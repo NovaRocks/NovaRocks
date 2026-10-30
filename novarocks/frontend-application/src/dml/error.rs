@@ -35,6 +35,7 @@ pub enum DmlErrorKind {
 enum DmlErrorBody {
     Legacy(String),
     Execution(Box<ExecutionFailureInput>),
+    Application(novarocks_query_application::session_error::QueryServiceError),
 }
 
 #[derive(Debug)]
@@ -53,10 +54,12 @@ pub struct DmlError {
 /// boundary renders it as a [`UserError`].
 ///
 /// COW begin failures keep their original typed cause until the original
-/// command worker retires it. Other failures retain their existing text route;
+/// command worker retires it. Governed application refusals retain their original
+/// QueryServiceError. Other failures retain their existing text route;
 /// no user-facing code is inferred from that text.
 #[derive(Debug)]
 pub enum DmlExecutionError {
+    Application(novarocks_query_application::session_error::QueryServiceError),
     Execution(ExecutionFailureInput),
     Engine(String),
     Compilation(novarocks_failure_contract::SharedFailureCause),
@@ -101,6 +104,21 @@ impl DmlExecutionError {
         }
     }
 
+    pub(crate) fn from_completion(
+        error: novarocks_query_application::preparation::FinalPlanCompletionError,
+    ) -> Self {
+        use novarocks_query_application::preparation::FinalPlanCompletionError as E;
+        use novarocks_type_contract::CompileControlError;
+        match error {
+            E::Cancelled { .. } => Self::Control(CompileControlError::Cancelled),
+            E::DeadlineExceeded => Self::Control(CompileControlError::DeadlineExceeded),
+            E::ResourceExhausted => Self::Control(CompileControlError::ResourceExhausted),
+            E::Source { source } => Self::Compilation(source),
+            E::Analyze { error } => Self::from_compile(error.into()),
+            error => Self::Engine(error.to_string()),
+        }
+    }
+
     pub(crate) fn from_encode(error: novarocks_plan_codec::PhysicalEncodeError) -> Self {
         match error {
             novarocks_plan_codec::PhysicalEncodeError::Control(error) => Self::Control(error),
@@ -111,6 +129,7 @@ impl DmlExecutionError {
     pub(crate) fn into_dml_error(self, source: Option<&str>) -> DmlError {
         match self {
             Self::Execution(input) => DmlError::from_execution(input),
+            Self::Application(error) => DmlError::from_application(error),
             Self::Engine(error) => DmlError::executor(error),
             Self::Compilation(source) => DmlError::compile_control(
                 novarocks_type_contract::CompileControlError::Source(source),
@@ -139,6 +158,12 @@ impl From<novarocks_plan_codec::PhysicalEncodeError> for DmlExecutionError {
 impl From<crate::query_execution::contract::DistributedQueryError> for DmlExecutionError {
     fn from(error: crate::query_execution::contract::DistributedQueryError) -> Self {
         Self::from_distributed(error)
+    }
+}
+
+impl From<novarocks_query_application::session_error::QueryServiceError> for DmlExecutionError {
+    fn from(error: novarocks_query_application::session_error::QueryServiceError) -> Self {
+        Self::Application(error)
     }
 }
 
@@ -174,6 +199,7 @@ impl std::fmt::Display for DmlExecutionError {
         match self {
             Self::Execution(input) => formatter.write_str(input.detail().as_str()),
             Self::Engine(error) => formatter.write_str(error),
+            Self::Application(error) => error.fmt(formatter),
             Self::Compilation(source) => source.fmt(formatter),
             Self::Analyze(error) => error.fmt(formatter),
             Self::Cow(error) => error.fmt(formatter),
@@ -186,6 +212,7 @@ impl std::error::Error for DmlExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Cow(error) => Some(error),
+            Self::Application(error) => Some(error),
             Self::Compilation(source) => Some(source),
             Self::Analyze(source) => Some(source),
             Self::Control(source) => Some(source),
@@ -202,25 +229,43 @@ impl From<crate::query_execution::dml::mutation_flow::CowFailure> for DmlExecuti
 /// Positive stage evidence retained independently of final publication.
 #[derive(Debug)]
 pub struct DmlStagedCreateFailure {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "retained as typed staged-create evidence in DML failure diagnostics"
-        )
+    #[expect(
+        dead_code,
+        reason = "Retain the original positive staged-create receipt and finalization evidence in DML failure diagnostics."
     )]
     pub receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "retained as typed staged-create evidence in DML failure diagnostics"
-        )
+    #[expect(
+        dead_code,
+        reason = "Retain the original positive staged-create receipt and finalization evidence in DML failure diagnostics."
     )]
     pub finalization: novarocks_spi::connector::ExternalMutationFinalization,
 }
 
 impl DmlError {
+    pub(crate) fn from_application(
+        error: novarocks_query_application::session_error::QueryServiceError,
+    ) -> Self {
+        Self {
+            kind: DmlErrorKind::Executor,
+            body: DmlErrorBody::Application(error),
+            publication_terminal: None,
+            user_error: None,
+            engine_error_code: None,
+            cow_failure: None,
+            compile_control: None,
+            staged_create_preparation: None,
+        }
+    }
+
+    pub(crate) fn application_error(
+        &self,
+    ) -> Option<&novarocks_query_application::session_error::QueryServiceError> {
+        match &self.body {
+            DmlErrorBody::Application(error) => Some(error),
+            _ => None,
+        }
+    }
+
     pub(crate) fn from_execution(input: ExecutionFailureInput) -> Self {
         Self {
             kind: DmlErrorKind::Executor,
@@ -234,42 +279,12 @@ impl DmlError {
         }
     }
 
-    /// Publication observations cannot replace an already selected Task input.
-    pub(crate) fn prefer_selected_execution(self, later: Self) -> Self {
-        if matches!(&self.body, DmlErrorBody::Execution(_)) {
-            tracing::warn!(publication_error = %later, "publication observation accompanies the selected execution failure");
-            self
-        } else {
-            later
-        }
-    }
-
     pub(crate) fn execution_failure(&self) -> Option<&ExecutionFailureInput> {
         match &self.body {
             DmlErrorBody::Execution(input) => Some(input.as_ref()),
+            DmlErrorBody::Application(error) => error.execution_failure(),
             DmlErrorBody::Legacy(_) => None,
         }
-    }
-
-    /// Cleanup may enrich local legacy diagnostics, never the selected input.
-    pub(crate) fn with_uncommitted_cleanup(
-        mut self,
-        cleanup: &novarocks_spi::connector::ExternalMutationFinalization,
-    ) -> Self {
-        match &mut self.body {
-            DmlErrorBody::Legacy(message) => {
-                *message =
-                    crate::connector::mutation::known_uncommitted_message(&*message, cleanup);
-            }
-            DmlErrorBody::Execution(_) => {
-                if let novarocks_spi::connector::ExternalMutationFinalization::Failed(error) =
-                    cleanup
-                {
-                    tracing::warn!(%error, "artifact cleanup failed after the selected execution failure");
-                }
-            }
-        }
-        self
     }
 
     fn cow(error: crate::query_execution::dml::mutation_flow::CowFailure) -> Self {
@@ -427,11 +442,6 @@ impl DmlError {
         self
     }
 
-    #[cfg(test)]
-    pub fn staged_create_preparation(&self) -> Option<&DmlStagedCreateFailure> {
-        self.staged_create_preparation.as_deref()
-    }
-
     pub fn publication_terminal(&self) -> Option<&LakePublicationTerminal> {
         self.publication_terminal.as_ref()
     }
@@ -439,11 +449,12 @@ impl DmlError {
 
 impl fmt::Display for DmlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match &self.body {
-            DmlErrorBody::Legacy(message) => message.as_str(),
-            DmlErrorBody::Execution(input) => input.detail().as_str(),
-        };
-        write!(formatter, "{:?}: {}", self.kind, message)?;
+        write!(formatter, "{:?}: ", self.kind)?;
+        match &self.body {
+            DmlErrorBody::Legacy(message) => formatter.write_str(message)?,
+            DmlErrorBody::Execution(input) => formatter.write_str(input.detail().as_str())?,
+            DmlErrorBody::Application(error) => fmt::Display::fmt(error, formatter)?,
+        }
         if let Some(terminal) = &self.publication_terminal {
             let target = terminal.target();
             write!(
@@ -472,6 +483,9 @@ impl fmt::Display for DmlError {
 
 impl std::error::Error for DmlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        if let DmlErrorBody::Application(error) = &self.body {
+            return Some(error);
+        }
         self.cow_failure
             .as_ref()
             .map(|error| error as &(dyn std::error::Error + 'static))
@@ -487,6 +501,156 @@ impl std::error::Error for DmlError {
 mod compile_control_tests {
     use super::*;
     use novarocks_type_contract::CompileControlError;
+
+    fn completed_sql_source() -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+        use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
+        use novarocks_sql::compiler::*;
+        let control = SqlCompileControl::unbounded();
+        let request = SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([84; 16]).unwrap(),
+            SqlStatementInput::sql("SELECT 1"),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                current_catalog: None,
+                current_database: "fixture".into(),
+                optimizer_settings: SessionOptimizerSettings {
+                    enable_materialized_view_rewrite: Some(false),
+                    ..SessionOptimizerSettings::default()
+                },
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            noop_constant_evaluator(),
+            crate::application::test_constant_policy(),
+            control.clone(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: 64,
+                max_batch_bytes: 1 << 20,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        );
+        match SqlCompiler::start(request.try_into_completion().unwrap(), &control).unwrap() {
+            SqlCompileProgress::Complete(completed) => completed.into_plan(),
+            SqlCompileProgress::Incomplete(_) => panic!("table-free source must complete"),
+        }
+    }
+
+    #[test]
+    fn actual_candidate_validation_preserves_control_and_source_until_dml_terminal() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_query_application::preparation::CompletedPhysicalPlanCandidate;
+        use novarocks_sql::compiler::{SqlCompileControl, SqlCompileError};
+        use novarocks_type_contract::{CompilePhase, PureCompileControl};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct Refuse {
+            cause: CompileControlError,
+            calls: AtomicUsize,
+        }
+        impl PureCompileControl for Refuse {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(self.cause.clone())
+            }
+        }
+
+        let mut policy = novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY;
+        policy.max_rows = 0;
+        let domain = novarocks_functions::ConstantValue::from_i64(
+            Arc::new(Field::new("value", DataType::Int64, false)),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+            1,
+            policy,
+            CompilePhase::Validate,
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap_err();
+        let expected_fact = domain.failure_fact();
+        let SqlCompileError::CompilationSource(original) = SqlCompileError::from(domain) else {
+            panic!("constant refusal must retain its actual source");
+        };
+        let plan = completed_sql_source();
+        CompletedPhysicalPlanCandidate::for_sql_program(
+            plan.clone(),
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::Source(original.clone()),
+        ] {
+            let control = Refuse {
+                cause: cause.clone(),
+                calls: AtomicUsize::new(0),
+            };
+            // Refuse the real candidate validator after SQL has authored the
+            // source, rather than manufacturing a completion error variant.
+            let error = CompletedPhysicalPlanCandidate::for_sql_program(plan.clone(), &control)
+                .and_then(|candidate| {
+                    candidate.freeze_root_output(
+                        novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                            novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                        ),
+                    )
+                })
+                .map_err(DmlExecutionError::from_completion)
+                .unwrap_err()
+                .into_dml_error(None);
+            assert_eq!(control.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(error.compile_control_error(), Some(cause.clone()));
+            assert_eq!(error.kind(), DmlErrorKind::Executor);
+            assert!(error.publication_terminal().is_none());
+            assert!(error.user_error().is_none());
+            if let CompileControlError::Source(source) = cause {
+                assert_eq!(source, original);
+                assert_eq!(error.execution_failure().unwrap().fact(), expected_fact);
+                let Some(CompileControlError::Source(carried)) = error.compile_control_error()
+                else {
+                    panic!("candidate boundary must retain the original source");
+                };
+                assert_eq!(carried, original);
+                assert!(
+                    carried
+                        .downcast_ref::<novarocks_functions::ConstantError>()
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_root_sealing_refusal_does_not_acquire_control_authority() {
+        use novarocks_query_application::preparation::CompletedPhysicalPlanCandidate;
+        let candidate = CompletedPhysicalPlanCandidate::for_sql_program(
+            completed_sql_source(),
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let retained = candidate.clone();
+        let error = candidate
+            .freeze_root_output(novarocks_result_contract::FrozenRootOutput::CountOnly)
+            .map_err(DmlExecutionError::from_completion)
+            .unwrap_err()
+            .into_dml_error(None);
+        assert_eq!(error.compile_control_error(), None);
+        assert!(error.execution_failure().is_none());
+        assert!(error.publication_terminal().is_none());
+        assert_eq!(error.kind(), DmlErrorKind::Executor);
+        // The ordinary refusal leaves the retained source's original root intact.
+        assert!(retained.original_public_result_port().is_some());
+    }
 
     #[test]
     fn encode_capability_refusal_keeps_its_identity_through_dml_projection() {

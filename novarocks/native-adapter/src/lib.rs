@@ -181,6 +181,24 @@ impl FrontendNativeTransport {
         Self::Pem(material)
     }
 
+    /// Borrow the actual selected endpoint and this original frozen TLS policy.
+    /// Tonic's dummy HTTP origin and later DNS addresses are not domain authors.
+    /// This pure projection grants no connection, stream or dispatch capacity.
+    pub fn selected_network_origin<'a>(
+        &self,
+        endpoint: &'a NativeEndpoint,
+    ) -> Result<
+        novarocks_resource_contract::SelectedNetworkOrigin<'a>,
+        novarocks_resource_contract::DependencyFactError,
+    > {
+        let mode = match self {
+            Self::Plaintext => novarocks_native_trust::NativeTransportMode::Disabled,
+            Self::Automatic(_) => novarocks_native_trust::NativeTransportMode::Automatic,
+            Self::Pem(_) => novarocks_native_trust::NativeTransportMode::Pem,
+        };
+        NativeEndpointConnector::selected_origin_for(endpoint, mode)
+    }
+
     pub fn connector_for(
         &self,
         endpoint: NativeEndpoint,
@@ -416,3 +434,48 @@ pub mod backend_test_session;
     all(not(novarocks_dev_controls), debug_assertions)
 ))]
 compile_error!("novarocks_dev_controls must match debug_assertions");
+
+#[cfg(test)]
+mod frontend_selected_origin_tests {
+    use super::FrontendNativeTransport;
+    use novarocks_native_trust::{
+        AutomaticTlsMaterial, DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust,
+        ValidatedSharedSecret,
+    };
+    use novarocks_secret::SecretValue;
+    use novarocks_types::NativeEndpoint;
+
+    #[test]
+    fn frozen_frontend_policy_projects_the_same_origin_as_its_actual_connector_without_io() {
+        let endpoint = NativeEndpoint::from_host_port("SELECTED.example", 443).unwrap();
+        let trust = NativeTrust::new(
+            DeploymentId::parse("frontend-origin-pure").unwrap(),
+            ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))
+                .unwrap(),
+            NativeCallerSubject::parse("fe@localhost:19040").unwrap(),
+            NativeTransportMode::Automatic,
+        );
+        let material = AutomaticTlsMaterial::for_endpoint(trust, endpoint.clone()).unwrap();
+        for (transport, expected) in [
+            (
+                FrontendNativeTransport::plaintext(),
+                "http://selected.example:443",
+            ),
+            (
+                FrontendNativeTransport::automatic(material),
+                "https://selected.example",
+            ),
+        ] {
+            let projected = transport
+                .selected_network_origin(&endpoint)
+                .unwrap()
+                .into_owned();
+            let connector = transport.connector_for(endpoint.clone()).unwrap();
+            assert_eq!(projected.as_str(), expected);
+            assert_eq!(
+                projected,
+                connector.selected_network_origin().unwrap().into_owned()
+            );
+        }
+    }
+}

@@ -77,14 +77,30 @@ impl CatalogEvidencePolicy {
     ) -> Result<EvidenceContext, ConnectorError> {
         use novarocks_spi::connector::ConnectorOperationControl;
         preparation.check_active()?;
-        EvidenceContext::new(self.evidence)
+        let grant = EvidenceContext::new(self.evidence, EvidencePhase::Evidence)?
+            .with_finalization_deadline_cap(preparation.necessary_finalization_deadline_cap());
+        if grant.expired() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "Necessary finalization deadline elapsed before nested publication",
+            ));
+        }
+        Ok(grant)
     }
     pub(crate) fn begin_finalization(&self) -> Result<EvidenceContext, ConnectorError> {
-        EvidenceContext::new(self.finalization)
+        EvidenceContext::new(self.finalization, EvidencePhase::Finalization)
     }
     pub(crate) fn begin_reclamation(&self) -> Result<EvidenceContext, ConnectorError> {
-        EvidenceContext::new(self.reclamation)
+        EvidenceContext::new(self.reclamation, EvidencePhase::Reclamation)
     }
+}
+
+/// The purpose of the original catalog phase grant, not a second authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum EvidencePhase {
+    Evidence,
+    Finalization,
+    Reclamation,
 }
 
 /// No statement cancellation view is retained: this capability only observes
@@ -94,9 +110,10 @@ pub(crate) struct EvidenceContext {
     #[cfg(test)]
     started: Instant,
     deadline: Instant,
+    phase: EvidencePhase,
 }
 impl EvidenceContext {
-    fn new(budget: Duration) -> Result<Self, ConnectorError> {
+    fn new(budget: Duration, phase: EvidencePhase) -> Result<Self, ConnectorError> {
         let started = Instant::now();
         let deadline = started.checked_add(budget).ok_or_else(|| {
             ConnectorError::new(
@@ -108,7 +125,17 @@ impl EvidenceContext {
             #[cfg(test)]
             started,
             deadline,
+            phase,
         })
+    }
+    pub(super) const fn phase(&self) -> EvidencePhase {
+        self.phase
+    }
+    pub(crate) fn with_finalization_deadline_cap(mut self, cap: Option<Instant>) -> Self {
+        if let Some(cap) = cap {
+            self.deadline = self.deadline.min(cap);
+        }
+        self
     }
     pub(crate) const fn deadline(&self) -> Instant {
         self.deadline
@@ -243,7 +270,8 @@ mod tests {
                     &[200],
                     &RequestContext::with_deadline((started + policy.evidence).into()),
                 )
-                .await;
+                .await
+                .expect("the original transport fixture has no MIO admission source");
             assert!(
                 matches!(
                     stage,
@@ -277,7 +305,8 @@ mod tests {
                 &[200],
                 &RequestContext::with_deadline((started + Duration::from_millis(100)).into()),
             )
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO admission source");
         assert!(matches!(
             stage,
             crate::rest_protocol::evidence::DispatchStage::WrittenNoStatus(_)

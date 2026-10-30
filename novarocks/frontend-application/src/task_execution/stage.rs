@@ -25,11 +25,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::task_execution::completion_facts::{
+    StageState, derive_stage_state, parent_released_children,
+};
 use novarocks_execution::task_execution::{
     CancelReason, ExchangeEdgeId, StageRef, TaskIdentity, TaskState,
-};
-use novarocks_query_application::coordination::{
-    StageState, derive_stage_state, parent_released_children,
 };
 #[cfg(test)]
 use novarocks_types::identity::StageId;
@@ -118,10 +118,12 @@ impl StageExecution {
         parent_released_children(self.state())
     }
 
+    #[cfg(test)]
     pub fn all_terminal(&self) -> bool {
         self.tasks.values().all(RemoteTask::is_terminal)
     }
 
+    #[cfg(test)]
     pub fn all_output_released(&self) -> bool {
         // Only a task that FINISHED owes an output responsibility. That state
         // is constructible on the backend precisely when the responsibility is
@@ -140,16 +142,14 @@ impl StageExecution {
             .all(|task| task.task_state() != TaskState::Finished || task.output_released())
     }
 
-    /// Stands down every task of this stage except the query's root.
-    ///
-    /// There is one normal reason, and this is the only thing that uses it:
-    /// anything else is a failure or an abort, which take their own paths and
-    /// can never be dressed up as a success-compatible cancellation.
-    pub fn cancel_non_root_tasks(&mut self) -> Vec<OperationIntent> {
+    /// Emit normal cancellation only for Tasks whose original demand owner
+    /// already authorized stand-down. Required input/output obligations can
+    /// refuse that authorization even after a parent stage releases demand.
+    pub fn cancel_normally_stood_down_tasks(&mut self) -> Vec<OperationIntent> {
         let root = self.root_task;
         self.tasks
             .iter_mut()
-            .filter(|(task_id, _)| Some(**task_id) != root)
+            .filter(|(task_id, task)| Some(**task_id) != root && task.normally_stood_down())
             .filter_map(|(_, task)| task.cancel_intent(CancelReason::UpstreamNoLongerNeeded))
             .collect()
     }
@@ -218,6 +218,8 @@ impl EdgeNormalCloseResolution {
 
 #[derive(Debug)]
 pub struct EdgeOpenTracker {
+    must_drain: BTreeSet<ExchangeEdgeId>,
+    drain_tasks: BTreeSet<TaskIdentity>,
     awaiting: BTreeMap<ExchangeEdgeId, BTreeSet<TaskIdentity>>,
     normally_closed: BTreeMap<ExchangeEdgeId, BTreeSet<TaskIdentity>>,
     producers: BTreeMap<ExchangeEdgeId, Vec<TaskIdentity>>,
@@ -243,7 +245,26 @@ impl EdgeOpenTracker {
                     .push(edge.edge_id());
             }
         }
+        let must_drain = graph
+            .edges()
+            .filter(|edge| {
+                edge.delivery()
+                    == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+            })
+            .map(|edge| edge.edge_id())
+            .collect();
+        let drain_tasks = graph
+            .edges()
+            .filter(|edge| {
+                edge.delivery()
+                    == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+            })
+            .flat_map(|edge| edge.producers().iter().chain(edge.destinations()))
+            .copied()
+            .collect();
         Self {
+            must_drain,
+            drain_tasks,
             awaiting,
             normally_closed: BTreeMap::new(),
             producers,
@@ -280,6 +301,11 @@ impl EdgeOpenTracker {
             .into_iter()
             .flatten()
         {
+            // A Task state says no more input is needed; it does not say
+            // that this exact strict stream was consumed through End.
+            if normally_closed && self.must_drain.contains(edge_id) {
+                continue;
+            }
             let Some(pending) = self.awaiting.get_mut(edge_id) else {
                 continue;
             };
@@ -312,6 +338,33 @@ impl EdgeOpenTracker {
         resolution
     }
 
+    /// Reduce each frozen edge's exact destination withdrawals once. A
+    /// producer is present only when it owns a real output edge; all of its
+    /// edges must be withdrawn before it can release a result prerequisite.
+    pub(crate) fn normal_output_withdrawals(
+        &self,
+        graph: &TaskGraph,
+    ) -> BTreeMap<TaskIdentity, bool> {
+        let mut producers = BTreeMap::<TaskIdentity, bool>::new();
+        for edge in graph.edges() {
+            let closed = self.normally_closed.get(&edge.edge_id());
+            let all_closed = edge.destinations().iter().all(|destination| {
+                closed.is_some_and(|destinations| destinations.contains(destination))
+            });
+            for &producer in edge.producers() {
+                producers
+                    .entry(producer)
+                    .and_modify(|all| *all &= all_closed)
+                    .or_insert(all_closed);
+            }
+        }
+        producers
+    }
+
+    pub(crate) fn requires_drain(&self, task: TaskIdentity) -> bool {
+        self.drain_tasks.contains(&task)
+    }
+
     pub fn producers_of(&self, edge_id: ExchangeEdgeId) -> &[TaskIdentity] {
         self.producers
             .get(&edge_id)
@@ -340,6 +393,8 @@ mod destination_close_tests {
         let target = identity(2);
         let sibling = identity(3);
         let mut tracker = EdgeOpenTracker {
+            must_drain: BTreeSet::new(),
+            drain_tasks: BTreeSet::new(),
             awaiting: BTreeMap::from([(edge, BTreeSet::from([target, sibling]))]),
             normally_closed: BTreeMap::new(),
             producers: BTreeMap::from([(edge, vec![producer])]),
@@ -362,13 +417,64 @@ mod destination_close_tests {
         assert_eq!(tracker.producers_of(edge), &[producer]);
     }
 
+    #[test]
+    fn strict_streams_ignore_demand_withdrawal_and_wait_for_installation() {
+        let ordinary = ExchangeEdgeId::new(1).unwrap();
+        let strict = ExchangeEdgeId::new(2).unwrap();
+        let producer = identity(1);
+        let target = identity(2);
+        let mut tracker = EdgeOpenTracker {
+            must_drain: BTreeSet::from([strict]),
+            drain_tasks: BTreeSet::from([producer, target]),
+            awaiting: BTreeMap::from([
+                (ordinary, BTreeSet::from([target])),
+                (strict, BTreeSet::from([target])),
+            ]),
+            normally_closed: BTreeMap::new(),
+            producers: BTreeMap::from([(ordinary, vec![producer]), (strict, vec![producer])]),
+            edges_of_destination: BTreeMap::from([(target, vec![ordinary, strict])]),
+            decided: BTreeSet::new(),
+        };
+        let withdrawal = tracker.note_normally_closed(target);
+        assert_eq!(
+            withdrawal
+                .closed()
+                .iter()
+                .map(|effect| effect.edge_id())
+                .collect::<Vec<_>>(),
+            [ordinary]
+        );
+        assert_eq!(
+            withdrawal
+                .opened()
+                .iter()
+                .map(|effect| effect.edge_id())
+                .collect::<Vec<_>>(),
+            [ordinary]
+        );
+        assert!(tracker.awaiting[&strict].contains(&target));
+        assert!(!tracker.normally_closed.contains_key(&strict));
+        let installed = tracker.note_created(target);
+        assert_eq!(
+            installed
+                .iter()
+                .map(|effect| effect.edge_id())
+                .collect::<Vec<_>>(),
+            [strict]
+        );
+        assert!(installed[0].normally_closed().is_empty());
+        assert!(tracker.note_normally_closed(target).closed().is_empty());
+        assert!(tracker.requires_drain(producer));
+        assert!(tracker.requires_drain(target));
+    }
+
     /// Exhaust every word up to length six, including repeated observations.
     /// These are inputs to the production reducers, not a second transition
     /// model: the oracle checks output safety and frozen membership directly.
     #[test]
     fn destination_reducer_bounded_interleavings() {
+        use crate::task_execution::conclusion::TerminationLatch;
         use novarocks_execution::task_execution::{SafeDetail, TaskFailure, TerminationDetail};
-        use novarocks_query_application::coordination::{RootReadFacts, TerminationLatch};
 
         #[derive(Clone, Copy, Debug)]
         enum Event {
@@ -418,6 +524,8 @@ mod destination_close_tests {
                 }
                 traces += 1;
                 let mut tracker = EdgeOpenTracker {
+                    must_drain: BTreeSet::new(),
+                    drain_tasks: BTreeSet::new(),
                     awaiting: BTreeMap::from([(edge, BTreeSet::from(destinations))]),
                     normally_closed: BTreeMap::new(),
                     producers: BTreeMap::from([(edge, vec![producer])]),
@@ -520,11 +628,8 @@ mod destination_close_tests {
                             !failure.cause().unwrap().is_success_compatible(),
                             "failure disguised: {counterexample}"
                         );
-                        assert!(
-                            !RootReadFacts::new(TaskState::Finished, true, failure.is_latched())
-                                .client_visible_completion(),
-                            "failure accepted as success: {counterexample}"
-                        );
+                        // Accepted-root sealing rejects this same latched-failure
+                        // property in the real result-owner tests.
                     }
                     // Record reachable production reducer state, independent of
                     // trace counters and the safety oracle's observation sets.

@@ -64,6 +64,7 @@ pub(crate) struct BeLogSnapshot {
     counts: HashMap<(usize, String), usize>,
     log_lengths: Vec<usize>,
     evidence_deadline: Option<Instant>,
+    original_work_deadline: Option<Instant>,
 }
 
 impl BeLogSnapshot {
@@ -77,7 +78,7 @@ pub(crate) fn snapshot(
     meta: &QueryMeta,
     server_handle: &dyn ServerHandle,
 ) -> Result<BeLogSnapshot> {
-    snapshot_with_deadline(meta, server_handle, step_evidence_deadline(meta))
+    snapshot_with_deadline(meta, server_handle, step_evidence_deadline(meta), None)
 }
 
 #[cfg(test)]
@@ -114,10 +115,12 @@ pub(crate) fn snapshot_with_deadline(
     meta: &QueryMeta,
     server_handle: &dyn ServerHandle,
     evidence_deadline: Option<Instant>,
+    original_work_deadline: Option<Instant>,
 ) -> Result<BeLogSnapshot> {
     if !has_directives(meta) {
         return Ok(BeLogSnapshot {
             evidence_deadline,
+            original_work_deadline,
             ..BeLogSnapshot::default()
         });
     }
@@ -167,6 +170,7 @@ pub(crate) fn snapshot_with_deadline(
         counts,
         log_lengths,
         evidence_deadline,
+        original_work_deadline,
     })
 }
 
@@ -455,9 +459,15 @@ pub(crate) fn run(
             bail!("BE log evidence directives require at least one runner-owned BE");
         }
         let started = Instant::now();
-        let deadline = snapshot
+        // Ordinary evidence gets its short window only after SQL returns.
+        // A lifecycle step keeps its original pre-SQL clock; neither can
+        // extend the fixture's original work cut.
+        let evidence_deadline = snapshot
             .evidence_deadline
             .unwrap_or(started + LOG_EVIDENCE_TIMEOUT);
+        let deadline = snapshot
+            .original_work_deadline
+            .map_or(evidence_deadline, |end| end.min(evidence_deadline));
         let mut pending_reason = "evidence was not evaluated".to_string();
         loop {
             if Instant::now() >= deadline {
@@ -728,6 +738,97 @@ mod tests {
 
         assert!(error.to_string().contains("timed out"));
         assert!(error.to_string().contains("fe-tail-sentinel"));
+    }
+
+    #[test]
+    fn ordinary_evidence_window_starts_after_elapsed_sql_time() {
+        let handle = Arc::new(FakeBeLogHandle::new(vec!["", "", ""]));
+        let step = step(QueryMeta {
+            be_log_contains: vec!["post-query-marker".to_string()],
+            ..QueryMeta::default()
+        });
+        let before = snapshot_with_deadline(
+            &step.meta,
+            handle.as_ref(),
+            step_evidence_deadline(&step.meta),
+            Some(Instant::now() + QUERY_LIFECYCLE_STEP_TIMEOUT),
+        )
+        .expect("pre-step snapshot");
+        assert!(before.evidence_deadline().is_none());
+        // Model SQL taking longer than the ordinary evidence window.
+        std::thread::sleep(LOG_EVIDENCE_TIMEOUT + LOG_EVIDENCE_POLL_INTERVAL);
+        let delayed_handle = Arc::clone(&handle);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(LOG_EVIDENCE_POLL_INTERVAL);
+            delayed_handle.append_log(0, "post-query-marker\n");
+        });
+        let mut log = String::new();
+
+        let result = run(&step, handle.as_ref(), &before, &mut log);
+        writer.join().expect("post-query log writer");
+
+        result.expect("elapsed SQL time must not consume the post-query evidence window");
+        assert!(log.contains("@be_log_contains PASS"), "{log}");
+    }
+
+    #[test]
+    fn ordinary_evidence_does_not_borrow_the_later_work_deadline() {
+        let handle = FakeBeLogHandle::new(vec!["", "", ""]);
+        let step = step(QueryMeta {
+            be_log_contains: vec!["missing-marker".to_string()],
+            ..QueryMeta::default()
+        });
+        let original_work_deadline = Instant::now() + QUERY_LIFECYCLE_STEP_TIMEOUT;
+        let before = snapshot_with_deadline(
+            &step.meta,
+            &handle,
+            step_evidence_deadline(&step.meta),
+            Some(original_work_deadline),
+        )
+        .expect("pre-step snapshot");
+        let mut log = String::new();
+
+        let error = run(&step, &handle, &before, &mut log)
+            .expect_err("the ordinary evidence window must expire before the work cut");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(
+            Instant::now() < original_work_deadline,
+            "the missing marker must time out while the original work cut is still in the future"
+        );
+        assert!(!log.contains("@be_log_contains PASS"), "{log}");
+    }
+
+    #[test]
+    fn original_work_and_lifecycle_expiry_cannot_be_resurrected_by_fresh_evidence() {
+        let expired = Instant::now();
+        let later = expired + QUERY_LIFECYCLE_STEP_TIMEOUT;
+        for (evidence_deadline, original_work_deadline) in [
+            (None, Some(expired)),
+            (Some(later), Some(expired)),
+            (Some(expired), Some(later)),
+        ] {
+            let handle = FakeBeLogHandle::new(vec!["", "", ""]);
+            let step = step(QueryMeta {
+                be_log_contains: vec!["fresh-marker".to_string()],
+                ..QueryMeta::default()
+            });
+            let before = snapshot_with_deadline(
+                &step.meta,
+                &handle,
+                evidence_deadline,
+                original_work_deadline,
+            )
+            .expect("pre-step snapshot");
+            handle.append_log(0, "fresh-marker\n");
+            let mut log = String::new();
+
+            let error = run(&step, &handle, &before, &mut log)
+                .expect_err("neither fresh evidence nor a later clock can revive an expired cut");
+
+            assert!(error.to_string().contains("timed out"));
+            assert!(!log.contains("@be_log_contains PASS"), "{log}");
+        }
     }
 
     #[test]

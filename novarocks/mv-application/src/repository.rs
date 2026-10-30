@@ -18,8 +18,9 @@
 //! Provider-neutral port for the lake-sourced MV Accelerator.
 //!
 //! The repository owns one closed rebuildable family. Runtime attempts,
-//! scheduler state, partition freshness, recovery and provider transactions do
-//! not cross this boundary.
+//! scheduler state and partition freshness remain with their runtime owners.
+//! Physical source custody stays with the caller; an uncertain repository
+//! result retains the same issued commit observation rather than a display id.
 
 use std::fmt;
 
@@ -41,10 +42,12 @@ pub enum MvRepositoryErrorKind {
     CommitUnknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct MvRepositoryError {
     kind: MvRepositoryErrorKind,
     message: String,
+    original: Option<novarocks_failure_contract::SharedFailureCause>,
+    observation: Option<novarocks_state_store_api::CommitObservation>,
 }
 
 impl MvRepositoryError {
@@ -52,9 +55,36 @@ impl MvRepositoryError {
         Self {
             kind,
             message: message.into(),
+            original: None,
+            observation: None,
         }
     }
 
+    pub(crate) fn with_original_failure(
+        mut self,
+        original: novarocks_failure_contract::SharedFailureCause,
+    ) -> Self {
+        self.original = Some(original);
+        self
+    }
+    pub(crate) fn with_commit_observation(
+        mut self,
+        observation: novarocks_state_store_api::CommitObservation,
+    ) -> Self {
+        self.observation = Some(observation);
+        self
+    }
+    pub fn original_failure(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.original.as_ref()
+    }
+    pub fn commit_observation(&self) -> Option<&novarocks_state_store_api::CommitObservation> {
+        self.observation.as_ref()
+    }
+    pub fn take_commit_observation(
+        &mut self,
+    ) -> Option<novarocks_state_store_api::CommitObservation> {
+        self.observation.take()
+    }
     pub const fn kind(&self) -> MvRepositoryErrorKind {
         self.kind
     }
@@ -70,7 +100,52 @@ impl fmt::Display for MvRepositoryError {
     }
 }
 
-impl std::error::Error for MvRepositoryError {}
+impl std::error::Error for MvRepositoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.original
+            .as_ref()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
+    }
+}
+impl PartialEq for MvRepositoryError {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.message == other.message
+            && self.original == other.original
+            && self.observation.as_ref().map(|value| value.id())
+                == other.observation.as_ref().map(|value| value.id())
+    }
+}
+impl Eq for MvRepositoryError {}
+
+/// Reasons authored by the MV repository itself, within the metadata domain.
+/// Provider/physical causes retain their own reason instead of using these.
+pub mod failure_reason {
+    use std::num::NonZeroU16;
+    pub const INVALID_REQUEST: NonZeroU16 = NonZeroU16::new(910).unwrap();
+    pub const NOT_FOUND: NonZeroU16 = NonZeroU16::new(911).unwrap();
+    pub const CONFLICT: NonZeroU16 = NonZeroU16::new(912).unwrap();
+    pub const CORRUPTION: NonZeroU16 = NonZeroU16::new(913).unwrap();
+    pub const UNAVAILABLE: NonZeroU16 = NonZeroU16::new(914).unwrap();
+    pub const COMMIT_UNKNOWN: NonZeroU16 = NonZeroU16::new(915).unwrap();
+}
+impl novarocks_failure_contract::FailureProjection for MvRepositoryError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass as C, FailureFact, FailureReason, domain};
+        if let Some(original) = &self.original {
+            return original.failure_fact();
+        }
+        let (class, reason) = match self.kind {
+            MvRepositoryErrorKind::InvalidRequest => (C::Data, failure_reason::INVALID_REQUEST),
+            MvRepositoryErrorKind::NotFound => (C::Dependency, failure_reason::NOT_FOUND),
+            MvRepositoryErrorKind::Conflict => (C::Dependency, failure_reason::CONFLICT),
+            MvRepositoryErrorKind::Corruption => (C::Data, failure_reason::CORRUPTION),
+            MvRepositoryErrorKind::Unavailable => (C::Dependency, failure_reason::UNAVAILABLE),
+            MvRepositoryErrorKind::CommitUnknown => (C::Dependency, failure_reason::COMMIT_UNKNOWN),
+        };
+        FailureFact::new(class, FailureReason::new(domain::METADATA, reason))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MvTargetLookup {

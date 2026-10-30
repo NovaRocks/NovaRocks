@@ -9,6 +9,10 @@ supersedes-files:
   - ADR-0157-native-rpc-ingress-cost-boundaries.md
   - ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0198
+    scope: "The read-oriented visibility/seal boundary and logical business-conclusion wording are generalized into computation readiness for all distributed intents and separate statement/domain completion; exact identity, Accepted/Installed, covered observation, frozen-semantic recovery and actual convergence remain active"
+    link: "ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md"
 date: 2026-09-28
 provenance:
   - "discussion: 2026-09-24 pure local programs, accepted/installed creation, covered observation and normal convergence"

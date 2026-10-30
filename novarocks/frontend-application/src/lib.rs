@@ -43,10 +43,20 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
     )
 }
 
+/// Native Task protocol bounds frozen by frontend process composition.
+pub mod task_protocol_config;
+
+mod native_workload;
+pub use native_workload::{
+    FrontendNativeCapacityInputs, FrontendStatementIngress, FrontendWorkloadCapacityConfig,
+    FrontendWorkloadCapacityProfile,
+};
+
 pub(crate) mod application;
 pub use application::{
-    FrontendApplicationError, FrontendApplicationErrorKind, FrontendExecutionConfig,
-    FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
+    FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+    FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
+    FrontendResultCapacityProfile,
 };
 pub(crate) mod capabilities;
 mod catalog_application;
@@ -54,7 +64,6 @@ mod catalog_controller;
 mod catalog_projection_metrics;
 mod catalog_prune;
 pub(crate) mod connector;
-pub(crate) mod coordinator;
 mod dml;
 pub(crate) mod metrics;
 mod mv;
@@ -62,6 +71,11 @@ pub use mv::management_audit::FileManagementAuditSink;
 pub use mv::startup_isolation_file::StartupIsolationSource;
 mod native;
 pub use query_execution::package_freeze::CompiledPackageCarrier;
+
+/// Known metadata facts of the original closed Internal CPU job factory.
+pub use query_execution::internal_result_cpu::{
+    InternalCpuActionQuote, InternalCpuMetadataGeometry,
+};
 #[cfg(novarocks_dev_controls)]
 mod preparation_diagnostics;
 pub(crate) mod query;
@@ -74,8 +88,9 @@ pub use catalog_application::admission_completion::{
 };
 pub use metrics::FrontendProcessMemoryObservation;
 pub use server::{
-    FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig,
-    open_frontend_application_for_server, serve_ready_frontend_session_factory,
+    FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendManagementServer,
+    FrontendServingConfig, open_frontend_application_for_server,
+    prepare_frontend_application_for_server, serve_ready_frontend_session_factory,
     shutdown_frontend_application_to_convergence, start_frontend_management_server,
 };
 #[cfg(feature = "mem-1-m07-hms-listing-observe")]

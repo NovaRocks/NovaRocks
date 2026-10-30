@@ -30,8 +30,8 @@ mod error;
 mod transport;
 
 pub use adapter::{
-    BoxedNativeIo, NATIVE_DNS_RESOLUTION_POSITIONS, NativeConnectFailure, NativeDnsResolver,
-    NativeEndpointConnector, NativeIncomingAdapter, NativeIo, OwnedNativeIo,
+    NATIVE_DNS_RESOLUTION_POSITIONS, NativeConnectFailure, NativeDnsResolver,
+    NativeEndpointConnector, NativeIncomingAdapter,
 };
 pub use auth::{
     AuthenticatedNativeCaller, ManualClock, NativeCallerSubject, NativeClientAuthInterceptor,

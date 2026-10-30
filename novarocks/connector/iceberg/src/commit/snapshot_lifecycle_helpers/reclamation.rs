@@ -1046,7 +1046,7 @@ async fn reclaim_round_using(
             }
             let candidate = pending.first().unwrap().clone();
             let (operator, path) = storage.delete_access(&candidate, &binding)?;
-            let versioned = operator.info().full_capability().delete_with_version;
+            let versioned = operator.info().capability().delete_with_version;
             let first = admission
                 .run_wait_for_exit(&context, async {
                     context.check_active()?;

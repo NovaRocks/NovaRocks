@@ -6,6 +6,9 @@ status: active
 supersedes: [ADR-0149]
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0201
+    scope: "NodeLocal references identify role-local acquisition definitions rather than independently downscoped cloud principals; Static, Vended and consumer-owned renewal remain effective"
+    link: "ADR-0201-role-local-node-credential-sources.md"
   - id: ADR-0175
     scope: "Meaning of the announced acquisition paths: both carry the frozen public routing context, the execution node never opens its own catalog session, and a vended read is admitted only when execution-node first acquisition can be formed; consumer-driven renewal, role-local material and ratio windows remain effective"
     link: "ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md"

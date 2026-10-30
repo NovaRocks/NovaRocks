@@ -27,8 +27,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::task_execution::operation::FrontendAction;
 use novarocks_execution::task_execution::PlanNodeId;
-use novarocks_query_application::coordination::FrontendAction;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::TaskId;
 
@@ -94,6 +94,7 @@ pub(crate) fn delivery_action(error: &SplitAssignmentDriverError) -> FrontendAct
         | SplitAssignmentDriverError::Assignment(_)
         | SplitAssignmentDriverError::NoAdmittedTask { .. }
         | SplitAssignmentDriverError::SplitSource { .. }
-        | SplitAssignmentDriverError::SourceClose { .. } => FrontendAction::FailAttempt,
+        | SplitAssignmentDriverError::SourceClose { .. }
+        | SplitAssignmentDriverError::SourceEnumeration { .. } => FrontendAction::FailAttempt,
     }
 }

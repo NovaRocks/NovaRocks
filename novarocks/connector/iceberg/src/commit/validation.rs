@@ -114,6 +114,7 @@ fn unwritable_error(kind: &str, table: &str, path: &str) -> ConnectorError {
         ConnectorErrorKind::Unsupported,
         format!("Iceberg {kind} writes are not supported yet: table {table}, column {path}"),
     )
+    .with_public_failure_detail()
 }
 
 /// New column definitions are decidable before any target metadata is read.
@@ -880,6 +881,7 @@ mod tests {
                     "Iceberg {kind} writes are not supported yet: table ice.db.t, column payload{suffix}"
                 )
             );
+            assert_eq!(error.public_failure_detail(), Some(error.message()));
             if kind == "uuid" {
                 deny_variant_registration(&schema, "ice.db.t")
                     .expect("uuid ADD FILES does not encode values");

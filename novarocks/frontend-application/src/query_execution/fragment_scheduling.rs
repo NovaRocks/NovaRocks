@@ -191,13 +191,8 @@ fn attempt_scan_work(
 }
 
 impl SchedulingFragmentFacts {
+    #[cfg(test)]
     pub fn has_scans(&self) -> bool {
         !self.scans.is_empty()
-    }
-}
-
-impl SchedulingScanFacts {
-    pub fn range_count(&self) -> usize {
-        self.ranges.len()
     }
 }

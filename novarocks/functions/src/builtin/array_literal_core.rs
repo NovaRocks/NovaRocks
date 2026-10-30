@@ -27,6 +27,7 @@ pub enum CollectionObservation {
 }
 #[derive(Debug)]
 pub enum ArrayLiteralError {
+    Operation(crate::KernelFailure),
     MissingOutput,
     NotList(novarocks_failure_contract::BoundedDetail),
     ElementLength { expected: usize, actual: usize },
@@ -36,6 +37,7 @@ pub enum ArrayLiteralError {
 impl std::fmt::Display for ArrayLiteralError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Operation(source) => source.fmt(f),
             Self::MissingOutput => f.write_str("array_expr missing output type"),
             Self::NotList(ty) => write!(f, "array_expr output type must be List, got {ty}"),
             Self::ElementLength { expected, actual } => write!(
@@ -54,7 +56,14 @@ impl std::fmt::Display for ArrayLiteralError {
         }
     }
 }
-impl std::error::Error for ArrayLiteralError {}
+impl std::error::Error for ArrayLiteralError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Operation(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl novarocks_failure_contract::FailureProjection for ArrayLiteralError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::{
@@ -62,6 +71,9 @@ impl novarocks_failure_contract::FailureProjection for ArrayLiteralError {
             RepresentationLayout, ResourceDimension, ResourceFacts, ResourceScope, domain,
         };
         let (class, code) = match self {
+            Self::Operation(source) => {
+                return novarocks_failure_contract::FailureProjection::failure_fact(source);
+            }
             Self::MissingOutput => (FailureClass::Invariant, 201),
             Self::NotList(_) => (FailureClass::Invariant, 202),
             Self::ElementLength { .. } => (FailureClass::Invariant, 203),
@@ -330,7 +342,15 @@ impl ArrayLiteralInputs {
             for idx in 0..element_arrays.len() {
                 observe(observer, CollectionObservation::Step)?;
                 observe(observer, CollectionObservation::OpaqueBoundary)?;
-                mutable.extend(idx, row, row + 1);
+                mutable.try_extend(idx, row, row + 1).map_err(|source| {
+                    ConstructionFailure::Domain(ArrayLiteralError::Operation(
+                        super::collection_arrow::arrow_failure(
+                            "array_expr",
+                            super::collection_arrow::ArrowSite::Extend,
+                            source,
+                        ),
+                    ))
+                })?;
                 observe(observer, CollectionObservation::OpaqueBoundary)?;
             }
         }
@@ -397,6 +417,56 @@ mod domain_tests {
         // Entry, vector construction, element step, then pre-cast boundary.
         assert_eq!(observed.get() - before, 4);
     }
+    #[test]
+    fn failed_extension_retains_actual_arrow_source_without_later_observation() {
+        use std::cell::Cell;
+        use std::error::Error;
+        let observed = Cell::new(0);
+        let mut observer = |_| {
+            observed.set(observed.get() + 1);
+            Ok::<(), &'static str>(())
+        };
+        let output = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let mut inputs =
+            ArrayLiteralInputs::from_output(Some(&output), 1, 1, &mut observer).unwrap();
+        inputs
+            .push_evaluated(
+                Arc::new(arrow_array::Int32Array::from(vec![7])),
+                &mut observer,
+            )
+            .unwrap();
+        let before = observed.get();
+        // The supplied cast returns a malformed length. The actual extension
+        // must reject its source range before any completion observation.
+        let error = inputs
+            .finish(
+                |_, _| Ok(Arc::new(arrow_array::Int64Array::from(Vec::<i64>::new())) as ArrayRef),
+                &mut observer,
+            )
+            .unwrap_err();
+        let ConstructionFailure::Domain(error @ ArrayLiteralError::Operation(_)) = error else {
+            panic!("expected the retained extension operation failure");
+        };
+        assert_eq!(observed.get() - before, 15);
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Invariant);
+        assert_eq!(fact.reason().code(), 375);
+        assert_eq!(fact.representation(), None);
+        let mut source = error.source();
+        let actual = loop {
+            let current = source.expect("the original Arrow source must remain in the chain");
+            if let Some(actual) = current.downcast_ref::<arrow_schema::ArrowError>() {
+                break actual;
+            }
+            source = current.source();
+        };
+        assert!(matches!(
+            actual,
+            arrow_schema::ArrowError::InvalidArgumentError(_)
+        ));
+        assert!(actual.to_string().contains("Invalid range 0..1"));
+    }
+
     #[test]
     fn invalid_output_cause_does_not_retain_arrow_field() {
         let field = Arc::new(Field::new("child", DataType::Int32, true));

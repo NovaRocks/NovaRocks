@@ -99,6 +99,42 @@ pub struct StatisticsCodecTotals {
     pub metadata_bytes: usize,
 }
 impl StatisticsCodecTotals {
+    /// Charge only the cumulative result-body coordinate using this codec's
+    /// original bounded profile. This is pure admission, not a record receipt.
+    pub fn checked_body_total(
+        current: usize,
+        additional: usize,
+    ) -> Result<usize, StatisticsCodecError> {
+        let body_bytes = current
+            .checked_add(additional)
+            .ok_or(StatisticsCodecError::BodyLimit)?;
+        Self {
+            rows: 0,
+            body_bytes,
+            metadata_bytes: 0,
+        }
+        .validate()?;
+        Ok(body_bytes)
+    }
+
+    /// Charge only the cumulative row coordinate using the same profile as
+    /// completed-record preflight. Reaching the bound remains legal.
+    pub fn checked_row_total(
+        current: usize,
+        additional: usize,
+    ) -> Result<usize, StatisticsCodecError> {
+        let rows = current
+            .checked_add(additional)
+            .ok_or(StatisticsCodecError::RowLimit)?;
+        Self {
+            rows,
+            body_bytes: 0,
+            metadata_bytes: 0,
+        }
+        .validate()?;
+        Ok(rows)
+    }
+
     fn validate(self) -> Result<(), StatisticsCodecError> {
         if self.rows > MAX_CONNECTOR_STATISTICS_ARTIFACTS {
             return Err(StatisticsCodecError::RowLimit);

@@ -33,10 +33,17 @@ pub struct CapturedCommandOutcome {
     pub output: Output,
     pub timed_out: bool,
     pub failures: Vec<String>,
+    group_exit_observed: bool,
     material: Arc<Material>,
 }
 
 impl CapturedCommandOutcome {
+    /// True only when the waited original monitor observed the entire local
+    /// payload group gone. This says nothing about remote producer work.
+    pub fn group_exit_observed(&self) -> bool {
+        self.group_exit_observed
+    }
+
     /// Release ordinary diagnostics after the caller consumes all assertions.
     pub fn release_diagnostics(&self) -> Result<()> {
         ensure!(
@@ -138,6 +145,7 @@ pub fn capture_command_until(
         output,
         timed_out,
         failures,
+        group_exit_observed: final_record.group_exit_observed,
         material,
     })
 }

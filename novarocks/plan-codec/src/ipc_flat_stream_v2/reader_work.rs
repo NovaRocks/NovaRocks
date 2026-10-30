@@ -46,11 +46,11 @@ fn source_work(
     metadata_bytes: usize,
     entries: usize,
 ) -> Result<usize, FlatPoolResourceError> {
-    // HashMap iteration scans empty/deleted buckets too. Public capacity()
-    // can fall after deletions without shrinking the raw table, so it cannot
-    // bound this scan. The mandatory trusted source invoice includes the whole
-    // retained original map allocation. Every raw bucket retains a control
-    // byte; the invoice therefore bounds bucket visits even with tombstones.
+    // Arrow 60.1.0 retains immutable BTree/Arc metadata and String backing;
+    // consumed HashMap staging buckets have exited. The trusted source-byte
+    // invoice still bounds entry/node walks and nominal-key comparisons.
+    // This is the existing conservative work envelope, not a bucket count
+    // or a claim that a larger invoice makes the actual tree walk longer.
     let buckets = source_retained_bytes;
     add(
         mul(2, add(add(add(metadata_bytes, entries)?, buckets)?, 1)?)?,
@@ -156,8 +156,8 @@ pub(super) fn preflight<W: ResourceWork>(
     known = work.numeric(add(known, semantic))?;
     work.library_work(known)?;
     work.step()?;
-    // Both original source walks and all four logical-tag lookup probes include
-    // the actual source table's spare capacity, not only populated entries.
+    // Both source walks and all four logical-tag lookup probes keep their
+    // conservative source-backing envelope for the current BTree/Arc owner.
     let source = source_work(source_retained_bytes, metadata, entries)?;
     known = work.numeric(add(known, source))?;
     work.library_work(known)?;

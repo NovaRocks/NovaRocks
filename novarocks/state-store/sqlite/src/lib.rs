@@ -21,6 +21,7 @@
 
 mod evidence;
 mod metrics;
+mod original;
 mod provider;
 mod range;
 mod schema;
@@ -87,6 +88,11 @@ impl SqliteStateStoreContribution {
     }
 }
 
+struct SqliteInstanceLifetime {
+    // The original process-exclusive file lease outlives every real connection.
+    _owner_lock: File,
+}
+
 struct SqliteStateStore {
     path: PathBuf,
     limits: StateStoreLimits,
@@ -98,7 +104,7 @@ struct SqliteStateStore {
     #[cfg(test)]
     test_hooks: txn::TestHooks,
     identity: StoreIdentity,
-    _owner_lock: File,
+    lifetime: Arc<SqliteInstanceLifetime>,
 }
 
 #[async_trait]
@@ -109,6 +115,27 @@ impl StateStore for SqliteStateStore {
 
     fn attempts(&self) -> &AttemptSupervisor {
         &self.attempts
+    }
+
+    async fn begin_original_read_in(
+        &self,
+        execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Result<
+        Box<dyn novarocks_state_store_api::OriginalReadTransaction>,
+        novarocks_state_store_api::StateStoreExecutionFailure,
+    > {
+        original::begin_read_in(self, execution).await
+    }
+    async fn begin_original_write_in(
+        &self,
+        attempt: WriteAttempt,
+        _purpose: &str,
+        execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Result<
+        Box<dyn novarocks_state_store_api::OriginalWriteTransaction>,
+        novarocks_state_store_api::StateStoreExecutionFailure,
+    > {
+        original::begin_write_in(self, attempt, execution).await
     }
 
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
@@ -209,11 +236,15 @@ fn open_blocking(
             )
         })?;
 
-    let evidence = Arc::new(SqliteCommitEvidence::new(connection));
+    let lifetime = Arc::new(SqliteInstanceLifetime {
+        _owner_lock: owner_lock,
+    });
+    let evidence = SqliteCommitEvidence::new(connection, Arc::clone(&lifetime));
     let attempts = AttemptSupervisor::new(
         outstanding_attempts,
         Arc::clone(&evidence) as Arc<dyn InDoubtAdjudicator>,
     );
+    evidence.initialize_original_scope(attempts.scope())?;
 
     Ok(SqliteStateStore {
         path,
@@ -224,7 +255,7 @@ fn open_blocking(
         #[cfg(test)]
         test_hooks: txn::new_test_hooks(),
         identity,
-        _owner_lock: owner_lock,
+        lifetime,
     })
 }
 

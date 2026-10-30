@@ -164,8 +164,285 @@ impl novarocks_failure_contract::FailureProjection for CatalogApplicationError {
     }
 }
 
+/// Durable local desired-state effects, distinct from external lake publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogMutationCommitted {
+    Created(crate::CatalogAttachmentVersioned),
+    Deleted(crate::CatalogAttachmentVersioned),
+}
+/// Stable domain receiving installed in the original Action before its F.
+/// This receipt grants no transaction, execution resource or deletion authority.
+#[derive(Default)]
+pub struct CatalogMutationReceipt {
+    state: std::sync::Mutex<CatalogMutationState>,
+}
+#[derive(Default)]
+struct CatalogMutationState {
+    input: Option<CatalogMutationInput>,
+    durable: Option<novarocks_state_store_api::CommitReceipt>,
+    confirmed: Option<CatalogMutationCommitted>,
+    observation: Option<novarocks_state_store_api::CommitObservation>,
+    commit_failure: Option<novarocks_failure_contract::SharedFailureCause>,
+}
+#[derive(Eq, PartialEq)]
+enum CatalogMutationInput {
+    Create(crate::CatalogAttachment),
+    Drop(crate::CatalogAttachmentVersioned),
+}
+impl CatalogMutationReceipt {
+    pub fn committed(&self) -> Option<CatalogMutationCommitted> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .confirmed
+            .clone()
+    }
+    /// Durable receipt precedes the fallible authoritative matching read.
+    pub fn durable_commit_receipt(&self) -> Option<novarocks_state_store_api::CommitReceipt> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .durable
+            .clone()
+    }
+    pub fn has_committed_effect(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.durable.is_some() || state.confirmed.is_some()
+    }
+    /// The same issued attempt may remain retained after its effect is known.
+    /// Presence is not, by itself, an Unknown business verdict or actual exit.
+    pub fn commit_observation(&self) -> Option<novarocks_state_store_api::CommitObservation> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .observation
+            .clone()
+    }
+    pub fn commit_failure(&self) -> Option<novarocks_failure_contract::SharedFailureCause> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .commit_failure
+            .clone()
+    }
+    pub fn requested_create(&self) -> Option<crate::CatalogAttachment> {
+        match &self.state.lock().unwrap_or_else(|p| p.into_inner()).input {
+            Some(CatalogMutationInput::Create(input)) => Some(input.clone()),
+            _ => None,
+        }
+    }
+    pub fn requested_drop(&self) -> Option<crate::CatalogAttachmentVersioned> {
+        match &self.state.lock().unwrap_or_else(|p| p.into_inner()).input {
+            Some(CatalogMutationInput::Drop(input)) => Some(input.clone()),
+            _ => None,
+        }
+    }
+    pub(crate) fn begin_create(
+        &self,
+        input: &crate::CatalogAttachment,
+    ) -> Result<(), CatalogApplicationError> {
+        self.bind_input(CatalogMutationInput::Create(input.clone()))
+    }
+    pub(crate) fn begin_drop(
+        &self,
+        input: &crate::CatalogAttachmentVersioned,
+    ) -> Result<(), CatalogApplicationError> {
+        self.bind_input(CatalogMutationInput::Drop(input.clone()))
+    }
+    fn bind_input(&self, input: CatalogMutationInput) -> Result<(), CatalogApplicationError> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.input.is_some() {
+            return Err(receiving_conflict(
+                "catalog mutation receiving is already bound",
+            ));
+        }
+        state.input = Some(input);
+        Ok(())
+    }
+    pub(crate) fn record_committed(
+        &self,
+        receipt: &novarocks_state_store_api::CommitReceipt,
+    ) -> Result<(), CatalogApplicationError> {
+        let receipt = receipt.clone();
+        let retired = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.input.is_none()
+                || state.durable.as_ref().is_some_and(|old| old != &receipt)
+                || state
+                    .observation
+                    .as_ref()
+                    .is_some_and(|old| old.id() != receipt.attempt)
+            {
+                return Err(receiving_conflict(
+                    "catalog durable receipt differs from its original input or attempt",
+                ));
+            }
+            if state.durable.is_none() {
+                state.durable = Some(receipt);
+            }
+            // A real terminal verdict releases this receiver's observation,
+            // while the original commit cause remains available diagnostically.
+            state.observation.take()
+        };
+        drop(retired);
+        Ok(())
+    }
+
+    pub(crate) fn record_unknown(
+        &self,
+        observation: &novarocks_state_store_api::CommitObservation,
+        failure: &novarocks_failure_contract::SharedFailureCause,
+    ) -> Result<(), CatalogApplicationError> {
+        let observation = observation.clone();
+        let failure = failure.clone();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.input.is_none()
+            || state.durable.is_some()
+            || state.confirmed.is_some()
+            || state
+                .observation
+                .as_ref()
+                .is_some_and(|old| old.id() != observation.id())
+        {
+            return Err(receiving_conflict(
+                "catalog uncertain receipt differs from its original attempt",
+            ));
+        }
+        if state.observation.is_none() {
+            state.observation = Some(observation);
+        }
+        if state.commit_failure.is_none() {
+            state.commit_failure = Some(failure);
+        }
+        Ok(())
+    }
+    pub(crate) fn record_not_committed(
+        &self,
+        observation: &novarocks_state_store_api::CommitObservation,
+    ) -> Result<(), CatalogApplicationError> {
+        if observation.publication_state().map_err(|error| {
+            CatalogApplicationError::from_domain(CatalogApplicationErrorKind::Internal, error)
+        })? != novarocks_state_store_api::CommitObservationState::Terminal(
+            novarocks_state_store_api::AttemptOutcome::NotCommitted,
+        ) {
+            return Err(receiving_conflict(
+                "catalog observation has no actual NotCommitted proof",
+            ));
+        }
+        let retired = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.durable.is_some()
+                || state.confirmed.is_some()
+                || !state
+                    .observation
+                    .as_ref()
+                    .is_some_and(|old| old.id() == observation.id())
+            {
+                return Err(receiving_conflict(
+                    "catalog uncommitted verdict differs from its original attempt",
+                ));
+            }
+            state.observation.take()
+        };
+        // Slot destruction may re-enter its original owner. The first commit
+        // cause stays diagnostic across proven-uncommitted replay attempts.
+        drop(retired);
+        Ok(())
+    }
+    pub(crate) fn confirm_created(
+        &self,
+        created: &crate::CatalogAttachmentVersioned,
+    ) -> Result<(), CatalogApplicationError> {
+        self.confirm(CatalogMutationCommitted::Created(created.clone()))
+    }
+    pub(crate) fn confirm_deleted(
+        &self,
+        expected: &crate::CatalogAttachmentVersioned,
+    ) -> Result<(), CatalogApplicationError> {
+        self.confirm(CatalogMutationCommitted::Deleted(expected.clone()))
+    }
+    fn confirm(&self, value: CatalogMutationCommitted) -> Result<(), CatalogApplicationError> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let matches = match (&state.input, &value) {
+            (
+                Some(CatalogMutationInput::Create(input)),
+                CatalogMutationCommitted::Created(created),
+            ) => input == &created.attachment,
+            (
+                Some(CatalogMutationInput::Drop(input)),
+                CatalogMutationCommitted::Deleted(deleted),
+            ) => input == deleted,
+            _ => false,
+        };
+        if !matches || state.confirmed.as_ref().is_some_and(|old| old != &value) {
+            return Err(receiving_conflict(
+                "catalog confirmed effect differs from its original input",
+            ));
+        }
+        if state.confirmed.is_none() {
+            state.confirmed = Some(value);
+        }
+        Ok(())
+    }
+}
+impl novarocks_state_store_runtime::StateStoreRunReceiving for CatalogMutationReceipt {
+    fn receive_attempt(
+        &self,
+        observation: &novarocks_state_store_api::CommitObservation,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        use novarocks_state_store_api::{AttemptOutcome, CommitObservationState};
+        let incoming = observation.clone();
+        let retired = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.input.is_none() || state.durable.is_some() || state.confirmed.is_some() {
+                return Err(novarocks_failure_contract::SharedFailureCause::new(
+                    receiving_conflict("catalog attempt receiving has no active original input"),
+                ));
+            }
+            if let Some(current) = state.observation.as_ref() {
+                if current.id() == incoming.id() {
+                    return Ok(());
+                }
+                let actual = current
+                    .publication_state()
+                    .map_err(novarocks_failure_contract::SharedFailureCause::new)?;
+                if actual != CommitObservationState::Terminal(AttemptOutcome::NotCommitted) {
+                    return Err(novarocks_failure_contract::SharedFailureCause::new(
+                        receiving_conflict(
+                            "catalog attempt receiving cannot replace an unsettled or committed attempt",
+                        ),
+                    ));
+                }
+            }
+            state.observation.replace(incoming)
+        };
+        // The old slot can release accounting and re-enter its provider owner.
+        drop(retired);
+        Ok(())
+    }
+    fn retire_not_committed(
+        &self,
+        observation: &novarocks_state_store_api::CommitObservation,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        self.record_not_committed(observation)
+            .map_err(novarocks_failure_contract::SharedFailureCause::new)
+    }
+}
+
+fn receiving_conflict(message: &'static str) -> CatalogApplicationError {
+    CatalogApplicationError::new(CatalogApplicationErrorKind::Conflict, message)
+}
+
 /// The Catalog application's command and admission dependency.
 pub trait CatalogApplicationPort: Send + Sync {
+    /// Pure source-mode admission. Presence of a Store is not mutation policy.
+    fn require_catalog_mutation_admission(&self) -> Result<(), CatalogApplicationError> {
+        Err(CatalogApplicationError::new(
+            CatalogApplicationErrorKind::Unavailable,
+            "catalog mutation admission is unavailable",
+        ))
+    }
+
     /// Observation only. Implementations without this capability must report
     /// unsupported rather than inventing an empty, healthy catalog set.
     fn catalog_activity_sources(
@@ -183,6 +460,37 @@ pub trait CatalogApplicationPort: Send + Sync {
     ) -> Result<CatalogRuntimeObservation, CatalogApplicationError>;
 
     fn drop_catalog(&self, command: CatalogDropCommand) -> Result<(), CatalogApplicationError>;
+
+    /// Execute through the caller's installed original StateStore receiver.
+    /// Missing support is an explicit refusal, never legacy blocking I/O.
+    fn create_catalog_in<'a>(
+        &'a self,
+        _command: CatalogCreateCommand,
+        _execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+        _receipt: &'a CatalogMutationReceipt,
+    ) -> futures::future::BoxFuture<'a, Result<CatalogRuntimeObservation, CatalogApplicationError>>
+    {
+        Box::pin(async {
+            Err(CatalogApplicationError::from_domain(
+                CatalogApplicationErrorKind::Unavailable,
+                novarocks_state_store_api::StateStoreOriginalUnsupported,
+            ))
+        })
+    }
+
+    fn drop_catalog_in<'a>(
+        &'a self,
+        _command: CatalogDropCommand,
+        _execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+        _receipt: &'a CatalogMutationReceipt,
+    ) -> futures::future::BoxFuture<'a, Result<(), CatalogApplicationError>> {
+        Box::pin(async {
+            Err(CatalogApplicationError::from_domain(
+                CatalogApplicationErrorKind::Unavailable,
+                novarocks_state_store_api::StateStoreOriginalUnsupported,
+            ))
+        })
+    }
 
     fn admit_catalog(&self, instance_id: &ConnectorInstanceId) -> CatalogAdmission;
 }

@@ -19,13 +19,11 @@
 
 pub mod add_files;
 pub(crate) mod attempt;
-pub mod ctas;
 mod delete;
 pub mod error;
 pub mod insert;
 pub mod mutation;
 pub(crate) mod observability;
-pub mod runner;
 pub mod service;
 pub mod truncate;
 

@@ -609,12 +609,12 @@ where
         }) => {
             // The admission position follows the IO: it is returned only after
             // the socket and its TLS state have been destroyed.
-            let stream = novarocks_native_trust::OwnedNativeIo::with_guard(stream, connection);
+            let stream = novarocks_transport_io::OwnedIo::with_guard(stream, connection);
             (stream, Some(head))
         }
         // Only private generic listener tests omit admission. Production
         // composition requires role-matched admission before listener startup.
-        None => (novarocks_native_trust::OwnedNativeIo::new(stream), None),
+        None => (novarocks_transport_io::OwnedIo::new(stream), None),
     };
     let mut builder = http2::Builder::new(TokioExecutor::new());
     configure_native_server(&mut builder);

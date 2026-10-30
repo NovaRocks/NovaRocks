@@ -1405,3 +1405,76 @@ fn planned_arithmetic_preserves_single_output_and_minimum_value_units() {
     let empty = ValueBuilder::<Global>::planned_layouts(ByteLayout::Utf8View, 0, 0, 0).unwrap();
     assert!(empty.is_empty());
 }
+
+#[test]
+fn view_table_structure_refusal_precedes_publication_and_keeps_original_sources() {
+    use crate::control::ValueStructure;
+    for layout in [ByteLayout::Utf8View, ByteLayout::BinaryView] {
+        for count in [0, 1, 64] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let sources = (0..count)
+                .map(|_| tracked_buffer(b"independent long shared region", drops.clone()))
+                .collect::<Vec<_>>();
+            let mut builder = ValueBuilder::new(layout);
+            for source in &sources {
+                let mut row = builder.begin_row();
+                if layout.is_utf8() {
+                    row.write_string_region(
+                        source,
+                        0..source.len(),
+                        std::str::from_utf8(source.as_slice()).unwrap(),
+                        &mut crate::control::global_growth,
+                        &mut crate::control::uncontrolled,
+                    )
+                    .unwrap();
+                } else {
+                    row.write_binary_region(
+                        source,
+                        0..source.len(),
+                        &mut crate::control::global_growth,
+                        &mut crate::control::uncontrolled,
+                    )
+                    .unwrap();
+                }
+                row.commit(
+                    &mut crate::control::global_growth,
+                    &mut crate::control::uncontrolled,
+                )
+                .unwrap();
+            }
+            let expected = novarocks_type_contract::owned_resources::layout::arc_layout(
+                Layout::array::<Buffer>(count).unwrap(),
+            )
+            .unwrap();
+            let cause = Arc::new(71);
+            let mut byte_arrays = 0;
+            let mut shared_tables = 0;
+            let result = builder.finish_structured_observed(
+                &mut |_| -> Result<(), Arc<i32>> { panic!("growth after table refusal") },
+                &mut |_| -> Result<(), Arc<i32>> { panic!("work after table refusal") },
+                &mut |event| match event {
+                    ValueStructure::ByteArray { .. } => {
+                        byte_arrays += 1;
+                        Ok(())
+                    }
+                    ValueStructure::SharedOwner(actual) => {
+                        shared_tables += 1;
+                        assert_eq!(actual, expected);
+                        Err(cause.clone())
+                    }
+                },
+            );
+            let Err(ValueFailure::Caller(actual)) = result else {
+                panic!("original shared-table observer refusal")
+            };
+            assert!(Arc::ptr_eq(&actual, &cause));
+            assert_eq!((byte_arrays, shared_tables), (1, 1));
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            for source in &sources {
+                assert_eq!(source.as_slice(), b"independent long shared region");
+            }
+            drop(sources);
+            assert_eq!(drops.load(Ordering::SeqCst), count);
+        }
+    }
+}

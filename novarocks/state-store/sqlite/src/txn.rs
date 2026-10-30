@@ -109,7 +109,11 @@ impl TestGate {
 
 #[cfg(test)]
 impl TestHookState {
-    fn pause_commit_before_apply(&self) {
+    pub(super) fn inject_commit_after_apply_panic(&self) {
+        self.panic_next_commit_after_apply
+            .store(true, Ordering::Release);
+    }
+    pub(super) fn pause_commit_before_apply(&self) {
         if let Some(gate) = self
             .commit_before_apply
             .lock()
@@ -120,7 +124,7 @@ impl TestHookState {
         }
     }
 
-    fn panic_commit_before_apply(&self) {
+    pub(super) fn panic_commit_before_apply(&self) {
         if self
             .panic_next_commit_before_apply
             .swap(false, Ordering::AcqRel)
@@ -129,7 +133,7 @@ impl TestHookState {
         }
     }
 
-    fn panic_commit_after_apply(&self) {
+    pub(super) fn panic_commit_after_apply(&self) {
         if self
             .panic_next_commit_after_apply
             .swap(false, Ordering::AcqRel)
@@ -173,6 +177,7 @@ pub(super) enum Mutation {
 
 pub(super) struct SqliteTxnState {
     pub(super) connection: Connection,
+    _lifetime: Arc<super::SqliteInstanceLifetime>,
     pub(super) overlay: BTreeMap<Key, Mutation>,
     mutations: Vec<(Key, Mutation)>,
     operation_count: usize,
@@ -185,7 +190,7 @@ pub(super) struct SqliteTxnState {
     pub(super) snapshot_established: bool,
     #[cfg(test)]
     test_hooks: TestHooks,
-    active: bool,
+    pub(super) active: bool,
 }
 
 #[derive(Clone)]
@@ -220,6 +225,7 @@ impl SqliteStateStore {
         let result = begin_transaction(
             self.path.clone(),
             self.limits.clone(),
+            Arc::clone(&self.lifetime),
             Arc::clone(&self.metrics),
             #[cfg(test)]
             Arc::clone(&self.test_hooks),
@@ -242,6 +248,7 @@ impl SqliteStateStore {
                 begin_transaction(
                     self.path.clone(),
                     self.limits.clone(),
+                    Arc::clone(&self.lifetime),
                     Arc::clone(&self.metrics),
                     #[cfg(test)]
                     Arc::clone(&self.test_hooks),
@@ -648,6 +655,7 @@ impl Drop for SqliteWriteTransaction {
 async fn begin_transaction(
     path: PathBuf,
     limits: StateStoreLimits,
+    lifetime: Arc<super::SqliteInstanceLifetime>,
     metrics: Arc<StateStoreMetrics>,
     #[cfg(test)] test_hooks: TestHooks,
 ) -> Result<TxnOwner, StateStoreError> {
@@ -659,43 +667,16 @@ async fn begin_transaction(
     let mut cancel_guard =
         BeginCancelOnDrop::new(Arc::clone(&cancelled), Arc::clone(&interrupt_slot));
     let mut worker = tokio::task::spawn_blocking(move || {
-        let connection = open_connection(&path)?;
-        let interrupt_handle = Arc::new(connection.get_interrupt_handle());
-        *worker_interrupt_slot.lock().map_err(|_| internal_error())? =
-            Some(Arc::clone(&interrupt_handle));
-        if worker_cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
-            return Err(deadline_error());
-        }
-        connection
-            .busy_timeout(remaining(deadline))
-            .map_err(|error| operation_error(&error, "failed to configure SQLite transaction"))?;
-        connection
-            .execute_batch("BEGIN DEFERRED")
-            .map_err(|error| {
-                operation_error(&error, "failed to begin SQLite deferred transaction")
-            })?;
-        if worker_cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
-            connection.execute_batch("ROLLBACK").map_err(|error| {
-                operation_error(&error, "failed to roll back timed out SQLite begin")
-            })?;
-            return Err(deadline_error());
-        }
-        Ok::<_, StateStoreError>(SqliteTxnState {
-            connection,
-            overlay: BTreeMap::new(),
-            mutations: Vec::new(),
-            operation_count: 0,
-            accounted_bytes: TRANSACTION_ENVELOPE_BYTES,
+        begin_transaction_blocking(
+            path,
             limits,
             deadline,
-            cancelled: worker_cancelled,
-            range_frozen: false,
-            interrupt_handle,
-            snapshot_established: false,
+            worker_cancelled,
+            worker_interrupt_slot,
+            lifetime,
             #[cfg(test)]
             test_hooks,
-            active: true,
-        })
+        )
     });
     let state = match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut worker)
         .await
@@ -727,6 +708,52 @@ async fn begin_transaction(
         cancelled,
         interrupt_handle,
         metrics,
+    })
+}
+
+pub(super) fn begin_transaction_blocking(
+    path: PathBuf,
+    limits: StateStoreLimits,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+    interrupt_slot: Arc<Mutex<Option<Arc<InterruptHandle>>>>,
+    lifetime: Arc<super::SqliteInstanceLifetime>,
+    #[cfg(test)] test_hooks: TestHooks,
+) -> Result<SqliteTxnState, StateStoreError> {
+    let connection = open_connection(&path)?;
+    let interrupt_handle = Arc::new(connection.get_interrupt_handle());
+    *interrupt_slot.lock().map_err(|_| internal_error())? = Some(Arc::clone(&interrupt_handle));
+    if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+        return Err(deadline_error());
+    }
+    connection
+        .busy_timeout(remaining(deadline))
+        .map_err(|error| operation_error(&error, "failed to configure SQLite transaction"))?;
+    connection
+        .execute_batch("BEGIN DEFERRED")
+        .map_err(|error| operation_error(&error, "failed to begin SQLite deferred transaction"))?;
+    if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+        connection.execute_batch("ROLLBACK").map_err(|error| {
+            operation_error(&error, "failed to roll back timed out SQLite begin")
+        })?;
+        return Err(deadline_error());
+    }
+    Ok::<_, StateStoreError>(SqliteTxnState {
+        connection,
+        overlay: BTreeMap::new(),
+        mutations: Vec::new(),
+        operation_count: 0,
+        accounted_bytes: TRANSACTION_ENVELOPE_BYTES,
+        limits,
+        deadline,
+        cancelled,
+        range_frozen: false,
+        interrupt_handle,
+        snapshot_established: false,
+        #[cfg(test)]
+        test_hooks,
+        active: true,
+        _lifetime: lifetime,
     })
 }
 
@@ -786,26 +813,30 @@ impl Drop for BeginCancelOnDrop {
 
 async fn get(owner: &TxnOwner, key: Key) -> Result<Option<StateRecord>, StateStoreError> {
     let owner = owner.clone();
-    run_operation(&owner, move |state| {
-        if let Some(mutation) = state.overlay.get(&key).cloned() {
-            return match mutation {
-                Mutation::Delete { .. } => Ok(None),
-                Mutation::Put {
-                    value,
-                    provisional_version,
-                    ..
-                } => Ok(Some(StateRecord {
-                    key,
-                    value,
-                    version: provisional_version,
-                })),
-            };
-        }
-        let record = load_record(&state.connection, &key)?;
-        state.snapshot_established = true;
-        Ok(record)
-    })
-    .await
+    run_operation(&owner, move |state| get_blocking(state, key)).await
+}
+
+pub(super) fn get_blocking(
+    state: &mut SqliteTxnState,
+    key: Key,
+) -> Result<Option<StateRecord>, StateStoreError> {
+    if let Some(mutation) = state.overlay.get(&key).cloned() {
+        return match mutation {
+            Mutation::Delete { .. } => Ok(None),
+            Mutation::Put {
+                value,
+                provisional_version,
+                ..
+            } => Ok(Some(StateRecord {
+                key,
+                value,
+                version: provisional_version,
+            })),
+        };
+    }
+    let record = load_record(&state.connection, &key)?;
+    state.snapshot_established = true;
+    Ok(record)
 }
 
 async fn run_operation<T, F>(owner: &TxnOwner, operation: F) -> Result<T, StateStoreError>
@@ -815,36 +846,11 @@ where
 {
     let state = Arc::clone(&owner.state);
     let timeout_state = Arc::clone(&owner.state);
-    let cancelled = Arc::clone(&owner.cancelled);
     let deadline = owner.deadline;
     let mut cancel_guard = CancelOnDrop::new(owner);
     let mut worker = tokio::task::spawn_blocking(move || {
         let mut state = state.lock().map_err(|_| internal_error())?;
-        #[cfg(test)]
-        if state
-            .test_hooks
-            .fail_next_operation_worker
-            .swap(false, Ordering::AcqRel)
-        {
-            panic!("injected SQLite operation worker failure");
-        }
-        if !state.active {
-            return Err(transaction_finished());
-        }
-        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
-            rollback(&mut state)?;
-            return Err(deadline_error());
-        }
-        state
-            .connection
-            .busy_timeout(remaining(deadline))
-            .map_err(|error| operation_error(&error, "failed to configure SQLite transaction"))?;
-        let result = operation(&mut state);
-        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
-            rollback(&mut state)?;
-            return Err(deadline_error());
-        }
-        result
+        run_operation_blocking(&mut state, operation)
     });
 
     let result = match tokio::time::timeout_at(
@@ -870,6 +876,40 @@ where
         }
     };
     cancel_guard.disarm();
+    result
+}
+
+pub(super) fn run_operation_blocking<T, F>(
+    state: &mut SqliteTxnState,
+    operation: F,
+) -> Result<T, StateStoreError>
+where
+    F: FnOnce(&mut SqliteTxnState) -> Result<T, StateStoreError>,
+{
+    #[cfg(test)]
+    if state
+        .test_hooks
+        .fail_next_operation_worker
+        .swap(false, Ordering::AcqRel)
+    {
+        panic!("injected SQLite operation worker failure");
+    }
+    if !state.active {
+        return Err(transaction_finished());
+    }
+    if state.cancelled.load(Ordering::Acquire) || Instant::now() >= state.deadline {
+        rollback(state)?;
+        return Err(deadline_error());
+    }
+    state
+        .connection
+        .busy_timeout(remaining(state.deadline))
+        .map_err(|error| operation_error(&error, "failed to configure SQLite transaction"))?;
+    let result = operation(state);
+    if state.cancelled.load(Ordering::Acquire) || Instant::now() >= state.deadline {
+        rollback(state)?;
+        return Err(deadline_error());
+    }
     result
 }
 
@@ -918,7 +958,7 @@ fn schedule_rollback(owner: TxnOwner) {
     }
 }
 
-fn validate_key_value(
+pub(super) fn validate_key_value(
     key: &Key,
     value: Option<&Value>,
     limits: &StateStoreLimits,
@@ -932,7 +972,9 @@ fn validate_key_value(
     Ok(())
 }
 
-fn validate_transaction_envelope(limits: &StateStoreLimits) -> Result<(), StateStoreError> {
+pub(super) fn validate_transaction_envelope(
+    limits: &StateStoreLimits,
+) -> Result<(), StateStoreError> {
     let accounted_bytes = checked_accounting_add(0, TRANSACTION_ENVELOPE_BYTES)?;
     if accounted_bytes > limits.max_transaction_bytes {
         return Err(limit_error("transaction byte limit exceeded"));
@@ -940,7 +982,7 @@ fn validate_transaction_envelope(limits: &StateStoreLimits) -> Result<(), StateS
     Ok(())
 }
 
-fn validate_range_request(
+pub(super) fn validate_range_request(
     request: &RangeRequest,
     limits: &StateStoreLimits,
 ) -> Result<(), StateStoreError> {
@@ -954,7 +996,7 @@ fn validate_range_request(
     Ok(())
 }
 
-fn stage_mutation(
+pub(super) fn stage_mutation(
     state: &mut SqliteTxnState,
     key: Key,
     mutation: Mutation,
@@ -982,7 +1024,7 @@ fn stage_mutation(
     Ok(())
 }
 
-fn next_operation_count(state: &SqliteTxnState) -> Result<usize, StateStoreError> {
+pub(super) fn next_operation_count(state: &SqliteTxnState) -> Result<usize, StateStoreError> {
     let next_operations = state
         .operation_count
         .checked_add(1)
@@ -1029,7 +1071,7 @@ fn precondition_bytes(precondition: &Precondition) -> usize {
     }
 }
 
-fn record_result<T>(
+pub(super) fn record_result<T>(
     metrics: &StateStoreMetrics,
     operation: StateStoreOperation,
     started: Instant,
@@ -1046,7 +1088,7 @@ fn record_result<T>(
     );
 }
 
-fn record_read_result(
+pub(super) fn record_read_result(
     metrics: &StateStoreMetrics,
     operation: StateStoreOperation,
     started: Instant,
@@ -1064,7 +1106,7 @@ fn record_read_result(
     }
 }
 
-fn record_range_result(
+pub(super) fn record_range_result(
     metrics: &StateStoreMetrics,
     started: Instant,
     result: &Result<RangePage, StateStoreError>,
@@ -1082,7 +1124,7 @@ fn record_range_result(
     }
 }
 
-fn record_write_result(
+pub(super) fn record_write_result(
     metrics: &StateStoreMetrics,
     operation: StateStoreOperation,
     started: Instant,
@@ -1094,7 +1136,7 @@ fn record_write_result(
     }
 }
 
-fn commit_metric_outcome(outcome: &CommitOutcome) -> StateStoreOutcome {
+pub(super) fn commit_metric_outcome(outcome: &CommitOutcome) -> StateStoreOutcome {
     match outcome {
         CommitOutcome::Committed(_) => StateStoreOutcome::Success,
         CommitOutcome::Conflict(_) => StateStoreOutcome::Conflict,
@@ -1104,7 +1146,7 @@ fn commit_metric_outcome(outcome: &CommitOutcome) -> StateStoreOutcome {
     }
 }
 
-fn commit_blocking(
+pub(super) fn commit_blocking(
     state: &mut SqliteTxnState,
     attempt: AttemptId,
     evidence: &SqliteCommitEvidence,
@@ -1417,7 +1459,7 @@ fn classify_commit_error(
     }
 }
 
-fn rollback(state: &mut SqliteTxnState) -> Result<(), StateStoreError> {
+pub(super) fn rollback(state: &mut SqliteTxnState) -> Result<(), StateStoreError> {
     if !state.active {
         return Ok(());
     }
@@ -1532,28 +1574,28 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
-const fn transaction_finished() -> StateStoreError {
+pub(super) const fn transaction_finished() -> StateStoreError {
     StateStoreError::new(
         StateStoreErrorKind::Cancelled,
         "SQLite transaction is no longer active",
     )
 }
 
-const fn deadline_error() -> StateStoreError {
+pub(super) const fn deadline_error() -> StateStoreError {
     StateStoreError::new(
         StateStoreErrorKind::DeadlineExceeded,
         "SQLite transaction deadline exceeded",
     )
 }
 
-const fn worker_error() -> StateStoreError {
+pub(super) const fn worker_error() -> StateStoreError {
     StateStoreError::new(
         StateStoreErrorKind::Internal,
         "SQLite transaction blocking worker failed",
     )
 }
 
-const fn internal_error() -> StateStoreError {
+pub(super) const fn internal_error() -> StateStoreError {
     StateStoreError::new(
         StateStoreErrorKind::Internal,
         "SQLite transaction state is unavailable",

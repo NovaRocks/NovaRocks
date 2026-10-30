@@ -21,15 +21,9 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-use crate::mv::domain::application::{MvRefreshRequest, MvShowStatement};
+use crate::mv::domain::application::MvRefreshRequest;
 use crate::mv::domain::refresh::planning::RefreshPlanContract;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
-
-#[derive(Clone, Debug)]
-pub struct ListMvsRequest {
-    pub stmt: MvShowStatement,
-    pub current_catalog: Option<String>,
-}
 
 #[derive(Clone, Debug)]
 #[allow(
@@ -144,14 +138,6 @@ pub struct MvListRow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshErrorKind {
     UserError,
-    PreCommitFailed,
-}
-
-#[cfg(test)]
-impl RefreshErrorKind {
-    pub fn should_rollback_after_commit(self) -> bool {
-        matches!(self, Self::UserError | Self::PreCommitFailed)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,15 +162,6 @@ impl RefreshError {
         self.compile_control.clone()
     }
 
-    pub fn compile_interruption(cause: novarocks_type_contract::CompileControlError) -> Self {
-        Self {
-            kind: RefreshErrorKind::UserError,
-            message: cause.to_string(),
-            compile_control: Some(cause),
-            unavailable_implementation: None,
-        }
-    }
-
     pub fn unavailable_implementation(
         &self,
     ) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
@@ -193,10 +170,6 @@ impl RefreshError {
 
     pub fn user(message: impl Into<String>) -> Self {
         Self::new(RefreshErrorKind::UserError, message)
-    }
-
-    pub fn pre_commit(message: impl Into<String>) -> Self {
-        Self::new(RefreshErrorKind::PreCommitFailed, message)
     }
 }
 
@@ -251,9 +224,9 @@ mod tests {
 
     #[test]
     fn refresh_error_formats_message_with_kind() {
-        let error = RefreshError::new(RefreshErrorKind::PreCommitFailed, "refresh planning failed");
+        let error = RefreshError::user("refresh planning failed");
 
-        assert_eq!(error.kind, RefreshErrorKind::PreCommitFailed);
+        assert_eq!(error.kind, RefreshErrorKind::UserError);
         assert_eq!(error.to_string(), "refresh planning failed");
     }
 

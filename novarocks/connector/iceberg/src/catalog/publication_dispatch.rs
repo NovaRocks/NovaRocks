@@ -106,18 +106,142 @@ impl EvidenceContext {
         novarocks_spi::connector::ConnectorRequestContext,
         novarocks_spi::connector::ConnectorError,
     > {
+        use crate::catalog::publication::EvidencePhase;
         use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
-        let mut request = ConnectorRequestContext::try_new(
-            self.deadline(),
-            ConnectorStopOwner::new().view(),
-            original.max_handle_payload_bytes(),
-            original.max_total_payload_bytes(),
-        )?
-        .with_initiation(original.initiation())
-        .after_external_effect();
-        if let Some(resolver) = original.storage_resolver() {
-            request = request.with_storage_resolver(std::sync::Arc::clone(resolver));
+        let inherited = original.necessary_finalization_deadline_cap();
+        let deadline = match self.phase() {
+            EvidencePhase::Reclamation => self.deadline(),
+            EvidencePhase::Evidence | EvidencePhase::Finalization => {
+                inherited.map_or(self.deadline(), |cap| cap.min(self.deadline()))
+            }
+        };
+        let stop = if inherited.is_some() && self.phase() != EvidencePhase::Reclamation {
+            // This is the necessary phase's own control, not the statement's
+            // business stop. A nested publication must not replace it.
+            original.stop().clone()
+        } else {
+            ConnectorStopOwner::new().view()
+        };
+        let mut request = if original.io_admission().is_some() {
+            original
+                .for_existing_obligation(deadline, stop)
+                .after_external_effect()
+        } else {
+            // Keep the original no-MIO capability boundary: do not copy an
+            // attempt source, credential collector or request-scope extension.
+            let mut request = ConnectorRequestContext::try_new(
+                deadline,
+                stop,
+                original.max_handle_payload_bytes(),
+                original.max_total_payload_bytes(),
+            )?
+            .with_initiation(original.initiation())
+            .after_external_effect();
+            if let Some(resolver) = original.storage_resolver() {
+                request = request.with_storage_resolver(std::sync::Arc::clone(resolver));
+            }
+            request
+        };
+        // Cleanup keeps its independent deadline, but cannot erase a parent
+        // restriction and thereby turn a later publication into fresh authority.
+        if let Some(cap) = inherited {
+            request = request.with_necessary_finalization_deadline_cap(cap);
+        }
+        if self.phase() == EvidencePhase::Finalization {
+            request = request.with_necessary_finalization_deadline_cap(deadline);
         }
         Ok(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::catalog::publication::CatalogEvidencePolicy;
+    use novarocks_spi::connector::read_stack::ConnectorSourceOperations;
+    use novarocks_spi::connector::{
+        ConnectorErrorKind, ConnectorOperationControl, ConnectorRangeScope,
+        ConnectorRequestContext, ConnectorStopOwner,
+    };
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    struct OriginalCredentialSink;
+    impl novarocks_spi::connector::ConnectorVendedCredentialLeaseSink for OriginalCredentialSink {
+        fn offer_vended_s3_credential_lease(
+            &self,
+            _: &novarocks_spi::connector::CatalogProperties,
+            _: novarocks_spi::connector::VendedS3CredentialLeaseContribution,
+        ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+            panic!("phase projection must not offer credentials");
+        }
+    }
+
+    #[test]
+    fn necessary_control_is_inherited_without_reauthorizing_no_mio_capabilities() {
+        let business_stop = ConnectorStopOwner::new();
+        let original = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            business_stop.view(),
+            64,
+            128,
+        )
+        .unwrap()
+        .with_vended_credential_lease_sink(Arc::new(OriginalCredentialSink))
+        .with_execution_source(
+            ConnectorRangeScope::try_new(1, 2, 3, 4, 5, 6).unwrap(),
+            ConnectorSourceOperations::new(),
+        );
+        let marker = original.request_scope_extension_or_insert_with(|| 42_u64);
+        let policy = CatalogEvidencePolicy::default();
+        let grant = policy.begin_finalization().unwrap();
+        let necessary = grant.for_io(&original).unwrap();
+        business_stop.request_stop();
+        assert!(necessary.check_active().is_ok());
+        assert!(necessary.deadline() > original.deadline());
+        assert_eq!(
+            necessary.necessary_finalization_deadline_cap(),
+            Some(grant.deadline())
+        );
+        assert!(necessary.range_scope().is_none());
+        assert!(necessary.source_operations().is_none());
+        assert!(necessary.vended_credential_lease_sink().is_none());
+        assert!(!Arc::ptr_eq(
+            &marker,
+            &necessary.request_scope_extension_or_insert_with(|| 42_u64),
+        ));
+        assert_eq!(necessary.max_handle_payload_bytes(), 64);
+        assert_eq!(necessary.max_total_payload_bytes(), 128);
+
+        // The original phase may carry a host-owned stop. Only this stop,
+        // never the already-cancelled business stop, survives nesting.
+        let phase_stop = ConnectorStopOwner::new();
+        let necessary = necessary.with_additional_stop(phase_stop.view());
+        let nested = policy.begin_evidence(&necessary).unwrap();
+        assert_eq!(nested.deadline(), grant.deadline());
+        let nested_io = nested.for_io(&necessary).unwrap();
+        let final_io = policy
+            .begin_finalization()
+            .unwrap()
+            .for_io(&necessary)
+            .unwrap();
+        let cleanup = policy
+            .begin_reclamation()
+            .unwrap()
+            .for_io(&necessary)
+            .unwrap();
+        phase_stop.request_stop();
+        for context in [&nested_io, &final_io] {
+            assert_eq!(context.deadline(), grant.deadline());
+            assert_eq!(
+                context.check_active().unwrap_err().kind(),
+                ConnectorErrorKind::Cancelled
+            );
+        }
+        assert!(cleanup.deadline() > grant.deadline());
+        assert!(cleanup.check_active().is_ok());
+        assert_eq!(
+            cleanup.necessary_finalization_deadline_cap(),
+            Some(grant.deadline())
+        );
     }
 }

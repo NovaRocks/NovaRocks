@@ -36,11 +36,14 @@ mod dependency_artifact_storage;
 pub mod distributed_rewrite;
 pub mod dml;
 pub mod fragment_scheduling;
+pub(crate) mod internal_consumer;
 pub(crate) mod internal_result_cpu;
 pub mod kernels;
 pub(crate) mod lifecycle_diagnostics;
 pub mod lifecycle_plan;
-pub(crate) mod logical_read;
+pub(crate) mod logical_execution;
+#[cfg(test)]
+pub(crate) mod logical_execution_test_profile;
 pub mod maintenance;
 pub mod mv_assembly;
 pub mod mv_native_write;
@@ -63,14 +66,11 @@ pub(crate) mod rewrite_group_read;
 pub(crate) mod row_mutation;
 pub(crate) mod runtime_filter_terminal_rollup;
 pub(crate) mod schedule;
-pub mod service;
 pub(crate) mod split_assignment;
 pub(crate) mod split_assignment_round;
 pub mod statistics;
-pub(crate) mod write_barrier;
 pub(crate) mod write_result;
 pub(crate) mod write_session;
-pub(crate) mod write_transaction;
 
 pub mod compiler;
 #[cfg(test)]

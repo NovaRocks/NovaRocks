@@ -28,3 +28,5 @@ shared across worktrees by default; each Codex setup runs
 `docker/iceberg-rest/up.sh --prepare-only`, which only generates this
 worktree's runtime entry, NovaRocks server port, and config files. It does not
 start Docker. See that README for usage, ports, and CI integration details.
+
+Linux 新开发节点的显式安装入口见 [Linux 环境准备](../../tools/dev/README.md)。它可联网安装和 provision；Codex 自动 setup 的 `--prepare-only` 仍只生成离线 unbound 入口。

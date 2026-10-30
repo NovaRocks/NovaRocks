@@ -37,6 +37,100 @@ pub(crate) struct RetentionPlan {
     pub removed_statistics_paths: BTreeSet<String>,
 }
 impl RetentionPlan {
+    /// Upper bound for the first-party retention decision's actual flat owned
+    /// copies and collection replacements, before compute()/journal clone.
+    /// This does not claim ownership or measurement of the borrowed SDK table.
+    pub(crate) fn owned_decision_bytes(metadata: &TableMetadata) -> Result<u64> {
+        fn add(total: &mut usize, bytes: usize) -> Result<()> {
+            *total = total
+                .checked_add(bytes)
+                .ok_or_else(|| invalid("retention backing overflow"))?;
+            Ok(())
+        }
+        fn tree<K, V>(n: usize) -> Result<usize> {
+            // Original ordered containers: worst sparse nodes plus a full
+            // replacement. Eleven K/V slots and twelve child pointers per node.
+            let node = 11usize
+                .checked_mul(std::mem::size_of::<K>() + std::mem::size_of::<V>())
+                .and_then(|v| v.checked_add(16 + 12 * std::mem::size_of::<usize>()))
+                .ok_or_else(|| invalid("retention tree overflow"))?;
+            n.checked_mul(2)
+                .and_then(|n| n.checked_add(2))
+                .and_then(|n| n.checked_mul(node))
+                .ok_or_else(|| invalid("retention tree overflow"))
+        }
+        let n = metadata.snapshots().len();
+        let refs = metadata.refs().len();
+        let mut total = std::mem::size_of::<Self>();
+        add(
+            &mut total,
+            tree::<i64, ()>(n)?
+                .checked_mul(4)
+                .ok_or_else(|| invalid("retention scratch overflow"))?,
+        )?;
+        add(&mut total, tree::<String, ()>(refs)?)?;
+        add(
+            &mut total,
+            refs.checked_mul(
+                2 * std::mem::size_of::<TableRequirement>()
+                    + 2 * std::mem::size_of::<TableUpdate>()
+                    + 2 * std::mem::size_of::<(i64, usize, i64)>(),
+            )
+            .ok_or_else(|| invalid("retention ref overflow"))?,
+        )?;
+        for name in metadata.refs().keys() {
+            add(
+                &mut total,
+                name.len()
+                    .checked_mul(4)
+                    .ok_or_else(|| invalid("retention ref overflow"))?,
+            )?;
+        }
+        for snapshot in metadata.snapshots() {
+            add(&mut total, 2 * std::mem::size_of::<Snapshot>())?;
+            add(&mut total, snapshot.manifest_list().len())?;
+            if let Some(key) = snapshot.encryption_key_id() {
+                add(&mut total, key.len())?;
+            }
+            let properties = &snapshot.summary().additional_properties;
+            add(&mut total, tree::<String, String>(properties.capacity())?)?;
+            for (key, value) in properties {
+                add(&mut total, key.len())?;
+                add(&mut total, value.len())?;
+            }
+            add(
+                &mut total,
+                2 * std::mem::size_of::<TableUpdate>() + 2 * std::mem::size_of::<i64>(),
+            )?;
+            for path in [
+                metadata
+                    .statistics_for_snapshot(snapshot.snapshot_id())
+                    .map(|s| s.statistics_path.as_str()),
+                metadata
+                    .partition_statistics_for_snapshot(snapshot.snapshot_id())
+                    .map(|s| s.statistics_path.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                add(&mut total, tree::<String, u64>(1)?)?;
+                add(
+                    &mut total,
+                    path.len()
+                        .checked_mul(4)
+                        .ok_or_else(|| invalid("retention statistics overflow"))?,
+                )?;
+            }
+        }
+        // The current decision, its original journal clone and updates tail
+        // coexist. Retried journal entries are accumulated by their caller.
+        u64::try_from(
+            total
+                .checked_mul(3)
+                .ok_or_else(|| invalid("retention copies overflow"))?,
+        )
+        .map_err(|_| invalid("retention backing overflow"))
+    }
     pub(crate) fn compute(
         metadata: &TableMetadata,
         evaluation_time_ms: i64,

@@ -15,224 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard, OnceLock};
-
-use novarocks_spi::connector::{
-    ConnectorControlResolver, ConnectorExactSemanticRevision, ConnectorReadSelector,
-    ConnectorRequestContext, ConnectorTableResolution,
-};
+use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_types::naming::TableIdentity;
 
-/// Ask the provider that owns the frozen table generation to validate and
-/// interpret a durable revision. Application code never decodes its payload.
-pub(crate) fn snapshot_from_exact_revision_with_ports(
-    connector_control: &dyn ConnectorControlResolver,
-    table_ref: &TableIdentity,
-    revision: &ConnectorExactSemanticRevision,
-    connector_context: &ConnectorRequestContext,
-) -> Result<i64, String> {
-    let lease =
-        crate::connector::acquire_metadata_planning_lease(connector_control, &table_ref.catalog)?;
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &lease,
-        connector_context.clone(),
-        &table_ref.namespace,
-        &table_ref.table,
-        ConnectorTableResolution::StrictBaseTable,
-    )?;
-    match lease
-        .binding()
-        .metadata()
-        .read_selector_from_exact_revision(&metadata.table, revision)
-        .map_err(|error| format!("admit exact revision for {}: {error}", table_ref.fqn()))?
-    {
-        ConnectorReadSelector::SnapshotId(snapshot_id) => Ok(snapshot_id),
-        _ => Err(format!(
-            "provider returned a non-snapshot MV read selector for {}",
-            table_ref.fqn()
-        )),
-    }
-}
-
-/// Freeze the narrow base-table facts used by one MV refresh attempt, from the
-/// exact control and observation ports selected for that attempt.
-///
-/// Metadata and the observation are resolved through the same exact planning
-/// lease. Callers must retain the returned value instead of re-resolving the
-/// connector's latest generation within the same decision.
-///
-/// This is the planner-facing entry point.  Callers that already own their
-/// admitted connector-control generation must pass those ports directly;
-/// they must not reconstruct an application facade merely to observe the base
-/// table again.
-pub(crate) fn observe_current_refresh_base_with_ports(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+// This inspector is pure over the sealed metadata loaded by its caller.
+pub(crate) fn observe_loaded_refresh_base(
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
-    table_ref: &TableIdentity,
-    connector_context: &ConnectorRequestContext,
-) -> Result<crate::mv::domain::storage_observation::MvRefreshBaseObservation, String> {
-    let exact_lease =
-        crate::connector::acquire_metadata_planning_lease(connector_control, &table_ref.catalog)?;
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &exact_lease,
-        connector_context.clone(),
-        &table_ref.namespace,
-        &table_ref.table,
-        ConnectorTableResolution::StrictBaseTable,
-    )?;
-    let observation = crate::mv::domain::storage_observation::observe_refresh_base(
-        storage_observation,
-        &exact_lease,
-        &metadata,
-        connector_context.clone(),
-    )
-    .map_err(|error| {
-        format!(
-            "observe MV refresh base facts for {}: {error}",
-            table_ref.fqn()
-        )
-    })?;
-    if observation.table() != &metadata.identity {
-        return Err(format!(
-            "MV refresh base observation identity does not match loaded metadata for {}",
-            table_ref.fqn()
-        ));
-    }
-    Ok(observation)
-}
-
-/// Observe the same admitted Current metadata as a provider-issued semantic
-/// revision. This is used by the product scheduler's occurrence-aware change
-/// decision; the ordinary refresh observation remains deliberately narrow.
-pub(crate) fn observe_current_refresh_revision_with_ports(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
     table_ref: &TableIdentity,
     connector_context: &ConnectorRequestContext,
 ) -> Result<
-    (
-        crate::mv::domain::storage_observation::MvRefreshBaseObservation,
-        ConnectorExactSemanticRevision,
-    ),
-    String,
+    crate::mv::domain::storage_observation::MvRefreshBaseObservation,
+    novarocks_spi::connector::ConnectorError,
 > {
-    let exact_lease =
-        crate::connector::acquire_metadata_planning_lease(connector_control, &table_ref.catalog)?;
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &exact_lease,
-        connector_context.clone(),
-        &table_ref.namespace,
-        &table_ref.table,
-        ConnectorTableResolution::StrictBaseTable,
-    )?;
     let observation = crate::mv::domain::storage_observation::observe_refresh_base(
         storage_observation,
-        &exact_lease,
-        &metadata,
+        lease,
+        metadata,
         connector_context.clone(),
-    )
-    .map_err(|error| {
-        format!(
-            "observe MV scheduler source facts for {}: {error}",
-            table_ref.fqn()
-        )
-    })?;
+    )?;
     if observation.table() != &metadata.identity {
-        return Err(format!(
-            "MV scheduler source identity does not match loaded metadata for {}",
-            table_ref.fqn()
+        return Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+            format!(
+                "MV refresh base observation identity does not match loaded metadata for {}",
+                table_ref.fqn()
+            ),
         ));
     }
-    let revision = exact_lease
-        .binding()
-        .metadata()
-        .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
-        .map_err(|error| {
-            format!(
-                "observe exact MV scheduler source revision for {}: {error}",
-                table_ref.fqn()
-            )
-        })?;
-    if let Some(observed_snapshot) = observation.current_snapshot_id() {
-        let selector = exact_lease
-            .binding()
-            .metadata()
-            .read_selector_from_exact_revision(&metadata.table, &revision)
-            .map_err(|error| {
-                format!(
-                    "admit exact MV scheduler source revision for {}: {error}",
-                    table_ref.fqn()
-                )
-            })?;
-        if selector != ConnectorReadSelector::SnapshotId(observed_snapshot) {
-            return Err(format!(
-                "MV scheduler source observation and exact revision disagree for {}",
-                table_ref.fqn()
-            ));
-        }
-    }
-    Ok((observation, revision))
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn single_snapshot_map(
-    table_ref: &TableIdentity,
-    snapshot_id: i64,
-) -> BTreeMap<String, i64> {
-    let mut snapshots = BTreeMap::new();
-    snapshots.insert(table_ref.fqn(), snapshot_id);
-    snapshots
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn single_table_uuid_map(
-    table_ref: &TableIdentity,
-    table_uuid: &str,
-) -> BTreeMap<String, String> {
-    let mut uuids = BTreeMap::new();
-    uuids.insert(table_ref.fqn(), table_uuid.to_string());
-    uuids
-}
-
-pub(crate) fn acquire_mv_refresh_lock() -> Result<MutexGuard<'static, ()>, String> {
-    static MV_REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    lock_mv_refresh_mutex(MV_REFRESH_LOCK.get_or_init(|| Mutex::new(())))
-}
-
-fn lock_mv_refresh_mutex(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String> {
-    lock.lock()
-        .map_err(|_| "materialized view refresh lock poisoned".to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{Mutex, OnceLock};
-
-    #[test]
-    fn lock_mv_refresh_mutex_reports_poisoned_lock() {
-        let lock: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
-        static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _hook_guard = PANIC_HOOK_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("panic hook lock");
-        let old_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let poison_result = std::panic::catch_unwind(|| {
-            let _guard = lock.lock().expect("lock");
-            panic!("poison test lock");
-        });
-        std::panic::set_hook(old_hook);
-        assert!(poison_result.is_err());
-
-        let err = super::lock_mv_refresh_mutex(lock).expect_err("poisoned lock should fail");
-        assert!(err.contains("poisoned"), "err={err}");
-    }
+    Ok(observation)
 }

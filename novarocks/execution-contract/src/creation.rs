@@ -42,13 +42,31 @@ use crate::descriptor::FragmentSinkKind;
 #[derive(Clone)]
 pub struct FrozenBytes {
     bytes: Bytes,
+    encoded_vec_capacity: Option<usize>,
 }
 
 impl FrozenBytes {
     /// Freezes bytes that the caller has just encoded, or has just received
     /// exactly as they were encoded. Nobody re-encodes them afterwards.
     pub const fn freeze(bytes: Bytes) -> Self {
-        Self { bytes }
+        Self {
+            bytes,
+            encoded_vec_capacity: None,
+        }
+    }
+
+    /// The exact whole Vec produced by the original encoder. This captures
+    /// actual retained capacity before Bytes erases that creation fact. Clones
+    /// preserve the same fact; no numeric caller assertion is accepted.
+    pub fn freeze_encoded(bytes: Vec<u8>) -> Self {
+        let capacity = bytes.capacity();
+        Self {
+            bytes: bytes.into(),
+            encoded_vec_capacity: Some(capacity),
+        }
+    }
+    pub fn encoded_backing_capacity(&self) -> Option<usize> {
+        self.encoded_vec_capacity
     }
 
     pub fn len(&self) -> usize {

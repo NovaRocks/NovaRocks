@@ -629,7 +629,12 @@ mod tests {
                         id,
                         false,
                     )
-                    .with_metadata([("annotation".into(), label.into())].into()),
+                    .with_metadata(
+                        std::collections::HashMap::<String, String>::from([(
+                            "annotation".into(),
+                            label.into(),
+                        )]),
+                    ),
                 ]
                 .into(),
             )
@@ -739,7 +744,7 @@ mod tests {
                 entries
                     .iter()
                     .map(|(key, value)| (key.to_string(), value.to_string()))
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             )
         };
         let left = field(&[("a", "first"), ("b", "second"), ("c", "third")]);
@@ -779,7 +784,7 @@ mod tests {
                 entries
                     .iter()
                     .map(|(key, value)| (key.to_string(), value.to_string()))
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             )
         };
         let left = field(&[("same-prefix-a", "first"), ("same-prefix-b", "second")]);
@@ -824,7 +829,9 @@ mod tests {
                     id,
                     ordered,
                 )
-                .with_metadata([("provider.id".into(), "7".into())].into()),
+                .with_metadata(std::collections::HashMap::<String, String>::from(
+                    [("provider.id".into(), "7".into())],
+                )),
             )
         };
         let wrap = |f: Arc<Field>| {
@@ -870,7 +877,10 @@ mod tests {
                 compatible
                     .as_ref()
                     .clone()
-                    .with_metadata([("provider.id".into(), "8".into())].into()),
+                    .with_metadata(std::collections::HashMap::<String, String>::from([(
+                        "provider.id".into(),
+                        "8".into(),
+                    )])),
             ),
             Arc::new(
                 compatible

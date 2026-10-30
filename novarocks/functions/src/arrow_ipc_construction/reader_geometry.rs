@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Pinned Arrow58.4 fb_to_schema construction events, after the shared
+//! Pinned Arrow60.0 try_fb_to_schema construction events, after the shared
 //! borrowed field verifier. Temporary constructor backing and actual source
 //! header backing use separate caller scopes. These are operation requests,
 //! not exact retained-byte measurements or unique allocator facts.
@@ -24,9 +24,11 @@ use arrow_schema::{DataType, Field, FieldRef, Schema};
 use novarocks_type_contract::{
     ControlResourceError,
     owned_resources::{
+        arrow_metadata::hashmap_conversion_requests,
+        btree::BTreeResourceError,
         hashmap::{HashMapResourceError, original_fresh_unique_insert_tables_observed},
         layout::{LayoutResourceError, arc_layout},
-        vec::{original_fresh_push_allocation_requests_observed, push_growth},
+        vec::original_fresh_push_allocation_requests_observed,
     },
 };
 use std::alloc::Layout;
@@ -37,6 +39,7 @@ pub enum ReaderStructureFailure<H> {
     Layout(LayoutResourceError),
     Vector(ControlResourceError),
     Map(HashMapResourceError),
+    BTree(BTreeResourceError),
     SourceModel(&'static str),
 }
 impl<H> From<ControlResourceError> for ReaderStructureFailure<H> {
@@ -47,6 +50,11 @@ impl<H> From<ControlResourceError> for ReaderStructureFailure<H> {
 impl<H> From<HashMapResourceError> for ReaderStructureFailure<H> {
     fn from(e: HashMapResourceError) -> Self {
         Self::Map(e)
+    }
+}
+impl<H> From<BTreeResourceError> for ReaderStructureFailure<H> {
+    fn from(e: BTreeResourceError) -> Self {
+        Self::BTree(e)
     }
 }
 impl<H> From<LayoutResourceError> for ReaderStructureFailure<H> {
@@ -116,19 +124,6 @@ impl<H> ReaderStructureObserver<'_, H> {
             &mut Some(&mut loan),
         )?;
         Ok(())
-    }
-    fn known_nontrusted_collect<T>(
-        &mut self,
-        count: usize,
-    ) -> Result<(), ReaderStructureFailure<H>> {
-        if count == 0 {
-            return Ok(());
-        }
-        // Rust1.98 SpecFromIterNested: after first element, exact size_hint
-        // yields count, maxed with the sole RawVec minimum. No pushes grow it.
-        let empty = Vec::<T>::new();
-        let minimum = push_growth(&empty)?.requested_capacity;
-        self.array::<T>(count.max(minimum), ReaderStructureClass::Temporary)
     }
     fn metadata(
         &mut self,
@@ -205,18 +200,37 @@ impl<H> ReaderStructureObserver<'_, H> {
         original_fresh_unique_insert_tables_observed::<String, String, ReaderStructureFailure<H>>(
             unique,
             || work().map_err(ReaderStructureFailure::Creator),
-            |table, last| {
+            |table, _last| {
+                // Arrow 60 first builds the same HashMap, then consumes it
+                // into Metadata's shared tree. No hash table survives.
                 opaque(
                     table.request_bytes_upper_bound,
-                    if last {
-                        ReaderStructureClass::SourceHeader
-                    } else {
-                        ReaderStructureClass::Temporary
-                    },
+                    ReaderStructureClass::Temporary,
                 )
                 .map_err(ReaderStructureFailure::Creator)
             },
-        )
+        )?;
+        let conversion = hashmap_conversion_requests(unique)?;
+        if let Some(layout) = conversion.entries_vector {
+            self.layout(layout, ReaderStructureClass::Temporary)?;
+        }
+        if let Some(layout) = conversion.sort_scratch {
+            self.layout(layout, ReaderStructureClass::Temporary)?;
+        }
+        // The common private-node model is a source upper, not an exact
+        // allocator Layout; preserve that distinction at the caller port.
+        for _ in 0..conversion.tree_nodes {
+            (self.opaque)(
+                conversion.tree_node.size(),
+                ReaderStructureClass::SourceHeader,
+            )
+            .map_err(ReaderStructureFailure::Creator)?;
+            self.step()?;
+        }
+        if let Some(layout) = conversion.map_arc {
+            self.layout(layout, ReaderStructureClass::SourceHeader)?;
+        }
+        Ok(())
     }
     /// Call once after the sole schema's profile/field count has been checked.
     pub fn schema(&mut self, source: ipc::Schema<'_>) -> Result<(), ReaderStructureFailure<H>> {
@@ -257,9 +271,10 @@ impl<H> ReaderStructureObserver<'_, H> {
         let children = source.children().map_or(0, |children| children.len());
         match source.type_type() {
             ipc::Type::Struct_ => {
-                // Flatbuffers25.9.23 VectorIter is ExactSize, NOT TrustedLen:
-                // generic Arc FromIterator creates Vec<FieldRef> then Arc slice.
-                self.known_nontrusted_collect::<FieldRef>(children)?;
+                // try_field_from collects Result<Vec<Field>, _>; GenericShunt
+                // has zero lower hint. Vec<Field>::into then maps Arc::new
+                // over a trusted iterator and builds the final shared slice.
+                self.fresh_pushes::<Field>(children)?;
                 self.shared_slice::<FieldRef>(children)?;
             }
             ipc::Type::Timestamp => {

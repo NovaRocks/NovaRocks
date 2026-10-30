@@ -269,6 +269,25 @@ impl OptimizeJobRuntime {
         Ok(submission)
     }
 
+    pub fn service_runtime(&self) -> Arc<OptimizeProcessRuntime> {
+        self.service.runtime()
+    }
+    pub fn install_original_job_in(
+        &self,
+        request: JobCreate<MaintenanceTarget>,
+        activity: &mut Option<MaintenanceActivityPermit>,
+        originals: &mut Option<crate::worker::OptimizeJobOriginals>,
+    ) -> Result<OptimizeJob, String> {
+        self.service
+            .runtime
+            .install_original_record_in(request, activity, originals)
+            .map_err(|e| format!("install original Optimize job failed: {e}"))
+    }
+    pub fn notify_original_job(&self) -> Result<(), String> {
+        self.wakeup_worker()?;
+        self.service.runtime.notify_original_change();
+        Ok(())
+    }
     pub async fn list(&self) -> Result<Vec<OptimizeJob>, String> {
         self.service.list().await
     }
@@ -333,12 +352,18 @@ impl OptimizeJobRuntime {
     }
 
     fn wakeup_worker(&self) -> Result<(), String> {
-        let worker = self
-            .worker
-            .lock()
-            .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
-        if let WorkerLifecycle::Started(worker) = &*worker {
-            worker.wakeup();
+        let wake = {
+            let lifecycle = self
+                .worker
+                .lock()
+                .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
+            match &*lifecycle {
+                WorkerLifecycle::Started(worker) => Some(worker.wakeup_handle()),
+                _ => None,
+            }
+        };
+        if let Some(wake) = wake {
+            wake.notify_one();
         }
         Ok(())
     }
@@ -400,12 +425,13 @@ mod tests {
 
     struct ReadyAdmission;
 
-    #[async_trait::async_trait]
     impl OptimizeJobAdmissionPort for ReadyAdmission {
-        async fn begin(&self) -> Result<OptimizeJobAdmission, String> {
-            Ok(OptimizeJobAdmission::Acquired(
-                crate::worker::tests::admitted_scope_fixture().await,
-            ))
+        fn begin(&self) -> crate::worker::OptimizeJobAdmissionFuture<'_> {
+            Box::pin(async move {
+                Ok(OptimizeJobAdmission::Acquired(
+                    crate::worker::tests::admitted_scope_fixture().await,
+                ))
+            })
         }
     }
 
@@ -418,36 +444,42 @@ mod tests {
 
         fn acquire(
             &self,
-            capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+            owner: &novarocks_workload_control::WorkOwner,
         ) -> Result<Option<Box<dyn OptimizeJobExecution>>, String> {
-            capacity
-                .scope()
-                .check()
-                .map_err(|error| error.to_string())?;
+            owner.scope().check().map_err(|error| error.to_string())?;
             Ok(Some(Box::new(Self)))
         }
     }
 
     impl OptimizeJobExecution for SuccessfulExecution {
-        fn rebind_target(&self, _job: &OptimizeJob) -> Result<MaintenanceTargetRebind, String> {
-            Ok(MaintenanceTargetRebind::Bound)
+        fn rebind_target<'a>(
+            &'a self,
+            _job: &'a OptimizeJob,
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceTargetRebind, String>>
+        {
+            Box::pin(async move { Ok(MaintenanceTargetRebind::Bound) })
         }
 
-        fn execute(
-            &self,
-            _job: &OptimizeJob,
-            capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-        ) -> Result<MaintenanceActionOutcome, crate::runtime::TerminalError> {
-            capacity.scope().check().unwrap();
-            Ok(MaintenanceActionOutcome::RewriteDataFiles {
-                target_snapshot_id: Some(1),
-                rewritten_data_files_count: 1,
-                added_data_files_count: Some(1),
-                added_delete_files_count: Some(0),
-                rewritten_bytes_count: 1,
-                failed_data_files_count: 0,
-                removed_delete_files_count: 0,
-                output_record_count: Some(1),
+        fn execute<'a>(
+            &'a self,
+            _job: &'a OptimizeJob,
+            capacity: &'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<MaintenanceActionOutcome, crate::runtime::TerminalError>,
+        > {
+            Box::pin(async move {
+                capacity.scope().check().unwrap();
+                Ok(MaintenanceActionOutcome::RewriteDataFiles {
+                    target_snapshot_id: Some(1),
+                    rewritten_data_files_count: 1,
+                    added_data_files_count: Some(1),
+                    added_delete_files_count: Some(0),
+                    rewritten_bytes_count: 1,
+                    failed_data_files_count: 0,
+                    removed_delete_files_count: 0,
+                    output_record_count: Some(1),
+                })
             })
         }
     }
@@ -535,6 +567,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn installed_original_job_runs_after_public_notification_waker_panics() {
+        use std::{
+            future::Future,
+            panic::{AssertUnwindSafe, catch_unwind},
+            task::{Context, Poll, Wake, Waker},
+        };
+        struct Cause;
+        struct PanicWake(Arc<Cause>);
+        impl Wake for PanicWake {
+            fn wake(self: Arc<Self>) {
+                std::panic::panic_any(self.0.clone());
+            }
+        }
+        let runtime = OptimizeJobRuntime::new();
+        runtime
+            .start(
+                &Handle::current(),
+                Arc::new(ReadyAdmission),
+                Arc::new(SuccessfulExecution),
+            )
+            .unwrap();
+        let jobs = runtime.service_runtime();
+        let cause = Arc::new(Cause);
+        let waker = Waker::from(Arc::new(PanicWake(cause.clone())));
+        let mut changed = Box::pin(jobs.change_notification());
+        assert!(matches!(
+            changed.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+        let mut scope = crate::worker::tests::admitted_scope_fixture().await;
+        let mut originals = Some(scope.take_originals().unwrap());
+        let mut activity = Some(
+            runtime
+                .acquire_activity(&target(), MaintenanceActivityFamily::Optimize)
+                .unwrap(),
+        );
+        let job = runtime
+            .install_original_job_in(
+                JobCreate {
+                    target: target(),
+                    effect_id: None,
+                    object_id: vec![8],
+                    base_snapshot_id: 12,
+                    created_at_ms: 1,
+                },
+                &mut activity,
+                &mut originals,
+            )
+            .unwrap();
+        assert!(activity.is_none() && originals.is_none());
+        let rejected = catch_unwind(AssertUnwindSafe(|| runtime.notify_original_job()));
+        let panic = rejected.expect_err("public notification must retain its original panic");
+        assert!(Arc::ptr_eq(
+            panic.downcast_ref::<Arc<Cause>>().unwrap(),
+            &cause
+        ));
+        drop(changed);
+        // No second submission or explicit wake may rescue the installed job.
+        let terminal =
+            tokio::time::timeout(Duration::from_secs(1), jobs.wait_for_completion(job.job_id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(terminal.state, MaintenanceJobState::Finished);
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn product_runtime_owns_submission_wakeup_and_worker_join() {
         let runtime = OptimizeJobRuntime::new();
         runtime
@@ -572,50 +675,59 @@ mod tests {
 
             fn acquire(
                 &self,
-                capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+                owner: &novarocks_workload_control::WorkOwner,
             ) -> Result<Option<Box<dyn OptimizeJobExecution>>, String> {
-                capacity
-                    .scope()
-                    .check()
-                    .map_err(|error| error.to_string())?;
+                owner.scope().check().map_err(|error| error.to_string())?;
                 Ok(Some(Box::new(Self)))
             }
         }
 
         impl OptimizeJobExecution for AutomaticExecution {
-            fn rebind_target(&self, _job: &OptimizeJob) -> Result<MaintenanceTargetRebind, String> {
-                Ok(MaintenanceTargetRebind::Bound)
+            fn rebind_target<'a>(
+                &'a self,
+                _job: &'a OptimizeJob,
+            ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceTargetRebind, String>>
+            {
+                Box::pin(async move { Ok(MaintenanceTargetRebind::Bound) })
             }
 
-            fn execute(
-                &self,
-                _job: &OptimizeJob,
-                _capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-            ) -> Result<MaintenanceActionOutcome, crate::runtime::TerminalError> {
-                panic!("automatic job must not use the user optimize path")
+            fn execute<'a>(
+                &'a self,
+                _job: &'a OptimizeJob,
+                _capacity: &'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+            ) -> crate::product::MaintenanceFuture<
+                'a,
+                Result<MaintenanceActionOutcome, crate::runtime::TerminalError>,
+            > {
+                Box::pin(async move { panic!("automatic job must not use the user optimize path") })
             }
 
-            fn execute_automatic(
-                &self,
-                job: &OptimizeJob,
+            fn execute_automatic<'a>(
+                &'a self,
+                job: &'a OptimizeJob,
                 effect_id: MaintenanceEffectId,
-                capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-            ) -> Result<AutomaticMaintenanceOutcome, crate::runtime::TerminalError> {
-                capacity.scope().check().unwrap();
-                assert_eq!(job.effect_id, Some(effect_id));
-                assert_eq!(effect_id.to_bytes(), [7; 16]);
-                Ok(AutomaticMaintenanceOutcome::NoOpWithoutCommit(
-                    MaintenanceActionOutcome::RewriteDataFiles {
-                        target_snapshot_id: None,
-                        rewritten_data_files_count: 0,
-                        added_data_files_count: Some(0),
-                        added_delete_files_count: Some(0),
-                        rewritten_bytes_count: 0,
-                        failed_data_files_count: 0,
-                        removed_delete_files_count: 0,
-                        output_record_count: Some(0),
-                    },
-                ))
+                capacity: &'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+            ) -> crate::product::MaintenanceFuture<
+                'a,
+                Result<AutomaticMaintenanceOutcome, crate::runtime::TerminalError>,
+            > {
+                Box::pin(async move {
+                    capacity.scope().check().unwrap();
+                    assert_eq!(job.effect_id, Some(effect_id));
+                    assert_eq!(effect_id.to_bytes(), [7; 16]);
+                    Ok(AutomaticMaintenanceOutcome::NoOpWithoutCommit(
+                        MaintenanceActionOutcome::RewriteDataFiles {
+                            target_snapshot_id: None,
+                            rewritten_data_files_count: 0,
+                            added_data_files_count: Some(0),
+                            added_delete_files_count: Some(0),
+                            rewritten_bytes_count: 0,
+                            failed_data_files_count: 0,
+                            removed_delete_files_count: 0,
+                            output_record_count: Some(0),
+                        },
+                    ))
+                })
             }
         }
 

@@ -113,6 +113,23 @@ async fn keyed_owner_reports_a_lost_committed_response_without_retry_or_rollback
         .unwrap()
         .unwrap_err();
     assert_eq!(error.kind(), MvRepositoryErrorKind::CommitUnknown);
+    assert!(
+        error
+            .original_failure()
+            .unwrap()
+            .downcast_ref::<novarocks_state_store_api::StateStoreError>()
+            .is_some()
+    );
+    // Explicitly adjudicate the exact observation returned by this original
+    // legacy-provider fault fixture. No operation-id lookup or write replay.
+    let observation = error
+        .commit_observation()
+        .expect("retain issued unknown observation");
+    assert!(matches!(
+        observation.outcome().await.unwrap(),
+        novarocks_state_store_api::AttemptOutcome::Committed(_)
+    ));
+
     let committed = reader
         .find_keyed_by_target(
             &tests_definition::target("unknown"),

@@ -199,8 +199,8 @@ pub fn decode_response(
                 p.clone().field("fact"),
             )?;
             let detail = decode_safe_detail(&refused.safe_detail, p.field("safe_detail"))?;
-            return Ok(RootReadResponse::Refused(RootReadRefusal::for_request(
-                expected, fact, detail,
+            return Ok(RootReadResponse::Refused(Box::new(
+                RootReadRefusal::for_request(expected, fact, detail),
             )));
         }
         None => return Err(missing(path, "root read requires one response result")),
@@ -585,19 +585,26 @@ mod tests {
             NonZeroU16::new(65534).unwrap(),
         );
         let failure = FailureFact::new(FailureClass::Resource, reason).with_resource(facts);
-        let mut results = vec![RootReadResponse::Refused(RootReadRefusal::for_request(
-            &request,
-            failure,
-            SafeDetail::new("x".repeat(512)).unwrap(),
+        let mut results = vec![RootReadResponse::Refused(Box::new(
+            RootReadRefusal::for_request(
+                &request,
+                failure,
+                SafeDetail::new("x".repeat(512)).unwrap(),
+            ),
         ))];
         for code in 1..=4 {
-            results.push(RootReadResponse::Refused(RootReadRefusal::for_request(
-                &request,
-                FailureFact::new(
-                    FailureClass::Dependency,
-                    FailureReason::new(domain::STORAGE_AUTHORITY, NonZeroU16::new(code).unwrap()),
+            results.push(RootReadResponse::Refused(Box::new(
+                RootReadRefusal::for_request(
+                    &request,
+                    FailureFact::new(
+                        FailureClass::Dependency,
+                        FailureReason::new(
+                            domain::STORAGE_AUTHORITY,
+                            NonZeroU16::new(code).unwrap(),
+                        ),
+                    ),
+                    SafeDetail::new(format!("Dependency failure (reason 23:{code})")).unwrap(),
                 ),
-                SafeDetail::new(format!("Dependency failure (reason 23:{code})")).unwrap(),
             )));
         }
         for reason in [

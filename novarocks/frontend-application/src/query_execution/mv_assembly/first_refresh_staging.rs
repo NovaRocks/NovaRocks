@@ -19,30 +19,11 @@
 
 use std::sync::Arc;
 
-use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
-
-use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::catalog_application::query_catalog::catalog_service_snapshot;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use crate::query_execution::kernels::QueryPreparationKernel;
-use crate::query_execution::mv_assembly::refresh_artifact::{
-    MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, PreparedMvFirstRefreshWrite,
-};
-use crate::query_execution::mv_native_write::{
-    PreparedMvNativeWriteAssembly, prepare_completed_mv_write,
-};
-use crate::query_execution::planning::write_sink::{
-    admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
-};
+use crate::query_execution::mv_assembly::refresh_artifact::MvFirstRefreshLogicalContext;
 use crate::query_execution::write_session::ConnectorWriteSession;
-use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
-use novarocks_sql::planning::mv::first_refresh::{
-    SqlMvFirstRefreshAnalyzeContext, SqlMvJoinFirstRefreshAnalyzeContext, SqlMvSnapshotPin,
-    SqlMvSnapshotPinOccurrence, analyze_join_first_refresh_connector_write,
-    analyze_mv_first_refresh_connector_write, begin_final_join_first_refresh_connector_write_plan,
-    begin_final_mv_first_refresh_connector_write_plan,
-};
+use novarocks_sql::planning::mv::first_refresh::{SqlMvSnapshotPin, SqlMvSnapshotPinOccurrence};
 
 pub(crate) fn frozen_logical_context_from_rewrite(
     rewrite: &crate::mv::domain::rewrite::context::IcebergMvRewriteContext,
@@ -162,55 +143,6 @@ fn sql_snapshot_pin(
     )
 }
 
-/// Reserve the one primary first-refresh write cohort from facts frozen in an
-/// MV refresh context. The staging branch must already exist and `exact_lease`
-/// must have been derived from the retained target control binding. This is
-/// the first point that mutates the provider write-service registry; SQL
-/// artifact preparation remains side-effect free.
-/// Bind an SQL-shaped first-refresh artifact only after the frontend has
-/// retained its exact write lease and admitted an immutable query execution.
-/// The result retains the exact native-assembly input for the Frontend; it
-/// deliberately does not encode or submit a query, commit a provider mutation,
-/// or expose row payloads.
-pub(crate) fn bind_prepared_mv_first_refresh_staging(
-    query_kernel: &QueryPreparationKernel,
-    ports: &IcebergMvCorePorts,
-    prepared: PreparedMvFirstRefreshWrite,
-    planning_lease: &ConnectorControlPlanningLease,
-    exact_lease: &ConnectorWriteLease,
-    execution: &QueryExecutionContext,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
-    // The session is opened before the plan is compiled because the plan's
-    // writer node carries the recipe it seals: a plan and the session that
-    // sealed it must not be separable.
-    let write_session = super::iceberg_activation::begin_first_refresh_connector_write_session(
-        &prepared,
-        connector_context.clone(),
-        exact_lease,
-        planning_lease,
-        query_kernel.typed_connector_control(),
-    )?;
-    match bind_first_refresh_write_dataflow(
-        query_kernel,
-        ports,
-        prepared,
-        planning_lease,
-        execution,
-        &connector_context,
-        &write_session,
-    ) {
-        Ok(assembly) => Ok(assembly),
-        Err(error) => {
-            super::iceberg_activation::release_mv_write_session_without_commit(
-                &write_session,
-                &connector_context,
-            );
-            Err(error)
-        }
-    }
-}
-
 /// The one logical target a first-refresh publication seals.
 ///
 /// A publication that republishes rows wholesale has exactly one thing to do
@@ -218,7 +150,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
 /// plan is compiled against that branch's ordinal, so a session that sealed a
 /// different number of them is refused here rather than having its extra
 /// branches written by nobody.
-fn sole_publication_write_target(
+pub(crate) fn sole_publication_write_target(
     write_session: &ConnectorWriteSession,
 ) -> Result<&novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan, String> {
     match write_session.targets() {
@@ -230,220 +162,14 @@ fn sole_publication_write_target(
     }
 }
 
-fn bind_first_refresh_write_dataflow(
-    query_kernel: &QueryPreparationKernel,
-    ports: &IcebergMvCorePorts,
-    prepared: PreparedMvFirstRefreshWrite,
-    planning_lease: &ConnectorControlPlanningLease,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: &Arc<ConnectorWriteSession>,
-) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
-    let expected_target_snapshot_id = prepared.expected_target_snapshot_id();
-    let target_catalog = prepared.target_catalog().to_string();
-    let target_namespace = prepared.target_namespace().to_string();
-    let target_name = prepared.target_name().to_string();
-    let current_catalog = prepared.current_catalog().map(str::to_string);
-    let current_database = prepared.current_database().to_string();
-    let root_hash_column = prepared.root_hash_column().to_string();
-    let write_target = sole_publication_write_target(write_session)?;
-    let write_target_ordinal = write_target.ordinal();
-    // The recipes are sealed once, here, and travel with the plan they were
-    // sealed for, so an encode can never pair one round's plan with another's
-    // session.
-    let _sealed_write_targets = write_session
-        .seal_write_targets()
-        .map_err(|error| format!("seal MV first-refresh write target: {error}"))?;
-    match prepared.into_execution_artifact() {
-        MvFirstRefreshExecutionArtifact::Sql(physical_sql) => {
-            let bindings = Arc::new(QueryTableBindingStore::try_new()?);
-            let target_binding = admit_session_connector_write_target(
-                bindings.as_ref(),
-                novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
-                    target_catalog.clone(),
-                    target_namespace.clone(),
-                    target_name.clone(),
-                )?,
-                write_target,
-                planning_lease.clone(),
-            )?;
-            let sink = dml_write_plan_input_for_admitted_target(
-                bindings.as_ref(),
-                target_binding,
-                novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
-                novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
-            )?;
-
-            let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
-            let materializer =
-                crate::catalog_application::query_materializer::CatalogServiceMaterializer::new(
-                    None,
-                    &catalog_service_snapshot,
-                    Arc::clone(&bindings),
-                    crate::catalog_application::query_materializer::iceberg_table_binding_loader(
-                        query_kernel.connector_control().as_ref(),
-                        connector_context.clone(),
-                    ),
-                );
-            let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
-            let compile_control =
-                crate::query_execution::planning::sql_compile_control_from_execution(execution);
-            let analyzed = analyze_mv_first_refresh_connector_write(
-                physical_sql,
-                SqlMvFirstRefreshAnalyzeContext {
-                    current_catalog: current_catalog.clone(),
-                    current_database: current_database.clone(),
-                    optimizer_settings: execution.optimizer_settings().clone(),
-                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
-                    catalog: &catalog,
-                    functions: query_kernel.function_catalog().as_ref(),
-                    constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
-                    constant_policy: query_kernel.constant_policy(),
-                    control: compile_control.clone(),
-                    sink,
-                },
-            )?;
-            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-                query_kernel,
-                Arc::clone(&bindings),
-                connector_context,
-            )?;
-            let finish_control = compile_control.clone();
-            let (completion, needs) = begin_final_mv_first_refresh_connector_write_plan(
-                analyzed,
-                &statistics,
-                compile_control,
-                write_session
-                    .statistics_requirements(write_target_ordinal)
-                    .map_err(|error| error.to_string())?,
-                write_target_ordinal,
-            )?;
-            prepare_completed_mv_write(
-                query_kernel,
-                execution,
-                bindings.as_ref(),
-                connector_context,
-                Arc::clone(write_session),
-                needs,
-                |version, dop, reads, targets| {
-                    completion.finish(version, dop, reads, targets, &finish_control)
-                },
-                &finish_control,
-            )
-        }
-        MvFirstRefreshExecutionArtifact::Logical(logical) => {
-            let facts = logical.into_context();
-            let frozen_base_overlays = facts.frozen_base_overlays.clone().ok_or_else(|| {
-                "MV first-refresh logical artifact is missing its admitted base bindings"
-                    .to_string()
-            })?;
-            let refresh_rewrite = rebuild_frozen_mv_rewrite_context(
-                ports,
-                expected_target_snapshot_id,
-                &target_catalog,
-                &target_namespace,
-                &target_name,
-                &facts,
-                planning_lease,
-                connector_context,
-            )?;
-            let bindings = Arc::new(QueryTableBindingStore::try_new()?);
-            let target_binding =
-                crate::query_execution::mv_assembly::query_local_bindings::bind_imv_target_query_table_in_store_from_rewrite(
-                    &refresh_rewrite,
-                    &bindings,
-                    planning_lease,
-                    connector_context,
-                    Some(&facts.affected_partitions),
-                )?;
-            let write_target_binding = admit_session_connector_write_target(
-                bindings.as_ref(),
-                novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
-                    target_catalog.clone(),
-                    target_namespace.clone(),
-                    target_name.clone(),
-                )?,
-                write_target,
-                planning_lease.clone(),
-            )?;
-            let sink = dml_write_plan_input_for_admitted_target(
-                bindings.as_ref(),
-                write_target_binding,
-                novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
-                novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
-            )?;
-
-            let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
-            let materializer = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
-                None,
-                &catalog_service_snapshot,
-                Arc::clone(&bindings),
-                crate::catalog_application::query_materializer::iceberg_table_binding_loader(
-                    query_kernel.connector_control().as_ref(),
-                    connector_context.clone(),
-                ),
-                frozen_base_overlays,
-            );
-            let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
-            let compile_control =
-                crate::query_execution::planning::sql_compile_control_from_execution(execution);
-            let analyzed =
-                analyze_join_first_refresh_connector_write(SqlMvJoinFirstRefreshAnalyzeContext {
-                    canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
-                    rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
-                    expected_root_hash_column: root_hash_column,
-                    current_catalog: current_catalog.clone(),
-                    current_database: current_database.clone(),
-                    optimizer_settings: execution.optimizer_settings().clone(),
-                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
-                    catalog: &catalog,
-                    functions: query_kernel.function_catalog().as_ref(),
-                    constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
-                    constant_policy: query_kernel.constant_policy(),
-                    control: compile_control.clone(),
-                    sink,
-                })?;
-            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-                query_kernel,
-                materializer.query_table_bindings(),
-                connector_context,
-            )?;
-            let finish_control = compile_control.clone();
-            let (completion, needs) = begin_final_join_first_refresh_connector_write_plan(
-                analyzed,
-                &statistics,
-                compile_control,
-                write_session
-                    .statistics_requirements(write_target_ordinal)
-                    .map_err(|error| error.to_string())?,
-                write_target_ordinal,
-            )?;
-            prepare_completed_mv_write(
-                query_kernel,
-                execution,
-                bindings.as_ref(),
-                connector_context,
-                Arc::clone(write_session),
-                needs,
-                |version, dop, reads, targets| {
-                    completion.finish(version, dop, reads, targets, &finish_control)
-                },
-                &finish_control,
-            )
-        }
-    }
-}
-
-pub(crate) fn rebuild_frozen_mv_rewrite_context(
-    ports: &IcebergMvCorePorts,
-    expected_target_snapshot_id: Option<i64>,
+/// Validate the frozen request for original asynchronous activation.
+/// This cannot resolve a new generation.
+pub(crate) fn validate_frozen_mv_rewrite_identity(
     target_catalog: &str,
     target_namespace: &str,
     target_name: &str,
     facts: &MvFirstRefreshLogicalContext,
-    planning_lease: &ConnectorControlPlanningLease,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Arc<crate::mv::domain::rewrite::context::IcebergMvRewriteContext>, String> {
+) -> Result<novarocks_types::naming::TableIdentity, String> {
     let persisted_target = facts.mv_definition.facts.target();
     let target_identity = novarocks_types::naming::TableIdentity {
         catalog: persisted_target
@@ -465,22 +191,31 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
         );
     }
     validate_frozen_join_base_facts(facts)?;
-    let target_binding =
-        crate::mv::domain::refresh::target_binding::load_mv_target_binding_with_lease_and_ports(
-            ports.storage_observation(),
-            &target_identity,
-            planning_lease.clone(),
-            connector_context,
-        )?;
+    Ok(target_identity)
+}
+
+/// Resume the frozen activation from its retained exact metadata binding.
+/// Provider failures preserve their original cause.
+pub(crate) fn finish_frozen_mv_rewrite_context_original(
+    ports: &IcebergMvCorePorts,
+    expected_target_snapshot_id: Option<i64>,
+    facts: &MvFirstRefreshLogicalContext,
+    target_binding: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    Arc<crate::mv::domain::rewrite::context::IcebergMvRewriteContext>,
+    crate::mv::domain::application::MvApplicationError,
+> {
+    use super::refresh_preparation::io_gate::{contract_error, provider_error};
     if target_binding.table_uuid() != facts.target_table_uuid {
-        return Err(
-            "MV refresh logical artifact target UUID drifted after preparation".to_string(),
-        );
+        return Err(contract_error(
+            "MV refresh logical artifact target UUID drifted after preparation",
+        ));
     }
     if target_binding.current_snapshot_id() != expected_target_snapshot_id {
-        return Err(
-            "MV refresh logical artifact target snapshot drifted after preparation".to_string(),
-        );
+        return Err(contract_error(
+            "MV refresh logical artifact target snapshot drifted after preparation",
+        ));
     }
     let target_schema = crate::mv::domain::storage_observation::observe_schema_validation(
         ports.storage_observation(),
@@ -488,22 +223,27 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
         target_binding.metadata(),
         connector_context.clone(),
     )
-    .map_err(|error| format!("observe exact MV target schema for activation: {error}"))?;
+    .map_err(provider_error)?;
     if target_schema.table() != target_binding.identity() {
-        return Err(
-            "MV first-refresh target schema and retained target binding differ".to_string(),
-        );
+        return Err(contract_error(
+            "MV first-refresh target schema and retained target binding differ",
+        ));
     }
     crate::mv::domain::refresh::rewrite_context::build_neutral_refresh_rewrite_context(
         Arc::new(facts.mv_definition.clone()),
         facts.pin.clone(),
         facts.previous.clone(),
         facts.target_table_uuid.clone(),
-        target_binding.physical_write_schema()?,
-        target_binding.write_input_fields()?,
+        target_binding
+            .physical_write_schema()
+            .map_err(contract_error)?,
+        target_binding
+            .write_input_fields()
+            .map_err(contract_error)?,
         target_schema.exact_schema().clone(),
         facts.analysis.clone(),
     )
+    .map_err(contract_error)
 }
 
 fn validate_frozen_join_base_facts(facts: &MvFirstRefreshLogicalContext) -> Result<(), String> {
@@ -537,18 +277,6 @@ fn validate_frozen_join_base_facts(facts: &MvFirstRefreshLogicalContext) -> Resu
         .ok_or_else(|| {
             "MV logical artifact is missing exact-generation frozen base overlays".to_string()
         })
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged MV execution assembly and recovery wiring."
-)]
-fn parse_query_from_sql(sql: &str) -> Result<novarocks_parser::ast::Query, String> {
-    let statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        return Err("MV first-refresh physical artifact is not a SELECT query".to_string());
-    };
-    Ok(query.clone())
 }
 
 #[cfg(test)]

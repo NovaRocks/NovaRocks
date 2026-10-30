@@ -283,13 +283,13 @@ fn narrow_shift_requests(
         return empty_shift_requests(array_arc);
     }
     let intermediate = int64_shift_requests(rows)?;
-    let values = rounded_buffer_bytes(
-        rows.checked_mul(width.bytes())
-            .ok_or(ScalarResourceError::Arithmetic)?,
-    )?;
+    // Arrow 60 unary_opt adopts an exact Vec rather than a rounded BufferBuilder.
+    let values = rows
+        .checked_mul(width.bytes())
+        .ok_or(ScalarResourceError::Arithmetic)?;
     let bitmap = rounded_buffer_bytes(checked_add(rows, 7)? / 8)?;
-    // Original safe unary_opt builds both new rounded backings, including
-    // validity for all-valid input. Neither reuses the intermediate values
+    // Original safe unary_opt builds an exact values Vec and rounded validity,
+    // including validity for all-valid input. Neither reuses the intermediate values
     // or lazy bitmap. Finishing transfers each backing to a new Bytes Arc;
     // the original cast then allocates the actual narrow array Arc.
     let additional = checked_add(checked_add(checked_add(values, bitmap)?, 128)?, array_arc)?;
@@ -303,7 +303,7 @@ pub(crate) fn require_arrow_model() -> Result<(), ScalarResourceError> {
     // The locked source and pinned compiler fix the private enum layout
     // algorithm. Public actual types also reject an unreviewed target/pool
     // profile; dependency features cannot be read from this crate's cfg.
-    if env!("NOVAROCKS_SCALAR_ARROW_SOURCE") != "58.4.0"
+    if env!("NOVAROCKS_SCALAR_ARROW_SOURCE") != "60.1.0"
         || !cfg!(any(
             all(target_arch = "aarch64", target_os = "macos"),
             all(
@@ -485,8 +485,7 @@ mod tests {
                     if let Some(narrow) = width.narrow() {
                         // Original safe cast creates validity even when ALL
                         // selected values are valid and mathematically in range.
-                        expected +=
-                            (rows * narrow.bytes()).div_ceil(64) * 64 + bitmap + 128 + array_arc;
+                        expected += rows * narrow.bytes() + bitmap + 128 + array_arc;
                     }
                     assert_eq!(facts.bytes(), expected);
                     assert_eq!(
@@ -528,10 +527,12 @@ mod tests {
                 // Round64 is capacity, not the actual x86_64 alignment128.
                 for alignment in [64, 128] {
                     Layout::from_size_align(bitmap.checked_add(8).unwrap(), alignment).unwrap();
-                    if let Some(narrow) = width.narrow() {
-                        let values = (rows * narrow.bytes()).div_ceil(64) * 64;
-                        Layout::from_size_align(values.checked_add(8).unwrap(), alignment).unwrap();
-                    }
+                }
+                if let Some(narrow) = width.narrow() {
+                    // Arrow 60 unary_opt's values come from an exact native Vec.
+                    let values = rows * narrow.bytes();
+                    Layout::from_size_align(values.checked_add(8).unwrap(), narrow.bytes())
+                        .unwrap();
                 }
             }
             for rows in [maximum + 1, usize::MAX] {
@@ -541,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_resources_narrow_cast_counts_distinct_rounded_values_and_always_bitmap() {
+    fn scalar_resources_narrow_cast_counts_exact_values_and_always_rounded_bitmap() {
         for width in [
             NarrowShiftWidth::Int8,
             NarrowShiftWidth::Int16,
@@ -566,7 +567,7 @@ mod tests {
                 let intermediate = ScalarInvocationResourceProfile::int64_shift()
                     .requests(rows)
                     .unwrap();
-                let values = (rows * width.bytes()).div_ceil(64) * 64;
+                let values = rows * width.bytes();
                 let bitmap = rows.div_ceil(8).div_ceil(64) * 64;
                 assert_eq!(facts.requests(), 12);
                 assert_eq!(

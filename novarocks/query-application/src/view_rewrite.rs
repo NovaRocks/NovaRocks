@@ -487,6 +487,274 @@ fn expand_external_table_factor(
     }
 }
 
+pub(crate) fn expand_external_views_async<'a>(
+    engine: &'a dyn ViewEngine,
+    query: &'a mut Query,
+    context: ViewRequestContext<'a>,
+    sql_semantics: &'a SqlSemanticSettings,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut stack = Vec::new();
+        expand_external_query_async(
+            engine,
+            query,
+            context,
+            &HashSet::new(),
+            &mut stack,
+            sql_semantics,
+        )
+        .await
+    })
+}
+
+fn expand_external_query_async<'a>(
+    engine: &'a dyn ViewEngine,
+    query: &'a mut Query,
+    context: ViewRequestContext<'a>,
+    visible_ctes: &'a HashSet<String>,
+    stack: &'a mut Vec<ExternalViewKey>,
+    sql_semantics: &'a SqlSemanticSettings,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        let settings =
+            query_sql_semantics(sql_semantics, query).map_err(|error| error.to_string())?;
+        let sql_semantics = &settings;
+        let mut body_visible_ctes = visible_ctes.clone();
+        if let Some(with_clause) = query.with.as_mut() {
+            let recursive = with_clause.recursive;
+            for cte in &mut with_clause.ctes {
+                let name = cte.name.value.to_ascii_lowercase();
+                let mut cte_visible_ctes = body_visible_ctes.clone();
+                if recursive {
+                    cte_visible_ctes.insert(name.clone());
+                }
+                expand_external_query_async(
+                    engine,
+                    cte.query.as_mut(),
+                    context,
+                    &cte_visible_ctes,
+                    stack,
+                    sql_semantics,
+                )
+                .await?;
+                body_visible_ctes.insert(name);
+            }
+        }
+        expand_external_set_expr_async(
+            engine,
+            query.body.as_mut(),
+            context,
+            &body_visible_ctes,
+            stack,
+            sql_semantics,
+        )
+        .await
+    })
+}
+
+fn expand_external_set_expr_async<'a>(
+    engine: &'a dyn ViewEngine,
+    expression: &'a mut SetExpr,
+    context: ViewRequestContext<'a>,
+    cte_names: &'a HashSet<String>,
+    stack: &'a mut Vec<ExternalViewKey>,
+    sql_semantics: &'a SqlSemanticSettings,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        match expression {
+            SetExpr::Select(select) => {
+                let settings = select_sql_semantics(sql_semantics, select)
+                    .map_err(|error| error.to_string())?;
+                let sql_semantics = &settings;
+                for table_with_joins in &mut select.from {
+                    expand_external_table_factor_async(
+                        engine,
+                        &mut table_with_joins.relation,
+                        context,
+                        cte_names,
+                        stack,
+                        sql_semantics,
+                    )
+                    .await?;
+                    for join in &mut table_with_joins.joins {
+                        expand_external_table_factor_async(
+                            engine,
+                            &mut join.relation,
+                            context,
+                            cte_names,
+                            stack,
+                            sql_semantics,
+                        )
+                        .await?;
+                    }
+                }
+                Ok(())
+            }
+            SetExpr::Query(query) => {
+                expand_external_query_async(
+                    engine,
+                    query.as_mut(),
+                    context,
+                    cte_names,
+                    stack,
+                    sql_semantics,
+                )
+                .await
+            }
+            SetExpr::SetOperation(operation) => {
+                expand_external_set_expr_async(
+                    engine,
+                    operation.left.as_mut(),
+                    context,
+                    cte_names,
+                    stack,
+                    sql_semantics,
+                )
+                .await?;
+                expand_external_set_expr_async(
+                    engine,
+                    operation.right.as_mut(),
+                    context,
+                    cte_names,
+                    stack,
+                    sql_semantics,
+                )
+                .await
+            }
+            _ => Ok(()),
+        }
+    })
+}
+
+fn expand_external_table_factor_async<'a>(
+    engine: &'a dyn ViewEngine,
+    factor: &'a mut TableFactor,
+    context: ViewRequestContext<'a>,
+    cte_names: &'a HashSet<String>,
+    stack: &'a mut Vec<ExternalViewKey>,
+    sql_semantics: &'a SqlSemanticSettings,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        match factor {
+            TableFactor::Table {
+                name, alias, span, ..
+            } => {
+                let parts = object_name_parts(name);
+                if parts.len() == 1 && cte_names.contains(&parts[0].to_ascii_lowercase()) {
+                    return Ok(());
+                }
+                let Some(target) = external_rewrite_candidate(engine, &parts, context) else {
+                    return Ok(());
+                };
+                let Some(connector_context) = context.connector_context else {
+                    return Err(
+                        "external view rewrite requires connector request context".to_string()
+                    );
+                };
+                let view = match engine
+                    .resolve_external_view_async(&target, connector_context)
+                    .await
+                {
+                    Ok(ExternalViewResolution::Table | ExternalViewResolution::Missing) => {
+                        return Ok(());
+                    }
+                    Ok(ExternalViewResolution::View(view)) => view,
+                    // A failed table probe historically left the relation for the
+                    // normal catalog path.  Preserve that behavior while making
+                    // an undeclared view capability an explicit admission error.
+                    Err(error) if !error.starts_with("Unsupported:") => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                let key = (
+                    target.catalog.clone(),
+                    target.database.clone(),
+                    target.view.clone(),
+                );
+                if stack.contains(&key) {
+                    return Err(format!(
+                        "circular view reference: {}.{}.{}",
+                        key.0, key.1, key.2
+                    ));
+                }
+                let mut body = parse_external_view_sql(&view, &key)?;
+                validate_persisted_query_semantics(&body, sql_semantics)?;
+                qualify_view_body_names(
+                    &mut body,
+                    &view.definition.resolution.default_catalog,
+                    &view.definition.resolution.default_database,
+                );
+                stack.push(key);
+                expand_external_query_async(
+                    engine,
+                    &mut body,
+                    ViewRequestContext {
+                        current_catalog: Some(&view.definition.resolution.default_catalog),
+                        current_database: &view.definition.resolution.default_database,
+                        connector_context: Some(connector_context),
+                    },
+                    &HashSet::new(),
+                    stack,
+                    sql_semantics,
+                )
+                .await?;
+                stack.pop();
+
+                let alias = alias.take().unwrap_or_else(|| TableAlias {
+                    name: synthetic_ident(parts.last().cloned().unwrap_or_default(), *span),
+                    columns: Vec::new(),
+                    explicit_as: false,
+                    span: *span,
+                });
+                *factor = TableFactor::Derived {
+                    lateral: false,
+                    subquery: Box::new(body),
+                    hints: Vec::new(),
+                    alias: Some(alias),
+                    span: *span,
+                };
+                Ok(())
+            }
+            TableFactor::Derived { subquery, .. } => {
+                expand_external_query_async(
+                    engine,
+                    subquery.as_mut(),
+                    context,
+                    cte_names,
+                    stack,
+                    sql_semantics,
+                )
+                .await
+            }
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
+                expand_external_table_factor_async(
+                    engine,
+                    &mut table_with_joins.relation,
+                    context,
+                    cte_names,
+                    stack,
+                    sql_semantics,
+                )
+                .await?;
+                for join in &mut table_with_joins.joins {
+                    expand_external_table_factor_async(
+                        engine,
+                        &mut join.relation,
+                        context,
+                        cte_names,
+                        stack,
+                        sql_semantics,
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    })
+}
+
 fn external_rewrite_candidate(
     engine: &dyn ViewEngine,
     parts: &[String],

@@ -169,7 +169,10 @@ fn typed_constructor_refuses_duplicate_slots_annotations_and_null_contract_confl
         field.clone().with_nullable(true),
         field
             .clone()
-            .with_metadata([("provider".into(), "source".into())].into()),
+            .with_metadata(std::collections::HashMap::<String, String>::from([(
+                "provider".into(),
+                "source".into(),
+            )])),
     ] {
         let result = StaticLayout::try_new_typed_for_compile(
             Arc::new(Schema::new(vec![invalid])),
@@ -197,12 +200,8 @@ fn typed_constructor_refuses_duplicate_slots_annotations_and_null_contract_confl
         |_| Ok(()),
         &Control,
     );
-    assert!(matches!(
-        result,
-        Err(LayoutCompileError::Layout(
-            LayoutError::ValueBindingMismatch
-        ))
-    ));
+    let layout = result.unwrap();
+    assert!(layout.schema().field(0).metadata().as_arc().is_none());
 }
 
 #[test]

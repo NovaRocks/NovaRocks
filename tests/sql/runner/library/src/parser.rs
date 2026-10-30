@@ -84,11 +84,13 @@ pub fn parse_meta_line(line: &str, meta_re: &Regex) -> Option<(String, String)> 
                 .trim_start()
                 .strip_prefix('@')?;
             let (key, value) = body.split_once('=')?;
-            return (key
-                .trim()
-                .eq_ignore_ascii_case("native_observation_attempts")
-                && value.trim().is_empty())
-            .then(|| ("native_observation_attempts".into(), String::new()));
+            return (matches!(
+                key.trim().to_ascii_lowercase().as_str(),
+                "native_observation_attempts"
+                    | "publication_catalog_fault_target"
+                    | "publication_catalog_fault_timing"
+            ) && value.trim().is_empty())
+            .then(|| (key.trim().to_ascii_lowercase(), String::new()));
         }
     };
     let key = captures.get(1)?.as_str().to_lowercase();
@@ -186,6 +188,56 @@ fn parse_publication_service_hold(raw: &str) -> anyhow::Result<PublicationServic
     Ok(PublicationServiceHoldDirective {
         table: table.to_string(),
         actor,
+    })
+}
+
+fn parse_publication_catalog_fault_target(raw: &str) -> Result<PublicationCatalogFaultTarget> {
+    let mut namespace = None;
+    let mut table = None;
+    for part in raw.split(',') {
+        let (key, value) = part.trim().split_once('=').context(
+            "publication_catalog_fault_target requires namespace=<namespace>,table=<table>",
+        )?;
+        let slot = match key.trim() {
+            "namespace" => &mut namespace,
+            "table" => &mut table,
+            _ => bail!("unknown publication_catalog_fault_target key"),
+        };
+        if slot.is_some() || value.trim().is_empty() {
+            bail!("publication_catalog_fault_target has an empty or duplicate name");
+        }
+        *slot = Some(value.trim());
+    }
+    let namespace = namespace.context("publication_catalog_fault_target requires namespace")?;
+    let table = table.context("publication_catalog_fault_target requires table")?;
+    // Reuse the SQL object-name grammar, never a wildcard or inferred session scope.
+    let command = format!("DROP TABLE {namespace}.{table}");
+    let statements = novarocks_parser::parse(&command)
+        .map_err(|_| anyhow::anyhow!("invalid publication_catalog_fault_target SQL names"))?;
+    let [
+        novarocks_parser::ast::Statement::Catalog(
+            novarocks_parser::ast::CatalogStatement::DropTable(drop),
+        ),
+    ] = statements.as_slice()
+    else {
+        bail!("publication_catalog_fault_target must name exactly one namespace.table");
+    };
+    let [namespace, table] = drop.name.parts.as_slice() else {
+        bail!("publication_catalog_fault_target must name exactly one namespace.table");
+    };
+    if drop.if_exists
+        || drop.force
+        || drop.name.span.start() != "DROP TABLE ".len()
+        || drop.name.span.end() != command.len()
+        || [namespace, table]
+            .iter()
+            .any(|part| part.value.is_empty() || part.value.contains('/'))
+    {
+        bail!("publication_catalog_fault_target must name an exact REST namespace.table");
+    }
+    Ok(PublicationCatalogFaultTarget {
+        namespace: namespace.value.clone(),
+        table: table.value.clone(),
     })
 }
 
@@ -341,7 +393,6 @@ fn parse_runtime_filter_total_at_least(
 fn structured_assertion_mut(meta: &mut QueryMeta) -> &mut QueryLifecycleStructuredAssertion {
     meta.query_lifecycle_structured_assertion
         .get_or_insert_with(|| QueryLifecycleStructuredAssertion {
-            error_source: None,
             runtime_filter_availability: None,
             runtime_filter_details: Vec::new(),
             runtime_filter_totals_at_least: Vec::new(),
@@ -546,6 +597,23 @@ fn parse_meta_with_sql_error_descriptors(
             "publication_catalog_fault" => {
                 meta.publication_catalog_fault = Some(parse_publication_catalog_fault(&raw_value)?);
             }
+            "publication_catalog_fault_target" => {
+                if meta.publication_catalog_fault_target.is_some() {
+                    bail!("duplicate publication_catalog_fault_target");
+                }
+                meta.publication_catalog_fault_target =
+                    Some(parse_publication_catalog_fault_target(&raw_value)?);
+            }
+            "publication_catalog_fault_timing" => {
+                if meta.publication_catalog_fault_timing.is_some() {
+                    bail!("duplicate publication_catalog_fault_timing");
+                }
+                meta.publication_catalog_fault_timing = Some(match raw_value.as_str() {
+                    "before-statement" => PublicationCatalogFaultTiming::BeforeStatement,
+                    "after-frontend-exit" => PublicationCatalogFaultTiming::AfterFrontendExit,
+                    _ => bail!("invalid publication_catalog_fault_timing"),
+                });
+            }
             "publication_service_hold" => {
                 meta.publication_service_hold = Some(parse_publication_service_hold(&raw_value)?);
             }
@@ -600,14 +668,6 @@ fn parse_meta_with_sql_error_descriptors(
                     meta.query_lifecycle_fault = Some(fault);
                 }
                 meta.query_lifecycle_faults.push(fault);
-            }
-            "expect_lifecycle_error_source" => {
-                let source = QueryLifecycleErrorSource::parse(&raw_value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid expect_lifecycle_error_source: {raw_value}; expected backend-attestation, frontend-liveness, or no-outcome"
-                    )
-                })?;
-                structured_assertion_mut(&mut meta).error_source = Some(source);
             }
             "expect_runtime_filter_available" => {
                 let availability = RuntimeFilterAvailabilityExpectation::parse(&raw_value)
@@ -875,10 +935,6 @@ fn merge_lifecycle_structured_assertion(
     let base = base?;
     let override_meta = override_meta.unwrap_or(base);
     Some(QueryLifecycleStructuredAssertion {
-        error_source: override_meta
-            .error_source
-            .clone()
-            .or_else(|| base.error_source.clone()),
         runtime_filter_availability: override_meta
             .runtime_filter_availability
             .or(base.runtime_filter_availability),
@@ -989,6 +1045,13 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         publication_catalog_fault: override_meta
             .publication_catalog_fault
             .or(base.publication_catalog_fault),
+        publication_catalog_fault_target: override_meta
+            .publication_catalog_fault_target
+            .clone()
+            .or_else(|| base.publication_catalog_fault_target.clone()),
+        publication_catalog_fault_timing: override_meta
+            .publication_catalog_fault_timing
+            .or(base.publication_catalog_fault_timing),
         publication_service_hold: override_meta
             .publication_service_hold
             .clone()
@@ -1489,6 +1552,153 @@ mod opt5_directive_tests {
         let lines = vec!["-- @normalize_explain_timing=true".to_string()];
         let meta = parse_meta(&lines, &re).expect("parse ok");
         assert!(meta.normalize_explain_timing);
+    }
+
+    #[test]
+    fn publication_fault_timing_preserves_default_and_rejects_empty_unknown_or_duplicate() {
+        let re = meta_re();
+        assert!(
+            parse_meta(&[], &re)
+                .unwrap()
+                .publication_catalog_fault_timing
+                .is_none()
+        );
+        for (name, expected) in [
+            (
+                "before-statement",
+                PublicationCatalogFaultTiming::BeforeStatement,
+            ),
+            (
+                "after-frontend-exit",
+                PublicationCatalogFaultTiming::AfterFrontendExit,
+            ),
+        ] {
+            let meta = parse_meta(
+                &[format!("-- @publication_catalog_fault_timing={name}")],
+                &re,
+            )
+            .unwrap();
+            assert_eq!(meta.publication_catalog_fault_timing, Some(expected));
+            assert_eq!(
+                merge_meta(&meta, &QueryMeta::default()).publication_catalog_fault_timing,
+                Some(expected)
+            );
+        }
+        for raw in ["", "after-restart", "before-start"] {
+            assert!(
+                parse_meta(
+                    &[format!("-- @publication_catalog_fault_timing={raw}")],
+                    &re
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            parse_meta(
+                &[
+                    "-- @publication_catalog_fault_timing=before-statement".into(),
+                    "-- @publication_catalog_fault_timing=after-frontend-exit".into(),
+                ],
+                &re
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn publication_fault_target_names_are_exact_and_malformed_metadata_is_rejected() {
+        let meta = parse_meta(
+            &["-- @publication_catalog_fault_target=namespace=ns,table=a_mv".into()],
+            &meta_re(),
+        )
+        .unwrap();
+        assert_eq!(
+            meta.publication_catalog_fault_target,
+            Some(PublicationCatalogFaultTarget {
+                namespace: "ns".into(),
+                table: "a_mv".into(),
+            })
+        );
+        for (raw, logical) in [("`a b`", "a b"), ("`a%20b`", "a%20b")] {
+            let parsed =
+                parse_publication_catalog_fault_target(&format!("namespace=ns,table={raw}"))
+                    .unwrap();
+            assert_eq!(parsed.namespace, "ns");
+            assert_eq!(parsed.table, logical);
+        }
+        assert_eq!(
+            merge_meta(&meta, &QueryMeta::default()).publication_catalog_fault_target,
+            meta.publication_catalog_fault_target
+        );
+        for raw in [
+            "",
+            "table=a_mv",
+            "namespace=ns",
+            "namespace=,table=a_mv",
+            "namespace=ns,table=",
+            "namespace=ns,table=*",
+            "namespace=ns.*,table=a_mv",
+            "namespace=IF EXISTS ns,table=a_mv",
+            "namespace=ns,table=a_mv FORCE",
+            "namespace=ns,table=a_mv;DROP TABLE x.y",
+            "namespace=ns,namespace=other,table=a_mv",
+            "namespace=ns,table=a_mv,extra=bad",
+        ] {
+            assert!(
+                parse_meta(
+                    &[format!("-- @publication_catalog_fault_target={raw}")],
+                    &meta_re()
+                )
+                .is_err(),
+                "accepted {raw:?}"
+            );
+        }
+        assert!(
+            parse_meta(
+                &[
+                    "-- @publication_catalog_fault_target=namespace=ns,table=a_mv".into(),
+                    "-- @publication_catalog_fault_target=namespace=other,table=a_mv".into(),
+                ],
+                &meta_re()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn publication_fault_target_uses_the_real_case_namespace_rewrite_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = "-- @sequential=true\n-- query 1\nCREATE DATABASE c.ns_${uuid0};\n-- query 2\n-- @publication_catalog_fault=table-load,corrupt-package\n-- @publication_catalog_fault_target=namespace=ns_${uuid0},table=a_mv\nSELECT 1;\n";
+        let marker = Regex::new(r"^--\s*query\s+(\d+)\s*$").unwrap();
+        let variables = crate::fixture_context::test_variables(&["left", "right"]);
+        let mut targets = Vec::new();
+        for name in ["left", "right"] {
+            let path = dir.path().join(format!("{name}.sql"));
+            fs::write(&path, raw).unwrap();
+            let case = load_sql_case_from_file(&path, &meta_re(), &marker, &variables)
+                .unwrap()
+                .unwrap();
+            let target = case.steps[1]
+                .meta
+                .publication_catalog_fault_target
+                .as_ref()
+                .unwrap();
+            let case_vars = case_placeholder_variables(&variables, name).unwrap();
+            let old_namespace = format!("ns_{}", case_vars["uuid0"]);
+            assert_eq!(
+                Some(&target.namespace),
+                case.namespace_rewrites.get(&old_namespace)
+            );
+            assert_eq!(target.table, "a_mv");
+            assert!(
+                case.steps[0]
+                    .sql
+                    .contains(&format!("c.{}", target.namespace))
+            );
+            assert!(!target.namespace.contains("${"));
+            targets.push(target.namespace.clone());
+        }
+        assert_ne!(targets[0], targets[1]);
     }
 
     #[test]
@@ -2334,7 +2544,7 @@ mod opt5_directive_tests {
         let re = meta_re();
         let lines = vec![
             "-- @query_lifecycle_fault=runtime-filter-contribution-ack-drop,2".to_string(),
-            "-- @expect_lifecycle_error_source=backend-attestation".to_string(),
+            "-- @expect_runtime_filter_available=available".to_string(),
         ];
 
         let meta = parse_meta(&lines, &re).expect("parse RFO-8R2 directives");
@@ -2356,8 +2566,8 @@ mod opt5_directive_tests {
             .query_lifecycle_structured_assertion
             .expect("structured assertion");
         assert_eq!(
-            assertion.error_source,
-            Some(QueryLifecycleErrorSource::BackendAttestation)
+            assertion.runtime_filter_availability,
+            Some(RuntimeFilterAvailabilityExpectation::Available)
         );
     }
 

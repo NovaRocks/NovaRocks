@@ -31,8 +31,8 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::query_execution::artifact::FragmentId;
+use crate::task_protocol_config::TaskUpdateRetryPolicy;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_types::UniqueId;
 
 use novarocks_spi::connector::ConnectorReadWireEncoder;
@@ -151,6 +151,13 @@ pub(crate) enum SplitAssignmentDriverError {
         fact: novarocks_execution_contract::failure::FailureFact,
         detail: novarocks_execution_contract::SafeDetail,
     },
+    /// Neutral facts projected before the original enumeration job retires
+    /// its raw Provider error or panic payload.
+    SourceEnumeration {
+        scan: ScanNodeKey,
+        fact: novarocks_execution_contract::failure::FailureFact,
+        detail: novarocks_execution_contract::SafeDetail,
+    },
     /// No admitted task exists for this plan node, so a split has nowhere to
     /// go. Failing closed is required: silently dropping it would produce a
     /// query that returns fewer rows than it should.
@@ -181,6 +188,11 @@ pub(crate) enum SplitAssignmentDriverError {
 impl fmt::Display for SplitAssignmentDriverError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SourceEnumeration { scan, detail, .. } => write!(
+                formatter,
+                "enumerating split source at {scan}: {}",
+                detail.as_str()
+            ),
             Self::SourceClose { scan, detail, .. } => write!(
                 formatter,
                 "closing split source at {scan}: {}",
@@ -230,7 +242,8 @@ impl SplitAssignmentDriverError {
             ExecutionFailureInput, ExecutionFailureSite,
         };
         match self {
-            Self::SourceClose { fact, detail, .. } => Some(ExecutionFailureInput::new(
+            Self::SourceClose { fact, detail, .. }
+            | Self::SourceEnumeration { fact, detail, .. } => Some(ExecutionFailureInput::new(
                 *fact,
                 detail.clone(),
                 ExecutionFailureSite::Coordinator,

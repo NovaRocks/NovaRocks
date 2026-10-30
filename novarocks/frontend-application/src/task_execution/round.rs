@@ -32,12 +32,14 @@ use std::sync::Arc;
 use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_execution::task_execution::status::TerminationDetail;
 
+use crate::task_execution::operation::OperationDispatchResult;
+use novarocks_execution::task_execution::OperationKind;
 use novarocks_execution::task_execution::identity::QueryContextRef;
 use novarocks_execution::task_execution::status::TaskStatusCursor;
 use novarocks_query_application::api::{QueryExecutionError, QueryExecutionErrorKind};
 use novarocks_query_application::coordination::{
     AcceptedAttemptFailure, AcceptedRootStatusSender, AcceptedRootStatusSource,
-    OperationDispatchResult, accepted_root_status_projection_with_control_port,
+    accepted_root_status_projection_with_control_port,
 };
 
 use super::abort_effect::{
@@ -272,8 +274,10 @@ pub(crate) struct TaskRound {
     connector_blocking_io: Option<ConnectorBlockingIoSupervisor>,
     root_status_sender: Option<AcceptedRootStatusSender>,
     root_status_source: Option<AcceptedRootStatusSource>,
+    protocol_facts: Option<super::protocol_facts::AttemptProtocolFactsPublisher>,
     /// Result consumes root output; other intents retain their Task evidence.
     result_consumer_attached: bool,
+    root_activation: Option<novarocks_coordination_contract::AttemptActivationIdentity>,
     pending_success_seal:
         Option<novarocks_query_application::coordination::AcceptedRootControlRequest>,
     abort_effect_intake: Option<NativeAbortEffectIntake>,
@@ -287,7 +291,6 @@ pub(crate) struct TaskRound {
     abort_closing_receipts:
         BTreeMap<novarocks_execution::task_execution::TaskOperationId, OperationAcknowledgement>,
     success_sealed: bool,
-    normal_drain_started: bool,
     terminal_cleanup_started: bool,
 }
 
@@ -338,16 +341,85 @@ impl TaskRound {
             connector_blocking_io: None,
             root_status_sender: Some(root_status_sender),
             root_status_source: Some(root_status_source),
+            protocol_facts: None,
             result_consumer_attached: false,
+            root_activation: None,
             pending_success_seal: None,
             abort_effect_intake: None,
             abort_effects: BTreeMap::new(),
             late_abort_settlements: BTreeMap::new(),
             abort_closing_receipts: BTreeMap::new(),
             success_sealed: false,
-            normal_drain_started: false,
             terminal_cleanup_started: false,
         }
+    }
+
+    pub(crate) fn install_protocol_facts(
+        &mut self,
+        plan: novarocks_query_application::api::PlanSeal,
+        writers: &BTreeSet<TaskIdentity>,
+        summary_sources: &BTreeSet<TaskIdentity>,
+    ) -> Result<super::protocol_facts::AttemptProtocolFactsReceiver, TaskExecutionError> {
+        if self.protocol_facts.is_some() || self.root_status_source.is_none() {
+            return Err(TaskExecutionError::Schedule(
+                "protocol facts must be installed once before root source transfer".to_owned(),
+            ));
+        }
+        let (publisher, receiver) =
+            super::protocol_facts::AttemptProtocolFactsPublisher::for_graph(
+                plan,
+                self.execution.graph(),
+                writers,
+                summary_sources,
+            )?;
+        self.protocol_facts = Some(publisher);
+        Ok(receiver)
+    }
+
+    pub(crate) fn bind_protocol_drive(
+        &mut self,
+        drive: &novarocks_query_application::coordination::NativeAttemptDrive,
+    ) -> Result<(), TaskExecutionError> {
+        if self
+            .root_activation
+            .is_some_and(|held| held != drive.identity())
+        {
+            return Err(TaskExecutionError::Schedule(
+                "root result belongs to another attempt activation".into(),
+            ));
+        }
+        if drive.identity().execution() != self.execution.graph().execution_id() {
+            return Err(TaskExecutionError::Schedule(
+                "root result drive names a foreign execution".into(),
+            ));
+        }
+        if let Some(publisher) = self.protocol_facts.as_mut() {
+            publisher.bind(drive)?;
+            publisher.publish(&mut self.execution, self.success_sealed)?;
+        }
+        self.root_activation = Some(drive.identity());
+        Ok(())
+    }
+
+    fn publish_protocol_facts(&mut self) -> Result<(), TaskExecutionError> {
+        if let Some(publisher) = self.protocol_facts.as_mut() {
+            publisher.publish(&mut self.execution, self.success_sealed)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_computation_ready(
+        &self,
+        ready: novarocks_query_application::api::ComputationReadyToken,
+    ) -> Result<(), TaskExecutionError> {
+        self.protocol_facts
+            .as_ref()
+            .ok_or_else(|| {
+                TaskExecutionError::Schedule(
+                    "computation cut has no original Native protocol binding".to_owned(),
+                )
+            })?
+            .verify_computation_ready(ready)
     }
 
     fn legacy_subscriber(&self) -> &dyn StatusSubscriptions {
@@ -606,23 +678,30 @@ impl TaskRound {
 
     fn turn_with_dispatch(&mut self, dispatch: bool) -> Result<TurnReport, TaskExecutionError> {
         let mut report = TurnReport::default();
-        if self.normal_drain_started
+        if self.execution.normal_drain_started()
             || self.terminal_cleanup_started
             || self.execution.failure_cause().is_some()
         {
-            // Local close must still advance even when an unrelated ACK or
-            // observation below returns an error on this turn.
             for pump in &mut self.pumps {
                 pump.begin_close();
-                // A completed local job may publish a new domain error at
-                // the same cut as its exit proof. Observe that once too.
-                match pump.owner.close_turn() {
-                    Ok(moved) => report.pumped += moved,
-                    Err(error) if !pump.close_error_observed && pump.close_error.is_none() => {
-                        pump.close_error = Some(error);
-                    }
-                    Err(_) => {}
+            }
+        }
+        // Input close progresses independently of remote drain or cleanup:
+        // Profile can retain remote diagnostics after stopping local inputs.
+        // Advance every original close owner before any ACK/status error can
+        // return from this turn, without treating a close error as exit proof.
+        for pump in &mut self.pumps {
+            if !pump.closing {
+                continue;
+            }
+            // A completed local job may publish a new domain error at
+            // the same cut as its exit proof. Observe that once too.
+            match pump.owner.close_turn() {
+                Ok(moved) => report.pumped += moved,
+                Err(error) if !pump.close_error_observed && pump.close_error.is_none() => {
+                    pump.close_error = Some(error);
                 }
+                Err(_) => {}
             }
         }
         if !self.pumps_sealed {
@@ -666,9 +745,10 @@ impl TaskRound {
                 continue;
             }
             if let Some(subscriber) = &self.covered_subscriber {
-                subscriber
-                    .reconcile(self.covered_request(context)?)
-                    .map_err(TaskExecutionError::Schedule)?;
+                if !subscriber.prepare(context)? {
+                    continue;
+                }
+                subscriber.reconcile(self.covered_request(context)?)?;
             } else {
                 self.legacy_subscriber()
                     .resubscribe(context, self.execution.status_cursors(context))
@@ -723,9 +803,7 @@ impl TaskRound {
                     {
                         continue;
                     }
-                    subscriber
-                        .update_applied_request(self.covered_request(context)?)
-                        .map_err(TaskExecutionError::Schedule)?;
+                    subscriber.update_applied_request(self.covered_request(context)?)?;
                 }
             }
             status
@@ -753,13 +831,6 @@ impl TaskRound {
                 "success seal refused because Task status observation was incomplete before its linearization point",
             ));
         }
-        if self.execution.covered_observation_active()
-            && let Some(identity) = self.execution.required_terminal_evidence_expired()
-        {
-            return Err(TaskExecutionError::Schedule(format!(
-                "required Task terminal observation {identity:?} did not arrive within its recovery budget"
-            )));
-        }
         if self.pending_success_seal.is_none()
             && self.execution.covered_observation_active()
             && self.execution.covered_recovery_expired()
@@ -779,13 +850,18 @@ impl TaskRound {
         if !status.resubscribe {
             self.try_settle_success_seal()?;
         }
+        // All accepted statuses and the selected failure latch have folded;
+        // include a seal accepted at this same serial cut. Idle turns retain
+        // the previous revision/Arc without cloning the full Task status set.
+        self.publish_protocol_facts()?;
         for context in self.execution.take_covered_reconciliations() {
             if self.needs_covered_observation(context)
                 && let Some(subscriber) = &self.covered_subscriber
             {
-                subscriber
-                    .reconcile(self.covered_request(context)?)
-                    .map_err(TaskExecutionError::Schedule)?;
+                if !subscriber.prepare(context)? {
+                    continue;
+                }
+                subscriber.reconcile(self.covered_request(context)?)?;
                 report.resubscriptions += 1;
             }
         }
@@ -804,9 +880,10 @@ impl TaskRound {
                     continue;
                 }
                 if let Some(subscriber) = &self.covered_subscriber {
-                    subscriber
-                        .reconcile(self.covered_request(context)?)
-                        .map_err(TaskExecutionError::Schedule)?;
+                    if !subscriber.prepare(context)? {
+                        continue;
+                    }
+                    subscriber.reconcile(self.covered_request(context)?)?;
                 } else {
                     self.legacy_subscriber()
                         .resubscribe(context, self.execution.status_cursors(context))
@@ -828,7 +905,7 @@ impl TaskRound {
         }
 
         if dispatch
-            && !self.normal_drain_started
+            && !self.execution.normal_drain_started()
             && !self.terminal_cleanup_started
             && self.execution.failure_cause().is_none()
         {
@@ -883,9 +960,10 @@ impl TaskRound {
                 continue;
             }
             if let Some(subscriber) = &self.covered_subscriber {
-                subscriber
-                    .ensure(self.covered_request(context)?)
-                    .map_err(TaskExecutionError::Schedule)?;
+                if !subscriber.prepare(context)? {
+                    continue;
+                }
+                subscriber.ensure(self.covered_request(context)?)?;
             } else {
                 self.legacy_subscriber()
                     .ensure(context, self.execution.status_cursors(context))
@@ -944,6 +1022,7 @@ impl TaskRound {
     /// Freeze only FE producers after the exact accepted Root completion.
     /// The original status, normal destination-close and Cancel path still
     /// runs. Profile may finish terminal info before Quiesce/Release starts.
+    #[cfg(test)]
     pub(crate) fn begin_input_close(&mut self) {
         for pump in &mut self.pumps {
             pump.begin_close();
@@ -953,14 +1032,12 @@ impl TaskRound {
     /// Stops input-producing pumps after the accepted root success seal while
     /// keeping status observation, cancellation, renewal, and Release live.
     pub(crate) fn begin_normal_drain(&mut self) {
-        if self.normal_drain_started {
-            return;
-        }
-        self.normal_drain_started = true;
-        for pump in &mut self.pumps {
-            pump.begin_close();
-        }
         self.execution.begin_normal_drain();
+        if self.execution.normal_drain_started() {
+            for pump in &mut self.pumps {
+                pump.begin_close();
+            }
+        }
     }
 
     /// Freezes normal attempt progress before remote convergence. Status and
@@ -992,20 +1069,6 @@ impl TaskRound {
             }
         }
         self.execution.begin_terminal_cleanup();
-    }
-
-    /// Return the caller's observation leases to the same original Native
-    /// process records. Their original futures, child work and actual joins
-    /// remain with the process owner; this is not an IO-exited receipt.
-    pub(crate) fn return_native_observation_custody(&mut self) {
-        self.begin_terminal_cleanup();
-        for &context in self.execution.graph().contexts() {
-            if let Some(subscriber) = &self.covered_subscriber {
-                subscriber.stop(context);
-            } else {
-                self.legacy_subscriber().stop(context);
-            }
-        }
     }
 
     fn drive_actor_abort_effect(&mut self) -> Result<usize, TaskExecutionError> {
@@ -1085,6 +1148,63 @@ impl TaskRound {
         acknowledgement: &OperationAcknowledgement,
     ) -> Result<bool, TaskExecutionError> {
         let operation_id = acknowledgement.operation_id();
+
+        if acknowledgement.dispatch_result() == OperationDispatchResult::NonWorkerRejected
+            && acknowledgement.governance_failure().is_some()
+        {
+            let exact_active = self.abort_effects.get(&operation_id).is_some_and(|effect| {
+                matches!(
+                    effect.validate_acknowledgement(acknowledgement),
+                    Err(super::abort_effect::NativeAbortEffectAckError::MissingWorkerReceipt)
+                )
+            });
+            if exact_active {
+                // Missing Worker receipt is expected only for this exact
+                // operation/kind's local refusal. It is never context closure.
+                let state = match self.execution.actor_abort_dispatch_state(operation_id) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        self.fail_closed_abort_operation(operation_id)?;
+                        return Err(error);
+                    }
+                };
+                let settled = match state {
+                    ActorAbortDispatchState::Queued => {
+                        self.execution.cancel_queued_actor_abort(operation_id)
+                    }
+                    ActorAbortDispatchState::InFlight => {
+                        self.execution.acknowledge(acknowledgement)
+                    }
+                };
+                if let Err(error) = settled {
+                    self.fail_closed_abort_operation(operation_id)?;
+                    return Err(error);
+                }
+                self.fail_closed_abort_operation(operation_id)?;
+                return Err(super::error::dispatch_rejection(
+                    acknowledgement,
+                    OperationKind::AbortQueryContext,
+                ));
+            }
+            let exact_late = self
+                .late_abort_settlements
+                .get(&operation_id)
+                .is_some_and(|late| {
+                    late.first().is_some_and(|settlement| {
+                        settlement.identity().operation_id() == operation_id
+                            && acknowledgement.kind() == OperationKind::AbortQueryContext
+                    })
+                });
+            if !self.abort_effects.contains_key(&operation_id) && exact_late {
+                // That dispatcher generation was already settled Unknown.
+                // Fail its original late owner without inventing a fence.
+                self.fail_closed_abort_operation(operation_id)?;
+                return Err(super::error::dispatch_rejection(
+                    acknowledgement,
+                    OperationKind::AbortQueryContext,
+                ));
+            }
+        }
 
         let replay_dispatch_state = if self.abort_effects.contains_key(&operation_id)
             && self.late_abort_settlements.contains_key(&operation_id)
@@ -1408,9 +1528,12 @@ impl TaskRound {
                 && status.state() == novarocks_execution::task_execution::TaskState::Finished
         });
         if root_finished && self.execution.failure_cause().is_none() {
-            // Freeze admission in this same serial cut, before the seal reply
-            // can race a residual transport error or this turn's pumps.
+            // Request closure in the original serial cut. Strict input work
+            // stays live until its independent Task obligations complete.
             self.begin_normal_drain();
+            let withdrawals = self.root_activation.map_or_else(Vec::new, |activation| {
+                self.execution.result_context_withdrawals(activation)
+            });
             let sender = self.root_status_sender.take().ok_or_else(|| {
                 TaskExecutionError::Schedule(
                     "success seal reached TaskRound after its publisher was consumed".to_owned(),
@@ -1419,7 +1542,7 @@ impl TaskRound {
             self.pending_success_seal
                 .take()
                 .expect("the success request was checked before settlement")
-                .accept(sender)
+                .accept(sender, withdrawals)
                 .map_err(|error| {
                     TaskExecutionError::Schedule(format!(
                         "seal accepted root Task success projection failed: {error}"
@@ -1459,6 +1582,7 @@ impl TaskRound {
     /// hosts a task has acknowledged this attempt's shared facts. A caller
     /// uses it to close a pre-ready retry window, so it must be an observation
     /// of acknowledgements rather than of having sent them.
+    #[cfg(test)]
     pub(crate) fn contexts_established(&self) -> bool {
         self.execution.graph().contexts().all(|&context| {
             self.execution
@@ -1473,6 +1597,7 @@ impl TaskRound {
     /// holds or historically held the exact task the schedule placed on it.
     /// Installed or terminal status can prove ownership before a lost Create
     /// receipt is replayed.
+    #[cfg(test)]
     pub(crate) fn tasks_created(&self) -> bool {
         self.execution.graph().tasks().all(|task| {
             self.execution
@@ -1483,6 +1608,7 @@ impl TaskRound {
 
     /// A result fetch needs its own root receiver installed. Other stage
     /// creates may still be preparing or may later be stood down.
+    #[cfg(test)]
     pub(crate) fn result_pump_ready(&self) -> bool {
         let root = self.execution.graph().root_identity();
         self.execution
@@ -1498,22 +1624,6 @@ impl TaskRound {
     /// The root task the client's result comes from.
     pub(crate) fn root_task(&self) -> TaskIdentity {
         self.execution.graph().root_identity()
-    }
-
-    /// Records one packet this frontend received from the root's result plane.
-    pub(crate) fn consume_root_result_packet(
-        &mut self,
-        packet_sequence: u64,
-        end_of_stream: bool,
-    ) -> Result<(), TaskExecutionError> {
-        let root = self.root_task();
-        self.execution
-            .consume_root_result_packet(root, packet_sequence, end_of_stream)
-    }
-
-    /// Whether the client may be told the read is complete.
-    pub(crate) fn client_visible_completion(&self) -> bool {
-        self.execution.client_visible_completion()
     }
 
     /// Whether the result owner and this Task owner fixed the accepted root's
@@ -1532,6 +1642,11 @@ impl TaskRound {
     #[cfg(test)]
     pub(crate) fn attempt_drained(&self) -> bool {
         self.execution.attempt_drained()
+    }
+
+    /// Pure observation of the original source-installation declaration.
+    pub(crate) fn pumps_declared(&self) -> bool {
+        self.pumps_sealed
     }
 
     /// Local pump proof is independent of remote Task/context receipts.
@@ -1566,6 +1681,7 @@ impl TaskRound {
 
     /// Only a process-health wait predicate: every healthy pump has joined,
     /// while a named unresolved pump remains retained. NEVER exit evidence.
+    #[cfg(test)]
     pub(crate) fn pump_close_progress_settled(&self) -> bool {
         self.pumps
             .iter()

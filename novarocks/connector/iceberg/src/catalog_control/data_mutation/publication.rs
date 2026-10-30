@@ -479,10 +479,12 @@ pub(super) fn project_external(
 ) -> ExternalMutationOutcome<ConnectorDataMutationReceipt> {
     match outcome {
         ExternalMutationOutcome::KnownCommitted {
+            cleanup,
             effect,
             receipt,
             finalization,
         } => ExternalMutationOutcome::KnownCommitted {
+            cleanup,
             effect,
             receipt: receipt.receipt,
             finalization,

@@ -17,19 +17,16 @@
 
 //! Exact D/L schema validation; no legacy descriptor or schema-contract recovery.
 
-use crate::mv::domain::refresh::observation::observe_schema_validation_for_table;
 use crate::mv::domain::refresh::target::IcebergMvTarget;
-use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
+use crate::mv::domain::storage_observation::{
+    MvSchemaValidationObservation, MvSourceSchemaObservation,
+};
 use novarocks_mv_application::persistence::codec::{InterpretationDocument, RelationOccurrence};
 use novarocks_mv_application::persistence::identity::FieldIdentity;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::persistence::runtime_bindings::{
     MvRuntimeBindings, reconstruct_keyed_runtime_bindings,
 };
-use novarocks_spi::connector::{
-    ConnectorControlResolver, ConnectorRequestContext, MvStorageObservationPort,
-};
-use novarocks_types::naming::TableIdentity;
 
 /// A query-local rename, identified by D occurrence and opaque provider field.
 /// The SQL owner must apply these facts with lexical occurrence scope.
@@ -63,7 +60,7 @@ pub(crate) fn validate_projection_target(
 /// Every bound field must still have the same exact identity, type and nullability.
 pub(crate) fn validate_relation_occurrence_schema(
     occurrence: &RelationOccurrence,
-    observation: &MvSchemaValidationObservation,
+    observation: &MvSourceSchemaObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, String> {
     // D records the source object inside the canonical exact-fact envelope;
     // the observation reports the provider's raw identity. Comparing the two
@@ -136,52 +133,11 @@ pub fn validate_aggregate_schema_contract_metadata<'a>(
 pub(crate) fn validate_aggregate_schema_contract_for_base(
     projection: &StoredKeyedMvProjection,
     occurrence: &RelationOccurrence,
-    base_observation: &MvSchemaValidationObservation,
+    base_observation: &MvSourceSchemaObservation,
     target_observation: &MvSchemaValidationObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, String> {
     validate_projection_target(projection, target_observation)?;
     validate_relation_occurrence_schema(occurrence, base_observation)
-}
-
-/// Repartition admission validates the currently installed interpretation first.
-/// Applying renamed input columns requires the SQL owner's occurrence-aware rewriter.
-pub(crate) fn validate_repartition_schema_contract(
-    connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
-    projection: &StoredKeyedMvProjection,
-    base_refs: &[TableIdentity],
-    target_observation: &MvSchemaValidationObservation,
-    connector_context: &ConnectorRequestContext,
-) -> Result<(), String> {
-    validate_projection_target(projection, target_observation)?;
-    let occurrences = &projection.facts.definition().relation_occurrences;
-    if occurrences.len() != base_refs.len() {
-        return Err(
-            "MV repartition source references do not retain every D occurrence".to_string(),
-        );
-    }
-    for (occurrence, table) in occurrences.iter().zip(base_refs) {
-        if occurrence.catalog_at_binding != table.catalog
-            || occurrence.namespace_at_binding != table.namespace
-            || occurrence.relation_at_binding != table.table
-        {
-            return Err(format!(
-                "MV repartition locator does not match occurrence {}",
-                occurrence.occurrence_id
-            ));
-        }
-        let observed = observe_schema_validation_for_table(
-            connector_control,
-            storage_observation,
-            table,
-            connector_context,
-        )?;
-        let renames = validate_relation_occurrence_schema(occurrence, &observed)?;
-        if !renames.is_empty() {
-            return Err("MV repartition requires occurrence-aware SQL field rebinding".to_string());
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -191,8 +147,8 @@ mod tests {
     use bytes::Bytes;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{
-        ConnectorCommittedVersion, ConnectorInstanceId, ConnectorTableIdentity,
-        ConnectorTableObjectId, MvObservedSourceField,
+        ConnectorCommittedVersion, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorTableIdentity, ConnectorTableObjectId, MvObservedSourceField,
         MvSchemaValidationObservation as SpiObservation,
     };
 
@@ -266,30 +222,26 @@ mod tests {
         occurrence: &RelationOccurrence,
         object: &[u8],
         rename: bool,
-    ) -> MvSchemaValidationObservation {
+    ) -> MvSourceSchemaObservation {
         let fields = occurrence
             .fields
             .iter()
-            .enumerate()
-            .map(|(ordinal, field)| {
-                (
-                    ordinal as u32,
-                    MvObservedSourceField::try_new(
-                        Bytes::copy_from_slice(field.field_id.as_bytes()),
-                        if rename {
-                            format!("new_{}", field.name_at_binding)
-                        } else {
-                            field.name_at_binding.clone()
-                        },
-                        field.type_signature.clone(),
-                        field.nullable,
-                    )
-                    .unwrap(),
+            .map(|field| {
+                MvObservedSourceField::try_new(
+                    Bytes::copy_from_slice(field.field_id.as_bytes()),
+                    if rename {
+                        format!("new_{}", field.name_at_binding)
+                    } else {
+                        field.name_at_binding.clone()
+                    },
+                    field.type_signature.clone(),
+                    field.nullable,
                 )
+                .unwrap()
             })
             .collect();
-        crate::mv::domain::storage_observation::schema_validation_from_spi(
-            SpiObservation::try_new(
+        crate::mv::domain::storage_observation::source_schema_from_spi(
+            novarocks_spi::connector::MvSourceSchemaObservation::try_new(
                 ConnectorTableIdentity {
                     instance_id: ConnectorInstanceId::parse(&occurrence.catalog_at_binding)
                         .unwrap(),
@@ -297,17 +249,10 @@ mod tests {
                     table: occurrence.relation_at_binding.clone().into(),
                 },
                 ConnectorTableObjectId::try_new(Bytes::copy_from_slice(object)).unwrap(),
-                ConnectorCommittedVersion::try_new(
-                    Bytes::from_static(b"source-metadata"),
-                    Some(12),
-                )
-                .unwrap(),
                 Bytes::from_static(b"source-schema-after-rename"),
-                Bytes::from_static(b"source-spec"),
                 true,
                 true,
                 fields,
-                vec![],
                 &context(),
             )
             .unwrap(),

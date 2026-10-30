@@ -275,12 +275,44 @@ pub(super) fn release_hold(
     deadline: Instant,
 ) -> Result<()> {
     use std::io::Write;
-    stream.set_write_timeout(Some(
-        deadline
-            .checked_duration_since(Instant::now())
-            .context("Native hold original deadline expired")?,
-    ))?;
-    stream.write_all(b"R")?;
+    ensure!(
+        Instant::now() < deadline,
+        "Native hold original deadline expired"
+    );
+    stream.set_nonblocking(true)?;
+    loop {
+        ensure!(
+            Instant::now() < deadline,
+            "Native hold original deadline expired"
+        );
+        match stream.write(b"R") {
+            Ok(1) => break,
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "Native hold release wrote no byte",
+                )
+                .into());
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotConnected
+                ) =>
+            {
+                // The original peer may already have ended its hold. This
+                // settles this rendezvous only, not Worker or operation exit.
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::yield_now();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     ensure!(
         Instant::now() < deadline,
         "Native hold original deadline expired"
@@ -385,5 +417,106 @@ mod tests {
                 .is_err()
         );
         assert!(owner.get().is_err());
+    }
+    #[test]
+    fn release_hold_after_peer_close_is_an_idempotent_rendezvous() {
+        let (mut stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(peer);
+        release_hold(
+            &mut stream,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn expired_release_does_not_send_a_new_byte() {
+        use std::io::Read;
+        let (mut stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(release_hold(&mut stream, Instant::now()).is_err());
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            peer.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(peer);
+        assert!(release_hold(&mut stream, Instant::now()).is_err());
+    }
+
+    #[test]
+    fn release_hold_delivers_the_original_byte_and_joins_the_peer() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let (mut stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let reader = std::thread::spawn(move || read_marker(&mut peer, deadline));
+        let released = release_hold(&mut stream, deadline);
+        drop(stream);
+        let received = reader.join();
+        released.unwrap();
+        assert_eq!(received.unwrap().unwrap(), "R");
+    }
+
+    #[test]
+    fn release_hold_obeys_real_queue_backpressure_and_joins() {
+        use std::io::{Read, Write};
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let (mut stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut queued = 0;
+        // Fill the actual kernel queue down to the one-byte release size.
+        // No capacity number or synthetic WouldBlock result substitutes for it.
+        for bytes in [&[0xa5_u8; 4096][..], &[0xa5_u8; 1][..]] {
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "original queue-fill deadline expired"
+                );
+                match stream.write(bytes) {
+                    Ok(0) => panic!("original queue fill wrote no byte"),
+                    Ok(count) => queued += count,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("original queue fill failed: {error}"),
+                }
+            }
+        }
+        assert!(queued > 0);
+        peer.set_nonblocking(true).unwrap();
+        let writer = std::thread::spawn(move || release_hold(&mut stream, deadline));
+        let drained = (|| -> Result<()> {
+            let mut received = 0;
+            let mut bytes = [0_u8; 4096];
+            while received < queued + 1 {
+                ensure!(
+                    Instant::now() < deadline,
+                    "original release drain deadline expired"
+                );
+                match peer.read(&mut bytes) {
+                    Ok(0) => anyhow::bail!("original release peer exited before R"),
+                    Ok(count) => {
+                        for &byte in &bytes[..count] {
+                            ensure!(received <= queued, "unexpected extra release byte");
+                            ensure!(
+                                byte == if received == queued { b'R' } else { 0xa5 },
+                                "original queued bytes or release byte changed"
+                            );
+                            received += 1;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(())
+        })();
+        // Even a failed drain closes only our original peer and joins its
+        // writer; an assertion cannot detach a live component thread.
+        drop(peer);
+        let released = writer.join();
+        drained.unwrap();
+        released.unwrap().unwrap();
     }
 }

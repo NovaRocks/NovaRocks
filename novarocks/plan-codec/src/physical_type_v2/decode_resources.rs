@@ -328,7 +328,7 @@ impl TypeDecodeModel {
                 let n = fields.fields.len();
                 self.request(array::<i8>(n)?, 1)?;
                 self.request(array::<Arc<Field>>(n)?, 1)?;
-                // Arrow58.4 UnionFields::try_new owns Vec::new()+push, followed
+                // Arrow 60.1.0 UnionFields::try_new owns Vec::new()+push, followed
                 // by Arc::from(Vec). Rust1.98 amortized capacities start at4
                 // tuples and double: at mostN requests, cumulative <=4N tuples.
                 if n != 0 {

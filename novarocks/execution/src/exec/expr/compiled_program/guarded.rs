@@ -3359,7 +3359,9 @@ mod result_creator_continuation_tests {
                     },
                     true,
                 )
-                .with_metadata([("provider.fact".into(), "kept".into())].into()),
+                .with_metadata(std::collections::HashMap::<String, String>::from(
+                    [("provider.fact".into(), "kept".into())],
+                )),
             );
             let raw: ArrayRef = if bufferless {
                 Arc::new(StructArray::new(
@@ -3598,8 +3600,12 @@ mod result_creator_continuation_tests {
         ));
         let ty = FunctionValueType::new(array.data_type().clone(), false);
         let field = Arc::new(
-            Field::new("provider-root", array.data_type().clone(), false)
-                .with_metadata([("provider.root".into(), "must stay original".into())].into()),
+            Field::new("provider-root", array.data_type().clone(), false).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "provider.root".into(),
+                    "must stay original".into(),
+                )]),
+            ),
         );
         let policy = novarocks_functions::ConstantPolicy {
             max_rows: 16,

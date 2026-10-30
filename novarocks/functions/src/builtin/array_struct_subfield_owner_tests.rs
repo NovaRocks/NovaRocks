@@ -406,7 +406,7 @@ fn public_array_projection_full_data_keeps_actual_domain_not_outer_demand() {
     host.released();
 }
 #[test]
-fn public_array_projection_case_collision_uses_original_conditional_cast() {
+fn public_array_projection_case_collision_is_an_explicit_binding_ambiguity() {
     let fields = vec![
         Arc::new(Field::new("ID", DataType::Int32, true)),
         Arc::new(Field::new("id", DataType::Int64, true)),
@@ -427,27 +427,38 @@ fn public_array_projection_case_collision_uses_original_conditional_cast() {
         None,
     ));
     let field = name("id");
-    let host = Host::with_limit(1 << 22);
-    let mut owner = instance(&source, &field, &host);
-    let sources = [
-        ScalarInvocationSource::Array(EvaluatedSourceLoan::new(&source, Selection::all(3))),
-        ScalarInvocationSource::Constant(&field),
+    let arguments = [
+        FunctionArgument::Value {
+            value_type: FunctionValueType::new(source.data_type().clone(), true),
+            constant: None,
+        },
+        FunctionArgument::Value {
+            value_type: FunctionValueType::new(DataType::Utf8, true),
+            constant: Some(field),
+        },
     ];
-    let out = owner
-        .evaluate_scoped(
-            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
-            &sources,
-            ScalarInvocationActivation::Activated,
-            &Control::default(),
+    let catalogue = super::catalogue::build_builtin_engine_function_catalog().unwrap();
+    let error = catalogue
+        .resolve_bound_user(
+            "__array_struct_subfield",
+            FunctionKind::Scalar,
+            FunctionBindingRequest {
+                arguments: &arguments,
+                logical_argument_count: 2,
+                expected_result_type: None,
+            },
+            crate::binding_test_control(),
         )
-        .unwrap();
-    // Binding's first ASCII-case-insensitive match is Int32; core's exact-byte
-    // match is Int64. The original default safe cast produces NULL on overflow.
-    assert_eq!(rows(&out), vec![vec![Some(123)], vec![None], vec![None]]);
-    drop(out);
-    drop(owner);
-    host.released();
+        .unwrap_err();
+    assert!(
+        matches!(&error, crate::FunctionBindingError::InvalidBinding(message) if message.contains("ambiguous"))
+    );
+    assert_eq!(
+        error.to_string(),
+        "invalid function binding: struct field 'id' is ambiguous"
+    );
 }
+
 #[test]
 fn public_array_projection_every_control_boundary_preserves_all_seven_causes_and_latch() {
     let source = ints(&[1, 2, 3]);
@@ -843,9 +854,9 @@ fn public_array_projection_nested_physical_children_use_original_take_complete_t
 }
 
 #[test]
-fn public_array_projection_utf8_conditional_cast_keeps_default_safe_nulls() {
+fn public_array_projection_unique_case_insensitive_utf8_keeps_original_values_without_cast() {
     let fields = vec![
-        Arc::new(Field::new("Chosen", DataType::Int32, true)),
+        Arc::new(Field::new("unselected", DataType::Int32, true)),
         Arc::new(Field::new("chosen", DataType::Utf8, true)),
     ]
     .into();
@@ -863,7 +874,7 @@ fn public_array_projection_utf8_conditional_cast_keeps_default_safe_nulls() {
         structures,
         None,
     ));
-    let field = name("chosen");
+    let field = name("CHOSEN");
     let host = Host::with_limit(1 << 22);
     let mut owner = instance(&source, &field, &host);
     let sources = [
@@ -878,7 +889,17 @@ fn public_array_projection_utf8_conditional_cast_keeps_default_safe_nulls() {
             &Control::default(),
         )
         .unwrap();
-    assert_eq!(rows(&out), vec![vec![Some(123)], vec![None], vec![None]]);
+    let list = out.values().as_any().downcast_ref::<ListArray>().unwrap();
+    let strings = list
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        strings.iter().collect::<Vec<_>>(),
+        vec![Some("123"), Some("invalid"), None]
+    );
+    assert_eq!(strings.data_type(), &DataType::Utf8);
     drop(out);
     drop(owner);
     host.released();
@@ -983,7 +1004,7 @@ fn run_child() -> ArrayRef {
     )
 }
 #[test]
-fn original_core_run_null_indices_preserve_pinned_encoded_math() {
+fn original_core_run_null_indices_preserve_logical_nulls_with_original_encoding() {
     use arrow_array::{RunArray, types::Int32Type};
     let child = run_child();
     let source = list(
@@ -1010,7 +1031,7 @@ fn original_core_run_null_indices_preserve_pinned_encoded_math() {
         .as_any()
         .downcast_ref::<RunArray<Int32Type>>()
         .unwrap();
-    assert_eq!(run.run_ends().values(), &[3, 4]);
+    assert_eq!(run.run_ends().values(), &[1, 2, 3, 4]);
     assert_eq!(
         run.values()
             .as_any()
@@ -1018,7 +1039,7 @@ fn original_core_run_null_indices_preserve_pinned_encoded_math() {
             .unwrap()
             .iter()
             .collect::<Vec<_>>(),
-        vec![Some("first"), Some("last")]
+        vec![None, Some("first"), None, Some("last")]
     );
 }
 #[test]
@@ -1607,4 +1628,163 @@ fn public_array_projection_validation_empty_actual_host_refusals_keep_typed_caus
             host.released();
         }
     }
+}
+
+#[test]
+fn struct_field_binding_shares_missing_and_ambiguity_rules_for_plain_and_array() {
+    let struct_type = DataType::Struct(
+        vec![
+            Field::new("ID", DataType::Int32, true),
+            Field::new("id", DataType::Int64, true),
+        ]
+        .into(),
+    );
+    let catalogue = super::catalogue::build_builtin_engine_function_catalog().unwrap();
+    for (function, source) in [
+        ("__struct_subfield", struct_type.clone()),
+        (
+            "__array_struct_subfield",
+            DataType::List(Arc::new(Field::new("item", struct_type.clone(), true))),
+        ),
+    ] {
+        for field in ["id", "ID", "absent"] {
+            let arguments = [
+                FunctionArgument::Value {
+                    value_type: FunctionValueType::new(source.clone(), true),
+                    constant: None,
+                },
+                FunctionArgument::Value {
+                    value_type: FunctionValueType::new(DataType::Utf8, true),
+                    constant: Some(name(field)),
+                },
+            ];
+            let error = catalogue
+                .resolve_bound_user(
+                    function,
+                    FunctionKind::Scalar,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: 2,
+                        expected_result_type: None,
+                    },
+                    crate::binding_test_control(),
+                )
+                .unwrap_err();
+            let expected = if field == "absent" {
+                "does not exist"
+            } else {
+                "ambiguous"
+            };
+            assert!(
+                matches!(&error,crate::FunctionBindingError::InvalidBinding(detail) if detail.contains(expected)),
+                "{function}: {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prepared_unique_ordinal_ignores_spelling_and_copies_no_other_field_values() {
+    let values: ArrayRef = Arc::new(StructArray::new(
+        vec![
+            Arc::new(Field::new("unselected", DataType::Int64, true)),
+            Arc::new(Field::new("Payload", DataType::Int32, true)),
+        ]
+        .into(),
+        vec![
+            Arc::new(Int64Array::from(vec![i64::MAX, i64::MIN, 0])),
+            Arc::new(Int32Array::from(vec![Some(11), None, Some(33)])),
+        ],
+        None,
+    ));
+    let source: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", values.data_type().clone(), true)),
+        OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+        values,
+        None,
+    ));
+    let field = name("pAYLOAD");
+    let host = Host::with_limit(1 << 22);
+    let mut owner = instance(&source, &field, &host);
+    let sources = [
+        ScalarInvocationSource::Array(EvaluatedSourceLoan::new(&source, Selection::all(3))),
+        ScalarInvocationSource::Constant(&field),
+    ];
+    let out = owner
+        .evaluate_scoped(
+            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            &sources,
+            ScalarInvocationActivation::Activated,
+            &Control::default(),
+        )
+        .unwrap();
+    assert_eq!(rows(&out), vec![vec![Some(11)], vec![None], vec![Some(33)]]);
+    assert!(
+        matches!(out.values().data_type(),DataType::List(item) if item.data_type()==&DataType::Int32)
+    );
+    drop(out);
+    drop(owner);
+    host.released();
+}
+
+#[test]
+fn direct_projection_rejects_mismatched_output_without_implicit_cast() {
+    let source = ints(&[1, 2]);
+    let names: ArrayRef = Arc::new(StringArray::from(vec!["ITEM"; 2]));
+    let target = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+    let error =
+        super::array_struct_subfield_core::project(&source, &names, Some(&target)).unwrap_err();
+    assert!(error.to_string().contains("prepared result declaration"));
+}
+
+#[test]
+fn public_array_projection_dense_union_nulls_use_the_existing_installed_owner() {
+    use arrow_array::UnionArray;
+    use arrow_schema::UnionFields;
+    let child: ArrayRef = Arc::new(
+        UnionArray::try_new(
+            UnionFields::try_new([5], [Field::new("item", DataType::Int32, true)]).unwrap(),
+            vec![5_i8; 4].into(),
+            Some(vec![0_i32, 1, 2, 3].into()),
+            vec![Arc::new(Int32Array::from(vec![11, 22, 33, 44]))],
+        )
+        .unwrap(),
+    );
+    let source = list(
+        child.clone(),
+        Some(vec![false, true, false, true]),
+        vec![0, 1, 2, 3, 4],
+        None,
+    );
+    let field = name("ITEM");
+    let host = Host::with_limit(1 << 22);
+    let mut owner = instance(&source, &field, &host);
+    let sources = [
+        ScalarInvocationSource::Array(EvaluatedSourceLoan::new(&source, Selection::all(4))),
+        ScalarInvocationSource::Constant(&field),
+    ];
+    let out = owner
+        .evaluate_scoped(
+            ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+            &sources,
+            ScalarInvocationActivation::Activated,
+            &Control::default(),
+        )
+        .unwrap();
+    let list = out.values().as_any().downcast_ref::<ListArray>().unwrap();
+    let union = list.values().as_any().downcast_ref::<UnionArray>().unwrap();
+    assert_eq!(union.type_ids().as_ref(), &[5_i8; 4]);
+    assert_eq!(
+        union
+            .child(5)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![None, Some(22), None, Some(44)]
+    );
+    drop(out);
+    drop(owner);
+    host.released();
 }

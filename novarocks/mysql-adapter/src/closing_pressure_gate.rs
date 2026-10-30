@@ -368,6 +368,7 @@ impl PressureOwner {
     pub(crate) fn bind_statement(
         &self,
         connection: ClientConnectionToken,
+        expected_session: novarocks_query_application::session_control::SessionToken,
         statement: StatementToken,
         actual_sql_sha256: [u8; 32],
     ) -> io::Result<Option<PressureScope>> {
@@ -406,8 +407,7 @@ impl PressureOwner {
             return Err(self.core.fail(Failure::Transition));
         }
         if state.facts.original_sql_sha256 != Some(actual_sql_sha256)
-            || statement.session().connection_id() != connection.connection_id()
-            || statement.session().session_epoch() == 0
+            || statement.session() != expected_session
             || statement.generation() == 0
         {
             return Err(self.core.fail(Failure::Identity));

@@ -68,7 +68,10 @@ impl PrivateDirectory {
         }
     }
     fn file(&self, generation: u64) -> PathBuf {
-        self.0.join(format!("real-run-7-11-{generation}.cap"))
+        self.0.join(format!(
+            "real-run-{}-{generation}.cap",
+            token(generation).session().key().get()
+        ))
     }
 }
 impl Drop for PrivateDirectory {
@@ -77,7 +80,15 @@ impl Drop for PrivateDirectory {
     }
 }
 fn token(generation: u64) -> StatementToken {
-    StatementToken::new(SessionToken::new(7, 11), generation)
+    StatementToken::new(
+        SessionToken::new(
+            novarocks_query_application::session_control::ClientSessionKey::new(
+                (7_u64 << 32) | 11_u64,
+            )
+            .expect("nonzero fixture session"),
+        ),
+        generation,
+    )
 }
 #[test]
 fn sql_dependency_artifact_storage_actual_data_charge_and_release_match_request() {
@@ -190,8 +201,14 @@ fn sql_dependency_artifact_storage_distinct_tokens_and_create_new_preserve_origi
     assert_eq!(first.bytes_written(), 84);
     first.finish_storage().unwrap();
     let original = std::fs::read(dir.file(13)).unwrap();
-    assert_eq!(&original[..8], b"NRDEPS01");
+    assert_eq!(&original[..8], b"NRDEPS02");
+    assert_eq!(
+        &original[8..16],
+        &token(13).session().key().get().to_le_bytes()
+    );
+    assert_eq!(&original[20..28], &13u64.to_le_bytes());
     assert_eq!(&original[28..60], &[0x71; 32]);
+    assert_eq!(&original[60..64], &2u32.to_le_bytes());
     assert!(
         matches!(factory.begin(token(13), &[0x72;32], &work.owner.scope()), Err(CaptureStorageError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists)
     );

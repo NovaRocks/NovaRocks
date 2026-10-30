@@ -1,0 +1,38 @@
+{
+  "deployment_id": "novarocks-ci",
+  "repository": "NovaRocks/NovaRocks",
+  "account_id": "1234567890123456",
+  "region": "cn-beijing",
+  "base_image_id": "replace-with-ubuntu26-image-id",
+  "candidates": [
+    {
+      "instance_type": "ecs.g7.2xlarge",
+      "vswitch_id": "vsw-replace",
+      "zone": "cn-beijing-k"
+    }
+  ],
+  "security_group_id": "sg-replace",
+  "instance_ram_role": "novarocks-ci-worker",
+  "system_disk_gib": 200,
+  "oss": {
+    "bucket": "replace-ci-bucket",
+    "prefix": "novarocks-ci"
+  },
+  "deadline": {
+    "work_minutes": 150,
+    "upload_reserve_minutes": 15,
+    "teardown_reserve_minutes": 15
+  },
+  "watcher": {
+    "poll_seconds": 10,
+    "cancel_budget_seconds": 120
+  },
+  "janitor": {
+    "grace_minutes": 15
+  },
+  "github": {
+    "runner_group_id": 1,
+    "workflow": ".github/workflows/aliyun-ci.yml"
+  },
+  "internet_max_bandwidth_out_mbps": 5
+}

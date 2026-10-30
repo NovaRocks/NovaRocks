@@ -129,7 +129,10 @@ fn map_size_only_real_map_signature_preserves_full_source_identity() {
         for sorted in [false, true] {
             let field = Arc::new(
                 Field::new("authored-entries", DataType::Struct(fields.clone()), false)
-                    .with_metadata([("entry-fact".into(), "preserved".into())].into()),
+                    .with_metadata(std::collections::HashMap::<String, String>::from([(
+                        "entry-fact".into(),
+                        "preserved".into(),
+                    )])),
             );
             let source = FunctionValueType::from_legacy_declared_projection(
                 DataType::Map(field.clone(), sorted),

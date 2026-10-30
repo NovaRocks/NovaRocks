@@ -866,6 +866,7 @@ impl ValueConversionContext {
             new_buffer_owners: 2,
         })
         .map_err(ValueFailure::Caller)?;
+        crate::control::shared_slice_owner::<Buffer, E>(regions.len(), observe)?;
         let array = unsafe {
             arrow_raw::make_view_unchecked(
                 layout,
@@ -962,6 +963,7 @@ fn convert_original<E>(
         new_buffer_owners: 1,
     })
     .map_err(ValueFailure::Caller)?;
+    crate::control::shared_slice_owner::<Buffer, E>(regions.len(), observe)?;
     let array = unsafe {
         arrow_raw::make_view_unchecked(layout, views.into(), regions, source.nulls().cloned())
     }?;
@@ -1604,5 +1606,74 @@ mod tests {
         let published = context.decode_planned(&plan);
         assert!(published.is_flattened());
         assert_eq!(published.value(0).unwrap(), Some(b"b".as_slice()));
+    }
+    #[test]
+    fn shared_view_table_refusal_preserves_original_cause_source_and_retry() {
+        use std::cell::Cell;
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["original external value"]));
+        for (input, budget) in [
+            (values.clone(), 8 * 1024 * 1024),
+            (dictionary(values.clone(), vec![Some(0)]), 8 * 1024 * 1024),
+            // Zero cache budget forces the original flatten constructor rather
+            // than retaining/reusing the dictionary conversion bottom.
+            (dictionary(values.clone(), vec![Some(0)]), 0),
+        ] {
+            let mut context = ValueConversionContext::new(budget);
+            let cause = Arc::new(83);
+            let published = Cell::new(false);
+            let refused = Cell::new(false);
+            let table = novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::array::<Buffer>(1).unwrap(),
+            )
+            .unwrap();
+            let result = context.decode_structured_observed(
+                &source(&input, ByteLayout::Utf8),
+                &ReachableRows::all(1),
+                &mut |_| {
+                    assert!(!refused.get(), "growth after original table refusal");
+                    Ok(())
+                },
+                &mut |_| {
+                    assert!(!refused.get(), "work after original table refusal");
+                    Ok(())
+                },
+                &mut |event| {
+                    assert!(!refused.get(), "structure after original table refusal");
+                    match event {
+                        ValueStructure::ByteArray { .. } => published.set(true),
+                        ValueStructure::SharedOwner(actual) if published.get() => {
+                            assert_eq!(actual, table);
+                            refused.set(true);
+                            return Err(cause.clone());
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                },
+            );
+            let Err(ValueFailure::Caller(actual)) = result else {
+                panic!("actual view table observer refusal")
+            };
+            assert!(Arc::ptr_eq(&actual, &cause));
+            assert!(refused.get());
+            let output = context
+                .decode(&source(&input, ByteLayout::Utf8), &ReachableRows::all(1))
+                .unwrap();
+            oracle(&output, &[Some("original external value")]);
+            if budget == 0 {
+                assert!(
+                    output.is_flattened(),
+                    "zero cache budget uses flatten on retry"
+                );
+            }
+            assert_eq!(
+                values
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "original external value"
+            );
+        }
     }
 }

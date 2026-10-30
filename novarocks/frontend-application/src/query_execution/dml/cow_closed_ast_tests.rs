@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::super::cow_compile_receipt::borrowed_value_footprint::{self as footprint, Failure};
 use super::*;
-use crate::query_execution::internal_result_cpu::INTERNAL_PEAK_BYTES;
 use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
 use novarocks_types::schema::SqlType;
 use std::sync::Arc;
@@ -35,19 +33,6 @@ fn declared(declaration: &SqlType, carrier: &DataType) -> FunctionValueType {
     .expect("complete COW type")
 }
 
-fn map_failure(f: Failure) -> BuildError {
-    match f {
-        Failure::ResourceExhausted => BuildError::ResourceExhausted,
-        Failure::Stopped => BuildError::InvalidSource("original COW scope stopped"),
-        Failure::InvalidSource(s) => BuildError::InvalidSource(s),
-        Failure::OriginalSemantic(s) => BuildError::OriginalSemantic(s.into()),
-    }
-}
-fn preflight(a: &dyn Array, row: usize) -> Result<()> {
-    footprint::borrowed_value(a, row, INTERNAL_PEAK_BYTES)
-        .map(|_| ())
-        .map_err(map_failure)
-}
 fn old_cell(
     column: &ArrayRef,
     row: usize,
@@ -79,7 +64,7 @@ fn old_cell(
     Ok(novarocks_parser::printer::print_expr(e))
 }
 fn new_cell(column: &ArrayRef, row: usize, declaration: &FunctionValueType) -> Result<String> {
-    let e = checked_value(column.as_ref(), row, &preflight, &|| Ok(()))?;
+    let e = checked_value(column.as_ref(), row, &|| Ok(()))?;
     Ok(novarocks_parser::printer::print_expr(&cast(
         e,
         declaration,
@@ -227,7 +212,7 @@ fn unsupported_nonnull_values_stay_unsupported_but_null_first_is_retained() {
 }
 
 #[test]
-fn preflight_rejection_happens_before_nested_ast_constructor_entry() {
+fn invalid_borrowed_row_is_rejected_before_nested_ast_constructor_entry() {
     let mut list = ListBuilder::new(BooleanBuilder::new());
     for _ in 0..4096 {
         list.values().append_value(true);
@@ -235,33 +220,25 @@ fn preflight_rejection_happens_before_nested_ast_constructor_entry() {
     list.append(true);
     let array = list.finish();
     let entered = std::cell::Cell::new(0_u64);
-    let result = checked_value(
-        &array,
-        0,
-        &|a, r| {
-            // Real borrowed nested lower bound; deliberately smaller COMPONENT
-            // allowance to exercise growth ordering, not a production profile.
-            footprint::borrowed_value(a, r, std::mem::size_of::<Expr>() as u64)
-                .map(|_| ())
-                .map_err(map_failure)
-        },
-        &|| {
-            entered.set(entered.get() + 1);
-            Ok(())
-        },
-    );
-    assert!(matches!(result, Err(BuildError::ResourceExhausted)));
+    let result = checked_value(&array, array.len(), &|| {
+        entered.set(entered.get() + 1);
+        Ok(())
+    });
+    assert!(matches!(
+        result,
+        Err(BuildError::InvalidSource("COW value row is out of bounds"))
+    ));
     assert_eq!(entered.get(), 0);
 }
 
 #[test]
-fn nested_constructor_still_checks_original_scope_after_first_admission() {
+fn nested_constructor_still_checks_original_scope_during_construction() {
     let array = ListArray::from_iter_primitive::<arrow::datatypes::Int8Type, _, _>([Some(vec![
             Some(1);
             600
         ])]);
     let checks = std::cell::Cell::new(0_u64);
-    let result = checked_value(&array, 0, &preflight, &|| {
+    let result = checked_value(&array, 0, &|| {
         checks.set(checks.get() + 1);
         if checks.get() == 2 {
             Err(BuildError::InvalidSource("original scope closed"))
@@ -279,7 +256,7 @@ fn nested_constructor_still_checks_original_scope_after_first_admission() {
 #[test]
 fn every_generated_nonempty_slot_is_exact_and_empty_values_are_rejected() {
     let a: ArrayRef = Arc::new(BinaryArray::from(vec![&b"abc"[..]]));
-    let e = checked_value(a.as_ref(), 0, &preflight, &|| Ok(())).unwrap();
+    let e = checked_value(a.as_ref(), 0, &|| Ok(())).unwrap();
     let Expr::Literal(Literal {
         kind: LiteralKind::HexString(s),
         ..
@@ -305,36 +282,10 @@ fn every_generated_nonempty_slot_is_exact_and_empty_values_are_rejected() {
     let mut projection = exact_vec(1).unwrap();
     projection.push(item(column("__nr_values", "__nr_v_0").unwrap(), "value").unwrap());
     let query = select(projection, from, None, None).unwrap();
-    let measured =
-        super::super::cow_compile_receipt::deep_closed_query::query_owned(&query).unwrap();
-    assert!(measured > std::mem::size_of::<Query>() as u64);
+    assert!(!novarocks_parser::printer::print_query(&query).is_empty());
     assert!(values(Vec::new(), "x", Vec::new()).is_err());
 }
 
-fn type_owned(ty: &TypeName) -> u64 {
-    // Inspect the actual public AST backing independently of the spelling
-    // projection used to construct it. Inline children are in the argument Vec.
-    let mut bytes = (ty.name.parts.capacity() * std::mem::size_of::<Ident>()) as u64
-        + (ty.arguments.capacity() * std::mem::size_of::<TypeNameArgument>()) as u64
-        + ty.argument_separator_spaces.capacity() as u64;
-    for part in &ty.name.parts {
-        bytes += part.value.capacity() as u64;
-    }
-    for argument in &ty.arguments {
-        bytes += match argument {
-            TypeNameArgument::Type(child) => type_owned(child),
-            TypeNameArgument::Field(field) => {
-                field.name.value.capacity() as u64 + type_owned(&field.data_type)
-            }
-            TypeNameArgument::Literal(Literal {
-                kind: LiteralKind::Number(value),
-                ..
-            }) => value.capacity() as u64,
-            _ => panic!("closed type argument"),
-        };
-    }
-    bytes
-}
 fn cast_sql(value: &FunctionValueType) -> String {
     novarocks_parser::printer::print_expr(&cast(null(), value, &|| Ok(())).unwrap())
 }
@@ -353,10 +304,6 @@ fn complete_domains_determine_same_carrier_cast_spelling() {
     assert!(matches!(
         type_name(&plain_fixed, &|| Ok(())),
         Err(BuildError::OriginalSemantic(_))
-    ));
-    assert!(matches!(
-        super::super::cow_compile_receipt::type_footprint::exact_type_heap(&plain_fixed),
-        Err(Failure::OriginalSemantic(_))
     ));
     assert_eq!(
         cast_sql(&declared(&SqlType::LargeInt, &carrier)),
@@ -384,10 +331,14 @@ fn complete_domains_determine_same_carrier_cast_spelling() {
     ));
 }
 #[test]
-fn nested_declared_domains_and_exact_type_heap_share_actual_spelling() {
+fn nested_declared_domains_preserve_actual_cast_spelling() {
     use arrow::datatypes::Field;
-    let leaf = Field::new("format_item", DataType::Utf8, false)
-        .with_metadata([("nrLogicalType".into(), "opaque-source-label".into())].into());
+    let leaf = Field::new("format_item", DataType::Utf8, false).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "nrLogicalType".into(),
+            "opaque-source-label".into(),
+        )]),
+    );
     let carrier = DataType::Struct(
         vec![
             Field::new("j`son", DataType::List(Arc::new(leaf)), true),
@@ -406,11 +357,7 @@ fn nested_declared_domains_and_exact_type_heap_share_actual_spelling() {
         ),
     ]);
     let complete = declared(&declaration, &carrier);
-    let ty = type_name(&complete, &|| Ok(())).unwrap();
-    assert_eq!(
-        super::super::cow_compile_receipt::type_footprint::exact_type_heap(&complete).unwrap(),
-        type_owned(&ty)
-    );
+    type_name(&complete, &|| Ok(())).unwrap();
     let sql = cast_sql(&complete);
     assert!(sql.contains("ARRAY<JSON>"), "{sql}");
     assert!(sql.contains("j``son"), "{sql}");
@@ -439,36 +386,60 @@ fn nested_declared_domains_and_exact_type_heap_share_actual_spelling() {
         ),
     ] {
         let complete = declared(&declaration, &carrier);
-        assert_eq!(
-            super::super::cow_compile_receipt::type_footprint::exact_type_heap(&complete).unwrap(),
-            type_owned(&type_name(&complete, &|| Ok(())).unwrap())
-        );
+        assert!(type_name(&complete, &|| Ok(())).is_ok());
     }
 }
 #[test]
 fn type_construction_preserves_first_original_caller_without_tail() {
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorStopOwner, OriginalResultCheckClass,
+    };
+    use std::error::Error;
+
+    let (control, root, binding, _capacity) =
+        crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+    let cancellation = ConnectorStopOwner::new();
+    let context = crate::connector::connector_request_context(None, cancellation.view()).unwrap();
+    let scope = crate::query_execution::original_cow_result_scope::from_original_binding(
+        &binding, &context,
+    )
+    .unwrap();
+    scope.check_active().expect("the original caller is active");
+    cancellation.request_stop();
     let complete = declared(&SqlType::Json, &DataType::Utf8);
     let calls = std::cell::Cell::new(0);
     let failure = type_name(&complete, &|| {
         calls.set(calls.get() + 1);
-        Err(BuildError::Control(
-            novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Cancelled,
-                "original COW caller stopped",
-            ),
-        ))
+        scope.check_active().map_err(BuildError::Original)
     })
     .unwrap_err();
-    let BuildError::Control(original) = failure else {
+    let BuildError::Original(original) = failure else {
         panic!("original caller");
     };
-    assert_eq!(original.message(), "original COW caller stopped");
+    assert_eq!(original.class(), OriginalResultCheckClass::Control);
+    assert_eq!(
+        original.failure_fact(),
+        ConnectorErrorKind::Cancelled.failure_fact()
+    );
+    let source = original
+        .source()
+        .unwrap()
+        .downcast_ref::<ConnectorError>()
+        .unwrap();
+    assert_eq!(source.kind(), ConnectorErrorKind::Cancelled);
+    assert_eq!(source.message(), "connector operation was cancelled");
     assert_eq!(calls.get(), 1);
+    drop(original);
+    drop(scope);
+    drop(binding);
+    root.owner.complete();
+    root.business.release();
+    control.close_admission();
 }
 
 #[test]
-fn authored_variant_fields_keep_exact_cast_identity_and_prospective_heap() {
-    use super::super::cow_compile_receipt::type_footprint;
+fn authored_variant_fields_keep_exact_cast_identity() {
     for (declaration, expected) in [
         (SqlType::Binary, "VARBINARY"),
         (SqlType::Variant, "VARIANT"),
@@ -484,10 +455,10 @@ fn authored_variant_fields_keep_exact_cast_identity_and_prospective_heap() {
             assert_eq!(new, old);
             assert!(old.ends_with(&format!(" AS {expected})")));
         }
-        let name = type_name(&complete, &|| Ok(())).unwrap();
+        type_name(&complete, &|| Ok(())).unwrap();
         assert_eq!(
-            type_footprint::exact_type_heap(&complete).unwrap(),
-            type_owned(&name)
+            novarocks_parser::printer::print_expr(&cast(null(), &complete, &|| Ok(())).unwrap()),
+            format!("CAST(NULL AS {expected})")
         );
     }
     // A mismatched declaration/carrier cannot become a signed complete author.
@@ -504,7 +475,6 @@ fn authored_variant_fields_keep_exact_cast_identity_and_prospective_heap() {
 
 #[test]
 fn declared_cow_field_types_preserve_original_caster_supported_intersection() {
-    use super::super::cow_compile_receipt::type_footprint;
     let cases = [
         (DataType::FixedSizeBinary(16), SqlType::LargeInt),
         (DataType::Utf8, SqlType::Json),
@@ -537,12 +507,9 @@ fn declared_cow_field_types_preserve_original_caster_supported_intersection() {
         match (old, new) {
             (Ok(old), Ok(new)) => {
                 assert_eq!(novarocks_parser::printer::print_expr(&new), old);
-                assert_eq!(
-                    type_footprint::exact_type_heap(&complete).unwrap(),
-                    type_owned(&type_name(&complete, &|| Ok(())).unwrap())
-                );
+                assert!(type_name(&complete, &|| Ok(())).is_ok());
             }
-            (Err(_), Err(_)) => assert!(type_footprint::exact_type_heap(&complete).is_err()),
+            (Err(_), Err(_)) => assert!(type_name(&complete, &|| Ok(())).is_err()),
             (old, new) => {
                 panic!("original/new COW cast support differs for {complete:?}: {old:?}, {new:?}")
             }
@@ -552,5 +519,4 @@ fn declared_cow_field_types_preserve_original_caster_supported_intersection() {
     // old carrier-only VARBINARY downgrade while merging the upstream test.
     let fixed = declared(&SqlType::Binary, &DataType::FixedSizeBinary(16));
     assert!(type_name(&fixed, &|| Ok(())).is_err());
-    assert!(type_footprint::exact_type_heap(&fixed).is_err());
 }

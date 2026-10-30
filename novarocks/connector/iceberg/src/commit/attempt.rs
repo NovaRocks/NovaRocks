@@ -70,12 +70,92 @@ pub(crate) trait Publisher: Send + Sync {
         request: &FrozenRequest,
         operation: &IcebergCommitOperation,
     ) -> Result<()>;
+    /// Borrow the original request slot. A scoped producer may move it only
+    /// into its stable original Source while the same CPU receipt is awaited.
+    /// Other existing families keep their original pure preflight author until
+    /// their P06 interface retirement; no network or refused CPU fallback.
+    fn preflight_recovery_in<'a>(
+        &'a self,
+        request: &'a mut Option<crate::commit::model::FrozenRequest>,
+        operation: &'a IcebergCommitOperation,
+    ) -> crate::commit::attempt::RecoveryPreflightFuture<'a> {
+        crate::commit::attempt::RecoveryPreflightFuture::ready(
+            request
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::new(ErrorKind::DataInvalid, "Original frozen request is absent")
+                })
+                .and_then(|request| self.preflight_recovery(request, operation)),
+        )
+    }
     /// Consume one complete request and issue at most one external mutation.
     async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof>;
 }
 
 /// The retained OCC entrance has one direct catalog dispatch per attempt.
 /// It shares staging and retry with owner publication without changing topology.
+/// Pure preflight stays inline. Only a real asynchronous scoped phase owns
+/// an independently quoted Box pointee; forwarding creates no hidden heap work.
+pub(crate) enum RecoveryPreflightFuture<'a> {
+    Ready(Option<Result<()>>),
+    Pending(std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>),
+}
+impl<'a> RecoveryPreflightFuture<'a> {
+    pub(crate) fn ready(result: Result<()>) -> Self {
+        Self::Ready(Some(result))
+    }
+    pub(crate) fn pending(
+        original: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>,
+    ) -> Self {
+        Self::Pending(original)
+    }
+    pub(crate) fn bind_preparation<R: Clone + Send + Sync + 'static>(
+        self,
+        journal: &'a observation::PublicationJournal<R>,
+        operation: &'a IcebergCommitOperation,
+    ) -> Self {
+        match self {
+            Self::Ready(mut result) => Self::ready(
+                result
+                    .take()
+                    .expect("one original preflight observation")
+                    .and_then(|()| journal.bind_preparation(operation.request_context().clone())),
+            ),
+            pending => Self::pending(Box::pin(bind_preparation_original(
+                pending, journal, operation,
+            ))),
+        }
+    }
+    pub(crate) fn binding_future_bytes<R: Clone + Send + Sync + 'static>() -> usize {
+        fn bytes<A, B, C, F: std::future::Future>(_: fn(A, B, C) -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        bytes(bind_preparation_original::<R>)
+    }
+}
+impl std::future::Future for RecoveryPreflightFuture<'_> {
+    type Output = Result<()>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.get_mut() {
+            Self::Ready(result) => {
+                std::task::Poll::Ready(result.take().expect("one original preflight observation"))
+            }
+            Self::Pending(original) => original.as_mut().poll(cx),
+        }
+    }
+}
+async fn bind_preparation_original<R: Clone + Send + Sync + 'static>(
+    original: RecoveryPreflightFuture<'_>,
+    journal: &observation::PublicationJournal<R>,
+    operation: &IcebergCommitOperation,
+) -> Result<()> {
+    original.await?;
+    journal.bind_preparation(operation.request_context().clone())
+}
+
 pub(crate) type RecoveryPreflight =
     std::sync::Arc<dyn Fn(&FrozenRequest, &IcebergCommitOperation) -> Result<()> + Send + Sync>;
 
@@ -103,6 +183,13 @@ impl Publisher for PinnedExpiryPublisher<'_> {
         operation: &IcebergCommitOperation,
     ) -> Result<()> {
         self.inner.preflight_recovery(request, operation)
+    }
+    fn preflight_recovery_in<'a>(
+        &'a self,
+        request: &'a mut Option<crate::commit::model::FrozenRequest>,
+        operation: &'a IcebergCommitOperation,
+    ) -> crate::commit::attempt::RecoveryPreflightFuture<'a> {
+        self.inner.preflight_recovery_in(request, operation)
     }
     async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
         self.inner.dispatch_once(request).await
@@ -196,6 +283,11 @@ impl RetryPolicy {
 /// Neither cancellation nor elapsed retry time interrupts an already-issued dispatch.
 /// Once publication is possible, its typed outcome alone decides cleanup and retry.
 // Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
+#[derive(Clone, Copy)]
+enum CommittedCleanupPhase {
+    Inline,
+    Retained,
+}
 pub(crate) async fn run(
     operation: &IcebergCommitOperation,
     intent: &OperationIntent,
@@ -203,6 +295,48 @@ pub(crate) async fn run(
     preparers: &[&dyn Preparer],
     publisher: &dyn Publisher,
     policy: RetryPolicy,
+) -> Report {
+    run_in_phase(
+        operation,
+        intent,
+        prefix,
+        preparers,
+        publisher,
+        policy,
+        CommittedCleanupPhase::Inline,
+    )
+    .await
+}
+/// Same algorithm and one dispatch, returning only after the true publication
+/// frontier. Its checked journal retains the exact published object set; the
+/// caller's same original operation must later drive cleanup to actual exit.
+pub(crate) async fn run_to_committed_frontier(
+    operation: &IcebergCommitOperation,
+    intent: &OperationIntent,
+    prefix: &PreparedChange,
+    preparers: &[&dyn Preparer],
+    publisher: &dyn Publisher,
+    policy: RetryPolicy,
+) -> Report {
+    run_in_phase(
+        operation,
+        intent,
+        prefix,
+        preparers,
+        publisher,
+        policy,
+        CommittedCleanupPhase::Retained,
+    )
+    .await
+}
+async fn run_in_phase(
+    operation: &IcebergCommitOperation,
+    intent: &OperationIntent,
+    prefix: &PreparedChange,
+    preparers: &[&dyn Preparer],
+    publisher: &dyn Publisher,
+    policy: RetryPolicy,
+    cleanup_phase: CommittedCleanupPhase,
 ) -> Report {
     if operation.token() != intent.token() {
         return rejected(
@@ -255,9 +389,17 @@ pub(crate) async fn run(
                         prepare(&attempt, intent, base, prefix, preparers).await?;
                     check_window(operation, started, policy)
                         .map_err(|error| before_dispatch_failure(&error))?;
+                    let mut original_request = Some(request);
                     publisher
-                        .preflight_recovery(&request, operation)
+                        .preflight_recovery_in(&mut original_request, operation)
+                        .await
                         .map_err(|error| before_dispatch_failure(&error))?;
+                    let request = original_request.ok_or_else(|| {
+                        before_dispatch_failure(&Error::new(
+                            ErrorKind::DataInvalid,
+                            "Preflight did not return its original frozen request",
+                        ))
+                    })?;
                     check_window(operation, started, policy)
                         .map_err(|error| before_dispatch_failure(&error))?;
                     Ok::<_, ConnectorMutationFailure>((attempt, request, retained))
@@ -273,7 +415,12 @@ pub(crate) async fn run(
             CatalogOutcome::KnownCommitted { receipt, .. } => {
                 return Report {
                     publication: PublicationOutcome::Committed(receipt),
-                    cleanup: operation.cleanup_after_commit(&retained).await,
+                    cleanup: match cleanup_phase {
+                        CommittedCleanupPhase::Inline => {
+                            operation.cleanup_after_commit(&retained).await
+                        }
+                        CommittedCleanupPhase::Retained => IcebergCleanupReport::NotAttempted,
+                    },
                 };
             }
             CatalogOutcome::CommitUnknown { failure, evidence } => {
@@ -1376,6 +1523,51 @@ mod tests {
             IcebergCleanupReport::Complete { deleted: 0 }
         );
         assert_eq!(fixture.operation.artifacts().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn committed_frontier_retains_the_actual_operation_until_cleanup_is_driven() {
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V3);
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
+        let discarded = ObjectIdentity::new(format!(
+            "file://{}/superseded-owned.puffin",
+            fixture.directory.path().display(),
+        ))
+        .unwrap();
+        std::fs::write(discarded.path().strip_prefix("file://").unwrap(), b"owned").unwrap();
+        fixture
+            .operation
+            .adopt_session_data(discarded.clone())
+            .unwrap();
+        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
+        let report = run_to_committed_frontier(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&FastAppendPreparer],
+            &publisher,
+            policy(),
+        )
+        .await;
+        assert!(matches!(
+            report.publication,
+            PublicationOutcome::Committed(_)
+        ));
+        assert_eq!(report.cleanup, IcebergCleanupReport::NotAttempted);
+        assert!(std::path::Path::new(discarded.path().strip_prefix("file://").unwrap()).exists());
+        let retained = fixture
+            .operation
+            .artifacts()
+            .unwrap()
+            .into_iter()
+            .map(|artifact| artifact.object)
+            .filter(|object| object != &discarded)
+            .collect::<Vec<_>>();
+        let cleanup = fixture.operation.cleanup_after_commit(&retained).await;
+        assert_eq!(cleanup, IcebergCleanupReport::Complete { deleted: 1 });
+        assert!(!std::path::Path::new(discarded.path().strip_prefix("file://").unwrap()).exists());
+        assert_eq!(publisher.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

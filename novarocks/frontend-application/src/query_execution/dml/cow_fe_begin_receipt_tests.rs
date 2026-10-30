@@ -16,7 +16,7 @@
 // under the License.
 
 #[test]
-fn request_bound_uses_original_safe_source_and_real_containers_without_new_admission() {
+fn request_uses_original_safe_source_without_a_metadata_capacity_invoice() {
     let fixture = cow_rewrite_query_fixture(
         vec![7],
         vec![2],
@@ -29,22 +29,8 @@ fn request_bound_uses_original_safe_source_and_real_containers_without_new_admis
     let context = connector_context_for_test();
     let deadline = context.deadline();
     let selection = collect_admitted_cow_selection(&fixture, &binding, context.clone());
-    let source = selection.owned_source_backing_upper().unwrap().unwrap() as u64;
-    let containers = selection.retained_container_bytes().unwrap() as u64;
     let held = capacity.snapshot().held_positions;
-    let receipt = cow_fe_begin_receipt::before_request(
-        &fixture.preparation,
-        &selection,
-        "db1",
-        "t",
-        &binding,
-        &context,
-    )
-    .unwrap();
-    let actual_total = receipt.through_request_peak_upper().unwrap();
-    let source_is_not_visible_bytes = source > selection.byte_count();
-    let existing_covers_backing_and_headers = receipt.existing_upper > source + containers;
-    let request_has_its_own_bound = actual_total > receipt.existing_upper;
+    cow_fe_begin_receipt::before_request(&selection, &binding, &context).unwrap();
     let held_unchanged = capacity.snapshot().held_positions == held;
     drop(selection);
     drop(fixture);
@@ -53,9 +39,6 @@ fn request_bound_uses_original_safe_source_and_real_containers_without_new_admis
     root.business.release();
     let exited = capacity.snapshot().held_positions;
     drop(control);
-    assert!(source_is_not_visible_bytes);
-    assert!(existing_covers_backing_and_headers);
-    assert!(request_has_its_own_bound);
     assert!(held_unchanged);
     assert_eq!(context.deadline(), deadline);
     assert_eq!(exited, [0; 4]);
@@ -75,10 +58,7 @@ fn legacy_selection_without_safe_receipts_never_enters_request_construction() {
         crate::query_execution::internal_result_cpu::admitted_internal_fixture();
     let entered = std::cell::Cell::new(false);
     let result = cow_fe_begin_receipt::before_request(
-        &fixture.preparation,
         &fixture.selection,
-        "db1",
-        "t",
         &binding,
         &connector_context_for_test(),
     )
@@ -114,14 +94,7 @@ fn original_control_failure_precedes_missing_source_receipts_at_request_boundary
         spi::ConnectorRequestContext::try_new(deadline, stop.view(), 64 * 1024, 1024 * 1024)
             .unwrap();
     stop.request_stop();
-    let result = cow_fe_begin_receipt::before_request(
-        &fixture.preparation,
-        &fixture.selection,
-        "db1",
-        "t",
-        &binding,
-        &context,
-    );
+    let result = cow_fe_begin_receipt::before_request(&fixture.selection, &binding, &context);
     let first_control = matches!(&result, Err(cow_necessary_before_begin::Error::Control(error))
         if error.kind() == spi::ConnectorErrorKind::Cancelled);
     drop(result);
@@ -186,7 +159,7 @@ fn nonempty_context_for_clone_receipt(
 }
 
 #[test]
-fn real_context_clone_two_vectors_are_counted_before_request_and_strings_shared() {
+fn real_context_clone_preserves_original_properties_credentials_and_shared_strings() {
     let fixture = cow_rewrite_query_fixture(
         vec![7],
         vec![2],
@@ -199,36 +172,13 @@ fn real_context_clone_two_vectors_are_counted_before_request_and_strings_shared(
     let original = connector_context_for_test();
     let deadline = original.deadline();
     let selection = collect_admitted_cow_selection(&fixture, &binding, original.clone());
-    let base = cow_fe_begin_receipt::borrowed_fe_begin_receipt(
-        &fixture.preparation,
-        &selection,
-        "db1",
-        "t",
-        &original,
-    )
-    .unwrap()
-    .unwrap();
     let context = nonempty_context_for_clone_receipt(original);
     let props = context
         .vended_credential_lease_collection()
         .unwrap()
         .catalog_properties();
-    // Derive the expected new clone layout BEFORE the request Context clone.
-    let expected = std::mem::size_of_val(props.execution_properties())
-        + std::mem::size_of_val(props.credential_bindings());
     let held = capacity.snapshot().held_positions;
-    let receipt = cow_fe_begin_receipt::before_request(
-        &fixture.preparation,
-        &selection,
-        "db1",
-        "t",
-        &binding,
-        &context,
-    )
-    .unwrap();
-    let delta = receipt.fresh_request_peak_upper - base.fresh_request_peak_upper;
-    let total = receipt.through_request_peak_upper().unwrap();
-    let window_check = binding.window_alias().check_backing_total(total).is_ok();
+    cow_fe_begin_receipt::before_request(&selection, &binding, &context).unwrap();
     // This is the actual production type's Clone, after actual before_request.
     let copied = context.clone();
     let copied_props = copied
@@ -274,10 +224,7 @@ fn real_context_clone_two_vectors_are_counted_before_request_and_strings_shared(
     root.business.release();
     let exited = capacity.snapshot().held_positions;
     drop(control);
-    assert!(expected > 0);
-    assert_eq!(delta, expected as u64);
-    assert_eq!(receipt.existing_upper, base.existing_upper);
-    assert!(window_check && positions_unchanged && same_deadline);
+    assert!(positions_unchanged && same_deadline);
     assert!(
         separate_properties
             && separate_bindings
@@ -310,15 +257,7 @@ fn original_stop_refuses_nonempty_context_before_the_request_clone() {
     stop.request_stop();
     let entered = std::cell::Cell::new(false);
     let held = capacity.snapshot().held_positions;
-    let result = cow_fe_begin_receipt::before_request(
-        &fixture.preparation,
-        &selection,
-        "db1",
-        "t",
-        &binding,
-        &context,
-    )
-    .map(|_| {
+    let result = cow_fe_begin_receipt::before_request(&selection, &binding, &context).map(|_| {
         entered.set(true);
         context.clone()
     });

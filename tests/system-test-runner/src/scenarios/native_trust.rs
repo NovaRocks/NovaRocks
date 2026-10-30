@@ -768,32 +768,8 @@ fn assert_credential_domain_task_ingress(
     Ok(())
 }
 
-/// Confirms one acceptance query really crossed the trust boundary and
-/// finished there.
-///
-/// Named for the boundary rather than for a lifecycle, because the retired
-/// protocol that owned that word is not what carries these queries any more.
-///
-/// This scenario is about JWT and TLS, not about lifecycle bookkeeping: the
-/// retired assertions here -- a non-empty participant outcome list, no error
-/// source, and every outcome a positive proof -- were only how it confirmed
-/// that a query had run end to end over the transport under test. None of the
-/// three has a subject on the task protocol:
-///
-/// * Participant outcomes are gone as a concept. The task protocol mints no
-///   `ParticipantTerminalOutcome`, and the frontend publishes an empty list
-///   rather than fabricating proofs (ADR-0135), so both the "not empty" and
-///   the "all proofs" assertions are unsatisfiable rather than merely false.
-/// * `error_source` is structurally `None` here. A task round publishes its
-///   convergence evidence only after the client-visible answer is already
-///   linearized as a success -- a failed attempt aborts its contexts and
-///   publishes nothing -- so the assertion could not fail, and an assertion
-///   that cannot fail is worse than no assertion.
-///
-/// What replaces them is the same confirmation built from the task protocol's
-/// own evidence, and it is deliberately stronger in one respect: it is scoped
-/// to this query's execution identity, where the retired backend-log
-/// assertions matched any query in the run.
+/// Confirms native execution and convergence across the trust boundary using
+/// this query's exact Task evidence.
 fn assert_query_crossed_trust_boundary(
     context: &mut ScenarioContext,
     snapshot: &QueryLifecycleStructuredSnapshot,

@@ -77,7 +77,7 @@ impl HadoopFileSystemCatalog {
         if !access
             .operator()
             .info()
-            .full_capability()
+            .capability()
             .write_with_if_not_exists
         {
             return Err(Error::new(
@@ -295,7 +295,7 @@ mod tests {
                 }
                 assert!(
                     matches!(publish(catalog,attempt,false,context,&journal).await,
-                ExternalMutationOutcome::KnownCommitted {effect:ExternalMutationEffect::Applied,receipt,finalization:ExternalMutationFinalization::Complete} if receipt==facts.table_uuid)
+                ExternalMutationOutcome::KnownCommitted { cleanup: _, effect:ExternalMutationEffect::Applied,receipt,finalization:ExternalMutationFinalization::Complete} if receipt==facts.table_uuid)
                 );
                 assert_eq!(std::fs::read(facts.metadata_location).unwrap(), bytes);
                 assert_eq!(
@@ -321,7 +321,7 @@ mod tests {
                 let uuid = attempt.facts.table_uuid.clone();
                 catalog.inject_test_fault(fault);
                 assert!(
-                    matches!(publish(catalog,attempt,false,context,&journal).await,ExternalMutationOutcome::KnownCommitted{effect:ExternalMutationEffect::Applied, receipt, finalization:ExternalMutationFinalization::Failed(_)} if receipt==uuid)
+                    matches!(publish(catalog,attempt,false,context,&journal).await,ExternalMutationOutcome::KnownCommitted{ cleanup: _, effect:ExternalMutationEffect::Applied, receipt, finalization:ExternalMutationFinalization::Failed(_)} if receipt==uuid)
                 );
                 assert!(
                     directory

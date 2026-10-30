@@ -5,6 +5,10 @@ domain: [provider-spi]
 status: active
 supersedes: [ADR-0023, ADR-0030, ADR-0051]
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0198
+    scope: "The all-participant-success commit gate and reliance on begin-session abort or age-gated GC for missing writer output; dataflow writers, one bounded root, frontend-only commit, per-driver ownership and statement-wide union bounds remain active"
+    link: "ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md"
 date: 2026-09-01
 provenance:
   - "discussion: 2026-09-01 distributed writer data plane and frontend commit boundary"
@@ -14,9 +18,9 @@ code-anchors:
   - "novarocks/spi/src/connector/write_stack/relation.rs (writer_output_schema, root_output_schema)"
   - "novarocks/execution/src/exec/operators/table_writer.rs (TableWriterOperatorFactory)"
   - "novarocks/execution/src/exec/operators/table_finish.rs (TableFinishOperatorFactory)"
-  - "novarocks/backend/src/connector/write_data_plane.rs (RootCommitFragmentCarrierValidator)"
-  - "novarocks/frontend/src/query_execution/write_barrier.rs (WriteCommitBarrier)"
-  - "novarocks/frontend/src/query_execution/write_session.rs (ConnectorWriteSession)"
+  - "novarocks/native-adapter/src/connector_write_data_plane.rs (RootCommitFragmentCarrierValidator)"
+  - "novarocks/frontend-application/src/query_execution/internal_consumer/write.rs (wait_write)"
+  - "novarocks/frontend-application/src/query_execution/write_session.rs (ConnectorWriteSession)"
   - "novarocks/connector/iceberg/src/commit/write_stack/control.rs (IcebergWriteSessionControl)"
 ---
 

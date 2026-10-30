@@ -81,6 +81,26 @@ impl SharedFailureCause {
             detail,
         }))
     }
+    /// A closed producer's static diagnostic avoids evaluating an arbitrary
+    /// formatter. The actual cause and its independently authored fact remain
+    /// the same original; this grants no allocation or execution capacity.
+    pub fn from_static_detail<E: Error + FailureProjection + Send + Sync + 'static>(
+        cause: E,
+        detail: &'static str,
+    ) -> Self {
+        let fact = cause.failure_fact();
+        Self(Arc::new(CauseRecord {
+            cause,
+            fact,
+            detail: BoundedDetail::truncating(detail),
+        }))
+    }
+    /// The actual private pointee, including fact and BoundedDetail header.
+    /// The caller's locked Arc-layout author adds the original Arc counters;
+    /// E's already-owned pointees and diagnostic bytes are separate custody.
+    pub fn record_layout<E>() -> std::alloc::Layout {
+        std::alloc::Layout::new::<CauseRecord<E>>()
+    }
     pub fn detail(&self) -> &str {
         self.0.local_detail()
     }
@@ -195,5 +215,37 @@ mod tests {
         assert_eq!(first.detail().len(), crate::DIAGNOSTIC_MAX_BYTES / 3 * 3);
         assert!(first.detail().chars().all(|c| c == '界'));
         assert_eq!(projections.load(Ordering::SeqCst), 2);
+    }
+    #[test]
+    fn static_detail_preserves_original_fact_without_calling_foreign_formatter() {
+        let projections = Arc::new(AtomicUsize::new(0));
+        let detail: &'static str = "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界";
+        let source = SharedFailureCause::from_static_detail(
+            ForeignCause {
+                projections: projections.clone(),
+                panic_on_display: true,
+            },
+            detail,
+        );
+        assert_eq!(source.failure_fact().class(), FailureClass::Resource);
+        assert!(
+            source
+                .downcast_ref::<ForeignCause>()
+                .unwrap()
+                .panic_on_display
+        );
+        assert_eq!(projections.load(Ordering::SeqCst), 1);
+        assert_eq!(source.detail().len(), 510);
+        assert!(source.detail().chars().all(|value| value == '界'));
+        // The quote follows the actual erased Arc pointee, including its fact
+        // and String header, rather than the smaller originating E alone.
+        assert_eq!(
+            SharedFailureCause::record_layout::<ForeignCause>(),
+            std::alloc::Layout::for_value(source.0.as_ref())
+        );
+        assert!(
+            SharedFailureCause::record_layout::<ForeignCause>().size()
+                > std::mem::size_of::<ForeignCause>()
+        );
     }
 }

@@ -41,11 +41,15 @@ use novarocks_spi::connector::{
 };
 
 use novarocks_execution::runtime::query_options::QueryOptions;
+#[cfg(test)]
+use novarocks_native_adapter::root_cow_selection_codec::CowSelectionCodecError;
 use novarocks_native_adapter::root_cow_selection_codec::{
-    COW_SELECTION_MAX_RECORD_BYTES, CowSelectionCodecError, CowSelectionRecordHeader,
+    COW_SELECTION_MAX_RECORD_BYTES, CowOwnedDecodeError, CowSelectionRecordHeader,
     CowSelectionRecordKind, CowSelectionStreamDecoder,
 };
-use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
+use novarocks_native_adapter::root_record_assembly::{
+    RootRecordAssembly, RootRecordAssemblyError, RootRecordDomain, RootRecordFramingError,
+};
 
 const DELETE_EFFECT_TAG: i8 = 1;
 const REPLACE_EFFECT_TAG: i8 = 2;
@@ -441,9 +445,13 @@ fn normalize_owned_to_signed_selection(
     retention: Option<&ConnectorPayloadRetentionGuard>,
     declarations: &[novarocks_type_contract::FunctionValueType],
     conversions: &mut novarocks_value_arrays::decode::ValueConversionContext,
+    sql_output: Option<&signed_layout::CowSqlOutput>,
     work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
 ) -> Result<ConnectorRowMutationSourceBatch, ConnectorError> {
-    let input = source.batch();
+    let projected = sql_output
+        .map(|output| output.validate_and_project(source.batch(), declarations, work))
+        .transpose()?;
+    let input = projected.as_deref().unwrap_or_else(|| source.batch());
     let observed_input = ConnectorRowConversionFootprint::retained_batch_bytes(input)?;
     let source_scratch = source.source_bytes().saturating_sub(observed_input);
     // 32 MiB validator + 8 MiB bookkeeping coexist while collecting. The
@@ -486,7 +494,20 @@ fn normalize_owned_to_signed_selection(
         )?,
         None => ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema))?,
     };
-    let normalized = plan.execute(conversions, work)?;
+    // Hydrate supplies its real output/scratch layouts before any allocation.
+    // Keep these original receipts until the temporary normalized batch exits;
+    // the independent SourceBuilder copies obtain their own Buffer receipts.
+    let mut normalization_receipts = Vec::new();
+    let normalized = plan.execute_with_growth(
+        conversions,
+        &mut |layout| {
+            if let Some(author) = retention {
+                normalization_receipts.push(author.reserve_owned_bytes(layout.size())?);
+            }
+            Ok(())
+        },
+        work,
+    )?;
     let mut columns = owner.children(schema.fields().len())?;
     let mut node = 0;
     for column in normalized.columns() {
@@ -516,6 +537,9 @@ pub struct RelayedCowSelectionCollector {
     collector: BoundedRowMutationMatchCollector,
     declarations: Vec<novarocks_type_contract::FunctionValueType>,
     conversions: novarocks_value_arrays::decode::ValueConversionContext,
+    sql_output: Option<signed_layout::CowSqlOutput>,
+    #[cfg(test)]
+    local_assembly: bool,
     retention: Option<ConnectorPayloadRetentionGuard>,
 }
 
@@ -527,7 +551,9 @@ impl RelayedCowSelectionCollector {
         schema: SchemaRef,
     ) -> Result<Self, ConnectorError> {
         let declarations = signed_layout::fixture_declarations(&schema);
-        Self::try_new_declared(context, exec_mem_limit, schema, declarations)
+        let mut collector = Self::try_new_declared(context, exec_mem_limit, schema, declarations)?;
+        collector.local_assembly = true;
+        Ok(collector)
     }
 
     pub fn try_new_declared(
@@ -555,13 +581,16 @@ impl RelayedCowSelectionCollector {
             schema,
             collector,
             retention: None,
+            #[cfg(test)]
+            local_assembly: false,
             declarations,
             conversions: novarocks_value_arrays::decode::ValueConversionContext::new(0),
+            sql_output: None,
         })
     }
 
     pub fn check_end(&self, output_rows: u64) -> Result<(), ConnectorError> {
-        self.assembly.finish().map_err(invalid_match)?;
+        self.assembly.finish().map_err(cow_framing_error)?;
         if self.collector.row_count() != output_rows {
             return Err(invalid_match(
                 "COW selection row count differs from Root End",
@@ -584,6 +613,10 @@ impl RelayedCowSelectionCollector {
 
     /// Feed one relayed body.
     pub fn push_body(&mut self, body: &[u8]) -> Result<(), ConnectorError> {
+        #[cfg(test)]
+        let explicit_local = self.local_assembly;
+        #[cfg(not(test))]
+        let explicit_local = false;
         let Self {
             assembly,
             decoder,
@@ -592,49 +625,25 @@ impl RelayedCowSelectionCollector {
             retention,
             declarations,
             conversions,
+            sql_output,
+            ..
         } = self;
-        // Keep the collector's own error kind (cancellation, deadline,
-        // budget) rather than flattening it through the assembly sink.
-        let mut collector_error = None;
-        let pushed = assembly.push(body, |record| {
-            let header =
-                CowSelectionRecordHeader::parse(record).map_err(|error| error.to_string())?;
+        let consume = |record: &[u8]| {
+            let header = CowSelectionRecordHeader::parse(record).map_err(cow_codec_error)?;
             if header.kind() == CowSelectionRecordKind::Batch {
                 // Refuse the declaration before the private codec creates Arrow buffers.
-                collector.check_next_batch(header.rows()).map_err(|error| {
-                    let message = error.to_string();
-                    collector_error = Some(error);
-                    message
-                })?;
+                collector.check_next_batch(header.rows())?;
             }
             let decoded = match retention.as_ref() {
                 Some(guard) => decoder.apply_owned_record_with_guard(record, guard.clone()),
                 None => decoder.apply_owned_record(record),
             };
-            let Some(batch) = decoded.map_err(|error| {
-                let message = format!("decode relayed COW selection record: {error}");
-                if matches!(
-                    error,
-                    CowSelectionCodecError::SourceLimit
-                        | CowSelectionCodecError::SchemaLimit
-                        | CowSelectionCodecError::BatchLimit
-                        | CowSelectionCodecError::RecordLimit
-                        | CowSelectionCodecError::ScratchLimit
-                ) {
-                    collector_error = Some(ConnectorError::new(
-                        ConnectorErrorKind::ResourceExhausted,
-                        message.clone(),
-                    ));
-                }
-                message
-            })?
-            else {
+            let Some(batch) = decoded.map_err(cow_owned_decode_error)? else {
                 let width = decoder.schema().map_or(0, |relayed| relayed.fields().len());
                 if width != schema.fields().len() {
-                    return Err(
-                        "relayed COW selection schema width differs from its signed contract"
-                            .to_string(),
-                    );
+                    return Err(invalid_match(
+                        "relayed COW selection schema width differs from its signed contract",
+                    ));
                 }
                 return Ok(());
             };
@@ -646,33 +655,33 @@ impl RelayedCowSelectionCollector {
                 retention.as_ref(),
                 declarations,
                 conversions,
+                sql_output.as_ref(),
                 &mut |_| collector.check_control(),
-            )
-            .map_err(|error| {
-                let message = error.to_string();
-                collector_error = Some(error);
-                message
-            })?;
-            collector.push_owned(batch).map_err(|error| {
-                let message = error.to_string();
-                collector_error = Some(error);
-                message
-            })
-        });
-        if let Some(error) = collector_error {
-            conversions.clear();
-            return Err(error);
-        }
+            )?;
+            collector.push_owned(batch)
+        };
+        let pushed = match retention.as_ref() {
+            Some(author) => {
+                assembly.push_budgeted(body, |bytes| author.reserve_owned_bytes(bytes), consume)
+            }
+            None if explicit_local => assembly.push(body, consume),
+            None => Err(RootRecordAssemblyError::Sink(invalid_match(
+                "COW Root assembly requires its original byte-budget author",
+            ))),
+        };
         if pushed.is_err() {
             conversions.clear();
         }
-        pushed.map_err(invalid_match)
+        pushed.map_err(|error| match error {
+            RootRecordAssemblyError::Sink(error) => error,
+            RootRecordAssemblyError::Framing(error) => cow_framing_error(error),
+        })
     }
 
     /// The stream's End: no record may remain unfinished.
     pub fn finish(mut self) -> Result<ConnectorRowMutationSelection, ConnectorError> {
         self.conversions.clear();
-        self.assembly.finish().map_err(invalid_match)?;
+        self.assembly.finish().map_err(cow_framing_error)?;
         // Schema-only streams retain the decoder's holder until the whole
         // selection has its own holder, including its empty indices.
         let _decoder_schema = self.decoder.finish_with_guard();
@@ -689,6 +698,22 @@ pub(crate) struct CowMatchRootConsumer {
 
 impl CowMatchRootConsumer {
     #[cfg(test)]
+    fn fixture_output(
+        declarations: &[novarocks_type_contract::FunctionValueType],
+    ) -> Vec<novarocks_query_application::api::ResultField> {
+        declarations
+            .iter()
+            .enumerate()
+            .map(|(ordinal, value)| {
+                novarocks_query_application::api::ResultField::new(
+                    format!("__nr_sel_{ordinal}"),
+                    value.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn try_new(
         context: ConnectorRequestContext,
         schema: SchemaRef,
@@ -696,7 +721,11 @@ impl CowMatchRootConsumer {
         intent: ConnectorRowMutationIntent,
     ) -> Result<Self, ConnectorError> {
         let declarations = signed_layout::fixture_declarations(&schema);
-        Self::try_new_declared(context, schema, declarations, contract, intent)
+        let output = Self::fixture_output(&declarations);
+        let mut consumer =
+            Self::try_new_declared(context, schema, declarations, contract, intent, &output)?;
+        consumer.collector.local_assembly = true;
+        Ok(consumer)
     }
     #[cfg(test)]
     pub(crate) fn try_new_with_capacity(
@@ -707,6 +736,7 @@ impl CowMatchRootConsumer {
         binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     ) -> Result<Self, ConnectorError> {
         let declarations = signed_layout::fixture_declarations(&schema);
+        let output = Self::fixture_output(&declarations);
         Self::try_new_declared_with_capacity(
             context,
             schema,
@@ -714,6 +744,7 @@ impl CowMatchRootConsumer {
             contract,
             intent,
             binding,
+            &output,
         )
     }
 
@@ -723,15 +754,21 @@ impl CowMatchRootConsumer {
         declarations: Vec<novarocks_type_contract::FunctionValueType>,
         contract: ConnectorMutationMatchContract,
         intent: ConnectorRowMutationIntent,
+        output: &[novarocks_query_application::api::ResultField],
     ) -> Result<Self, ConnectorError> {
+        let mut collector =
+            RelayedCowSelectionCollector::try_new_declared(context, None, schema, declarations)?;
+        let validator = RowMutationMatchValidator::try_new(contract, intent)?;
+        let sql_output = signed_layout::CowSqlOutput::try_new(
+            output,
+            &collector.schema,
+            &validator,
+            &mut |_| collector.collector.check_control(),
+        )?;
+        collector.sql_output = Some(sql_output);
         Ok(Self {
-            collector: RelayedCowSelectionCollector::try_new_declared(
-                context,
-                None,
-                schema,
-                declarations,
-            )?,
-            validator: RowMutationMatchValidator::try_new(contract, intent)?,
+            collector,
+            validator,
         })
     }
 
@@ -742,6 +779,7 @@ impl CowMatchRootConsumer {
         contract: ConnectorMutationMatchContract,
         intent: ConnectorRowMutationIntent,
         binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        output: &[novarocks_query_application::api::ResultField],
     ) -> Result<Self, ConnectorError> {
         let window = binding.window_alias();
         crate::query_execution::internal_result_cpu::require_internal_result_capacity(
@@ -749,8 +787,14 @@ impl CowMatchRootConsumer {
             &window,
         )
         .map_err(invalid_match)?;
-        let guard = ConnectorPayloadRetentionGuard::new(window);
-        let mut consumer = Self::try_new_declared(context, schema, declarations, contract, intent)?;
+        let retention =
+            crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(binding)
+                .map_err(invalid_match)?;
+        let guard = retention
+            .try_spi_guard()
+            .map_err(|error| invalid_match(error.to_string()))?;
+        let mut consumer =
+            Self::try_new_declared(context, schema, declarations, contract, intent, output)?;
         consumer.collector.collector.retention = Some(guard.clone());
         consumer.collector.retention = Some(guard);
         Ok(consumer)
@@ -859,7 +903,7 @@ impl RowMutationMatchValidator {
     }
 
     pub fn validate_batch(&mut self, batch: &RecordBatch) -> Result<(), ConnectorError> {
-        self.validate_schema(batch)?;
+        self.validate_schema(&batch.schema())?;
         let effect_ordinal = usize::try_from(self.contract.effect_field().target_ordinal())
             .map_err(|_| invalid_match("row-mutation effect ordinal does not fit usize"))?;
         let effects = batch
@@ -936,9 +980,9 @@ impl RowMutationMatchValidator {
         Ok(())
     }
 
-    fn validate_schema(&self, batch: &RecordBatch) -> Result<(), ConnectorError> {
+    fn validate_schema(&self, schema: &SchemaRef) -> Result<(), ConnectorError> {
         for field in self.contract.identity_fields() {
-            validate_schema_field(batch, field.source_ordinal(), field.field())?;
+            validate_schema_field(schema, field.source_ordinal(), field.field())?;
         }
         for field in self
             .contract
@@ -946,10 +990,10 @@ impl RowMutationMatchValidator {
             .iter()
             .chain(self.contract.after_fields())
         {
-            validate_schema_field(batch, field.target_ordinal(), field.field())?;
+            validate_schema_field(schema, field.target_ordinal(), field.field())?;
         }
         validate_schema_field(
-            batch,
+            schema,
             self.contract.effect_field().target_ordinal(),
             self.contract.effect_field().field(),
         )
@@ -1003,13 +1047,12 @@ fn match_field(
 }
 
 fn validate_schema_field(
-    batch: &RecordBatch,
+    schema: &SchemaRef,
     ordinal: u32,
     expected: &arrow::datatypes::Field,
 ) -> Result<(), ConnectorError> {
     let ordinal = usize::try_from(ordinal)
         .map_err(|_| invalid_match("row-mutation field ordinal does not fit usize"))?;
-    let schema = batch.schema();
     let actual = schema
         .fields()
         .get(ordinal)
@@ -1028,6 +1071,32 @@ fn decode_effect(value: i8) -> Result<ConnectorRowMutationEffect, ConnectorError
         REPLACE_EFFECT_TAG => Ok(ConnectorRowMutationEffect::Replace),
         INSERT_EFFECT_TAG => Ok(ConnectorRowMutationEffect::Insert),
         _ => Err(invalid_match("row-mutation effect tag is unknown")),
+    }
+}
+
+fn cow_owned_decode_error(error: CowOwnedDecodeError) -> ConnectorError {
+    match error {
+        CowOwnedDecodeError::Codec(error) => cow_codec_error(error),
+        CowOwnedDecodeError::Source(error) => error,
+    }
+}
+
+fn cow_codec_error<E>(error: E) -> ConnectorError
+where
+    E: std::error::Error + novarocks_failure_contract::FailureProjection + Send + Sync + 'static,
+{
+    use novarocks_failure_contract::FailureClass;
+    let kind = match error.failure_fact().class() {
+        FailureClass::Resource => ConnectorErrorKind::ResourceExhausted,
+        _ => ConnectorErrorKind::CorruptData,
+    };
+    ConnectorError::from_domain(kind, error)
+}
+
+fn cow_framing_error(error: RootRecordFramingError) -> ConnectorError {
+    match error {
+        RootRecordFramingError::Cow(error) => cow_codec_error(error),
+        other => cow_codec_error(other),
     }
 }
 
@@ -1146,6 +1215,318 @@ mod tests {
             Field::new("after", DataType::Int32, true),
             Field::new("effect", DataType::Int8, false),
         ]))
+    }
+
+    fn required_role_contract(before_nullable: bool) -> ConnectorMutationMatchContract {
+        let original = contract();
+        let target = |field: &ConnectorMutationTargetField, nullable| {
+            ConnectorMutationTargetField::try_new_typed(
+                field.token(),
+                field.field().clone().with_nullable(nullable),
+                field.target_ordinal(),
+                field
+                    .execution_type()
+                    .unwrap()
+                    .with_nullable(nullable)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        ConnectorMutationMatchContract::try_new(
+            original.owner().clone(),
+            original.table().clone(),
+            original.base_version().clone(),
+            original.identity_fields().to_vec(),
+            vec![target(&original.before_fields()[0], before_nullable)],
+            vec![target(&original.after_fields()[0], false)],
+            original.uniqueness_tokens().to_vec(),
+            original.effect_field().clone(),
+        )
+        .unwrap()
+    }
+    fn required_role_schema(before_nullable: bool) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("identity", DataType::Int32, false),
+            Field::new("before", DataType::Int32, before_nullable),
+            Field::new("after", DataType::Int32, false),
+            Field::new("effect", DataType::Int8, false),
+        ]))
+    }
+    fn frozen_sql_fields(
+        nullable: [bool; 3],
+    ) -> Vec<novarocks_query_application::api::ResultField> {
+        nullable
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, nullable)| {
+                novarocks_query_application::api::ResultField::new(
+                    format!("__nr_sel_{ordinal}"),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int32, nullable),
+                )
+            })
+            .chain(std::iter::once(
+                novarocks_query_application::api::ResultField::new(
+                    "__nr_sel_3",
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+                ),
+            ))
+            .collect()
+    }
+    fn sql_values(values: [Option<i32>; 3]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("sql_identity", DataType::Int32, true),
+                Field::new("sql_before", DataType::Int32, true),
+                Field::new("sql_after", DataType::Int32, true),
+                Field::new("sql_effect", DataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![values[0]])),
+                Arc::new(Int32Array::from(vec![values[1]])),
+                Arc::new(Int32Array::from(vec![values[2]])),
+                Arc::new(Int8Array::from(vec![REPLACE_EFFECT_TAG])),
+            ],
+        )
+        .unwrap()
+    }
+    fn constrained_cow_consumer(
+        output: &[novarocks_query_application::api::ResultField],
+    ) -> CowMatchRootConsumer {
+        let schema = required_role_schema(false);
+        let declarations = signed_layout::fixture_declarations(&schema);
+        let mut consumer = CowMatchRootConsumer::try_new_declared(
+            context(
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                1 << 20,
+            ),
+            schema,
+            declarations,
+            required_role_contract(false),
+            ConnectorRowMutationIntent::Merge {
+                effects: vec![ConnectorRowMutationEffect::Replace],
+            },
+            output,
+        )
+        .unwrap();
+        consumer.collector.local_assembly = true;
+        consumer
+    }
+
+    #[test]
+    fn nullable_sql_after_null_is_business_data_but_the_sql_promise_remains_strict() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_value_arrays::{ValueError, ValueViolation};
+        let input = sql_values([Some(1), Some(10), None]);
+        let stream = relayed_stream(std::slice::from_ref(&input));
+        let mut consumer = constrained_cow_consumer(&frozen_sql_fields([false, false, true]));
+        let error = consumer.push_body(&stream).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        assert!(
+            error
+                .to_string()
+                .contains("COW assignment value does not satisfy its required target")
+        );
+        let mut consumer = constrained_cow_consumer(&frozen_sql_fields([false, false, false]));
+        let error = consumer.push_body(&stream).unwrap_err();
+        assert_eq!(
+            error.failure_fact(),
+            ValueError::Invariant(ValueViolation::RequiredNull).failure_fact()
+        );
+        // Complete equality may reuse the middle target check, never the
+        // actual SQL promise above or the original Hydrate/selection authors.
+        let mut consumer = constrained_cow_consumer(&frozen_sql_fields([false, false, false]));
+        consumer
+            .push_body(&relayed_stream(&[sql_values([
+                Some(1),
+                Some(10),
+                Some(11),
+            ])]))
+            .unwrap();
+        let selection = consumer.finish().unwrap();
+        assert_eq!(
+            selection.batches()[0]
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            11,
+        );
+    }
+
+    #[test]
+    fn required_string_after_rejects_a_valid_sql_null_as_business_data() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let original = required_role_contract(false);
+        let field = &original.after_fields()[0];
+        let contract = ConnectorMutationMatchContract::try_new(
+            original.owner().clone(),
+            original.table().clone(),
+            original.base_version().clone(),
+            original.identity_fields().to_vec(),
+            original.before_fields().to_vec(),
+            vec![
+                ConnectorMutationTargetField::try_new_typed(
+                    field.token(),
+                    Field::new(field.field().name(), DataType::Utf8, false),
+                    field.target_ordinal(),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                )
+                .unwrap(),
+            ],
+            original.uniqueness_tokens().to_vec(),
+            original.effect_field().clone(),
+        )
+        .unwrap();
+        let target = Arc::new(Schema::new(vec![
+            Field::new("identity", DataType::Int32, false),
+            Field::new("before", DataType::Int32, false),
+            Field::new("after", DataType::Utf8, false),
+            Field::new("effect", DataType::Int8, false),
+        ]));
+        let mut output = frozen_sql_fields([false, false, true]);
+        output[2] = novarocks_query_application::api::ResultField::new(
+            "__nr_sel_2",
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
+        let mut consumer = CowMatchRootConsumer::try_new_declared(
+            context(
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                1 << 20,
+            ),
+            Arc::clone(&target),
+            signed_layout::fixture_declarations(&target),
+            contract,
+            ConnectorRowMutationIntent::Merge {
+                effects: vec![ConnectorRowMutationEffect::Replace],
+            },
+            &output,
+        )
+        .unwrap();
+        consumer.collector.local_assembly = true;
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("sql_identity", DataType::Int32, false),
+                Field::new("sql_before", DataType::Int32, false),
+                Field::new("sql_after", DataType::Utf8, true),
+                Field::new("sql_effect", DataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(arrow::array::StringArray::from(vec![None::<&str>])),
+                Arc::new(Int8Array::from(vec![REPLACE_EFFECT_TAG])),
+            ],
+        )
+        .unwrap();
+        let error = consumer.push_body(&relayed_stream(&[source])).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        let input =
+            crate::query_execution::internal_consumer::domain_state::InternalDomainFailure::from(
+                error,
+            )
+            .execution_input()
+            .unwrap();
+        assert_eq!(input.fact().class(), FailureClass::Data);
+        assert_eq!(
+            input.detail().as_str(),
+            "statement execution failed in its coordinator"
+        );
+        assert_eq!(
+            input.site(),
+            novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator
+        );
+    }
+
+    #[test]
+    fn nullable_sql_identity_and_before_do_not_weaken_required_provider_invariants() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_value_arrays::{ValueError, ValueViolation};
+        let expected = ValueError::Invariant(ValueViolation::RequiredNull).failure_fact();
+        for values in [[None, Some(10), None], [Some(1), None, None]] {
+            let mut consumer = constrained_cow_consumer(&frozen_sql_fields([true, true, true]));
+            let error = consumer
+                .push_body(&relayed_stream(&[sql_values(values)]))
+                .unwrap_err();
+            assert_eq!(error.failure_fact(), expected);
+        }
+    }
+
+    #[test]
+    fn optional_before_remains_legal_and_frozen_sql_column_order_is_explicit() {
+        let schema = required_role_schema(true);
+        let validator = RowMutationMatchValidator::try_new(
+            required_role_contract(true),
+            ConnectorRowMutationIntent::Merge {
+                effects: vec![ConnectorRowMutationEffect::Replace],
+            },
+        )
+        .unwrap();
+        let output = frozen_sql_fields([false, true, true]);
+        let capture =
+            signed_layout::CowSqlOutput::try_new(&output, &schema, &validator, &mut |_| Ok(()))
+                .unwrap();
+        let input = sql_values([Some(1), None, Some(11)]);
+        let projected = capture
+            .validate_and_project(
+                &input,
+                &signed_layout::fixture_declarations(&schema),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        assert!(projected.column(1).is_null(0));
+        let output = frozen_sql_fields([false, false, true]);
+        let permutation = [2, 1, 0, 3];
+        let frozen = permutation
+            .iter()
+            .map(|&i| output[i].clone())
+            .collect::<Vec<_>>();
+        let input = sql_values([Some(1), Some(10), Some(11)])
+            .project(&permutation)
+            .unwrap();
+        let mut consumer = constrained_cow_consumer(&frozen);
+        consumer.push_body(&relayed_stream(&[input])).unwrap();
+        let selection = consumer.finish().unwrap();
+        let batch = &selection.batches()[0];
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            11
+        );
+    }
+
+    #[test]
+    fn malformed_sql_carrier_cannot_be_hidden_by_an_after_target_refusal() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_value_arrays::{ValueError, ValueViolation};
+        let mut output = frozen_sql_fields([false, false, true]);
+        output[2] = novarocks_query_application::api::ResultField::new(
+            "__nr_sel_2",
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
+        let mut consumer = constrained_cow_consumer(&output);
+        let error = consumer
+            .push_body(&relayed_stream(&[sql_values([Some(1), Some(10), None])]))
+            .unwrap_err();
+        assert_eq!(
+            error.failure_fact(),
+            ValueError::Invariant(ValueViolation::Layout).failure_fact()
+        );
     }
 
     #[test]
@@ -1439,6 +1820,7 @@ mod tests {
 
     #[test]
     fn relayed_selection_refuses_oversized_records_truncation_and_cancellation() {
+        use novarocks_failure_contract::FailureProjection;
         let one = batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]);
         let stream = relayed_stream(std::slice::from_ref(&one));
         let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
@@ -1465,7 +1847,24 @@ mod tests {
         let mut grown = batch_record[..40].to_vec();
         grown[8..16].copy_from_slice(&((budget as u64) + 1).to_le_bytes());
         let error = small.push_body(&grown).unwrap_err();
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert_eq!(
+            error.failure_fact(),
+            RootRecordFramingError::Capacity {
+                requested: budget + 1,
+                limit: budget,
+            }
+            .failure_fact()
+        );
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            .unwrap();
+        assert!(matches!(
+            source.downcast_ref::<RootRecordFramingError>(),
+            Some(RootRecordFramingError::Capacity { requested, limit })
+                if *requested == budget + 1 && *limit == budget
+        ));
         assert!(small.assembly_bytes() <= 32, "{}", small.assembly_bytes());
 
         // End inside an unfinished record is refused.
@@ -1476,9 +1875,35 @@ mod tests {
         )
         .unwrap();
         truncated.push_body(&stream[..stream.len() - 1]).unwrap();
+        let error = truncated.finish().unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
         assert_eq!(
-            truncated.finish().unwrap_err().kind(),
-            ConnectorErrorKind::InvalidRequest
+            error.failure_fact(),
+            RootRecordFramingError::Incomplete.failure_fact()
+        );
+
+        // A complete record reaches the actual codec sink without erasing its
+        // concrete cause through the generic framing callback.
+        let mut malformed_schema = stream[..schema_record].to_vec();
+        malformed_schema[32] = u8::MAX;
+        let mut malformed = RelayedCowSelectionCollector::try_new(
+            context(Arc::clone(&cancellation), 1 << 20),
+            None,
+            selection_schema(),
+        )
+        .unwrap();
+        let error = malformed.push_body(&malformed_schema).unwrap_err();
+        assert_eq!(
+            error.failure_fact(),
+            CowSelectionCodecError::MalformedSchema.failure_fact()
+        );
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            .unwrap();
+        assert_eq!(
+            source.downcast_ref::<CowSelectionCodecError>(),
+            Some(&CowSelectionCodecError::MalformedSchema)
         );
 
         // The collector's own cancellation kind survives the relay sink.
@@ -1536,6 +1961,82 @@ mod tests {
             ConnectorErrorKind::ResourceExhausted
         );
         assert_eq!(relayed.byte_count(), retained_before_refusal);
+    }
+
+    #[test]
+    fn production_cow_collector_without_author_is_refused_even_in_tests() {
+        let mut collector = RelayedCowSelectionCollector::try_new_declared(
+            context(
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                COW_SELECTION_BYTES as usize,
+            ),
+            None,
+            selection_schema(),
+            signed_layout::fixture_declarations(&selection_schema()),
+        )
+        .unwrap();
+        let stream = relayed_stream(&[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])]);
+        let error = collector.push_body(&stream).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(collector.assembly_bytes(), 0);
+        assert_eq!(collector.collector.row_count(), 0);
+    }
+
+    #[test]
+    fn actual_root_budget_refusal_reaches_cow_consumer_as_original_work_source() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_workload_control::{ResultCapacityConfig, WorkError};
+        use std::error::Error;
+        let (_control, root, binding, _) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let window = binding.window_alias();
+        let mut consumer = CowMatchRootConsumer::try_new_with_capacity(
+            context(
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                COW_SELECTION_BYTES as usize,
+            ),
+            selection_schema(),
+            contract(),
+            ConnectorRowMutationIntent::Merge {
+                effects: vec![ConnectorRowMutationEffect::Replace],
+            },
+            &binding,
+        )
+        .unwrap();
+        let original_reservation = window
+            .reserve_payload_bytes(ResultCapacityConfig::V1.all_objects_bytes[2])
+            .unwrap();
+        let held = window.retained_payload_bytes();
+        let stream = relayed_stream(&[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])]);
+        let error = consumer.push_body(&stream).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            .unwrap();
+        assert_eq!(
+            source.downcast_ref::<WorkError>(),
+            Some(&WorkError::Capacity("retained result bytes"))
+        );
+        assert_eq!(
+            error.failure_fact(),
+            WorkError::Capacity("retained result bytes").failure_fact()
+        );
+        assert_eq!(consumer.collector.collector.row_count(), 0);
+        assert_eq!(
+            consumer.collector.assembly_bytes(),
+            0,
+            "complete borrowed records create no partial copy"
+        );
+        assert_eq!(window.retained_payload_bytes(), held);
+        drop(consumer);
+        assert_eq!(window.retained_payload_bytes(), held);
+        drop(original_reservation);
+        assert_eq!(window.retained_payload_bytes(), 0);
+        drop((binding, window));
+        root.owner.complete();
+        root.business.release();
     }
 
     #[test]

@@ -80,7 +80,7 @@ fn original_pool() -> ConstantPool {
             Field::new("original.request", DataType::Int64, true).with_metadata(
                 [("producer".to_owned(), "request-only".to_owned())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         ),
         ty,
@@ -394,7 +394,7 @@ fn request_nested_named_semantics_are_checked_against_the_real_admitted_pool() {
             Field::new(metadata, DataType::Int64, true).with_metadata(
                 [("source.metadata".to_owned(), metadata.to_owned())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         )
     };

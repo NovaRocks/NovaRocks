@@ -163,6 +163,7 @@ impl MysqlWriteTestScope {
     pub(crate) fn arm(
         &self,
         statement: StatementToken,
+        expected_session: novarocks_query_application::session_control::SessionToken,
         sql_sha256: [u8; 32],
         cut: u64,
     ) -> io::Result<()> {
@@ -171,10 +172,10 @@ impl MysqlWriteTestScope {
         if state.facts.phase != GatePhase::Fresh {
             return Err(fail(&mut state, GateFailure::Transition));
         }
-        if statement.session().connection_id() != state.facts.connection.connection_id() {
+        if statement.session() != expected_session {
             return Err(fail(&mut state, GateFailure::Identity));
         }
-        // Session epoch and connection generation are distinct owner namespaces.
+        // The original session association was observed from the application owner.
         if cut == 0 || cut > MAX_CUT_BYTES {
             return Err(fail(&mut state, GateFailure::Length));
         }
@@ -725,7 +726,7 @@ mod tests {
                     let (mut client, write) = pair().await?;
                     let hook = binding
                         .hub
-                        .bind_statement(connection, statement, [0; 32])?
+                        .bind_statement(connection, statement.session(), statement, [0; 32])?
                         .unwrap();
                     let gate = super::super::late_binding::InitiallyRawMysqlWriter::new(
                         write,
@@ -943,7 +944,15 @@ mod tests {
     fn identities() -> (ClientConnectionToken, StatementToken) {
         (
             ClientConnectionToken::new(71, 19).unwrap(),
-            StatementToken::new(SessionToken::new(71, 23), 29),
+            StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (71_u64 << 32) | 23_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                29,
+            ),
         )
     }
     async fn pair() -> io::Result<(TcpStream, tokio::net::tcp::OwnedWriteHalf)> {
@@ -984,6 +993,7 @@ mod tests {
         assert_eq!(gate.is_write_vectored(), vectored);
         scope.arm(
             statement,
+            statement.session(),
             Sha256::digest(b"fixture SQL identity").into(),
             cut,
         )?;
@@ -1065,8 +1075,12 @@ mod tests {
                 fixture_work(async {
                     let (mut client, write) = pair().await?;
                     let gate = MysqlWriteGate::new(write, &scope)?;
-                    scope.arm(statement, [0; 32], 2)?;
-                    assert!(scope.arm(statement, [0; 32], 2).is_err());
+                    scope.arm(statement, statement.session(), [0; 32], 2)?;
+                    assert!(
+                        scope
+                            .arm(statement, statement.session(), [0; 32], 2)
+                            .is_err()
+                    );
                     scope.stop();
                     children.spawn(async move {
                         let mut gate = gate;
@@ -1093,7 +1107,7 @@ mod tests {
         let scope = MysqlWriteTestScope::new(connection, Instant::now() + Duration::from_secs(5));
         let gate = MysqlWriteGate::new(write, &scope)?;
         let writer = OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
-        scope.arm(statement, [0; 32], 2)?;
+        scope.arm(statement, statement.session(), [0; 32], 2)?;
         let other = StatementToken::new(statement.session(), statement.generation() + 1);
         assert!(scope.begin_rows(other, writer.receipt()).is_err());
         drop(writer);
@@ -1115,7 +1129,7 @@ mod tests {
                 fixture_work(async {
                     let (mut client, write) = pair().await?;
                     let gate = MysqlWriteGate::new(write, &scope)?;
-                    scope.arm(statement, [0; 32], 2)?;
+                    scope.arm(statement, statement.session(), [0; 32], 2)?;
                     let mut writer =
                         OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
                     scope.begin_rows(statement, writer.receipt())?;
@@ -1161,7 +1175,7 @@ mod tests {
         let primary = timeout_result(tokio::time::timeout(Duration::from_secs(5), fixture_work(async {
             let (mut client, write) = pair().await?;
             let gate = MysqlWriteGate::new(write, &scope)?;
-            scope.arm(statement, [0; 32], (S + 1) as u64)?;
+            scope.arm(statement, statement.session(), [0; 32], (S + 1) as u64)?;
             let mut writer = OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
             scope.begin_rows(statement, writer.receipt())?;
             writer.start_row((S + 4) as u32)?;
@@ -1219,7 +1233,7 @@ mod tests {
                 fixture_work(async {
                     let (mut client, write) = pair().await?;
                     let gate = MysqlWriteGate::new(write, &scope)?;
-                    scope.arm(statement, [0; 32], 2)?;
+                    scope.arm(statement, statement.session(), [0; 32], 2)?;
                     let mut writer =
                         OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
                     scope.begin_rows(statement, writer.receipt())?;
@@ -1270,14 +1284,21 @@ mod tests {
         assert_eq!(scope.snapshot().failure, Some(GateFailure::Deadline));
         assert_eq!(scope.core.deadline, deadline);
         assert_eq!(
-            scope.arm(statement, [0; 32], 2).unwrap_err().kind(),
+            scope
+                .arm(statement, statement.session(), [0; 32], 2)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::TimedOut
         );
         scope.stop();
         assert_eq!(scope.snapshot().failure, Some(GateFailure::Deadline));
         let prior = MysqlWriteTestScope::new(connection, Instant::now() + Duration::from_secs(1));
-        prior.arm(statement, [0; 32], 2)?;
-        assert!(prior.arm(statement, [0; 32], 2).is_err());
+        prior.arm(statement, statement.session(), [0; 32], 2)?;
+        assert!(
+            prior
+                .arm(statement, statement.session(), [0; 32], 2)
+                .is_err()
+        );
         assert_eq!(
             prior.wait_blocked().await.unwrap_err().kind(),
             io::ErrorKind::InvalidData
@@ -1305,7 +1326,7 @@ mod tests {
                     Duration::from_millis(100),
                     fixture_work(async {
                         let gate = MysqlWriteGate::new(write, &scope)?;
-                        scope.arm(statement, [0; 32], 2)?;
+                        scope.arm(statement, statement.session(), [0; 32], 2)?;
                         let mut writer =
                             OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
                         scope.begin_rows(statement, writer.receipt())?;
@@ -1364,7 +1385,7 @@ mod tests {
                 fixture_work(async {
                     let (mut client, write) = pair().await?;
                     let gate = MysqlWriteGate::new(write, &scope)?;
-                    scope.arm(statement, [0; 32], 2)?;
+                    scope.arm(statement, statement.session(), [0; 32], 2)?;
                     let mut writer =
                         OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
                     scope.begin_rows(statement, writer.receipt())?;
@@ -1414,7 +1435,7 @@ mod tests {
         let scope = MysqlWriteTestScope::new(connection, Instant::now() + Duration::from_secs(5));
         let gate = MysqlWriteGate::new(write, &scope)?;
         let writer = OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
-        scope.arm(statement, [0; 32], 2)?;
+        scope.arm(statement, statement.session(), [0; 32], 2)?;
         scope.begin_rows(statement, writer.receipt())?;
         assert!(scope.begin_rows(statement, writer.receipt()).is_err());
         assert!(scope.resume().is_err());
@@ -1432,7 +1453,7 @@ mod tests {
         let scope = MysqlWriteTestScope::new(connection, Instant::now() + Duration::from_secs(5));
         let gate = MysqlWriteGate::new(write, &scope)?;
         let writer = OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
-        scope.arm(statement, [0; 32], 2)?;
+        scope.arm(statement, statement.session(), [0; 32], 2)?;
         scope.begin_rows(statement, writer.receipt())?;
         let mut gate = writer.into_inner();
         assert!(
@@ -1586,7 +1607,7 @@ mod tests {
             let (inner, script) = Scripted::new(steps);
             let gate = MysqlWriteGate::new(inner, &scope)?;
             let writer = OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
-            scope.arm(statement, [0; 32], cut)?;
+            scope.arm(statement, statement.session(), [0; 32], cut)?;
             scope.begin_rows(statement, writer.receipt())?;
             Ok((scope, writer.into_inner(), script))
         }
@@ -1820,7 +1841,7 @@ mod tests {
                     fixture_work(async {
                         let (mut client, write) = pair().await?;
                         let gate = MysqlWriteGate::new(write, &scope)?;
-                        scope.arm(statement, [0; 32], 2)?;
+                        scope.arm(statement, statement.session(), [0; 32], 2)?;
                         let mut writer =
                             OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
                         scope.begin_rows(statement, writer.receipt())?;

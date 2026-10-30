@@ -40,7 +40,6 @@ use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorTableColumnRole, ConnectorTableHandle,
     ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
-    ConnectorTableResolution,
 };
 
 use novarocks_types::naming::TableIdentity;
@@ -167,70 +166,10 @@ impl MvTargetBinding {
     }
 }
 
-/// Resolve an MV target from the exact control and observation ports admitted
-/// for a refresh attempt.
-///
-/// The returned binding retains the planning lease.  A caller must pass that
-/// binding through planning and write preparation instead of resolving the
-/// catalog's latest connector generation again.
-pub(crate) fn load_mv_target_binding_with_ports(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+pub(crate) fn validate_target_lease(
     table: &TableIdentity,
-    connector_context: &ConnectorRequestContext,
-) -> Result<MvTargetBinding, String> {
-    load_mv_target_binding_with_ports_typed(
-        connector_control,
-        storage_observation,
-        table,
-        connector_context,
-    )
-    .map_err(|error| error.to_string())
-}
-
-/// Typed refresh-time binding load for callers that need to retain connector
-/// availability semantics until scheduling decides whether to retry.
-pub(crate) fn load_mv_target_binding_with_ports_typed(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
-    table: &TableIdentity,
-    connector_context: &ConnectorRequestContext,
-) -> Result<MvTargetBinding, ConnectorError> {
-    let exact_lease = crate::connector::metadata_binding_typed(connector_control, &table.catalog)?;
-    load_mv_target_binding_with_lease_and_ports_typed(
-        storage_observation,
-        table,
-        exact_lease,
-        connector_context,
-    )
-}
-
-/// Complete a target binding using a planning lease retained by the caller.
-///
-/// This preserves atomicity when the caller already acquired the lease while
-/// resolving related target facts.
-pub fn load_mv_target_binding_with_lease_and_ports(
-    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
-    table: &TableIdentity,
-    exact_lease: ConnectorControlPlanningLease,
-    connector_context: &ConnectorRequestContext,
-) -> Result<MvTargetBinding, String> {
-    load_mv_target_binding_with_lease_and_ports_typed(
-        storage_observation,
-        table,
-        exact_lease,
-        connector_context,
-    )
-    .map_err(|error| error.to_string())
-}
-
-/// Typed variant of [`load_mv_target_binding_with_lease_and_ports`].
-pub(crate) fn load_mv_target_binding_with_lease_and_ports_typed(
-    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
-    table: &TableIdentity,
-    exact_lease: ConnectorControlPlanningLease,
-    connector_context: &ConnectorRequestContext,
-) -> Result<MvTargetBinding, ConnectorError> {
+    exact_lease: &ConnectorControlPlanningLease,
+) -> Result<(), ConnectorError> {
     let expected_instance = ConnectorInstanceId::parse(&table.catalog).map_err(|error| {
         ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
     })?;
@@ -243,13 +182,15 @@ pub(crate) fn load_mv_target_binding_with_lease_and_ports_typed(
             ),
         ));
     }
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease_typed(
-        &exact_lease,
-        connector_context.clone(),
-        &table.namespace,
-        &table.table,
-        ConnectorTableResolution::StrictBaseTable,
-    )?;
+    Ok(())
+}
+
+pub(crate) fn complete_target_binding(
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    exact_lease: ConnectorControlPlanningLease,
+    metadata: ConnectorTableMetadata,
+    connector_context: &ConnectorRequestContext,
+) -> Result<MvTargetBinding, ConnectorError> {
     let observation = crate::mv::domain::storage_observation::observe_refresh_target(
         storage_observation,
         &exact_lease,

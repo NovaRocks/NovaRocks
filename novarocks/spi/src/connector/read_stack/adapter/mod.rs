@@ -201,7 +201,101 @@ impl<T> ProviderReadSystemTablePlan<T> {
 #[derive(Debug)]
 pub enum UnsupportedFrozenReadSource {}
 
+/// No preparation value exists for a provider which does not implement the
+/// frozen-source preparation contract.
+pub enum UnsupportedPreparedSourceRead {}
+
+pub struct ProviderPreparedSourceRead<T> {
+    source: T,
+    admission: Option<crate::connector::ConnectorChangeWindowAdmission>,
+    to_metadata: Arc<crate::connector::ConnectorTableMetadata>,
+}
+
+impl<T> ProviderPreparedSourceRead<T> {
+    pub const fn snapshot(
+        source: T,
+        to_metadata: Arc<crate::connector::ConnectorTableMetadata>,
+    ) -> Self {
+        Self {
+            source,
+            admission: None,
+            to_metadata,
+        }
+    }
+
+    pub const fn change_window(
+        source: T,
+        admission: crate::connector::ConnectorChangeWindowAdmission,
+        to_metadata: Arc<crate::connector::ConnectorTableMetadata>,
+    ) -> Self {
+        Self {
+            source,
+            admission: Some(admission),
+            to_metadata,
+        }
+    }
+}
+
+pub struct ProviderReadOpenedRelation<T> {
+    handle: T,
+    unit_hint: Option<SystemTableUnitHint>,
+}
+impl<T> ProviderReadOpenedRelation<T> {
+    pub const fn new(handle: T, unit_hint: Option<SystemTableUnitHint>) -> Self {
+        Self { handle, unit_hint }
+    }
+    pub fn into_parts(self) -> (T, Option<SystemTableUnitHint>) {
+        (self.handle, self.unit_hint)
+    }
+}
+
 pub trait ProviderReadMetadata: ProviderReadRuntime {
+    /// Completed resource-free facts own their retained data independently of
+    /// the preparing request/provider. Projection borrows a current exact
+    /// binding; a receipt does not keep the old request's live capabilities.
+    type PreparedSourceRead: Send + Sync + 'static;
+
+    fn prepare_source_read<'a>(
+        &'a self,
+        _session: &'a ConnectorSession,
+        _request: &'a super::runtime::ConnectorReadSourcePreparationRequest,
+        _cpu: &'a Arc<dyn crate::connector::ProviderMetadataCpuPort>,
+        _original: &'a crate::connector::ConnectorOriginalResultScope,
+        _owner: &'a mut Option<crate::connector::ConnectorProcessLocalPayload>,
+    ) -> BoxFuture<'a, Result<ProviderPreparedSourceRead<Self::PreparedSourceRead>, ConnectorError>>
+    {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "provider does not prepare frozen source reads",
+            ))
+        })
+    }
+
+    fn project_prepared_source_read(
+        &self,
+        _session: &ConnectorSession,
+        _request: &super::runtime::ConnectorReadSourcePreparationRequest,
+        _source: &Self::PreparedSourceRead,
+        _projection: super::runtime::ConnectorReadSourceProjection,
+    ) -> Result<Self::Table, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider does not project frozen source reads",
+        ))
+    }
+
+    type PreparedRelation: Send + Sync + 'static;
+    fn prepare_relation<'a>(
+        &'a self,
+        session: &'a ConnectorSession,
+        request: &'a super::runtime::ConnectorReadRelationPreparationRequest,
+    ) -> BoxFuture<'a, Result<Option<Self::PreparedRelation>, ConnectorError>>;
+    fn create_prepared_relation(
+        &self,
+        prepared: Self::PreparedRelation,
+    ) -> Result<Option<ProviderReadOpenedRelation<Self::Table>>, ConnectorError>;
+
     type FrozenSource: Debug + Send + Sync + 'static;
 
     /// Source validation belongs to the provider. In particular a write
@@ -368,15 +462,59 @@ pub trait ProviderReadSplitSource<P: ProviderReadRuntime>: Send {
     fn close(&mut self) -> Result<(), ConnectorError>;
 }
 
+/// Original owned split inputs. Sharing an opaque table keeps its actual
+/// concrete value without imposing Clone or re-creating Provider facts.
+pub struct ProviderReadSplitOpenRequest<P: ProviderReadRuntime> {
+    pub session: ConnectorSession,
+    pub table: Arc<P::Table>,
+    pub columns: Vec<Assignment<P::Column>>,
+    pub dynamic_filter_columns: BTreeSet<P::Column>,
+    pub constraint: Constraint<P::Column>,
+    pub preparation: Option<super::runtime::ConnectorReadSplitPreparation>,
+}
+
+/// Driver returned after the original split-open source has been installed.
+pub type ProviderReadSplitOpenFuture<P> =
+    BoxFuture<'static, Result<Box<dyn ProviderReadSplitSource<P>>, ConnectorError>>;
+
 pub trait ProviderReadSplitManager: ProviderReadRuntime {
-    fn get_splits(
-        &self,
-        session: &ConnectorSession,
-        table: &Self::Table,
-        columns: &[Assignment<Self::Column>],
-        dynamic_filter_columns: &BTreeSet<Self::Column>,
-        constraint: &Constraint<Self::Column>,
-    ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError>
+    /// Prepared-source providers install their closed original Source here,
+    /// synchronously into the caller-owned slot before returning its driver.
+    /// Ordinary reads retain their existing borrowed planning implementation.
+    fn begin_get_splits(
+        self: Arc<Self>,
+        request: ProviderReadSplitOpenRequest<Self>,
+        original_owner: &mut Option<crate::connector::ConnectorProcessLocalPayload>,
+    ) -> Result<ProviderReadSplitOpenFuture<Self>, ConnectorError>
+    where
+        Self: Sized,
+    {
+        if original_owner.is_some() {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "split opening owner is occupied",
+            ));
+        }
+        Ok(Box::pin(async move {
+            self.get_splits(
+                &request.session,
+                &request.table,
+                &request.columns,
+                &request.dynamic_filter_columns,
+                &request.constraint,
+            )
+            .await
+        }))
+    }
+
+    fn get_splits<'a>(
+        &'a self,
+        session: &'a ConnectorSession,
+        table: &'a Self::Table,
+        columns: &'a [Assignment<Self::Column>],
+        dynamic_filter_columns: &'a BTreeSet<Self::Column>,
+        constraint: &'a Constraint<Self::Column>,
+    ) -> BoxFuture<'a, Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError>>
     where
         Self: Sized;
 }
@@ -686,7 +824,117 @@ impl<P: ProviderReadMetadata> ReadRuntimeAdapter<P> {
     }
 }
 
+struct BoundRelationPreparation<P: ProviderReadMetadata> {
+    facts: P::PreparedRelation,
+    provider: Arc<P>,
+}
+
+struct BoundSourcePreparation<P: ProviderReadMetadata> {
+    facts: P::PreparedSourceRead,
+}
+
 impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
+    fn prepare_source_read<'a>(
+        &'a self,
+        session: &'a ConnectorSession,
+        request: &'a super::runtime::ConnectorReadSourcePreparationRequest,
+        cpu: &'a Arc<dyn crate::connector::ProviderMetadataCpuPort>,
+        original: &'a crate::connector::ConnectorOriginalResultScope,
+        owner: &'a mut Option<crate::connector::ConnectorProcessLocalPayload>,
+    ) -> super::runtime::ConnectorPreparedSourceReadFuture<'a> {
+        Box::pin(async move {
+            if request.observed_table().owner() != &self.provider.descriptor().instance_id {
+                return Err(binding_error());
+            }
+            let prepared = self
+                .provider
+                .prepare_source_read(session, request, cpu, original, owner)
+                .await?;
+            let is_window = matches!(
+                request.selection(),
+                super::runtime::ConnectorReadSourceSelection::ChangeWindow(_)
+            );
+            if is_window != prepared.admission.is_some() {
+                return Err(ConnectorError::new(
+                    crate::connector::ConnectorErrorKind::InvalidRequest,
+                    "provider source preparation decision differs from its selection",
+                ));
+            }
+            Ok(super::runtime::ConnectorPreparedSourceRead::new(
+                self.binding.clone(),
+                request.clone(),
+                prepared.admission,
+                prepared.to_metadata,
+                BoundSourcePreparation::<P> {
+                    facts: prepared.source,
+                },
+            ))
+        })
+    }
+
+    fn project_prepared_source_read(
+        &self,
+        session: &ConnectorSession,
+        source: &super::runtime::ConnectorPreparedSourceRead,
+        projection: super::runtime::ConnectorReadSourceProjection,
+    ) -> Result<ConnectorReadTableHandle, ConnectorError> {
+        if source.binding() != &self.binding {
+            return Err(binding_error());
+        }
+        if !source.permits(projection) {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "prepared source does not permit the requested read projection",
+            ));
+        }
+        let prepared = source
+            .facts::<BoundSourcePreparation<P>>()
+            .ok_or_else(type_error)?;
+        self.provider
+            .project_prepared_source_read(session, source.request(), &prepared.facts, projection)
+            .map(|table| self.wrap_table(table))
+    }
+
+    fn prepare_relation<'a>(
+        &'a self,
+        session: &'a ConnectorSession,
+        request: &'a super::runtime::ConnectorReadRelationPreparationRequest,
+    ) -> super::runtime::ConnectorReadRelationPreparationFuture<'a> {
+        Box::pin(async move {
+            self.provider
+                .prepare_relation(session, request)
+                .await
+                .map(|facts| {
+                    facts.map(|facts| {
+                        super::runtime::ConnectorReadRelationPreparation::new(
+                            self.binding.clone(),
+                            BoundRelationPreparation::<P> {
+                                facts,
+                                provider: Arc::clone(&self.provider),
+                            },
+                        )
+                    })
+                })
+        })
+    }
+    fn create_prepared_relation(
+        &self,
+        prepared: super::runtime::ConnectorReadRelationPreparation,
+    ) -> Result<Option<super::runtime::ConnectorReadOpenedRelation>, ConnectorError> {
+        let original = prepared.into_facts::<BoundRelationPreparation<P>>(&self.binding)?;
+        if !Arc::ptr_eq(&original.provider, &self.provider) {
+            return Err(binding_error());
+        }
+        self.provider
+            .create_prepared_relation(original.facts)
+            .map(|relation| {
+                relation.map(|relation| {
+                    let (handle, hint) = relation.into_parts();
+                    super::runtime::ConnectorReadOpenedRelation::new(self.wrap_table(handle), hint)
+                })
+            })
+    }
+
     fn negotiate(
         &self,
         session: &ConnectorSession,
@@ -1067,27 +1315,39 @@ impl<P: ProviderReadSplitManager> ConnectorReadSplitManager for ReadRuntimeAdapt
 
     fn get_splits(
         &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        columns: &[Assignment<ConnectorReadColumnHandle>],
-        dynamic_filter_columns: &BTreeSet<ConnectorReadColumnHandle>,
-        constraint: &ConnectorReadConstraint,
-    ) -> Result<Box<dyn ConnectorReadSplitSource>, ConnectorError> {
-        let table = self.table(table)?;
-        let columns = self.typed_assignments(columns)?;
-        let dynamic_filter_columns = self.typed_columns(dynamic_filter_columns)?;
-        let constraint = self.typed_constraint(constraint)?;
-        let source = self.provider.get_splits(
-            session,
-            table,
-            &columns,
-            &dynamic_filter_columns,
-            &constraint,
-        )?;
-        Ok(Box::new(AdapterSplitSource {
-            source,
-            adapter: self.clone(),
-        }))
+        request: super::runtime::ConnectorReadSplitOpenRequest,
+        original_owner: &mut Option<crate::connector::ConnectorProcessLocalPayload>,
+    ) -> super::runtime::ConnectorReadSplitOpenFuture {
+        let adapter = self.clone();
+        // Typed input and the Provider Source are received before an async
+        // borrower can poll or unwind. A pending driver never owns this slot.
+        let opening = (|| {
+            if original_owner.is_some() {
+                return Err(ConnectorError::new(
+                    crate::connector::ConnectorErrorKind::InvalidRequest,
+                    "split opening owner is occupied",
+                ));
+            }
+            let (session, table, columns, dynamic_filter_columns, constraint, preparation) =
+                request.into_parts();
+            adapter.table(&table)?;
+            let table =
+                super::runtime::shared_table_value::<P::Table>(&table).ok_or_else(type_error)?;
+            let request = ProviderReadSplitOpenRequest::<P> {
+                session,
+                table,
+                columns: adapter.typed_assignments(&columns)?,
+                dynamic_filter_columns: adapter.typed_columns(&dynamic_filter_columns)?,
+                constraint: adapter.typed_constraint(&constraint)?,
+                preparation,
+            };
+            Arc::clone(&adapter.provider).begin_get_splits(request, original_owner)
+        })();
+        Box::pin(async move {
+            let source = opening?.await?;
+            Ok(Box::new(AdapterSplitSource { source, adapter })
+                as Box<dyn ConnectorReadSplitSource>)
+        })
     }
 }
 
@@ -1611,15 +1871,36 @@ mod tests {
 
     const PUBLIC_SCHEMA_EXTRA_FIELD: u8 = 99;
 
+    struct SourceDropWitness(Arc<AtomicU64>);
+    impl Drop for SourceDropWitness {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ProbeSourceFacts {
+        ordinal: usize,
+        _retention: Option<SourceDropWitness>,
+    }
+
     struct Probe {
+        // Representative provider-private request inventory. It must not be
+        // retained merely because a completed fact receipt has aliases.
+        _source_request_inventory: Option<SourceDropWitness>,
         descriptor: ConnectorInstanceDescriptor,
         catalog_handle: CatalogHandle,
         public_schema_calls: AtomicU64,
+        preparation_gate: std::sync::Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+        prepared_calls: AtomicU64,
+        created_calls: AtomicU64,
+        split_gate: std::sync::Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+        split_calls: AtomicU64,
     }
 
     impl Probe {
         fn new() -> Self {
             Self {
+                _source_request_inventory: None,
                 descriptor: ConnectorInstanceDescriptor {
                     provider_id: ConnectorProviderId::parse("probe").expect("provider ID"),
                     instance_id: ConnectorInstanceId::parse("catalog").expect("instance ID"),
@@ -1629,6 +1910,11 @@ mod tests {
                     crate::connector::CatalogVersion::from_bytes([3; 32]),
                 ),
                 public_schema_calls: AtomicU64::new(0),
+                preparation_gate: std::sync::Mutex::new(None),
+                prepared_calls: AtomicU64::new(0),
+                created_calls: AtomicU64::new(0),
+                split_gate: std::sync::Mutex::new(None),
+                split_calls: AtomicU64::new(0),
             }
         }
     }
@@ -1651,6 +1937,92 @@ mod tests {
     }
 
     impl ProviderReadMetadata for Probe {
+        type PreparedSourceRead = ProbeSourceFacts;
+
+        fn project_prepared_source_read(
+            &self,
+            _session: &ConnectorSession,
+            _request: &super::super::ConnectorReadSourcePreparationRequest,
+            source: &Self::PreparedSourceRead,
+            _projection: super::super::ConnectorReadSourceProjection,
+        ) -> Result<Self::Table, ConnectorError> {
+            assert_eq!(source.ordinal, 41);
+            self.created_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Table)
+        }
+
+        type PreparedRelation = (
+            Self::Table,
+            Option<crate::connector::read_stack::SystemTableUnitHint>,
+        );
+        fn prepare_relation<'a>(
+            &'a self,
+            session: &'a crate::connector::read_stack::ConnectorSession,
+            request: &'a crate::connector::read_stack::ConnectorReadRelationPreparationRequest,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Option<Self::PreparedRelation>, crate::connector::ConnectorError>,
+        > {
+            Box::pin(async move {
+                self.prepared_calls.fetch_add(1, Ordering::SeqCst);
+                let gate = self.preparation_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.await.expect("preparation gate");
+                }
+                use crate::connector::read_stack::ConnectorReadRelationPreparationKind as K;
+                let name = request.name();
+                match request.kind() {
+                    K::Table { version, reference } => self
+                        .get_table_handle(session, name, *version, reference.as_deref())
+                        .map(|v| v.map(|v| (v, None))),
+                    K::Metadata { request } => match request {
+                        Some(request) => {
+                            self.get_system_table_plan_for_request(session, name, request)
+                        }
+                        None => self.get_system_table_plan(session, name),
+                    }
+                    .map(|v| {
+                        v.map(|v| {
+                            let hint = v.unit_hint();
+                            (v.into_handle(), Some(hint))
+                        })
+                    }),
+                    K::Delta { window } => self
+                        .get_change_window_plan(session, name, *window)
+                        .map(|v| v.map(|v| (v, None))),
+                    K::MvTarget {
+                        object_id,
+                        snapshot_id,
+                    } => self
+                        .get_mv_target_handle(session, name, object_id, *snapshot_id)
+                        .map(|v| v.map(|v| (v, None))),
+                    K::MvTargetPartition { selection } => self
+                        .get_mv_target_partition_handle(session, name, selection)
+                        .map(|v| v.map(|v| (v, None))),
+                    K::PinnedFileSet { pinned } => self
+                        .get_pinned_file_set_handle(session, name, pinned)
+                        .map(|v| v.map(|v| (v, None))),
+                    K::TableExecute { procedure } => self
+                        .get_table_execute_plan(session, name, procedure.clone())
+                        .map(|v| v.map(|v| (v, None))),
+                }
+            })
+        }
+        fn create_prepared_relation(
+            &self,
+            prepared: Self::PreparedRelation,
+        ) -> Result<
+            Option<crate::connector::read_stack::adapter::ProviderReadOpenedRelation<Self::Table>>,
+            crate::connector::ConnectorError,
+        > {
+            self.created_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(
+                crate::connector::read_stack::adapter::ProviderReadOpenedRelation::new(
+                    prepared.0, prepared.1,
+                ),
+            ))
+        }
+
         type FrozenSource = UnsupportedFrozenReadSource;
 
         fn get_table_handle(
@@ -1824,18 +2196,28 @@ mod tests {
     }
 
     impl ProviderReadSplitManager for Probe {
-        fn get_splits(
-            &self,
-            _session: &ConnectorSession,
-            _table: &Self::Table,
-            _columns: &[Assignment<Self::Column>],
-            _dynamic_filter_columns: &BTreeSet<Self::Column>,
-            _constraint: &Constraint<Self::Column>,
-        ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
-            Err(ConnectorError::new(
-                crate::connector::ConnectorErrorKind::Unsupported,
-                "attempt-access test provider does not enumerate splits",
-            ))
+        fn get_splits<'a>(
+            &'a self,
+            _session: &'a ConnectorSession,
+            _table: &'a Self::Table,
+            _columns: &'a [Assignment<Self::Column>],
+            _dynamic_filter_columns: &'a BTreeSet<Self::Column>,
+            _constraint: &'a Constraint<Self::Column>,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError>,
+        > {
+            Box::pin(async move {
+                self.split_calls.fetch_add(1, Ordering::SeqCst);
+                let gate = self.split_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.await.expect("split open gate");
+                }
+                Err(ConnectorError::new(
+                    crate::connector::ConnectorErrorKind::Unsupported,
+                    "attempt-access test provider does not enumerate splits",
+                ))
+            })
         }
     }
 
@@ -1929,6 +2311,252 @@ mod tests {
             .expect("session")
     }
 
+    fn prepared_source_metadata(
+        adapter: &ReadRuntimeAdapter<Probe>,
+    ) -> Arc<crate::connector::ConnectorTableMetadata> {
+        use crate::connector::{
+            ConnectorTableDefinitionFacts, ConnectorTableIdentity, ConnectorTableMetadata,
+            ConnectorTableMetadataHeader, ConnectorTablePlanningFacts,
+        };
+        let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+        let schema = Arc::new(arrow::datatypes::Schema::empty());
+        let execution = novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+            schema.clone(),
+            Vec::new().into_boxed_slice(),
+            storage.clone(),
+        )
+        .unwrap();
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation =
+            super::super::ConnectorReadSchemaCreation::new(storage, &mut request, &mut work);
+        Arc::new(
+            ConnectorTableMetadata::try_new_typed(
+                ConnectorTableMetadataHeader {
+                    identity: ConnectorTableIdentity {
+                        instance_id: adapter.provider.descriptor.instance_id.clone(),
+                        namespace: "db".into(),
+                        table: "source".into(),
+                    },
+                    planning_facts: ConnectorTablePlanningFacts::empty(),
+                    definition_facts: ConnectorTableDefinitionFacts::empty(),
+                    version: None,
+                    statistics_data_version: None,
+                    table: crate::connector::ConnectorTableHandle::try_new(
+                        adapter.provider.descriptor.instance_id.clone(),
+                        bytes::Bytes::from_static(b"prepared-source"),
+                    )
+                    .unwrap(),
+                },
+                schema,
+                execution,
+                &mut creation,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn prepared_source(
+        adapter: &ReadRuntimeAdapter<Probe>,
+        admission: Option<crate::connector::ConnectorChangeWindowAdmission>,
+    ) -> super::super::ConnectorPreparedSourceRead {
+        prepared_source_with_facts(
+            adapter,
+            admission,
+            ProbeSourceFacts {
+                ordinal: 41,
+                _retention: None,
+            },
+        )
+    }
+
+    fn prepared_source_with_facts(
+        adapter: &ReadRuntimeAdapter<Probe>,
+        admission: Option<crate::connector::ConnectorChangeWindowAdmission>,
+        facts: ProbeSourceFacts,
+    ) -> super::super::ConnectorPreparedSourceRead {
+        use crate::connector::read_stack::{
+            ConnectorReadChangeWindow, ConnectorReadSourcePreparationRequest,
+        };
+        let object = crate::connector::ConnectorTableObjectId::try_new(bytes::Bytes::from_static(
+            b"source-object",
+        ))
+        .unwrap();
+        let revision = |snapshot| {
+            crate::connector::ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                adapter.provider.descriptor.provider_id.clone(),
+                &object,
+                Some(snapshot),
+            )
+            .unwrap()
+        };
+        let name = SchemaTableName::try_new("db", "source").unwrap();
+        let observation = crate::connector::ConnectorProcessLocalPayload::new(
+            crate::connector::ConnectorProviderBindingKey {
+                instance_id: adapter.provider.descriptor.instance_id.clone(),
+                incarnation: crate::connector::ProviderBindingEpoch::from_bytes([1; 16]),
+            },
+            Arc::new(41_i64),
+        );
+        let request = if admission.is_some() {
+            ConnectorReadSourcePreparationRequest::change_window(
+                name,
+                prepared_source_metadata(adapter).table.clone(),
+                observation,
+                object.clone(),
+                ConnectorReadChangeWindow::new(40, 41),
+                revision(40),
+                revision(41),
+            )
+        } else {
+            ConnectorReadSourcePreparationRequest::snapshot(
+                name,
+                prepared_source_metadata(adapter).table.clone(),
+                observation,
+                object.clone(),
+                41,
+                revision(41),
+            )
+        };
+        super::super::ConnectorPreparedSourceRead::new(
+            adapter.binding.clone(),
+            request,
+            admission,
+            prepared_source_metadata(adapter),
+            BoundSourcePreparation::<Probe> { facts },
+        )
+    }
+
+    #[test]
+    fn prepared_source_projects_only_the_capabilities_of_its_closed_decision() {
+        use crate::connector::ConnectorChangeWindowAdmission as A;
+        use crate::connector::read_stack::ConnectorReadSourceProjection as P;
+        let provider = Arc::new(Probe::new());
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
+        let incremental = A::Incremental {
+            has_inserts: true,
+            has_deletes: false,
+            partition_impact: crate::connector::ConnectorChangeWindowPartitionImpact::Unpartitioned,
+        };
+        for decision in [
+            None,
+            Some(A::MetadataOnly),
+            Some(A::FullRebuild(
+                crate::connector::ConnectorChangeWindowFullRebuildReason::LineageBroken {
+                    from_snapshot_id: 40,
+                },
+            )),
+            Some(incremental),
+        ] {
+            let source = prepared_source(&adapter, decision.clone());
+            for projection in [P::To, P::From, P::Delta] {
+                let before = provider.created_calls.load(Ordering::SeqCst);
+                let result = adapter.project_prepared_source_read(&session(), &source, projection);
+                let permitted = projection == P::To
+                    || matches!(decision, Some(A::Incremental { .. }))
+                    || (projection == P::Delta && matches!(decision, Some(A::MetadataOnly)));
+                assert_eq!(result.is_ok(), permitted);
+                assert_eq!(
+                    provider.created_calls.load(Ordering::SeqCst),
+                    before + u64::from(permitted),
+                );
+                if let Err(error) = result {
+                    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+                }
+            }
+        }
+        assert_eq!(provider.prepared_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepared_source_rejects_foreign_bindings_and_payloads_before_projection() {
+        use crate::connector::read_stack::ConnectorReadSourceProjection as P;
+        let provider = Arc::new(Probe::new());
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
+        let mut foreign = Probe::new();
+        foreign.catalog_handle = CatalogHandle::new(
+            foreign.descriptor.instance_id.clone(),
+            crate::connector::CatalogVersion::from_bytes([4; 32]),
+        );
+        let foreign = ReadRuntimeAdapter::new(Arc::new(foreign));
+        let source = prepared_source(&adapter, None);
+        assert!(
+            foreign
+                .project_prepared_source_read(&session(), &source, P::To)
+                .is_err()
+        );
+        let wrong_type = super::super::ConnectorPreparedSourceRead::new(
+            adapter.binding.clone(),
+            source.request().clone(),
+            None,
+            prepared_source_metadata(&adapter),
+            41_usize,
+        );
+        assert!(
+            adapter
+                .project_prepared_source_read(&session(), &wrong_type, P::To)
+                .is_err()
+        );
+        assert_eq!(provider.created_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(foreign.provider.created_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepared_source_projects_into_another_request_of_the_same_exact_binding() {
+        use crate::connector::read_stack::ConnectorReadSourceProjection;
+        let original = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let request = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let source = prepared_source(&original, None);
+        let alias = source.clone();
+        assert!(std::ptr::eq(source.to_metadata(), alias.to_metadata()));
+        request
+            .project_prepared_source_read(&session(), &source, ConnectorReadSourceProjection::To)
+            .unwrap();
+        assert_eq!(original.provider.created_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(request.provider.created_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(request.provider.prepared_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepared_source_aliases_retain_facts_without_the_original_request_inventory() {
+        use crate::connector::read_stack::ConnectorReadSourceProjection;
+        let inventory_drops = Arc::new(AtomicU64::new(0));
+        let facts_drops = Arc::new(AtomicU64::new(0));
+        let provider = Arc::new(Probe {
+            _source_request_inventory: Some(SourceDropWitness(inventory_drops.clone())),
+            ..Probe::new()
+        });
+        let old_request = Arc::downgrade(&provider);
+        let adapter = ReadRuntimeAdapter::new(provider.clone());
+        let source = prepared_source_with_facts(
+            &adapter,
+            None,
+            ProbeSourceFacts {
+                ordinal: 41,
+                _retention: Some(SourceDropWitness(facts_drops.clone())),
+            },
+        );
+        let alias = source.clone();
+        drop(adapter);
+        drop(provider);
+        assert!(old_request.upgrade().is_none());
+        assert_eq!(inventory_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(facts_drops.load(Ordering::SeqCst), 0);
+
+        // A different request of the same exact binding consumes retained
+        // facts after the preparing provider and its inventory actually drop.
+        let request = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        request
+            .project_prepared_source_read(&session(), &alias, ConnectorReadSourceProjection::To)
+            .unwrap();
+        assert_eq!(request.provider.created_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(request.provider.prepared_calls.load(Ordering::SeqCst), 0);
+        drop(source);
+        assert_eq!(facts_drops.load(Ordering::SeqCst), 0);
+        drop(alias);
+        assert_eq!(facts_drops.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn frozen_mv_target_requires_provider_support_without_generic_fallback() {
         let provider = Arc::new(Probe::new());
@@ -1992,6 +2620,189 @@ mod tests {
     fn test_session() -> ConnectorSession {
         ConnectorSession::try_new("q", "u", "UTC", "en_US", SystemTime::UNIX_EPOCH)
             .expect("session")
+    }
+
+    fn current_relation_request(
+        name: SchemaTableName,
+    ) -> crate::connector::read_stack::ConnectorReadRelationPreparationRequest {
+        use crate::connector::read_stack::{
+            ConnectorReadRelationPreparationKind as K, ConnectorReadRelationPreparationRequest as R,
+        };
+        R::new(
+            name,
+            K::Table {
+                version: ConnectorReadRelationVersion::Current,
+                reference: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn relation_preparation_waits_before_the_exact_author_creates_a_handle() {
+        use futures::FutureExt;
+        let (release, gate) = futures::channel::oneshot::channel();
+        let probe = Probe::new();
+        *probe.preparation_gate.lock().unwrap() = Some(gate);
+        let provider = Arc::new(probe);
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
+        let session = test_session();
+        let name = SchemaTableName::try_new("db", "t").unwrap();
+        let request = current_relation_request(name);
+        let mut preparing = adapter.prepare_relation(&session, &request);
+        assert!(preparing.as_mut().now_or_never().is_none());
+        assert_eq!(provider.prepared_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.created_calls.load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        let prepared = preparing.await.unwrap().unwrap();
+        assert_eq!(prepared.binding(), adapter.binding());
+        let (table, _) = adapter
+            .create_prepared_relation(prepared)
+            .unwrap()
+            .unwrap()
+            .into_parts();
+        assert_eq!(table.binding(), adapter.binding());
+        assert_eq!(provider.created_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn prepared_relation_cannot_cross_equal_catalog_bindings_with_distinct_authors() {
+        let original = Arc::new(Probe::new());
+        let replacement = Arc::new(Probe::new());
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&original));
+        let other = ReadRuntimeAdapter::new(Arc::clone(&replacement));
+        assert_eq!(adapter.binding(), other.binding());
+        let session = test_session();
+        let name = SchemaTableName::try_new("db", "t").unwrap();
+        let request = current_relation_request(name);
+        let prepared = adapter
+            .prepare_relation(&session, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = other.create_prepared_relation(prepared).err().unwrap();
+        assert_eq!(error.kind(), binding_error().kind());
+        assert_eq!(original.created_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(replacement.created_calls.load(Ordering::SeqCst), 0);
+        let prepared = adapter
+            .prepare_relation(&session, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        adapter.create_prepared_relation(prepared).unwrap().unwrap();
+        assert_eq!(original.created_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn full_relation_preparation_keeps_original_author_and_selection() {
+        use crate::connector::read_stack::{
+            ConnectorReadRelationPreparationKind as K, ConnectorReadRelationPreparationRequest as R,
+        };
+        let provider = Arc::new(Probe::new());
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
+        let other = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let session = test_session();
+        let request = R::new(
+            SchemaTableName::try_new("db", "t").unwrap(),
+            K::Table {
+                version: ConnectorReadRelationVersion::SnapshotId(41),
+                reference: Some("branch".into()),
+            },
+        );
+        let prepared = adapter
+            .prepare_relation(&session, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = other.create_prepared_relation(prepared).err().unwrap();
+        assert_eq!(error.kind(), binding_error().kind());
+        assert_eq!(provider.created_calls.load(Ordering::SeqCst), 0);
+        let prepared = adapter
+            .prepare_relation(&session, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        let (table, hint) = adapter
+            .create_prepared_relation(prepared)
+            .unwrap()
+            .unwrap()
+            .into_parts();
+        assert_eq!(table.binding(), adapter.binding());
+        assert!(hint.is_none());
+        assert_eq!(provider.prepared_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn owned_split_future_keeps_the_same_author_after_borrowing_wait_is_cancelled() {
+        use crate::connector::read_stack::ConnectorReadSplitOpenRequest;
+        use futures::FutureExt;
+        let (release, gate) = futures::channel::oneshot::channel();
+        let provider = Arc::new(Probe::new());
+        *provider.split_gate.lock().unwrap() = Some(gate);
+        let original = Arc::downgrade(&provider);
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
+        let table = adapter.wrap_table(Table);
+        let mut original_owner = None;
+        let mut opening = adapter.get_splits(
+            ConnectorReadSplitOpenRequest::new(
+                test_session(),
+                table,
+                Vec::new(),
+                BTreeSet::new(),
+                Constraint::of_summary(TupleDomain::all()),
+            ),
+            &mut original_owner,
+        );
+        assert!(opening.as_mut().now_or_never().is_none());
+        assert_eq!(provider.split_calls.load(Ordering::SeqCst), 1);
+        drop(adapter);
+        drop(provider);
+        assert!(original.upgrade().is_some());
+        // Dropping the temporary borrowing poll did not drop the stable F.
+        release.send(()).unwrap();
+        let error = opening.await.err().unwrap();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(original.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn occupied_split_owner_refuses_before_provider_and_preserves_original() {
+        let provider = Arc::new(Probe::new());
+        let adapter = ReadRuntimeAdapter::new(provider.clone());
+        let retained = Arc::new(41_i64);
+        let weak = Arc::downgrade(&retained);
+        let mut owner = Some(crate::connector::ConnectorProcessLocalPayload::new(
+            crate::connector::ConnectorProviderBindingKey {
+                instance_id: provider.descriptor.instance_id.clone(),
+                incarnation: crate::connector::ProviderBindingEpoch::from_bytes([1; 16]),
+            },
+            retained,
+        ));
+        let error = adapter
+            .get_splits(
+                super::super::ConnectorReadSplitOpenRequest::new(
+                    test_session(),
+                    adapter.wrap_table(Table),
+                    Vec::new(),
+                    BTreeSet::new(),
+                    Constraint::of_summary(TupleDomain::all()),
+                ),
+                &mut owner,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.kind(),
+            crate::connector::ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(provider.split_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            **owner.as_ref().unwrap().value::<i64>("catalog").unwrap(),
+            41
+        );
+        assert!(weak.upgrade().is_some());
+        drop(owner);
+        assert!(weak.upgrade().is_none());
     }
 
     fn probe_public_schema(
@@ -2174,8 +2985,7 @@ mod tests {
             )
             .expect("attempt request context"),
         );
-        source
-            .for_attempt(&attempt)
+        futures::executor::block_on(source.for_attempt(&attempt))
             .expect("same static binding rebinds for a new attempt");
 
         let foreign_adapter = ReadRuntimeAdapter::new(Arc::new(Probe {
@@ -2188,6 +2998,8 @@ mod tests {
                 ConnectorInstanceId::parse("other").expect("instance ID"),
                 crate::connector::CatalogVersion::from_bytes([4; 32]),
             ),
+
+            ..Probe::new()
         }));
         let error = match static_control.seal_attempt_access(&foreign_adapter.wrap_table(Table)) {
             Ok(_) => panic!("a foreign generation cannot enter the static access source"),
@@ -2200,11 +3012,12 @@ mod tests {
     fn provider_attempt_access_rejects_foreign_returned_generation() {
         struct ReturnRuntime(ConnectorReadAttemptRuntime);
         impl ConnectorReadAttemptAccessReacquirer for ReturnRuntime {
-            fn for_attempt(
-                &self,
-                _request: &crate::connector::ConnectorAttemptContext,
-            ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
-                Ok(self.0.clone())
+            fn for_attempt<'a>(
+                &'a self,
+                _request: &'a crate::connector::ConnectorAttemptContext,
+            ) -> futures::future::BoxFuture<'a, Result<ConnectorReadAttemptRuntime, ConnectorError>>
+            {
+                Box::pin(async move { Ok(self.0.clone()) })
             }
         }
 
@@ -2230,6 +3043,8 @@ mod tests {
                 ConnectorInstanceId::parse("foreign").expect("instance ID"),
                 crate::connector::CatalogVersion::from_bytes([9; 32]),
             ),
+
+            ..Probe::new()
         }));
         let foreign = ConnectorReadAttemptRuntime::new(Arc::new(foreign_adapter.clone()));
         let control = ConnectorReadRequestControl::provider_reacquire_attempt_access(
@@ -2249,7 +3064,7 @@ mod tests {
             )
             .expect("attempt request context"),
         );
-        let error = match source.for_attempt(&request) {
+        let error = match futures::executor::block_on(source.for_attempt(&request)) {
             Ok(_) => panic!("reacquirer must not replace the sealed generation"),
             Err(error) => error,
         };
@@ -2260,11 +3075,12 @@ mod tests {
     fn provider_sealer_cannot_replay_a_source_from_an_earlier_seal() {
         struct ReturnRuntime(ConnectorReadAttemptRuntime);
         impl ConnectorReadAttemptAccessReacquirer for ReturnRuntime {
-            fn for_attempt(
-                &self,
-                _request: &crate::connector::ConnectorAttemptContext,
-            ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
-                Ok(self.0.clone())
+            fn for_attempt<'a>(
+                &'a self,
+                _request: &'a crate::connector::ConnectorAttemptContext,
+            ) -> futures::future::BoxFuture<'a, Result<ConnectorReadAttemptRuntime, ConnectorError>>
+            {
+                Box::pin(async move { Ok(self.0.clone()) })
             }
         }
 
@@ -2321,6 +3137,8 @@ mod tests {
                 ConnectorInstanceId::parse("foreign").expect("instance ID"),
                 crate::connector::CatalogVersion::from_bytes([8; 32]),
             ),
+
+            ..Probe::new()
         }));
         let control = ConnectorReadRequestControl::static_attempt_access(
             Arc::new(adapter.clone()),

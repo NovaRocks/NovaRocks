@@ -5,13 +5,17 @@ domain: [cluster-membership, distributed-query-lifecycle]
 status: active
 supersedes: [ADR-0013]
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0198
+    scope: "Whole semantic replanning before ControlReady and pre-ready retries for mutating execution; external desired membership, authenticated registration, exact heartbeat and process identity remain active"
+    link: "ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md"
 date: 2026-08-25
 provenance:
   - "discussion: 2026-08-25 serverless backend self-registration, drain, and pre-ready admission"
 code-anchors:
-  - "novarocks/frontend/src/topology.rs (ClusterBackendService)"
-  - "novarocks/backend/src/application.rs (run_backend_server_until_signal)"
-  - "novarocks/frontend/src/coordinator/execution.rs (FrontendDistributedQueryCoordinator)"
+  - "novarocks/frontend-application/src/topology.rs (ClusterBackendService)"
+  - "novarocks-server/library/src/roles/backend.rs (run_until_shutdown)"
+  - "novarocks/frontend-application/src/coordinator/execution.rs (FrontendDistributedQueryCoordinator)"
 ---
 
 ## 问题

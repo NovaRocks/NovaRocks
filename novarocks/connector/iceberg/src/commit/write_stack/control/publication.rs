@@ -482,70 +482,133 @@ impl Preparer for WriteStatisticsPreparer {
     }
 }
 
+pub(super) enum WritePublicationVerdict {
+    KnownCommitted {
+        effect: ExternalMutationEffect,
+        receipt: ConnectorWriteReceipt,
+        finalization: ExternalMutationFinalization,
+        cleanup: novarocks_spi::connector::write_stack::ConnectorWriteCleanupState,
+    },
+    KnownUncommitted {
+        failure: ConnectorMutationFailure,
+        cleanup: ExternalMutationFinalization,
+    },
+    CommitUnknown {
+        failure: ConnectorMutationFailure,
+        evidence: ExternalMutationEvidence,
+    },
+}
+impl WritePublicationVerdict {
+    fn from_outcome(outcome: ExternalMutationOutcome<ConnectorWriteReceipt>) -> Self {
+        match outcome {
+            ExternalMutationOutcome::KnownCommitted {
+                effect,
+                receipt,
+                finalization,
+                cleanup,
+            } => Self::KnownCommitted {
+                effect,
+                receipt,
+                finalization,
+                cleanup:
+                    novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+                        cleanup,
+                    ),
+            },
+            ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
+                Self::KnownUncommitted { failure, cleanup }
+            }
+            ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
+                Self::CommitUnknown { failure, evidence }
+            }
+        }
+    }
+    pub(super) fn into_completion(
+        self,
+    ) -> novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion {
+        match self {
+            Self::KnownCommitted { effect, receipt, finalization, cleanup } => {
+                let mut canonical = novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_committed_frontier(effect, receipt, finalization);
+                let novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { cleanup: original, .. } = &mut canonical else { unreachable!() };
+                *original = cleanup;
+                canonical
+            },
+            Self::KnownUncommitted { failure, cleanup } => novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownUncommitted { failure, cleanup },
+            Self::CommitUnknown { failure, evidence } => novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::CommitUnknown { failure, evidence },
+        }
+    }
+}
+pub(super) struct WritePublicationDispatch {
+    pub(super) outcome: WritePublicationVerdict,
+    pub(super) cleanup: Option<(
+        IcebergCommitOperation,
+        PublicationJournal<ConnectorWriteReceipt>,
+    )>,
+}
+impl WritePublicationDispatch {
+    fn settled(outcome: ExternalMutationOutcome<ConnectorWriteReceipt>) -> Self {
+        Self {
+            outcome: WritePublicationVerdict::from_outcome(outcome),
+            cleanup: None,
+        }
+    }
+}
 impl IcebergWriteSessionControl {
-    pub(super) fn dispatch_operation(
+    pub(super) async fn dispatch_operation_async(
         &self,
         handle: &IcebergCommitHandle,
         validated: &[ValidatedFragment<'_>],
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
         documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
         context: &ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        let operation = IcebergCommitOperation::new(
-            OperationToken::from_write_session(handle.session_id()),
-            handle.table().table_location(),
-            self.runtime.resources().planning_binding().clone(),
-            context.clone(),
-            self.runtime.resources().catalog_runtime().clone(),
-            OperationLimits::default(),
-        )
-        .map_err(|e| internal(e.to_string()))?;
-        // Physical ownership deduplicates objects, while intent keeps full DV identities.
-        let objects: BTreeSet<_> = validated
-            .iter()
-            .map(|entry| entry.fragment.path().to_owned())
-            .collect();
-        for path in objects {
-            operation
-                .adopt_session_data(ObjectIdentity::new(path).map_err(|e| corrupt(e.to_string()))?)
-                .map_err(|e| internal(e.to_string()))?;
-        }
+    ) -> Result<WritePublicationDispatch, ConnectorError> {
+        let (operation, journal) = self.adopt_received_operation(handle, validated, context)?;
         let recipe = WriteRecipe::freeze(handle, validated, documents);
         let recipe = match recipe {
             Ok(recipe) => recipe,
             Err(error) => {
                 let error = if documents.is_some() {
-                    crate::document_storage::keyed::write::refusal_with_retained_bytes(
+                    crate::document_storage::keyed::write::refusal_with_retained_bytes_async(
                         &self.runtime,
                         handle.table().namespace(),
                         handle.table().table_name(),
                         context,
                         error,
                     )
+                    .await
                 } else {
                     error
                 };
-                return Ok(self.reject_operation(&operation, error));
+                return Ok(WritePublicationDispatch::settled(
+                    self.reject_operation(handle, &operation, error).await,
+                ));
             }
         };
         let data = match recipe.preparer() {
             Ok(data) => data,
-            Err(error) => return Ok(self.reject_operation(&operation, error)),
+            Err(error) => {
+                return Ok(WritePublicationDispatch::settled(
+                    self.reject_operation(handle, &operation, error).await,
+                ));
+            }
         };
         let policy = match RetryPolicy::from_properties(recipe.source.properties()) {
             Ok(policy) => policy,
             Err(error) => {
-                return Ok(self.reject_operation(&operation, format_error_to_connector(error)));
+                return Ok(WritePublicationDispatch::settled(
+                    self.reject_operation(handle, &operation, format_error_to_connector(error))
+                        .await,
+                ));
             }
         };
-        let journal = PublicationJournal::for_runtime(
-            operation.token(),
-            self.runtime.resources().catalog_runtime(),
-        );
         let template =
             match RecoveryTemplate::from_handle(&self.descriptor, self.key.incarnation, handle) {
                 Ok(template) => template,
-                Err(error) => return Ok(self.reject_operation(&operation, error)),
+                Err(error) => {
+                    return Ok(WritePublicationDispatch::settled(
+                        self.reject_operation(handle, &operation, error).await,
+                    ));
+                }
             };
         let preflight_journal = journal.clone();
         let receipt_partitioning = handle.repartition().map(|r| r.committed().clone());
@@ -583,78 +646,99 @@ impl IcebergWriteSessionControl {
         };
         let output_facts = recipe.output_facts;
         let run_operation = operation.clone();
-        let result = self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                let intent = match run_operation
-                    .runtime()
-                    .observe_preparation_async(
-                        recipe.intent(&run_operation),
-                        attempt::before_dispatch_failure,
-                    )
-                    .await
-                {
-                    Ok(intent) => intent,
-                    Err(error) => {
-                        return attempt::rejected(
-                            &run_operation,
-                            attempt::before_dispatch_failure(&error),
-                        )
-                        .await;
-                    }
-                };
-                let keyed = recipe.keyed_documents.map(KeyedPublicationPreparer);
-                let mut preparers: Vec<&dyn Preparer> = Vec::new();
-                if let Some(keyed) = &keyed {
-                    preparers.push(keyed);
-                }
-                preparers.extend([data.as_ref(), &stats as &dyn Preparer]);
-                attempt::run(
-                    &run_operation,
-                    &intent,
-                    &recipe.prefix,
-                    &preparers,
-                    &publisher,
-                    policy,
+        let report = async move {
+            let intent = match run_operation
+                .runtime()
+                .observe_preparation_async(
+                    recipe.intent(&run_operation),
+                    attempt::before_dispatch_failure,
                 )
                 .await
-            });
-        let outcome = match result {
-            Ok(report) => journal.project(report),
-            Err(error) => {
-                let recovery = journal.clone();
-                let recovery_operation = operation.clone();
-                match operation.runtime().block_on(async move {
-                    recovery
-                        .recover_bridge(
-                            &recovery_operation,
-                            format!("Write publication bridge failed: {error}"),
-                        )
-                        .await
-                }) {
-                    Ok(outcome) => outcome,
-                    Err(error) => journal.bridge_failure(
-                        &operation,
-                        format!("Write publication recovery bridge failed: {error}"),
-                    ),
+            {
+                Ok(intent) => intent,
+                Err(error) => {
+                    return attempt::rejected(
+                        &run_operation,
+                        attempt::before_dispatch_failure(&error),
+                    )
+                    .await;
                 }
+            };
+            let keyed = recipe.keyed_documents.map(KeyedPublicationPreparer);
+            let mut preparers: Vec<&dyn Preparer> = Vec::new();
+            if let Some(keyed) = &keyed {
+                preparers.push(keyed);
+            }
+            preparers.extend([data.as_ref(), &stats as &dyn Preparer]);
+            attempt::run_to_committed_frontier(
+                &run_operation,
+                &intent,
+                &recipe.prefix,
+                &preparers,
+                &publisher,
+                policy,
+            )
+            .await
+        }
+        .await;
+        // Before the first dispatch entry exists, the session itself retains
+        // the complete original cleanup report. Nothing is encoded into a
+        // second replay/terminal map, and no object list is reconstructed.
+        let mut outcome = if journal.current_entry().is_none() {
+            let cleanup = report.cleanup.finalization();
+            handle.retain_early_cleanup(report.cleanup);
+            match report.publication {
+                crate::commit::model::PublicationOutcome::KnownUncommitted(failure) => {
+                    WritePublicationVerdict::KnownUncommitted { failure, cleanup }
+                }
+                _ => unreachable!("publication without a dispatch entry is uncommitted"),
+            }
+        } else {
+            match journal.project_retained_committed_frontier(report) {
+                crate::commit::attempt::observation::RetainedPublicationProjection::Committed {
+                    effect,
+                    receipt,
+                    finalization,
+                } => WritePublicationVerdict::KnownCommitted {
+                    effect,
+                    receipt,
+                    finalization,
+                    cleanup:
+                        novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Pending,
+                },
+                crate::commit::attempt::observation::RetainedPublicationProjection::Settled(
+                    outcome,
+                ) => WritePublicationVerdict::from_outcome(outcome),
             }
         };
         if let Some(evidence) = journal
             .current_entry()
             .and_then(|entry| journal.entry_evidence(entry))
+            && let Err(error) = handle.retain_recovery_evidence(evidence)
         {
-            handle.retain_recovery_evidence(evidence)?;
+            // A local custody error cannot erase the journal's original
+            // dispatch fact. Unknown retains its existing checked evidence.
+            match &mut outcome {
+                WritePublicationVerdict::KnownCommitted { finalization, .. } => {
+                    *finalization = add_finalization_failure(finalization.clone(), error.message());
+                }
+                WritePublicationVerdict::KnownUncommitted { cleanup, .. } => {
+                    *cleanup = add_finalization_failure(cleanup.clone(), error.message());
+                }
+                WritePublicationVerdict::CommitUnknown { .. } => {}
+            }
         }
-        let ExternalMutationOutcome::KnownCommitted {
+        let WritePublicationVerdict::KnownCommitted {
+            cleanup,
             effect,
             receipt,
             mut finalization,
         } = outcome
         else {
-            return Ok(outcome);
+            return Ok(WritePublicationDispatch {
+                outcome,
+                cleanup: None,
+            });
         };
         let snapshot_id =
             journal
@@ -665,20 +749,22 @@ impl IcebergWriteSessionControl {
                 });
         let enriched = match snapshot_id {
             Some(snapshot_id) => {
-                let rows = match journal
-                    .finalization_context(
-                        journal
-                            .current_entry()
-                            .expect("committed write has a publication entry"),
-                        self.runtime.novarocks_catalog().evidence_policy(),
-                    )
-                    .and_then(|grant| grant.for_io(context))
-                {
+                let rows = match receive_existing_finalization_context(
+                    handle,
+                    &journal,
+                    journal
+                        .current_entry()
+                        .expect("committed write has a publication entry"),
+                    context,
+                    self.runtime.novarocks_catalog().evidence_policy(),
+                ) {
                     Ok(finalization_context) => {
                         let _finalizing = journal
                             .current_entry()
                             .and_then(|entry| journal.finalization_activity(entry));
-                        match self.publication_row_count(handle, snapshot_id, &finalization_context)
+                        match self
+                            .publication_row_count_async(handle, snapshot_id, &finalization_context)
+                            .await
                         {
                             Ok(rows) => rows,
                             Err(error) => {
@@ -708,45 +794,118 @@ impl IcebergWriteSessionControl {
         if let Some(entry) = journal.current_entry() {
             journal.record_entry_finalization(entry, finalization.clone());
         }
-        Ok(ExternalMutationOutcome::KnownCommitted {
-            effect,
-            receipt: enriched,
-            finalization,
+        Ok(WritePublicationDispatch {
+            outcome: WritePublicationVerdict::KnownCommitted {
+                cleanup,
+                effect,
+                receipt: enriched,
+                finalization,
+            },
+            cleanup: Some((operation, journal)),
         })
     }
 
-    fn reject_operation(
+    fn adopt_received_operation(
         &self,
+        handle: &IcebergCommitHandle,
+        validated: &[ValidatedFragment<'_>],
+        context: &ConnectorRequestContext,
+    ) -> Result<
+        (
+            IcebergCommitOperation,
+            PublicationJournal<ConnectorWriteReceipt>,
+        ),
+        ConnectorError,
+    > {
+        let operation = IcebergCommitOperation::new(
+            OperationToken::from_write_session(handle.session_id()),
+            handle.table().table_location(),
+            self.runtime.resources().planning_binding().clone(),
+            context.clone(),
+            self.runtime.resources().catalog_runtime().clone(),
+            OperationLimits::default(),
+        )
+        .map_err(|e| internal(e.to_string()))?;
+        let journal = PublicationJournal::for_runtime(
+            operation.token(),
+            self.runtime.resources().catalog_runtime(),
+        );
+        handle.retain_publication(operation.clone(), journal.clone())?;
+        // Physical ownership deduplicates objects, while intent keeps full DV identities.
+        let objects: BTreeSet<_> = validated
+            .iter()
+            .map(|entry| entry.fragment.path().to_owned())
+            .collect();
+        for path in objects {
+            operation
+                .adopt_session_data(ObjectIdentity::new(path).map_err(|e| corrupt(e.to_string()))?)
+                .map_err(|e| internal(e.to_string()))?;
+        }
+        Ok((operation, journal))
+    }
+
+    pub(super) async fn cleanup_received_set_async(
+        &self,
+        handle: &IcebergCommitHandle,
+        received: &ConnectorPreparedWriteSet,
+        context: &ConnectorRequestContext,
+    ) -> Result<ExternalMutationFinalization, ConnectorError> {
+        if !matches!(
+            handle.state()?,
+            IcebergWriteSessionState::KnownUncommitted { .. }
+        ) {
+            return Err(invalid(
+                "received write cleanup requires a proven uncommitted session",
+            ));
+        }
+        if handle.flavor() == IcebergWriteFlavor::StagedCreate {
+            return Err(invalid(
+                "staged target publication retains its own sealed object cleanup authority",
+            ));
+        }
+        // The caller must have transferred the exact completed Session union;
+        // the same Provider additionally checks binding/targets/fragment facts.
+        // No ref/live-set scan and no old-reference path is adopted for deletion.
+        let validated = validate_prepared_set(handle, &self.adapter, received)?;
+        let (operation, _) = self.adopt_received_operation(handle, &validated, context)?;
+        let cleanup = {
+            let mut original = std::pin::pin!(operation.cleanup(CleanupScope::EntireOperation));
+            let report =
+                std::future::poll_fn(|cx| std::future::Future::poll(original.as_mut(), cx)).await;
+            let cleanup = report.finalization();
+            // The exact report enters the original handle before the actual
+            // cleanup F drops at this scope's end, including Drop unwind.
+            handle.retain_early_cleanup(report);
+            cleanup
+        };
+        handle.retain_cleanup(cleanup.clone());
+        handle.retain_finalization(cleanup.clone());
+        Ok(cleanup)
+    }
+
+    async fn reject_operation(
+        &self,
+        handle: &IcebergCommitHandle,
         operation: &IcebergCommitOperation,
         error: ConnectorError,
     ) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
         self.reject_operation_failure(
+            handle,
             operation,
             attempt::before_dispatch_failure(&format_error(error)),
         )
+        .await
     }
 
-    fn reject_operation_failure(
+    async fn reject_operation_failure(
         &self,
+        handle: &IcebergCommitHandle,
         operation: &IcebergCommitOperation,
         failure: ConnectorMutationFailure,
     ) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
-        let cleanup_operation = operation.clone();
-        let cleanup = match self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                cleanup_operation
-                    .cleanup(CleanupScope::EntireOperation)
-                    .await
-            }) {
-            Ok(cleanup) => cleanup.finalization(),
-            Err(error) => ExternalMutationFinalization::Failed(super::failure(
-                ConnectorMutationFailureKind::Unavailable,
-                format!("Iceberg pre-dispatch cleanup bridge failed: {error}"),
-            )),
-        };
+        let report = operation.cleanup(CleanupScope::EntireOperation).await;
+        let cleanup = report.finalization();
+        handle.retain_early_cleanup(report);
         ExternalMutationOutcome::KnownUncommitted { failure, cleanup }
     }
 }

@@ -761,6 +761,7 @@ mod keyed_publication_trace_tests {
             })
             .expect("finish zero-row ordinary append");
         let ExternalMutationOutcome::KnownCommitted {
+            cleanup: _,
             effect: ExternalMutationEffect::Applied,
             receipt,
             finalization: ExternalMutationFinalization::Complete,

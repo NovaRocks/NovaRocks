@@ -74,7 +74,11 @@ impl<H> ArithmeticCreationFailure<H> {
         match self {
             Self::Prepare(error) => error.control_error().is_some(),
             Self::Construction(
-                Failure::Observer(_) | Failure::Layout(_) | Failure::Vec(_) | Failure::HashMap(_),
+                Failure::Observer(_)
+                | Failure::Layout(_)
+                | Failure::Vec(_)
+                | Failure::HashMap(_)
+                | Failure::BTree(_),
             ) => true,
             Self::Construction(Failure::ValueType(_) | Failure::Rule(_)) => false,
         }
@@ -93,7 +97,7 @@ fn pure_arithmetic_creation_failure(
             ArithmeticTypeCreationFailure::Creator(never),
         )) => match never {},
         ArithmeticCreationFailure::Construction(
-            Failure::Layout(_) | Failure::Vec(_) | Failure::HashMap(_),
+            Failure::Layout(_) | Failure::Vec(_) | Failure::HashMap(_) | Failure::BTree(_),
         ) => CompileControlError::ResourceExhausted.into(),
         ArithmeticCreationFailure::Construction(Failure::ValueType(_) | Failure::Rule(_)) => {
             ArithmeticPrepareError::TypeMismatch

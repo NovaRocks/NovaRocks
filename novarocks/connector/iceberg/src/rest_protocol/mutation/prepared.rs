@@ -64,6 +64,7 @@ pub(crate) struct PreparedRestMutation {
     expectation: AttributionExpectation,
     owner: Arc<crate::rest_protocol::auth::RestAuthOwner>,
     keep_document: bool,
+    original: ConnectorRequestContext,
 }
 impl std::fmt::Debug for PreparedRestMutation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -99,14 +100,15 @@ impl PreparedRestMutation {
         descriptor.validate()?;
         // These awaits are session/authentication reads. Their shared attempt
         // remains driven by other waiters if this caller stops waiting.
+        let request_context = RequestContext::from_connector(preparation);
         let session = tokio::select! {
-            result = endpoints.session() => result.map_err(|failure| binding_failure(failure.step))?,
+            result = endpoints.session_in(&request_context) => result.map_err(|failure| match failure.original { Some(original) => PreparationFailure::from(original), None => binding_failure(failure.step) })?,
             _ = preparation.stop().stopped() => return Err(PreparationFailure(novarocks_spi::connector::ConnectorMutationFailure::new(novarocks_spi::connector::ConnectorMutationFailureKind::Cancelled, "REST publication preparation cancelled"))),
             _ = tokio::time::sleep_until(preparation.deadline().into()) => return Err(PreparationFailure(novarocks_spi::connector::ConnectorMutationFailure::new(novarocks_spi::connector::ConnectorMutationFailureKind::DeadlineExceeded, "REST publication preparation deadline elapsed"))),
         };
         let mut headers = session.request_headers(delegation);
         tokio::select! {
-            result = endpoints.owner().authorize(&mut headers) => result.map_err(|failure| binding_failure(failure.step))?,
+            result = endpoints.owner().authorize_in(&mut headers, &request_context) => result.map_err(|failure| match failure.original { Some(original) => PreparationFailure::from(original), None => binding_failure(failure.step) })?,
             _ = preparation.stop().stopped() => return Err(PreparationFailure(novarocks_spi::connector::ConnectorMutationFailure::new(novarocks_spi::connector::ConnectorMutationFailureKind::Cancelled, "REST publication preparation cancelled"))),
             _ = tokio::time::sleep_until(preparation.deadline().into()) => return Err(PreparationFailure(novarocks_spi::connector::ConnectorMutationFailure::new(novarocks_spi::connector::ConnectorMutationFailureKind::DeadlineExceeded, "REST publication preparation deadline elapsed"))),
         }
@@ -189,6 +191,7 @@ impl PreparedRestMutation {
             expectation,
             owner: Arc::clone(endpoints.owner()),
             keep_document,
+            original: preparation.clone(),
         })
     }
 
@@ -197,16 +200,35 @@ impl PreparedRestMutation {
     }
 
     /// Starts no new session/auth request and serializes no request data.
-    pub(crate) async fn dispatch(self, context: EvidenceContext) -> PreparedRestOutcome {
+    pub(crate) async fn dispatch(
+        self,
+        context: EvidenceContext,
+    ) -> Result<PreparedRestOutcome, novarocks_spi::connector::ConnectorError> {
+        // First publication is independent of statement cancellation after
+        // dispatch. A nested necessary publication retains its phase's own
+        // stop and the deadline already bounded by the original journal.
+        let stop = if self
+            .original
+            .necessary_finalization_deadline_cap()
+            .is_some()
+        {
+            self.original.stop().clone()
+        } else {
+            novarocks_spi::connector::ConnectorStopOwner::new().view()
+        };
+        let original = self
+            .original
+            .for_existing_obligation(context.deadline(), stop);
+        let request_context = RequestContext::from_connector(&original);
         let (stage, body) = self
             .owner
             .http()
             .send_once(
                 Ok(self.request),
                 self.expectation.endpoint().success_statuses(),
-                &RequestContext::with_deadline(context.deadline().into()),
+                &request_context,
             )
-            .await;
+            .await?;
         let (read, document) = match (self.expectation.endpoint().response_shape(), body) {
             (Some(shape), Some(body)) => {
                 read_view(shape, &self.expectation, body, self.keep_document).await
@@ -216,11 +238,11 @@ impl PreparedRestMutation {
         };
         let evidence = classify(&stage, read, &self.expectation);
         let document = document.filter(|_| matches!(evidence, RestEvidence::Applied { .. }));
-        PreparedRestOutcome {
+        Ok(PreparedRestOutcome {
             evidence,
             stage,
             document,
-        }
+        })
     }
 }
 
@@ -386,7 +408,7 @@ mod tests {
         .await
         .unwrap();
         stop.request_stop();
-        let outcome = task.await.unwrap();
+        let outcome = task.await.unwrap().unwrap();
         assert!(matches!(
             outcome.dispatch_evidence(),
             DispatchEvidence::Applied { .. }
@@ -437,7 +459,8 @@ mod tests {
             };
             let outcome = prepared
                 .dispatch(policy.begin_evidence(&preparation).unwrap())
-                .await;
+                .await
+                .unwrap();
             assert!(matches!(
                 outcome.dispatch_evidence(),
                 DispatchEvidence::Unknown { .. }

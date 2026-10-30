@@ -119,6 +119,60 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
         })
     }
 
+    fn external_system_catalog_facts_async<'a>(
+        &'a self,
+        request: &'a novarocks_spi::connector::ConnectorRequestContext,
+        catalog_name: &'a str,
+        include_table_names: bool,
+    ) -> futures::future::BoxFuture<'a, Result<Option<SystemCatalogFacts>, String>> {
+        Box::pin(async move {
+            let lease = match crate::connector::acquire_metadata_planning_lease(
+                self.connector_control.as_ref(),
+                catalog_name,
+            ) {
+                Ok(lease) => lease,
+                Err(_) => return Ok(None),
+            };
+            let mut budget = ConnectorListingBudget::new(ConnectorListingBound::V1)
+                .map_err(|e| e.to_string())?;
+            let mut schema_names =
+                crate::connector::metadata_list_namespaces_with_planning_lease_async(
+                    lease.clone(),
+                    request.clone(),
+                    budget.remaining_bound(),
+                )
+                .await?
+                .into_iter()
+                .map(|n| n.namespace.to_string())
+                .collect::<Vec<_>>();
+            schema_names.sort();
+            schema_names.dedup();
+            budget
+                .admit_names(schema_names.iter().map(String::as_str))
+                .map_err(|e| format!("list external schemas: {e}"))?;
+            let mut table_names = Vec::new();
+            if include_table_names {
+                for schema in &schema_names {
+                    let tables = crate::connector::metadata_list_tables_with_planning_lease_async(
+                        &lease,
+                        request.clone(),
+                        schema,
+                        budget.remaining_bound(),
+                    )
+                    .await?;
+                    budget
+                        .admit_qualified_names(schema, tables.iter().map(String::as_str))
+                        .map_err(|e| format!("list external tables in {schema}: {e}"))?;
+                    table_names.extend(tables.into_iter().map(|table| (schema.clone(), table)));
+                }
+            }
+            Ok(Some(SystemCatalogFacts {
+                catalog_name: catalog_name.to_owned(),
+                schema_names,
+                table_names,
+            }))
+        })
+    }
     fn external_system_catalog_facts(
         &self,
         request: &novarocks_spi::connector::ConnectorRequestContext,

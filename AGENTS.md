@@ -46,9 +46,10 @@ Its production runtime is the native NovaRocks FE/BE role model:
     boundary and is not an application role or separate production topology.
 
 - **Sealed external Connector providers**
-  - The active Server provider manifest contains exactly Iceberg and Paimon.
-  - Paimon is read-only for append-only and `deduplicate` primary-key snapshot
-    reads. Iceberg retains its existing read/write capabilities.
+  - Server sealed manifest 保留 Iceberg 与 Paimon 注册；Iceberg 保持既有读写能力。
+  - Paimon 读取已暂停：catalog 配置与投影保留，目录和读取操作明确返回 Unsupported，
+    不进入 pure catalogue。恢复须待 paimon-rust 及其依赖支持 Arrow 60 与 zstd 0.14，
+    并重新满足 ADR-0138 的授权读取边界；见 ADR-0204。
   - StarRocks is retired: its source remains for reference, but it has no active
     read capability and `[connector.starrocks]` is rejected at configuration
     parsing.
@@ -66,7 +67,7 @@ SQL client
   `- MySQL protocol -----------> NovaRocks role=fe
                                       |
                                       v
-                            Frontend SQL/coordinator application
+                            Frontend SQL / logical execution
                                       |
                                       v
                             Native gRPC fragment submission
@@ -139,8 +140,10 @@ SQL client
 
 - `novarocks/frontend-application/src/**`
   FE application composition, SQL admission, catalog projection, native query
-  execution adapter and distributed task coordination. Query-local semantic
-  policy remains in `novarocks/query-application/src/**`; long-lived Catalog
+  adapter, supervised statement orchestration and domain publication.
+  `task_execution/**` owns Native attempt protocol facts; the common logical
+  execution owner and recovery policy remain in `novarocks/query-application/src/**`.
+  Long-lived Catalog
   generation ownership remains in `novarocks/catalog-application/src/**`.
   `state_family/**` is the closed manifest of every frontend-local state
   family: it owns each family's classification (`ExternalProjection` /
@@ -160,6 +163,14 @@ SQL client
   kernels shared by FE and BE application owners. `execution-contract` owns the
   identities and contracts both roles must agree on; `execution` owns the
   runtime that runs under them.
+
+- `novarocks/coordination-contract/src/**`
+  仅共享 FE owner 之间实际使用的身份、时间、消息与中立事实；无 Tokio、领域载荷、
+  session、closure、资源 owner 或恢复算法。Query Application 的 `coordination/supervisor.rs`
+  拥有唯一 query-id 来源、逻辑驱动和恢复政策，`runtime_registry.rs` 与
+  `runtime_registry/health.rs` 保管原任务、真实退出和原始 health；writer/统计完成证明属于
+  Frontend 领域。见 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md)；
+  源码结构与局部测试不证明整族原生或最终全工作区验证完成。
 
 ### 4.2 SQL Frontend: Parse, Plan, Admit
 
@@ -188,6 +199,48 @@ SQL client
   DML flows — `insert.rs`, `delete/**`, `mutation.rs` / `mutation_flow.rs`,
   `truncate.rs`, `add_files.rs`, `ctas.rs` / `iceberg_ctas.rs`,
   `iceberg_writer.rs` (INSERT INTO / INSERT OVERWRITE).
+
+- `novarocks/frontend-application/src/query/{statement_action,read_action,write_action,mutation_action,ctas_action}.rs`
+  当前 governed 语句接缝：普通 Read 保留 Client 窗口与流式 handle；Internal 写入由稳定 Action
+  编排 prepare、计算、publication 和必要 finalize。共享阶段/计算在 `query/statement_computation.rs`，
+  共享 publication 在 `query/statement_publication.rs`。计算就绪、必要业务就绪与真实退出分别取证；
+  成功和失败路径保留累计外部效果，seal/NoOp 不冒充最终 CREATE 或真实提交。
+  命令完成经 Query Application 的 `StatementCommandCompletion` / `GovernedCompletionStatementResult`
+  保留原业务选定的 affected rows，再由 MySQL `terminal.rs` 标准编码。普通/MOR 取同 Session
+  完整冻结的 Root 计数，COW 取原 selection，CTAS 等最终 CREATE；控制与签名 NoOp 显式为零。
+  缺计数或失败不能转成 OK(0)，完成数据不替代原 visibility、取消、真实 flush 与退出。
+
+- `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`
+  Stats 的前台 capture 与后台 governed Action：capture 的 CPU/Provider 实际关闭后，原 query permit
+  静默移交给同 job 的稳定接收格，再通知原串行 worker。计算沿共享 `statement_computation.rs`，
+  Ready 在 payload 移交前保留原 statement retention；publication 与 residual 继续保管同原 Session。
+  scoped CPU 作者在 `query_execution/internal_result_cpu/scoped_statistics.rs`，准备访问保管在
+  `query_execution/statistics/preparation.rs`。普通业务拒绝、actual quiescence 与 raw health 分别保留，
+  不能用其中一项代替另一项；这些源码入口不证明整族或原生验收完成。
+
+- `novarocks/workload-control/src/result_window.rs` 与
+  `novarocks/workload-control/src/result_window/retained_bytes.rs`、
+  `novarocks/query-application/src/cpu.rs` 与
+  `novarocks/query-application/src/cpu/bounded_worker.rs`、
+  `novarocks/frontend-application/src/native/task_transport.rs`
+  分别拥有结果数据预算、实际 worker/队列和 Transport bytes/items。scope、完整 D 与
+  factory 身份不能自行授予资源；普通 Full 沿原队列可取消等待，不当作资源失败。
+  出队归还队列位置，已开始工作及结果析构仍按实际退出归还原运行资源。
+  Client 复用原结果窗口，Internal 计算位置与保留数据分开，不与 worker 数绑定。
+  复制前按实际 buffer 的 old+new 并存峰取得同一预算回执，最后实际 alias 退出才退款；
+  额外 schema lifetime 不授予 byte author。same Root 自持数据导致预算不足时 typed 拒绝，
+  不等待自己、不建立递归 SDK invoice。当前实现沿上述 owner 接线；原生/最终全工作区验证范围、
+  失败处置与验收资格分别核对。
+
+- `novarocks/frontend-application/src/query/{mv_action,mv_read_action}.rs` 与
+  `novarocks/frontend-application/src/mv/service/background_original.rs`
+  MV 的 CREATE、DROP、普通 ALTER、Refresh/Repartition 与 SHOW/EXPLAIN 分别走原 Root 的
+  控制、数据或只读 Action；后台沿原 scheduler/runtime 的稳定 Source 提交同一执行 owner。
+  `novarocks/mv-application/src/service.rs` 的 `MvProductOperations` 保同一业务闸门与调度状态，
+  process wrapper 独持 `process_runtime.rs` 的异步后台任务和原 Join；不让活动 Source 强持
+  wrapper 形成循环。借用 future 的取消不丢原 owner，停止等待不替代真实 close。
+  旧同步 runner、协调器及其第二身份来源已退役；未触及的 CALL/Host 辅助入口不能据此称为全域
+  异步完成。ADR-0198 所述架构已实施；既有基线失败、能力限制与正式准入资格仍须独立核对。
 
 - `novarocks/frontend-application/src/catalog_application/statement.rs`
   Catalog, database and table DDL against the projected catalog.
@@ -273,7 +326,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `novarocks/execution/src/runtime/function_set.rs`
   只封存真实 EngineFunctionCatalog metadata；不持有旧实现 map、legacy registry 或 implementation manifest。
-  `novarocks/version/src/lib.rs` 的 compatibility domain/生产 epoch 为 7；旧执行实现摘要不再参与，
+  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 10；旧执行实现摘要不再参与，
   函数目录、pure 目录、descriptor、plan contract 与 Provider/carrier 事实仍保持 exact-island 判定。
 
 - `novarocks/execution/src/exec/operators/**`
@@ -290,8 +343,18 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `binding.rs` 定义 `ExchangeBindings`、`ScanBindings`，writer bindings 在 `runtime/fragment`。
 
 - `novarocks/execution/src/exec/pipeline/executor.rs`
-  `prepare_compiled_program_pipeline_execution_with_profiler` 准备 compiled pipeline；
-  program 与 Task 能力分别传入，不能重建已删除的 construction plan bridge。
+  生产入口 `prepare_compiled_program_with_sink_materializer` 先建立计算图，再按实际 root DOP
+  绑定 sink。change-stream 的独立 summary pipeline 加入同一 DriverBatch/FragmentCompletion，
+  不等待 Task terminal，也不从请求 profile 猜贡献者数量。program 与 Task 能力分别传入，
+  不能重建已删除的 construction plan bridge。
+
+- `novarocks/execution/src/runtime/fragment/sink.rs`、`exec/pipeline/builder/compiled_writer.rs`
+  Router 按原 static branch 绑定 provider route 与独立 summary，表达式 root 保留原 branch 身份。
+  writer 以相同 canonical typed key 分别消费 InstanceV1 与 DriverV1 hash 域；条件断言仅对
+  WhenTrue 行判重，FALSE/NULL 绕过 key。逻辑 finish 以 Source 公平消费有界 writer-results
+  合流和准确 source-bound summary，不再为 summary 构建竞争同一 receiver 的第二个 Source。
+  核心契约见 [ADR-0208](docs/adr/ADR-0208-logical-write-counts-and-strict-stream-delivery.md)，
+  冻结放置、Task 绑定与完成装配见 [ADR-0206](docs/adr/ADR-0206-frozen-write-placement-and-task-completion-assembly.md)。
 
 - `novarocks/execution/src/exec/pipeline/driver.rs`
   Driver execution logic.
@@ -398,10 +461,12 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   - `novarocks/connector/iceberg/src/commit/staging/**`：updates 前缀事实、ID 规范化、requirements 折算及 manifest-list 的实际 row-ID 分配。
   - `novarocks/connector/iceberg/src/commit/attempt.rs`：加载、验证、准备、冻结、单次派发和确定冲突的重试。
   - `novarocks/connector/iceberg/src/commit/operation.rs`：操作内 I/O 并发、先登记后写入、实际退出监督和有界 owned-object 清理。
+  - `novarocks/connector/iceberg/src/commit/write_stack/execution/cleanup.rs`：原 unsealed writer actor 持有准确 staged journal，首次清理启用现有 Provider 独立时间预算，保留原 scope、凭据与 I/O 能力；只在实际 DELETE 成功后移除原路径。Work 停止不取消已存在的清理义务，sealed 产物与 Unknown 仍保留原所有权及真实退出要求。
 
 - `novarocks/connector/paimon/**`
-  Read-only Paimon Filesystem Catalog, private wire codec, snapshot planning,
-  and append-only / `deduplicate` primary-key table reads.
+  Paimon Provider 已暂停；保留配置、合约与私有 wire codec，catalog materialize 成功，
+  目录与读取入口返回带恢复条件的 Unsupported，BE bind 明确拒绝。恢复须待 paimon-rust
+  及其依赖支持 Arrow 60 与 zstd 0.14，再按 ADR-0138 恢复授权读取；见 ADR-0204。
 
 - `novarocks/fs/**`
   Connector-neutral authorized object-store access. Its process-local
@@ -418,10 +483,10 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 1. A MySQL client connects to a `role=fe` process through the native SQL
    entrypoint.
 2. The frontend owns session admission, catalog resolution, planning, and
-   coordinator lifecycle assembly.
-3. Persistent tables belong to external providers. Iceberg owns its catalog and
-   mutation truth; Paimon owns its external snapshots and exposes only its
-   supported read capability.
+   supervised statement orchestration and common logical execution assembly.
+3. 持久表属于外部 Provider。Iceberg 拥有 catalog 与 mutation 真相；Paimon 保留注册
+   与 catalog 投影，读取已暂停。恢复须待上游闭包支持 Arrow 60 与 zstd 0.14，
+   并重新满足授权读取边界，见 ADR-0204。
 4. Frontend 将完成的物理计划冻结成 compiled packages，连同准确的 Connector facts
    经 native gRPC 提交到一个或多个 `role=be` 进程。
 5. BE hosts bind installed Connector execution instances and run Arrow batches
@@ -442,22 +507,35 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    `novarocks/execution/src/runtime/fragment/io/exchange_receiver.rs` and the
    registry in `novarocks/execution/src/runtime/exchange.rs`.
 4. The exchange source operator
-   (`novarocks/execution/src/exec/operators/exchange_source.rs`) blocks until all
-   senders reach EOS.
+   (`novarocks/execution/src/exec/operators/exchange_source.rs`) waits for every
+   sender and authors Consumed only after the actual input consumes its final
+   EOS; early withdrawal remains Withdrawn. MustDrain inputs cannot use ordinary
+   demand withdrawal to authorize success or normal retirement. Pre-success
+   validation, settled conclusion and the retirement re-read remain distinct.
 5. On cancellation, `exchange::cancel_fragment` / `cancel_exchange_key` clear
    exchange keys and wake blocked waiters.
 
 ### 5.3 Native Distributed Task Execution Path
 
-1. `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs` freezes a
-   `QueryExecutionId` and, from one live backend snapshot, a task graph:
-   `novarocks/frontend-application/src/task_execution/graph.rs` mints a `TaskIdentity`
+1. Query Application 的 `coordination/supervisor.rs` 统一预留 query 与 attempt 身份；
+   `novarocks/frontend-application/src/query_execution/logical_execution.rs` 从同一 reservation
+   续接原凭据与 attempt 责任。`native_execution_adapter.rs` 从一个实际 backend snapshot 冻结
+   Task graph；`novarocks/frontend-application/src/task_execution/graph.rs` mints a `TaskIdentity`
    ({QueryExecutionId, StageId, TaskId, BackendProcessId}) per placement and a
    `QueryContextRef` ({QueryExecutionId, FrontendProcessId, BackendProcessId})
    per participating backend. A context exists only where the scheduler placed
    a task, so the number of participants is a property of the plan and the
    splits, never of the cluster size.
-2. `execute_round_on_task_protocol` establishes every context and creates every
+   `coordination/schedule.rs` 消费显式 Singleton/ScanWork/Spread/FollowSources policy，
+   独立决定 source、各 writer route 和 finish 的实例集合；driver DOP 使用同一 query options
+   冻结的域。manifest 从同一准确 placement 分别冻结 writer 与 summary-source Task 集合。
+2. Query Application 的统一逻辑执行 owner 管理各分布式意图的恢复、结果与计算就绪；
+   Frontend Action 编排 prepare、领域 publication 和必要 finalize，Task 驱动只提供协议事实。
+   稳定 Source 在启动前接收原输入、同 Root 责任与访问能力，跨取消和 panic 保管原件；
+   业务 Ready、原 Future 的 poll/Drop 退出和 Unknown 库存的处置分别取证。
+   结构退役不代表整族 Native 通过；实际验证范围、原始失败与验收资格须独立核对。
+   ADR-0198 将内部计算就绪、publication、诊断和收敛分开；就绪不等于语句成功。
+   `execute_round_on_task_protocol` establishes every context and creates every
    task through a bounded, fair dispatcher
    (`novarocks/frontend-application/src/task_execution/{round,dispatch,context_owner}.rs`).
    Each operation gets one verdict per domain -- Apply / Idempotent / Older /
@@ -474,6 +552,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    BE 的 typed 能力拒绝沿 `TaskFailureCategory::Unsupported` 与
    `AttemptFailureClass::Unsupported` 传至 `[UnsupportedCompiledShape]`，不重试或重新规划。
    SQL 分析期缺 pure 实现保留 `[sql.analyze.unavailable_implementation]`。
+   写完成要求完整 Root End、准确结果覆盖及各领域冻结 Task 的完成事实，并保留取消/deadline 否决。
+   root seal 后原 Task 驱动继续推进严格尾部；所有 MustDrain 端点终态后才进入原 normal drain，
+   不把 root seal 当成 source/writer 已完成，也不为普通读新增全参与者成功屏障。
 3. Push exchange edges start Closed and open once every frozen destination has
    an Installed fact or has normally withdrawn its exact input demand
    (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no
@@ -497,8 +578,10 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    task's terminal *is* its own status.
 6. Client cancellation is `KILL QUERY` through the Query Application query-control
    owner, delivered as `AbortQueryContext`. The Frontend Application withholds the
-   interrupt until its coordinator worker unwinds, so the next statement on
-   that connection cannot race the statement generation.
+   interrupt until this statement's local supervised orchestration exits, so the
+   next statement cannot race its generation. This does not require remote
+   Unknown publication or residual cleanup to disappear; its stable owner retains
+   the actual responsibility and capacity. See ADR-0198.
 
 ## 6. Core Data Structures (Current Implementation)
 
@@ -566,16 +649,27 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   Embedded-JVM toggle for Iceberg metadata-table and remote metadata planning.
 
 - `[standalone_server]`
-  `mysql_port`, `user`, MV scheduler settings, and Iceberg maintenance settings.
+  `mysql_port`、`trino_port`（默认 `8080`）、`trino_client_timeout_ms`（默认 `300000`）、
+  `user`、MV scheduler 与 Iceberg maintenance 设置。Trino 固定监听 `127.0.0.1`，与 MySQL
+  复用配置用户；Host 仅接受 `localhost`、`127.0.0.1`、`[::1]`（可带数字端口）。
+  Trino 是客户端协议入口，SQL 仍使用当前方言；客户端 TLS、非本机访问与非空认证不在此入口范围。
 
 - `[connector.object_store]`
-  Process-local object-store credentials for Iceberg and Paimon connector
-  execution; this does not define a native internal table store.
+  Iceberg Connector 执行使用的进程本地对象存储凭据，不定义 native 内部表存储。
+  Paimon 已暂停，不组合其 SDK 存储资源；恢复前须满足 Arrow 60、zstd 0.14
+  与 ADR-0138 的授权读取边界。
 
 - `[debug]`
   `exec_node_output`, `exec_batch_plan_json`
 
 ### 7.3 Local Test Environment (Iceberg REST + MinIO + Spark)
+
+新 Ubuntu 26.04 amd64 开发节点使用 [版本化准备入口](tools/dev/README.md)：
+`sudo tools/dev/linux-env.sh prepare --user <account> --profile tools/dev/profiles/aliyun-ubuntu26-amd64.json --fixture iceberg-rest`。
+prepare 才安装/联网供给；check/env 只观察/输出环境。显式账户和准确平台必须贯通 fixture schema 2，
+相同输入不无故重启服务；旧 BOM 明确重新 provision，现有机器版本变化沿原维护入口，不清卷。
+专用 profile 使用本机可用 CPU，通用构建默认不变。该节点不因此成为正式 CI 来源。
+
 
 The canonical local test fixture lives at `docker/iceberg-rest/` and is also
 the CI fixture for the `iceberg`, `iceberg-compatibility`, and `iceberg-rest`
@@ -670,9 +764,11 @@ done
 grep -q '^NOVAROCKS_READY ' "$LOG" || { echo "timed out waiting for NOVAROCKS_READY" >&2; kill -9 "$SRV_PID"; exit 1; }
 ```
 
-The marker line is emitted on stdout immediately after a successful bind:
-`NOVAROCKS_READY mysql_port=23223 pid=<pid>`. Any orchestration that
-backgrounds the server **must** gate its first connection on this line.
+FE 绑定 Trino 与 MySQL 客户端监听后，在 stdout 输出：
+`NOVAROCKS_READY mysql_port=23223 pid=<pid> trino_port=<actual-port>`。
+字段 `trino_port` 追加在末尾，原 `NOVAROCKS_READY mysql_port=` 前缀保留。
+后台启动的编排必须等到这一行再连接，端口取本次实际 marker；不能只探测一个可能已被其他进程占用的端口。
+`NOVA_ENV_TRINO_PORT` 是本地 fixture 导出的 Trino 端口。
 
 Run SQL tests with the generated runner config:
 
@@ -912,7 +1008,7 @@ unless you edited them.
 | `novarocks/worker/**`, `novarocks/native-adapter/**` | `-p novarocks-worker -p novarocks-native-adapter` |
 | `novarocks/connector/<name>/**` | that connector crate, plus `-p novarocks-fs` when authorized object-store access changes |
 | `novarocks/state-store/**` | the touched backend crate plus `-p novarocks-state-store-api` |
-| `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
+| `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/coordination-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
 
 **SQL: choose suites from native declarations** and their generated map in
 `tests/sql/correctness/README.md`. Direct `--only <case>` is useful for diagnosis;
@@ -966,11 +1062,26 @@ suspected case against a clean server before attributing it to the change.
   `delete/**`, `mutation_flow.rs`, `truncate.rs`, `add_files.rs`,
   `iceberg_writer.rs`); catalog/table DDL is in
   `novarocks/frontend-application/src/catalog_application/statement.rs`.
+  Current governed statement custody starts at `novarocks/frontend-application/src/query/statement_action.rs`;
+  inspect the read/write/mutation/CTAS/MV Actions, shared `statement_computation.rs` and
+  `statement_publication.rs` in that directory. Provider rewrite session custody is in
+  `query_execution/distributed_rewrite.rs`; the former empty `QueryExecutionService` injection
+  chain is retired.
+  Common logical execution policy and identity are in `novarocks/query-application/src/coordination/**`.
+  Preserve cumulative effects through `novarocks/query-application/src/api/result.rs`
+  and MySQL success/error projection; consult ADR-0198 before changing these boundaries.
+  资源修改沿原 worker、Transport 与结果预算 owner；保留 typed Source、完整 D 和实际退出证据。
+  局部组件通过不证明原生调用面或最终全工作区验证完成。
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、
   `commit/attempt.rs`、`commit/operation.rs` 和 `commit/write_stack/control/publication.rs` 开始。
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
   `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
-  读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md) 与 [ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 后再改身份、字段继承、派发生命周期或清理授权。
+  读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)、[ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 与 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 后再改身份、字段继承、派发或清理授权。
+  BE seal 先不可回退撤销 writer 删除权；FE 收齐后做本地交接。缺产物清单不能报 cleanup Complete。
+  精确 operation-owned cleanup 与扫描 GC 分开；REST/Hadoop 扫描安全仍为 UNPROVEN，手动/自动入口共用缺证限制，不能以本地 deadline 或年龄授予删除权。
+  必要业务事实与原 receipt/cause 由同 canonical `ConnectorWriteNeededReady` Arc 保管；
+  `query_execution/write_session/publication_call.rs` 保留同一 Provider F 到真实退出，安全 GC 由同 Call 的残留继续驱动。
+  NeededReady、cleanup Pending/Observed、实际 F 退出及库存 Disposed 不可互换；封存必要 finalize 失败不能授权最终 CTAS publication。
 - **Execution semantics/operator behavior**：先核对 `novarocks/local-compiler/src/**` 和
   `novarocks/local-program/src/**`，再看 Execution `exec/pipeline/builder/compiled.rs`、
   `exec/operators/**`；`exec/node/**` 仍有共享值类型和运行能力，不能当旧树整片删除。
@@ -979,10 +1090,21 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/execution/src/runtime/fragment/io/**`,
   `novarocks/execution/src/exec/operators/exchange_source.rs`, and
   `novarocks/native-adapter/src/{exchange_data_plane,exchange_transmitter,fragment_exchange_receiver}.rs`.
-- **Materialized views**: inspect `novarocks/mv-application/src/**` and
-  `novarocks/frontend-application/src/mv/**`; MV query rewrite is an optimizer
-  concern under `novarocks/sql/src/optimizer/**`.
-- **Native distributed task execution**: inspect
+- **Statistics collection/publication**: inspect
+  `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`,
+  `query_execution/statistics/preparation.rs`, and `query_execution/internal_result_cpu/scoped_statistics.rs`.
+  Follow the original Root, query-permit handoff, CPU/Provider source and retained result through actual exit;
+  `query_execution/maintenance/io_admission.rs` separates ordinary refusal from actual quiescence.
+  Structural migration does not establish whole-family Native qualification or resolve recorded failures.
+- **Materialized views**: inspect `novarocks/frontend-application/src/query/{mv_action,mv_read_action}.rs`,
+  `novarocks/mv-application/src/{service,process_runtime}.rs` and
+  `novarocks/frontend-application/src/mv/service/background_original.rs` for original Action,
+  business-gate and async background custody. Provider publication, Current projection,
+  cumulative effect, necessary finalization and physical retirement retain separate facts.
+  MV query rewrite is an optimizer concern under `novarocks/sql/src/optimizer/**`.
+- **Native distributed task execution**: start with the common execution owner in
+  `novarocks/query-application/src/coordination/**` and the minimal boundary in
+  `novarocks/coordination-contract/**` (minimal neutral facts; ADR-0198), then inspect
   `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs`,
   `novarocks/frontend-application/src/task_execution/**`,
   `novarocks/worker/src/{task_registry,ingress,convergence}.rs`,
@@ -991,8 +1113,9 @@ suspected case against a clean server before attributing it to the change.
   gated edge-open barrier and the per-domain Apply / Idempotent / Older /
   Conflict verdict; do not add a protocol shim, a standalone direct-call path,
   or a no-runtime-filter retry inside an attempt. See ADR-0161.
-- **Connector behavior**: inspect `novarocks/connector/**` and
-  `novarocks/fs/**`. The active sealed providers are Iceberg and Paimon;
+- **Connector behavior**：读取 `novarocks/connector/**` 与 `novarocks/fs/**`。
+  sealed manifest 注册 Iceberg 与 Paimon，Paimon 能力已暂停；
+  恢复须待上游支持 Arrow 60 与 zstd 0.14，并满足 ADR-0138，见 ADR-0204。
   StarRocks is retired and must not be restored through a local-binding config
   or runtime fallback.
 - **Connector scan execution**: inspect
@@ -1090,6 +1213,10 @@ Use the generic skills-only plugin under `.agents/skills/workbench/`:
 - `dev-workflow-write-spec`: write the accepted design into project docs;
 - `dev-workflow-plan`: write and iterate the plan directly in project docs,
   then mark the persisted version approved after explicit user approval;
+- `dev-workflow-review-spec-plan`: read-only, open-ended review of a spec,
+  umbrella or plan's direction against mature industry practice and long-term
+  architecture, performance, availability and extensibility; it requires a
+  stated basis for every new hard limit and allows no new vendor patches;
 - `dev-workflow-execute`: create a goal and execute continuously through
   verification;
 - `dev-workflow-finish`: publish and archive only when authorized;

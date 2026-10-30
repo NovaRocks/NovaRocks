@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 
 use crate::query_execution::artifact::FragmentId;
+#[cfg(test)]
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_types::UniqueId;
@@ -34,6 +35,7 @@ pub struct FragmentInstancePlacement {
     pub instance_index: usize,
     pub finst_id: UniqueId,
     pub backend_idx: usize,
+    #[cfg(test)]
     pub endpoint: RuntimeEndpoint,
     pub scan_ranges: BTreeMap<i32, Vec<ScanRangeParams>>,
 }

@@ -102,6 +102,12 @@ impl std::error::Error for ConnectorWriteCodecError {
     }
 }
 
+impl novarocks_execution_contract::failure::FailureProjection for ConnectorWriteCodecError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        self.protocol.failure_fact()
+    }
+}
+
 /// Frontend half: turn one logical write recipe into its carrier.
 pub trait ConnectorWriteHandleEncoder: Send + Sync {
     fn owner(&self) -> &str;

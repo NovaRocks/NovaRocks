@@ -82,8 +82,8 @@ class WriterStartupTests(unittest.TestCase):
             read.assert_not_called()
 
     def test_iceberg_consumer_still_rejects_a_different_running_spark_image(self):
-        bom = {"images": {"minio-mc": {"alias": "minio/mc:verified"}},
-               "derived_images": {"iceberg-spark": {"image_id": "sha256:expected"}},
+        bom = {"images": {},
+               "derived_images": {"minio-mc": {"image_id": "sha256:verified-mc"}, "iceberg-spark": {"image_id": "sha256:expected"}},
                "lock_sha256": "locked"}
         publication = {"shared_docker": True,
                        "runtime": {"machine": {"containers": {"spark": "exact-spark"}}}}

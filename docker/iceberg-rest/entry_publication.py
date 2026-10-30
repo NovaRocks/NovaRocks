@@ -30,7 +30,7 @@ import fixture_runtime as runtime
 SCHEMA = 2
 # Presentation changes get a fresh immutable identity without rewriting files
 # still pinned by an existing consumer. Readers verify older schema-2 records.
-RENDERER_REVISION = 2
+RENDERER_REVISION = 4
 
 
 def _hash(path):

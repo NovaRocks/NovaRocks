@@ -74,6 +74,42 @@ class MachineCommandDeadlineExpired(runtime.RuntimeFailure):
         self.readonly_not_dispatched = readonly
 
 
+def is_cloud(record):
+    return record.get("config", {}).get("object_store", {}).get("kind") == "aliyun-oss"
+
+
+def validate_cloud_snapshot(record, *, require_sdk=True):
+    """Validate the saved activation, never a mutable installer desired copy."""
+    if not is_cloud(record):
+        return
+    config = machine_config(record["config"])["object_store"]
+    expected = dict(provider="aliyun-oss", endpoint=f"https://s3.oss-{config['region']}-internal.aliyuncs.com",
+        region=config["region"], bucket=config["bucket"], root_prefix=config["root_prefix"])
+    path = Path(record.get("object_store_config_file", ""))
+    if (record.get("storage_owner") != expected or not path.is_absolute()
+            or path != Path(record["compose_file"]).parent / "object-store.json"):
+        raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "cloud activation storage identity changed")
+    try:
+        saved = runtime.read_json(path)
+    except (OSError, ValueError) as error:
+        raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "cloud activation configuration is unavailable") from error
+    if saved != config:
+        raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "cloud activation configuration changed")
+    python = Path(record.get("oss_ops_python", ""))
+    if require_sdk and (not python.is_absolute() or not python.is_file()):
+        raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "verified OSS SDK interpreter is unavailable")
+
+
+def validate_verified_sdk_location(record, definition):
+    """A fresh verified definition cannot silently reuse a different SDK path."""
+    if not is_cloud(record) or not ({"config", "oss_ops_python"} & definition.keys()):
+        return
+    if not definition.get("oss_ops_python"):
+        raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "verified OSS SDK location is missing")
+    if record.get("oss_ops_python") != definition["oss_ops_python"]:
+        raise runtime.RuntimeFailure("MachineVersionMismatch", "verified OSS SDK location differs; explicit machine maintenance is required")
+
+
 def endpoints(snapshot: dict[str, Any]) -> dict[str, str]:
     ports = snapshot["ports"]
     result = {
@@ -84,6 +120,11 @@ def endpoints(snapshot: dict[str, Any]) -> dict[str, str]:
         "container_minio_endpoint": "http://minio:9000",
         "container_rest_uri": "http://rest:8181",
     }
+    if is_cloud(snapshot):
+        result.pop("minio_endpoint")
+        result.pop("minio_console")
+        result.pop("container_minio_endpoint")
+        result["object_store_endpoint"] = snapshot["storage_owner"]["endpoint"]
     if "rest-mv" in snapshot["images"]:
         result.update(rest_mv_uri=f"http://127.0.0.1:{ports['rest_mv']}",
                       container_rest_mv_uri="http://rest-mv:8181")
@@ -92,9 +133,20 @@ def endpoints(snapshot: dict[str, Any]) -> dict[str, str]:
 
 def machine_config(value: dict[str, Any] | None = None) -> dict[str, Any]:
     value = copy.deepcopy(value or {})
-    unknown = set(value) - {"ports", "policy", "benchmark_root", "minio_volume"}
+    if not isinstance(value, dict):
+        raise runtime.RuntimeFailure("InvalidConfiguration", "machine configuration must be an object")
+    unknown = set(value) - {"ports", "policy", "benchmark_root", "minio_volume", "object_store"}
     if unknown:
         raise runtime.RuntimeFailure("InvalidConfiguration", "unknown machine configuration fields")
+    cloud = None
+    if "object_store" in value:
+        try:
+            from oss_ops import validate_config
+            cloud = validate_config(value["object_store"])
+        except Exception as error:
+            raise runtime.RuntimeFailure("InvalidConfiguration", "invalid cloud object store configuration") from error
+        if "minio_volume" in value:
+            raise runtime.RuntimeFailure("InvalidConfiguration", "cloud storage cannot select a MinIO volume")
     ports = {**DEFAULT_PORTS, **value.get("ports", {})}
     policy = {**DEFAULT_POLICY, **value.get("policy", {})}
     if set(ports) != set(DEFAULT_PORTS) or any(type(p) is not int or not 0 < p < 65536 for p in ports.values()) or len(set(ports.values())) != len(ports):
@@ -107,7 +159,8 @@ def machine_config(value: dict[str, Any] | None = None) -> dict[str, Any]:
         raise runtime.RuntimeFailure("InvalidConfiguration", "cleanup reserve exhausts the run budget")
     from scratch import canonical_s3, contains
     try:
-        benchmark = canonical_s3(value.get("benchmark_root", "s3://novarocks/shared/benchmarks"))
+        benchmark = canonical_s3(value.get("benchmark_root",
+            f"s3://{cloud['bucket']}/{cloud['root_prefix']}benchmarks" if cloud else "s3://novarocks/shared/benchmarks"))
         if "/" not in benchmark[5:]:
             raise runtime.RuntimeFailure("InvalidScratchScope", "benchmark root has no prefix")
     except runtime.RuntimeFailure as error:
@@ -115,22 +168,36 @@ def machine_config(value: dict[str, Any] | None = None) -> dict[str, Any]:
     for warehouse in ("s3://warehouse/fixture-machine/rest", "s3://warehouse/fixture-machine/rest-mv"):
         if contains(benchmark, warehouse) or contains(warehouse, benchmark):
             raise runtime.RuntimeFailure("InvalidConfiguration", "benchmark root overlaps a shared REST warehouse")
+    if cloud:
+        root = f"s3://{cloud['bucket']}/{cloud['root_prefix']}"
+        if not contains(root, benchmark):
+            raise runtime.RuntimeFailure("InvalidConfiguration", "benchmark root leaves the configured cloud storage root")
+        for reserved in ("catalogs", "worktrees", "machines"):
+            protected = root + reserved
+            if contains(benchmark, protected) or contains(protected, benchmark):
+                raise runtime.RuntimeFailure("InvalidConfiguration", "benchmark root overlaps a catalog or worktree storage domain")
+        return dict(ports=ports, policy=policy, benchmark_root=benchmark, object_store=cloud)
     volume = value.get("minio_volume", PROJECT + "_minio-data")
     runtime.safe_component(volume)
     return dict(ports=ports, policy=policy, benchmark_root=benchmark, minio_volume=volume)
 
 
-def input_facts(bom: dict[str, Any], backend: Any) -> tuple[dict, dict]:
+def input_facts(bom: dict[str, Any], backend: Any, *, cloud=False) -> tuple[dict, dict]:
     """Consume already verified BOM facts; actual IDs never come from a mutable tag."""
     if not bom.get("lock_sha256"):
         raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "verified input lock identity is missing")
-    images, facts = {}, {"lock_sha256": bom["lock_sha256"]}
-    for service, group, logical in (
-        ("minio", "images", "minio"), ("mc", "images", "minio-mc"),
+    images, facts = {}, {"lock_sha256": bom["lock_sha256"], "platform": bom["platform"]}
+    sources = (
+        ("minio", "derived_images", "minio"), ("mc", "derived_images", "minio-mc"),
         ("rest", "images", "iceberg-rest"),
         ("spark", "derived_images", "iceberg-spark"),
         ("rest-mv", "derived_images", "rest-mv"),
-    ):
+    )
+    if cloud:
+        sources = (("rest", "derived_images", "iceberg-rest-oss"),
+                   ("rest-mv", "derived_images", "rest-mv-oss"),
+                   ("spark", "derived_images", "iceberg-spark-oss"))
+    for service, group, logical in sources:
         receipt = bom.get(group, {}).get(logical)
         if not isinstance(receipt, dict):
             raise runtime.RuntimeFailure("FixturePrerequisiteMissing", logical)
@@ -148,11 +215,18 @@ def input_facts(bom: dict[str, Any], backend: Any) -> tuple[dict, dict]:
             raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "derived definition identity is missing")
         facts[logical] = {"image_id": actual, "receipt": semantic}
         images[service] = {"image_id": actual, "tag": actual, "receipt": copy.deepcopy(receipt)}
-    images["mc-init"] = copy.deepcopy(images["mc"])
+    if cloud:
+        sdk = bom.get("python_environments", {}).get("oss-sdk")
+        if not isinstance(sdk, dict) or not sdk.get("definition_sha256") or not sdk.get("python_version") or not sdk.get("packages") or not isinstance(sdk.get("files"), dict) or not sdk["files"]:
+            raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "verified OSS SDK environment is missing")
+        facts["oss-sdk"] = {k: copy.deepcopy(sdk[k]) for k in ("definition_sha256", "python_version", "packages")}
+        facts["oss-sdk"]["files_sha256"] = runtime.digest(sdk["files"])
+    else:
+        images["mc-init"] = copy.deepcopy(images["mc"])
     return images, facts
 
 
-def verified_bom(repo: Path, store: Path | None = None) -> dict:
+def verified_bom(repo: Path, store: Path | None = None, *, consumer="iceberg-rest") -> dict:
     directory = repo / "docker/fixture-inputs"
     sys.path.insert(0, str(directory))
     try:
@@ -160,8 +234,10 @@ def verified_bom(repo: Path, store: Path | None = None) -> dict:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         from fixture_inputs import fixture_store
-        return module.verify(fixture_store(str(store) if store else None), repo,
-                             directory / "lock.json", consumer="iceberg-rest")
+        selected_store = fixture_store(str(store) if store else None).resolve()
+        result = module.verify(selected_store, repo, directory / "lock.json", consumer=consumer)
+        result["_verified_store_root"] = str(selected_store)
+        return result
     except Exception as error:
         raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "local fixture BOM verification failed") from error
     finally:
@@ -225,10 +301,13 @@ class MachineDocker(runtime.Docker):
                 raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "machine container was replaced outside maintenance")
         return info
 
-    def validate_resources(self, record):
+    def validate_resources(self, record, *, require_sdk=True):
         if record.get("kind") != "machine":
             return super().validate_resources(record)
-        self.validate_minio_volume(record)
+        if is_cloud(record):
+            validate_cloud_snapshot(record, require_sdk=require_sdk)
+        else:
+            self.validate_minio_volume(record)
         for service in record["images"]:
             self.container(record, service)
         self.own_network(record)
@@ -238,7 +317,7 @@ class MachineDocker(runtime.Docker):
                 raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "machine network was replaced")
         for name in record["volumes"]:
             volume = self.inspect("volume", name, absent_ok=True)
-            if volume and name != record["config"]["minio_volume"] and any(
+            if volume and name != record["config"].get("minio_volume") and any(
                 volume.get("Labels", {}).get(k) != v for k, v in self.labels(record).items()
             ):
                 raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "foreign machine state volume")
@@ -250,6 +329,8 @@ class MachineDocker(runtime.Docker):
             raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "fixed machine network already exists without saved authority")
         if self.inspect("volume", PROJECT + "_authority", absent_ok=True):
             raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "machine authority exists without saved state")
+        if is_cloud(record):
+            return
         volume = self.inspect("volume", record["config"]["minio_volume"], absent_ok=True)
         if volume and self.command(["ps", "--filter", "volume=" + record["config"]["minio_volume"], "-q"]):
             raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "selected MinIO volume still has an active consumer")
@@ -316,15 +397,20 @@ class MachineDocker(runtime.Docker):
             raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "another control directory owns this daemon's machine")
 
     def ensure_machine(self, record, previous=None):
+        if is_cloud(record):
+            validate_cloud_snapshot(record)
         self.ensure_authority_volume(record)
         self.activation_preflight(record, previous)
-        self.validate_minio_volume(record)
-        self.compose(record, ["up", "-d", "--force-recreate", "minio", "mc-init", "rest", "rest-mv", "spark"])
+        if not is_cloud(record):
+            self.validate_minio_volume(record)
+        services = ["rest", "rest-mv", "spark"] if is_cloud(record) else ["minio", "mc-init", "rest", "rest-mv", "spark"]
+        self.compose(record, ["up", "-d", "--force-recreate", *services])
         self.await_health(record)
 
     def activation_preflight(self, record, previous):
         """A saved activation intent authorizes its own partially created targets."""
-        self.validate_minio_volume(record)
+        if not is_cloud(record):
+            self.validate_minio_volume(record)
         for service in record["images"]:
             try:
                 self.container(record, service)
@@ -340,7 +426,7 @@ class MachineDocker(runtime.Docker):
             raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "activation's shared network changed")
         for volume in record["volumes"]:
             info = self.inspect("volume", volume, absent_ok=True)
-            if info and volume != record["config"]["minio_volume"] and any(
+            if info and volume != record["config"].get("minio_volume") and any(
                 info.get("Labels", {}).get(k) != v for k, v in self.labels(record).items()
             ):
                 raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "activation has a foreign state volume")
@@ -357,7 +443,10 @@ class MachineDocker(runtime.Docker):
         record["network_id"] = self.own_network(record)["Id"]
 
     def stop_writers(self, record):
-        self.validate_resources(record)
+        if is_cloud(record):
+            self.validate_resources(record, require_sdk=False)
+        else:
+            self.validate_resources(record)
         self.compose(record, ["stop", "rest", "rest-mv", "spark"])
 
     def rotate_root(self, record, previous):
@@ -432,8 +521,15 @@ class MachineDocker(runtime.Docker):
                     http_status is not None and (type(http_status) is not int or http_status not in {401, 403})):
                 raise runtime.RuntimeFailure("CredentialFenceUnconfirmed", "old root rejection was not observed")
 
+    def run_oss(self, record, args, *, deadline=None):
+        validate_cloud_snapshot(record)
+        from machine_operation import run_owned_host_sdk_operation
+        return run_owned_host_sdk_operation(self, record, args, deadline=deadline)
+
     def run_mc(self, record, script, *, deadline=None, binary=False):
         """Register, execute and actually settle one exact transient container."""
+        if is_cloud(record):
+            raise runtime.RuntimeFailure("CloudIamUnsupported", "OSS requires explicit SDK operations; MinIO mc is unavailable")
         limits = [time.monotonic() + self.timeout]
         limits += [limit for limit in (deadline, getattr(self, "operation_deadline", None)) if limit is not None]
         deadline = min(limits)
@@ -522,12 +618,24 @@ class MachineDocker(runtime.Docker):
             raise primary
         result = runtime.read_json(journal)
         if result.get("phase") != "settled":
-            code = "MachineOperationUnconfirmed" if request.get("operation") == "control" else "ContainerCleanupUnconfirmed"
+            code = "MachineOperationUnconfirmed" if request.get("operation") in {"control", "host-sdk"} else "ContainerCleanupUnconfirmed"
             raise runtime.RuntimeFailure(code, str(journal))
         return result
 
+    # Design: ADR-0199 (docs/adr/ADR-0199-readonly-observation-and-mutation-settlement.md)
+    @staticmethod
+    def readonly_command(args):
+        # Closed Docker read verbs used by this owner. A word named inspect in
+        # an arbitrary command is not evidence that the command is readonly.
+        if not isinstance(args, (list, tuple)) or not args or not all(isinstance(a, str) for a in args):
+            return False
+        return (args[0] in {"ps", "info", "inspect", "version"}
+                or tuple(args[:2]) == ("context", "show")
+                or (len(args) >= 2 and args[0] in {"container", "image", "network", "volume", "context"}
+                    and args[1] == "inspect"))
+
     def command(self, args, *, absent_ok=False, catalog_removal=None):
-        readonly = args[0] in {"ps", "info", "inspect", "version"} or "inspect" in args[:2] or args[:2] == ["context", "show"]
+        readonly = self.readonly_command(args)
         deadline = min(time.monotonic() + self.timeout,
                        getattr(self, "operation_deadline", None) or float("inf"))
         timeout = deadline - time.monotonic()
@@ -570,7 +678,8 @@ class MachineDocker(runtime.Docker):
 
     @staticmethod
     def _readonly_deadline_settled(args, original, result, journal):
-        if (original["mutating"] is not False or result.get("mutating") is not False
+        if (not MachineDocker.readonly_command(args)
+                or original["mutating"] is not False or result.get("mutating") is not False
                 or type(result.get("schema")) is not int
                 or any(result.get(key) != original[key] for key in
                        ("schema", "kind", "control_root", "machine"))
@@ -617,7 +726,7 @@ class MachineDocker(runtime.Docker):
             return False
         return False
 
-    def unsettled_operations(self, base):
+    def unsettled_operations(self, base, *, include_disposed=False):
         pending = []
         paths = [*Path(base).glob("activations/**/operations/*.json"), *Path(base).glob("operations/*.json")]
         for path in sorted(paths):
@@ -627,8 +736,86 @@ class MachineDocker(runtime.Docker):
             if fact.get("schema") != 1 or fact.get("phase") not in {"intent", "creating", "create-unknown", "created", "running", "settled", "cleanup-failed", "command-unknown"}:
                 raise runtime.RuntimeFailure("RuntimeStateUnreadable", "invalid operation journal")
             if fact["phase"] != "settled":
+                if not include_disposed and self.failed_readonly_disposition(path, fact, base):
+                    continue
                 pending.append((path, fact))
         return pending
+
+    def _failed_readonly_control_material(self, path, fact, base):
+        # This classification proves absence of a daemon mutation obligation,
+        # never CLI success, local process exit, or remote writer quiescence.
+        base, path = Path(base), Path(path)
+        if (path.parent != base / "operations" or not re.fullmatch(r"control-[0-9a-f]{32}\.json", path.name)
+                or fact.get("schema") != 1 or fact.get("kind") != "control"
+                or fact.get("phase") not in {"cleanup-failed", "command-unknown"}
+                or fact.get("control_root") != str(base.parent) or fact.get("machine") != base.name
+                or fact.get("mutating") is not False):
+            return None
+        try:
+            paths = (path, path.with_suffix(".request"), base / "state.json")
+            material = {name: self._terminal_material(name) for name in paths}
+            original, request, state = (json.loads(material[name][0]) for name in paths)
+            if original != fact or not isinstance(request, dict) or not isinstance(state, dict):
+                return None
+            arguments = request.get("args")
+            if (request.get("operation") != "control" or not self.readonly_command(arguments)
+                    or set(request) != {"operation", "args", "environment", "deadline_monotonic"}
+                    or not isinstance(request.get("environment"), dict)
+                    or not all(isinstance(k, str) and isinstance(v, str) for k, v in request["environment"].items())
+                    or type(request.get("deadline_monotonic")) not in (int, float)
+                    or not math.isfinite(request["deadline_monotonic"])
+                    or state.get("schema") != PROTOCOL or state.get("kind") != "machine"
+                    or state.get("id") != base.name or state.get("control_root") != str(base.parent)
+                    or state.get("project") != PROJECT or not isinstance(state.get("daemon_id"), str)
+                    or base.name != "machine-" + runtime.digest(state["daemon_id"])[:16]):
+                return None
+            original = {k: v for k, v in fact.items() if k != "observation_disposition"}
+            expected = dict(schema=1, kind="failed-readonly-control",
+                            mutation_obligation="none",
+                            original_failure_sha256=runtime.digest(original),
+                            request_sha256=hashlib.sha256(material[paths[1]][0]).hexdigest(),
+                            machine=base.name, daemon_id=state["daemon_id"])
+            return expected, material
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+
+    def failed_readonly_disposition(self, path, fact, base):
+        if "observation_disposition" not in fact:
+            return False
+        verified = self._failed_readonly_control_material(path, fact, base)
+        return verified is not None and fact["observation_disposition"] == verified[0]
+
+    def reconcile_failed_readonly_control(self, path, fact, base):
+        # Only an explicitly invoked owner settlement may author this disposition.
+        if (getattr(self, "maintenance_fd", None) is None
+                or getattr(self, "maintenance_base", None) != Path(base)
+                or "observation_disposition" in fact):
+            return False
+        verified = self._failed_readonly_control_material(path, fact, base)
+        if verified is None:
+            return False
+        disposition, material = verified
+        try:
+            if any(self._terminal_material(name) != observed for name, observed in material.items()):
+                return False
+        except (OSError, ValueError):
+            return False
+        fact = dict(fact, observation_disposition=disposition)
+        runtime.atomic_json(path, fact)
+        return True
+
+    def observation_status(self, path, fact, base):
+        return dict(journal=str(path), phase=fact["phase"], error=fact.get("error"),
+                    observation_disposition=fact.get("observation_disposition"),
+                    original_completion={k: fact[k] for k in ("command_dispatched", "cli_pid", "command_exit",
+                        "timed_out", "command_succeeded", "leader_waited", "group_exit_confirmed",
+                        "group_exit_observed") if k in fact},
+                    disposition_valid=self.failed_readonly_disposition(path, fact, base))
+
+    def failed_observation_status(self, base):
+        return [self.observation_status(path, fact, base)
+                for path, fact in self.unsettled_operations(base, include_disposed=True)
+                if fact.get("kind") == "control" and fact.get("phase") in {"cleanup-failed", "command-unknown"}]
 
     def reconcile_terminal_port_failure(self, path, fact, base):
         # A native daemon bind rejection is a terminal RPC result, whereas
@@ -774,6 +961,14 @@ class MachineDocker(runtime.Docker):
 
     def settle_operations(self, base):
         for path, fact in self.unsettled_operations(base):
+            if fact.get("kind") == "host-sdk":
+                if fact.get("control_root") != str(Path(base).parent) or fact.get("machine") != Path(base).name:
+                    raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "host SDK operation belongs to another machine")
+                if fact.get("phase") == "intent" and fact.get("command_dispatched") is not True:
+                    fact.update(phase="settled", command_succeeded=False, interrupted=True)
+                    runtime.atomic_json(path, fact)
+                    continue
+                raise runtime.RuntimeFailure("MachineOperationUnconfirmed", "host SDK exit remains unconfirmed: " + str(path))
             if fact.get("kind") == "control":
                 if fact.get("control_root") != str(Path(base).parent) or fact.get("machine") != Path(base).name:
                     raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "control operation belongs to another machine")
@@ -862,6 +1057,7 @@ class MachineOwner:
         self._daemon = daemon
         self.timeout, self.clock = timeout, clock
         self.template = Path(template or runtime.SCRIPT_DIR / "templates/machine.yml")
+        self.custom_template = template is not None
         self.sweeper_factory = sweeper_factory
 
     @property
@@ -887,11 +1083,18 @@ class MachineOwner:
             raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "machine belongs to another Docker daemon")
 
     @contextmanager
-    def maintenance_lock(self, deadline=None):
+    def maintenance_lock(self, deadline=None, *, readonly_existing=False):
         deadline = time.monotonic() + self.timeout if deadline is None else deadline
-        self.base.mkdir(parents=True, exist_ok=True)
-        self.base.chmod(0o700)
-        with (self.base / "maintenance.lock").open("a+b") as lock:
+        if not readonly_existing:
+            self.base.mkdir(parents=True, exist_ok=True)
+            self.base.chmod(0o700)
+        try:
+            lock = (self.base / "maintenance.lock").open("rb" if readonly_existing else "a+b")
+        except OSError as error:
+            if readonly_existing:
+                raise runtime.RuntimeFailure("MachineUnavailable", "existing machine maintenance lock is unavailable") from error
+            raise
+        with lock:
             while True:
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -902,13 +1105,15 @@ class MachineOwner:
                     time.sleep(min(0.02, max(0, deadline - time.monotonic())))
             previous_fd = getattr(self.backend, "maintenance_fd", None)
             previous_base = getattr(self.backend, "maintenance_base", None)
-            self.backend.maintenance_fd = lock.fileno()
-            self.backend.maintenance_base = self.base
+            if not readonly_existing:
+                self.backend.maintenance_fd = lock.fileno()
+                self.backend.maintenance_base = self.base
             try:
                 yield
             finally:
-                self.backend.maintenance_fd = previous_fd
-                self.backend.maintenance_base = previous_base
+                if not readonly_existing:
+                    self.backend.maintenance_fd = previous_fd
+                    self.backend.maintenance_base = previous_base
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     def read_saved_state(self):
@@ -921,6 +1126,34 @@ class MachineOwner:
             raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "invalid machine authority state")
         return value
 
+    def resolve_readonly_observation(self, journal):
+        """Dispose one failed read's mutation obligation, never its exit proof."""
+        deadline = time.monotonic() + self.timeout
+        previous = getattr(self.backend, "operation_deadline", None)
+        deadline = min(deadline, previous) if previous is not None else deadline
+        self.backend.operation_deadline = deadline
+        try:
+            with self.maintenance_lock(deadline):
+                self.assert_live_daemon()
+                if self.read_saved_state() is None:
+                    raise runtime.RuntimeFailure("MachineUnavailable", "machine authority state is absent")
+                journal = Path(journal)
+                if not journal.is_absolute() or journal.parent != self.base / "operations":
+                    raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "observation belongs to another machine")
+                try:
+                    fact = json.loads(self.backend._terminal_material(journal)[0])
+                    if not isinstance(fact, dict):
+                        raise ValueError("invalid control journal")
+                except (OSError, ValueError, TypeError) as error:
+                    raise runtime.RuntimeFailure("RuntimeStateUnreadable", "invalid observation journal") from error
+                if not self.backend.failed_readonly_disposition(journal, fact, self.base):
+                    if not self.backend.reconcile_failed_readonly_control(journal, fact, self.base):
+                        raise runtime.RuntimeFailure("MachineOperationUnconfirmed", "observation has no readonly disposition")
+                    fact = json.loads(self.backend._terminal_material(journal)[0])
+                return self.backend.observation_status(journal, fact, self.base)
+        finally:
+            self.backend.operation_deadline = previous
+
     def load_config(self):
         state = self.read_saved_state()
         if state:
@@ -930,16 +1163,28 @@ class MachineOwner:
 
     def required_definition(self, config, verified_bom):
         config = machine_config(config)
-        images, facts = input_facts(verified_bom, self.backend)
-        text = self.template.read_text()
+        cloud = bool(config.get("object_store"))
+        images, facts = input_facts(verified_bom, self.backend, cloud=cloud)
+        template = runtime.SCRIPT_DIR / "templates/machine-oss.yml" if cloud and not self.custom_template else self.template
+        text = template.read_text()
         version = runtime.digest(dict(protocol=PROTOCOL, inputs=facts,
                                       template_sha256=runtime.digest(text), config=config))
-        return dict(version=version, config=config, images=images, template=text,
-                    producer_receipt={"lock_sha256": verified_bom["lock_sha256"],
-                                      **copy.deepcopy(verified_bom["derived_images"]["iceberg-spark"])})
+        result = dict(version=version, config=config, images=images, template=text,
+                      producer_receipt={"lock_sha256": verified_bom["lock_sha256"],
+                                        **copy.deepcopy(verified_bom["derived_images"]["iceberg-spark-oss" if cloud else "iceberg-spark"])})
+        if cloud:
+            receipt = verified_bom["python_environments"]["oss-sdk"]
+            relative = Path(receipt.get("path", ""))
+            root = verified_bom.get("_verified_store_root")
+            if not root or not Path(root).is_absolute() or relative.is_absolute() or not relative.parts or ".." in relative.parts:
+                raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "verified OSS SDK location is missing")
+            # Keep the venv symlink name: resolving bin/python would lose its site packages.
+            result["oss_ops_python"] = str(Path(root).resolve() / relative / "bin/python")
+        return result
 
     @contextmanager
-    def ready_snapshot(self, definition, deadline=None, *, expected_generation=None, lock_deadline=None):
+    def ready_snapshot(self, definition, deadline=None, *, expected_generation=None, lock_deadline=None,
+                       readonly_existing=False):
         if lock_deadline is not None and (type(lock_deadline) not in (int, float) or not math.isfinite(lock_deadline)):
             raise runtime.RuntimeFailure("InvalidConfiguration", "machine lock deadline must be finite")
         previous = getattr(self.backend, "operation_deadline", None)
@@ -954,7 +1199,7 @@ class MachineOwner:
         try:
             check_deadline()
             self.assert_live_daemon()
-            with self.maintenance_lock(lock_limit):
+            with self.maintenance_lock(lock_limit, **({"readonly_existing": True} if readonly_existing else {})):
                 state = self.read_saved_state()
                 if not state or state["phase"] != "ready":
                     raise runtime.RuntimeFailure("MachineUnavailable", "start or finish machine maintenance explicitly")
@@ -964,7 +1209,11 @@ class MachineOwner:
                     raise runtime.RuntimeFailure("MachineUnavailable", "fixture activation changed")
                 if self.backend.unsettled_operations(self.base):
                     raise runtime.RuntimeFailure("MachineUnavailable", "finish unsettled machine operations explicitly")
-                self.backend.validate_minio_volume(state)
+                if is_cloud(state):
+                    validate_verified_sdk_location(state, definition)
+                    validate_cloud_snapshot(state)
+                else:
+                    self.backend.validate_minio_volume(state)
                 healthy = self.backend.healthy(state)
                 check_deadline()
                 if not healthy:
@@ -972,6 +1221,12 @@ class MachineOwner:
                 yield copy.deepcopy(state)
         finally:
             self.backend.operation_deadline = previous
+
+    def check_ready(self, verified_bom, config=None):
+        """Observe the original exact readiness contract without publishing state."""
+        definition = self.required_definition(self.load_config() if config is None else config, verified_bom)
+        with self.ready_snapshot(definition, readonly_existing=True) as state:
+            return {**state, "observed_healthy": True}
 
     def _save(self, record):
         runtime.atomic_json(self.base / "state.json", record)
@@ -997,6 +1252,8 @@ class MachineOwner:
     def _record(self, definition, credentials=None):
         generation = uuid.uuid4().hex
         directory = self.base / "activations" / generation
+        if definition["config"].get("object_store"):
+            return self._cloud_record(definition, generation, directory)
         credentials = credentials or dict(access_key="nr" + secrets.token_hex(9),
                                            secret_key=secrets.token_urlsafe(32), generation=uuid.uuid4().hex)
         images = copy.deepcopy(definition["images"])
@@ -1023,7 +1280,32 @@ class MachineOwner:
                                  endpoints(record)["rest_uri"] + "/v1/config", endpoints(record)["rest_mv_uri"] + "/v1/config"]
         return record
 
+    def _cloud_record(self, definition, generation, directory):
+        config = copy.deepcopy(definition["config"])
+        cloud = config["object_store"]
+        root = f"s3://{cloud['bucket']}/{cloud['root_prefix']}machines/{self.machine_id}/{generation}"
+        record = dict(schema=PROTOCOL, protocol=PROTOCOL, kind="machine", key="machine",
+            id=self.machine_id, daemon_id=self.daemon_id, control_root=str(self.root), namespace=self.machine_id,
+            phase="maintenance", version=definition["version"], generation=generation, created_at=self.clock(),
+            config=config, project=PROJECT, network=NETWORK, images=copy.deepcopy(definition["images"]),
+            ports=config["ports"], policy=config["policy"], containers={}, steps={},
+            compose_file=str(directory / "compose.yml"), compose_env=str(directory / "compose.env"),
+            object_store_config_file=str(directory / "object-store.json"), oss_ops_python=definition["oss_ops_python"],
+            storage_owner=dict(provider="aliyun-oss", endpoint=f"https://s3.oss-{cloud['region']}-internal.aliyuncs.com",
+                region=cloud["region"], bucket=cloud["bucket"], root_prefix=cloud["root_prefix"]),
+            template=definition["template"], producer_receipt=definition["producer_receipt"],
+            protected_benchmark_roots=[config["benchmark_root"]],
+            volumes=[PROJECT + "_rest-catalog", PROJECT + "_rest-mv-catalog"],
+            required_services=["rest", "rest-mv", "spark"], server_warehouse=root + "/rest",
+            server_warehouses={"rest": root + "/rest", "rest-mv": root + "/rest-mv"})
+        record["service_ports"] = {service: {port: config["ports"][name]} for service, port, name in
+            (("rest", "8181/tcp", "rest"), ("rest-mv", "8181/tcp", "rest_mv"), ("spark", "4040/tcp", "spark"))}
+        record["health_urls"] = [endpoints(record)[name] + "/v1/config" for name in ("rest_uri", "rest_mv_uri")]
+        return record
+
     def _write_definition(self, record):
+        if is_cloud(record):
+            return self._write_cloud_definition(record)
         credentials = record["credentials"]
         values = dict(NOVA_FIXTURE_OWNER=record["namespace"], NOVA_FIXTURE_CONTROL_ROOT=str(self.root),
                       NOVA_FIXTURE_VERSION=record["version"], NOVA_FIXTURE_PROJECT=PROJECT,
@@ -1042,17 +1324,102 @@ class MachineOwner:
             if not path.exists():
                 runtime.atomic_bytes(path, data.encode())
 
+    def _write_cloud_definition(self, record):
+        cloud = record["config"]["object_store"]
+        values = dict(NOVA_FIXTURE_OWNER=record["namespace"], NOVA_FIXTURE_CONTROL_ROOT=str(self.root),
+            NOVA_FIXTURE_VERSION=record["version"], NOVA_FIXTURE_GENERATION=record["generation"],
+            NOVA_OSS_ROLE_NAME=cloud["role_name"], NOVA_OSS_REGION=cloud["region"],
+            NOVA_OSS_S3_ENDPOINT=record["storage_owner"]["endpoint"],
+            NOVA_ENV_REST_SERVER_WAREHOUSE_URI=record["server_warehouses"]["rest"],
+            NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI=record["server_warehouses"]["rest-mv"])
+        values.update({s.upper().replace("-", "_") + "_IMAGE": img["image_id"] for s, img in record["images"].items()})
+        values.update({"NOVA_ENV_" + n.upper() + "_PORT": v for n, v in record["ports"].items() if n in {"rest", "rest_mv", "spark"}})
+        text = "".join(f"{key}='{str(value).replace(chr(39), chr(92)+chr(39))}'\n" for key, value in sorted(values.items()))
+        config_text = json.dumps(cloud, sort_keys=True, indent=2) + "\n"
+        for name, data in (("compose_file", record["template"]), ("compose_env", text), ("object_store_config_file", config_text)):
+            path = Path(record[name])
+            if path.exists() and path.read_text() != data:
+                raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "activation definition changed")
+            if not path.exists():
+                runtime.atomic_bytes(path, data.encode())
+
     def _sweeper(self, record):
         if self.sweeper_factory:
             return self.sweeper_factory(record, self.backend)
         from scratch import ScratchSweeper
         return ScratchSweeper(record, self.backend)
 
-    def activate(self, definition, *, upgrade=False):
+    def _activate_cloud(self, definition, *, upgrade=False):
         self.assert_live_daemon()
         with self.maintenance_lock():
             self.backend.settle_operations(self.base)
             old = self.read_saved_state()
+            if old and not is_cloud(old):
+                raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "machine storage provider cannot change in place")
+            if old and old["phase"] == "ready" and old["version"] == definition["version"] and not upgrade:
+                validate_verified_sdk_location(old, definition)
+                validate_cloud_snapshot(old)
+                if self.backend.healthy(old):
+                    return old
+                record = self._record(definition)
+                record["previous"] = old
+                record["recover_only"] = True
+                # Recovery reuses the original catalog volume and its exact warehouse.
+                record["server_warehouse"] = old["server_warehouse"]
+                record["server_warehouses"] = copy.deepcopy(old["server_warehouses"])
+            elif old and old["phase"] == "maintenance":
+                if old["version"] != definition["version"]:
+                    raise runtime.RuntimeFailure("MachineMaintaining", "finish the saved maintenance definition first")
+                validate_verified_sdk_location(old, definition)
+                record = old
+            else:
+                if old and not upgrade:
+                    raise runtime.RuntimeFailure("MachineVersionMismatch", "explicit upgrade is required")
+                record = self._record(definition)
+                if old:
+                    record["previous"] = old
+                else:
+                    self.backend.validate_absent(record)
+            if old:
+                record["protected_benchmark_roots"] = sorted(set(record["protected_benchmark_roots"] + old.get("protected_benchmark_roots", [])))
+            self._save(record)
+            self._write_definition(record)
+            previous = record.get("previous")
+            if previous and not record.get("recover_only"):
+                steps = record["steps"]
+                if not steps.get("writers_stopped"):
+                    self.backend.stop_writers(previous)
+                    steps["writers_stopped"] = True
+                    self._save(record)
+                if not steps.get("rest_removed"):
+                    record["offline_catalog_barrier"] = self.backend.remove_rest_state(previous)
+                    steps["rest_removed"] = True
+                    self._save(record)
+                # No IAM mutation, unknown-writer TTL cleanup or old-object deletion.
+                # A new catalog receives a distinct warehouse; original objects remain.
+                if not steps.get("activation_started"):
+                    record["offline_catalog_barrier"] = self.backend.rest_state_barrier(previous)
+                    self._save(record)
+            record["steps"]["activation_started"] = True
+            self._save(record)
+            self.backend.ensure_machine(record, previous)
+            if not self.backend.healthy(record):
+                raise runtime.RuntimeFailure("ReadinessTimeout", "activation health was not confirmed")
+            record["phase"] = "ready"
+            record.pop("previous", None)
+            record.pop("recover_only", None)
+            self._save(record)
+            return record
+
+    def activate(self, definition, *, upgrade=False):
+        if definition.get("config", {}).get("object_store"):
+            return self._activate_cloud(definition, upgrade=upgrade)
+        self.assert_live_daemon()
+        with self.maintenance_lock():
+            self.backend.settle_operations(self.base)
+            old = self.read_saved_state()
+            if old and is_cloud(old):
+                raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "machine storage provider cannot change in place")
             if old and old["config"]["minio_volume"] != definition["config"]["minio_volume"]:
                 raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "upgrade cannot replace the preserved MinIO data volume")
             if old and (old.get("minio_volume_identity") or old["phase"] == "ready"):
@@ -1160,12 +1527,20 @@ class MachineOwner:
                     raise runtime.RuntimeFailure("MachineVersionMismatch", "sweep publication version differs")
                 if expected_generation is not None and state["generation"] != expected_generation:
                     raise runtime.RuntimeFailure("MachineUnavailable", "sweep publication activation changed")
-                self.backend.validate_minio_volume(state)
+                if is_cloud(state):
+                    validate_cloud_snapshot(state)
+                else:
+                    self.backend.validate_minio_volume(state)
                 observation_only = False
                 self.backend.settle_operations(self.base)
                 observation_only = True
                 if not self.backend.healthy(state):
                     raise runtime.RuntimeFailure("MachineUnavailable", "machine services are not healthy")
+                if is_cloud(state):
+                    return {"complete": True, "status": "NOT_RUN", "scope": "cloud-ttl", "cleanup_performed": False,
+                            "errors": [], "removed": [],
+                            "disposition": "retained-no-writer-exit-proof",
+                            "reason": "cloud TTL cleanup requires original writer exit evidence"}
                 observation_only = False
                 report = self._sweeper(state).sweep(expired_only=True, deadline=deadline)
                 self._save_scratch_observation(state, report)
@@ -1223,20 +1598,28 @@ def main(argv=None):
     parser.add_argument("--root", type=Path)
     parser.add_argument("--timeout", type=float, default=90)
     commands = parser.add_subparsers(dest="operation", required=True)
-    for operation in ("start", "upgrade"):
+    for operation in ("start", "upgrade", "check"):
         sub = commands.add_parser(operation)
         sub.add_argument("--config", type=Path)
         sub.add_argument("--store", type=Path)
     commands.add_parser("status")
     commands.add_parser("sweep")
+    resolve = commands.add_parser("resolve-readonly-observation")
+    resolve.add_argument("--journal", type=Path, required=True)
     args = parser.parse_args(argv)
     runtime.install_signal_handlers()
     try:
         owner = MachineOwner(args.root, timeout=args.timeout)
-        if args.operation in {"start", "upgrade"}:
+        if args.operation in {"start", "upgrade", "check"}:
             config = machine_config(runtime.read_json(args.config)) if args.config else owner.load_config()
-            bom = verified_bom(runtime.SCRIPT_DIR.parent.parent, args.store)
-            result = owner.activate(owner.required_definition(config, bom), upgrade=args.operation == "upgrade")
+            bom = verified_bom(runtime.SCRIPT_DIR.parent.parent, args.store,
+                consumer="iceberg-rest-oss" if config.get("object_store") else "iceberg-rest")
+            if args.operation == "check":
+                result = owner.check_ready(bom, config)
+            else:
+                result = owner.activate(owner.required_definition(config, bom), upgrade=args.operation == "upgrade")
+        elif args.operation == "resolve-readonly-observation":
+            result = owner.resolve_readonly_observation(args.journal)
         elif args.operation == "sweep":
             result = owner.sweep()
         else:
@@ -1244,6 +1627,7 @@ def main(argv=None):
             if result:
                 result["observed_healthy"] = owner.backend.healthy(result) if result["phase"] == "ready" else False
                 result["scratch_observation"] = owner.scratch_observation(result)
+                result["failed_observations"] = owner.backend.failed_observation_status(owner.base)
         print(json.dumps(public_snapshot(result), sort_keys=True))
         return 0
     except runtime.RuntimeFailure as error:

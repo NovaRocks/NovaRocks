@@ -22,7 +22,9 @@
 //! the Connector; this module only routes maintenance intents to it and shapes
 //! the neutral outcome the frontend reports.
 
-use crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer;
+use crate::connector::metadata_maintenance::{
+    MetadataMaintenanceCacheFinalizer, MetadataMaintenanceCall, MetadataMaintenanceIntent,
+};
 use novarocks_table_maintenance::runtime::TerminalError;
 use novarocks_table_maintenance::{
     AutomaticMaintenanceOutcome, MaintenanceActionOutcome, MaintenanceActionRequest,
@@ -31,7 +33,8 @@ use novarocks_table_maintenance::{
 
 /// Dispatch one automatic metadata effect with the identity already frozen by
 /// MV management. Keep the provider's terminal classification intact.
-pub(crate) fn execute_automatic_metadata_action_with_ports(
+pub(crate) async fn execute_automatic_metadata_action_with_ports(
+    pending: &mut Option<MetadataMaintenanceCall>,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
     cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
     request: MaintenanceActionRequest,
@@ -79,16 +82,33 @@ pub(crate) fn execute_automatic_metadata_action_with_ports(
             ));
         }
     };
-    let completed = match crate::connector::metadata_maintenance::resolve_metadata_maintenance(
+    let operation_id = ConnectorMutationOperationId::from_bytes(effect_id.to_bytes());
+    let call = match original_call(
+        pending,
         connector_control,
-        cache_finalizer,
         &instance_id,
-        ConnectorMutationOperationId::from_bytes(effect_id.to_bytes()),
+        operation_id,
         identity,
         intent,
         connector_context,
     ) {
-        ResolvedMetadataMaintenance::KnownCommitted(completed) => completed,
+        Ok(call) => call,
+        Err(failure) => {
+            return Err(match failure {
+                ResolvedMetadataMaintenance::ContractFailure { error, .. } => {
+                    TerminalError::pre_dispatch_failed(error.to_string())
+                }
+                _ => unreachable!("pure call construction only returns contract failure"),
+            });
+        }
+    };
+    let completed = match crate::connector::metadata_maintenance::resolve_metadata_maintenance(
+        call,
+        cache_finalizer,
+    )
+    .await
+    {
+        ResolvedMetadataMaintenance::KnownCommitted(completed) => *completed,
         ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => {
             return Err(TerminalError::known_uncommitted(
                 crate::connector::mutation::known_uncommitted_message(failure, &cleanup),
@@ -152,7 +172,8 @@ pub(crate) fn execute_automatic_metadata_action_with_ports(
 /// Execute a non-rewrite maintenance action through explicit frontend-owned
 /// connector and cache-finalization ports. The caller owns the request context;
 /// this helper never captures a process-local cancellation or topology view.
-pub(crate) fn execute_action_with_ports(
+pub(crate) async fn execute_action_with_ports(
+    pending: &mut Option<MetadataMaintenanceCall>,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
     cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
     request: MaintenanceActionRequest,
@@ -168,26 +189,34 @@ pub(crate) fn execute_action_with_ports(
             target,
             use_caching,
             spec_id,
-        } => run_rewrite_manifests_action_with_ports(
-            connector_control,
-            cache_finalizer,
-            target,
-            use_caching,
-            spec_id,
-            connector_context,
-        ),
+        } => {
+            run_rewrite_manifests_action_with_ports(
+                pending,
+                connector_control,
+                cache_finalizer,
+                target,
+                use_caching,
+                spec_id,
+                connector_context,
+            )
+            .await
+        }
         MaintenanceActionRequest::ExpireSnapshots {
             target,
             older_than_ms,
             retain_last,
-        } => run_expire_snapshots_action_with_ports(
-            connector_control,
-            cache_finalizer,
-            target,
-            older_than_ms,
-            retain_last,
-            connector_context,
-        ),
+        } => {
+            run_expire_snapshots_action_with_ports(
+                pending,
+                connector_control,
+                cache_finalizer,
+                target,
+                older_than_ms,
+                retain_last,
+                connector_context,
+            )
+            .await
+        }
         MaintenanceActionRequest::RemoveOrphanFiles { .. } => Err(
             "remove orphan files must be dispatched by the frontend durable cleanup owner"
                 .to_string(),
@@ -217,7 +246,8 @@ pub(crate) fn current_snapshot_id_with_ports(
     })
 }
 
-fn run_rewrite_manifests_action_with_ports(
+async fn run_rewrite_manifests_action_with_ports(
+    pending: &mut Option<MetadataMaintenanceCall>,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
     cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
     target: MaintenanceTarget,
@@ -235,20 +265,27 @@ fn run_rewrite_manifests_action_with_ports(
     }
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| error.to_string())?;
-    let completed = crate::connector::metadata_maintenance::execute_metadata_maintenance(
+    let operation_id = pending.as_ref().map_or_else(
+        novarocks_spi::connector::ConnectorMutationOperationId::new,
+        MetadataMaintenanceCall::operation_id,
+    );
+    let call = original_call(
+        pending,
         connector_control,
-        cache_finalizer,
         &instance_id,
-        novarocks_spi::connector::ConnectorMutationOperationId::new(),
+        operation_id,
         novarocks_spi::connector::ConnectorTableIdentity {
             instance_id: instance_id.clone(),
             namespace: target.namespace.clone().into(),
             table: target.table.clone().into(),
         },
-        crate::connector::metadata_maintenance::MetadataMaintenanceIntent::rewrite_metadata_layout(
-        ),
+        MetadataMaintenanceIntent::rewrite_metadata_layout(),
         connector_context,
-    )?;
+    )
+    .map_err(|error| format!("{error:?}"))?;
+    let completed =
+        crate::connector::metadata_maintenance::execute_metadata_maintenance(call, cache_finalizer)
+            .await?;
     let summary = completed.receipt.summary();
 
     Ok(MaintenanceActionOutcome::RewriteManifests {
@@ -259,7 +296,8 @@ fn run_rewrite_manifests_action_with_ports(
     })
 }
 
-fn run_expire_snapshots_action_with_ports(
+async fn run_expire_snapshots_action_with_ports(
+    pending: &mut Option<MetadataMaintenanceCall>,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
     cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
     target: MaintenanceTarget,
@@ -269,22 +307,26 @@ fn run_expire_snapshots_action_with_ports(
 ) -> Result<MaintenanceActionOutcome, String> {
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| error.to_string())?;
-    crate::connector::metadata_maintenance::execute_metadata_maintenance(
+    let operation_id = pending.as_ref().map_or_else(
+        novarocks_spi::connector::ConnectorMutationOperationId::new,
+        MetadataMaintenanceCall::operation_id,
+    );
+    let call = original_call(
+        pending,
         connector_control,
-        cache_finalizer,
         &instance_id,
-        novarocks_spi::connector::ConnectorMutationOperationId::new(),
+        operation_id,
         novarocks_spi::connector::ConnectorTableIdentity {
             instance_id: instance_id.clone(),
             namespace: target.namespace.clone().into(),
             table: target.table.clone().into(),
         },
-        crate::connector::metadata_maintenance::MetadataMaintenanceIntent::expire_table_versions(
-            older_than_ms,
-            retain_last,
-        ),
+        MetadataMaintenanceIntent::expire_table_versions(older_than_ms, retain_last),
         connector_context,
-    )?;
+    )
+    .map_err(|error| format!("{error:?}"))?;
+    crate::connector::metadata_maintenance::execute_metadata_maintenance(call, cache_finalizer)
+        .await?;
 
     tracing::info!(
         catalog = %target.catalog,
@@ -301,6 +343,39 @@ fn run_expire_snapshots_action_with_ports(
         deleted_manifest_lists_count: None,
         deleted_statistics_files_count: None,
     })
+}
+
+/// The caller's original durable action row owns `pending`. Never clear this
+/// field just because a wait was cancelled or an outcome is still Unknown.
+fn original_call<'a>(
+    pending: &'a mut Option<MetadataMaintenanceCall>,
+    resolver: &dyn novarocks_spi::connector::ConnectorMetadataMaintenanceResolver,
+    instance: &novarocks_spi::connector::ConnectorInstanceId,
+    operation: novarocks_spi::connector::ConnectorMutationOperationId,
+    table: novarocks_spi::connector::ConnectorTableIdentity,
+    intent: MetadataMaintenanceIntent,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    &'a mut MetadataMaintenanceCall,
+    crate::connector::metadata_maintenance::ResolvedMetadataMaintenance,
+> {
+    if let Some(call) = pending.as_ref() {
+        if !call.matches(instance, operation, &table, &intent) {
+            return Err(crate::connector::metadata_maintenance::ResolvedMetadataMaintenance::ContractFailure {
+                error:novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    "maintenance wait changes the original action identity"),
+                dispatch:crate::connector::metadata_maintenance::MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+            });
+        }
+    } else {
+        *pending = Some(MetadataMaintenanceCall::try_new(
+            resolver, instance, operation, table, intent, context,
+        )?);
+    }
+    Ok(pending
+        .as_mut()
+        .expect("original maintenance call is installed"))
 }
 
 fn action_target(target: &MaintenanceTarget) -> String {

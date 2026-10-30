@@ -17,6 +17,8 @@ mem-1-m07-root-observation = []
 mem-1-m07-exact-mysql-write = ["novarocks-mysql-adapter/mem-1-m07-exact-mysql-write"]
 
 [dependencies]
+novarocks-resource-contract.workspace = true
+novarocks-coordination-contract.workspace = true
 novarocks-type-contract.workspace = true
 novarocks-value-arrays.workspace = true
 allocator-api2.workspace = true
@@ -35,7 +37,6 @@ hex.workspace = true
 h2.workspace = true
 novarocks-catalog-application.workspace = true
 novarocks-connector-contract.workspace = true
-novarocks-fs.workspace = true
 novarocks-functions.workspace = true
 novarocks-memory.workspace = true
 novarocks-execution.workspace = true
@@ -55,6 +56,7 @@ novarocks-state-store-api.workspace = true
 novarocks-state-store-runtime.workspace = true
 novarocks-mv-application.workspace = true
 novarocks-mysql-adapter.workspace = true
+novarocks-trino-adapter.workspace = true
 novarocks-native-adapter.workspace = true
 novarocks-statistics-application.workspace = true
 novarocks-table-maintenance.workspace = true
@@ -76,7 +78,6 @@ toml.workspace = true
 uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
-novarocks-connector-paimon.workspace = true
 novarocks-local-compiler.workspace = true
 novarocks-local-program.workspace = true
 novarocks-plan-codec = { workspace = true }
@@ -85,11 +86,13 @@ novarocks-catalog-application = { workspace = true }
 novarocks-query-application = { workspace = true }
 novarocks-result-render.workspace = true
 novarocks-secret.workspace = true
+novarocks-state-store-sqlite.workspace = true
 novarocks-state-store-testkit.workspace = true
 novarocks-sql = { workspace = true }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
+url.workspace = true
 
 [package.metadata.novarocks.test]
 runtime-inputs = []

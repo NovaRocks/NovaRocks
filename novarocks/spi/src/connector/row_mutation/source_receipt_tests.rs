@@ -28,7 +28,7 @@ fn owned_selection() -> (ConnectorRowMutationSelection, std::sync::Weak<()>, usi
     let holder = Arc::new(());
     let weak = Arc::downgrade(&holder);
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-    let mut builder = ConnectorRowMutationSourceBuilder::try_new_with_guard(
+    let mut builder = ConnectorRowMutationSourceBuilder::try_new_with_retention(
         schema.clone(),
         ConnectorPayloadRetentionGuard::new(holder),
     )

@@ -18,6 +18,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+#[path = "data_writer/staged_paths.rs"]
+mod staged_paths;
+pub(crate) use staged_paths::StagedPathJournal;
+
 use super::write_adaptation::adapt_batch;
 use crate as novarocks_connector_iceberg;
 use arrow::array::Array;
@@ -32,7 +36,7 @@ use novarocks_connector_iceberg::iceberg::spec::{
 use novarocks_connector_iceberg::iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use novarocks_connector_iceberg::iceberg::writer::file_writer::ParquetWriterBuilder;
 use novarocks_connector_iceberg::iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, DefaultLocationGenerator, LocationGenerator,
 };
 use novarocks_connector_iceberg::iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use novarocks_connector_iceberg::iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
@@ -45,8 +49,32 @@ use parquet::file::properties::WriterProperties;
 use novarocks_connector_iceberg::commit::report as iceberg_report;
 use novarocks_connector_iceberg::delete_file::IcebergFileContent;
 
-type IcebergDataFileWriterBuilder =
-    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+type IcebergDataFileWriterBuilder = DataFileWriterBuilder<
+    ParquetWriterBuilder,
+    JournaledLocationGenerator,
+    DefaultFileNameGenerator,
+>;
+
+/// Wrap the original SDK's resolved path, including its real partition/object
+/// placement policy. No copied path template or second allocation identity.
+#[derive(Clone, Debug)]
+struct JournaledLocationGenerator {
+    original: DefaultLocationGenerator,
+    journal: Option<StagedPathJournal>,
+}
+impl LocationGenerator for JournaledLocationGenerator {
+    fn generate_location(
+        &self,
+        partition: Option<&crate::iceberg::spec::PartitionKey>,
+        name: &str,
+    ) -> String {
+        let path = self.original.generate_location(partition, name);
+        if let Some(journal) = &self.journal {
+            journal.record(&path);
+        }
+        path
+    }
+}
 
 pub(crate) const PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY: &str = "write.parquet.row-group-size-bytes";
 const MAX_WRITE_BATCH_ROWS: usize = 1024;
@@ -215,9 +243,16 @@ impl StagedWriteContext {
         &self.file_io
     }
 
-    pub fn data_file_writer_builder(&self) -> Result<IcebergDataFileWriterBuilder, String> {
+    fn data_file_writer_builder(
+        &self,
+        journal: Option<&StagedPathJournal>,
+    ) -> Result<IcebergDataFileWriterBuilder, String> {
         let location_generator = DefaultLocationGenerator::new(self.metadata.as_ref())
             .map_err(|e| format!("build iceberg location generator failed: {e}"))?;
+        let location_generator = JournaledLocationGenerator {
+            original: location_generator,
+            journal: journal.cloned(),
+        };
         let file_name_generator = DefaultFileNameGenerator::new(
             "novarocks".to_string(),
             Some(unique_file_suffix()),
@@ -287,7 +322,24 @@ pub async fn write_record_batches(
     ctx: &StagedWriteContext,
     batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<Vec<StagedDataFile>, String> {
-    let data_file_builder = ctx.data_file_writer_builder()?;
+    write_record_batches_with_journal(ctx, batches, None).await
+}
+
+/// Actual BE writer path: its stable original inventory precedes every SDK
+/// output, and outlives errors, cancellation and fallible post-write metadata.
+pub(crate) async fn write_record_batches_journaled(
+    ctx: &StagedWriteContext,
+    batches: impl IntoIterator<Item = RecordBatch>,
+    journal: &StagedPathJournal,
+) -> Result<Vec<StagedDataFile>, String> {
+    write_record_batches_with_journal(ctx, batches, Some(journal)).await
+}
+async fn write_record_batches_with_journal(
+    ctx: &StagedWriteContext,
+    batches: impl IntoIterator<Item = RecordBatch>,
+    journal: Option<&StagedPathJournal>,
+) -> Result<Vec<StagedDataFile>, String> {
+    let data_file_builder = ctx.data_file_writer_builder(journal)?;
     // Parquet checks its row-group byte threshold between RecordBatch writes.
     // The SQL sink can hand us a much larger batch, so preserve the configured
     // limit's usefulness by making the same bounded write granularity explicit.
@@ -1304,7 +1356,7 @@ mod tests {
         }
     }
 
-    struct LocalFsTestTable {
+    pub(super) struct LocalFsTestTable {
         table: novarocks_connector_iceberg::iceberg::table::Table,
         _dir: tempfile::TempDir,
     }
@@ -1321,7 +1373,10 @@ mod tests {
         build_local_fs_test_table(name, false).await
     }
 
-    async fn build_local_fs_test_table(name: &str, partitioned: bool) -> LocalFsTestTable {
+    pub(super) async fn build_local_fs_test_table(
+        name: &str,
+        partitioned: bool,
+    ) -> LocalFsTestTable {
         build_local_fs_test_table_with_spec_id(name, partitioned, 0).await
     }
 
@@ -1442,7 +1497,7 @@ mod tests {
         LocalFsTestTable { table, _dir: dir }
     }
 
-    fn test_batch(ids: &[i32]) -> arrow::record_batch::RecordBatch {
+    pub(super) fn test_batch(ids: &[i32]) -> arrow::record_batch::RecordBatch {
         use arrow::array::Int32Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -1948,10 +2003,7 @@ mod tests {
         let columns = reader.parquet_schema().columns();
         assert!(matches!(
             columns[0].logical_type_ref(),
-            Some(LogicalType::Timestamp {
-                is_adjusted_to_u_t_c: true,
-                ..
-            })
+            Some(LogicalType::Timestamp(value)) if value.is_adjusted_to_u_t_c
         ));
         let paths = columns
             .iter()
@@ -2015,3 +2067,7 @@ mod tests {
         assert!(map.values().is_null(1));
     }
 }
+
+#[cfg(test)]
+#[path = "data_writer/journal_tests.rs"]
+mod journal_tests;

@@ -22,8 +22,8 @@ use arrow_schema::{DataType, Field, Schema};
 use novarocks_type_contract::owned_resources::metadata_materialization::{
     MaterializedField, MaterializedMetadataMap,
 };
-use novarocks_type_contract::owned_resources::{hashmap, layout};
-use std::{alloc::Layout, collections::HashMap, sync::Arc};
+use novarocks_type_contract::owned_resources::{arrow_metadata, hashmap, layout};
+use std::{alloc::Layout, sync::Arc};
 
 fn absent() -> ConnectorError {
     ConnectorError::new(
@@ -107,9 +107,31 @@ fn owned_field_materialization_body<O: OwnedCopy>(
     Ok(Some(copied))
 }
 
+// Arrow 60 consumes the old HashMap when publishing Metadata. Its request
+// remains in the complete-operation quote but belongs to temporary custody;
+// only the resulting BTree nodes and Arc are retained by the field/schema.
+fn temporary_metadata_table<O: OwnedCopy>(
+    entries: usize,
+    context: &mut O,
+) -> Result<usize, O::Error> {
+    if context.source_invoice().is_none() {
+        return Ok(0);
+    }
+    let facts = hashmap::fresh_table_layout::<String, String>(entries)
+        .map_err(|error| context.hash_error(error))?;
+    if let Some(layout) = facts.layout {
+        context.temporary_model_request(layout, 1)?;
+    }
+    context.work(context.add(
+        context.mul(entries, size_of::<(String, String)>())?,
+        context.add(facts.buckets, 16)?,
+    )?)?;
+    Ok(facts.buckets)
+}
+
 /// The original Field metadata copy, also used by the root Schema owner.
 fn owned_metadata_core<O: OwnedCopy>(
-    source: &HashMap<String, String>,
+    source: &arrow_schema::Metadata,
     base: usize,
     prefunded_buckets: Option<usize>,
     context: &mut O,
@@ -118,7 +140,7 @@ fn owned_metadata_core<O: OwnedCopy>(
     let buckets = if let Some(buckets) = prefunded_buckets {
         buckets
     } else {
-        let buckets = context.table::<String, String>(entries)?;
+        let buckets = temporary_metadata_table(entries, context)?;
         // A partial materialized field may be destroyed on any later refusal.
         // Prefund the fresh raw-table walk and two closed String destructors.
         context.table_cleanup::<String, String>(entries, 256)?;
@@ -134,6 +156,7 @@ fn owned_metadata_core<O: OwnedCopy>(
     } else {
         None
     };
+    let mut max_key_bytes = 0;
     let mut iter = source.iter();
     loop {
         context.flush()?;
@@ -141,6 +164,7 @@ fn owned_metadata_core<O: OwnedCopy>(
         context.step()?;
         context.flush()?;
         let Some((key, value)) = next else { break };
+        max_key_bytes = max_key_bytes.max(key.len());
         context.source_floor(context.add(base, context.add(key.capacity(), value.capacity())?)?)?;
         if context.source_invoice().is_some() {
             let units =
@@ -159,6 +183,27 @@ fn owned_metadata_core<O: OwnedCopy>(
             context.flush()?;
         }
     }
+    // The original temporary HashMap is consumed by Arrow 60's Metadata
+    // conversion only after this pass: Vec -> stable sort -> BTree -> Arc.
+    // Its source and all new conversion requests coexist under the same owner.
+    let conversion = arrow_metadata::hashmap_conversion_requests(entries)
+        .map_err(|error| context.metadata_error(error))?;
+    for layout in [conversion.entries_vector, conversion.sort_scratch]
+        .into_iter()
+        .flatten()
+    {
+        context.temporary_model_request(layout, 1)?;
+    }
+    if conversion.tree_nodes != 0 {
+        context.opaque_model_request(conversion.tree_node.size(), conversion.tree_nodes)?;
+    }
+    if let Some(layout) = conversion.map_arc {
+        context.request(layout, 1)?;
+    }
+    let work = arrow_metadata::hashmap_conversion_work_upper_bound(entries, max_key_bytes)
+        .map_err(|error| context.metadata_error(error))?;
+    context.work(work)?;
+    context.flush()?;
     Ok(metadata)
 }
 
@@ -180,7 +225,7 @@ pub(crate) fn preflight_owned_schema<O: OwnedCopy>(
         base,
         context.mul(schema.metadata().len(), size_of::<(String, String)>())?,
     )?)?;
-    let buckets = context.table::<String, String>(schema.metadata().len())?;
+    let buckets = temporary_metadata_table(schema.metadata().len(), context)?;
     context.table_cleanup::<String, String>(schema.metadata().len(), 256)?;
     Ok(buckets)
 }
@@ -256,7 +301,7 @@ fn owned_arc_field<O: OwnedCopy>(
 }
 
 fn union_requests<O: OwnedCopy>(count: usize, context: &mut O) -> Result<(), O::Error> {
-    // Arrow 58.2 try_new's Vec grows 4..128 before its original nonnegative,
+    // Arrow 60.1.0 try_new's Vec grows 4..128 before its nonnegative,
     // unique i8-ID gate. This is a library request upper, not a source cap:
     // all source children are still copied before the opaque constructor.
     let success_prefix = count.min(128);

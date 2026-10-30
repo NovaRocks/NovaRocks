@@ -24,8 +24,8 @@ use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderB
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
 use novarocks_fs::{
-    ObjectStoreAccessContext, ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig,
-    ObjectStoreProviderPool, ObjectStoreProviderPoolOptions, ObjectStoreSecretMaterial,
+    ObjectStoreAccessContext, ObjectStoreEndpointConfig, ObjectStoreProviderPool,
+    ObjectStoreProviderPoolOptions, ObjectStoreSecretMaterial,
 };
 use novarocks_server_application::app_config::{NovaRocksConfig, load_from_env_or_default};
 use novarocks_spi::connector::{
@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
         .context("configured role has no exact object-store-data S3 credential")?;
     let pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default())
         .map_err(anyhow::Error::msg)?;
-    let object_store_access = ObjectStoreAccessContext::new(
+    let object_store_access = ObjectStoreAccessContext::for_static(
         ObjectStoreEndpointConfig {
             endpoint: endpoint.clone(),
             enable_path_style_access: None,
@@ -203,7 +203,7 @@ async fn main() -> Result<()> {
             timeout_ms: None,
             io_timeout_ms: None,
         },
-        ObjectStoreCredentialProviderIdentity::Static(reference),
+        reference,
         ObjectStoreSecretMaterial {
             access_key_id: material.access_key_id().clone(),
             access_key_secret: material.access_key_secret().clone(),

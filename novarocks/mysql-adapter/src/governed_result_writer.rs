@@ -430,7 +430,11 @@ pub(crate) mod streaming_result_tests {
         let cases = [
             (
                 cancelled_query_result_delivery(QueryCancellationReason::ExplicitKill {
-                    requester_connection_id: 3_090_001,
+                    requester_session:
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            3_090_001,
+                        )
+                        .expect("nonzero fixture requester"),
                 }),
                 QueryFailureReason::Cancelled,
                 QueryExecutionErrorKind::Cancelled,
@@ -457,7 +461,7 @@ pub(crate) mod streaming_result_tests {
             ),
             (
                 governed_cancelled_query_result_delivery(CancellationReason::ExplicitKill {
-                    requester_connection_id: 3_090_001,
+                    requester_session: 3_090_001,
                 }),
                 QueryFailureReason::Cancelled,
                 QueryExecutionErrorKind::Cancelled,
@@ -546,7 +550,10 @@ pub(crate) mod streaming_result_tests {
     #[test]
     fn explicit_kill_delivery_cancellation_keeps_the_statement_message() {
         let error = cancelled_query_result_delivery(QueryCancellationReason::ExplicitKill {
-            requester_connection_id: 7,
+            requester_session: novarocks_query_application::session_control::ClientSessionKey::new(
+                7,
+            )
+            .expect("nonzero fixture requester"),
         });
         assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
         assert_eq!(error.to_string(), "Query execution was interrupted");
@@ -603,7 +610,9 @@ pub(crate) mod streaming_result_tests {
                 "logical execution was cancelled before success EOF",
             ),
             Some(QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 7,
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(7)
+                        .expect("nonzero fixture requester"),
             }),
         )
         .await;
@@ -626,7 +635,9 @@ pub(crate) mod streaming_result_tests {
             QueryCancellationReason::ExecutionCancellationRequested,
             QueryCancellationReason::ExecutionOwnerDropped,
             QueryCancellationReason::ExplicitKillConnection {
-                requester_connection_id: 7,
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(7)
+                        .expect("nonzero fixture requester"),
             },
             QueryCancellationReason::ClientDisconnected,
             QueryCancellationReason::DeadlineExceeded { timeout_ms: 1_000 },
@@ -663,7 +674,9 @@ pub(crate) mod streaming_result_tests {
             let error = observe_ready_actor_failure(
                 expected.clone(),
                 Some(QueryCancellationReason::ExplicitKill {
-                    requester_connection_id: 7,
+                    requester_session:
+                        novarocks_query_application::session_control::ClientSessionKey::new(7)
+                            .expect("nonzero fixture requester"),
                 }),
             )
             .await;
@@ -679,7 +692,9 @@ pub(crate) mod streaming_result_tests {
                 "logical execution deadline expired before success EOF",
             ),
             Some(QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 7,
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(7)
+                        .expect("nonzero fixture requester"),
             }),
         )
         .await;

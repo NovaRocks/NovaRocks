@@ -16,19 +16,13 @@
 -- under the License.
 
 -- @order_sensitive=true
--- Validate ALTER TABLE x REMOVE ORPHAN FILES OLDER THAN '<ts>' end-to-end:
---   parser -> engine -> run_remove_orphan_files -> opendal s3 scan -> catalog.
--- Covers: healthy-table noop, empty-table noop, EXPIRE+ORPHAN pipeline,
--- no-OLDER-THAN reject, branch-suffix reject, v2 table support,
--- epoch-ms integer timestamp, future-timestamp acceptance,
--- trailing-tokens reject, combined EXPIRE->ORPHAN->INSERT maintenance sequence.
---
--- Note: "orphan" file simulation is not possible from SQL alone (it requires
--- injecting stale files into the object store). All positive cases therefore
--- run on healthy tables where REMOVE ORPHAN FILES is a noop (deleted_count=0).
--- This is still a meaningful smoke test: it exercises the opendal s3 scan path,
--- the metadata traversal, and the timestamp-filter logic in the real MinIO
--- environment used by the iceberg suite.
+-- Validate the admitted REMOVE ORPHAN FILES syntax and the Provider safety
+-- refusal through the real native frontend/connector path. REST/Hadoop do not
+-- prove writer fencing or Unknown/unreceived-object protection, so scanned GC
+-- must return Unsupported even for empty tables or historical cutoffs.
+-- Existing row/count readbacks and the final INSERT independently prove that
+-- this refusal preserves committed data and ordinary maintenance/write access.
+-- Exact snapshot metadata maintenance remains a separate supported operation.
 --
 -- Note: tbl$snapshots metadata table queries are not used here because the iceberg
 -- suite's current_catalog mode causes the pre-query table-registration step to try
@@ -41,9 +35,8 @@
 -- (`iceberg_cat_${suite_uuid0}`) selected by `SET catalog` at session setup.
 
 -- ---------------------------------------------------------------------------
--- Case 1: Healthy table -> no deletions, data intact
--- Verifies: future cutoff does not remove any live data files; table remains
--- fully readable after the command completes.
+-- Case 1: Healthy table -> explicit scan refusal, data intact
+-- Verifies: the rejected cleanup leaves every original row readable.
 -- ---------------------------------------------------------------------------
 
 -- query 1
@@ -68,13 +61,13 @@ INSERT INTO ${case_db}.t1 VALUES (3, 'c');
 SELECT COUNT(*) AS n FROM ${case_db}.t1;
 
 -- query 6
--- @skip_result_check=true
--- Historical cutoff stays behind the shared safe-GC boundary; all data files
--- are newer and referenced by live snapshots, so 0 files are deleted.
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- The admitted old cutoff does not supply the missing Provider safety proof.
 ALTER TABLE ${case_db}.t1 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 7
--- All 3 rows must remain visible after the noop orphan removal.
+-- All 3 rows must remain visible after the explicit scan refusal.
 SELECT id, v FROM ${case_db}.t1 ORDER BY id;
 
 -- query 8
@@ -82,8 +75,8 @@ SELECT id, v FROM ${case_db}.t1 ORDER BY id;
 SELECT COUNT(*) AS n FROM ${case_db}.t1;
 
 -- ---------------------------------------------------------------------------
--- Case 2: Empty table -> no deletions, no error
--- Verifies: empty table (no current snapshot, no data files) returns Ok.
+-- Case 2: Empty table -> the same explicit scan refusal
+-- Verifies: absence of current data does not invent a safety proof.
 -- ---------------------------------------------------------------------------
 
 -- query 9
@@ -96,20 +89,19 @@ TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 SELECT COUNT(*) AS n FROM ${case_db}.t2;
 
 -- query 11
--- @skip_result_check=true
--- Empty table has no data files to scan; command succeeds without error.
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- An empty table does not grant scanned-object deletion authority.
 ALTER TABLE ${case_db}.t2 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 12
--- Still empty after noop orphan removal.
+-- Still empty after the explicit scan refusal.
 SELECT COUNT(*) AS n FROM ${case_db}.t2;
 
 -- ---------------------------------------------------------------------------
--- Case 3: After EXPIRE, ORPHAN succeeds and data is intact
--- Verifies: chaining EXPIRE SNAPSHOTS -> REMOVE ORPHAN FILES works without
--- error and data remains visible.
--- Note: EXPIRE on a healthy main chain is also a noop here (all snapshots live),
--- so ORPHAN still removes 0 files. The test value is the pipeline composition.
+-- Case 3: Exact EXPIRE succeeds, scanned ORPHAN refuses, data is intact
+-- Verifies: separate metadata maintenance does not grant scanned deletion.
+-- The original readback remains required after both operations.
 -- ---------------------------------------------------------------------------
 
 -- query 13
@@ -139,12 +131,13 @@ SELECT COUNT(*) AS n FROM ${case_db}.t3;
 ALTER TABLE ${case_db}.t3 EXPIRE SNAPSHOTS OLDER THAN '2020-01-01 00:00:00';
 
 -- query 19
--- @skip_result_check=true
--- Step 2: REMOVE ORPHAN FILES after EXPIRE succeeds without error.
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- Exact snapshot maintenance cannot authorize a later scanned-object sweep.
 ALTER TABLE ${case_db}.t3 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 20
--- All rows visible after EXPIRE+ORPHAN pipeline.
+-- All rows visible after exact EXPIRE and rejected scanned cleanup.
 SELECT id, v FROM ${case_db}.t3 ORDER BY id;
 
 -- ---------------------------------------------------------------------------
@@ -176,8 +169,8 @@ TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 ALTER TABLE ${case_db}.t5.branch_dev REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- ---------------------------------------------------------------------------
--- Case 6: V2 table support
--- Verifies: REMOVE ORPHAN FILES is not v3-only; works on format-version 2 tables.
+-- Case 6: V2 shares the safety refusal
+-- Verifies: the scanned-object proof requirement is not format-version-specific.
 -- ---------------------------------------------------------------------------
 
 -- query 25
@@ -198,12 +191,13 @@ INSERT INTO ${case_db}.t6 VALUES (2, 'second');
 SELECT COUNT(*) AS n FROM ${case_db}.t6;
 
 -- query 29
--- @skip_result_check=true
--- REMOVE ORPHAN FILES on v2 table: noop (all files live) and no error.
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- V2 uses the same unproven scanned-object safety boundary.
 ALTER TABLE ${case_db}.t6 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 30
--- Data intact after orphan removal on v2 table.
+-- Data intact after the scan refusal on the v2 table.
 SELECT id, v FROM ${case_db}.t6 ORDER BY id;
 
 -- ---------------------------------------------------------------------------
@@ -225,13 +219,13 @@ INSERT INTO ${case_db}.t7 VALUES (1, 'one');
 INSERT INTO ${case_db}.t7 VALUES (2, 'two');
 
 -- query 34
--- @skip_result_check=true
--- Epoch-ms integer: 1700000000000 is 2023-11-14, which is before test data.
--- All data files are newer than the cutoff so 0 files are removed.
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- Epoch-ms syntax is admitted; age does not prove safe scanned deletion.
 ALTER TABLE ${case_db}.t7 REMOVE ORPHAN FILES OLDER THAN 1700000000000;
 
 -- query 35
--- Data intact after epoch-ms REMOVE ORPHAN FILES.
+-- Data intact after the scan refusal with an admitted epoch-ms cutoff.
 SELECT id, v FROM ${case_db}.t7 ORDER BY id;
 
 -- ---------------------------------------------------------------------------
@@ -249,10 +243,8 @@ TBLPROPERTIES ("format-version" = "2");
 ALTER TABLE ${case_db}.t8 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00' WHERE size_in_bytes < 100;
 
 -- ---------------------------------------------------------------------------
--- Case 9: historical safe-GC cutoff is accepted
--- Verifies: a cutoff older than the shared safe-GC boundary is parsed and
--- applied without error. Current data files are newer and referenced by live
--- snapshots, so the operation is a noop.
+-- Case 9: Historical cutoff syntax is accepted, scanned cleanup is refused
+-- Verifies: age and current reachability are not Provider safety evidence.
 -- ---------------------------------------------------------------------------
 
 -- query 38
@@ -273,19 +265,19 @@ INSERT INTO ${case_db}.t9 VALUES (200, 'beta');
 SELECT COUNT(*) AS n FROM ${case_db}.t9;
 
 -- query 42
--- @skip_result_check=true
--- Far-future cutoff: all files are live-referenced, 0 orphans, command succeeds.
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- A historical cutoff is insufficient even while current files are live.
 ALTER TABLE ${case_db}.t9 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 43
--- Row count unchanged confirming no data files removed.
+-- Row count unchanged after the explicit scan refusal.
 SELECT COUNT(*) AS n FROM ${case_db}.t9;
 
 -- ---------------------------------------------------------------------------
 -- Case 10: Combined EXPIRE -> ORPHAN -> INSERT maintenance sequence
--- Verifies: full maintenance pipeline leaves table healthy for continued writes.
--- Multiple INSERTs build up snapshot history, EXPIRE and ORPHAN are applied,
--- then a subsequent INSERT proves the snapshot chain is intact.
+-- Verifies: exact EXPIRE and refused scanned cleanup preserve continued writes.
+-- The subsequent INSERT and all original row/count readbacks remain required.
 -- ---------------------------------------------------------------------------
 
 -- query 44
@@ -315,8 +307,9 @@ SELECT COUNT(*) AS n FROM ${case_db}.t10;
 ALTER TABLE ${case_db}.t10 EXPIRE SNAPSHOTS OLDER THAN '2020-01-01 00:00:00';
 
 -- query 50
--- @skip_result_check=true
--- Maintenance step 2: remove orphan files (noop, no stale files).
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- The unproven scanned-object phase refuses without authorizing deletion.
 ALTER TABLE ${case_db}.t10 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 51

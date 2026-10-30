@@ -279,13 +279,19 @@ fn policy() -> ConstantPolicy {
 
 #[test]
 fn installed_unnest_fresh_and_frozen_keep_exact_selection_full_fields_and_table_effects() {
-    let child = Arc::new(
-        Field::new("inner", DataType::Int32, true)
-            .with_metadata([("nested-source".into(), "preserved".into())].into()),
-    );
+    let child = Arc::new(Field::new("inner", DataType::Int32, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "nested-source".into(),
+            "preserved".into(),
+        )]),
+    ));
     let items = Arc::new(
-        Field::new("struct-item", DataType::Struct(vec![child].into()), false)
-            .with_metadata([("item-source".into(), "exact".into())].into()),
+        Field::new("struct-item", DataType::Struct(vec![child].into()), false).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "item-source".into(),
+                "exact".into(),
+            )]),
+        ),
     );
     let source =
         FunctionValueType::from_legacy_declared_projection(DataType::List(items.clone()), true);
@@ -613,8 +619,12 @@ fn explicit_dictionary_plain_ingress_and_nested_values_keep_padding_semantics() 
     );
     let dictionary = arrow_cast::cast(dictionary.as_ref(), &DataType::Utf8).unwrap();
     let field = Arc::new(
-        Field::new("dictionary-item", dictionary.data_type().clone(), true)
-            .with_metadata([("child-source".into(), "unaltered".into())].into()),
+        Field::new("dictionary-item", dictionary.data_type().clone(), true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "child-source".into(),
+                "unaltered".into(),
+            )]),
+        ),
     );
     let array: ArrayRef = Arc::new(ListArray::new(
         field,
@@ -622,10 +632,9 @@ fn explicit_dictionary_plain_ingress_and_nested_values_keep_padding_semantics() 
         dictionary,
         None,
     ));
-    let nested_field = Arc::new(
-        Field::new("nested", DataType::Int32, true)
-            .with_metadata([("nested-key".into(), "exact".into())].into()),
-    );
+    let nested_field = Arc::new(Field::new("nested", DataType::Int32, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([("nested-key".into(), "exact".into())]),
+    ));
     let structs: ArrayRef = Arc::new(StructArray::new(
         vec![nested_field].into(),
         vec![Arc::new(Int32Array::from(vec![Some(7)]))],

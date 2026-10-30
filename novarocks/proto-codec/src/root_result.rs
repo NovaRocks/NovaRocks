@@ -118,8 +118,9 @@ mod tests {
 }
 
 use novarocks_result_contract::{
-    ClientRenderSchema, NamedRenderField, NativeRenderType, OpaqueRenderType, RenderColumn,
-    RenderField, RenderPresentation, RenderTimeUnit, RootProfileV1,
+    ClientPresentationFamily, ClientRenderSchema, NamedRenderField, NativeRenderType,
+    OpaqueRenderType, RenderColumn, RenderField, RenderPresentation, RenderTimeUnit, RootProfileV1,
+    TrinoJsonFacts,
 };
 use prost::Message;
 
@@ -138,6 +139,18 @@ pub fn encode_client_schema(schema: &ClientRenderSchema) -> wire::ClientRenderSc
     wire::ClientRenderSchema {
         columns,
         field_nodes: nodes,
+        family: Some(match schema.family() {
+            ClientPresentationFamily::MysqlText => {
+                wire::client_render_schema::Family::MysqlText(wire::MysqlTextFamily {})
+            }
+            ClientPresentationFamily::TrinoJson(facts) => {
+                wire::client_render_schema::Family::TrinoJson(wire::TrinoJsonFamily {
+                    parametric_datetime: facts.parametric_datetime,
+                    variant: facts.variant,
+                    variant_binary: facts.variant_binary,
+                })
+            }
+        }),
     }
 }
 fn encode_field(field: &RenderField, nodes: &mut Vec<wire::RenderField>) -> u32 {
@@ -156,6 +169,7 @@ fn encode_field(field: &RenderField, nodes: &mut Vec<wire::RenderField>) -> u32 
         RenderPresentation::VariantJson { .. } => wire::RenderPresentation::VariantJson,
         RenderPresentation::OpaqueNull => wire::RenderPresentation::OpaqueNull,
         RenderPresentation::MysqlContainer => wire::RenderPresentation::MysqlContainer,
+        RenderPresentation::TrinoValue => wire::RenderPresentation::TrinoValue,
     };
     let native_type = encode_type(&field.native_type, nodes);
     nodes[id as usize - 1] = wire::RenderField {
@@ -283,6 +297,19 @@ pub fn decode_client_schema(
     input_columns: usize,
     path: FieldPath,
 ) -> Result<ClientRenderSchema, ProtocolError> {
+    let family = match src.family.as_ref() {
+        Some(wire::client_render_schema::Family::MysqlText(_)) => {
+            ClientPresentationFamily::MysqlText
+        }
+        Some(wire::client_render_schema::Family::TrinoJson(facts)) => {
+            ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
+                parametric_datetime: facts.parametric_datetime,
+                variant: facts.variant,
+                variant_binary: facts.variant_binary,
+            })
+        }
+        None => return Err(invalid(path, "client schema requires presentation family")),
+    };
     if src.columns.is_empty()
         || src.columns.len() > RootProfileV1::MAX_COLUMNS
         || src.field_nodes.is_empty()
@@ -389,7 +416,7 @@ pub fn decode_client_schema(
             )?,
         });
     }
-    ClientRenderSchema::try_new(columns, input_columns)
+    ClientRenderSchema::try_new(family, columns, input_columns)
         .map_err(|_| invalid(path, "invalid frozen client schema"))
 }
 fn add_backing(backing: &mut usize, count: usize, path: FieldPath) -> Result<(), ProtocolError> {
@@ -465,6 +492,7 @@ fn decode_field(
         },
         Ok(wire::RenderPresentation::OpaqueNull) => RenderPresentation::OpaqueNull,
         Ok(wire::RenderPresentation::MysqlContainer) => RenderPresentation::MysqlContainer,
+        Ok(wire::RenderPresentation::TrinoValue) => RenderPresentation::TrinoValue,
         _ => return Err(invalid(path, "render presentation is required and closed")),
     };
     if !matches!(presentation, RenderPresentation::VariantJson { .. })
@@ -602,6 +630,49 @@ mod schema_tests {
         }
     }
     #[test]
+    fn trino_facts_round_trip_and_family_is_required_without_cross_family_values() {
+        for mask in 0..8 {
+            let facts = TrinoJsonFacts {
+                parametric_datetime: mask & 1 != 0,
+                variant: mask & 2 != 0,
+                variant_binary: mask & 4 != 0,
+            };
+            let schema = ClientRenderSchema::try_new(
+                ClientPresentationFamily::TrinoJson(facts),
+                vec![col(
+                    0,
+                    NativeRenderType::String,
+                    RenderPresentation::TrinoValue,
+                )],
+                1,
+            )
+            .unwrap();
+            let bytes = encode_client_schema(&schema).encode_to_vec();
+            let encoded = wire::ClientRenderSchema::decode(bytes.as_slice()).unwrap();
+            assert_eq!(
+                decode_client_schema(&encoded, 1, FieldPath::root("schema")).unwrap(),
+                schema
+            );
+            let mut missing = encoded.clone();
+            missing.family = None;
+            assert!(decode_client_schema(&missing, 1, FieldPath::root("schema")).is_err());
+            let mut mixed = encoded.clone();
+            mixed.family = Some(wire::client_render_schema::Family::MysqlText(
+                wire::MysqlTextFamily {},
+            ));
+            assert!(decode_client_schema(&mixed, 1, FieldPath::root("schema")).is_err());
+            let mut mixed = encoded.clone();
+            mixed.field_nodes[0].presentation = wire::RenderPresentation::ScalarText as i32;
+            assert!(decode_client_schema(&mixed, 1, FieldPath::root("schema")).is_err());
+            let mut unknown = encoded.clone();
+            unknown.field_nodes[0].presentation = i32::MAX;
+            assert!(decode_client_schema(&unknown, 1, FieldPath::root("schema")).is_err());
+            let mut offset = encoded;
+            offset.field_nodes[0].variant_json_timezone_offset_seconds = Some(0);
+            assert!(decode_client_schema(&offset, 1, FieldPath::root("schema")).is_err());
+        }
+    }
+    #[test]
     fn schema_preserves_exact_width_precision_zone_and_occurrences() {
         let columns = vec![
             col(
@@ -637,7 +708,12 @@ mod schema_tests {
                 RenderPresentation::OpaqueNull,
             ),
         ];
-        let schema = ClientRenderSchema::try_new(columns, 5).unwrap();
+        let schema = ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            columns,
+            5,
+        )
+        .unwrap();
         let encoded = encode_client_schema(&schema);
         assert_eq!(encoded.columns[0].source_slot, Some(10));
         assert_eq!(
@@ -656,6 +732,7 @@ mod schema_tests {
     #[test]
     fn nested_presentations_preserve_frozen_context_without_defaults() {
         let schema = ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
             vec![col(
                 0,
                 NativeRenderType::Struct(vec![
@@ -714,6 +791,7 @@ mod schema_tests {
     #[test]
     fn missing_extra_or_conflicting_semantics_fail_before_binding() {
         let schema = ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
             vec![col(
                 0,
                 NativeRenderType::String,
@@ -754,6 +832,7 @@ mod schema_tests {
             };
         }
         let schema = ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: Some(10),
@@ -796,6 +875,7 @@ mod schema_tests {
     #[test]
     fn flat_schema_rejects_graph_expansion_cycles_and_unused_nodes() {
         let schema = ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
             vec![col(
                 0,
                 NativeRenderType::String,

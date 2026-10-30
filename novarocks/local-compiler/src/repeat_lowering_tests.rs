@@ -199,9 +199,10 @@ fn fixture(
         .map(|index| {
             if index == 0 && matches!(case, Case::NestedKey) {
                 let field = arrow_schema::Field::new("nested-source", DataType::Utf8, true)
-                    .with_metadata(
-                        [("source-fidelity".to_owned(), "kept-exact".to_owned())].into(),
-                    );
+                    .with_metadata(std::collections::HashMap::<String, String>::from([(
+                        "source-fidelity".to_owned(),
+                        "kept-exact".to_owned(),
+                    )]));
                 (
                     ExprKind::Literal(LiteralValue::Null),
                     FunctionValueType::new(DataType::Struct(vec![Arc::new(field)].into()), true),

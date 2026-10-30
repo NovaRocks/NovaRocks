@@ -77,6 +77,12 @@ enum Action {
     },
 }
 
+// The original finite claim stays owned across either release wait.
+struct AuthorizedBarrier {
+    claim: ActionClaim,
+    trigger: PathBuf,
+}
+
 struct AuthorizedAction {
     grant: GrantHandle,
     action: Action,
@@ -468,7 +474,7 @@ impl MvTestControls {
         Err("MV document expiry has no active unclaimed authorization for this FE launch, target and token".into())
     }
 
-    pub(crate) fn recovery(
+    pub(crate) async fn recovery_async(
         &self,
         catalog: &str,
         namespace: &str,
@@ -476,39 +482,60 @@ impl MvTestControls {
         phase: &str,
     ) -> Result<(), String> {
         for action in &self.actions {
-            let Action::Recovery {
-                target,
-                phase: expected,
-                directory,
-                token,
-            } = &action.action
-            else {
-                continue;
-            };
-            if expected != phase || !target.matches(catalog, namespace, mv) {
-                continue;
+            if let Some(barrier) =
+                self.claim_recovery_barrier(action, catalog, namespace, mv, phase)?
+            {
+                wait_release_async(
+                    &barrier.claim,
+                    &barrier.trigger,
+                    Duration::from_secs(30),
+                    || false,
+                )
+                .await?;
             }
-            let trigger = directory.join(format!("mv-refresh-at-{phase}.trigger"));
-            if !trigger.exists() {
-                continue;
-            }
-            let contents = std::fs::read_to_string(&trigger)
-                .map_err(|error| format!("read authorized MV recovery trigger: {error}"))?;
-            if contents != format!("token={token}\n") {
-                return Err("MV recovery trigger does not match its finite grant".into());
-            }
-            let mut claim = match action.grant.claim_once(self.process) {
-                Ok(claim) => claim,
-                Err(_) => continue,
-            };
-            claim.record_hit().map_err(|error| error.to_string())?;
-            eprintln!("NOVAROCKS_MV_RECOVERY_PHASE phase={phase} token={token}");
-            wait_release(&claim, &trigger, Duration::from_secs(30), || false)?;
         }
         Ok(())
     }
 
-    pub(crate) fn known_committed(
+    fn claim_recovery_barrier(
+        &self,
+        action: &AuthorizedAction,
+        catalog: &str,
+        namespace: &str,
+        mv: &str,
+        phase: &str,
+    ) -> Result<Option<AuthorizedBarrier>, String> {
+        let Action::Recovery {
+            target,
+            phase: expected,
+            directory,
+            token,
+        } = &action.action
+        else {
+            return Ok(None);
+        };
+        if expected != phase || !target.matches(catalog, namespace, mv) {
+            return Ok(None);
+        }
+        let trigger = directory.join(format!("mv-refresh-at-{phase}.trigger"));
+        if !trigger.exists() {
+            return Ok(None);
+        }
+        let contents = std::fs::read_to_string(&trigger)
+            .map_err(|error| format!("read authorized MV recovery trigger: {error}"))?;
+        if contents != format!("token={token}\n") {
+            return Err("MV recovery trigger does not match its finite grant".into());
+        }
+        let mut claim = match action.grant.claim_once(self.process) {
+            Ok(claim) => claim,
+            Err(_) => return Ok(None),
+        };
+        claim.record_hit().map_err(|error| error.to_string())?;
+        eprintln!("NOVAROCKS_MV_RECOVERY_PHASE phase={phase} token={token}");
+        Ok(Some(AuthorizedBarrier { claim, trigger }))
+    }
+
+    pub(crate) async fn known_committed_async(
         &self,
         catalog: &str,
         namespace: &str,
@@ -516,47 +543,82 @@ impl MvTestControls {
         publication_id: &novarocks_spi::connector::LakePublicationId,
     ) -> Result<(), String> {
         for action in &self.actions {
-            let Action::KnownCommitted { target, directory } = &action.action else {
-                continue;
-            };
-            if !target.matches(catalog, namespace, mv) {
-                continue;
+            if let Some(barrier) =
+                self.claim_known_committed_barrier(action, catalog, namespace, mv, publication_id)?
+            {
+                wait_release_async(
+                    &barrier.claim,
+                    &barrier.trigger,
+                    Duration::from_secs(30),
+                    || false,
+                )
+                .await?;
             }
-            let trigger = novarocks_failpoint::mv_known_committed_before_projector_cas_trigger_path(
-                directory,
-            );
-            if !trigger.exists() {
-                continue;
-            }
-            let mut claim = match action.grant.claim_once(self.process) {
-                Ok(claim) => claim,
-                Err(_) => continue,
-            };
-            let marker =
-                novarocks_failpoint::mv_known_committed_before_projector_cas_marker_path(directory);
-            std::fs::write(
-                marker,
-                format!(
-                    "publication_id={}\nphase=known-committed-before-projector-cas\n",
-                    publication_id.as_uuid()
-                ),
-            )
-            .map_err(|error| format!("write authorized MV projector marker: {error}"))?;
-            claim.record_hit().map_err(|error| error.to_string())?;
-            eprintln!(
-                "NOVAROCKS_MV_PROJECTOR_PHASE publication_id={} phase=known-committed-before-projector-cas action=kill_fe",
-                publication_id.as_uuid()
-            );
-            wait_release(&claim, &trigger, Duration::from_secs(30), || false)?;
         }
         Ok(())
     }
 
-    pub(crate) fn scheduler(
+    fn claim_known_committed_barrier(
+        &self,
+        action: &AuthorizedAction,
+        catalog: &str,
+        namespace: &str,
+        mv: &str,
+        publication_id: &novarocks_spi::connector::LakePublicationId,
+    ) -> Result<Option<AuthorizedBarrier>, String> {
+        let Action::KnownCommitted { target, directory } = &action.action else {
+            return Ok(None);
+        };
+        if !target.matches(catalog, namespace, mv) {
+            return Ok(None);
+        }
+        let trigger =
+            novarocks_failpoint::mv_known_committed_before_projector_cas_trigger_path(directory);
+        if !trigger.exists() {
+            return Ok(None);
+        }
+        let mut claim = match action.grant.claim_once(self.process) {
+            Ok(claim) => claim,
+            Err(_) => return Ok(None),
+        };
+        let marker =
+            novarocks_failpoint::mv_known_committed_before_projector_cas_marker_path(directory);
+        std::fs::write(
+            marker,
+            format!(
+                "publication_id={}\nphase=known-committed-before-projector-cas\n",
+                publication_id.as_uuid()
+            ),
+        )
+        .map_err(|error| format!("write authorized MV projector marker: {error}"))?;
+        claim.record_hit().map_err(|error| error.to_string())?;
+        eprintln!(
+            "NOVAROCKS_MV_PROJECTOR_PHASE publication_id={} phase=known-committed-before-projector-cas action=kill_fe",
+            publication_id.as_uuid()
+        );
+        Ok(Some(AuthorizedBarrier { claim, trigger }))
+    }
+
+    pub(crate) async fn scheduler_async(
         &self,
         target: &novarocks_sql::planning::mv::SqlMvTarget,
         cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
     ) -> Result<bool, String> {
+        if let Some(barrier) = self.claim_scheduler_barrier(target)? {
+            wait_release_async(
+                &barrier.claim,
+                &barrier.trigger,
+                Duration::from_secs(120),
+                || cancellation.is_cancelled(),
+            )
+            .await?;
+        }
+        Ok(cancellation.is_cancelled())
+    }
+    fn claim_scheduler_barrier(
+        &self,
+        target: &novarocks_sql::planning::mv::SqlMvTarget,
+    ) -> Result<Option<AuthorizedBarrier>, String> {
         for action in &self.actions {
             let Action::Scheduler {
                 target: expected,
@@ -582,15 +644,12 @@ impl MvTestControls {
             )
             .map_err(|error| format!("write authorized MV scheduler marker: {error}"))?;
             claim.record_hit().map_err(|error| error.to_string())?;
-            return wait_release(
-                &claim,
-                &directory.join("mvx4-scheduler-hold.trigger"),
-                Duration::from_secs(120),
-                || cancellation.is_cancelled(),
-            )
-            .map(|()| cancellation.is_cancelled());
+            return Ok(Some(AuthorizedBarrier {
+                claim,
+                trigger: directory.join("mvx4-scheduler-hold.trigger"),
+            }));
         }
-        Ok(cancellation.is_cancelled())
+        Ok(None)
     }
 
     /// Pin the first real admitted object and D/L/C. P and provider versions
@@ -724,11 +783,19 @@ impl MvTestControls {
             .grant
             .claim_once(self.process)
             .map_err(|e| e.to_string())?;
-        let (fact, public_message) = match decision.compile_control_error() {
-            Some(CompileControlError::Source(source)) => {
-                let fact = source.failure_fact();
+        // The Source identity is the original typed failure origin. Native
+        // execution facts remain distinct from compiler-control Source errors.
+        let original_fact = decision
+            .execution_failure()
+            .map(|input| input.fact())
+            .or_else(|| match decision.compile_control_error() {
+                Some(CompileControlError::Source(source)) => Some(source.failure_fact()),
+                _ => None,
+            });
+        let (fact, public_message) = match original_fact {
+            Some(fact) => {
                 // SafeDetail is bounded, not a redactor. Do not copy arbitrary
-                // Source text into a new artifact; existing role logs retain it.
+                // original execution/Source text into a new artifact.
                 let input = ExecutionFailureInput::new(
                     fact,
                     novarocks_execution_contract::SafeDetail::truncating(
@@ -741,7 +808,7 @@ impl MvTestControls {
                     Some(input.user_error().to_string()),
                 )
             }
-            _ => (None, None),
+            None => (None, None),
         };
         let cancellation = action.grant.cancellation();
         let document = serde_json::json!({
@@ -838,8 +905,7 @@ impl MvTestControls {
                 .ok_or("MV rewrite has no frozen statement nomination")?;
             let actual = statement_target.actual_statement;
             if original.statement_run_token != statement_target.run_token
-                || original.connection_id != actual.session().connection_id()
-                || original.session_epoch != actual.session().session_epoch()
+                || original.session_key != actual.session().key().get()
                 || original.statement_generation != actual.generation()
             {
                 return Err("MV rewrite statement differs from its frozen original target".into());
@@ -1044,7 +1110,11 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
             let phase = text("phase")?;
             if !matches!(
                 phase,
-                "data-prepared" | "write-committed" | "publication-committed"
+                "source-pinned"
+                    | "source-prepared"
+                    | "data-prepared"
+                    | "write-committed"
+                    | "publication-committed"
             ) {
                 return Err("MV recovery grant has invalid phase".into());
             }
@@ -1079,27 +1149,62 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
     })
 }
 
+fn barrier_deadline(claim: &ActionClaim, phase_budget: Duration) -> Result<Instant, String> {
+    Ok(Instant::now()
+        .checked_add(phase_budget)
+        .ok_or("MV barrier deadline overflow")?
+        .min(claim.cancellation().deadline()))
+}
+
+fn check_barrier_wait(
+    claim: &ActionClaim,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+) -> Result<(), String> {
+    if !claim.cancellation().is_active() {
+        return Err("MV test session closed during authorized barrier".into());
+    }
+    if cancelled() {
+        return Err("MV product request cancelled during authorized barrier".into());
+    }
+    if Instant::now() >= deadline {
+        return Err("timed out waiting for authorized MV barrier release".into());
+    }
+    Ok(())
+}
+
 fn wait_release(
     claim: &ActionClaim,
     trigger: &Path,
     phase_budget: Duration,
     cancelled: impl Fn() -> bool,
 ) -> Result<(), String> {
-    let deadline = Instant::now()
-        .checked_add(phase_budget)
-        .ok_or("MV barrier deadline overflow")?
-        .min(claim.cancellation().deadline());
+    let deadline = barrier_deadline(claim, phase_budget)?;
     while trigger.exists() {
-        if !claim.cancellation().is_active() {
-            return Err("MV test session closed during authorized barrier".into());
-        }
-        if cancelled() {
-            return Err("MV product request cancelled during authorized barrier".into());
-        }
-        if Instant::now() >= deadline {
-            return Err("timed out waiting for authorized MV barrier release".into());
-        }
+        check_barrier_wait(claim, deadline, &cancelled)?;
         std::thread::park_timeout(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+async fn wait_release_async(
+    claim: &ActionClaim,
+    trigger: &Path,
+    phase_budget: Duration,
+    cancelled: impl Fn() -> bool,
+) -> Result<(), String> {
+    let deadline = barrier_deadline(claim, phase_budget)?;
+    let cancellation = claim.cancellation();
+    while trigger.exists() {
+        check_barrier_wait(claim, deadline, &cancelled)?;
+        // This timer observes the existing filesystem test trigger, not a
+        // product admission gate. The same grant can wake it immediately.
+        let next_observation = (Instant::now() + Duration::from_millis(10)).min(deadline);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {},
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_observation)) => {},
+        }
     }
     Ok(())
 }
@@ -1290,6 +1395,75 @@ pub(crate) mod tests {
             )
             .unwrap()
         }
+        #[test]
+        fn original_native_execution_fact_roundtrips_through_authorized_scheduler_outcome() {
+            use novarocks_mv_application::{
+                scheduler::MvSchedulerConfig,
+                scheduler_runtime::{MvRefreshDisposition, MvRefreshSchedulerRuntime},
+            };
+            use novarocks_query_application::execution_error::{
+                ExecutionFailureInput, ExecutionFailureSite,
+            };
+            for original in [
+                novarocks_local_compiler::FragmentCompileError::Unsupported {
+                    node: Some(novarocks_physical_plan::NodeId::new(2)),
+                    feature: "private Native capability diagnostic",
+                },
+                novarocks_local_compiler::FragmentCompileError::Invalid(
+                    "unsupported private text must not choose a capability identity",
+                ),
+            ] {
+                let input = ExecutionFailureInput::new(
+                    original.failure_fact(),
+                    novarocks_execution_contract::SafeDetail::truncating(
+                        "private original Native execution diagnostic",
+                    ),
+                    ExecutionFailureSite::Coordinator,
+                );
+                let mut scheduler = MvRefreshSchedulerRuntime::<i64, ()>::new(
+                    MvSchedulerConfig::new(true, 1, 1, 10, 40),
+                );
+                let decision = scheduler.record(
+                    &7,
+                    MvRefreshDisposition::InvariantViolation(
+                        MvRefreshFailure::new("private scheduler detail", None)
+                            .with_execution_failure(Some(input.clone())),
+                    ),
+                    100,
+                );
+                assert_eq!(decision.execution_failure(), Some(&input));
+                assert_eq!(decision.compile_control_error(), None);
+                let fixture = Fixture::new();
+                fixture
+                    .controls
+                    .scheduler_request_completed(fixture.admit(&Fixture::source()), &decision)
+                    .unwrap();
+                let record = fixture.record();
+                assert_eq!(record["failure_identity"], "Source");
+                assert_eq!(fact(&record), input.fact());
+                let safe = ExecutionFailureInput::new(
+                    input.fact(),
+                    novarocks_execution_contract::SafeDetail::truncating(
+                        "MV scheduler request blocked; source diagnostic retained in FE role logs",
+                    ),
+                    ExecutionFailureSite::Coordinator,
+                );
+                assert_eq!(record["public_message"], safe.user_error().to_string());
+                assert!(!record.to_string().contains("private"));
+                assert_eq!(record["actual_task_attempt"], "NOT_OBSERVED");
+                assert_eq!(record["actual_publication_attempt"], "NOT_OBSERVED");
+            }
+            let fixture = Fixture::new();
+            fixture
+                .controls
+                .scheduler_request_completed(fixture.admit(&Fixture::source()), &blocked(None))
+                .unwrap();
+            let record = fixture.record();
+            assert_eq!(record["failure_identity"], "UNKNOWN");
+            assert!(record["failure_fact"].is_null());
+            assert!(record["public_message"].is_null());
+        }
+
         #[test]
         fn actual_admission_success_and_transient_do_not_consume_later_blocked_slot() {
             let fixture = Fixture::new();
@@ -1551,9 +1725,33 @@ pub(crate) mod tests {
 
     #[test]
     fn rewrite_nomination_rejects_another_connection_or_generation() {
-        let actual = StatementToken::new(SessionToken::new(7, 1), 2);
-        let other_connection = StatementToken::new(SessionToken::new(8, 1), 2);
-        let later = StatementToken::new(SessionToken::new(7, 1), 3);
+        let actual = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            2,
+        );
+        let other_connection = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (8_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            2,
+        );
+        let later = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            3,
+        );
         assert!(MvRewriteStatementTarget::new(actual, other_connection, "run".into()).is_err());
         assert!(MvRewriteStatementTarget::new(actual, later, "run".into()).is_err());
         assert!(MvRewriteStatementTarget::new(actual, actual, "run".into()).is_ok());
@@ -1572,7 +1770,15 @@ pub(crate) mod tests {
             3000,
         );
         let controls = session.controls().unwrap();
-        let statement = StatementToken::new(SessionToken::new(7, 1), 2);
+        let statement = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            2,
+        );
         let target = MvRewriteStatementTarget::new(statement, statement, "wrong".into()).unwrap();
         let statements = novarocks_parser::parse("SELECT 1").unwrap();
         let [Statement::Query(query)] = statements.as_slice() else {
@@ -1646,8 +1852,8 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
-    fn session_close_releases_scheduler_barrier_and_actual_waiter_is_joined() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_close_releases_scheduler_barrier_and_actual_waiter_is_joined() {
         let directory = std::env::temp_dir().join(format!("nrscheduler-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir(&directory).unwrap();
         std::fs::write(directory.join("mvx4-scheduler-hold.trigger"), "hold").unwrap();
@@ -1659,15 +1865,19 @@ pub(crate) mod tests {
             3000,
         );
         let controls = session.controls().unwrap();
-        let waiter = std::thread::spawn(move || {
-            controls.scheduler(
-                &novarocks_sql::planning::mv::SqlMvTarget {
-                    catalog: Some("ice".into()),
-                    database: "sales".into(),
-                    name: "orders".into(),
-                },
-                &novarocks_query_application::cancellation::QueryCancellationSource::new().view(),
-            )
+        let waiter = tokio::spawn(async move {
+            let cancellation =
+                novarocks_query_application::cancellation::QueryCancellationSource::new();
+            controls
+                .scheduler_async(
+                    &novarocks_sql::planning::mv::SqlMvTarget {
+                        catalog: Some("ice".into()),
+                        database: "sales".into(),
+                        name: "orders".into(),
+                    },
+                    &cancellation.view(),
+                )
+                .await
         });
         let until = Instant::now() + Duration::from_secs(1);
         while !directory
@@ -1675,12 +1885,12 @@ pub(crate) mod tests {
             .exists()
         {
             assert!(Instant::now() < until);
-            std::thread::yield_now();
+            tokio::task::yield_now().await;
         }
         session.close();
         assert!(
             waiter
-                .join()
+                .await
                 .unwrap()
                 .unwrap_err()
                 .contains("session closed")
@@ -1706,8 +1916,8 @@ pub(crate) mod tests {
             target_session_id: session.role.scope().session_id().into(),
             statement_run_token: run_token.into(),
             frontend_process_id: session.role.scope().process().process_id(),
-            connection_id: statement.session().connection_id(),
-            session_epoch: statement.session().session_epoch(),
+            connection_id: 7,
+            session_key: statement.session().key().get(),
             statement_generation: statement.generation(),
         }
     }
@@ -1723,7 +1933,7 @@ pub(crate) mod tests {
             statement_run_token: nomination.statement_run_token.clone(),
             frontend_process_id: nomination.frontend_process_id.clone(),
             connection_id: nomination.connection_id,
-            session_epoch: nomination.session_epoch,
+            session_key: nomination.session_key,
             sql_sha256: sha2::Sha256::digest(b"SELECT 1").into(),
         }
     }
@@ -1739,7 +1949,15 @@ pub(crate) mod tests {
             3000,
         );
         let controls = session.controls().unwrap();
-        let actual = StatementToken::new(SessionToken::new(7, 1), 1);
+        let actual = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            1,
+        );
         let original = nomination(&session, actual, "first");
         let pinned = input(&session, &original);
         assert!(controls.nominate_statement(&pinned, &original).is_err());
@@ -1760,7 +1978,7 @@ pub(crate) mod tests {
         controls.pin_statement_input(&pinned).unwrap();
         controls.pin_statement_input(&pinned).unwrap();
         let mut different_client = pinned.clone();
-        different_client.session_epoch += 1;
+        different_client.session_key += 1;
         let mut different_connection = pinned.clone();
         different_connection.connection_id += 1;
         let mut different_sql = pinned.clone();
@@ -1798,7 +2016,15 @@ pub(crate) mod tests {
         assert!(controls.actions[1].frozen_input.lock().unwrap().is_none());
         let fresh_nom = nomination(
             &session,
-            StatementToken::new(SessionToken::new(8, 2), 1),
+            StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (8_u64 << 32) | 2_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                1,
+            ),
             "fresh",
         );
         let fresh_input = input(&session, &fresh_nom);
@@ -1825,7 +2051,15 @@ pub(crate) mod tests {
             3000,
         );
         let controls = session.controls().unwrap();
-        let a = StatementToken::new(SessionToken::new(7, 1), 1);
+        let a = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            1,
+        );
         let original = nomination(&session, a, "frozen-run");
         controls
             .pin_statement_input(&input(&session, &original))
@@ -1855,9 +2089,33 @@ pub(crate) mod tests {
             .unwrap();
         assert!(session.role.scope().observations().is_empty());
         for b in [
-            StatementToken::new(SessionToken::new(7, 1), 2),
-            StatementToken::new(SessionToken::new(7, 2), 1),
-            StatementToken::new(SessionToken::new(8, 1), 1),
+            StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (7_u64 << 32) | 1_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                2,
+            ),
+            StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (7_u64 << 32) | 2_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                1,
+            ),
+            StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (8_u64 << 32) | 1_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                1,
+            ),
         ] {
             assert!(
                 controls
@@ -1913,7 +2171,15 @@ pub(crate) mod tests {
             3000,
         );
         let controls = session.controls().unwrap();
-        let other = StatementToken::new(SessionToken::new(8, 1), 1);
+        let other = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (8_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            1,
+        );
         controls
             .nominate_statement(
                 &input(&session, &nomination(&session, other, "unlisted")),
@@ -1927,7 +2193,15 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_none()
         );
-        let actual = StatementToken::new(SessionToken::new(7, 1), 1);
+        let actual = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            1,
+        );
         controls
             .pin_statement_input(&input(&session, &nomination(&session, actual, "listed")))
             .unwrap();
@@ -2076,7 +2350,15 @@ pub(crate) mod tests {
             3000,
         );
         let controls = session.controls().unwrap();
-        let statement = StatementToken::new(SessionToken::new(7, 1), 1);
+        let statement = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            1,
+        );
         let original = nomination(&session, statement, "listed");
         let mut wrong_session = original.clone();
         wrong_session.target_session_id = "other-fe-session".into();
@@ -2117,8 +2399,8 @@ pub(crate) mod tests {
         assert!(session.role.scope().observations().is_empty());
     }
 
-    #[test]
-    fn recovery_wrong_target_phase_or_arm_token_cannot_claim() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_wrong_target_phase_or_arm_token_cannot_claim() {
         let root = std::env::temp_dir().join(format!("nrmvrecovery-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir(&root).unwrap();
         let controlled = TestSession::new(
@@ -2137,12 +2419,16 @@ pub(crate) mod tests {
             ("ice", "sales", "other", "data-prepared"),
             ("ice", "sales", "orders", "publication-committed"),
         ] {
-            controls.recovery(catalog, namespace, mv, phase).unwrap();
+            controls
+                .recovery_async(catalog, namespace, mv, phase)
+                .await
+                .unwrap();
         }
         assert!(controlled.role.scope().observations().is_empty());
         assert!(
             controls
-                .recovery("ice", "sales", "orders", "data-prepared")
+                .recovery_async("ice", "sales", "orders", "data-prepared")
+                .await
                 .unwrap_err()
                 .contains("finite grant")
         );
@@ -2156,6 +2442,205 @@ pub(crate) mod tests {
                 .unwrap(),
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduler_async_yields_to_release_and_keeps_the_original_claim() {
+        let directory =
+            std::env::temp_dir().join(format!("nrmvasyncscheduler-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&directory).unwrap();
+        let trigger = directory.join("mvx4-scheduler-hold.trigger");
+        std::fs::write(&trigger, "hold").unwrap();
+        let session = TestSession::new(
+            vec![
+                json!({"action":"scheduler-hold","catalog":"ice","namespace":"sales","mv":"orders","directory":directory}),
+            ],
+            SessionRole::Fe,
+            3000,
+        );
+        let controls = session.controls().unwrap();
+        let observed = session.role.scope().clone();
+        let marker = directory.join("mvx4-scheduler-admitted-orders.marker");
+        let release = trigger.clone();
+        let caller = std::thread::current().id();
+        let releaser = tokio::spawn(async move {
+            assert_eq!(std::thread::current().id(), caller);
+            assert!(marker.exists());
+            assert_eq!(
+                observed
+                    .observations()
+                    .iter()
+                    .filter(|event| event.event == "hit")
+                    .count(),
+                1
+            );
+            std::fs::remove_file(release).unwrap();
+        });
+        let cancellation =
+            novarocks_query_application::cancellation::QueryCancellationSource::new();
+        assert!(
+            !controls
+                .scheduler_async(
+                    &novarocks_sql::planning::mv::SqlMvTarget {
+                        catalog: Some("ice".into()),
+                        database: "sales".into(),
+                        name: "orders".into()
+                    },
+                    &cancellation.view()
+                )
+                .await
+                .unwrap()
+        );
+        releaser.await.unwrap();
+        assert!(!trigger.exists());
+        assert!(
+            controls.actions[0]
+                .grant
+                .claim_once(controls.process)
+                .is_err()
+        );
+        for expected in ["claimed", "hit", "claim-released"] {
+            assert_eq!(
+                session
+                    .role
+                    .scope()
+                    .observations()
+                    .iter()
+                    .filter(|event| event.event == expected)
+                    .count(),
+                1
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_async_yields_to_release_on_the_same_runtime_and_claims_once() {
+        let directory =
+            std::env::temp_dir().join(format!("nrmvasyncrecovery-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&directory).unwrap();
+        let session = TestSession::new(
+            vec![
+                json!({"action":"recovery-hold","catalog":"ice","namespace":"sales","mv":"orders","phase":"data-prepared","directory":directory,"token":"right"}),
+            ],
+            SessionRole::Fe,
+            3000,
+        );
+        let controls = session.controls().unwrap();
+        let trigger = directory.join("mv-refresh-at-data-prepared.trigger");
+        std::fs::write(&trigger, "token=right\n").unwrap();
+        let scope = session.role.scope().clone();
+        let release = trigger.clone();
+        let caller = std::thread::current().id();
+        let releaser = tokio::spawn(async move {
+            assert_eq!(std::thread::current().id(), caller);
+            assert_eq!(
+                scope
+                    .observations()
+                    .iter()
+                    .filter(|event| event.event == "hit")
+                    .count(),
+                1
+            );
+            std::fs::remove_file(release).unwrap();
+        });
+        controls
+            .recovery_async("ice", "sales", "orders", "data-prepared")
+            .await
+            .unwrap();
+        releaser.await.unwrap();
+        assert!(!trigger.exists());
+        assert!(
+            controls.actions[0]
+                .grant
+                .claim_once(controls.process)
+                .is_err()
+        );
+        let observations = session.role.scope().observations();
+        for expected in ["claimed", "hit", "claim-released"] {
+            assert_eq!(
+                observations
+                    .iter()
+                    .filter(|event| event.event == expected)
+                    .count(),
+                1
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn known_committed_async_keeps_the_marker_and_grant_close_wakes_its_waiter() {
+        use std::future::Future;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::task::{Context, Poll, Wake, Waker};
+        struct CountWake(AtomicUsize);
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("nrmvasynccommit-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&directory).unwrap();
+        let session = TestSession::new(
+            vec![
+                json!({"action":"known-committed-hold","catalog":"ice","namespace":"sales","mv":"orders","directory":directory}),
+            ],
+            SessionRole::Fe,
+            3000,
+        );
+        let controls = session.controls().unwrap();
+        let trigger =
+            novarocks_failpoint::mv_known_committed_before_projector_cas_trigger_path(&directory);
+        std::fs::write(&trigger, "hold").unwrap();
+        let publication = novarocks_spi::connector::LakePublicationId::new_v7();
+        let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter =
+            Box::pin(controls.known_committed_async("ice", "sales", "orders", &publication));
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+        let marker =
+            novarocks_failpoint::mv_known_committed_before_projector_cas_marker_path(&directory);
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            format!(
+                "publication_id={}\nphase=known-committed-before-projector-cas\n",
+                publication.as_uuid()
+            )
+        );
+        assert_eq!(wake.0.load(Ordering::SeqCst), 0);
+        // No runtime tick or filesystem release occurs between these calls.
+        // This wake must be the original grant's close notification.
+        session
+            .role
+            .scope()
+            .close(novarocks_failpoint::scope::CloseCause::ExplicitEnd);
+        assert!(wake.0.load(Ordering::SeqCst) > 0);
+        let Poll::Ready(Err(error)) = waiter.as_mut().poll(&mut cx) else {
+            panic!("closed original grant must finish the same barrier");
+        };
+        assert!(error.contains("session closed"));
+        assert!(trigger.exists());
+        let observations = session.role.scope().observations();
+        for expected in ["claimed", "hit", "claim-released"] {
+            assert_eq!(
+                observations
+                    .iter()
+                    .filter(|event| event.event == expected)
+                    .count(),
+                1
+            );
+        }
+        drop(waiter);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2173,7 +2658,15 @@ pub(crate) mod tests {
             3000,
         );
         let controls = std::sync::Arc::new(session.controls().unwrap());
-        let actual = StatementToken::new(SessionToken::new(7, 1), 1);
+        let actual = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            1,
+        );
         controls
             .pin_statement_input(&input(&session, &nomination(&session, actual, "exact")))
             .unwrap();

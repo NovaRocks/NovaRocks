@@ -806,7 +806,10 @@ fn concat_runtime_keeps_original_dictionary_field_equality_and_real_child_negati
     #[allow(deprecated)]
     let original_item =
         arrow_schema::Field::new_dict("item", dictionary.data_type().clone(), true, 7, false)
-            .with_metadata([("original.source".into(), "kept".into())].into());
+            .with_metadata(std::collections::HashMap::<String, String>::from([(
+                "original.source".into(),
+                "kept".into(),
+            )]));
     let inner = arrow_array::ListArray::new(
         Arc::new(original_item.clone()),
         arrow_buffer::OffsetBuffer::new(vec![0i32].into()),
@@ -859,7 +862,10 @@ fn concat_runtime_keeps_original_dictionary_field_equality_and_real_child_negati
         original_item.clone().with_nullable(false),
         original_item
             .clone()
-            .with_metadata([("original.source".into(), "different".into())].into()),
+            .with_metadata(std::collections::HashMap::<String, String>::from([(
+                "original.source".into(),
+                "different".into(),
+            )])),
     ] {
         let expected = DataType::List(Arc::new(different));
         assert_ne!(expected, inner_type);

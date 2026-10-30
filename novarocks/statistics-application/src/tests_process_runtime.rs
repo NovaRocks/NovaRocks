@@ -21,10 +21,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    StatisticsAttemptError, StatisticsAttemptExecutor, StatisticsColumns, StatisticsFailure,
-    StatisticsJob, StatisticsJobConclusion, StatisticsJobCreate, StatisticsJobPhase,
-    StatisticsJobRepository, StatisticsJobState, StatisticsPublicationFact,
-    StatisticsPublicationOutcome, StatisticsTarget, StatisticsWorker,
+    StatisticsAttemptError, StatisticsColumns, StatisticsFailure, StatisticsJob,
+    StatisticsJobConclusion, StatisticsJobCreate, StatisticsJobPhase, StatisticsJobRepository,
+    StatisticsJobState, StatisticsPublicationFact, StatisticsPublicationOutcome, StatisticsTarget,
+    StatisticsWorker,
 };
 use novarocks_workload_control::{
     ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
@@ -75,8 +75,9 @@ struct PublishExecutor {
     publications: AtomicUsize,
     outcome: StatisticsPublicationFact,
     finalization_failure: bool,
+    cleanup_failure: bool,
 }
-impl StatisticsAttemptExecutor for PublishExecutor {
+impl crate::StatisticsPhaseFixture for PublishExecutor {
     fn prepare(
         &self,
         _job: &StatisticsJob,
@@ -98,12 +99,37 @@ impl StatisticsAttemptExecutor for PublishExecutor {
     ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
         context.stage_scope().check().map_err(failed)?;
         self.publications.fetch_add(1, Ordering::SeqCst);
-        Ok(StatisticsPublicationOutcome {
-            fact: self.outcome,
-            finalization_failure: self.finalization_failure.then(|| StatisticsFailure {
-                compile_control: None,
-                message: Arc::from("finalization projection failed"),
-            }),
+        let finalization_failure = self
+            .finalization_failure
+            .then(|| crate::test_publication_failure("finalization projection failed"));
+        let cleanup_failure = self
+            .cleanup_failure
+            .then(|| crate::test_publication_failure("original cleanup failed"));
+        Ok(match self.outcome {
+            StatisticsPublicationFact::NoOp => StatisticsPublicationOutcome::NoOp {
+                finalization_failure,
+                cleanup_failure,
+            },
+            StatisticsPublicationFact::KnownCommitted => {
+                StatisticsPublicationOutcome::KnownCommitted {
+                    finalization_failure,
+                    cleanup_failure,
+                }
+            }
+            StatisticsPublicationFact::KnownUncommitted => {
+                StatisticsPublicationOutcome::KnownUncommitted {
+                    failure: crate::test_publication_failure("original publication refused"),
+                    cleanup_failure,
+                }
+            }
+            StatisticsPublicationFact::CommitUnknown => {
+                StatisticsPublicationOutcome::CommitUnknown {
+                    failure: crate::test_publication_failure("original publication unknown"),
+                }
+            }
+            StatisticsPublicationFact::NotStarted => {
+                panic!("phase fixture requires a provider verdict")
+            }
         })
     }
 }
@@ -152,6 +178,7 @@ async fn commit_unknown_is_terminal_and_not_redispatched() {
         publications: AtomicUsize::new(0),
         outcome: StatisticsPublicationFact::CommitUnknown,
         finalization_failure: false,
+        cleanup_failure: false,
     });
     let worker = StatisticsWorker::new(repository.clone(), executor.clone());
     let job = repository
@@ -183,6 +210,7 @@ async fn known_commit_finalization_failure_retains_the_provider_fact() {
         publications: AtomicUsize::new(0),
         outcome: StatisticsPublicationFact::KnownCommitted,
         finalization_failure: true,
+        cleanup_failure: false,
     });
     let worker = StatisticsWorker::new(repository.clone(), executor);
     repository
@@ -192,7 +220,7 @@ async fn known_commit_finalization_failure_retains_the_provider_fact() {
     let terminal = worker.run_one(2).await.expect("run").expect("terminal");
     assert_eq!(
         terminal.state,
-        StatisticsJobState::Terminal(StatisticsJobConclusion::Succeeded)
+        StatisticsJobState::Terminal(StatisticsJobConclusion::Failed)
     );
     assert_eq!(
         terminal.publication,
@@ -202,8 +230,7 @@ async fn known_commit_finalization_failure_retains_the_provider_fact() {
         terminal
             .publication_finalization_failure
             .unwrap()
-            .message
-            .as_ref(),
+            .local_diagnostic(),
         "finalization projection failed"
     );
     assert!(terminal.convergence.is_complete());
@@ -215,7 +242,8 @@ async fn known_uncommitted_cleanup_failure_remains_a_failed_definite_publication
     let executor = Arc::new(PublishExecutor {
         publications: AtomicUsize::new(0),
         outcome: StatisticsPublicationFact::KnownUncommitted,
-        finalization_failure: true,
+        finalization_failure: false,
+        cleanup_failure: true,
     });
     let worker = StatisticsWorker::new(repository.clone(), executor.clone());
     repository
@@ -231,14 +259,26 @@ async fn known_uncommitted_cleanup_failure_remains_a_failed_definite_publication
         terminal.publication,
         StatisticsPublicationFact::KnownUncommitted
     );
-    assert!(terminal.failure.is_some());
     assert_eq!(
         terminal
-            .publication_finalization_failure
+            .publication_failure
+            .as_ref()
             .unwrap()
-            .message
-            .as_ref(),
-        "finalization projection failed"
+            .local_diagnostic(),
+        "original publication refused"
+    );
+    assert!(terminal.failure.is_none());
+    assert_eq!(
+        terminal.publication_failure.unwrap().fact(),
+        crate::test_publication_failure("original publication refused").fact()
+    );
+    assert!(terminal.publication_finalization_failure.is_none());
+    assert_eq!(
+        terminal
+            .publication_cleanup_failure
+            .unwrap()
+            .local_diagnostic(),
+        "original cleanup failed"
     );
     assert_eq!(executor.publications.load(Ordering::SeqCst), 1);
     assert!(worker.run_one(3).await.unwrap().is_none());
@@ -270,7 +310,7 @@ mod statement_observation_tests {
             statement_run_token: "original-analyze".into(),
             frontend_process_id: "019200aa-0000-7000-8000-0000000000ab".into(),
             connection_id: 1,
-            session_epoch: 2,
+            session_key: 2,
             statement_generation: 3,
         })
     }
@@ -280,7 +320,7 @@ mod statement_observation_tests {
         seen: Mutex<Vec<(crate::StatisticsJobId, Option<StatementWorkNomination>)>>,
         fail_before_take: bool,
     }
-    impl StatisticsAttemptExecutor for NominatedExecutor {
+    impl crate::StatisticsPhaseFixture for NominatedExecutor {
         fn prepare(
             &self,
             job: &StatisticsJob,
@@ -349,6 +389,7 @@ mod statement_observation_tests {
                     publications: AtomicUsize::new(0),
                     outcome: StatisticsPublicationFact::KnownCommitted,
                     finalization_failure: false,
+                    cleanup_failure: false,
                 },
                 seen: Mutex::new(Vec::new()),
                 fail_before_take,
@@ -470,4 +511,41 @@ mod statement_observation_tests {
                 .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn known_committed_cleanup_failure_does_not_change_business_success() {
+    let repository = StatisticsJobRepository::new();
+    let executor = Arc::new(PublishExecutor {
+        publications: AtomicUsize::new(0),
+        outcome: StatisticsPublicationFact::KnownCommitted,
+        finalization_failure: false,
+        cleanup_failure: true,
+    });
+    let worker = StatisticsWorker::new(repository.clone(), executor.clone());
+    repository
+        .create_admitted(create(1), root().await)
+        .await
+        .unwrap();
+    let terminal = worker.run_one(2).await.unwrap().unwrap();
+    assert_eq!(
+        terminal.state,
+        StatisticsJobState::Terminal(StatisticsJobConclusion::Succeeded)
+    );
+    assert_eq!(
+        terminal.publication,
+        StatisticsPublicationFact::KnownCommitted
+    );
+    assert!(terminal.failure.is_none());
+    assert!(terminal.publication_failure.is_none());
+    assert!(terminal.publication_finalization_failure.is_none());
+    assert_eq!(
+        terminal
+            .publication_cleanup_failure
+            .unwrap()
+            .local_diagnostic(),
+        "original cleanup failed"
+    );
+    assert_eq!(executor.publications.load(Ordering::SeqCst), 1);
+    assert!(worker.run_one(3).await.unwrap().is_none());
 }

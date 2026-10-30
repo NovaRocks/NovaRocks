@@ -22,49 +22,22 @@
 //! query intent or rehydrate planning inputs after admission.
 
 use crate::query_execution::lifecycle_plan::{
-    AttemptCredentialLeaseCollector, QueryCredentialLeases,
+    AttemptCredentialLeaseCollector, AttemptTerminalCredentialResolver, QueryCredentialLeases,
 };
 use novarocks_query_application::api::build_string_query_result;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorRequestScope};
-use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
+use novarocks_types::QueryExecutionId;
+#[cfg(test)]
+use novarocks_types::{AttemptId, QueryId};
 use std::sync::Arc;
-
-/// Move-only ownership of one logical query identity.
-///
-/// Preparation uses this identity only to correlate diagnostics. Attempt
-/// identity, credentials and request scope are minted later by the
-/// coordinator, after the immutable logical operation has crossed the
-/// execution boundary.
-pub struct LogicalQueryReservation {
-    query_id: QueryId,
-}
-
-impl LogicalQueryReservation {
-    pub(crate) const fn new(query_id: QueryId) -> Self {
-        Self { query_id }
-    }
-
-    pub(crate) const fn into_query_id(self) -> QueryId {
-        self.query_id
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn for_test(query_id: QueryId) -> Self {
-        Self::new(query_id)
-    }
-}
 
 /// FE-local identity for one distributed attempt.
 ///
-/// Read-only query preparation cannot construct this value. The coordinator
-/// mints it only after receiving the frozen logical operation. Effectful
-/// statement wrappers may reserve it earlier when their staged business
-/// protocol must own attempt-scoped capabilities before Core request
-/// construction.
+/// The QA process owner reserves the actual identity; `from_reserved` binds
+/// this first-attempt credential custody to that same move-only reservation.
+/// Credential collection and terminal material remain Frontend-owned.
 pub struct QueryAttemptReservation {
-    query_id: QueryId,
-    execution_id: QueryExecutionId,
     credential_collector: Arc<AttemptCredentialLeaseCollector>,
     request_scope: ConnectorRequestScope,
     #[cfg(novarocks_dev_controls)]
@@ -73,12 +46,7 @@ pub struct QueryAttemptReservation {
 }
 
 impl QueryAttemptReservation {
-    pub(crate) fn first(
-        query_id: QueryId,
-    ) -> Result<Self, crate::query_execution::contract::DistributedQueryError> {
-        Self::for_round(query_id, 1)
-    }
-
+    #[cfg(test)]
     pub(crate) fn retry(
         query_id: QueryId,
         attempt: u32,
@@ -86,6 +54,7 @@ impl QueryAttemptReservation {
         Self::for_round(query_id, attempt)
     }
 
+    #[cfg(test)]
     fn for_round(
         query_id: QueryId,
         attempt: u32,
@@ -105,22 +74,43 @@ impl QueryAttemptReservation {
                 error.to_string(),
             )
         })?;
-        Ok(Self {
-            query_id,
-            execution_id,
+        Ok(Self::for_execution(execution_id))
+    }
+
+    /// Retains the exact initial identity allocated by the QA process owner.
+    /// The original move-only token still has to pass QA's issuer check at start.
+    pub(super) fn from_reserved(
+        reserved: &novarocks_query_application::api::ReservedExecutionIdentity,
+    ) -> Result<Self, crate::query_execution::contract::DistributedQueryError> {
+        let execution_id = reserved.execution();
+        if execution_id.attempt_id().get() != 1 {
+            return Err(
+                crate::query_execution::contract::DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
+                    "initial computation reservation must name the original first attempt",
+                ),
+            );
+        }
+        Ok(Self::for_execution(execution_id))
+    }
+
+    fn for_execution(execution_id: QueryExecutionId) -> Self {
+        Self {
             credential_collector: AttemptCredentialLeaseCollector::new(execution_id),
             request_scope: ConnectorRequestScope::new(),
             #[cfg(novarocks_dev_controls)]
             test_nomination: std::sync::OnceLock::new(),
-        })
+        }
     }
 
-    pub(crate) const fn query_id(&self) -> QueryId {
-        self.query_id
+    pub(super) fn terminal_storage_resolver(&self) -> Arc<AttemptTerminalCredentialResolver> {
+        self.credential_collector.terminal_storage_resolver()
     }
 
-    pub(crate) const fn execution_id(&self) -> QueryExecutionId {
-        self.execution_id
+    pub(super) fn seal_for_terminal(
+        &self,
+    ) -> Result<(), crate::query_execution::contract::DistributedQueryError> {
+        self.credential_collector.seal_for_terminal().map(|_| ())
     }
 
     pub(crate) fn credential_lease_sink(
@@ -170,116 +160,22 @@ impl QueryAttemptReservation {
         self.credential_collector.has_collected_leases()
     }
 
-    pub(crate) fn into_credential_leases(
-        self,
+    /// The initializer borrows its original reservation through the one-shot
+    /// Native drain. The reservation continues to anchor terminal material.
+    pub(crate) fn drain_credential_leases(
+        &self,
     ) -> Result<QueryCredentialLeases, crate::query_execution::contract::DistributedQueryError>
     {
         self.credential_collector.drain_credential_leases()
     }
 }
 
-/// Frontend-owned factory for a replacement *whole* distributed round. It
-/// receives a fresh topology snapshot and must return request artifacts and a
-/// matching completion formatter that belong to that attempt alone.
-///
-/// The rule this replaces said no existing fragment, split, writer, RF,
-/// schedule, manifest, or profile artifact may be reused. That was written
-/// when the only way to get a second round was to plan one from scratch, and
-/// it conflated two different things. What must not be reused is anything an
-/// attempt *owns*: no fragment instance, split source, writer, RF artifact,
-/// schedule, manifest or profile may cross from a spent attempt into a fresh
-/// one, and no credential or lease may either.
-///
-/// The sealed *description* is the opposite case. It is semantic input to
-/// every attempt of one logical execution, it names no backend and holds no
-/// capability, and re-deriving it per attempt is how two rounds of one
-/// statement came to disagree about plan shape whenever the statistics under
-/// them moved. A replacement round therefore rebinds the same sealed plan and
-/// re-derives only what the new attempt owns.
-pub(crate) trait PreReadyRetryBoundary {
-    fn permit_pre_ready_retry(
-        &self,
-    ) -> Result<(), crate::query_execution::contract::DistributedQueryError>;
-
-    fn close_after_control_ready(&self) {}
-
-    fn close_after_stage_or_start(&self) {}
-}
-
-pub(crate) trait PreparedDistributedAttemptFactory: Send + PreReadyRetryBoundary {
-    fn instantiate(
-        &mut self,
-        topology: novarocks_query_application::api::BackendTopologySnapshot,
-    ) -> Result<PreparedDistributedAttempt, crate::query_execution::contract::DistributedQueryError>;
-}
-
-/// Request and completion artifacts for a replacement attempt of an already
-/// owned logical query.
-///
-/// This deliberately carries no logical or attempt reservation. The
-/// coordinator keeps the sole logical identity and mints a fresh attempt only
-/// after these immutable replacement artifacts have been produced.
-pub(crate) struct PreparedDistributedAttempt {
-    request: crate::query_execution::contract::DistributedQueryRequest,
-    completion: PreparedQueryCompletion,
-}
-
-impl PreparedDistributedAttempt {
-    pub(crate) fn new(
-        request: crate::query_execution::contract::DistributedQueryRequest,
-        completion: PreparedQueryCompletion,
-    ) -> Self {
-        Self {
-            request,
-            completion,
-        }
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        crate::query_execution::contract::DistributedQueryRequest,
-        PreparedQueryCompletion,
-    ) {
-        (self.request, self.completion)
-    }
-}
-
-/// One raw-outcome distributed operation.
-///
-/// The caller retains its provider commit/abort boundary, but this carrier
-/// deliberately cannot create a successor round. An external-effect request
-/// without engine/provider proof of isolation must report `NoRecovery` rather
-/// than turn a pre-ready transport failure into an automatic replan.
-pub struct PreparedRawDistributedRequest {
-    request: crate::query_execution::contract::DistributedQueryRequest,
-    /// A DML operation can observe vended storage credentials while it is
-    /// still building its first native request.  Keep the matching attempt
-    /// reservation move-only with that request so lifecycle Init, rather than
-    /// a later coordinator-generated identity, owns those credentials.
-    reservation: Option<QueryAttemptReservation>,
-}
-
-impl PreparedRawDistributedRequest {
-    pub(crate) fn new(request: crate::query_execution::contract::DistributedQueryRequest) -> Self {
-        Self {
-            request,
-            reservation: None,
-        }
-    }
-
-    pub(crate) fn with_attempt_reservation(mut self, reservation: QueryAttemptReservation) -> Self {
-        self.reservation = Some(reservation);
-        self
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        crate::query_execution::contract::DistributedQueryRequest,
-        Option<QueryAttemptReservation>,
-    ) {
-        (self.request, self.reservation)
+impl Drop for QueryAttemptReservation {
+    fn drop(&mut self) {
+        // Abandonment closes collection/Native transfer rights. It does not
+        // prove any asynchronous initializer or external operation has exited.
+        // An explicit terminal owner observes validation errors before Drop.
+        let _ = self.seal_for_terminal();
     }
 }
 
@@ -293,7 +189,6 @@ pub enum PreparedQueryOperation {
     /// frozen logical description and the reusable Native attempt template;
     /// it cannot be downgraded to one legacy coordinator round.
     LogicalRead(PreparedLogicalRead),
-    Distributed(PreparedDistributedQuery),
 }
 
 impl PreparedQueryOperation {
@@ -301,13 +196,6 @@ impl PreparedQueryOperation {
     /// operation constructor to application callers.
     pub fn immediate(result: StatementResult) -> Self {
         Self::Immediate(PreparedImmediateQuery::new(result))
-    }
-
-    /// Build the canonical single-column response used by EXPLAIN.
-    pub fn explain_lines(lines: Vec<String>) -> Result<Self, String> {
-        Ok(Self::immediate(StatementResult::Query(
-            build_string_query_result("Explain String", lines)?,
-        )))
     }
 }
 
@@ -333,6 +221,26 @@ impl PreparedLogicalRead {
             attempt_template,
             options,
         }
+    }
+
+    pub(crate) fn validate_read_start(&self) -> Result<(), &'static str> {
+        use novarocks_coordination_contract::{ExecutionEffect, RecoveryMode};
+        use novarocks_query_application::preparation::ExecutionFinishBoundary;
+        if self.description.finish_boundary() != ExecutionFinishBoundary::ClientEof
+            || self.description.effect() != ExecutionEffect::None
+            || self.description.recovery() != RecoveryMode::RestartAttemptBeforeVisibility
+            || !self
+                .description
+                .matches_plan_seal(self.attempt_template.native_manifest_template().plan())
+        {
+            return Err("ordinary Read has a foreign output, recovery, or plan seal");
+        }
+        Ok(())
+    }
+    pub(crate) fn row_carrier(
+        &self,
+    ) -> Result<novarocks_query_application::api::ResultRowCarrier, String> {
+        self.description.row_carrier()
     }
 
     pub(crate) fn scalar_schema(&self) -> Option<&novarocks_result_contract::ScalarSchema> {
@@ -361,55 +269,6 @@ impl PreparedImmediateQuery {
 
     pub fn into_result(self) -> StatementResult {
         self.result
-    }
-}
-
-pub struct PreparedDistributedQuery {
-    request: crate::query_execution::contract::DistributedQueryRequest,
-    completion: PreparedQueryCompletion,
-    attempt_factory: Option<Box<dyn PreparedDistributedAttemptFactory>>,
-    logical_reservation: LogicalQueryReservation,
-}
-
-impl PreparedDistributedQuery {
-    /// Pair the Core-validated request with its exact completion formatter.
-    /// Only Frontend native assembly receives both values from the same
-    /// sealed query preparation.
-    pub fn new(
-        request: crate::query_execution::contract::DistributedQueryRequest,
-        completion: PreparedQueryCompletion,
-        logical_reservation: LogicalQueryReservation,
-    ) -> Self {
-        Self {
-            request,
-            completion,
-            attempt_factory: None,
-            logical_reservation,
-        }
-    }
-
-    pub(crate) fn with_attempt_factory(
-        mut self,
-        attempt_factory: Box<dyn PreparedDistributedAttemptFactory>,
-    ) -> Self {
-        self.attempt_factory = Some(attempt_factory);
-        self
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        crate::query_execution::contract::DistributedQueryRequest,
-        PreparedQueryCompletion,
-        Option<Box<dyn PreparedDistributedAttemptFactory>>,
-        LogicalQueryReservation,
-    ) {
-        (
-            self.request,
-            self.completion,
-            self.attempt_factory,
-            self.logical_reservation,
-        )
     }
 }
 
@@ -453,35 +312,22 @@ impl PreparedQueryCompletion {
             }),
         }
     }
-
-    pub fn complete(
-        self,
-        outcome: crate::query_execution::outcome::DistributedQueryOutcome,
-    ) -> Result<StatementResult, String> {
-        match self.formatter {
-            PreparedQueryFormatter::Profile(formatter) => complete_profile(formatter, outcome),
-        }
-    }
 }
 
-fn complete_profile(
+fn render_profile_result(
     formatter: PreparedProfileFormatter,
-    outcome: crate::query_execution::outcome::DistributedQueryOutcome,
-) -> Result<StatementResult, String> {
-    let outcome = outcome
-        .into_profile()
-        .map(crate::query_execution::outcome::ProfileExecutionOutcome::into_parts)
-        .map_err(|error| error.to_string())?;
-    let (output_rows, fragment_profiles) = outcome;
-    let fragment_profiles = fragment_profiles.into_profiles();
-    if fragment_profiles.is_empty() {
-        return Err("EXPLAIN ANALYZE completed without fragment runtime profiles".into());
-    }
+    output_rows: u64,
+    fragment_profiles: Vec<crate::query_execution::profile::FragmentProfileTree>,
+    diagnostics: Vec<String>,
+) -> Result<novarocks_query_application::api::QueryResult, String> {
     // Per-fragment attribution is read while each tree still carries the
     // fragment its producer named; every other summary below is a counter sum
     // over the trees themselves and needs no attribution.
     let per_fragment =
         crate::query_execution::profile::collect_per_fragment_profile_summaries(&fragment_profiles);
+    let reported_runtime = fragment_profiles.iter().any(|profile| {
+        profile.fragment_root_plan_node_id().is_some() && profile.has_runtime_statistics()
+    });
     let fragment_profiles = fragment_profiles
         .into_iter()
         .map(crate::query_execution::profile::FragmentProfileTree::into_tree)
@@ -501,7 +347,10 @@ fn complete_profile(
         format_explain_analyze_duration(formatter.execution_started_at.elapsed()),
         output_rows
     ));
-    lines.push(format_distributed_profile_summary(&profile_summary));
+    if reported_runtime || diagnostics.is_empty() {
+        lines.push(format_distributed_profile_summary(&profile_summary));
+    }
+    lines.extend(diagnostics);
     if let Some(apply) =
         crate::query_execution::profile::collect_native_runtime_filter_apply_from_profile_trees(
             &fragment_profiles,
@@ -547,7 +396,104 @@ fn complete_profile(
             &formatter.control,
         )?,
     });
-    build_string_query_result("Explain String", lines).map(StatementResult::Query)
+    build_string_query_result("Explain String", lines)
+}
+
+impl PreparedQueryCompletion {
+    /// Render the accepted computation with its independent, exact Native
+    /// diagnostic snapshot. A missing diagnostic is not a missing Ready cut.
+    pub(crate) fn complete_profile_observation(
+        self,
+        ready: &crate::query_execution::internal_consumer::profile::ReadyProfileComputation,
+        observation: Result<
+            &crate::task_execution::profile_diagnostics::ProfileDiagnosticSnapshot,
+            crate::query_execution::internal_consumer::profile::ProfileSnapshotMissing,
+        >,
+    ) -> Result<novarocks_query_application::api::QueryResult, String> {
+        use crate::task_execution::profile_diagnostics::ProfileTaskDiagnostic;
+        let PreparedQueryFormatter::Profile(formatter) = self.formatter;
+        let ProfilePlan::Completed { plan, .. } = &formatter.plan;
+        let mut profiles = crate::query_execution::profile::ProfileTerminalBuilder::new();
+        let mut diagnostics = Vec::new();
+        match observation {
+            Ok(snapshot) => {
+                if snapshot.ready != ready.ready_token()
+                    || !snapshot
+                        .tasks
+                        .iter()
+                        .map(|(task, _)| *task)
+                        .eq(ready.expected_tasks().iter().copied())
+                    || snapshot.fragments.len() != snapshot.tasks.len()
+                    || !snapshot
+                        .fragments
+                        .iter()
+                        .map(|(task, _)| *task)
+                        .eq(snapshot.tasks.iter().map(|(task, _)| *task))
+                {
+                    return Err(
+                        "EXPLAIN ANALYZE diagnostics do not match the accepted computation"
+                            .to_string(),
+                    );
+                }
+                if !snapshot.complete() {
+                    diagnostics.push(format!("Diagnostics: {:?}; complete=false", snapshot.closure));
+                }
+                for ((task, fact), (_, fragment)) in
+                    snapshot.tasks.iter().zip(snapshot.fragments.iter())
+                {
+                    let fragment = plan
+                        .fragments()
+                        .get(&novarocks_physical_plan::FragmentId::new(*fragment))
+                        .ok_or_else(|| "EXPLAIN ANALYZE diagnostic Task names an absent plan fragment".to_string())?;
+                    let root = i32::try_from(fragment.root().get()).map_err(|_| "EXPLAIN ANALYZE fragment root exceeds native profile range".to_string())?;
+                    match fact {
+                        ProfileTaskDiagnostic::Available(info) => {
+                            if info.final_status().identity() != *task {
+                                return Err(
+                                    "EXPLAIN ANALYZE final info has a foreign Task identity"
+                                        .to_string(),
+                                );
+                            }
+                            profiles
+                                .apply_task_operator_statistics(info, root)
+                                .map_err(|error| error.to_string())?;
+                        }
+                        ProfileTaskDiagnostic::Missing(reason) => {
+                            profiles.apply_missing_task_information(*task, root);
+                            diagnostics.push(format!(
+                                "Diagnostics missing: stage={} task={}; reason={reason:?}",
+                                task.stage_id(), task.task_id()
+                            ));
+                        }
+                    }
+                }
+                if !snapshot.runtime_filters.is_complete() {
+                    diagnostics.push("RuntimeFilter diagnostics unavailable: context release incomplete".to_string());
+                }
+                for (process, telemetry) in snapshot.runtime_filters.contributions() {
+                    if matches!(telemetry.as_proto().telemetry, Some(novarocks_proto_models::novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(_))) {
+                        diagnostics.push(format!("RuntimeFilter diagnostics unavailable: backend={process}"));
+                    }
+                    profiles.apply_runtime_filter_contribution(ready.ready_token().root().query_execution_id(), *process, telemetry)
+                        .map_err(|error| error.to_string())?;
+                }
+                match snapshot.split {
+                    crate::task_execution::profile_diagnostics::ProfileSplitDiagnostic::Available(profile) => profiles.apply_split_assignment_profile(profile),
+                    crate::task_execution::profile_diagnostics::ProfileSplitDiagnostic::Missing(reason) => diagnostics.push(format!("FrontendSplitAssignment diagnostics unavailable: {reason:?}")),
+                }
+            }
+            Err(crate::query_execution::internal_consumer::profile::ProfileSnapshotMissing::ForeignComputationCut) => {
+                return Err("EXPLAIN ANALYZE diagnostic observer has a foreign computation cut".to_string());
+            }
+            Err(reason) => diagnostics.push(format!("Diagnostics unavailable: {reason:?}")),
+        }
+        render_profile_result(
+            formatter,
+            ready.output_rows(),
+            profiles.finish().into_profiles(),
+            diagnostics,
+        )
+    }
 }
 
 fn render_completed_profile(
@@ -717,21 +663,6 @@ fn format_explain_analyze_duration(duration: std::time::Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn logical_query_identity_is_separate_from_attempt_identity() {
-        let query_id = novarocks_types::QueryId::new(7, 41);
-        let logical = super::LogicalQueryReservation::for_test(query_id);
-
-        assert_eq!(logical.into_query_id(), query_id);
-
-        let first = super::QueryAttemptReservation::first(query_id).expect("first attempt");
-        let replacement =
-            super::QueryAttemptReservation::retry(query_id, 2).expect("replacement attempt");
-        assert_eq!(first.query_id(), query_id);
-        assert_eq!(replacement.query_id(), query_id);
-        assert_eq!(first.execution_id().attempt_id().get(), 1);
-        assert_eq!(replacement.execution_id().attempt_id().get(), 2);
-    }
 
     #[test]
     fn connector_file_summary_includes_cache_and_page_index_effect_counters() {

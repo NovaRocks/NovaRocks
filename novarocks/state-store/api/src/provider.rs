@@ -115,6 +115,23 @@ pub enum StateStoreProviderLifecycle {
 #[async_trait::async_trait]
 pub trait StateStoreProviderFactory: Send + Sync {
     fn descriptor(&self) -> &StateStoreProviderDescriptor;
+    /// Actual dependencies of this provider's closed blocking operations.
+    /// None means the provider has not supplied these facts; an empty list is
+    /// an explicit pure implementation, never a guessed host-local route.
+    fn blocking_dependency_facts(&self) -> Option<Vec<crate::SharedDependency>> {
+        None
+    }
+    fn blocking_source_vocabulary(&self) -> Option<crate::StateStoreBlockingSourceVocabulary> {
+        None
+    }
+    fn prepare_open_in(
+        self: Box<Self>,
+        _request: StateStoreOpenRequest,
+        _execution: &crate::StateStoreExecutionContext,
+        _target: &mut Option<Box<dyn crate::StateStoreOriginalOpen>>,
+    ) -> Result<(), crate::StateStoreExecutionFailure> {
+        Err(crate::StateStoreOriginalUnsupported.into_original_failure())
+    }
 
     async fn open(
         self: Box<Self>,
@@ -125,8 +142,30 @@ pub trait StateStoreProviderFactory: Send + Sync {
 #[async_trait::async_trait]
 pub trait StateStoreProviderInstance: Send {
     fn descriptor(&self) -> &StateStoreProviderDescriptor;
+    /// Actual dependencies of this provider's closed blocking operations.
+    /// None means the provider has not supplied these facts; an empty list is
+    /// an explicit pure implementation, never a guessed host-local route.
+    fn blocking_dependency_facts(&self) -> Option<Vec<crate::SharedDependency>> {
+        None
+    }
+    fn blocking_source_vocabulary(&self) -> Option<crate::StateStoreBlockingSourceVocabulary> {
+        None
+    }
+    fn blocking_instance_scope(&self) -> Option<crate::InstanceScope> {
+        None
+    }
     fn lifecycle(&self) -> StateStoreProviderLifecycle;
     fn state_store(&self) -> Option<Arc<dyn StateStore>>;
+
+    /// Install the same instance's stable closing source before releasing any
+    /// provider custody. Unsupported providers never delegate to legacy shutdown.
+    fn prepare_close_in(
+        &mut self,
+        _execution: &crate::StateStoreExecutionContext,
+        _target: &mut Option<Box<dyn crate::StateStoreOriginalClose>>,
+    ) -> Result<(), crate::StateStoreExecutionFailure> {
+        Err(crate::StateStoreOriginalUnsupported.into_original_failure())
+    }
 
     async fn shutdown(&mut self, deadline: Instant) -> Result<(), StateStoreError>;
 }

@@ -243,25 +243,57 @@ impl PendingManagementObservation {
         ),
         ManagementObservationError,
     > {
+        self.validate_request(&request)?;
+        let view = lease
+            .observe_keyed_documents(request)
+            .map_err(|error| document_observation_kind(&error))?;
+        self.finish_keyed_view(view)
+    }
+
+    /// Await the retained lease's actual asynchronous observation. This consumes
+    /// the pending capability, but does not own or retire the Provider source.
+    pub async fn complete_keyed_async(
+        self,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<
+        (
+            FreshManagementObservation,
+            novarocks_spi::connector::KeyedDocumentView,
+        ),
+        ManagementObservationFailure,
+    > {
+        self.validate_request(&request)?;
+        let view = lease
+            .observe_keyed_documents_async(request)
+            .await
+            .map_err(ManagementObservationFailure::from_document)?;
+        self.finish_keyed_view(view).map_err(Into::into)
+    }
+
+    fn validate_request(
+        &self,
+        request: &novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<(), ManagementObservationError> {
         if request.catalog_handle != *self.target.catalog()
             || request.target != *self.target.table()
             || request.object_id != *self.target.object_id()
         {
             return Err(ManagementObservationError::EffectTargetMismatch);
         }
-        let view = lease
-            .observe_keyed_documents(request)
-            .map_err(|error| match error {
-                novarocks_spi::connector::KeyedDocumentReadError::Invalid(error)
-                    if error.table_object_binding_failure()
-                        == Some(
-                            novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced,
-                        ) =>
-                {
-                    ManagementObservationError::Ownership(ManagementOwnershipError::TargetReplaced)
-                }
-                _ => ManagementObservationError::UnsealedObservation,
-            })?;
+        Ok(())
+    }
+
+    fn finish_keyed_view(
+        self,
+        view: novarocks_spi::connector::KeyedDocumentView,
+    ) -> Result<
+        (
+            FreshManagementObservation,
+            novarocks_spi::connector::KeyedDocumentView,
+        ),
+        ManagementObservationError,
+    > {
         let slot = view
             .slots
             .get(
@@ -504,6 +536,38 @@ impl ManagementObservationState {
         Ok((phase, view))
     }
 
+    /// Consume the exact ticket before polling foreign I/O. No State mutex is
+    /// held here; the caller retains the same Source while this borrower waits.
+    pub async fn complete_keyed_current_observation_async(
+        &mut self,
+        pending: PendingManagementObservation,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<
+        (
+            ManagementObservationPhase,
+            novarocks_spi::connector::KeyedDocumentView,
+        ),
+        ManagementObservationFailure,
+    > {
+        self.consume_current_request(pending.request_id)?;
+        let (fresh, view) = match pending.complete_keyed_async(lease, request).await {
+            Ok(observation) => observation,
+            Err(error) => {
+                if matches!(
+                    error.kind(),
+                    ManagementObservationError::Ownership(ManagementOwnershipError::TargetReplaced)
+                ) {
+                    self.phase = ManagementObservationPhase::ClosedObjectReplacement;
+                    self.liveness.close();
+                }
+                return Err(error);
+            }
+        };
+        let phase = self.apply_current_observation(fresh)?;
+        Ok((phase, view))
+    }
+
     pub fn record_registration_terminal(
         &mut self,
         terminal: super::EffectTerminalFact,
@@ -642,6 +706,88 @@ impl ManagementObservationState {
         self.active_request = None;
         self.consumed_requests.insert(request_id);
         Ok(())
+    }
+}
+
+/// The existing management decision plus the Provider's originating failure.
+/// This sidecar neither changes the domain policy nor grants execution rights.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagementObservationFailure {
+    kind: ManagementObservationError,
+    original_failure: Option<novarocks_failure_contract::SharedFailureCause>,
+}
+
+impl ManagementObservationFailure {
+    pub const fn kind(&self) -> &ManagementObservationError {
+        &self.kind
+    }
+
+    pub fn original_failure(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.original_failure.as_ref()
+    }
+
+    fn from_document(error: novarocks_spi::connector::KeyedDocumentReadError) -> Self {
+        let kind = document_observation_kind(&error);
+        let original_failure = match error {
+            novarocks_spi::connector::KeyedDocumentReadError::Invalid(error) => {
+                std::error::Error::source(&error)
+                    .and_then(|source| {
+                        source.downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| novarocks_failure_contract::SharedFailureCause::new(error))
+            }
+            // The codec now authors the legacy format's own fact; capture the
+            // actual typed error instead of maintaining another raw sidecar.
+            legacy @ novarocks_spi::connector::KeyedDocumentReadError::LegacyFormat { .. } => {
+                novarocks_failure_contract::SharedFailureCause::new(legacy)
+            }
+        };
+        Self {
+            kind,
+            original_failure: Some(original_failure),
+        }
+    }
+}
+
+impl From<ManagementObservationError> for ManagementObservationFailure {
+    fn from(kind: ManagementObservationError) -> Self {
+        Self {
+            kind,
+            original_failure: None,
+        }
+    }
+}
+
+impl fmt::Display for ManagementObservationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(formatter)?;
+        if let Some(original) = &self.original_failure {
+            write!(formatter, ": {}", original.detail())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ManagementObservationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.original_failure
+            .as_ref()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
+    }
+}
+
+fn document_observation_kind(
+    error: &novarocks_spi::connector::KeyedDocumentReadError,
+) -> ManagementObservationError {
+    match error {
+        novarocks_spi::connector::KeyedDocumentReadError::Invalid(error)
+            if error.table_object_binding_failure()
+                == Some(novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced) =>
+        {
+            ManagementObservationError::Ownership(ManagementOwnershipError::TargetReplaced)
+        }
+        _ => ManagementObservationError::UnsealedObservation,
     }
 }
 

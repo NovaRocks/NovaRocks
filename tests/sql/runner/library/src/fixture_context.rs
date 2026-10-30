@@ -408,6 +408,15 @@ pub(crate) fn storage_scope(
 /// Explicit writer-start maintenance, after the complete naming preflight.
 /// Read-only prepared-dataset admission never calls this helper.
 pub(crate) fn startup_sweep(config: &RunnerConfig, repo: &Path, budget: &RunBudget) -> Result<()> {
+    startup_sweep_in_scope(config, repo, budget, None)
+}
+
+fn startup_sweep_in_scope(
+    config: &RunnerConfig,
+    repo: &Path,
+    budget: &RunBudget,
+    storage: Option<&RunStorageScope>,
+) -> Result<()> {
     let Some(env_file) = config.values.get("fixture_env_file") else {
         return Ok(());
     };
@@ -418,7 +427,16 @@ pub(crate) fn startup_sweep(config: &RunnerConfig, repo: &Path, budget: &RunBudg
         return Ok(());
     }
     budget.check_work()?;
-    novarocks_cluster_harness::fixture_run::startup_sweep(repo, Path::new(env_file), budget)?;
+    if let Some(storage) = storage {
+        novarocks_cluster_harness::fixture_run::startup_sweep_with_storage(
+            repo,
+            Path::new(env_file),
+            budget,
+            storage,
+        )?;
+    } else {
+        novarocks_cluster_harness::fixture_run::startup_sweep(repo, Path::new(env_file), budget)?;
+    }
     budget.check_work()
 }
 
@@ -1412,14 +1430,15 @@ print(json.dumps({'complete':True,'pending':False,'errors':[],'removed':[]}))
             None,
         )
         .unwrap();
+        let storage = RunStorageScope::from_record(budget.identity(), &record).unwrap();
         let mut config = RunnerConfig::default();
         config.values.insert(
             "fixture_env_file".into(),
             env_file.to_string_lossy().into_owned(),
         );
         assert!(!root.path().join("started").exists());
-        startup_sweep(&config, root.path(), &budget).unwrap();
-        startup_sweep(&config, root.path(), &budget.clone()).unwrap();
+        startup_sweep_in_scope(&config, root.path(), &budget, Some(&storage)).unwrap();
+        startup_sweep_in_scope(&config, root.path(), &budget.clone(), Some(&storage)).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.path().join("started"))
                 .unwrap()

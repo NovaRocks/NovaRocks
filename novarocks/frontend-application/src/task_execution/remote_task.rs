@@ -36,18 +36,22 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::task_execution::domain_tracker::{
+    TaskDomainIntentTracker, TaskDomainReceiptExpectation, verify_task_domain_receipt,
+};
+use crate::task_execution::operation::{FrontendAction, OperationDispatchResult, frontend_action};
+use crate::task_execution::status_validation::{GoneObservation, classify_gone};
+use novarocks_coordination_contract::{
+    MonotonicInstant, ObservedTaskTransition, StatusObservation, classify_observation,
+    classify_observed_task_transition,
+};
 use novarocks_execution::task_execution::{
     CancelReason, CancelTask, DomainConflict, DomainProgression, ExchangeEdgeId, OperationEnvelope,
     OperationKind, OperationOutcome, QueryContextRef, TaskDomainUpdate, TaskIdentity,
     TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail, UpdateTask,
 };
-use novarocks_query_application::coordination::{
-    FrontendAction, GoneObservation, MonotonicInstant, ObservedTaskTransition,
-    OperationDispatchResult, StatusObservation, TaskDomainIntentTracker,
-    TaskDomainReceiptExpectation, classify_gone, classify_observation,
-    classify_observed_task_transition, frontend_action, verify_task_domain_receipt,
-};
 
+use super::context_owner::CreateRefusalObservationHorizon;
 use super::creation::{
     CreateTaskIntent, CreationLengths, TaskCreationSeed, create_queued_bytes, plan_carrier_bytes,
 };
@@ -131,6 +135,33 @@ struct ReleasedUpdate {
 }
 
 #[derive(Debug)]
+struct PendingUpdateInput {
+    update: Option<TaskDomainUpdate>,
+    preparation: super::intent::TaskOperationQueuePreparation,
+}
+
+impl Drop for PendingUpdateInput {
+    fn drop(&mut self) {
+        let update = self.update.take();
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(update)));
+        if let Err(cause) = dropped {
+            // Do not certify queue/input exit when the original foreign
+            // payload destructor unwound. Keep the same paid source with it.
+            std::panic::resume_unwind(Box::new(PendingInputCleanupFailure {
+                _cause: cause,
+                _preparation: std::mem::take(&mut self.preparation),
+            }));
+        }
+        self.preparation.withdraw_unpublished();
+    }
+}
+
+struct PendingInputCleanupFailure {
+    _cause: Box<dyn std::any::Any + Send>,
+    _preparation: super::intent::TaskOperationQueuePreparation,
+}
+
+#[derive(Debug)]
 struct PendingUpdate {
     update: TaskDomainUpdate,
     expected_receipt: TaskDomainReceiptExpectation,
@@ -153,7 +184,7 @@ enum CreationReplay {
     },
     /// Frozen once. Every send of this create, including an exact resend after
     /// an unknown outcome, hands out this same intent.
-    Frozen(Arc<CreateTaskIntent>),
+    Frozen(CreateTaskIntent),
     /// An exactly correlated success settled the create, so nothing may ever
     /// resend it and the payload was released.
     Settled,
@@ -207,6 +238,10 @@ impl UpdateCandidate {
 /// The frontend's owner of one remote task.
 #[derive(Debug)]
 pub struct RemoteTask {
+    pub(super) create_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    pub(super) update_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    pub(super) cancel_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    pending_input: Option<PendingUpdateInput>,
     identity: TaskIdentity,
     context: QueryContextRef,
     create_envelope: OperationEnvelope,
@@ -214,6 +249,9 @@ pub struct RemoteTask {
     state: RemoteTaskState,
     create_in_flight: Option<TaskOperationId>,
     create_remote_unknown: bool,
+    // The exact rejected Create and the already-effective context lease cut.
+    // This is immutable observation evidence, never authority for new work.
+    rejected_create_observation: Option<(TaskOperationId, MonotonicInstant)>,
     create_ownership_proven: bool,
     normal_stand_down: bool,
     fenced_out: bool,
@@ -249,7 +287,7 @@ fn edge_regression(
 /// A split-domain refusal that names the offer it refused.
 fn split_regression(
     intent: &novarocks_execution::task_execution::SplitAssignmentIntent,
-    watermark: novarocks_query_application::coordination::SentSplitWatermark,
+    watermark: crate::task_execution::domain_tracker::SentSplitWatermark,
     conflict: DomainConflict,
 ) -> TaskExecutionError {
     TaskExecutionError::DomainRegression {
@@ -299,6 +337,10 @@ impl RemoteTask {
         )
         .with_exchange_destinations(outbound_destinations);
         Ok(Self {
+            create_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            update_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            cancel_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            pending_input: None,
             identity,
             context,
             create_envelope: OperationEnvelope::with_default_wait(
@@ -312,6 +354,7 @@ impl RemoteTask {
             state: RemoteTaskState::Creating,
             create_in_flight: None,
             create_remote_unknown: false,
+            rejected_create_observation: None,
             create_ownership_proven: false,
             normal_stand_down: false,
             fenced_out: false,
@@ -376,6 +419,15 @@ impl RemoteTask {
         self.create_ownership_proven
     }
 
+    pub(crate) fn rejected_create_observation_remaining(
+        &self,
+        operation_id: TaskOperationId,
+        now: MonotonicInstant,
+    ) -> Option<Duration> {
+        let (original, expiry) = self.rejected_create_observation?;
+        (original == operation_id).then(|| expiry.saturating_duration_since(now))
+    }
+
     /// A deployment position survives the Accepted RPC and unknown outcomes.
     /// Runtime installation, terminal evidence or permanent stand-down returns it.
     pub(crate) fn needs_deployment_window(&self) -> bool {
@@ -402,6 +454,7 @@ impl RemoteTask {
         self.normal_stand_down = true;
         self.create_waiting_for_establish = false;
         self.create_busy_until = None;
+        self.discard_pending_input(false);
         let before = self.pending.len();
         self.pending
             .retain(|pending| is_destination_close(&pending.update));
@@ -413,6 +466,14 @@ impl RemoteTask {
             self.released_update = None;
         }
         self.creation = CreationReplay::Closed;
+        self.create_queue_preparation.withdraw_unpublished();
+        if self
+            .released_update
+            .as_ref()
+            .is_none_or(|released| !released.request.domains().iter().all(is_destination_close))
+        {
+            self.update_queue_preparation.withdraw_unpublished();
+        }
     }
 
     /// Returns frontend replay backing after the attempt has failed. A sent
@@ -421,6 +482,27 @@ impl RemoteTask {
         self.creation = CreationReplay::Closed;
         self.create_waiting_for_establish = false;
         self.create_busy_until = None;
+        self.discarded_updates += self.pending.len();
+        self.pending.clear();
+        self.discard_pending_input(true);
+        self.withdraw_unsent_preparations();
+    }
+
+    fn discard_pending_input(&mut self, include_destination_close: bool) {
+        if self.pending_input.as_ref().is_some_and(|input| {
+            include_destination_close
+                || !is_destination_close(input.update.as_ref().expect("original pending input"))
+        }) {
+            let input = self.pending_input.take();
+            self.discarded_updates += 1;
+            drop(input);
+        }
+    }
+
+    fn withdraw_unsent_preparations(&mut self) {
+        self.create_queue_preparation.withdraw_unpublished();
+        self.update_queue_preparation.withdraw_unpublished();
+        self.cancel_queue_preparation.withdraw_unpublished();
     }
 
     /// Applies the Worker's complete cumulative fence membership.
@@ -494,6 +576,18 @@ impl RemoteTask {
     }
 
     #[cfg(test)]
+    pub(super) fn preparing_update(&self) -> Option<&TaskDomainUpdate> {
+        self.pending_input
+            .as_ref()
+            .and_then(|input| input.update.as_ref())
+    }
+
+    #[cfg(test)]
+    pub(super) fn first_pending_update(&self) -> Option<&TaskDomainUpdate> {
+        self.pending.front().map(|input| &input.update)
+    }
+
+    #[cfg(test)]
     pub const fn discarded_updates(&self) -> usize {
         self.discarded_updates
     }
@@ -552,7 +646,7 @@ impl RemoteTask {
             return Ok(None);
         }
         let backend = self.identity.backend_process_id();
-        let (fragment, lengths) = match &mut self.creation {
+        let (fragment, lengths, new_backing) = match &mut self.creation {
             CreationReplay::Unfrozen { seed, priced } => {
                 let lengths = match priced {
                     Some(lengths) => *lengths,
@@ -562,11 +656,16 @@ impl RemoteTask {
                         lengths
                     }
                 };
-                (Arc::clone(seed.fragment()), lengths)
+                (
+                    Arc::clone(seed.fragment()),
+                    lengths,
+                    seed.size_without_projection()?.new_backing_bytes,
+                )
             }
             CreationReplay::Frozen(intent) => (
                 Arc::clone(intent.parts().fragment()),
                 intent.parts().lengths(),
+                0,
             ),
             CreationReplay::Settled | CreationReplay::Closed => return Ok(None),
         };
@@ -575,9 +674,63 @@ impl RemoteTask {
             request: TaskOperationQueueRequest::create_task(
                 backend,
                 create_queued_bytes(self.create_envelope, &fragment, lengths),
+            )
+            .with_native_input(
+                crate::native::task_transport::queued_creation_quote(new_backing)
+                    .map_err(TaskExecutionError::Workload)?,
             ),
             plan_carrier_bytes: plan_carrier_bytes(&fragment, lengths),
         }))
+    }
+
+    pub(super) fn begin_input_preparation(
+        &mut self,
+        update: TaskDomainUpdate,
+    ) -> Result<(), TaskExecutionError> {
+        if self.pending_input.is_some() {
+            return Err(TaskExecutionError::Workload(
+                novarocks_workload_control::WorkError::Capacity("Task Native input preparation"),
+            ));
+        }
+        self.pending_input = Some(PendingUpdateInput {
+            update: Some(update),
+            preparation: super::intent::TaskOperationQueuePreparation::new(),
+        });
+        Ok(())
+    }
+    pub(super) fn poll_input_preparation(
+        &mut self,
+        sink: &dyn super::intent::TaskOperationSink,
+    ) -> Result<UpdateAdmission, TaskExecutionError> {
+        if let Some(disposition) = self.pending_input.as_ref().and_then(|input| {
+            self.update_disposition(input.update.as_ref().expect("original pending input"))
+        }) {
+            self.discard_pending_input(true);
+            return Ok(disposition);
+        }
+        let Some(input) = self.pending_input.as_mut() else {
+            return Ok(UpdateAdmission::Queued);
+        };
+        let request = super::intent::TaskOperationQueueRequest::task_update(
+            self.identity.backend_process_id(),
+            input.update.as_ref().expect("original pending input"),
+        );
+        let permit = match sink.try_reserve_queue(request, &mut input.preparation) {
+            super::intent::TaskOperationQueueAdmission::Admitted(permit) => permit,
+            super::intent::TaskOperationQueueAdmission::TargetFull
+            | super::intent::TaskOperationQueueAdmission::ProcessFull => {
+                return Ok(UpdateAdmission::Preparing);
+            }
+            super::intent::TaskOperationQueueAdmission::Rejected(error) => {
+                return Err(TaskExecutionError::Workload(error));
+            }
+        };
+        let mut input = self
+            .pending_input
+            .take()
+            .expect("same original input preparation");
+        let update = input.update.take().expect("same original input");
+        self.enqueue_update(update, permit)
     }
 
     /// Releases this task's create for sending, after admission reserved its
@@ -589,6 +742,7 @@ impl RemoteTask {
     pub(crate) fn release_create(
         &mut self,
         now: MonotonicInstant,
+        retention: Option<novarocks_resource_contract::ExistingOwnerRetentionLease>,
     ) -> Result<OperationIntent, TaskExecutionError> {
         if !self.create_sendable(now) {
             return Err(TaskExecutionError::Schedule(format!(
@@ -611,17 +765,18 @@ impl RemoteTask {
                 unreachable!("checked above");
             };
             let parts = seed.freeze(priced.expect("checked above"))?;
-            self.creation = CreationReplay::Frozen(Arc::new(CreateTaskIntent::new(
+            self.creation = CreationReplay::Frozen(CreateTaskIntent::new(
                 self.create_envelope,
                 self.identity,
                 parts,
-            )));
+                retention,
+            ));
         }
         let CreationReplay::Frozen(intent) = &self.creation else {
             unreachable!("a sendable create is frozen by now");
         };
         self.create_in_flight = Some(self.create_envelope.operation_id());
-        Ok(OperationIntent::CreateTask(Arc::clone(intent)))
+        Ok(OperationIntent::CreateTask(intent.clone()))
     }
 
     /// Records one domain fact for this task.
@@ -634,11 +789,8 @@ impl RemoteTask {
         update: TaskDomainUpdate,
         queue_permit: Box<dyn TaskOperationQueuePermit>,
     ) -> Result<UpdateAdmission, TaskExecutionError> {
-        if self.normal_stand_down && !is_destination_close(&update) {
-            return Ok(UpdateAdmission::DiscardedTerminal);
-        }
-        if matches!(self.state, RemoteTaskState::Terminal) || self.awaiting_terminal_status {
-            return Ok(UpdateAdmission::DiscardedTerminal);
+        if let Some(disposition) = self.update_disposition(&update) {
+            return Ok(disposition);
         }
         let expected_receipt = self.admit_domain(&update)?;
         self.pending.push_back(PendingUpdate {
@@ -647,6 +799,33 @@ impl RemoteTask {
             queue_permit,
         });
         Ok(UpdateAdmission::Queued)
+    }
+
+    fn update_disposition(&self, update: &TaskDomainUpdate) -> Option<UpdateAdmission> {
+        if (self.normal_stand_down && !is_destination_close(update))
+            || matches!(self.state, RemoteTaskState::Terminal)
+            || self.awaiting_terminal_status
+        {
+            // Only this original Task owner can distinguish withdrawn demand
+            // from an observed failure or a terminal outcome still awaiting its
+            // status. Normal input withdrawal never replaces a contrary cause.
+            let normal_withdrawal = self.normal_stand_down
+                && self
+                    .status
+                    .as_ref()
+                    .and_then(TaskStatus::termination)
+                    .is_none_or(TerminationDetail::is_success_compatible);
+            let normal_terminal = self
+                .status
+                .as_ref()
+                .is_some_and(TaskStatus::is_success_compatible_terminal);
+            return Some(if normal_withdrawal || normal_terminal {
+                UpdateAdmission::DiscardedNoLongerNeeded
+            } else {
+                UpdateAdmission::DiscardedTerminal
+            });
+        }
+        None
     }
 
     /// Records the decision to open one of this producer's frozen edges.
@@ -945,8 +1124,11 @@ impl RemoteTask {
         ack: &OperationAcknowledgement,
         now: MonotonicInstant,
         context_established: bool,
+        observation_horizon: Option<CreateRefusalObservationHorizon>,
     ) -> Result<CreateSettlement, TaskExecutionError> {
-        if self.create_in_flight != Some(ack.operation_id()) {
+        if ack.kind() != OperationKind::CreateTask
+            || self.create_in_flight != Some(ack.operation_id())
+        {
             return Err(TaskExecutionError::UnknownOperation);
         }
         self.create_in_flight = None;
@@ -1002,12 +1184,12 @@ impl RemoteTask {
                 Ok(CreateSettlement::RetryExactRequest)
             }
             FrontendAction::RetryAfterProgress => {
-                let outcome = ack
-                    .worker_outcome()
-                    .ok_or(TaskExecutionError::DispatchRejected {
-                        kind: OperationKind::CreateTask,
-                        result: ack.dispatch_result(),
-                    })?;
+                let outcome = ack.worker_outcome().ok_or(
+                    crate::task_execution::error::dispatch_rejection(
+                        ack,
+                        OperationKind::CreateTask,
+                    ),
+                )?;
                 if self.create_ownership_proven
                     && matches!(
                         outcome,
@@ -1043,11 +1225,32 @@ impl RemoteTask {
                     if !self.create_remote_unknown {
                         self.enter_terminal();
                     }
-                    return Err(TaskExecutionError::DispatchRejected {
-                        kind: OperationKind::CreateTask,
-                        result: ack.dispatch_result(),
-                    });
+                    return Err(crate::task_execution::error::dispatch_rejection(
+                        ack,
+                        OperationKind::CreateTask,
+                    ));
                 };
+                if !self.create_ownership_proven
+                    && outcome == OperationOutcome::IdentityMismatch
+                    && matches!(
+                        ack.worker_header(),
+                        Some(
+                            novarocks_execution_contract::operation::OperationResult::Verdict {
+                                outcome: OperationOutcome::IdentityMismatch,
+                                ..
+                            }
+                        )
+                    )
+                    && let Some(horizon) = observation_horizon
+                    && horizon.matches_parent_acknowledgement(context_established)
+                    && !now.has_reached(horizon.expiry())
+                {
+                    // on_create_ack has matched the original in-flight Task.
+                    // Preserve the issued Establish ticket or Applied lease;
+                    // a later ACK/renewal never replaces this original cut.
+                    self.rejected_create_observation
+                        .get_or_insert((ack.operation_id(), horizon.expiry()));
+                }
                 self.enter_terminal();
                 Ok(CreateSettlement::FailedClosed(outcome))
             }
@@ -1129,10 +1332,10 @@ impl RemoteTask {
         let Some(outcome) = ack.worker_outcome() else {
             // An ingress refusal says nothing about the already accepted
             // task's terminal state. Failure cleanup must still stop it.
-            return Err(TaskExecutionError::DispatchRejected {
-                kind: OperationKind::UpdateTask,
-                result: ack.dispatch_result(),
-            });
+            return Err(crate::task_execution::error::dispatch_rejection(
+                ack,
+                OperationKind::UpdateTask,
+            ));
         };
         self.enter_terminal();
         Ok(UpdateSettlement::FailedClosed(outcome))
@@ -1153,10 +1356,10 @@ impl RemoteTask {
         if ack.worker_outcome().is_none()
             && ack.dispatch_result() != OperationDispatchResult::TransportUnknown
         {
-            return Err(TaskExecutionError::DispatchRejected {
-                kind: OperationKind::CancelTask,
-                result: ack.dispatch_result(),
-            });
+            return Err(crate::task_execution::error::dispatch_rejection(
+                ack,
+                OperationKind::CancelTask,
+            ));
         }
         Ok(())
     }
@@ -1246,18 +1449,22 @@ impl RemoteTask {
         self.awaiting_terminal_status = false;
         self.discarded_updates += self.pending.len();
         self.pending.clear();
+        self.discard_pending_input(true);
         // A terminal task is never created again, so neither its seed nor its
         // frozen parts can be needed. A send already in flight keeps its own
         // handle until it settles.
         if !matches!(self.creation, CreationReplay::Settled) {
             self.creation = CreationReplay::Closed;
         }
+        self.withdraw_unsent_preparations();
     }
 
     fn await_terminal_status(&mut self) {
         self.awaiting_terminal_status = true;
         self.discarded_updates += self.pending.len();
         self.pending.clear();
+        self.discard_pending_input(true);
+        self.withdraw_unsent_preparations();
     }
 
     /// The terminal facts, once this task has them.
@@ -1315,6 +1522,10 @@ mod destination_close_tests {
             .with_exchange_destinations([(edge, target), (edge, sibling)]);
         (
             RemoteTask {
+                create_queue_preparation: Default::default(),
+                update_queue_preparation: Default::default(),
+                cancel_queue_preparation: Default::default(),
+                pending_input: None,
                 identity: producer,
                 context,
                 create_envelope: OperationEnvelope::with_default_wait(
@@ -1325,6 +1536,7 @@ mod destination_close_tests {
                 state: RemoteTaskState::Created,
                 create_in_flight: None,
                 create_remote_unknown: false,
+                rejected_create_observation: None,
                 create_ownership_proven: true,
                 normal_stand_down: false,
                 fenced_out: false,
@@ -1347,6 +1559,59 @@ mod destination_close_tests {
             target,
             sibling,
         )
+    }
+
+    #[test]
+    fn rejected_create_snapshot_is_not_renewed_by_late_receipts_or_owned_tasks() {
+        for (owned, established, expiry) in [
+            (false, true, Some(Duration::from_secs(9))),
+            (true, true, Some(Duration::from_secs(9))),
+            (false, false, Some(Duration::from_secs(9))),
+            (false, true, None),
+            (false, true, Some(Duration::ZERO)),
+        ] {
+            let (mut task, _, _, _) = producer_with_two_destinations();
+            let operation = task.create_envelope.operation_id();
+            task.create_in_flight = Some(operation);
+            task.create_ownership_proven = owned;
+            let ack = OperationAcknowledgement::worker_receipt(
+                operation,
+                OperationKind::CreateTask,
+                OperationOutcome::IdentityMismatch,
+                AckPayload::None,
+            );
+            // Preserve the old false-parent plus valid Applied-lease negative.
+            // Unknown submitted parents require their distinct owner source.
+            let old = expiry
+                .map(MonotonicInstant::from_origin)
+                .map(CreateRefusalObservationHorizon::AppliedLease);
+            task.on_create_ack(&ack, MonotonicInstant::ORIGIN, established, old)
+                .unwrap();
+            let before =
+                task.rejected_create_observation_remaining(operation, MonotonicInstant::ORIGIN);
+            assert_eq!(
+                before,
+                (!owned && established && expiry == Some(Duration::from_secs(9)))
+                    .then_some(Duration::from_secs(9))
+            );
+            // A later effective lease cannot be used by a duplicate Create
+            // receipt: the original in-flight operation was already consumed.
+            assert!(
+                task.on_create_ack(
+                    &ack,
+                    MonotonicInstant::ORIGIN,
+                    true,
+                    Some(CreateRefusalObservationHorizon::AppliedLease(
+                        MonotonicInstant::from_origin(Duration::from_secs(90))
+                    ))
+                )
+                .is_err()
+            );
+            assert_eq!(
+                task.rejected_create_observation_remaining(operation, MonotonicInstant::ORIGIN),
+                before
+            );
+        }
     }
 
     #[test]
@@ -1463,7 +1728,7 @@ mod destination_close_tests {
         assert!(preview.requires_control_progress());
         assert_eq!(
             preview.lane(),
-            novarocks_query_application::coordination::DispatchLane::Update
+            crate::task_protocol_config::DispatchLane::Update
         );
         producer
             .enqueue_update(close, super::super::intent::test_queue_permit())
@@ -1493,8 +1758,16 @@ mod destination_close_tests {
 /// What happened to one recorded domain fact.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum UpdateAdmission {
+    /// The same original Task owns the input and paid ticket; no physical
+    /// process queue holder exists until its preparation actually grants.
+    Preparing,
+
     /// The fact is queued and will be sent when this task may send.
     Queued,
-    /// The task is terminal, so the fact was discarded.
+    /// The original owner withdrew normal input demand or accepted a
+    /// success-compatible terminal. This is not a Task success or exit proof.
+    DiscardedNoLongerNeeded,
+    /// Input is closed without a positive normal-completion fact, including
+    /// an observed failure or a terminal outcome still awaiting its status.
     DiscardedTerminal,
 }

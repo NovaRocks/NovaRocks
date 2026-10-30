@@ -124,7 +124,18 @@ pub fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
 /// path. Plain queries and session commands must use their dedicated routes.
 pub fn typed_statement_work_class(statement: &ParsedStatement) -> WorkClass {
     match statement {
-        ParsedStatement::Dml(_) | ParsedStatement::ExplainQuery(_) => WorkClass::Query,
+        ParsedStatement::Dml(_)
+        | ParsedStatement::ExplainQuery(_)
+        | ParsedStatement::Statistics(ast::StatisticsStatement::AnalyzeTable(_))
+        | ParsedStatement::Maintenance(ast::MaintenanceStatement::Optimize(_)) => WorkClass::Query,
+        ParsedStatement::Maintenance(ast::MaintenanceStatement::Call(call))
+            if matches!(call.procedure.parts.as_slice(), [_, namespace, procedure]
+                if namespace.value.eq_ignore_ascii_case("system")
+                    && (procedure.value.eq_ignore_ascii_case("rewrite_data_files")
+                        || procedure.value.eq_ignore_ascii_case("rewrite_position_delete_files"))) =>
+        {
+            WorkClass::Query
+        }
         ParsedStatement::Session(_) | ParsedStatement::Query(_) => {
             unreachable!("session and plain query statements do not use the typed route")
         }
@@ -405,16 +416,53 @@ mod tests {
             typed_statement_work_class(&management),
             WorkClass::Management
         );
-        // A waiting submitting statement must not hold the warehouse query
-        // slot needed by its independently governed statistics/optimize job.
+        // OPTIMIZE carries this exact SQL permit into its original JobRoot.
+        let optimize = parse_single_statement("ALTER TABLE lake.db.events OPTIMIZE")
+            .expect("parse job-submitting statement");
+        assert_eq!(typed_statement_work_class(&optimize), WorkClass::Query);
+    }
+
+    #[test]
+    fn analyze_reserves_the_original_query_permit_for_its_job_handoff() {
+        // Capture closes before moving this same grant into the job. It must
+        // not enter the management route with an empty query-permit slot.
         for sql in [
             "ANALYZE TABLE lake.db.events",
-            "ALTER TABLE lake.db.events OPTIMIZE",
+            "ANALYZE FULL TABLE lake.db.events (event_id) WITH SYNC MODE",
+            "ANALYZE SAMPLE TABLE lake.db.events",
         ] {
-            let statement = parse_single_statement(sql).expect("parse job-submitting statement");
+            let statement = parse_single_statement(sql).expect("parse ANALYZE");
+            assert!(matches!(
+                statement,
+                ParsedStatement::Statistics(ast::StatisticsStatement::AnalyzeTable(_))
+            ));
             assert_eq!(
                 typed_statement_work_class(&statement),
-                WorkClass::Management
+                WorkClass::Query,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn statistics_observation_cancellation_and_drop_remain_management() {
+        for sql in [
+            "SHOW ANALYZE JOBS",
+            "SHOW TABLE STATS lake.db.events",
+            "SHOW BASIC STATS META",
+            "SHOW HISTOGRAM STATS META",
+            "CANCEL ANALYZE 018f8c30-8a95-7b4e-b515-4da6f2aeb419",
+            "KILL ANALYZE 018f8c30-8a95-7b4e-b515-4da6f2aeb419",
+            "DROP STATS lake.db.events",
+            "DROP HISTOGRAM ON lake.db.events (event_id)",
+            "DROP MULTIPLE COLUMNS STATS lake.db.events",
+        ] {
+            let statement = parse_single_statement(sql).expect("parse statistics management");
+            assert!(matches!(statement, ParsedStatement::Statistics(_)));
+            assert_eq!(
+                typed_statement_work_class(&statement),
+                WorkClass::Management,
+                "{sql}"
             );
         }
     }
@@ -551,6 +599,29 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+    #[test]
+    fn direct_rewrite_calls_keep_the_original_sql_query_permit_class() {
+        for sql in [
+            "CALL ice.system.rewrite_data_files(table => 'db.orders')",
+            "CALL ice.system.rewrite_position_delete_files(table => 'db.orders')",
+            "CALL ice.SYSTEM.ReWrItE_DaTa_FiLeS(table => 'db.orders')",
+        ] {
+            let statement = parse_single_statement(sql).expect("original typed CALL parser");
+            assert_eq!(typed_statement_work_class(&statement), WorkClass::Query);
+        }
+        for sql in [
+            "CALL ice.system.remove_orphan_files(table => 'db.orders', older_than => TIMESTAMP '2020-01-01 00:00:00')",
+            "CALL ice.other.rewrite_data_files(table => 'db.orders')",
+            "CALL ice.system.rewrite_manifests(table => 'db.orders')",
+            "SHOW ALTER TABLE OPTIMIZE",
+        ] {
+            let statement = parse_single_statement(sql).expect("original typed management parser");
+            assert_eq!(
+                typed_statement_work_class(&statement),
+                WorkClass::Management
+            );
         }
     }
 }

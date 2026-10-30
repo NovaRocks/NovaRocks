@@ -75,6 +75,7 @@ struct IcebergRewritePlanPayloadV1 {
 }
 
 /// Complete distributed-rewrite capability for one provider generation.
+#[derive(Clone)]
 pub struct IcebergDistributedRewriteControl {
     key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
@@ -130,17 +131,6 @@ impl IcebergDistributedRewriteControl {
             .load_table_for_request(&target.namespace, &target.table, &request.context)
             .map_err(unavailable)?
             .into_table();
-        let metadata = table.metadata();
-        if matches!(
-            request.operation(),
-            ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
-        ) {
-            crate::commit::validation::deny_unwritable_data_files(
-                metadata.current_schema(),
-                &format!("{}.{}", target.namespace, target.table),
-            )?;
-        }
-        let base_snapshot_id = metadata.current_snapshot_id();
         let table_for_files = table.clone();
         let read_control = request.context.clone();
         let files_result = self
@@ -156,11 +146,45 @@ impl IcebergDistributedRewriteControl {
             });
         validate_context(&request.context)?;
         let files = files_result.map_err(unavailable)?.map_err(unavailable)?;
+        let live_delete_paths = if matches!(
+            request.operation(),
+            ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+        ) {
+            live_delete_file_paths(&self.runtime, &table, &request.context)?
+        } else {
+            BTreeSet::new()
+        };
+        self.build_loaded_plan(request, &table, files, &live_delete_paths, creation)
+    }
+
+    /// Pure group/schema/artifact author, called only by the bound closed CPU source on the async route.
+    fn build_loaded_plan(
+        &self,
+        request: &ConnectorDistributedRewritePlanningRequest,
+        table: &crate::iceberg::table::Table,
+        files: Vec<DataFileWithStats>,
+        live_delete_paths: &BTreeSet<EntryIdentity>,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorDistributedRewritePlan,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        validate_context(&request.context)?;
+        let target = self.provider.table_payload(request.operation().table())?;
+        let metadata = table.metadata();
+        if matches!(
+            request.operation(),
+            ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+        ) {
+            crate::commit::validation::deny_unwritable_data_files(
+                metadata.current_schema(),
+                &format!("{}.{}", target.namespace, target.table),
+            )?;
+        }
+        let base_snapshot_id = metadata.current_snapshot_id();
         let groups = match request.operation() {
             ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
-                let live_delete_paths =
-                    live_delete_file_paths(&self.runtime, &table, &request.context)?;
-                plan_data_file_groups(files, &live_delete_paths)?
+                plan_data_file_groups(files, live_delete_paths)?
             }
             ConnectorDistributedRewriteOperation::RewritePositionDeletes {
                 rewrite_all,
@@ -282,7 +306,24 @@ impl IcebergDistributedRewriteControl {
     }
 }
 
+pub(crate) mod async_plan;
 impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
+    fn planning_initial_dependencies(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::SharedDependency>, ConnectorError> {
+        self.runtime.metadata_action_initial_dependencies()
+    }
+
+    fn scoped_cpu_source_type_id(&self) -> Option<std::any::TypeId> {
+        Some(std::any::TypeId::of::<async_plan::RewritePlanOriginal>())
+    }
+    fn prepare_plan_source_in(
+        &self,
+        request: &mut Option<novarocks_spi::connector::ConnectorRewriteSourceRequest>,
+        receiving: &mut Option<Box<dyn novarocks_spi::connector::ConnectorRewritePlanSource>>,
+    ) -> Result<(), ConnectorError> {
+        async_plan::prepare_source_in(self, request, receiving)
+    }
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
@@ -544,9 +585,14 @@ fn group_data_files(
                 delete.file_content == IcebergDeleteFileContent::Position
                     && delete.file_format == IcebergDeleteFileFormat::Parquet
             }) {
-                return Err(invalid(
-                    "V2 Parquet position delete rewrite is not supported",
-                ));
+                let error = invalid("V2 Parquet position delete rewrite is not supported");
+                tracing::debug!(
+                    target: "novarocks_connector_iceberg::maintenance_refusal",
+                    site = "rewrite.plan.v2_parquet_position_delete",
+                    refusal = "V2ParquetPositionDeleteRewriteUnsupported",
+                    "Original maintenance capability refused"
+                );
+                return Err(error);
             }
             let mut selected = file
                 .delete_files
@@ -1070,19 +1116,7 @@ pub(crate) fn frozen_rewrite_scan_schema(
     }
 }
 
-/// Resolve one frozen rewrite group back to the delete artifacts it names, as
-/// the splits that re-encode them.
-///
-/// The group is the authority on which artifacts this procedure instance
-/// rewrites, and the commit replaces exactly that set. Nothing here reselects:
-/// the attempt-owned content is validated by identity, the named group is
-/// looked up inside it, and the only judgement made is whether the pinned
-/// snapshot still holds every artifact the group named. It if does not, the
-/// cohort's commit could no longer replace what this read would consume, so the
-/// read fails rather than producing a delete file for artifacts somebody else
-/// already replaced.
-pub(crate) fn plan_rewrite_position_delete_splits(
-    runtime: &IcebergMetadataContext,
+pub(crate) async fn plan_rewrite_position_delete_splits_async(
     table: &crate::iceberg::table::Table,
     snapshot_id: i64,
     content: &IcebergFrozenRewriteArtifactV1,
@@ -1097,7 +1131,8 @@ pub(crate) fn plan_rewrite_position_delete_splits(
     // immutable rewrite artifact, so fail before split dispatch if that fence
     // no longer holds.
     validate_frozen_rewrite_table(content, table.metadata())?;
-    let live = live_delete_file_paths_at_with_control(runtime, table, snapshot_id, Some(context))?;
+    let live =
+        live_delete_file_paths_at_with_control_async(table, snapshot_id, Some(context)).await?;
     validate_context(context)?;
     select_rewrite_position_delete_artifacts(group, &live, snapshot_id)
 }
@@ -1168,25 +1203,6 @@ fn live_delete_file_paths(
     live_delete_file_paths_of(runtime, table, snapshot, Some(context))
 }
 
-/// The delete files alive at one exact snapshot of a relation.
-fn live_delete_file_paths_at_with_control(
-    runtime: &IcebergMetadataContext,
-    table: &crate::iceberg::table::Table,
-    snapshot_id: i64,
-    context: Option<&ConnectorRequestContext>,
-) -> Result<BTreeSet<EntryIdentity>, ConnectorError> {
-    let snapshot = table
-        .metadata()
-        .snapshot_by_id(snapshot_id)
-        .cloned()
-        .ok_or_else(|| {
-            corrupt(format!(
-                "Iceberg relation no longer holds snapshot {snapshot_id}, which a rewrite was frozen at"
-            ))
-        })?;
-    live_delete_file_paths_of(runtime, table, snapshot, context)
-}
-
 fn live_delete_file_paths_of(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
@@ -1242,6 +1258,65 @@ fn live_delete_file_paths_of(
         validate_context(context)?;
     }
     result.map_err(unavailable)?.map_err(unavailable)
+}
+
+async fn live_delete_file_paths_at_with_control_async(
+    table: &crate::iceberg::table::Table,
+    snapshot_id: i64,
+    context: Option<&ConnectorRequestContext>,
+) -> Result<BTreeSet<EntryIdentity>, ConnectorError> {
+    let snapshot=table.metadata().snapshot_by_id(snapshot_id).cloned().ok_or_else(|| corrupt(format!(
+        "Iceberg relation no longer holds snapshot {snapshot_id}, which a rewrite was frozen at")))?;
+    if let Some(context) = context {
+        validate_context(context)?;
+    }
+    let file_io = table.file_io().clone();
+    let metadata = table.metadata().clone();
+    let control = context.cloned();
+    let result = (async move {
+        let check_active = || -> Result<(), String> {
+            if let Some(control) = &control {
+                ConnectorOperationControl::check_active(control)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        };
+        check_active()?;
+        let manifest_list = crate::manifest::load_manifest_list(&snapshot, &file_io, &metadata)
+            .await
+            .map_err(|error| format!("load Iceberg rewrite manifest list: {error}"))?;
+        check_active()?;
+        let mut paths = BTreeSet::new();
+        for manifest_file in manifest_list.entries() {
+            check_active()?;
+            if manifest_file.content != crate::iceberg::spec::ManifestContentType::Deletes {
+                continue;
+            }
+            let manifest = crate::manifest::load_manifest(manifest_file, &file_io)
+                .await
+                .map_err(|error| format!("load Iceberg rewrite delete manifest: {error}"))?;
+            check_active()?;
+            for entry in manifest.entries() {
+                check_active()?;
+                if entry.is_alive() {
+                    let identity = EntryIdentity::try_from(entry.data_file())
+                        .map_err(|error| error.to_string())?;
+                    if !paths.insert(identity) {
+                        return Err(
+                            "Iceberg rewrite snapshot repeats a logical delete entry".to_string()
+                        );
+                    }
+                }
+            }
+        }
+        check_active()?;
+        Ok::<_, String>(paths)
+    })
+    .await;
+    if let Some(context) = context {
+        validate_context(context)?;
+    }
+    result.map_err(unavailable)
 }
 
 fn validate_frozen_rewrite_table(
@@ -1807,6 +1882,15 @@ mod tests {
                 warehouse.path().display().to_string(),
             ),
         ];
+        if catalog_type == "rest" {
+            properties.push((
+                "uri".to_string(),
+                format!(
+                    "http://{}",
+                    listener.local_addr().expect("listener address")
+                ),
+            ));
+        }
         if catalog_type == "hive" {
             properties.push((
                 "hive.metastore.uris".to_string(),
@@ -1836,6 +1920,54 @@ mod tests {
             .expect("control runtime"),
         );
         (executor, warehouse, runtime, listener)
+    }
+
+    #[test]
+    fn same_generation_rewrite_and_write_begin_declare_the_same_original_rest_route() {
+        use novarocks_spi::connector::write_stack::session::ConnectorWriteControl;
+        use novarocks_spi::connector::{
+            CatalogHandle, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
+            NetworkServiceOrigin, SharedDependency,
+        };
+
+        let (_executor, warehouse, runtime, listener) = admission_runtime("rest");
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+        };
+        let incarnation = ProviderBindingEpoch::from_bytes([9; 16]);
+        let provider = Arc::new(IcebergMetadata::new(
+            descriptor.clone(),
+            incarnation,
+            runtime.clone(),
+        ));
+        let rewrite = IcebergDistributedRewriteControl::new(
+            descriptor.clone(),
+            incarnation,
+            runtime.clone(),
+            provider,
+        )
+        .unwrap();
+        let write = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+            descriptor.clone(),
+            incarnation,
+            CatalogHandle::new(descriptor.instance_id, CatalogVersion::from_bytes([3; 32])),
+            runtime.clone(),
+        );
+        assert!(Arc::ptr_eq(write.runtime(), &runtime));
+        assert!(Arc::ptr_eq(&rewrite.runtime, &runtime));
+        assert_eq!(write.binding_key(), &rewrite.key);
+        let planning = rewrite.planning_initial_dependencies().unwrap();
+        let beginning = write.rewrite_begin_initial_dependencies().unwrap();
+        let expected = SharedDependency::Network(
+            NetworkServiceOrigin::from_selected_url(
+                &url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(planning, vec![expected.clone()]);
+        assert_eq!(beginning, vec![expected]);
+        assert_admission_left_no_io(&warehouse, &listener);
     }
 
     fn admission_context(catalog_type: &str) -> ConnectorRequestContext {

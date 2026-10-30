@@ -786,6 +786,25 @@ pub fn observe_current_keyed_documents_with_management(
     Ok((observed, convergence))
 }
 
+pub async fn observe_current_keyed_documents_with_management_async(
+    lease: &ConnectorDocumentStorageLease,
+    request: KeyedDocumentObservationRequest,
+    budget: PersistenceDecodeBudget,
+    entrance: &crate::management::ManagementEntrance,
+) -> Result<
+    (
+        MvKeyedObservedCurrentDocuments,
+        crate::management::SlotChangeConvergence,
+    ),
+    MvDocumentError,
+> {
+    let catalog = request.catalog_handle.clone();
+    let (view, convergence) =
+        observe_current_keyed_view_with_management_async(lease, request, entrance).await?;
+    let observed = decode_current_keyed_documents(view, catalog, budget)?;
+    Ok((observed, convergence))
+}
+
 pub(crate) fn observe_current_keyed_view_with_management(
     lease: &ConnectorDocumentStorageLease,
     request: KeyedDocumentObservationRequest,
@@ -802,6 +821,32 @@ pub(crate) fn observe_current_keyed_view_with_management(
     if convergence.reinstall_current_projection {
         view = lease
             .observe_keyed_documents(request)
+            .map_err(MvDocumentError::KeyedStorage)?;
+        entrance.revoke_foreign_current_management(&view, &catalog)?;
+    }
+    Ok((view, convergence))
+}
+
+pub(crate) async fn observe_current_keyed_view_with_management_async(
+    lease: &ConnectorDocumentStorageLease,
+    request: KeyedDocumentObservationRequest,
+    entrance: &crate::management::ManagementEntrance,
+) -> Result<(KeyedDocumentView, crate::management::SlotChangeConvergence), MvDocumentError> {
+    let catalog = request.catalog_handle.clone();
+    let mut view = lease
+        .observe_keyed_documents_async(request.clone())
+        .await
+        .map_err(MvDocumentError::KeyedStorage)?;
+    // Revocation grants no authority. A generic reader may still return valid
+    // foreign-owned facts for a read-only projection; corrupt P remains an error.
+    entrance.revoke_foreign_current_management(&view, &catalog)?;
+    let convergence = entrance
+        .resolve_pending_slot_changes_async(lease, request.clone())
+        .await?;
+    if convergence.reinstall_current_projection {
+        view = lease
+            .observe_keyed_documents_async(request)
+            .await
             .map_err(MvDocumentError::KeyedStorage)?;
         entrance.revoke_foreign_current_management(&view, &catalog)?;
     }

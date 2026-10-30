@@ -56,6 +56,23 @@ def rust_batch(root,binary='p',name='regular',identity=None):
 
 
 class Run(unittest.TestCase):
+    def test_ecs_oss_requires_an_explicit_absolute_config_file_without_probing_cloud(self):
+        config=self.base/'oss.json'
+        config.write_text('not parsed by the availability observer')
+        probe=mock.Mock(side_effect=AssertionError('availability must not probe cloud services'))
+        for path in (None,'oss.json',str(self.base/'missing.json'),str(self.base)):
+            with self.subTest(path=path):
+                environment={} if path is None else {'NOVA_OSS_TEST_CONFIG':path}
+                result=run.requirement_checks(['fixture:aliyun-ecs-oss'],environment,self.native,probe)
+                self.assertFalse(result[0]['ok'])
+                self.assertEqual(result[0]['missing'],['NOVA_OSS_TEST_CONFIG'])
+        result=run.requirement_checks(['fixture:aliyun-ecs-oss'],
+            {'NOVA_OSS_TEST_CONFIG':str(config)},self.native,probe)
+        self.assertTrue(result[0]['ok'])
+        self.assertEqual(result[0]['missing'],[])
+        self.assertIn('native owner validates runtime facts',result[0]['basis'])
+        probe.assert_not_called()
+
     def test_cli_direct_module_and_shell_entrypoints_start_from_another_directory(self):
         ci=Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(prefix='verification-cli-') as directory:
@@ -93,6 +110,105 @@ class Run(unittest.TestCase):
     def scope(self,kind,native,tier='regular',selected=True):
         unit=UnitKey(kind,native)
         return Scope(str(unit),(unit,),{'build':'fixture'},'isolated',True,selected,tier)
+
+    def java_owner_group(self):
+        module = run.java_rest_owner(Path(run.__file__).resolve().parents[3])
+        names = sorted(module.EXPECTED)
+        listing = {'rust-suites':{'p':{'testcases':{
+            name:{'ignored':True,'filter-match':{'status':'matches'}} for name in names}}}}
+        scopes = [self.scope('rust-test','p::'+name,'heavy',selected=index==0)
+                  for index,name in enumerate(names)]
+        ignored = {str(scope.units[0]):{'class':'heavy','input-owner':module.OWNER,
+                   'requires':['fixture:iceberg-rest','fixture:minio','toolchain:java']} for scope in scopes}
+        bindings = json.loads((self.inputs/'test-artifacts.json').read_text())['binaries']
+        with mock.patch.object(run,'java_rest_owner',return_value=module):
+            grouped = run.java_rest_group(self.repo,scopes,ignored,bindings,listing)
+        return module, scopes, grouped[0], ignored, bindings, listing
+
+    def test_java_input_owner_is_complete_group_even_for_partial_selection_or_resume(self):
+        module, original, group, ignored, bindings, listing = self.java_owner_group()
+        self.assertEqual(group.key,module.SCOPE)
+        self.assertEqual(set(group.units),{scope.units[0] for scope in original})
+        self.assertEqual(len(group.units),14)
+        self.assertTrue(group.selected)
+        expression = run._rust_expression(group,bindings,{'p':{'name':'pkg'}},listing)
+        for name in module.EXPECTED:
+            self.assertIn('test(='+name+')',expression)
+        with mock.patch.object(run,'java_rest_owner',return_value=module):
+            with self.assertRaisesRegex(ValueError,'complete original fourteen'):
+                run.java_rest_group(self.repo,original[:-1],ignored,bindings,listing)
+
+    def test_java_target_is_written_before_whole_native_batch_and_not_learned_from_results(self):
+        module, original, group, ignored, bindings, listing = self.java_owner_group()
+        attempt=self.base/'attempt';attempt.mkdir()
+        self.native.update(ignored_units=ignored,regular_inventory=listing,identity_inputs=str(self.inputs))
+        caller_declarations=[{'name':name,'kind':'value'}
+                             for name in ('AWS_SESSION_TOKEN','AWS_REGION')]
+        caller_values={'AWS_SESSION_TOKEN':'fixture-token','AWS_REGION':'fixture-region'}
+        caller_inputs=run.identity_snapshot.env_inputs(caller_declarations,caller_values)
+        payload={'executable_sha256':'actual-binary','env':dict(caller_inputs,
+                 PATH='same-java',NOVA_FIXTURE_RUN_CONTEXT='actual-run')}
+        root=attempt/'java-rest-inputs';root.mkdir()
+        bound_file=self.base/'pinned-bom.json';bound_file.write_text('original BOM')
+        owner=mock.Mock(root=root,environment={'actual':'owner'},
+                        input_files={str(bound_file):run.identity_snapshot.digest(bound_file)})
+        owned=mock.MagicMock();owned.__enter__.return_value=owner
+        snapshots={unit.id:{'inputs':payload} for unit in group.units}
+        def batch(repo, current, output, expression, environment, **kwargs):
+            saved=json.loads((attempt/'java-rest-target.json').read_text())
+            self.assertEqual(saved['phase'],'before-execution')
+            self.assertEqual(saved['units'],[str(unit) for unit in group.units])
+            self.assertEqual(saved['identity'],payload)
+            self.assertTrue((self.base/'java-rest-target.json').is_file())
+            self.assertEqual(environment,owner.environment)
+            self.assertIs(kwargs['input_owner'],owner)
+            self.assertTrue(kwargs['ignored'])
+            return 0
+        with mock.patch.object(run,'java_rest_owner',return_value=module), \
+                mock.patch.object(module,'own_inputs',return_value=owned), \
+                mock.patch.object(run,'native_list',return_value=listing), \
+                mock.patch.object(run,'requirement_checks',return_value=[{'ok':True}]), \
+                mock.patch.object(run.identity_snapshot,'rust_snapshot',return_value=snapshots), \
+                mock.patch.object(run,'read_rust',return_value=([
+                    Observation(unit,group.key,attempt.name,'nextest',payload,'pass',True,True,True,'ok')
+                    for unit in group.units],[])), \
+                mock.patch.object(run,'_rust_batch',side_effect=batch):
+            self.assertEqual(run._java_rest_batch(self.repo,self.base,attempt,self.native,group,
+                             bindings,{'p':{'name':'pkg'}},{}),0)
+        # A later read uses the pre-execution declaration, not JUnit or a receipt.
+        target={'identities':{group.key:None}}
+        group.identity=dict(payload,env=dict(caller_inputs,PATH='same-java'))
+        with mock.patch.object(run,'java_rest_owner',return_value=module):
+            rebound=run._java_rest_target(self.base,[group],target)
+            self.assertEqual(rebound['identities'][group.key],payload)
+            bound_file.write_text('changed BOM')
+            self.assertEqual(run._java_rest_target(self.base,[group],target),target)
+            bound_file.write_text('original BOM')
+            group.identity=dict(payload,env=dict(caller_inputs,PATH='different-java'))
+            self.assertEqual(run._java_rest_target(self.base,[group],target),target)
+            for name in ('AWS_SESSION_TOKEN','AWS_REGION'):
+                for absent in (False,True):
+                    with self.subTest(caller_input=name,absent=absent):
+                        changed=dict(caller_values)
+                        if absent:
+                            changed.pop(name)
+                        else:
+                            changed[name]='changed-fixture-value'
+                        current=run.identity_snapshot.env_inputs(caller_declarations,changed)
+                        group.identity=dict(payload,env=dict(current,PATH='same-java'))
+                        self.assertEqual(run._java_rest_target(self.base,[group],target),target)
+
+    def test_java_native_membership_mismatch_refuses_before_run_admission(self):
+        module, original, group, ignored, bindings, listing = self.java_owner_group()
+        partial=copy.deepcopy(listing)
+        partial['rust-suites']['p']['testcases'].pop(next(iter(module.EXPECTED)))
+        with mock.patch.object(run,'java_rest_owner',return_value=module), \
+                mock.patch.object(module,'own_inputs') as owner, \
+                mock.patch.object(run,'native_list',return_value=partial):
+            with self.assertRaisesRegex(ValueError,'complete owner group'):
+                run._java_rest_batch(self.repo,self.base,self.base,self.native,group,
+                                     bindings,{'p':{'name':'pkg'}},{})
+            owner.assert_not_called()
 
     def test_exclusive_attempts_and_native_preparation_has_no_positional_filter(self):
         self.assertNotEqual(run.exclusive(self.base),run.exclusive(self.base))
@@ -157,6 +273,48 @@ class Run(unittest.TestCase):
             value,_,attempt=run.execute(self.repo,self.base/'missing',self.native,self.chosen,[heavy])
         batch.assert_not_called();self.assertFalse(value['layer_ok'])
         self.assertTrue(json.loads((attempt/'execution.json').read_text())['errors'])
+
+    def test_java_owner_cleanup_retains_original_native_material_failures(self):
+        owner_ok={'command_returned':True,'cleanup':{'summary':'ok'}}
+        cases=[
+            ('missing-owner','violation',None,'violation'),
+            ('unfinished-owner','violation',{'command_returned':False,'cleanup':{'summary':'unknown'}},'violation'),
+            ('native-unknown','unknown',owner_ok,'unknown'),
+            ('native-violation','violation',owner_ok,'violation'),
+            ('owner-violation','ok',{'command_returned':True,'cleanup':{'summary':'violation'}},'violation'),
+            ('both-ok','ok',owner_ok,'ok'),
+        ]
+        for label,native_cleanup,owner,expected in cases:
+            with self.subTest(case=label):
+                root=self.base/label
+                batch=root/'rust-heavy-java-rest'
+                identity=rust_batch(batch)
+                put(batch/'identity/doctest.json',{'schema':1,'domain':'doctest','scopes':{}})
+                scope=Scope('rust-test:p::regular',(UnitKey('rust-test','p::regular'),),identity,'isolated')
+                if native_cleanup == 'violation':
+                    put(batch/'rust-run/cleanup-summary.json',
+                        {'schema':1,'complete':True,'ok':False,'records':[],
+                         'errors':['original native cleanup failure']})
+                elif native_cleanup == 'unknown':
+                    put(batch/'rust-run/cleanup-summary.json',
+                        {'schema':1,'complete':False,'ok':False,'records':[],'errors':[]})
+                native,errors=run.read_rust(batch,root.name,[scope])
+                self.assertEqual(errors,[])
+                native=[item for item in native if item.unit == scope.units[0]]
+                self.assertEqual(len(native),1)
+                self.assertEqual(native[0].cleanup,native_cleanup)
+                if owner is not None:
+                    put(root/'java-rest-inputs/owner-result.json',owner)
+                observed=[item for item in run.owned_attempt(root,[scope]).observations
+                          if item.unit == scope.units[0]]
+                self.assertEqual(len(observed),1)
+                self.assertEqual(observed[0].cleanup,expected)
+                self.assertEqual(observed[0].detail['native_cleanup'],native_cleanup)
+                owner_status=observed[0].detail['java_rest_owner_cleanup']
+                self.assertEqual(owner_status['summary'],owner['cleanup']['summary'] if owner else 'unknown')
+                self.assertEqual(owner_status['command_returned'],owner['command_returned'] if owner else None)
+                self.assertEqual(Path(observed[0].detail['java_rest_owner_result']),
+                                 (root/'java-rest-inputs/owner-result.json').resolve())
 
     def test_workspace_stage_runs_full_native_command_and_imports_its_batch(self):
         stage=self.scope('stage','workspace nextest and doctests')

@@ -30,6 +30,15 @@ const MAX_DECODED_BYTES: usize = 8 * 1024 * 1024;
 const WINDOW_LOG: u32 = 20;
 const LEVEL: i32 = 3;
 
+/// Supported first-party encoder envelope: raw JSON, compressed bytes and
+/// final framed output coexist. SDK/compressor private heaps are not guessed.
+pub(super) fn initial_owned_backing_bytes() -> Result<usize, ConnectorError> {
+    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(MAX_DECODED_BYTES))
+        .ok_or_else(|| capacity("Recovery encoder envelope overflow"))
+}
+
 struct LimitedWriter {
     bytes: Vec<u8>,
     limit: usize,

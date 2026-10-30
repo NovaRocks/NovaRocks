@@ -192,6 +192,13 @@ impl<C> Clone for FunctionBindingRequest<'_, C> {
     }
 }
 
+/// Original binding-author reason; not proof of which caller requested it.
+pub const UNAVAILABLE_IMPLEMENTATION: novarocks_failure_contract::FailureReason =
+    novarocks_failure_contract::FailureReason::new(
+        novarocks_failure_contract::domain::FUNCTION_BINDING,
+        std::num::NonZeroU16::new(2).unwrap(),
+    );
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FunctionBindingError {
     Control(CompileControlError),
@@ -322,7 +329,9 @@ impl novarocks_failure_contract::FailureProjection for FunctionBindingError {
             Self::ValueType(cause) => return cause.failure_fact(),
             Self::Constant(cause) => return cause.failure_fact(),
             Self::MissingEffectDeclaration(_) => (FailureClass::Invariant, 1),
-            Self::UnavailableImplementation(_) => (FailureClass::Unsupported, 2),
+            Self::UnavailableImplementation(_) => {
+                return FailureFact::new(FailureClass::Unsupported, UNAVAILABLE_IMPLEMENTATION);
+            }
             Self::UnknownFunction => (FailureClass::Data, 3),
             Self::HiddenFunction => (FailureClass::Data, 4),
             Self::MissingBindingDeclaration => (FailureClass::Invariant, 5),

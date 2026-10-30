@@ -51,7 +51,9 @@ Dockerfile 定义；输入身份仍分散。这是设计否决。
    必须先验证 BOM，缺失或不一致时 fail fast。
 3. **身份规则**：消费者只接受 BOM 中锁定的本机别名和 derived-image definition label；不能以 tag、
    镜像站名称或当前 Docker cache 代替 manifest/platform/hash 身份。
-4. **CI 分类规则**：fixture 前置条件缺失是 `BLOCKED`，不是 Rust 或 SQL `VERIFY FAILED`；CI 不得为
+4. **平台与覆盖规则**：schema 2 源锁按准确平台声明变体，共享 artifacts；统一解析作者冻结平台绑定 lock_id，consumer 只选择依赖闭包，不改变身份。实际运行核对本机与 daemon 原生平台；缺变体在副作用前拒绝。部分 provision 不回退同锁/平台已验证覆盖，补齐时重新核验并合并有效回执和 artifact。旧 schema 1 BOM 明确重新供给，不猜测升级、不删除旧数据。
+5. **数据集身份规则**：运行供给证明与数据集语义 key 分开；producer 仅消费对应平台的 recipe/基础镜像/artifact 语义投影，传输来源或别名不构成内容身份。producer 源码摘要仍由原数据集 owner 维护。
+6. **CI 分类规则**：fixture 前置条件缺失是 `BLOCKED`，不是 Rust 或 SQL `VERIFY FAILED`；CI 不得为
    解除 BLOCKED 自行 provision。
 
 ## 接受的妥协（诚实记录）

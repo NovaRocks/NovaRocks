@@ -48,7 +48,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -99,11 +99,61 @@ enum Liveness {
     Unrecorded,
 }
 
+// Every physical connection alias carries this same original file lease.
+// Field order drops the connection before its lease, including cancelled
+// legacy async callers whose already-dispatched worker keeps the last alias.
+struct ConnectionCustody {
+    connection: Mutex<Connection>,
+    // This field drops after the real Connection field, not at Drop entry.
+    #[cfg(test)]
+    connection_exit: ConnectionExitObservation,
+    _lifetime: Arc<super::SqliteInstanceLifetime>,
+    #[cfg(test)]
+    legacy_pause: Mutex<Option<LegacyEvidencePause>>,
+}
+#[cfg(test)]
+struct ConnectionExitObservation {
+    thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
+}
+#[cfg(test)]
+impl Drop for ConnectionExitObservation {
+    fn drop(&mut self) {
+        *self.thread.lock().expect("connection exit observation") =
+            Some(std::thread::current().id());
+    }
+}
+impl std::ops::Deref for ConnectionCustody {
+    type Target = Mutex<Connection>;
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+#[cfg(test)]
+struct LegacyEvidencePause {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+impl ConnectionCustody {
+    fn pause_legacy_worker(&self) {
+        let pause = self.legacy_pause.lock().expect("legacy pause slot").take();
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            pause
+                .release
+                .recv()
+                .expect("same legacy evidence worker released");
+        }
+    }
+}
+
 pub(super) struct SqliteCommitEvidence {
+    original: Weak<Self>,
+    original_scope: OnceLock<novarocks_state_store_api::InstanceScope>,
     /// A dedicated connection, so adjudicating and releasing never wait on
     /// opening a database file and never borrow a live transaction's
     /// connection.
-    connection: Arc<Mutex<Connection>>,
+    connection: Arc<ConnectionCustody>,
     dispatches: Dispatches,
     /// Releases that could not be performed when they were due. Retried on the
     /// next evidence operation rather than abandoned.
@@ -113,14 +163,81 @@ pub(super) struct SqliteCommitEvidence {
 }
 
 impl SqliteCommitEvidence {
-    pub(super) fn new(connection: Connection) -> Self {
-        Self {
-            connection: Arc::new(Mutex::new(connection)),
+    pub(super) fn new(
+        connection: Connection,
+        lifetime: Arc<super::SqliteInstanceLifetime>,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|original| Self {
+            original: original.clone(),
+            original_scope: OnceLock::new(),
+            connection: Arc::new(ConnectionCustody {
+                connection: Mutex::new(connection),
+                #[cfg(test)]
+                connection_exit: ConnectionExitObservation {
+                    thread: Arc::new(Mutex::new(None)),
+                },
+                _lifetime: lifetime,
+                #[cfg(test)]
+                legacy_pause: Mutex::new(None),
+            }),
             dispatches: Arc::new(Mutex::new(HashMap::new())),
             deferred: Mutex::new(VecDeque::new()),
             #[cfg(test)]
             fail_next_release: AtomicBool::new(false),
-        }
+        })
+    }
+
+    pub(super) fn initialize_original_scope(
+        &self,
+        scope: novarocks_state_store_api::InstanceScope,
+    ) -> Result<(), StateStoreError> {
+        self.original_scope
+            .set(scope)
+            .map_err(|_| internal("SQLite evidence original scope was already initialized"))
+    }
+    pub(super) fn original_scope(
+        &self,
+    ) -> Result<
+        novarocks_state_store_api::InstanceScope,
+        novarocks_state_store_api::StateStoreExecutionFailure,
+    > {
+        self.original_scope.get().copied().ok_or_else(|| {
+            internal("SQLite evidence original scope is not initialized").into_original_failure()
+        })
+    }
+    fn original_arc(
+        &self,
+    ) -> Result<Arc<Self>, novarocks_state_store_api::StateStoreExecutionFailure> {
+        self.original.upgrade().ok_or_else(|| {
+            internal("SQLite evidence original owner is unavailable").into_original_failure()
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn connection_exit_thread(&self) -> Arc<Mutex<Option<std::thread::ThreadId>>> {
+        self.connection.connection_exit.thread.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_next_legacy_worker(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, receiving) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let mut pause = self
+            .connection
+            .legacy_pause
+            .lock()
+            .expect("legacy pause slot");
+        assert!(pause.is_none());
+        *pause = Some(LegacyEvidencePause {
+            entered,
+            release: held,
+        });
+        (receiving, release)
     }
 
     /// Makes the next durable release fail, without touching the database.
@@ -150,6 +267,57 @@ impl SqliteCommitEvidence {
             dispatches.insert(attempt, Arc::clone(&state));
         }
         DispatchGuard { state }
+    }
+
+    pub(super) fn register_original_dispatch(
+        &self,
+        attempt: AttemptId,
+    ) -> Result<DispatchGuard, StateStoreError> {
+        let state = Arc::new(DispatchState::default());
+        let mut dispatches = self
+            .dispatches
+            .lock()
+            .map_err(|_| internal("SQLite dispatch receiving is poisoned"))?;
+        if dispatches.contains_key(&attempt) {
+            return Err(internal("SQLite original dispatch already exists"));
+        }
+        dispatches.insert(attempt, state.clone());
+        Ok(DispatchGuard { state })
+    }
+
+    pub(super) fn adjudicate_original_blocking(&self, attempt: AttemptId) -> AttemptOutcome {
+        if !matches!(self.liveness(attempt), Liveness::Finished) {
+            return AttemptOutcome::Unresolved;
+        }
+        let Ok(connection) = self.connection.lock() else {
+            return AttemptOutcome::Unresolved;
+        };
+        adjudicate_on_connection(&connection, attempt)
+    }
+
+    pub(super) fn release_original_blocking(
+        &self,
+        attempt: AttemptId,
+    ) -> Result<(), StateStoreError> {
+        if matches!(self.liveness(attempt), Liveness::InFlight) {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::Transient,
+                "SQLite commit evidence is still being written by its worker",
+            ));
+        }
+        self.check_release_failure()?;
+        delete_evidence_blocking(&self.connection, &self.dispatches, attempt)
+    }
+
+    fn check_release_failure(&self) -> Result<(), StateStoreError> {
+        #[cfg(test)]
+        if self.fail_next_release.swap(false, Ordering::AcqRel) {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "injected SQLite commit evidence release failure",
+            ));
+        }
+        Ok(())
     }
 
     /// Drops the liveness record for an attempt that never reached a worker.
@@ -215,37 +383,50 @@ impl SqliteCommitEvidence {
     }
 
     async fn delete_evidence(&self, attempt: AttemptId) -> Result<(), StateStoreError> {
-        #[cfg(test)]
-        if self.fail_next_release.swap(false, Ordering::AcqRel) {
-            return Err(StateStoreError::new(
-                StateStoreErrorKind::ProviderUnavailable,
-                "injected SQLite commit evidence release failure",
-            ));
-        }
+        self.check_release_failure()?;
         let connection = Arc::clone(&self.connection);
         let dispatches = Arc::clone(&self.dispatches);
         tokio::task::spawn_blocking(move || {
-            {
-                let connection = connection
-                    .lock()
-                    .map_err(|_| internal("SQLite commit evidence connection is poisoned"))?;
-                connection
-                    .execute(
-                        "DELETE FROM state_store_commits WHERE attempt = ?1",
-                        params![attempt_key(attempt)],
-                    )
-                    .map_err(|error| {
-                        operation_error(&error, "failed to release SQLite commit evidence")
-                    })?;
-            }
-            if let Ok(mut dispatches) = dispatches.lock() {
-                dispatches.remove(&attempt);
-            }
-            Ok(())
+            #[cfg(test)]
+            connection.pause_legacy_worker();
+            delete_evidence_blocking(&connection, &dispatches, attempt)
         })
         .await
         .map_err(|_| internal("SQLite commit evidence worker failed"))?
     }
+}
+
+fn adjudicate_on_connection(connection: &Connection, attempt: AttemptId) -> AttemptOutcome {
+    match lookup_commit_on_connection(connection, attempt) {
+        Ok(Some(receipt)) => AttemptOutcome::Committed(receipt),
+        // Only the same worker's actual return permits absence to deny commit.
+        Ok(None) => AttemptOutcome::NotCommitted,
+        Err(_) => AttemptOutcome::Unresolved,
+    }
+}
+
+fn delete_evidence_blocking(
+    connection: &Mutex<Connection>,
+    dispatches: &Mutex<HashMap<AttemptId, Arc<DispatchState>>>,
+    attempt: AttemptId,
+) -> Result<(), StateStoreError> {
+    {
+        let connection = connection
+            .lock()
+            .map_err(|_| internal("SQLite commit evidence connection is poisoned"))?;
+        connection
+            .execute(
+                "DELETE FROM state_store_commits WHERE attempt = ?1",
+                params![attempt_key(attempt)],
+            )
+            .map_err(|error| operation_error(&error, "failed to release SQLite commit evidence"))?;
+    }
+    let retired = dispatches
+        .lock()
+        .map_err(|_| internal("SQLite dispatch receiving is poisoned"))?
+        .remove(&attempt);
+    drop(retired);
+    Ok(())
 }
 
 /// Releases an attempt's evidence from the path that witnessed its terminal.
@@ -269,6 +450,20 @@ pub(super) async fn release_witnessed_evidence(
 
 #[async_trait]
 impl InDoubtAdjudicator for SqliteCommitEvidence {
+    async fn adjudicate_in(
+        &self,
+        attempt: AttemptId,
+        execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Result<AttemptOutcome, novarocks_state_store_api::StateStoreExecutionFailure> {
+        super::original::adjudicate_evidence_in(self.original_arc()?, attempt, execution).await
+    }
+    async fn release_evidence_in(
+        &self,
+        attempt: AttemptId,
+        execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        super::original::release_evidence_in(self.original_arc()?, attempt, execution).await
+    }
     async fn adjudicate(&self, attempt: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
         self.drain_deferred().await;
         match self.liveness(attempt) {
@@ -280,18 +475,14 @@ impl InDoubtAdjudicator for SqliteCommitEvidence {
         }
         let connection = Arc::clone(&self.connection);
         Ok(tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            connection.pause_legacy_worker();
             // A read that cannot be performed is not proof that nothing
             // happened.
             let Ok(connection) = connection.lock() else {
                 return AttemptOutcome::Unresolved;
             };
-            match lookup_commit_on_connection(&connection, attempt) {
-                Ok(Some(receipt)) => AttemptOutcome::Committed(receipt),
-                // The worker has stopped and left no row inside the transaction
-                // that would have carried the data, so nothing can still land.
-                Ok(None) => AttemptOutcome::NotCommitted,
-                Err(_) => AttemptOutcome::Unresolved,
-            }
+            adjudicate_on_connection(&connection, attempt)
         })
         .await
         // A lost worker means the verdict could not be produced, never that the

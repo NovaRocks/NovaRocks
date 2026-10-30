@@ -41,13 +41,122 @@ use crate::{
 /// reads cancellation but never manufactures a host scope or a second
 /// admission authority.
 pub trait OptimizeJobScope: Send + Sync {
-    fn result_capacity(
-        &self,
-    ) -> Result<
-        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-        String,
-    >;
+    /// Move this exact admission into the shared background Source once.
+    fn take_originals(&mut self) -> Result<OptimizeJobOriginals, String>;
+    fn original_owner(&self) -> Result<&novarocks_workload_control::WorkOwner, String>;
     fn is_cancelled(&self) -> Result<bool, String>;
+}
+
+/// Original current-process job slots. A UI waiter never owns these values.
+pub struct OptimizeJobOriginals {
+    pub owner: Option<novarocks_workload_control::WorkOwner>,
+    pub query_concurrency: Option<novarocks_workload_control::QueryConcurrencyPermit>,
+    #[cfg(test)]
+    pub result_capacity:
+        Option<novarocks_query_application::admitted_query_context::QueryResultCapacityBinding>,
+    scope: novarocks_workload_control::WorkScope,
+}
+impl OptimizeJobOriginals {
+    #[cfg(test)]
+    pub fn new(
+        owner: novarocks_workload_control::WorkOwner,
+        query_concurrency: novarocks_workload_control::QueryConcurrencyPermit,
+        result_capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Self, String> {
+        let scope = owner.scope();
+        if !query_concurrency.is_for_scope(&scope)
+            || !result_capacity.window_alias().is_for_scope(&scope)
+        {
+            return Err("optimize originals belong to different Root scopes".into());
+        }
+        Ok(Self {
+            owner: Some(owner),
+            query_concurrency: Some(query_concurrency),
+            result_capacity: Some(result_capacity),
+            scope,
+        })
+    }
+    /// Every scope/permit check precedes the move from the caller's slots.
+    pub fn take_in(
+        owner: &mut Option<novarocks_workload_control::WorkOwner>,
+        permit: &mut Option<novarocks_workload_control::QueryConcurrencyPermit>,
+    ) -> Result<Self, String> {
+        let scope = owner
+            .as_ref()
+            .ok_or("Optimize original Root is empty")?
+            .scope();
+        if !permit.as_ref().is_some_and(|p| p.is_for_scope(&scope)) {
+            return Err("Optimize original query permit has a foreign Root".into());
+        }
+        scope.check().map_err(|e| e.to_string())?;
+        Ok(Self {
+            owner: owner.take(),
+            query_concurrency: permit.take(),
+            scope,
+            #[cfg(test)]
+            result_capacity: None,
+        })
+    }
+    pub fn take_prepared_root_in(
+        owner: &mut Option<novarocks_workload_control::WorkOwner>,
+    ) -> Result<Self, String> {
+        let scope = owner
+            .as_ref()
+            .ok_or("Optimize prepared Root is empty")?
+            .scope();
+        scope.check().map_err(|e| e.to_string())?;
+        Ok(Self {
+            owner: owner.take(),
+            query_concurrency: None,
+            scope,
+            #[cfg(test)]
+            result_capacity: None,
+        })
+    }
+    pub fn scope(&self) -> &novarocks_workload_control::WorkScope {
+        &self.scope
+    }
+}
+impl Drop for OptimizeJobOriginals {
+    fn drop(&mut self) {
+        // Before mounting only pure source selection ran. After mounting these
+        // owner/permit slots are empty and the common Source owns actual exit.
+        #[cfg(test)]
+        drop(self.result_capacity.take());
+        drop(self.query_concurrency.take());
+        if let Some(owner) = self.owner.take() {
+            owner.complete();
+        }
+    }
+}
+
+/// A prepared record transfers its original Root rather than acquiring a
+/// second query permit. This wrapper is a single-use receiving cell, not an
+/// alternative admission path or an owner reconstructed from a result alias.
+struct ReceivedOriginalScope {
+    original: Option<OptimizeJobOriginals>,
+}
+impl OptimizeJobScope for ReceivedOriginalScope {
+    fn take_originals(&mut self) -> Result<OptimizeJobOriginals, String> {
+        self.original
+            .take()
+            .ok_or_else(|| "Optimize original already mounted".into())
+    }
+    fn original_owner(&self) -> Result<&novarocks_workload_control::WorkOwner, String> {
+        self.original
+            .as_ref()
+            .and_then(|o| o.owner.as_ref())
+            .ok_or_else(|| "Optimize original Root is empty".into())
+    }
+    fn is_cancelled(&self) -> Result<bool, String> {
+        self.original
+            .as_ref()
+            .ok_or("Optimize original is empty")?
+            .scope()
+            .cancellation()
+            .map(|c| c.reason().is_some())
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Result of asking the host for one Table Maintenance root scope.
@@ -58,9 +167,11 @@ pub enum OptimizeJobAdmission {
 }
 
 /// Host adapter for role-local admission and resource attribution.
-#[async_trait::async_trait]
+pub type OptimizeJobAdmissionFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<OptimizeJobAdmission, String>> + Send + 'a>,
+>;
 pub trait OptimizeJobAdmissionPort: Send + Sync {
-    async fn begin(&self) -> Result<OptimizeJobAdmission, String>;
+    fn begin(&self) -> OptimizeJobAdmissionFuture<'_>;
 }
 
 /// Exact role-local provider/native execution capability for one OPTIMIZE job.
@@ -79,31 +190,81 @@ pub trait OptimizeJobExecutionPort: Send + Sync {
     /// rebind and dispatch, so host teardown cannot race between them.
     fn acquire(
         &self,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        owner: &novarocks_workload_control::WorkOwner,
     ) -> Result<Option<Box<dyn OptimizeJobExecution>>, String>;
 }
 
 /// One exact provider/native execution lease for a claimed OPTIMIZE job.
-pub trait OptimizeJobExecution: Send {
-    fn rebind_target(&self, job: &OptimizeJob) -> Result<MaintenanceTargetRebind, String>;
+pub trait OptimizeJobExecution: Send + Sync + 'static {
+    #[cfg(not(test))]
+    fn run_original_job<'a>(
+        self: Box<Self>,
+        jobs: Arc<OptimizeProcessRuntime>,
+        originals: OptimizeJobOriginals,
+        job: OptimizeJob,
+    ) -> crate::product::MaintenanceFuture<'a, Result<crate::OptimizeJobOutcome, TerminalError>>;
 
-    fn execute(
-        &self,
-        job: &OptimizeJob,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    ) -> Result<crate::MaintenanceActionOutcome, TerminalError>;
+    #[cfg(test)]
+    fn run_original_job<'a>(
+        self: Box<Self>,
+        jobs: Arc<OptimizeProcessRuntime>,
+        originals: OptimizeJobOriginals,
+        job: OptimizeJob,
+    ) -> crate::product::MaintenanceFuture<'a, Result<crate::OptimizeJobOutcome, TerminalError>>
+    {
+        Box::pin(async move {
+            let capacity = originals
+                .result_capacity
+                .as_ref()
+                .expect("original test capacity")
+                .clone();
+            execute_claimed_job(
+                jobs.as_ref(),
+                self.as_ref(),
+                originals.scope(),
+                capacity,
+                job,
+            )
+            .await
+        })
+    }
+
+    /// Exact original publication/no-op author; legacy fixtures may have no
+    /// such fact. Never infer an effect from a successful job state.
+    fn original_effect<'a>(
+        &'a self,
+    ) -> crate::product::MaintenanceFuture<
+        'a,
+        Option<novarocks_coordination_contract::ExecutionEffect>,
+    > {
+        Box::pin(async move { None })
+    }
+
+    fn rebind_target<'a>(
+        &'a self,
+        job: &'a OptimizeJob,
+    ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceTargetRebind, String>>;
+
+    fn execute<'a>(
+        &'a self,
+        job: &'a OptimizeJob,
+        capacity: &'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> crate::product::MaintenanceFuture<'a, Result<crate::MaintenanceActionOutcome, TerminalError>>;
 
     /// Executes an MV-owned OPTIMIZE using the identity frozen before job
     /// submission. An adapter without this capability fails before dispatch.
-    fn execute_automatic(
-        &self,
-        _job: &OptimizeJob,
+    fn execute_automatic<'a>(
+        &'a self,
+        _job: &'a OptimizeJob,
         _effect_id: MaintenanceEffectId,
-        _capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
-        Err(TerminalError::pre_dispatch_failed(
-            "automatic optimize effect identity is unsupported",
-        ))
+        _capacity: &'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> crate::product::MaintenanceFuture<'a, Result<AutomaticMaintenanceOutcome, TerminalError>>
+    {
+        Box::pin(async move {
+            Err(TerminalError::pre_dispatch_failed(
+                "automatic optimize effect identity is unsupported",
+            ))
+        })
     }
 }
 
@@ -139,6 +300,9 @@ impl OptimizeWorker {
         }
     }
 
+    pub(crate) fn wakeup_handle(&self) -> Arc<Notify> {
+        Arc::clone(&self.wakeup)
+    }
     pub fn wakeup(&self) {
         self.wakeup.notify_one();
     }
@@ -176,6 +340,7 @@ async fn run_worker(
     stop: Arc<AtomicBool>,
     wakeup: Arc<Notify>,
 ) -> Result<(), String> {
+    let mut waiting = OriginalAdmissionWait::default();
     loop {
         if stop.load(Ordering::Acquire) {
             cancel_for_shutdown(jobs.as_ref()).await?;
@@ -185,30 +350,18 @@ async fn run_worker(
             cancel_for_shutdown(jobs.as_ref()).await?;
             return Ok(());
         }
-        let scope = match admission.begin().await? {
-            OptimizeJobAdmission::Acquired(scope) => scope,
-            OptimizeJobAdmission::RetryLater => {
-                tokio::select! {
-                    _ = wakeup.notified() => {}
-                    _ = jobs.wait_for_change() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-                }
-                continue;
-            }
-            OptimizeJobAdmission::Closed => {
+        let Some((job, mut scope)) = receive_original_or_admit(
+            jobs.as_ref(),
+            admission.clone(),
+            &mut waiting,
+            &stop,
+            &wakeup,
+        )
+        .await?
+        else {
+            if stop.load(Ordering::Acquire) {
                 cancel_for_shutdown(jobs.as_ref()).await?;
                 return Ok(());
-            }
-        };
-        let claimed = jobs
-            .claim_next(now_unix_millis())
-            .await
-            .map_err(|error| format!("claim current optimize job failed: {error}"))?;
-        let Some(job) = claimed else {
-            drop(scope);
-            tokio::select! {
-                _ = wakeup.notified() => {}
-                _ = jobs.wait_for_change() => {}
             }
             continue;
         };
@@ -227,17 +380,14 @@ async fn run_worker(
                 .await?;
                 continue;
             }
-            Ok(false) => scope.result_capacity().and_then(|capacity| {
-                execution
-                    .acquire(&capacity)
-                    .map(|execution| (execution, capacity))
-            }),
+            Ok(false) => scope
+                .original_owner()
+                .and_then(|owner| execution.acquire(owner)),
             Err(error) => Err(error),
         };
-        let (execution, capacity) = match acquisition {
-            Ok((Some(execution), capacity)) => (execution, capacity),
-            Ok((None, capacity)) => {
-                drop(capacity);
+        let execution = match acquisition {
+            Ok(Some(execution)) => execution,
+            Ok(None) => {
                 drop(scope);
                 finish(
                     jobs.as_ref(),
@@ -263,13 +413,150 @@ async fn run_worker(
                 continue;
             }
         };
-        let terminal =
-            execute_claimed_job(jobs.as_ref(), execution, scope.as_ref(), capacity, job).await;
+        // No side effect ran yet. Move the exact original admission before
+        // the frontend mounts its Product/Provider Action in the common host.
+        let terminal = match scope.take_originals() {
+            Ok(originals) => {
+                let current = execution.run_original_job(Arc::clone(&jobs), originals, job);
+                tokio::pin!(current);
+                std::future::poll_fn(|cx| {
+                    // The old independent job keeps its exact FIFO ticket
+                    // while this already-admitted job executes serially.
+                    let _ = waiting.poll(cx);
+                    // A negative exit observation never drops or cancels the
+                    // currently retained Product F on observer failure.
+                    let _ = jobs.poll_exits(cx);
+                    std::future::Future::poll(current.as_mut(), cx)
+                })
+                .await
+            }
+            Err(error) => Err(TerminalError::pre_dispatch_failed(error)),
+        };
         // Design: ADR-0169 (docs/adr/ADR-0169-read-only-hms-and-single-writer-admission.md)
-        // The blocking task and its original capacity aliases have actually
-        // returned before the root/window scope is dropped and terminal is published.
+        // Business Ready came from the common Source. Its original residual
+        // independently owns actual Native/Provider exit after this job terminal.
         drop(scope);
         finish(jobs.as_ref(), job_id, terminal).await?;
+    }
+}
+
+type AdmissionFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<OptimizeJobAdmission, String>> + Send>,
+>;
+#[derive(Default)]
+struct OriginalAdmissionWait {
+    future: Option<AdmissionFuture>,
+    // The affirmative receive precedes original F Drop. It is not inferred
+    // from an absent future, a ready event or the query driver's grant state.
+    received: Option<Result<OptimizeJobAdmission, String>>,
+}
+impl OriginalAdmissionWait {
+    fn start(&mut self, admission: Arc<dyn OptimizeJobAdmissionPort>) {
+        assert!(
+            self.future.is_none() && self.received.is_none(),
+            "one original Optimize waiting admission"
+        );
+        self.future = Some(Box::pin(wait_original_admission(admission)));
+    }
+    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.received.is_some() {
+            return std::task::Poll::Ready(());
+        }
+        let Some(future) = self.future.as_mut() else {
+            return std::task::Poll::Pending;
+        };
+        let result = std::task::ready!(future.as_mut().poll(cx));
+        self.received = Some(result);
+        drop(self.future.take());
+        std::task::Poll::Ready(())
+    }
+}
+async fn wait_original_admission(
+    admission: Arc<dyn OptimizeJobAdmissionPort>,
+) -> Result<OptimizeJobAdmission, String> {
+    admission.begin().await
+}
+/// A prepared record uses its original permit; the independent job's one
+/// pending ticket stays in this original slot across serial prepared jobs.
+async fn receive_original_or_admit(
+    jobs: &OptimizeProcessRuntime,
+    admission: Arc<dyn OptimizeJobAdmissionPort>,
+    waiting: &mut OriginalAdmissionWait,
+    stop: &AtomicBool,
+    wakeup: &Notify,
+) -> Result<Option<(OptimizeJob, Box<dyn OptimizeJobScope>)>, String> {
+    loop {
+        let changed = jobs.change_notification();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if stop.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        // Establish the oldest independent job's ONE FIFO ticket before a
+        // prepared record can be selected. Continuous prepared arrivals must
+        // not prevent that original ticket from ever entering the warehouse.
+        if waiting.future.is_none()
+            && waiting.received.is_none()
+            && jobs.has_worker_pending().map_err(|e| e.to_string())?
+        {
+            waiting.start(admission.clone());
+        }
+        // Poll/receive an already established ticket before considering the
+        // queue. New arrivals never cancel it, replace it, or mint another Q.
+        std::future::poll_fn(|cx| {
+            let _ = waiting.poll(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut retry = false;
+        // A real received grant for the oldest independent job wins before
+        // later prepared records. Pending tickets keep their FIFO position;
+        // receiving that grant is the bounded opportunity to execute it.
+        if let Some(received) = waiting.received.take() {
+            match received? {
+                OptimizeJobAdmission::Acquired(scope) => {
+                    if let Some(job) = jobs
+                        .claim_next(now_unix_millis())
+                        .await
+                        .map_err(|e| e.to_string())?
+                    {
+                        return Ok(Some((job, scope)));
+                    }
+                    drop(scope);
+                }
+                OptimizeJobAdmission::RetryLater => retry = true,
+                OptimizeJobAdmission::Closed => {
+                    stop.store(true, Ordering::Release);
+                    return Ok(None);
+                }
+            }
+        }
+        if let Some(mut original) = jobs
+            .claim_prepared(now_unix_millis())
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(Some((
+                original.job,
+                Box::new(ReceivedOriginalScope {
+                    original: original.originals.take(),
+                }),
+            )));
+        }
+        if retry {
+            tokio::select! {
+                _ = wakeup.notified() => {}, _ = &mut changed => {},
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+            }
+            continue;
+        }
+        let pending = waiting.future.is_some();
+        tokio::select! {
+            result=std::future::poll_fn(|cx|jobs.poll_exits(cx))=>{result.map_err(|e|e.to_string())?;},
+            _=std::future::poll_fn(|cx|waiting.poll(cx)), if pending=>{},
+            _=&mut changed=>{},
+            _=wakeup.notified()=>{},
+        }
     }
 }
 
@@ -279,15 +566,19 @@ async fn cancel_for_shutdown(jobs: &OptimizeProcessRuntime) -> Result<(), String
         .map_err(|error| format!("request optimize shutdown cancellation failed: {error}"))
 }
 
-async fn execute_claimed_job(
+pub async fn execute_claimed_job<E: OptimizeJobExecution + ?Sized>(
     jobs: &OptimizeProcessRuntime,
-    execution: Box<dyn OptimizeJobExecution>,
-    scope: &dyn OptimizeJobScope,
+    execution: &E,
+    scope: &novarocks_workload_control::WorkScope,
     capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     job: OptimizeJob,
 ) -> Result<crate::OptimizeJobOutcome, TerminalError> {
     let job_id = job.job_id;
-    let initially_cancelled = match scope.is_cancelled() {
+    let initially_cancelled = match scope
+        .cancellation()
+        .map(|view| view.reason().is_some())
+        .map_err(|error| error.to_string())
+    {
         Ok(cancelled) => cancelled,
         Err(error) => {
             return Err(TerminalError::pre_dispatch_failed(format!(
@@ -300,7 +591,7 @@ async fn execute_claimed_job(
             "optimize job cancelled before target rebind",
         ));
     }
-    let terminal = match execution.rebind_target(&job) {
+    let terminal = match execution.rebind_target(&job).await {
         Ok(MaintenanceTargetRebind::Bound) => None,
         Ok(MaintenanceTargetRebind::Replaced) => Some(Err(TerminalError::target_replaced(
             "optimize target was replaced before provider dispatch",
@@ -315,7 +606,11 @@ async fn execute_claimed_job(
     if let Some(terminal) = terminal {
         return terminal;
     }
-    let scope_cancelled = match scope.is_cancelled() {
+    let scope_cancelled = match scope
+        .cancellation()
+        .map(|view| view.reason().is_some())
+        .map_err(|error| error.to_string())
+    {
         Ok(cancelled) => cancelled,
         Err(error) => {
             return Err(TerminalError::pre_dispatch_failed(format!(
@@ -336,10 +631,10 @@ async fn execute_claimed_job(
             "optimize job cancelled before provider dispatch",
         ));
     }
-    let automatic = job.effect_id.is_some();
-    let execution = tokio::task::spawn_blocking(move || match job.effect_id {
+    let executed = match job.effect_id {
         Some(effect_id) => execution
             .execute_automatic(&job, effect_id, &capacity)
+            .await
             .map(|outcome| {
                 let (action, committed) = match outcome {
                     AutomaticMaintenanceOutcome::KnownCommitted(action) => (action, true),
@@ -347,13 +642,18 @@ async fn execute_claimed_job(
                 };
                 (action, Some(committed))
             }),
-        None => execution
-            .execute(&job, &capacity)
-            .map(|action| (action, None)),
-    })
-    .await;
-    match execution {
-        Ok(Ok((outcome, committed))) => optimize_job_outcome_from_action(outcome)
+        None => match execution.execute(&job, &capacity).await {
+            Ok(action) => Ok((
+                action,
+                execution.original_effect().await.map(|effect| {
+                    effect == novarocks_coordination_contract::ExecutionEffect::External
+                }),
+            )),
+            Err(error) => Err(error),
+        },
+    };
+    match executed {
+        Ok((outcome, committed)) => optimize_job_outcome_from_action(outcome)
             .map(|mut outcome| {
                 outcome.commit_occurred = committed;
                 outcome
@@ -365,15 +665,7 @@ async fn execute_claimed_job(
                     TerminalError::failed(error)
                 }
             }),
-        Ok(Err(terminal)) => Err(terminal),
-        Err(error) => {
-            let message = format!("optimize job {job_id} engine task failed: {error}");
-            Err(if automatic {
-                TerminalError::commit_unknown(message)
-            } else {
-                TerminalError::failed(message)
-            })
-        }
+        Err(terminal) => Err(terminal),
     }
 }
 
@@ -382,7 +674,18 @@ async fn finish(
     job_id: i64,
     terminal: Result<crate::OptimizeJobOutcome, TerminalError>,
 ) -> Result<(), String> {
-    jobs.finish(job_id, terminal, now_unix_millis())
+    let effect = terminal
+        .as_ref()
+        .ok()
+        .and_then(|o| o.commit_occurred)
+        .map(|applied| {
+            if applied {
+                novarocks_coordination_contract::ExecutionEffect::External
+            } else {
+                novarocks_coordination_contract::ExecutionEffect::None
+            }
+        });
+    jobs.finish_with_effect(job_id, terminal, effect, now_unix_millis())
         .await
         .map(|_| ())
         .map_err(|error| format!("record optimize terminal failed: {error}"))
@@ -422,13 +725,17 @@ pub(crate) mod tests {
     }
 
     impl OptimizeJobScope for TestScope {
-        fn result_capacity(
-            &self,
-        ) -> Result<
-            novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-            String,
-        > {
-            Ok(self.capacity.clone())
+        fn take_originals(&mut self) -> Result<OptimizeJobOriginals, String> {
+            OptimizeJobOriginals::new(
+                self.root.take().ok_or("test Root already moved")?,
+                self.permit.take().ok_or("test permit already moved")?,
+                self.capacity.clone(),
+            )
+        }
+        fn original_owner(&self) -> Result<&novarocks_workload_control::WorkOwner, String> {
+            self.root
+                .as_ref()
+                .ok_or_else(|| "fixture Root is empty".into())
         }
         fn is_cancelled(&self) -> Result<bool, String> {
             Ok(self.cancelled)
@@ -478,18 +785,19 @@ pub(crate) mod tests {
         closed: Arc<AtomicBool>,
     }
 
-    #[async_trait::async_trait]
     impl OptimizeJobAdmissionPort for TestAdmission {
-        async fn begin(&self) -> Result<OptimizeJobAdmission, String> {
-            if self.closed.load(Ordering::Acquire) {
-                return Ok(OptimizeJobAdmission::Closed);
-            }
-            if !self.ready.load(Ordering::Acquire) {
-                return Ok(OptimizeJobAdmission::RetryLater);
-            }
-            Ok(OptimizeJobAdmission::Acquired(
-                admitted_scope_fixture().await,
-            ))
+        fn begin(&self) -> crate::worker::OptimizeJobAdmissionFuture<'_> {
+            Box::pin(async move {
+                if self.closed.load(Ordering::Acquire) {
+                    return Ok(OptimizeJobAdmission::Closed);
+                }
+                if !self.ready.load(Ordering::Acquire) {
+                    return Ok(OptimizeJobAdmission::RetryLater);
+                }
+                Ok(OptimizeJobAdmission::Acquired(
+                    admitted_scope_fixture().await,
+                ))
+            })
         }
     }
 
@@ -506,42 +814,48 @@ pub(crate) mod tests {
 
         fn acquire(
             &self,
-            capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+            owner: &novarocks_workload_control::WorkOwner,
         ) -> Result<Option<Box<dyn OptimizeJobExecution>>, String> {
-            capacity
-                .scope()
-                .check()
-                .map_err(|error| error.to_string())?;
+            owner.scope().check().map_err(|error| error.to_string())?;
             Ok(Some(Box::new(self.clone())))
         }
     }
 
     impl OptimizeJobExecution for RecordingExecution {
-        fn rebind_target(&self, _job: &OptimizeJob) -> Result<MaintenanceTargetRebind, String> {
-            self.calls.lock().expect("calls lock").push("rebind");
-            Ok(self.rebind)
+        fn rebind_target<'a>(
+            &'a self,
+            _job: &'a OptimizeJob,
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceTargetRebind, String>>
+        {
+            Box::pin(async move {
+                self.calls.lock().expect("calls lock").push("rebind");
+                Ok(self.rebind)
+            })
         }
 
-        fn execute(
-            &self,
-            _job: &OptimizeJob,
-            capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-        ) -> Result<MaintenanceActionOutcome, TerminalError> {
-            assert_eq!(
-                capacity.class(),
-                novarocks_workload_control::ResultWindowClass::Internal
-            );
-            capacity.scope().check().unwrap();
-            self.calls.lock().expect("calls lock").push("execute");
-            Ok(MaintenanceActionOutcome::RewriteDataFiles {
-                target_snapshot_id: Some(1),
-                rewritten_data_files_count: 1,
-                added_data_files_count: None,
-                added_delete_files_count: None,
-                rewritten_bytes_count: 0,
-                failed_data_files_count: 0,
-                removed_delete_files_count: 0,
-                output_record_count: None,
+        fn execute<'a>(
+            &'a self,
+            _job: &'a OptimizeJob,
+            capacity: &'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>>
+        {
+            Box::pin(async move {
+                assert_eq!(
+                    capacity.class(),
+                    novarocks_workload_control::ResultWindowClass::Internal
+                );
+                capacity.scope().check().unwrap();
+                self.calls.lock().expect("calls lock").push("execute");
+                Ok(MaintenanceActionOutcome::RewriteDataFiles {
+                    target_snapshot_id: Some(1),
+                    rewritten_data_files_count: 1,
+                    added_data_files_count: None,
+                    added_delete_files_count: None,
+                    rewritten_bytes_count: 0,
+                    failed_data_files_count: 0,
+                    removed_delete_files_count: 0,
+                    output_record_count: None,
+                })
             })
         }
     }
@@ -648,7 +962,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn capacity_binding_failure_finishes_claim_without_target_rebind() {
+    async fn original_scope_binding_failure_finishes_claim_without_target_rebind() {
         struct RefusedExecution;
         impl OptimizeJobExecutionPort for RefusedExecution {
             fn is_available(&self) -> bool {
@@ -656,13 +970,10 @@ pub(crate) mod tests {
             }
             fn acquire(
                 &self,
-                capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+                owner: &novarocks_workload_control::WorkOwner,
             ) -> Result<Option<Box<dyn OptimizeJobExecution>>, String> {
-                assert_eq!(
-                    capacity.class(),
-                    novarocks_workload_control::ResultWindowClass::Internal
-                );
-                Err("frozen attempt capacity mismatch".to_string())
+                owner.scope().check().unwrap();
+                Err("original attempt binding refused".to_string())
             }
         }
         let jobs = Arc::new(OptimizeProcessRuntime::new());
@@ -728,16 +1039,17 @@ pub(crate) mod tests {
             admitted: Option<Box<dyn OptimizeJobScope>>,
         }
         impl OptimizeJobScope for ReleaseScope {
-            fn result_capacity(
-                &self,
-            ) -> Result<
-                novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-                String,
-            > {
+            fn take_originals(&mut self) -> Result<OptimizeJobOriginals, String> {
+                self.admitted
+                    .as_mut()
+                    .ok_or("release fixture original Root already moved")?
+                    .take_originals()
+            }
+            fn original_owner(&self) -> Result<&novarocks_workload_control::WorkOwner, String> {
                 self.admitted
                     .as_ref()
                     .ok_or_else(|| "release fixture scope already dropped".to_string())?
-                    .result_capacity()
+                    .original_owner()
             }
             fn is_cancelled(&self) -> Result<bool, String> {
                 Ok(self.cancelled)
@@ -766,12 +1078,14 @@ pub(crate) mod tests {
         struct ReleaseAdmission {
             scope: Mutex<Option<ReleaseScope>>,
         }
-        #[async_trait::async_trait]
+
         impl OptimizeJobAdmissionPort for ReleaseAdmission {
-            async fn begin(&self) -> Result<OptimizeJobAdmission, String> {
-                Ok(match self.scope.lock().unwrap().take() {
-                    Some(scope) => OptimizeJobAdmission::Acquired(Box::new(scope)),
-                    None => OptimizeJobAdmission::Closed,
+            fn begin(&self) -> crate::worker::OptimizeJobAdmissionFuture<'_> {
+                Box::pin(async move {
+                    Ok(match self.scope.lock().unwrap().take() {
+                        Some(scope) => OptimizeJobAdmission::Acquired(Box::new(scope)),
+                        None => OptimizeJobAdmission::Closed,
+                    })
                 })
             }
         }
@@ -824,5 +1138,182 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn original_job_receiving_rejects_foreign_permit_without_consuming_either_owner() {
+        use novarocks_workload_control::{WorkClass, WorkRequest, WorkloadConfig, WorkloadControl};
+        let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
+        control.mark_ready().unwrap();
+        let a = control
+            .root_admission()
+            .begin_warehouse_root(WorkRequest::new(WorkClass::TableMaintenance))
+            .unwrap();
+        let b = control
+            .root_admission()
+            .begin_warehouse_root(WorkRequest::new(WorkClass::TableMaintenance))
+            .unwrap();
+        let a_scope = a.owner.scope();
+        let b_scope = b.owner.scope();
+        let mut a_owner = Some(a.owner);
+        let mut b_owner = Some(b.owner);
+        let mut b_permit = Some(b_scope.admit_query().unwrap().await.unwrap());
+        assert!(OptimizeJobOriginals::take_in(&mut a_owner, &mut b_permit).is_err());
+        assert!(a_owner.as_ref().unwrap().is_for_scope(&a_scope));
+        assert!(b_permit.as_ref().unwrap().is_for_scope(&b_scope));
+        let originals = OptimizeJobOriginals::take_in(&mut b_owner, &mut b_permit).unwrap();
+        assert!(b_owner.is_none() && b_permit.is_none());
+        assert!(originals.owner.as_ref().unwrap().is_for_scope(&b_scope));
+        assert!(matches!(
+            originals.scope().result_capacity(),
+            Err(novarocks_workload_control::WorkError::NotReady)
+        ));
+        drop(originals);
+        a_owner.take().unwrap().complete();
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+    }
+
+    struct TicketOnlyScope {
+        owner: Option<novarocks_workload_control::WorkOwner>,
+        permit: Option<novarocks_workload_control::QueryConcurrencyPermit>,
+    }
+    impl Drop for TicketOnlyScope {
+        fn drop(&mut self) {
+            drop(self.permit.take());
+            if let Some(owner) = self.owner.take() {
+                owner.complete();
+            }
+        }
+    }
+    impl OptimizeJobScope for TicketOnlyScope {
+        fn take_originals(&mut self) -> Result<OptimizeJobOriginals, String> {
+            Err("this fixture never dispatches a Provider job".into())
+        }
+        fn original_owner(&self) -> Result<&novarocks_workload_control::WorkOwner, String> {
+            self.owner
+                .as_ref()
+                .ok_or_else(|| "fixture owner is empty".into())
+        }
+        fn is_cancelled(&self) -> Result<bool, String> {
+            self.owner
+                .as_ref()
+                .ok_or("fixture owner is empty")?
+                .scope()
+                .cancellation()
+                .map(|c| c.reason().is_some())
+                .map_err(|e| e.to_string())
+        }
+    }
+    struct OriginalTicketAdmission {
+        roots: novarocks_workload_control::RootAdmissionHandle,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl OptimizeJobAdmissionPort for OriginalTicketAdmission {
+        fn begin(&self) -> OptimizeJobAdmissionFuture<'_> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let root = self
+                    .roots
+                    .begin_warehouse_root(novarocks_workload_control::WorkRequest::new(
+                        novarocks_workload_control::WorkClass::TableMaintenance,
+                    ))
+                    .map_err(|e| e.to_string())?;
+                let permit = root
+                    .owner
+                    .scope()
+                    .admit_query()
+                    .map_err(|e| e.to_string())?
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(OptimizeJobAdmission::Acquired(Box::new(TicketOnlyScope {
+                    owner: Some(root.owner),
+                    permit: Some(permit),
+                })))
+            })
+        }
+    }
+    #[tokio::test]
+    async fn waiting_original_ticket_survives_prepared_handoffs_and_receives_before_successor() {
+        use novarocks_workload_control::{
+            QueryConcurrencyPermit, ResourceConfig, WorkClass, WorkRequest, WorkloadConfig,
+            WorkloadControl,
+        };
+        use std::task::{Context, Waker};
+        let control = WorkloadControl::try_new(
+            WorkloadConfig {
+                query_concurrency_limit: 1,
+                ..WorkloadConfig::default()
+            },
+            ResourceConfig {
+                total_bytes: 32768,
+                control_bytes: 1024,
+                per_scope_bytes: 31744,
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let roots = control.root_admission();
+        let sql = roots
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let mut held = Some(sql.owner.scope().admit_query().unwrap().await.unwrap());
+        let mut current = sql.owner;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut waiting = OriginalAdmissionWait::default();
+        waiting.start(Arc::new(OriginalTicketAdmission {
+            roots: roots.clone(),
+            calls: calls.clone(),
+        }));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(waiting.poll(&mut cx).is_pending());
+        let queued = control.observation().snapshot().admission_records;
+        assert_eq!(queued, 1);
+        // These are exact same-State permit handoffs. None cancels or
+        // reconstructs the old independent job's original warehouse ticket.
+        for _ in 0..3 {
+            let child = roots
+                .begin_warehouse_root(WorkRequest::new(WorkClass::TableMaintenance))
+                .unwrap();
+            let mut received = None;
+            let notice = QueryConcurrencyPermit::handoff_in(
+                &mut held,
+                &current.scope(),
+                &child.owner,
+                &mut received,
+            )
+            .unwrap();
+            notice.notify();
+            current.complete();
+            current = child.owner;
+            held = received;
+            assert!(waiting.poll(&mut cx).is_pending());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(control.observation().snapshot().admission_records, queued);
+            assert_eq!(control.observation().snapshot().admitted_queries, 1);
+        }
+        drop(held.take());
+        current.complete();
+        assert!(waiting.poll(&mut cx).is_ready());
+        assert!(waiting.future.is_none());
+        assert!(matches!(
+            waiting.received.as_ref(),
+            Some(Ok(OptimizeJobAdmission::Acquired(_)))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let next = roots
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let mut successor = Box::pin(next.owner.scope().admit_query().unwrap());
+        assert!(std::future::Future::poll(successor.as_mut(), &mut cx).is_pending());
+        // Its original grant was positively received before F Drop and is
+        // retained in the waiting slot until the original worker consumes it.
+        drop(waiting.received.take());
+        let next_permit = successor.await.unwrap();
+        drop(next_permit);
+        next.owner.complete();
+        assert_eq!(control.observation().snapshot().admitted_queries, 0);
     }
 }

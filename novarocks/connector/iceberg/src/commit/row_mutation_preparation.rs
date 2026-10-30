@@ -1556,13 +1556,13 @@ mod tests {
         // Signed target fields are the provider's exact frozen fields, so each
         // carries the Iceberg field-id annotation of the resolved schema.
         let provider_field = |name: &str, data_type: DataType, nullable: bool, field_id: i32| {
-            Field::new(name, data_type, nullable).with_metadata(
-                [(
-                    parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
-                    field_id.to_string(),
-                )]
-                .into(),
-            )
+            Field::new(name, data_type, nullable).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+                field_id.to_string(),
+            )]))
         };
         for (target_ref, snapshot, expected) in [
             (

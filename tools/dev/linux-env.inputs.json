@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "rustup": {
+    "version": "1.28.2",
+    "url": "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init",
+    "sha256": "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
+  },
+  "nextest": {
+    "version": "0.9.148",
+    "url": "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/cargo-nextest-0.9.148-x86_64-unknown-linux-gnu.tar.gz",
+    "sha256": "223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc",
+    "executable_sha256": "53470cfc9b5cbcd96780db2d348700d76af962467503791f1f8a8824d8967e5c"
+  },
+  "packages": [
+    "build-essential",
+    "clang",
+    "libclang-dev",
+    "cmake",
+    "pkg-config",
+    "protobuf-compiler",
+    "libssl-dev",
+    "git",
+    "curl",
+    "ca-certificates",
+    "python3",
+    "python3-venv",
+    "locales",
+    "ripgrep"
+  ]
+}

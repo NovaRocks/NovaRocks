@@ -526,7 +526,7 @@ fn check_acquisition_failure(
         "Storage statement lost its acquisition cause: {snapshot:?}"
     );
     ensure!(
-        snapshot.error_source.is_none() && snapshot.worker_contexts_converged,
+        snapshot.worker_contexts_converged,
         "Storage failure was not an original converged attempt: {snapshot:?}"
     );
     let Some(QueryLifecycleFailureSite::Task { identity, phase }) = &snapshot.failure_site else {

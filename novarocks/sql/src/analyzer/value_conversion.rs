@@ -433,7 +433,7 @@ mod checked_constant_tests {
         };
         assert_eq!(value.value_type(), &output.value_type);
         assert_eq!(value.try_utf8().unwrap(), None);
-        assert_eq!(value.pool().field_ref().metadata().capacity(), 0);
+        assert!(value.pool().field_ref().metadata().as_arc().is_none());
         assert!(value.pool().source_metadata_namespace().is_none());
     }
 }

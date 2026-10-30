@@ -66,6 +66,8 @@ max_blocking_threads = 64
 
 [standalone_server]
 mysql_port = 9030
+trino_port = 8080
+trino_client_timeout_ms = 300000
 user = "root"
 
 [connector.object_store]

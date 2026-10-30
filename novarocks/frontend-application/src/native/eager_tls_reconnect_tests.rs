@@ -228,7 +228,9 @@ async fn original_eager_tls_reconnect(retire_before_bracket: bool) -> Result<Out
         if retire_before_bracket && !runtime.invalidate_channel_if_current(original) {
             return Err("original current cache invalidation failed".into());
         }
-        let cached = runtime.cached_channel(&original.slot).ok_or(CacheRetired)?;
+        let cached = runtime
+            .cached_channel(original.slot())
+            .ok_or(CacheRetired)?;
         let bracket = Bracket {
             same_cached_generation: original.same_generation_for_test(&cached),
             cold_io: cold.data_connections,
@@ -238,7 +240,7 @@ async fn original_eager_tls_reconnect(retire_before_bracket: bool) -> Result<Out
             reconnect_positions: state.data_connections,
             reconnect_handshakes: state.data_handshakes,
             original_call_pending: pending(call.as_mut()).await,
-            original_lane_remaining: original.channel.available_streams(),
+            original_lane_remaining: original.channel().available_streams(),
             original_requests: state.requests,
         };
         bracket.check().map_err(|reason| BracketFailure {

@@ -1,0 +1,19 @@
+[package]
+name = "novarocks-coordination-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+novarocks-execution-contract.workspace = true
+novarocks-types.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

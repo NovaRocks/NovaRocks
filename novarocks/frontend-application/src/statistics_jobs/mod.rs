@@ -19,5 +19,4 @@
 
 pub mod application;
 pub(crate) mod attempt_executor;
-pub mod model;
 pub mod service;

@@ -89,7 +89,14 @@ pub async fn load_manifest_list(
     metadata: &TableMetadata,
 ) -> crate::iceberg::Result<ManifestList> {
     let bytes = file_io.new_input(snapshot.manifest_list())?.read().await?;
-    ManifestList::parse_with_version(&bytes, metadata.format_version())
+    decode_manifest_list(&bytes, metadata)
+}
+
+pub(crate) fn decode_manifest_list(
+    bytes: &[u8],
+    metadata: &TableMetadata,
+) -> crate::iceberg::Result<ManifestList> {
+    ManifestList::parse_with_version(bytes, metadata.format_version())
 }
 
 /// Read physical entries and inherit their snapshot and sequence facts from
@@ -99,10 +106,17 @@ pub async fn load_manifest(
     descriptor: &ManifestFile,
     file_io: &FileIO,
 ) -> crate::iceberg::Result<Manifest> {
+    let bytes = file_io.new_input(&descriptor.manifest_path)?.read().await?;
+    decode_manifest(&bytes, descriptor)
+}
+
+pub(crate) fn decode_manifest(
+    bytes: &[u8],
+    descriptor: &ManifestFile,
+) -> crate::iceberg::Result<Manifest> {
     // Iceberg's initial sequence is zero; the SDK keeps this constant private.
     const INITIAL_SEQUENCE_NUMBER: i64 = 0;
-    let bytes = file_io.new_input(&descriptor.manifest_path)?.read().await?;
-    let (entries, metadata) = Manifest::parse_avro(&bytes)?.into_parts();
+    let (entries, metadata) = Manifest::parse_avro(bytes)?.into_parts();
     let entries = entries
         .into_iter()
         .map(|entry| {
@@ -177,15 +191,15 @@ fn partition_field_values_checked(
     schema: &crate::iceberg::spec::Schema,
     spec_id: i32,
     partition: &crate::iceberg::spec::Struct,
-    budget: Option<&crate::read_snapshot::cow_capture::CaptureBudget<'_>>,
+    capture: Option<&crate::read_snapshot::cow_capture::CaptureScope<'_>>,
 ) -> Result<Vec<IcebergPartitionFieldValue>, crate::read_snapshot::cow_capture::ReadFailure> {
     let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
         return Err(format!("iceberg table metadata missing partition spec id {spec_id}").into());
     };
     let mut values = Vec::with_capacity(spec.fields().len());
     for (idx, field) in spec.fields().iter().enumerate() {
-        if let Some(budget) = budget {
-            budget.active()?;
+        if let Some(capture) = capture {
+            capture.active()?;
         }
         let source_column = schema
             .field_by_id(field.source_id)
@@ -488,23 +502,43 @@ pub(crate) async fn extract_data_files_with_stats_at_projected<O>(
     table: &Table,
     snapshot_id: i64,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+    project: impl FnMut(
+        DataFileWithStats,
+        std::sync::Arc<crate::read_model::IcebergDataFileMetadata>,
+        crate::delete_semantics::LoadView,
+    ) -> O,
+) -> Result<Vec<O>, String> {
+    let read_snapshot =
+        crate::read_snapshot::build_read_snapshot_at_with_control(table, snapshot_id, control)
+            .await?;
+    finish_data_files_with_stats_from_original_files(
+        table.metadata(),
+        snapshot_id,
+        read_snapshot.files,
+        control,
+        project,
+    )
+}
+
+/// The original pure projection, shared by scoped CPU continuations after the
+/// same complete manifest observation; no I/O or second manifest algorithm.
+pub(crate) fn finish_data_files_with_stats_from_original_files<O>(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    snapshot_id: i64,
+    files: Vec<crate::read_model::IcebergReadFile>,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
     mut project: impl FnMut(
         DataFileWithStats,
         std::sync::Arc<crate::read_model::IcebergDataFileMetadata>,
         crate::delete_semantics::LoadView,
     ) -> O,
 ) -> Result<Vec<O>, String> {
-    let metadata = table.metadata();
     let snapshot_schema = metadata
         .snapshot_by_id(snapshot_id)
         .ok_or_else(|| format!("Iceberg snapshot {snapshot_id} is absent from table metadata"))?
         .schema(metadata)
         .map_err(|error| format!("resolve Iceberg snapshot {snapshot_id} schema: {error}"))?;
-    let read_snapshot =
-        crate::read_snapshot::build_read_snapshot_at_with_control(table, snapshot_id, control)
-            .await?;
-    read_snapshot
-        .files
+    files
         .into_iter()
         .map(|file| {
             if let Some(control) = control {
@@ -614,7 +648,6 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_control(
 /// Original-window COW capture keeps all outputs under one neutral owner.
 pub(crate) struct CheckedCowDataFiles {
     pub files: Vec<FrozenReadFileWithStats>,
-    pub simultaneous_upper: u64,
     pub _retention_guard: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
 }
 
@@ -622,124 +655,86 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_original_scope(
     table: &Table,
     snapshot_id: i64,
     scope: &novarocks_spi::connector::ConnectorOriginalResultScope,
-    base_upper: u64,
 ) -> Result<CheckedCowDataFiles, novarocks_spi::connector::ConnectorCowBeginCause> {
-    use crate::read_snapshot::cow_capture::{
-        CaptureBudget, ReadFailure, geometry, partition, recipe,
-    };
-    use novarocks_spi::connector::ConnectorCowBeginCause;
+    use crate::read_snapshot::cow_capture::{CaptureScope, ReadFailure};
     let build = async {
-        let budget = CaptureBudget::new(scope, base_upper)?;
-        let metadata = table.metadata();
-        let snapshot_schema = metadata
-            .snapshot_by_id(snapshot_id)
-            .ok_or_else(|| format!("Iceberg snapshot {snapshot_id} is absent from table metadata"))?
-            .schema(metadata)
-            .map_err(|error| format!("resolve Iceberg snapshot {snapshot_id} schema: {error}"))?;
+        let capture = CaptureScope::new(scope)?;
         let captured = crate::read_snapshot::build_cow_read_files_at_with_original_scope(
             table,
             snapshot_id,
-            &budget,
+            &capture,
         )
         .await?;
-        budget.charge(recipe(geometry::slots::<
-            ConnectorCowBeginCause,
-            FrozenReadFileWithStats,
-        >(captured.len()))?)?;
-        let mut files = Vec::with_capacity(captured.len());
-        for file in captured {
-            budget.active()?;
-            let partition_field_values =
-                match (file.partition_spec_id, file.partition_values.as_ref()) {
-                    (Some(spec_id), Some(values)) => {
-                        if let Some(plan) =
-                            recipe(partition::field_values::<ConnectorCowBeginCause>(
-                                metadata,
-                                snapshot_schema.as_ref(),
-                                spec_id,
-                                values,
-                                &mut || scope.check_active().map_err(Into::into),
-                            ))?
-                        {
-                            budget.charge(plan.constructor_upper)?;
-                        }
-                        partition_field_values_checked(
-                            metadata,
-                            snapshot_schema.as_ref(),
-                            spec_id,
-                            values,
-                            Some(&budget),
-                        )?
-                    }
-                    _ => Vec::new(),
-                };
-            let mut delete_files = Vec::new();
-            for fact in file.deletes.members() {
-                budget.active()?;
-                budget.vector(&delete_files)?;
-                let mut upper = fact.address().path().len() as u64;
-                let tuple = fact.partition().json_owned_upper().ok_or_else(|| {
-                    ReadFailure::Semantic("COW delete tuple upper overflow".into())
-                })?;
-                upper = recipe(geometry::add::<ConnectorCowBeginCause>(
-                    upper,
-                    recipe(geometry::mul::<ConnectorCowBeginCause>(tuple, 2))?,
-                ))?;
-                match fact.kind() {
-                    crate::delete_semantics::DeleteKind::Position { exact_target } => {
-                        if let Some(target) = exact_target {
-                            upper = recipe(geometry::add::<ConnectorCowBeginCause>(
-                                upper,
-                                target.len() as u64,
-                            ))?;
-                        }
-                    }
-                    crate::delete_semantics::DeleteKind::DeletionVector { exact_target } => {
-                        upper = recipe(geometry::add::<ConnectorCowBeginCause>(
-                            upper,
-                            exact_target.len() as u64,
-                        ))?;
-                    }
-                    crate::delete_semantics::DeleteKind::Equality(group) => {
-                        upper = recipe(geometry::add::<ConnectorCowBeginCause>(
-                            upper,
-                            recipe(geometry::slots::<ConnectorCowBeginCause, i32>(
-                                group.fields().len(),
-                            ))?,
-                        ))?;
-                    }
-                }
-                budget.charge(upper)?;
-                delete_files.push(canonical_delete_to_catalog_delete(fact)?);
-            }
-            let stats = DataFileWithStats {
-                path: file.path,
-                size: file.size,
-                record_count: file.record_count,
-                column_stats: file.column_stats,
-                partition_spec_id: file.partition_spec_id,
-                partition_key: file.partition_key,
-                partition_values: file.partition_values,
-                manifest_path: file.manifest_path,
-                partition_field_values,
-                first_row_id: file.first_row_id,
-                data_sequence_number: file.data_sequence_number,
-                delete_files,
-            };
-            files.push(FrozenReadFileWithStats::retain(
-                stats,
-                file.manifest,
-                file.deletes,
-            ));
-        }
-        budget.active()?;
-        Ok::<_, ReadFailure>(CheckedCowDataFiles {
-            files,
-            simultaneous_upper: budget.upper(),
-            _retention_guard: scope.retention_guard(),
-        })
+        finish_checked_cow_data_files_from_original_files(
+            table.metadata(),
+            snapshot_id,
+            captured,
+            scope,
+            &capture,
+        )
     };
     build.await.map_err(ReadFailure::into_cause)
+}
+
+/// Pure checked projection of the same original raw files. The caller retains
+/// its original operation and the exact captured files.
+pub(crate) fn finish_checked_cow_data_files_from_original_files(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    snapshot_id: i64,
+    captured: Vec<crate::read_model::IcebergReadFile>,
+    scope: &novarocks_spi::connector::ConnectorOriginalResultScope,
+    capture: &crate::read_snapshot::cow_capture::CaptureScope<'_>,
+) -> Result<CheckedCowDataFiles, crate::read_snapshot::cow_capture::ReadFailure> {
+    use crate::read_snapshot::cow_capture::ReadFailure;
+    let snapshot_schema = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("Iceberg snapshot {snapshot_id} is absent from table metadata"))?
+        .schema(metadata)
+        .map_err(|error| format!("resolve Iceberg snapshot {snapshot_id} schema: {error}"))?;
+    let mut files = Vec::with_capacity(captured.len());
+    for file in captured {
+        capture.active()?;
+        let partition_field_values = match (file.partition_spec_id, file.partition_values.as_ref())
+        {
+            (Some(spec_id), Some(values)) => partition_field_values_checked(
+                metadata,
+                snapshot_schema.as_ref(),
+                spec_id,
+                values,
+                Some(capture),
+            )?,
+            _ => Vec::new(),
+        };
+        let mut delete_files = Vec::new();
+        for fact in file.deletes.members() {
+            capture.active()?;
+            delete_files.push(canonical_delete_to_catalog_delete(fact)?);
+        }
+        let stats = DataFileWithStats {
+            path: file.path,
+            size: file.size,
+            record_count: file.record_count,
+            column_stats: file.column_stats,
+            partition_spec_id: file.partition_spec_id,
+            partition_key: file.partition_key,
+            partition_values: file.partition_values,
+            manifest_path: file.manifest_path,
+            partition_field_values,
+            first_row_id: file.first_row_id,
+            data_sequence_number: file.data_sequence_number,
+            delete_files,
+        };
+        files.push(FrozenReadFileWithStats::retain(
+            stats,
+            file.manifest,
+            file.deletes,
+        ));
+    }
+    capture.active()?;
+    Ok::<_, ReadFailure>(CheckedCowDataFiles {
+        files,
+        _retention_guard: scope.retention_guard(),
+    })
 }
 
 pub async fn extract_data_files_with_stats(

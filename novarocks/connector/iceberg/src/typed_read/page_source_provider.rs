@@ -834,7 +834,7 @@ mod tests {
             Field::new("id", DataType::Int64, false).with_metadata(
                 [(PARQUET_FIELD_ID_META_KEY.to_owned(), "1".to_owned())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         ]));
         let file = std::fs::File::create(&path).expect("create data file");

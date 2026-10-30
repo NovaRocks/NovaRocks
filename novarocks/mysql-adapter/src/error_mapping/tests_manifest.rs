@@ -39,7 +39,7 @@ fn every_active_manifest_descriptor_has_exactly_one_adapter_wire_mapping() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         descriptor_codes.len(),
-        31 + novarocks_query_application::execution_error::EXECUTION_ERROR_CODE_DESCRIPTORS.len()
+        32 + novarocks_query_application::execution_error::EXECUTION_ERROR_CODE_DESCRIPTORS.len()
     );
     for code in descriptor_codes {
         assert!(

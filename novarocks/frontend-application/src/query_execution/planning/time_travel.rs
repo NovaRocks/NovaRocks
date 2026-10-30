@@ -242,169 +242,195 @@ impl_kernel_time_travel_resolver!(DmlExecutionKernel);
 ///      so that `SELECT t.col FROM t FOR VERSION AS OF ...` resolves `t.col`.
 ///
 /// Tables without a version clause are left untouched.
-pub(crate) fn rewrite_time_travel_refs(
-    resolver: &impl TimeTravelResolver,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &mut Query,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), TimeTravelRewriteError> {
-    // Walk CTEs
-    if let Some(with) = &mut query.with {
-        for cte in &mut with.ctes {
-            rewrite_time_travel_in_query(
-                resolver,
-                current_catalog,
-                current_database,
-                cte.query.as_mut(),
-                connector_context,
-            )?;
-        }
-    }
-    rewrite_time_travel_in_set_expr(
-        resolver,
-        current_catalog,
-        current_database,
-        query.body.as_mut(),
-        connector_context,
-    )
-}
-
-fn rewrite_time_travel_in_query(
-    resolver: &impl TimeTravelResolver,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &mut Query,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), TimeTravelRewriteError> {
-    if let Some(with) = &mut query.with {
-        for cte in &mut with.ctes {
-            rewrite_time_travel_in_query(
-                resolver,
-                current_catalog,
-                current_database,
-                cte.query.as_mut(),
-                connector_context,
-            )?;
-        }
-    }
-    rewrite_time_travel_in_set_expr(
-        resolver,
-        current_catalog,
-        current_database,
-        query.body.as_mut(),
-        connector_context,
-    )
-}
-
-fn rewrite_time_travel_in_set_expr(
-    resolver: &impl TimeTravelResolver,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    expr: &mut SetExpr,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), TimeTravelRewriteError> {
-    match expr {
-        SetExpr::Select(select) => {
-            for tw in &mut select.from {
-                rewrite_time_travel_in_factor(
+pub(crate) fn rewrite_time_travel_refs_async<'a>(
+    resolver: &'a (impl TimeTravelResolver + Sync),
+    current_catalog: Option<&'a str>,
+    current_database: &'a str,
+    query: &'a mut Query,
+    connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), TimeTravelRewriteError>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        // Walk CTEs
+        if let Some(with) = &mut query.with {
+            for cte in &mut with.ctes {
+                rewrite_time_travel_in_query_async(
                     resolver,
                     current_catalog,
                     current_database,
-                    &mut tw.relation,
+                    cte.query.as_mut(),
                     connector_context,
-                )?;
-                for join in &mut tw.joins {
-                    rewrite_time_travel_in_factor(
-                        resolver,
-                        current_catalog,
-                        current_database,
-                        &mut join.relation,
-                        connector_context,
-                    )?;
-                }
+                )
+                .await?;
             }
-            Ok(())
         }
-        SetExpr::SetOperation(operation) => {
-            rewrite_time_travel_in_set_expr(
-                resolver,
-                current_catalog,
-                current_database,
-                operation.left.as_mut(),
-                connector_context,
-            )?;
-            rewrite_time_travel_in_set_expr(
-                resolver,
-                current_catalog,
-                current_database,
-                operation.right.as_mut(),
-                connector_context,
-            )
-        }
-        SetExpr::Query(q) => rewrite_time_travel_in_query(
+        rewrite_time_travel_in_set_expr_async(
             resolver,
             current_catalog,
             current_database,
-            q.as_mut(),
+            query.body.as_mut(),
             connector_context,
-        ),
-        _ => Ok(()),
-    }
+        )
+        .await
+    })
 }
 
-fn rewrite_time_travel_in_factor(
-    resolver: &impl TimeTravelResolver,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    factor: &mut TableFactor,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), TimeTravelRewriteError> {
-    match factor {
-        TableFactor::Table {
-            name,
-            version,
-            alias,
-            ..
-        } if version.is_some() => {
-            let version_clause = version.take().expect("checked is_some above");
-
-            // Extract name parts for our ObjectName lookup
-            let parts: Vec<String> = name
-                .parts
-                .iter()
-                .map(|ident| ident.value.to_ascii_lowercase())
-                .collect();
-
-            if parts.is_empty() {
-                return Err("iceberg time travel: table name has no identifier parts"
-                    .to_string()
-                    .into());
+fn rewrite_time_travel_in_query_async<'a>(
+    resolver: &'a (impl TimeTravelResolver + Sync),
+    current_catalog: Option<&'a str>,
+    current_database: &'a str,
+    query: &'a mut Query,
+    connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), TimeTravelRewriteError>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        if let Some(with) = &mut query.with {
+            for cte in &mut with.ctes {
+                rewrite_time_travel_in_query_async(
+                    resolver,
+                    current_catalog,
+                    current_database,
+                    cte.query.as_mut(),
+                    connector_context,
+                )
+                .await?;
             }
+        }
+        rewrite_time_travel_in_set_expr_async(
+            resolver,
+            current_catalog,
+            current_database,
+            query.body.as_mut(),
+            connector_context,
+        )
+        .await
+    })
+}
 
-            // Reject the combination of branch/tag suffix with FOR VERSION/TIMESTAMP AS OF.
-            if let Some(last) = parts.last() {
-                for prefix in &["branch_", "tag_"] {
-                    if let Some(ref_name) = last.strip_prefix(prefix)
-                        && !ref_name.is_empty()
-                    {
-                        return Err(format!(
+fn rewrite_time_travel_in_set_expr_async<'a>(
+    resolver: &'a (impl TimeTravelResolver + Sync),
+    current_catalog: Option<&'a str>,
+    current_database: &'a str,
+    expr: &'a mut SetExpr,
+    connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), TimeTravelRewriteError>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        match expr {
+            SetExpr::Select(select) => {
+                for tw in &mut select.from {
+                    rewrite_time_travel_in_factor_async(
+                        resolver,
+                        current_catalog,
+                        current_database,
+                        &mut tw.relation,
+                        connector_context,
+                    )
+                    .await?;
+                    for join in &mut tw.joins {
+                        rewrite_time_travel_in_factor_async(
+                            resolver,
+                            current_catalog,
+                            current_database,
+                            &mut join.relation,
+                            connector_context,
+                        )
+                        .await?;
+                    }
+                }
+                Ok(())
+            }
+            SetExpr::SetOperation(operation) => {
+                rewrite_time_travel_in_set_expr_async(
+                    resolver,
+                    current_catalog,
+                    current_database,
+                    operation.left.as_mut(),
+                    connector_context,
+                )
+                .await?;
+                rewrite_time_travel_in_set_expr_async(
+                    resolver,
+                    current_catalog,
+                    current_database,
+                    operation.right.as_mut(),
+                    connector_context,
+                )
+                .await
+            }
+            SetExpr::Query(q) => {
+                rewrite_time_travel_in_query_async(
+                    resolver,
+                    current_catalog,
+                    current_database,
+                    q.as_mut(),
+                    connector_context,
+                )
+                .await
+            }
+            _ => Ok(()),
+        }
+    })
+}
+
+fn rewrite_time_travel_in_factor_async<'a>(
+    resolver: &'a (impl TimeTravelResolver + Sync),
+    current_catalog: Option<&'a str>,
+    current_database: &'a str,
+    factor: &'a mut TableFactor,
+    connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), TimeTravelRewriteError>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        match factor {
+            TableFactor::Table {
+                name,
+                version,
+                alias,
+                ..
+            } if version.is_some() => {
+                let version_clause = version.take().expect("checked is_some above");
+
+                // Extract name parts for our ObjectName lookup
+                let parts: Vec<String> = name
+                    .parts
+                    .iter()
+                    .map(|ident| ident.value.to_ascii_lowercase())
+                    .collect();
+
+                if parts.is_empty() {
+                    return Err("iceberg time travel: table name has no identifier parts"
+                        .to_string()
+                        .into());
+                }
+
+                // Reject the combination of branch/tag suffix with FOR VERSION/TIMESTAMP AS OF.
+                if let Some(last) = parts.last() {
+                    for prefix in &["branch_", "tag_"] {
+                        if let Some(ref_name) = last.strip_prefix(prefix)
+                            && !ref_name.is_empty()
+                        {
+                            return Err(format!(
                             "iceberg ref: branch suffix '.{}_{}' conflicts with FOR VERSION AS OF clause",
                             prefix.trim_end_matches('_'),
                             ref_name,
                         )
                         .into());
+                        }
                     }
                 }
-            }
 
-            let name_span = name.span;
-            let our_name = ObjectName { parts };
-            let target =
-                resolve_table_target(resolver, &our_name, current_catalog, current_database)?;
+                let name_span = name.span;
+                let our_name = ObjectName { parts };
+                let target =
+                    resolve_table_target(resolver, &our_name, current_catalog, current_database)?;
 
-            if target.provider_id.as_str() != "iceberg" {
-                return Err(format!(
+                if target.provider_id.as_str() != "iceberg" {
+                    return Err(format!(
                     "iceberg time travel: table '{}' is not an Iceberg table; time travel is only supported for Iceberg",
                     our_name
                         .parts
@@ -413,119 +439,135 @@ fn rewrite_time_travel_in_factor(
                         .as_str()
                 )
                 .into());
-            }
+                }
 
-            let fqn = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
-            // Time-travel fact resolution is catalog admission.  Resolve all
-            // facts from one exact control generation; the synthetic table is
-            // subsequently admitted by the query-local materializer.
-            let lease = crate::connector::acquire_metadata_planning_lease(
-                resolver.connector_control(),
-                &target.catalog,
-            )?;
-            let facts = crate::connector::metadata_read_reference_facts_with_planning_lease(
-                lease,
-                connector_context.clone(),
-                &target.namespace,
-                &target.table,
-            )?;
-            let metadata = project_iceberg_ref_metadata(&facts)?;
-            let binding = resolve_time_travel_snapshot_binding(&version_clause, &metadata, &fqn)?;
-            let snapshot_id = binding.snapshot_id();
+                let fqn = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
+                // Time-travel fact resolution is catalog admission.  Resolve all
+                // facts from one exact control generation; the synthetic table is
+                // subsequently admitted by the query-local materializer.
+                let lease = crate::connector::acquire_metadata_planning_lease(
+                    resolver.connector_control(),
+                    &target.catalog,
+                )?;
+                let facts =
+                    crate::connector::metadata_read_reference_facts_with_planning_lease_async(
+                        lease,
+                        connector_context.clone(),
+                        &target.namespace,
+                        &target.table,
+                    )
+                    .await?;
+                let metadata = project_iceberg_ref_metadata(&facts)?;
+                let binding =
+                    resolve_time_travel_snapshot_binding(&version_clause, &metadata, &fqn)?;
+                let snapshot_id = binding.snapshot_id();
 
-            // A time-travel identity is query-local.  The synthetic name is
-            // only an analyzer key; its exact snapshot table and planning
-            // lease remain in the binding store and never enter the shared
-            // in-memory catalog.
-            let synthetic_table_name = format!("__sqlx1_tt_{}_{}", target.table, snapshot_id);
+                // A time-travel identity is query-local.  The synthetic name is
+                // only an analyzer key; its exact snapshot table and planning
+                // lease remain in the binding store and never enter the shared
+                // in-memory catalog.
+                let synthetic_table_name = format!("__sqlx1_tt_{}_{}", target.table, snapshot_id);
 
-            // Rewrite the AST node in-place:
-            // - Set alias to original table name if user didn't specify one
-            // - Replace name with the synthetic name resolved against the target namespace
-            // - version is already cleared (we took it above)
-            if alias.is_none() {
-                // Infer the original table alias from the last non-catalog part of the name
-                let original_leaf = our_name
-                    .parts
-                    .last()
-                    .expect("checked nonempty table name")
-                    .clone();
-                *alias = Some(TableAlias {
-                    name: Ident {
-                        value: original_leaf,
-                        quoted: false,
-                        quote_style: None,
+                // Rewrite the AST node in-place:
+                // - Set alias to original table name if user didn't specify one
+                // - Replace name with the synthetic name resolved against the target namespace
+                // - version is already cleared (we took it above)
+                if alias.is_none() {
+                    // Infer the original table alias from the last non-catalog part of the name
+                    let original_leaf = our_name
+                        .parts
+                        .last()
+                        .expect("checked nonempty table name")
+                        .clone();
+                    *alias = Some(TableAlias {
+                        name: Ident {
+                            value: original_leaf,
+                            quoted: false,
+                            quote_style: None,
+                            span: name_span,
+                        },
+                        columns: vec![],
+                        explicit_as: false,
                         span: name_span,
-                    },
-                    columns: vec![],
-                    explicit_as: false,
+                    });
+                }
+
+                // Route the synthetic analyzer identity through the canonical
+                // connector catalog so the query catalog materializer resolves the
+                // query-local binding above instead of consulting global state.
+                *name = ParserObjectName {
+                    parts: vec![target.catalog, target.namespace, synthetic_table_name]
+                        .into_iter()
+                        .map(|value| Ident {
+                            value,
+                            quoted: false,
+                            quote_style: None,
+                            span: name_span,
+                        })
+                        .collect(),
                     span: name_span,
-                });
+                };
+
+                Ok(())
             }
-
-            // Route the synthetic analyzer identity through the canonical
-            // connector catalog so the query catalog materializer resolves the
-            // query-local binding above instead of consulting global state.
-            *name = ParserObjectName {
-                parts: vec![target.catalog, target.namespace, synthetic_table_name]
-                    .into_iter()
-                    .map(|value| Ident {
-                        value,
-                        quoted: false,
-                        quote_style: None,
-                        span: name_span,
-                    })
-                    .collect(),
-                span: name_span,
-            };
-
-            Ok(())
+            TableFactor::Table { .. } => Ok(()),
+            TableFactor::Derived { subquery, .. } => {
+                rewrite_time_travel_in_query_async(
+                    resolver,
+                    current_catalog,
+                    current_database,
+                    subquery.as_mut(),
+                    connector_context,
+                )
+                .await
+            }
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
+                rewrite_time_travel_in_table_with_joins_async(
+                    resolver,
+                    current_catalog,
+                    current_database,
+                    table_with_joins,
+                    connector_context,
+                )
+                .await
+            }
+            _ => Ok(()),
         }
-        TableFactor::Table { .. } => Ok(()),
-        TableFactor::Derived { subquery, .. } => rewrite_time_travel_in_query(
-            resolver,
-            current_catalog,
-            current_database,
-            subquery.as_mut(),
-            connector_context,
-        ),
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => rewrite_time_travel_in_table_with_joins(
-            resolver,
-            current_catalog,
-            current_database,
-            table_with_joins,
-            connector_context,
-        ),
-        _ => Ok(()),
-    }
+    })
 }
 
-fn rewrite_time_travel_in_table_with_joins(
-    resolver: &impl TimeTravelResolver,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    table: &mut TableWithJoins,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), TimeTravelRewriteError> {
-    rewrite_time_travel_in_factor(
-        resolver,
-        current_catalog,
-        current_database,
-        &mut table.relation,
-        connector_context,
-    )?;
-    for join in &mut table.joins {
-        rewrite_time_travel_in_factor(
+fn rewrite_time_travel_in_table_with_joins_async<'a>(
+    resolver: &'a (impl TimeTravelResolver + Sync),
+    current_catalog: Option<&'a str>,
+    current_database: &'a str,
+    table: &'a mut TableWithJoins,
+    connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), TimeTravelRewriteError>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        rewrite_time_travel_in_factor_async(
             resolver,
             current_catalog,
             current_database,
-            &mut join.relation,
+            &mut table.relation,
             connector_context,
-        )?;
-    }
-    Ok(())
+        )
+        .await?;
+        for join in &mut table.joins {
+            rewrite_time_travel_in_factor_async(
+                resolver,
+                current_catalog,
+                current_database,
+                &mut join.relation,
+                connector_context,
+            )
+            .await?;
+        }
+        Ok(())
+    })
 }
 
 /// Resolve statement-level connector schema facts without registering a

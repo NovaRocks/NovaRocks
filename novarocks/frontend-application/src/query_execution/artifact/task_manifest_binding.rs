@@ -79,6 +79,31 @@ impl BoundManifestBackend {
     }
 }
 
+/// An exact attempt Task's declared writer/target occurrence, read from the
+/// immutable template this manifest retained. It grants no deletion authority
+/// and does not enumerate unknown BE-local driver/object identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BoundWriterCohort {
+    plan: novarocks_query_application::api::PlanSeal,
+    task: TaskIdentity,
+    fragment: FragmentId,
+    writer: crate::native::fragment_encoder::frozen::StaticTableWriter,
+}
+impl BoundWriterCohort {
+    pub(crate) const fn plan(self) -> novarocks_query_application::api::PlanSeal {
+        self.plan
+    }
+    pub(crate) const fn task(self) -> TaskIdentity {
+        self.task
+    }
+    pub(crate) const fn fragment(self) -> FragmentId {
+        self.fragment
+    }
+    pub(crate) const fn writer(self) -> crate::native::fragment_encoder::frozen::StaticTableWriter {
+        self.writer
+    }
+}
+
 /// One exact scheduled context and its complete frozen backend facts.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct BoundManifestContext {
@@ -336,8 +361,14 @@ impl FrozenAttemptTopology {
         self.revision
     }
 
-    fn into_parts(self) -> (u64, BTreeMap<BackendProcessId, BoundManifestBackend>) {
-        (self.revision, self.backends)
+    fn into_parts(
+        self,
+    ) -> (
+        u64,
+        BTreeMap<BackendProcessId, BoundManifestBackend>,
+        Box<[BackendProcessId]>,
+    ) {
+        (self.revision, self.backends, self.eligible_backends)
     }
 }
 
@@ -351,6 +382,7 @@ impl FrozenAttemptTopology {
 pub(crate) struct TaskManifestBinding {
     execution: QueryExecutionId,
     topology_revision: u64,
+    eligible_backends: Box<[BackendProcessId]>,
     native_template: RequestBoundNativeTemplate,
     tasks: Box<[BoundManifestTask]>,
     contexts: Box<[BoundManifestContext]>,
@@ -373,6 +405,155 @@ impl std::fmt::Debug for TaskManifestBinding {
 }
 
 impl TaskManifestBinding {
+    /// Reentry uses the exact original placement without allocating a second
+    /// graph or accepting execution/process identity as a substitute for it.
+    pub(crate) fn validate_schedule(
+        &self,
+        schedule: &AttemptSchedule,
+    ) -> Result<(), DistributedQueryError> {
+        let same =
+            self.execution == schedule.execution()
+                && self.root == schedule.root()
+                && self
+                    .contexts
+                    .iter()
+                    .map(|context| context.context())
+                    .eq(schedule.contexts().iter().copied())
+                && self.tasks.len()
+                    == schedule
+                        .fragments()
+                        .iter()
+                        .map(|fragment| fragment.tasks().len())
+                        .sum::<usize>()
+                && self
+                    .tasks
+                    .iter()
+                    .zip(schedule.fragments().iter().flat_map(|fragment| {
+                        fragment.tasks().iter().map(move |task| (fragment, task))
+                    }))
+                    .all(|(bound, (fragment, task))| {
+                        bound.fragment_id == fragment.fragment_id()
+                            && bound.identity.stage_id() == fragment.stage_id()
+                            && bound.identity == task.identity()
+                            && bound.context == task.context()
+                            && bound.instance_index == task.instance_index()
+                            && bound.scan_work.len() == task.scan_work().len()
+                            && bound
+                                .scan_work
+                                .iter()
+                                .zip(task.scan_work())
+                                .all(|(old, new)| {
+                                    let assignment = match new.assignment() {
+                                        ScheduledScanAssignment::RuntimeSplits => {
+                                            BoundManifestScanAssignment::RuntimeSplits
+                                        }
+                                        ScheduledScanAssignment::FrozenUnits { units } => {
+                                            BoundManifestScanAssignment::FrozenUnits(
+                                                BoundManifestFrozenUnits::from_scheduled(*units),
+                                            )
+                                        }
+                                    };
+                                    old.scan == new.scan() && old.assignment == assignment
+                                })
+                    })
+                && self.edges.len() == schedule.edges().len()
+                && self.edges.iter().zip(schedule.edges()).all(|(old, new)| {
+                    old.edge_id == new.edge_id()
+                        && old.source_fragment_id == new.source_fragment_id()
+                        && old.target_fragment_id == new.target_fragment_id()
+                        && old.target_exchange_node_id == new.target_exchange_node_id()
+                        && old.sender_count == new.sender_count()
+                        && old.destinations.as_ref() == new.destinations()
+                        && old.producers.len() == new.producers().len()
+                        && old.producers.iter().zip(new.producers()).all(|(old, new)| {
+                            old.task == new.task() && old.sender_ordinal == new.sender_ordinal()
+                        })
+                });
+        if same {
+            Ok(())
+        } else {
+            Err(contract_error(
+                "qualification reentry changed the original bound schedule",
+            ))
+        }
+    }
+
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(crate) fn qualification_fixture_for_test(
+        execution: QueryExecutionId,
+        processes: &[BackendProcessId; 3],
+        selected: usize,
+    ) -> (Self, AttemptSchedule) {
+        tests::qualification_fixture(execution, processes, selected)
+    }
+
+    /// Finite neutral protocol topology from the caller's exact attempt and
+    /// placements. This does not create a request ticket or executable Router.
+    #[cfg(test)]
+    pub(crate) fn protocol_fixture_for_test(
+        execution: QueryExecutionId,
+        frontend: novarocks_types::FrontendProcessId,
+        schedule: &crate::query_execution::schedule::SchedulingPlan,
+        edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+        processes: &BTreeMap<usize, BackendProcessId>,
+        fragments: BTreeMap<
+            FragmentId,
+            std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+        >,
+    ) -> Result<Self, DistributedQueryError> {
+        let (template, scheduled, topology) =
+            protocol_fixture_inputs(execution, frontend, schedule, edges, processes, fragments)?;
+        Self::bind(template, &scheduled, topology)
+    }
+
+    /// Exercise the real bind rejection with one exact endpoint fact absent.
+    #[cfg(test)]
+    pub(crate) fn protocol_missing_backend_for_test(
+        execution: QueryExecutionId,
+        frontend: novarocks_types::FrontendProcessId,
+        schedule: &crate::query_execution::schedule::SchedulingPlan,
+        edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+        processes: &BTreeMap<usize, BackendProcessId>,
+        fragments: BTreeMap<
+            FragmentId,
+            std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+        >,
+        missing: usize,
+    ) -> Result<Self, DistributedQueryError> {
+        let (template, scheduled, topology) =
+            protocol_fixture_inputs(execution, frontend, schedule, edges, processes, fragments)?;
+        let (revision, mut backends, eligible) = topology.into_parts();
+        let process = processes
+            .get(&missing)
+            .ok_or_else(|| contract_error("negative fixture must name an original backend"))?;
+        backends.remove(process);
+        Self::bind_facts(
+            template,
+            execution,
+            ScheduleFacts::from_schedule(&scheduled),
+            revision,
+            backends,
+            eligible,
+        )
+    }
+
+    /// The production collision recorder rejects the same two original keys.
+    #[cfg(test)]
+    pub(crate) fn protocol_collision_for_test(
+        first: UniqueId,
+        second: UniqueId,
+    ) -> Result<(), DistributedQueryError> {
+        let mut seen = BTreeSet::new();
+        derive_and_record_fragment_instance_id(&mut seen, || Ok(first))?;
+        derive_and_record_fragment_instance_id(&mut seen, || Ok(second))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn original_writer_occurrences_for_test() -> Vec<BoundWriterCohort> {
+        tests::original_writer_occurrences()
+    }
+
     pub(super) const fn request_bound_native(&self) -> &RequestBoundNativeTemplate {
         &self.native_template
     }
@@ -384,13 +565,14 @@ impl TaskManifestBinding {
     ) -> Result<Self, DistributedQueryError> {
         let RequestBoundNativeTemplate { execution, .. } = bound_template;
         let facts = ScheduleFacts::from_schedule(schedule);
-        let (topology_revision, backends) = topology.into_parts();
+        let (topology_revision, backends, eligible_backends) = topology.into_parts();
         Self::bind_facts(
             bound_template,
             execution,
             facts,
             topology_revision,
             backends,
+            eligible_backends,
         )
     }
 
@@ -400,6 +582,7 @@ impl TaskManifestBinding {
         schedule: ScheduleFacts,
         topology_revision: u64,
         endpoint_by_process: BTreeMap<BackendProcessId, BoundManifestBackend>,
+        eligible_backends: Box<[BackendProcessId]>,
     ) -> Result<Self, DistributedQueryError> {
         validate_schedule_execution(expected_execution, schedule.execution)?;
         let prepared = PreparedManifestFacts::from_template(&bound_template.template)?;
@@ -613,12 +796,19 @@ impl TaskManifestBinding {
         Ok(Self {
             execution: expected_execution,
             topology_revision,
+            eligible_backends,
             native_template: bound_template,
             tasks: bound_tasks.into_boxed_slice(),
             contexts: bound_contexts.into_boxed_slice(),
             edges: bound_edges.into_boxed_slice(),
             root: schedule.root,
         })
+    }
+
+    /// The original selection survives binding even when only a subset has Tasks.
+    /// This is the same Box from FrozenAttemptTopology, including exclusions.
+    pub(crate) fn eligible_backends(&self) -> &[BackendProcessId] {
+        &self.eligible_backends
     }
 
     pub(crate) const fn execution(&self) -> QueryExecutionId {
@@ -633,8 +823,82 @@ impl TaskManifestBinding {
         self.topology_revision
     }
 
+    /// Borrow the existing frozen occurrence list; no per-Task list is cloned.
+    /// Binding already proved that every Task's fragment is in this template.
+    pub(crate) fn writer_cohorts(&self) -> impl Iterator<Item = BoundWriterCohort> + '_ {
+        let template = &self.native_template.template;
+        bound_writer_cohorts(template.plan(), &self.tasks, &template.native_template)
+    }
+
+    /// Each exact Task that owns the independent summary output of its
+    /// retained checked package. The edge is semantic identity, not a branch ordinal.
+    pub(crate) fn summary_sources(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            TaskIdentity,
+            crate::native::fragment_encoder::frozen::StaticSinkTarget,
+        ),
+    > + '_ {
+        bound_summary_sources(&self.tasks, &self.native_template.template.native_template)
+    }
+
+    pub(crate) fn validate_submission_fragment(
+        &self,
+        execution: QueryExecutionId,
+        fragment: &std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+    ) -> Result<(), DistributedQueryError> {
+        validate_schedule_execution(self.execution, execution)?;
+        let id = fragment.facts().fragment_id();
+        let original = self
+            .native_template
+            .template
+            .native_template
+            .get(id)
+            .ok_or_else(|| {
+                contract_error(format!(
+                    "submission fragment {id} is absent from its retained Native template"
+                ))
+            })?;
+        if !std::sync::Arc::ptr_eq(original, fragment) {
+            return Err(contract_error(format!(
+                "submission fragment {id} belongs to another frozen Native artifact"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn tasks(&self) -> &[BoundManifestTask] {
         &self.tasks
+    }
+
+    /// Finite facts for actual participant contexts, not all eligible members.
+    /// Both original endpoints are projected; the original paid builder performs
+    /// canonical union/dedup. This iterator allocates no second backend list,
+    /// invokes no network/callback, and carries no admission authority.
+    pub(crate) fn selected_network_origins<'a>(
+        &'a self,
+        transport: &'a novarocks_native_adapter::FrontendNativeTransport,
+    ) -> impl Iterator<
+        Item = Result<
+            novarocks_resource_contract::SelectedNetworkOrigin<'a>,
+            novarocks_resource_contract::DependencyFactError,
+        >,
+    > + 'a {
+        self.contexts.iter().flat_map(move |context| {
+            let descriptor = context.backend().target().descriptor();
+            [
+                descriptor.endpoint().native_endpoint(),
+                descriptor.control_endpoint().native_endpoint(),
+            ]
+            .into_iter()
+            .map(move |endpoint| transport.selected_network_origin(endpoint))
+        })
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn remote_writer_sender(&self) -> Option<TaskIdentity> {
+        select_remote_writer_sender(self.writer_cohorts(), self.root, &self.edges)
     }
 
     pub(crate) fn contexts(&self) -> &[BoundManifestContext] {
@@ -650,10 +914,71 @@ impl TaskManifestBinding {
     }
 }
 
+#[cfg(novarocks_dev_controls)]
+fn select_remote_writer_sender(
+    writers: impl Iterator<Item = BoundWriterCohort>,
+    root: TaskIdentity,
+    edges: &[BoundManifestEdge],
+) -> Option<TaskIdentity> {
+    // A fixture selects one existing original; this is no writer-count policy.
+    writers
+        .map(|writer| writer.task())
+        .filter(|task| {
+            *task != root
+                && task.backend_process_id() != root.backend_process_id()
+                && edges.iter().any(|edge| {
+                    edge.producers().iter().any(|source| source.task() == *task)
+                        && edge.destinations().contains(&root)
+                })
+        })
+        .min()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProjectedScanAssignment {
     RuntimeSplits,
     FrozenUnits(BoundManifestFrozenUnits),
+}
+
+fn bound_summary_sources<'a>(
+    tasks: &'a [BoundManifestTask],
+    fragments: &'a crate::query_execution::native_fragment::NativeFragmentAttachment,
+) -> impl Iterator<
+    Item = (
+        TaskIdentity,
+        crate::native::fragment_encoder::frozen::StaticSinkTarget,
+    ),
+> + 'a {
+    tasks.iter().filter_map(move |task| {
+        fragments
+            .get(task.fragment_id)
+            .expect("bound Task fragment belongs to its retained Native template")
+            .facts()
+            .logical_summary_output()
+            .map(|output| (task.identity, output))
+    })
+}
+
+fn bound_writer_cohorts<'a>(
+    plan: novarocks_query_application::api::PlanSeal,
+    tasks: &'a [BoundManifestTask],
+    fragments: &'a crate::query_execution::native_fragment::NativeFragmentAttachment,
+) -> impl Iterator<Item = BoundWriterCohort> + 'a {
+    tasks.iter().flat_map(move |task| {
+        fragments
+            .get(task.fragment_id)
+            .expect("bound Task fragment belongs to its retained Native template")
+            .facts()
+            .table_writers()
+            .iter()
+            .copied()
+            .map(move |writer| BoundWriterCohort {
+                plan,
+                task: task.identity,
+                fragment: task.fragment_id,
+                writer,
+            })
+    })
 }
 
 impl ProjectedScanAssignment {
@@ -1263,8 +1588,195 @@ fn validate_schedule_execution(
     }
 }
 
+/// Only the existing development test graph calls this value fixture. Its
+/// supplied Result/Stream bytes and neutral control DAG remain separate; no
+/// provider, runtime or application preparation ticket is manufactured.
+#[cfg(test)]
+fn protocol_fixture_inputs(
+    execution: QueryExecutionId,
+    frontend: novarocks_types::FrontendProcessId,
+    schedule: &crate::query_execution::schedule::SchedulingPlan,
+    edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+    processes: &BTreeMap<usize, BackendProcessId>,
+    fragments: BTreeMap<
+        FragmentId,
+        std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+    >,
+) -> Result<
+    (
+        RequestBoundNativeTemplate,
+        AttemptSchedule,
+        FrozenAttemptTopology,
+    ),
+    DistributedQueryError,
+> {
+    use super::native_submission::{
+        NativeSubmissionFragmentRole, SubmissionFragmentFacts, SubmissionPlanFacts,
+    };
+    use crate::query_execution::fragment_scheduling::{
+        FragmentSchedulingFacts, SchedulingEdgeFacts, SchedulingFragmentFacts, SchedulingScanFacts,
+        SchedulingStreamKind,
+    };
+    use std::sync::Arc;
+    let order = schedule.by_fragment.keys().copied().collect::<Vec<_>>();
+    let scheduling = FragmentSchedulingFacts {
+        handoff_id: 9,
+        order: order.clone(),
+        anchor: schedule.root_fragment_id,
+        fragments: schedule.by_fragment.iter().map(|(&fragment, placements)| {
+            let first = placements.first().ok_or_else(|| contract_error("protocol fixture fragment has no placement"))?;
+            let scans = first.scan_ranges.keys().map(|&node| SchedulingScanFacts {
+                node_id: node,
+                ranges: Vec::new(),
+                runtime_splits: Some(novarocks_query_application::api::RuntimeSplitPlacement::Spread),
+            }).collect();
+            for placement in placements {
+                if placement.scan_ranges.keys().ne(first.scan_ranges.keys()) || placement.scan_ranges.values().any(|ranges| !ranges.is_empty()) {
+                    return Err(contract_error("finite protocol fixture requires its original empty runtime-split assignments"));
+                }
+            }
+            Ok((fragment, SchedulingFragmentFacts { placement: novarocks_physical_plan::StagePlacementPolicy::ScanWork, scans }))
+        }).collect::<Result<_, DistributedQueryError>>()?,
+        edges: edges.iter().map(|edge| SchedulingEdgeFacts {
+            source: edge.source_fragment_id,
+            target: edge.target_fragment_id,
+            target_exchange_node_id: edge.target_exchange_node_id,
+            native_hash_partitioned: edge.partition_kind == AttemptPartitionKind::Hash,
+            stream_kind: if edge.partition_kind == AttemptPartitionKind::Unpartitioned { SchedulingStreamKind::Gather } else { SchedulingStreamKind::Partitioned },
+        }).collect(),
+    };
+    let seal = novarocks_query_application::api::PlanSeal::Version(
+        novarocks_physical_plan::PlanVersionId::try_new([9; 16])
+            .expect("original protocol fixture version"),
+    );
+    let native =
+        crate::query_execution::native_fragment::NativeFragmentAttachment::for_completed_plan(
+            fragments,
+            schedule.root_fragment_id,
+        )
+        .map_err(contract_error)?;
+    let facts = crate::query_execution::attempt_plan_facts::AttemptPlanFacts::from_completed(
+        scheduling,
+        edges.to_vec(),
+        Vec::new(),
+        SubmissionPlanFacts::for_completed_plan(
+            order.clone(),
+            order
+                .iter()
+                .map(|&id| {
+                    SubmissionFragmentFacts::for_completed_plan(
+                        id,
+                        if id == schedule.root_fragment_id {
+                            NativeSubmissionFragmentRole::Result
+                        } else {
+                            NativeSubmissionFragmentRole::NonTerminal
+                        },
+                        Vec::new(),
+                    )
+                })
+                .collect(),
+            edges.iter().map(|e| e.source_fragment_id).collect(),
+        ),
+        Default::default(),
+        None,
+    );
+    let template = RequestBoundNativeTemplate {
+        execution,
+        template: PreparedDistributedNativeTemplate {
+            identity: super::PreparedDistributedTemplateIdentity::new(9, seal),
+            plan_facts: Arc::new(facts),
+            native_template: Arc::new(native),
+        },
+        affinity: Arc::new(super::PreparedDistributedAttemptAffinity),
+    };
+    let explicit = schedule
+        .by_fragment
+        .iter()
+        .map(|(&fragment, placements)| {
+            let backends = placements
+                .iter()
+                .map(|placement| {
+                    processes
+                        .get(&placement.backend_idx)
+                        .copied()
+                        .ok_or_else(|| {
+                            contract_error(format!(
+                                "protocol fixture backend {} lacks its original process",
+                                placement.backend_idx
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((fragment, backends))
+        })
+        .collect::<Result<BTreeMap<_, _>, DistributedQueryError>>()?;
+    let scheduled = novarocks_query_application::test_support::protocol_fixture_schedule(
+        execution,
+        frontend,
+        &template
+            .template
+            .attempt_scheduling_facts()
+            .map_err(contract_error)?,
+        &explicit,
+    )
+    .map_err(contract_error)?;
+    let mut placed_endpoints = BTreeMap::new();
+    for placement in schedule.by_fragment.values().flatten() {
+        if let Some(previous) =
+            placed_endpoints.insert(placement.backend_idx, placement.endpoint.clone())
+            && previous != placement.endpoint
+        {
+            return Err(contract_error(
+                "one protocol backend process must retain one endpoint",
+            ));
+        }
+    }
+    let targets = processes
+        .iter()
+        .map(|(&index, &process)| {
+            let endpoint = placed_endpoints.get(&index).cloned().unwrap_or_else(|| {
+                RuntimeEndpoint::new("127.0.0.1", 9000 + index as i32)
+                    .expect("declared unused protocol endpoint")
+            });
+            let control_endpoint = RuntimeEndpoint::new("127.0.0.1", 11000 + index as i32)
+                .expect("declared protocol control endpoint");
+            let descriptor = novarocks_execution_contract::BackendProcessDescriptor::try_new(
+                process,
+                endpoint,
+                control_endpoint.clone(),
+                "test-deployment",
+                "test-build",
+                NativeCompatibilityId::new([0x71; 32]),
+                4096,
+            )
+            .map_err(|error| contract_error(error.to_string()))?;
+            let descriptor = descriptor
+                .with_bounded_root_support(
+                    novarocks_execution_contract::native_result_support::BoundedRootSupport::new(
+                        control_endpoint,
+                        novarocks_result_contract::RootProfileId::V1,
+                    ),
+                )
+                .map_err(|error| contract_error(error.to_string()))?;
+            Ok(LiveBackendTarget::new(
+                index,
+                descriptor,
+                AdmissionEpochCapability::try_from_bytes([0x61; 16])
+                    .expect("original protocol epoch"),
+            ))
+        })
+        .collect::<Result<Vec<_>, DistributedQueryError>>()?;
+    let topology = FrozenAttemptTopology::capture(
+        BackendTopologySnapshot::try_new(91, targets)
+            .map_err(|error| contract_error(error.to_string()))?,
+    )?;
+    Ok((template, scheduled, topology))
+}
+
 #[cfg(test)]
 mod tests {
+    include!("task_manifest_binding_router_freeze_tests.rs");
+    use crate::query_execution::completion_facts::test_support::FinalPlanCompletionDriverTestExt;
     use std::num::{NonZeroU32, NonZeroUsize};
 
     use novarocks_execution::task_execution::AdmissionEpochCapability;
@@ -1495,7 +2007,10 @@ mod tests {
         // SQL completion keeps the real immutable call-source journal even
         // when constant folding leaves only a literal Values expression.
         let paired = runtime
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request, &scope))
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete_for_test(request, &scope),
+            )
             .expect("the exact original Int64 payload completes from SQL");
         let plan = paired.candidate().plan();
         assert_eq!(plan.version(), version);
@@ -1510,8 +2025,13 @@ mod tests {
         assert_eq!(result.fields[0].ty, ValueType::new(DataType::Int64, false));
         // ResultField retains the expression label separately from the SQL
         // alias. Public rendering owns the column name seen by the client.
-        let render = novarocks_sql::compiler::client_render_schema_from_port(Some(result), 0)
-            .expect("render schema from the original SQL public result declaration");
+        let render = novarocks_sql::compiler::client_render_schema_from_port(
+            Some(result),
+            novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
+                timezone_offset_seconds: 0,
+            },
+        )
+        .expect("render schema from the original SQL public result declaration");
         assert_eq!(render.columns().len(), 1);
         assert_eq!(render.columns()[0].name, "payload");
         assert_eq!(render.columns()[0].source_ordinal, 0);
@@ -1524,7 +2044,7 @@ mod tests {
             .unwrap_or_else(|(error, _access)| panic!("freeze the original root purpose: {error}"));
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             paired,
-            &crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+            &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
                 novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
                 novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
             ),
@@ -1703,13 +2223,18 @@ mod tests {
                 full_bind_supported(live_target(1, BackendProcessId::new_v7(), 19011));
             let snapshot = BackendTopologySnapshot::try_new(83, vec![legacy, supported_peer])
                 .expect("original snapshot preserves the supported non-root candidate");
-            let (revision, backends) = FrozenAttemptTopology::capture(snapshot)
+            let (revision, backends, eligible_backends) = FrozenAttemptTopology::capture(snapshot)
                 .expect("legacy descriptors are representable before selected-root use")
                 .into_parts();
             let template = full_bind_native_template(execution, purpose);
             let schedule = full_bind_schedule(execution, process, &template);
             let error = super::TaskManifestBinding::bind_facts(
-                template, execution, schedule, revision, backends,
+                template,
+                execution,
+                schedule,
+                revision,
+                backends,
+                eligible_backends,
             )
             .expect_err("the production bind call must refuse the exact unsupported root");
             assert_eq!(
@@ -1736,8 +2261,10 @@ mod tests {
             let snapshot = BackendTopologySnapshot::try_new(84, vec![supported, legacy])
                 .expect("one supported root and one legacy non-root candidate");
             let frozen = FrozenAttemptTopology::capture(snapshot).expect("original snapshot");
+            let original_eligible = frozen.eligible_backends().as_ptr();
+            let expected_eligible = frozen.eligible_backends().to_vec();
             assert!(frozen.eligible_backends().contains(&legacy_process));
-            let (revision, backends) = frozen.into_parts();
+            let (revision, backends, eligible_backends) = frozen.into_parts();
             let template = full_bind_native_template(execution, purpose);
             let schedule = full_bind_schedule(execution, process, &template);
             let root = schedule.root;
@@ -1750,7 +2277,12 @@ mod tests {
             let producer = expected_edge.producers[0].0;
             assert_ne!(producer, root);
             let manifest = super::TaskManifestBinding::bind_facts(
-                template, execution, schedule, revision, backends,
+                template,
+                execution,
+                schedule,
+                revision,
+                backends,
+                eligible_backends,
             )
             .expect("production full binding reaches a valid manifest");
             assert_eq!(manifest.execution(), execution);
@@ -1758,6 +2290,9 @@ mod tests {
             assert_eq!(manifest.topology_revision(), 84);
             assert_eq!(manifest.tasks().len(), 2);
             assert_eq!(manifest.contexts().len(), 1);
+            assert_eq!(manifest.eligible_backends(), expected_eligible);
+            assert_eq!(manifest.eligible_backends().as_ptr(), original_eligible);
+            assert!(manifest.eligible_backends().contains(&legacy_process));
             assert_eq!(manifest.edges().len(), 1);
             assert_eq!(
                 manifest
@@ -1805,12 +2340,75 @@ mod tests {
     }
 
     #[test]
+    fn bound_manifest_keeps_original_eligibility_exclusions_and_unplaced_candidates() {
+        let execution = execution();
+        let selected = full_bind_supported(live_target(0, BackendProcessId::new_v7(), 19010));
+        let process = selected.descriptor().process_id();
+        let excluded = live_target(1, BackendProcessId::new_v7(), 19011);
+        let excluded_process = excluded.descriptor().process_id();
+        let unplaced = live_target(2, BackendProcessId::new_v7(), 19012);
+        let unplaced_process = unplaced.descriptor().process_id();
+        let snapshot =
+            BackendTopologySnapshot::try_new(87, vec![selected, excluded, unplaced]).unwrap();
+        let frozen = FrozenAttemptTopology::capture_for_candidate(
+            snapshot,
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
+                excluded_process,
+            ),
+        )
+        .unwrap();
+        let original = frozen.eligible_backends().as_ptr();
+        let expected = frozen.eligible_backends().to_vec();
+        let (revision, backends, eligible) = frozen.into_parts();
+        assert!(
+            backends.contains_key(&excluded_process),
+            "membership facts remain complete despite placement exclusion"
+        );
+        let template = full_bind_native_template(execution, FullBindPurpose::ClientRows);
+        let schedule = full_bind_schedule(execution, process, &template);
+        let manifest = super::TaskManifestBinding::bind_facts(
+            template, execution, schedule, revision, backends, eligible,
+        )
+        .unwrap();
+        assert_eq!(manifest.eligible_backends(), expected);
+        assert_eq!(manifest.eligible_backends().as_ptr(), original);
+        assert!(manifest.eligible_backends().contains(&unplaced_process));
+        assert!(!manifest.eligible_backends().contains(&excluded_process));
+        assert_eq!(
+            manifest.contexts().len(),
+            1,
+            "eligible candidates are not participant contexts"
+        );
+        assert_eq!(
+            manifest.contexts()[0].context().backend_process_id(),
+            process
+        );
+        let transport = novarocks_native_adapter::FrontendNativeTransport::plaintext();
+        let selected = manifest
+            .selected_network_origins(&transport)
+            .map(|origin| origin.unwrap().into_owned().as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected,
+            [
+                "http://127.0.0.1:19010",
+                "http://control-0.test.invalid:19061"
+            ]
+        );
+        assert_eq!(
+            selected.len(),
+            2,
+            "unplaced and excluded candidates create no selected service facts"
+        );
+    }
+
+    #[test]
     fn full_manifest_bind_cannot_borrow_supported_backend_for_a_foreign_root_identity() {
         let execution = execution();
         let supported = full_bind_supported(live_target(0, BackendProcessId::new_v7(), 19010));
         let process = supported.descriptor().process_id();
         let snapshot = BackendTopologySnapshot::try_new(85, vec![supported]).expect("snapshot");
-        let (revision, backends) = FrozenAttemptTopology::capture(snapshot)
+        let (revision, backends, eligible_backends) = FrozenAttemptTopology::capture(snapshot)
             .unwrap()
             .into_parts();
         let template = full_bind_native_template(execution, FullBindPurpose::ClientRows);
@@ -1827,7 +2425,12 @@ mod tests {
             process,
         );
         let error = super::TaskManifestBinding::bind_facts(
-            template, execution, schedule, revision, backends,
+            template,
+            execution,
+            schedule,
+            revision,
+            backends,
+            eligible_backends,
         )
         .expect_err("same supported backend cannot replace the complete scheduled task identity");
         assert!(
@@ -1854,7 +2457,7 @@ mod tests {
         let (legacy_root, _) = task(execution(), 1, 1, legacy.descriptor().process_id());
         let (supported_root, _) = task(execution(), 1, 2, supported.descriptor().process_id());
         let snapshot = BackendTopologySnapshot::try_new(71, vec![legacy, supported]).unwrap();
-        let (_, backends) = FrozenAttemptTopology::capture(snapshot)
+        let (_, backends, _) = FrozenAttemptTopology::capture(snapshot)
             .unwrap()
             .into_parts();
 
@@ -1883,7 +2486,7 @@ mod tests {
         let present = live_target(0, BackendProcessId::new_v7(), 19010);
         let (foreign_root, _) = task(execution(), 1, 1, BackendProcessId::new_v7());
         let snapshot = BackendTopologySnapshot::try_new(72, vec![present]).unwrap();
-        let (_, backends) = FrozenAttemptTopology::capture(snapshot)
+        let (_, backends, _) = FrozenAttemptTopology::capture(snapshot)
             .unwrap()
             .into_parts();
         let error = validate_root_backend_support(foreign_root, &backends)
@@ -1912,7 +2515,7 @@ mod tests {
         .unwrap();
         assert_eq!(frozen.eligible_backends(), &[remaining]);
         assert_eq!(frozen.revision(), 7);
-        let (_, retained) = frozen.into_parts();
+        let (_, retained, _) = frozen.into_parts();
         assert!(
             retained.contains_key(&failed),
             "failed target remains an exact snapshot fact"
@@ -1940,12 +2543,12 @@ mod tests {
         assert_eq!(frozen.revision(), 41);
         assert_eq!(later.revision(), 42);
 
-        let (_, exact) = frozen.into_parts();
+        let (_, exact, _) = frozen.into_parts();
         assert_eq!(
             exact[&process].admission_epoch_capability().to_bytes(),
             [0x61; 16]
         );
-        let (_, replacement) = later.into_parts();
+        let (_, replacement, _) = later.into_parts();
         assert_eq!(
             replacement[&process]
                 .admission_epoch_capability()
@@ -2259,5 +2862,368 @@ mod tests {
         let error = derive_and_record_fragment_instance_id(&mut seen, || Ok(collision))
             .expect_err("a repeated derived identity must fail closed");
         assert!(error.message().contains("identity collision"));
+    }
+
+    pub(super) fn original_writer_occurrences() -> Vec<super::BoundWriterCohort> {
+        let (plan, fragments) =
+            crate::query_execution::package_writes::tests::frozen_write_fragments();
+        let seal = PlanSeal::Version(plan.version());
+        let execution = execution();
+        let mut tasks = Vec::new();
+        let mut ordinal = 1;
+        for fragment in plan.fragments().values() {
+            // Two placements deliberately share static facts but never Task identity.
+            for instance in 0..2 {
+                let (identity, context) = task(
+                    execution,
+                    fragment.id().get(),
+                    ordinal,
+                    BackendProcessId::new_v7(),
+                );
+                ordinal += 1;
+                tasks.push(super::BoundManifestTask {
+                    identity,
+                    context,
+                    fragment_id: fragment.id().get(),
+                    instance_index: instance,
+                    fragment_instance_id: UniqueId::new(1, ordinal as i64),
+                    scan_work: Box::default(),
+                });
+            }
+        }
+
+        super::bound_writer_cohorts(seal, &tasks, &fragments).collect::<Vec<_>>()
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn selected_remote_writer_follows_original_edges_when_root_backend_changes() {
+        let writers = original_writer_occurrences();
+        assert_eq!(writers.len(), 2);
+        let execution = writers[0].task().query_execution_id();
+        for root_backend in [
+            writers[0].task().backend_process_id(),
+            writers[1].task().backend_process_id(),
+        ] {
+            let root = TaskIdentity::new(
+                execution,
+                StageId::new(77).unwrap(),
+                novarocks_types::TaskId::new(91).unwrap(),
+                root_backend,
+            );
+            let edges = writers
+                .iter()
+                .enumerate()
+                .map(|(i, writer)| super::BoundManifestEdge {
+                    edge_id: ExchangeEdgeId::new(i as u32 + 1).unwrap(),
+                    source_fragment_id: writer.fragment(),
+                    target_fragment_id: 77,
+                    target_exchange_node_id: 0,
+                    partition_kind: BoundManifestPartitionKind::Unpartitioned,
+                    delivery:
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                    producers: vec![super::BoundManifestProducer {
+                        task: writer.task(),
+                        sender_ordinal: 0,
+                    }]
+                    .into_boxed_slice(),
+                    destinations: vec![root].into_boxed_slice(),
+                    sender_count: NonZeroU32::new(1).unwrap(),
+                })
+                .collect::<Vec<_>>();
+            let expected = writers
+                .iter()
+                .find(|writer| writer.task().backend_process_id() != root_backend)
+                .unwrap()
+                .task();
+            assert_eq!(
+                super::select_remote_writer_sender(writers.iter().copied(), root, &edges),
+                Some(expected)
+            );
+            assert_eq!(
+                super::select_remote_writer_sender(writers.iter().copied().rev(), root, &edges),
+                Some(expected),
+                "selection is deterministic, independent of writer iteration"
+            );
+            assert_eq!(
+                super::select_remote_writer_sender(writers.iter().copied(), root, &[]),
+                None,
+                "writer membership alone proves no remote edge"
+            );
+            assert_eq!(
+                super::select_remote_writer_sender(
+                    writers
+                        .iter()
+                        .copied()
+                        .filter(|writer| writer.task().backend_process_id() == root_backend),
+                    root,
+                    &edges
+                ),
+                None,
+                "a same-backend writer is not a remote sender"
+            );
+            let mut disconnected = edges;
+            for edge in &mut disconnected {
+                edge.destinations = vec![expected].into_boxed_slice();
+            }
+            assert_eq!(
+                super::select_remote_writer_sender(writers.iter().copied(), root, &disconnected),
+                None,
+                "an edge to another Task cannot stand in for the Root input"
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_writer_cohorts_bind_each_exact_task_to_its_original_node_and_target() {
+        let (plan, fragments) =
+            crate::query_execution::package_writes::tests::frozen_write_fragments();
+        let seal = PlanSeal::Version(plan.version());
+        let execution = execution();
+        let mut expected = Vec::new();
+        let mut tasks = Vec::new();
+        let mut ordinal = 1;
+        for fragment in plan.fragments().values() {
+            // Two placements deliberately share static facts but never Task identity.
+            for instance in 0..2 {
+                let (identity, context) = task(
+                    execution,
+                    fragment.id().get(),
+                    ordinal,
+                    BackendProcessId::new_v7(),
+                );
+                ordinal += 1;
+                tasks.push(super::BoundManifestTask {
+                    identity,
+                    context,
+                    fragment_id: fragment.id().get(),
+                    instance_index: instance,
+                    fragment_instance_id: UniqueId::new(1, ordinal as i64),
+                    scan_work: Box::default(),
+                });
+                for node in fragment.nodes().values() {
+                    if let novarocks_physical_plan::NodeKind::TableWriter { target } = &node.kind {
+                        expected.push((
+                            identity,
+                            fragment.id().get(),
+                            node.id,
+                            target.write_target_ordinal,
+                        ));
+                    }
+                }
+            }
+        }
+        let cohorts = super::bound_writer_cohorts(seal, &tasks, &fragments).collect::<Vec<_>>();
+        assert_eq!(cohorts.len(), 2, "finish placements are not writer cohorts");
+        assert_eq!(
+            cohorts
+                .iter()
+                .map(|cohort| (
+                    cohort.task(),
+                    cohort.fragment(),
+                    cohort.writer().node(),
+                    cohort.writer().target()
+                ))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(cohorts.iter().all(|cohort| cohort.plan() == seal));
+        assert_eq!(
+            super::bound_summary_sources(&tasks, &fragments).count(),
+            0,
+            "ordinary writer and finish Tasks declare no logical summary source"
+        );
+        assert_ne!(cohorts[0].task(), cohorts[1].task());
+        assert_eq!(cohorts[0].writer(), cohorts[1].writer());
+    }
+
+    #[test]
+    fn manifest_submission_requires_the_original_attempt_and_frozen_artifact() {
+        let execution = execution();
+        let template = full_bind_native_template(execution, FullBindPurpose::ClientRows);
+        let fragment = std::sync::Arc::clone(
+            template
+                .template
+                .native_template
+                .get(template.template.native_template.root())
+                .unwrap(),
+        );
+        let supported = full_bind_supported(live_target(0, BackendProcessId::new_v7(), 19010));
+        let process = supported.descriptor().process_id();
+        let schedule = full_bind_schedule(execution, process, &template);
+        let (revision, backends, eligible_backends) = FrozenAttemptTopology::capture(
+            BackendTopologySnapshot::try_new(86, vec![supported]).unwrap(),
+        )
+        .unwrap()
+        .into_parts();
+        let manifest = super::TaskManifestBinding::bind_facts(
+            template,
+            execution,
+            schedule,
+            revision,
+            backends,
+            eligible_backends,
+        )
+        .unwrap();
+        manifest
+            .validate_submission_fragment(execution, &fragment)
+            .unwrap();
+        let foreign_execution =
+            QueryExecutionId::new(execution.query_id(), AttemptId::new(2).unwrap()).unwrap();
+        assert!(
+            manifest
+                .validate_submission_fragment(foreign_execution, &fragment)
+                .is_err()
+        );
+        // Freeze the exact same valid bytes into a distinct original artifact.
+        let other = full_bind_native_template(execution, FullBindPurpose::ClientRows);
+        let other_fragment = other
+            .template
+            .native_template
+            .get(fragment.facts().fragment_id())
+            .unwrap();
+        assert_eq!(fragment.content().bytes(), other_fragment.content().bytes());
+        assert!(
+            manifest
+                .validate_submission_fragment(execution, other_fragment)
+                .unwrap_err()
+                .message()
+                .contains("another frozen Native artifact")
+        );
+        assert_eq!(
+            manifest.writer_cohorts().count(),
+            0,
+            "ordinary read tasks cannot become writers from statuses"
+        );
+    }
+
+    #[test]
+    fn actual_participant_domain_projection_preserves_data_control_and_tls_policy_without_io() {
+        use novarocks_native_adapter::FrontendNativeTransport;
+        use novarocks_native_trust::{
+            AutomaticTlsMaterial, DeploymentId, NativeCallerSubject, NativeTransportMode,
+            NativeTrust, ValidatedSharedSecret,
+        };
+        use novarocks_secret::SecretValue;
+        let execution = execution();
+        let process = BackendProcessId::new_v7();
+        let descriptor = BackendProcessDescriptor::try_new(
+            process,
+            RuntimeEndpoint::new("2001:0DB8::1", 443).unwrap(),
+            RuntimeEndpoint::new("CONTROL.EXAMPLE", 443).unwrap(),
+            "test-deployment",
+            "test-build",
+            NativeCompatibilityId::new([0x71; 32]),
+            4096,
+        )
+        .unwrap();
+        let selected = full_bind_supported(LiveBackendTarget::new(
+            0,
+            descriptor,
+            AdmissionEpochCapability::try_from_bytes([0x61; 16]).unwrap(),
+        ));
+        let unplaced = live_target(1, BackendProcessId::new_v7(), 19012);
+        let frozen = FrozenAttemptTopology::capture(
+            BackendTopologySnapshot::try_new(88, vec![selected, unplaced]).unwrap(),
+        )
+        .unwrap();
+        let (revision, backends, eligible) = frozen.into_parts();
+        let template = full_bind_native_template(execution, FullBindPurpose::ClientRows);
+        let schedule = full_bind_schedule(execution, process, &template);
+        let manifest = super::TaskManifestBinding::bind_facts(
+            template, execution, schedule, revision, backends, eligible,
+        )
+        .unwrap();
+        assert_eq!(manifest.contexts().len(), 1);
+        assert_eq!(
+            manifest.tasks().len(),
+            2,
+            "the original real encoder supplies both fragments on the same participant"
+        );
+        let endpoint = manifest.contexts()[0]
+            .backend()
+            .endpoint()
+            .native_endpoint();
+        let trust = NativeTrust::new(
+            DeploymentId::parse("manifest-domain-pure").unwrap(),
+            ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))
+                .unwrap(),
+            NativeCallerSubject::parse("fe@localhost:19040").unwrap(),
+            NativeTransportMode::Automatic,
+        );
+        let material = AutomaticTlsMaterial::for_endpoint(trust, endpoint.clone()).unwrap();
+        for (transport, expected) in [
+            (
+                FrontendNativeTransport::plaintext(),
+                ["http://[2001:db8::1]:443", "http://control.example:443"],
+            ),
+            (
+                FrontendNativeTransport::automatic(material),
+                ["https://[2001:db8::1]", "https://control.example"],
+            ),
+        ] {
+            let facts = manifest
+                .selected_network_origins(&transport)
+                .map(|origin| origin.unwrap().into_owned().as_str().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(facts, expected);
+        }
+        // No Native open/activation, split source, client, DNS, socket or task.
+    }
+    #[cfg(novarocks_dev_controls)]
+    pub(super) fn qualification_fixture(
+        execution: QueryExecutionId,
+        processes: &[BackendProcessId; 3],
+        selected: usize,
+    ) -> (super::TaskManifestBinding, super::AttemptSchedule) {
+        let targets = processes
+            .iter()
+            .enumerate()
+            .map(|(index, &process)| {
+                full_bind_supported(live_target(index, process, 19010 + index as u16))
+            })
+            .collect();
+        let topology =
+            FrozenAttemptTopology::capture(BackendTopologySnapshot::try_new(91, targets).unwrap())
+                .unwrap();
+        let template = full_bind_native_template(execution, FullBindPurpose::ClientRows);
+        let facts = template.template.attempt_scheduling_facts().unwrap();
+        let schedule = novarocks_query_application::test_support::qualification_schedule(
+            execution,
+            FrontendProcessId::new_v7(),
+            &[processes[selected]],
+            &facts,
+        );
+        let manifest = super::TaskManifestBinding::bind(template, &schedule, topology).unwrap();
+        (manifest, schedule)
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn qualification_reentry_accepts_same_schedule_and_rejects_same_execution_new_placement() {
+        let processes = [
+            BackendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        ];
+        let execution = execution();
+        let (manifest, original) = qualification_fixture(execution, &processes, 0);
+        manifest.validate_schedule(&original).unwrap();
+        manifest.validate_schedule(&original).unwrap();
+        let (_, changed) = qualification_fixture(execution, &processes, 1);
+        assert_eq!(original.execution(), changed.execution());
+        assert_ne!(
+            original.root().backend_process_id(),
+            changed.root().backend_process_id()
+        );
+        assert!(manifest.validate_schedule(&changed).is_err());
+        let (_, different_context) = qualification_fixture(execution, &processes, 0);
+        assert_eq!(original.root(), different_context.root());
+        assert_ne!(original.contexts(), different_context.contexts());
+        assert!(
+            manifest.validate_schedule(&different_context).is_err(),
+            "same root identity is not the same exact schedule"
+        );
+        manifest.validate_schedule(&original).unwrap();
     }
 }

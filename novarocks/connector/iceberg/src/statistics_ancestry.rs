@@ -59,6 +59,15 @@ pub async fn resolve_ancestor_ndv(
     queried_snapshot: i64,
     wanted: &BTreeSet<i32>,
 ) -> HashMap<i32, AncestorNdv> {
+    resolve_ancestor_ndv_from_metadata(metadata, queried_snapshot, wanted)
+}
+
+/// The registered metadata-only resolver, used by the admitted pure CPU phase.
+pub(crate) fn resolve_ancestor_ndv_from_metadata(
+    metadata: &TableMetadata,
+    queried_snapshot: i64,
+    wanted: &BTreeSet<i32>,
+) -> HashMap<i32, AncestorNdv> {
     let mut resolved = HashMap::new();
     if wanted.is_empty() {
         return resolved;

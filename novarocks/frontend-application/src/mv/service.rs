@@ -21,19 +21,10 @@ use novarocks_workload_control::{
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::background::{MvBackgroundBindings, MvBackgroundEngine};
-use crate::mv::domain::application::{
-    MvApplicationError, MvCreateProviderAdapter, MvRequestContext,
-};
+use super::background::MvBackgroundBindings;
+use crate::mv::domain::application::MvApplicationError;
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::query_execution::maintenance::{TableMaintenanceEngine, TableMaintenanceService};
-use crate::query_execution::mv_assembly::refresh_handoff::{
-    MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
-    PreparedMvRefreshWork,
-};
-use crate::query_execution::service::QueryExecutionService;
 use novarocks_mv_application::{
-    activity::{MvActivityAdmissionError, MvActivityLease, MvActivityOwner},
     maintenance::{
         MaintenanceCoordinatorConfig, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
     },
@@ -42,16 +33,13 @@ use novarocks_mv_application::{
 };
 use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_query_application::api::BackendTopologyService;
-use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
+use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_sql::compiler::SessionOptimizerSettings;
 
-use super::{
-    activity::canonical_mv_target,
-    create,
-    maintenance_worker::{FrontendMaintenanceWorker, FrontendMaintenanceWorkerDependencies},
-    refresh,
-    scheduler::{self, ScheduledRefreshDisposition, ScheduledRefreshRequest},
-};
+use super::scheduler::{self, ScheduledRefreshDisposition, ScheduledRefreshRequest};
+
+#[path = "service/background_original.rs"]
+mod background_original;
 
 /// Frontend composition and statement adapter for materialized-view products.
 ///
@@ -59,10 +47,10 @@ use super::{
 /// deliberately return `None` so their existing core routes remain active.
 pub struct FrontendMvProductAdapter {
     readiness: Arc<MvReadinessPort>,
-    refresh: refresh::FrontendMvRefreshDependencies,
+    provider_activation:
+        Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation>,
     product_service: Arc<MvKeyedProductService>,
     maintenance_config: MaintenanceCoordinatorConfig,
-    table_maintenance_service: Arc<dyn TableMaintenanceService>,
     execution_role: novarocks_types::ClusterRole,
     topology: BackendTopologyService,
     /// Cost budget frozen from `[runtime]`; the MV worker has no session, so it
@@ -77,14 +65,8 @@ pub struct FrontendMvProductAdapter {
 }
 
 impl FrontendMvProductAdapter {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Frontend MV composition keeps independently owned ports explicit at the application boundary."
-    )]
     pub(crate) fn with_refresh_dependencies(
         readiness: Arc<MvReadinessPort>,
-        query_execution: QueryExecutionService,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
         provider_activation: Arc<
             dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation,
         >,
@@ -92,24 +74,16 @@ impl FrontendMvProductAdapter {
         topology: BackendTopologyService,
         product_service: Arc<MvKeyedProductService>,
         maintenance_config: MaintenanceCoordinatorConfig,
-        table_maintenance_service: Arc<dyn TableMaintenanceService>,
         optimizer_query_mem_limit_bytes: u64,
         attempt_timeout: Duration,
         root_admission: RootAdmissionHandle,
         startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
     ) -> Self {
         Self {
-            refresh: refresh::FrontendMvRefreshDependencies {
-                query_execution,
-                connector_control: Arc::clone(&connector_control),
-                provider_activation: Arc::clone(&provider_activation),
-                #[cfg(novarocks_dev_controls)]
-                test_controls: readiness.test_controls_owner(),
-            },
+            provider_activation,
             readiness: Arc::clone(&readiness),
             product_service,
             maintenance_config,
-            table_maintenance_service,
             execution_role,
             topology,
             optimizer_query_mem_limit_bytes,
@@ -121,6 +95,18 @@ impl FrontendMvProductAdapter {
 
     pub(crate) fn readiness_port(&self) -> Arc<MvReadinessPort> {
         Arc::clone(&self.readiness)
+    }
+
+    pub(crate) fn original_refresh_ports(
+        &self,
+    ) -> (
+        Arc<MvKeyedProductService>,
+        Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation>,
+    ) {
+        (
+            self.product_service.clone(),
+            self.provider_activation.clone(),
+        )
     }
 
     pub(crate) fn product_service(&self) -> &MvKeyedProductService {
@@ -149,18 +135,15 @@ impl FrontendMvProductAdapter {
             .product_service
             .begin_background_start()
             .map_err(lifecycle_error)?;
-        let dependencies = self.refresh.clone();
         let topology = self.topology.clone();
-        let table_maintenance_service = Arc::clone(&self.table_maintenance_service);
         let runtime = start_background_workers(RefreshWorkerDependencies {
             readiness: Arc::clone(&self.readiness),
-            refresh: dependencies,
-            background_engine: bindings.engine,
+            provider_activation: Arc::clone(&self.provider_activation),
+            ports: bindings.ports,
+            execution: bindings.execution,
             topology,
             role: self.execution_role,
             maintenance_config: self.maintenance_config.clone(),
-            table_maintenance_engine: bindings.table_maintenance_engine,
-            table_maintenance_service,
             product_service: Arc::clone(&self.product_service),
             root_admission: self.root_admission.clone(),
             optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
@@ -172,142 +155,36 @@ impl FrontendMvProductAdapter {
     }
 }
 
-impl FrontendMvProductAdapter {
-    pub(crate) fn execute_create(
-        &self,
-        engine: &dyn MvCreateProviderAdapter,
-        statement: &crate::mv::domain::application::MvCreateStatement,
-        context: MvRequestContext<'_>,
-    ) -> Result<(), MvApplicationError> {
-        create::handle_create(&self.product_service, engine, statement, context)
-    }
-
-    pub fn execute_prepared_refresh(
-        &self,
-        refresh_plan: PreparedMvRefresh,
-        connector_context: ConnectorRequestContext,
-        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    ) -> Result<(), MvApplicationError> {
-        refresh::execute(
-            self.product_service.as_ref(),
-            &self.refresh,
-            refresh_plan,
-            connector_context,
-            execution,
-        )
-    }
-
-    pub(crate) fn prepare_and_execute_refresh(
-        &self,
-        preparation: &dyn MvRefreshPreparationService,
-        statement: novarocks_sql::planning::mv::MvRefreshStatement,
-        target: novarocks_sql::planning::mv::SqlMvTarget,
-        owner: MvActivityOwner,
-        connector_context: ConnectorRequestContext,
-        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    ) -> Result<(), MvApplicationError> {
-        let _gate_lease = self.acquire_activity_lease(&target, owner, execution)?;
-        let attempt = self.product_service.reserve_refresh_attempt();
-        let prepared = prepare_refresh_step(
-            preparation,
-            MvRefreshPreparationRequest {
-                statement,
-                target,
-                attempt: attempt.clone(),
-            },
-        )?;
-        if prepared.attempt != attempt {
-            return Err(MvApplicationError::new(
-                crate::mv::domain::application::MvApplicationErrorKind::InvalidRequest,
-                "MV refresh preparation changed the frontend-reserved attempt identity",
-            ));
-        }
-        self.execute_prepared_refresh(prepared, connector_context, execution)
-    }
-
-    /// Run one foreground DDL path under the same per-target FIFO gate as
-    /// refresh and background maintenance. The SQL session cancellation scope
-    /// remains the authority while the statement waits for its turn.
-    pub(crate) fn execute_serialized<T, E: From<String>>(
-        &self,
-        target: &novarocks_sql::planning::mv::SqlMvTarget,
-        owner: MvActivityOwner,
-        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-        action: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E> {
-        let _gate_lease = self
-            .acquire_activity_lease(target, owner, execution)
-            .map_err(|error| E::from(error.to_string()))?;
-        action()
-    }
-
-    fn acquire_activity_lease(
-        &self,
-        target: &novarocks_sql::planning::mv::SqlMvTarget,
-        owner: MvActivityOwner,
-        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    ) -> Result<MvActivityLease, MvApplicationError> {
-        self.product_service
-            .acquire_foreground(canonical_mv_target(target), owner, || {
-                execution.cancellation().is_cancelled()
-            })
-            .map_err(|error| match error {
-                MvActivityAdmissionError::Cancelled => MvApplicationError::new(
-                    crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
-                    "MV statement was cancelled while waiting for activity gate",
-                ),
-                MvActivityAdmissionError::Stopping => MvApplicationError::new(
-                    crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
-                    "frontend MV activity admission is closed",
-                ),
-            })
-    }
-}
-
-/// Preserve SQL preparation facts before entering the product execution phase.
-pub(super) fn prepare_refresh_step(
-    preparation: &dyn MvRefreshPreparationService,
-    request: MvRefreshPreparationRequest,
-) -> Result<PreparedMvRefresh, MvApplicationError> {
-    preparation
-        .prepare_step(request)
-        .map_err(preparation_application_error)
-}
-
-fn preparation_application_error(
-    error: crate::mv::domain::lifecycle::RefreshError,
-) -> MvApplicationError {
-    use crate::mv::domain::application::MvApplicationErrorKind;
-    use crate::mv::domain::lifecycle::RefreshErrorKind;
-
-    let kind = match error.kind {
-        RefreshErrorKind::PreCommitFailed => MvApplicationErrorKind::Unavailable,
-        RefreshErrorKind::UserError => MvApplicationErrorKind::InvalidRequest,
-    };
-    MvApplicationError::new(kind, error.message.clone())
-        .with_compile_control(error.compile_control_error())
-        .with_unavailable_implementation(error.unavailable_implementation().cloned())
-}
-
 #[derive(Clone)]
 struct RefreshWorkerDependencies {
     readiness: Arc<MvReadinessPort>,
-    refresh: refresh::FrontendMvRefreshDependencies,
-    background_engine: Arc<dyn MvBackgroundEngine>,
+    provider_activation:
+        Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation>,
+    ports: crate::mv::domain::iceberg_refresh::IcebergMvCorePorts,
+    execution: crate::query::mv_action::MvExecutionServices,
     topology: BackendTopologyService,
     role: novarocks_types::ClusterRole,
     maintenance_config: MaintenanceCoordinatorConfig,
-    table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
-    table_maintenance_service: Arc<dyn TableMaintenanceService>,
     product_service: Arc<MvKeyedProductService>,
     root_admission: RootAdmissionHandle,
     optimizer_query_mem_limit_bytes: u64,
     attempt_timeout: Duration,
-    /// The MV product owns bare lifecycle threads. This handle lets those
-    /// threads await the shared warehouse queue without blocking a Tokio
-    /// worker or creating a local admission queue.
+    /// The existing FE runtime hosts the two original serial asynchronous
+    /// tasks and the shared warehouse queue; no worker or local queue is added.
     runtime: tokio::runtime::Handle,
     startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
+}
+
+struct MvBackgroundHealth(novarocks_query_application::api::QueryExecutionClient);
+impl novarocks_mv_application::process_runtime::MvBackgroundHealthPort for MvBackgroundHealth {
+    fn record_failure(&self, cause: Arc<dyn std::error::Error + Send + Sync>) {
+        self.0.report_process_failure(
+            novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                "MV background original source failed before actual closure",
+                cause,
+            ),
+        );
+    }
 }
 
 fn start_background_workers(
@@ -321,54 +198,20 @@ fn start_background_workers(
     );
     let maintenance_interval =
         Duration::from_millis(dependencies.maintenance_config.tick_interval_ms.max(1));
-    let maintenance = Arc::new(FrontendMaintenanceWorker::new(
-        FrontendMaintenanceWorkerDependencies {
-            readiness: Arc::clone(&dependencies.readiness),
-            background_engine: Arc::clone(&dependencies.background_engine),
-            table_maintenance_engine: Arc::clone(&dependencies.table_maintenance_engine),
-            table_maintenance_service: Arc::clone(&dependencies.table_maintenance_service),
-            connector_control: Arc::clone(&dependencies.refresh.connector_control),
-            product_service: Arc::clone(&dependencies.product_service),
-            root_admission: dependencies.root_admission.clone(),
-            coordinator_config: dependencies.maintenance_config.clone(),
-            attempt_timeout: dependencies.attempt_timeout,
-            runtime: tokio::runtime::Handle::current(),
-        },
-    ));
-    // The startup statement is re-read on every maintenance tick, not once at
-    // startup: it can be written after this process is already serving, and
-    // the window it starts usually has not elapsed when it arrives.
-    let continuation_inputs = dependencies.startup_isolation.clone().map(|source| {
-        (
-            source,
-            Arc::clone(&dependencies.readiness),
-            Arc::clone(&dependencies.refresh.connector_control),
-            Arc::clone(&dependencies.product_service),
-        )
-    });
-    let refresh_task_dependencies = dependencies;
+    let scheduler = background_original::SchedulerOriginal::new(
+        background_original::OriginalWorkerDependencies::from(&dependencies),
+    );
+    let maintenance = background_original::MaintenanceOriginal::new(&dependencies);
     MvBackgroundRuntime::start(
+        &dependencies.runtime,
+        Arc::new(MvBackgroundHealth(dependencies.execution.client.clone())),
         interval,
         maintenance_interval,
         MvBackgroundTasks::new(
             Box::new(move |stop, maintenance_wakeup_tx| {
-                run_refresh_event(&refresh_task_dependencies, stop, maintenance_wakeup_tx);
+                Box::pin(scheduler.clone().run(stop, maintenance_wakeup_tx))
             }),
-            Box::new(move |_| {
-                if let Err(error) = maintenance.run_once(now_unix_millis()) {
-                    tracing::warn!(error = %error, "frontend MV maintenance inventory failed");
-                }
-                if let Some((source, readiness, connector_control, product_service)) =
-                    continuation_inputs.as_ref()
-                {
-                    run_startup_continuation(
-                        source,
-                        readiness,
-                        connector_control.as_ref(),
-                        product_service,
-                    );
-                }
-            }),
+            Box::new(move |stop| Box::pin(maintenance.clone().run(stop))),
         ),
     )
     .map_err(|error| {
@@ -376,217 +219,11 @@ fn start_background_workers(
     })
 }
 
-/// One startup-continuation pass, if this process still owns the management
-/// authority the pass needs. A product without it has nothing to reopen.
-fn run_startup_continuation(
-    source: &crate::mv::startup_isolation_file::StartupIsolationSource,
-    readiness: &MvReadinessPort,
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    product_service: &MvKeyedProductService,
-) {
-    let (Some(entrance), Some(continuation)) = (
-        product_service.management_entrance(),
-        product_service.management_continuation(),
-    ) else {
-        return;
-    };
-    let report = crate::mv::domain::startup_continuation::run_startup_continuation_pass(
-        &crate::mv::domain::startup_continuation::StartupContinuationPass {
-            entrance: entrance.as_ref(),
-            continuation: continuation.as_ref(),
-            readiness,
-            connector_control,
-            source,
-        },
-    );
-    if !report.is_silent() {
-        tracing::info!(
-            readmitted = report.readmitted,
-            waiting = report.waiting,
-            operator_only = report.operator_only,
-            not_covered = report.not_covered,
-            failed = report.failed,
-            "MV startup continuation pass"
-        );
-    }
-}
-
 fn lifecycle_error(error: impl std::fmt::Display) -> MvBackgroundEngineError {
     MvBackgroundEngineError::new(
         MvBackgroundEngineErrorKind::InvariantViolation,
         error.to_string(),
     )
-}
-
-fn run_refresh_event(
-    dependencies: &RefreshWorkerDependencies,
-    stop: &MvBackgroundStop,
-    maintenance_wakeup_tx: &std::sync::mpsc::SyncSender<()>,
-) {
-    let now_ms = now_unix_millis();
-    match scheduler::poll(
-        dependencies.product_service.as_ref(),
-        dependencies.readiness.as_ref(),
-        dependencies.background_engine.as_ref(),
-        now_ms,
-    ) {
-        Ok(requests) => {
-            run_scheduled_refreshes(dependencies, requests, stop, maintenance_wakeup_tx);
-        }
-        Err(error) => tracing::warn!(error = %error, "frontend MV scheduler poll failed"),
-    }
-}
-
-fn run_scheduled_refreshes(
-    dependencies: &RefreshWorkerDependencies,
-    requests: Vec<ScheduledRefreshRequest>,
-    stop: &MvBackgroundStop,
-    maintenance_wakeup_tx: &std::sync::mpsc::SyncSender<()>,
-) {
-    for request in requests {
-        if stop.is_requested() {
-            scheduler::requeue(dependencies.product_service.as_ref(), request);
-            break;
-        }
-        let AdmittedBackgroundQuery {
-            owner,
-            query_concurrency,
-            result_capacity,
-        } = match admit_background_query(
-            &dependencies.root_admission,
-            &dependencies.runtime,
-            WorkClass::MaterializedView,
-        ) {
-            Ok(work) => work,
-            Err(_) => {
-                // Draining is terminal for this process runtime. Preserve the
-                // coalesced request without creating a new refresh attempt.
-                scheduler::requeue(dependencies.product_service.as_ref(), request);
-                break;
-            }
-        };
-        let cancellation = match owner.scope().cancellation() {
-            Ok(view) => novarocks_query_application::cancellation::QueryCancellationView::governed(
-                view, None,
-            ),
-            Err(_) => {
-                finish_background_root(owner, query_concurrency);
-                scheduler::requeue(dependencies.product_service.as_ref(), request);
-                break;
-            }
-        };
-        let mut ticket = match dependencies.product_service.request_activity(
-            canonical_mv_target(&request.target),
-            MvActivityOwner::ScheduledRefresh,
-        ) {
-            Ok(ticket) => ticket,
-            Err(_) => {
-                finish_background_root(owner, query_concurrency);
-                continue;
-            }
-        };
-        let lease = match ticket.try_acquire() {
-            Ok(Some(lease)) => lease,
-            Ok(None) => {
-                finish_background_root(owner, query_concurrency);
-                scheduler::requeue(dependencies.product_service.as_ref(), request);
-                continue;
-            }
-            Err(_) => {
-                finish_background_root(owner, query_concurrency);
-                continue;
-            }
-        };
-        if scheduler::mark_started(
-            dependencies.product_service.as_ref(),
-            request.projection().mv_id,
-        ) {
-            // The scheduler has already bounded this batch. Execute its
-            // transitions on this event loop rather than creating an OS thread
-            // for every due MV. Keeping the activity lease and governed root local
-            // to the same transition makes `complete` the exact terminal
-            // observation before the next event starts.
-            #[cfg(novarocks_dev_controls)]
-            let outcome_admission = dependencies.readiness.test_controls().and_then(|controls| {
-                match controls.scheduler_request_admitted(&request.target, request.projection().mv_id,
-                    request.projection().facts.source_revision()) {
-                    Ok(admission) => admission,
-                    Err(error) => { tracing::warn!(reason = %error, "finite MV scheduler admission observation failed"); None }
-                }
-            });
-            let disposition =
-                execute_scheduled_refresh(dependencies, &request, cancellation, &result_capacity);
-            let completed = matches!(disposition, ScheduledRefreshDisposition::Completed);
-            if let Some((disposition_kind, reason)) = scheduler_outcome_log_fields(&disposition) {
-                tracing::warn!(
-                    mv_id = request.projection().mv_id,
-                    target = %request.target.display_name(),
-                    disposition_kind,
-                    reason = %reason,
-                    "frontend MV scheduler refresh did not complete"
-                );
-            }
-            let _decision = scheduler::complete(
-                dependencies.product_service.as_ref(),
-                &request,
-                disposition,
-                now_unix_millis(),
-            );
-            #[cfg(novarocks_dev_controls)]
-            if let Some(admission) = outcome_admission
-                && let Some(controls) = dependencies.readiness.test_controls()
-                && let Err(error) = controls.scheduler_request_completed(admission, &_decision)
-            {
-                tracing::warn!(reason = %error, "finite MV scheduler terminal observation failed");
-            }
-            if completed {
-                let _ = maintenance_wakeup_tx.try_send(());
-            }
-            // Release the activity lease only after the scheduler terminal is
-            // durable, then complete the governed root.
-            drop(lease);
-            finish_background_root(owner, query_concurrency);
-        } else {
-            finish_background_root(owner, query_concurrency);
-            scheduler::requeue(dependencies.product_service.as_ref(), request);
-        }
-    }
-}
-
-struct AdmittedBackgroundQuery {
-    owner: WorkOwner,
-    query_concurrency: QueryConcurrencyPermit,
-    result_capacity:
-        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-}
-
-fn admit_background_query(
-    root_admission: &RootAdmissionHandle,
-    runtime: &tokio::runtime::Handle,
-    class: WorkClass,
-) -> Result<AdmittedBackgroundQuery, novarocks_workload_control::WorkError> {
-    let root = root_admission.begin_warehouse_root(WorkRequest::new(class))?;
-    let (query_concurrency, window) = runtime.block_on(async {
-        root.owner
-            .scope()
-            .admit_query_with_result(novarocks_workload_control::ResultWindowClass::Internal)?
-            .await
-    })?;
-    let result_capacity =
-        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
-            &root.owner.scope(),
-            window.retain_alias(),
-        )?;
-    Ok(AdmittedBackgroundQuery {
-        owner: root.owner,
-        query_concurrency,
-        result_capacity,
-    })
-}
-
-fn finish_background_root(owner: WorkOwner, query_concurrency: QueryConcurrencyPermit) {
-    drop(query_concurrency);
-    owner.complete();
 }
 
 fn scheduler_outcome_log_fields(
@@ -616,133 +253,26 @@ fn scheduler_outcome_log_fields(
     }
 }
 
-fn execute_scheduled_refresh(
-    dependencies: &RefreshWorkerDependencies,
-    request: &ScheduledRefreshRequest,
-    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-    result_capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-) -> ScheduledRefreshDisposition {
-    #[cfg(novarocks_dev_controls)]
-    if let Some(controls) = dependencies.readiness.test_controls() {
-        match controls.scheduler(&request.target, &cancellation) {
-            Ok(true) => return ScheduledRefreshDisposition::ShutdownCancelled(None),
-            Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error.into()),
-            Ok(false) => {}
-        }
-    }
-    let topology = match dependencies.topology.snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return ScheduledRefreshDisposition::TransientUnavailable(error.to_string().into());
-        }
-    };
-    // FE restart begins before authenticated BE announces have rebuilt the
-    // runtime topology. The MV definition remains valid, so retry after the
-    // frontend observes at least one admitted backend instead of blocking it.
-    if topology.targets().is_empty() {
-        return ScheduledRefreshDisposition::TransientUnavailable(
-            "scheduler refresh is waiting for a non-empty admitted backend topology"
-                .to_string()
-                .into(),
-        );
-    }
-    let deadline = match Instant::now().checked_add(dependencies.attempt_timeout) {
-        Some(deadline) => deadline,
-        None => {
-            return ScheduledRefreshDisposition::InvariantViolation(
-                "MV worker deadline overflow".to_string().into(),
-            );
-        }
-    };
-    let context = RequestContext::admit(RequestAdmission::new(
-        request.target.catalog.clone(),
-        request.target.database.clone(),
-        dependencies.role,
-        topology,
-        Some(deadline),
-        cancellation.clone(),
-        SessionOptimizerSettings {
-            optimizer_query_mem_limit_bytes: Some(
-                dependencies.optimizer_query_mem_limit_bytes as f64,
-            ),
-            ..SessionOptimizerSettings::default()
-        },
-        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-    ))
-    .with_result_capacity(result_capacity.clone());
-    let context = match context {
-        Ok(context) => context,
-        Err(error) => {
-            return ScheduledRefreshDisposition::InvariantViolation(error.to_string().into());
-        }
-    };
-    let connector_context =
-        match crate::connector::connector_request_context_for_execution_on_runtime(
-            None,
-            context.execution(),
-            &dependencies.runtime,
-        ) {
-            Ok(context) => context
-                .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background),
-            Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error.into()),
-        };
-    if cancellation.is_cancelled() {
-        return ScheduledRefreshDisposition::ShutdownCancelled(None);
-    }
-    let steps = match dependencies
-        .background_engine
-        .resolve_refresh_steps(&request.target)
-    {
-        Ok(steps) => steps,
-        Err(error) => return ScheduledRefreshDisposition::from_background_error(error),
-    };
-    let mut step_context = connector_context;
-    let mut any_effect = false;
-    for step in steps {
-        if cancellation.is_cancelled() {
-            return ScheduledRefreshDisposition::ShutdownCancelled(None);
-        }
-        let attempt = dependencies.product_service.reserve_refresh_attempt();
-        let prepared =
-            match dependencies
-                .background_engine
-                .prepare_refresh_step(&step, attempt, &step_context)
-            {
-                Ok(prepared) => prepared,
-                Err(error) => return ScheduledRefreshDisposition::from_background_error(error),
-            };
-        let no_op = matches!(prepared.work, PreparedMvRefreshWork::NoOp);
-        if let Err(error) = refresh::execute(
-            dependencies.product_service.as_ref(),
-            &dependencies.refresh,
-            prepared,
-            step_context.clone(),
-            context.execution(),
-        ) {
-            return application_disposition(error);
-        }
-        if !no_op {
-            any_effect = true;
-            // The next dependency must observe the committed upstream state.
-            step_context = step_context.after_external_effect();
-        }
-    }
-    if any_effect {
-        ScheduledRefreshDisposition::Completed
-    } else {
-        ScheduledRefreshDisposition::NoOp
-    }
-}
-
 fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposition {
     use crate::mv::domain::application::MvApplicationErrorKind;
+    // The selected domain cause and compiler sidecar are independent facts.
+    // Use the same neutral projector as the service path; a Provider failure
+    // must not disappear merely because domain policy was already selected.
+    let execution = error.original_failure().and_then(|cause| {
+        novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+            cause.clone(),
+        )
+        .execution_failure()
+        .cloned()
+    });
     let failure = novarocks_mv_application::scheduler_runtime::MvRefreshFailure::new(
         error.message(),
         error.compile_control_error(),
-    );
+    )
+    .with_execution_failure(execution);
     match error.kind() {
         MvApplicationErrorKind::AlreadyActive => {
-            ScheduledRefreshDisposition::AlreadyActive(error.compile_control_error())
+            ScheduledRefreshDisposition::AlreadyActive(failure)
         }
         MvApplicationErrorKind::Unavailable | MvApplicationErrorKind::BindingInvalidated => {
             ScheduledRefreshDisposition::TransientUnavailable(failure)
@@ -755,7 +285,7 @@ fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposi
             ScheduledRefreshDisposition::TerminalFailure(failure)
         }
         MvApplicationErrorKind::ShutdownCancelled => {
-            ScheduledRefreshDisposition::ShutdownCancelled(error.compile_control_error())
+            ScheduledRefreshDisposition::ShutdownCancelled(failure)
         }
         MvApplicationErrorKind::Engine => ScheduledRefreshDisposition::InvariantViolation(failure),
     }
@@ -772,8 +302,6 @@ fn now_unix_millis() -> i64 {
 
 #[cfg(test)]
 mod shutdown_tests {
-    use std::sync::mpsc;
-    use std::thread;
     use std::time::{Duration, Instant};
 
     use super::{MvBackgroundRuntime, application_disposition};
@@ -795,59 +323,48 @@ mod shutdown_tests {
 
     #[tokio::test]
     async fn shared_deadline_retains_the_same_mv_worker_join_for_retry() {
-        let (stop_tx, _stop_rx) = mpsc::channel();
-        let (maintenance_stop_tx, _maintenance_stop_rx) = mpsc::channel();
-        let (maintenance_wakeup_tx, _maintenance_wakeup_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::channel();
-        let refresh_worker = thread::spawn(move || {
-            let _ = release_rx.recv();
+        let (maintenance_wakeup_tx, _maintenance_wakeup_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let refresh_worker = tokio::spawn(async move {
+            let _ = release_rx.await;
         });
-        let maintenance_worker = thread::spawn(|| {});
+        let maintenance_worker = tokio::spawn(async {});
         let mut runtime = MvBackgroundRuntime::new(
-            stop_tx,
+            novarocks_mv_application::process_runtime::MvBackgroundStop::default(),
             refresh_worker,
-            maintenance_stop_tx,
             maintenance_wakeup_tx,
             maintenance_worker,
         );
-
         let error = runtime
             .stop_and_join_until(Instant::now() + Duration::from_millis(10))
             .await
             .expect_err("blocked MV worker must respect the shared deadline");
         assert!(error.contains("shared shutdown deadline"));
-
         release_tx.send(()).unwrap();
         runtime
             .stop_and_join_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("the retained MV worker join remains retryable");
     }
-
     #[tokio::test]
     async fn retry_still_joins_mv_maintenance_after_refresh_already_stopped() {
-        let (stop_tx, _stop_rx) = mpsc::channel();
-        let (maintenance_stop_tx, _maintenance_stop_rx) = mpsc::channel();
-        let (maintenance_wakeup_tx, _maintenance_wakeup_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::channel();
-        let refresh_worker = thread::spawn(|| {});
-        let maintenance_worker = thread::spawn(move || {
-            let _ = release_rx.recv();
+        let (maintenance_wakeup_tx, _maintenance_wakeup_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let maintenance_worker = tokio::spawn(async move {
+            let _ = release_rx.await;
         });
+        let refresh_worker = tokio::spawn(async {});
         let mut runtime = MvBackgroundRuntime::new(
-            stop_tx,
+            novarocks_mv_application::process_runtime::MvBackgroundStop::default(),
             refresh_worker,
-            maintenance_stop_tx,
             maintenance_wakeup_tx,
             maintenance_worker,
         );
-
         let error = runtime
             .stop_and_join_until(Instant::now() + Duration::from_millis(10))
             .await
             .expect_err("blocked MV maintenance must respect the shared deadline");
         assert!(error.contains("shared shutdown deadline"));
-
         release_tx.send(()).unwrap();
         runtime
             .stop_and_join_until(Instant::now() + Duration::from_secs(1))
@@ -858,9 +375,8 @@ mod shutdown_tests {
 
 #[cfg(test)]
 mod compile_control_tests {
-    use super::preparation_application_error;
     use crate::mv::domain::application::MvApplicationErrorKind;
-    use crate::mv::domain::lifecycle::RefreshError;
+    use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError;
     use novarocks_type_contract::CompileControlError;
 
     #[test]
@@ -870,11 +386,23 @@ mod compile_control_tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let error = preparation_application_error(RefreshError::from(
-                novarocks_sql::compiler::SqlCompileError::from(control.clone()),
-            ));
-            assert_eq!(error.compile_control_error(), Some(control));
+            let error = PreparationError::from(novarocks_sql::compiler::SqlCompileError::from(
+                control.clone(),
+            ))
+            .0;
+            assert_eq!(error.compile_control_error(), Some(control.clone()));
             assert_eq!(error.kind(), MvApplicationErrorKind::InvalidRequest);
+            let command = crate::mv::command::mv_application_command_error(error);
+            assert_eq!(command.compile_control_error(), Some(control.clone()));
+            assert_eq!(command.to_string(), control.to_string());
+            assert_eq!(
+                command.kind(),
+                if control == CompileControlError::Cancelled {
+                    novarocks_query_application::api::CommandErrorKind::Cancelled
+                } else {
+                    novarocks_query_application::api::CommandErrorKind::Failed
+                }
+            );
         }
     }
     #[test]
@@ -895,9 +423,10 @@ mod compile_control_tests {
                 novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".into()),
             )),
         ] {
-            let error = preparation_application_error(RefreshError::from(
-                novarocks_sql::compiler::SqlCompileError::from(control.clone()),
-            ));
+            let error = PreparationError::from(novarocks_sql::compiler::SqlCompileError::from(
+                control.clone(),
+            ))
+            .0;
             let message = error.message().to_owned();
             let disposition = application_disposition(error);
             assert_eq!(disposition.compile_control_error(), Some(control.clone()));
@@ -912,6 +441,166 @@ mod compile_control_tests {
             assert!(matches!(decision, MvRefreshRuntimeDecision::Blocked { .. }));
             assert_eq!(decision.compile_control_error(), Some(control));
             assert!(runtime.is_suppressed(&7, 100));
+        }
+    }
+
+    #[test]
+    fn selected_connector_cause_reaches_blocked_scheduler_without_compile_relabeling() {
+        use super::{MvApplicationError, ScheduledRefreshDisposition, application_disposition};
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_mv_application::scheduler::MvSchedulerConfig;
+        use novarocks_mv_application::scheduler_runtime::{
+            MvRefreshRuntimeDecision, MvRefreshSchedulerRuntime,
+        };
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
+        for original in [
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "missing original composed capability",
+            ),
+            ConnectorError::from_domain(
+                ConnectorErrorKind::Unsupported,
+                novarocks_local_compiler::FragmentCompileError::Invalid(
+                    "unsupported text does not select the original category",
+                ),
+            ),
+        ] {
+            let fact = original.failure_fact();
+            let domain =
+                MvApplicationError::from_connector(MvApplicationErrorKind::Engine, original);
+            let selected = domain.original_failure().unwrap().clone();
+            let service =
+                novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+                    selected.clone(),
+                );
+            let disposition = application_disposition(domain);
+            assert!(matches!(
+                disposition,
+                ScheduledRefreshDisposition::InvariantViolation(_)
+            ));
+            assert_eq!(disposition.compile_control_error(), None);
+            assert_eq!(
+                disposition.execution_failure().unwrap(),
+                service.execution_failure().unwrap()
+            );
+            assert_eq!(
+                disposition.execution_failure().unwrap().fact(),
+                selected.failure_fact()
+            );
+            let mut runtime = MvRefreshSchedulerRuntime::<i64, ()>::new(MvSchedulerConfig::new(
+                true, 1, 1, 10, 40,
+            ));
+            let decision = runtime.record(&7, disposition, 100);
+            assert!(matches!(decision, MvRefreshRuntimeDecision::Blocked { .. }));
+            assert_eq!(decision.compile_control_error(), None);
+            assert_eq!(decision.execution_failure().unwrap().fact(), fact);
+            assert_eq!(
+                decision.execution_failure().unwrap(),
+                service.execution_failure().unwrap()
+            );
+            assert!(runtime.is_suppressed(&7, i64::MAX));
+        }
+    }
+
+    #[test]
+    fn retryable_preparation_error_preserves_its_typed_disposition() {
+        use super::{application_disposition, scheduler_outcome_log_fields};
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_mv_application::scheduler::MvSchedulerConfig;
+        use novarocks_mv_application::scheduler_runtime::{
+            MvRefreshRuntimeDecision, MvRefreshSchedulerRuntime,
+        };
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
+        let error = PreparationError::from(ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            "connector is starting",
+        ))
+        .0;
+        let cause = error
+            .original_failure()
+            .expect("provider cause is retained")
+            .clone();
+        let fact = cause.failure_fact();
+        let command = crate::mv::command::mv_application_command_error(error.clone());
+        assert_eq!(command.failure_cause(), Some(&cause));
+        assert_eq!(command.failure_cause().unwrap().failure_fact(), fact);
+        let message = error.message().to_owned();
+        let disposition = application_disposition(error);
+        assert_eq!(
+            scheduler_outcome_log_fields(&disposition),
+            Some(("transient_unavailable", message.as_str()))
+        );
+        let mut runtime =
+            MvRefreshSchedulerRuntime::<i64, ()>::new(MvSchedulerConfig::new(true, 1, 1, 10, 40));
+        let MvRefreshRuntimeDecision::TransientBackoff { error, retry_at_ms } =
+            runtime.record(&7, disposition, 100)
+        else {
+            panic!("provider unavailability must remain retryable");
+        };
+        assert_eq!(error.message(), message);
+        assert!(retry_at_ms > 100);
+        assert!(runtime.is_suppressed(&7, 100));
+        assert!(!runtime.is_suppressed(&7, retry_at_ms));
+    }
+
+    #[test]
+    fn definition_preparation_error_remains_blocked() {
+        use super::{application_disposition, scheduler_outcome_log_fields};
+        use novarocks_mv_application::scheduler::MvSchedulerConfig;
+        use novarocks_mv_application::scheduler_runtime::{
+            MvRefreshRuntimeDecision, MvRefreshSchedulerRuntime,
+        };
+
+        let error = PreparationError::user("stored MV contract is incompatible").0;
+        let message = error.message().to_owned();
+        let disposition = application_disposition(error);
+        assert_eq!(
+            scheduler_outcome_log_fields(&disposition),
+            Some(("invalid_definition", message.as_str()))
+        );
+        let mut runtime =
+            MvRefreshSchedulerRuntime::<i64, ()>::new(MvSchedulerConfig::new(true, 1, 1, 10, 40));
+        let MvRefreshRuntimeDecision::Blocked { error } = runtime.record(&7, disposition, 100)
+        else {
+            panic!("invalid stored definitions must remain blocked");
+        };
+        assert_eq!(error.message(), message);
+        assert!(runtime.is_suppressed(&7, 100));
+        assert!(runtime.is_suppressed(&7, i64::MAX));
+    }
+
+    #[test]
+    fn background_preparation_terminal_retains_control_without_changing_policy_kind() {
+        use super::{application_disposition, scheduler_outcome_log_fields};
+        use novarocks_mv_application::scheduler::MvSchedulerConfig;
+        use novarocks_mv_application::scheduler_runtime::{
+            MvRefreshRuntimeDecision, MvRefreshSchedulerRuntime,
+        };
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let error = PreparationError::from(novarocks_sql::compiler::SqlCompileError::from(
+                control.clone(),
+            ))
+            .0;
+            let message = error.message().to_owned();
+            let disposition = application_disposition(error);
+            assert_eq!(disposition.compile_control_error(), Some(control.clone()));
+            assert_eq!(
+                scheduler_outcome_log_fields(&disposition),
+                Some(("invalid_definition", message.as_str()))
+            );
+            let mut runtime = MvRefreshSchedulerRuntime::<i64, ()>::new(MvSchedulerConfig::new(
+                true, 1, 1, 10, 40,
+            ));
+            let decision = runtime.record(&7, disposition, 100);
+            assert!(matches!(decision, MvRefreshRuntimeDecision::Blocked { .. }));
+            assert_eq!(decision.compile_control_error(), Some(control));
+            assert!(runtime.is_suppressed(&7, i64::MAX));
         }
     }
 }

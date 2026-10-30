@@ -50,38 +50,8 @@ pub struct KillBeAfterBeLogDirective {
     pub pattern: String,
 }
 
-/// Structured fault assertions deliberately name a result category rather
-/// than matching a human-readable diagnostic. T7/T9 provide the actual
-/// snapshot producer; T4 owns this stable runner contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QueryLifecycleErrorSource {
-    BackendAttestation,
-    FrontendLiveness,
-    NoOutcome,
-}
-
-impl QueryLifecycleErrorSource {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "backend-attestation" => Some(Self::BackendAttestation),
-            "frontend-liveness" => Some(Self::FrontendLiveness),
-            "no-outcome" => Some(Self::NoOutcome),
-            _ => None,
-        }
-    }
-
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::BackendAttestation => "backend-attestation",
-            Self::FrontendLiveness => "frontend-liveness",
-            Self::NoOutcome => "no-outcome",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryLifecycleStructuredAssertion {
-    pub error_source: Option<QueryLifecycleErrorSource>,
     /// Runtime Filter facts are asserted from the typed query-terminal
     /// projection supplied by the cluster harness, never from profile text.
     pub runtime_filter_availability: Option<RuntimeFilterAvailabilityExpectation>,
@@ -319,6 +289,10 @@ pub struct QueryMeta {
     /// One bounded runner-owned fault for the next matching standard Iceberg
     /// REST publication request. The SQL case never names an operation id.
     pub publication_catalog_fault: Option<PublicationCatalogFaultDirective>,
+    /// Optional exact REST target, resolved with this case's original namespace mapping.
+    pub publication_catalog_fault_target: Option<PublicationCatalogFaultTarget>,
+    /// Optional arm cut; absence retains the original before-statement timing.
+    pub publication_catalog_fault_timing: Option<PublicationCatalogFaultTiming>,
     /// Exact REST table and actor for a server-side post-requirements hold.
     pub publication_service_hold: Option<PublicationServiceHoldDirective>,
     /// One cross-engine shell command executed after a runner proxy or real
@@ -529,6 +503,18 @@ impl PublicationCatalogFault {
 pub struct PublicationCatalogFaultDirective {
     pub action: PublicationCatalogAction,
     pub fault: PublicationCatalogFault,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationCatalogFaultTarget {
+    pub namespace: String,
+    pub table: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationCatalogFaultTiming {
+    BeforeStatement,
+    AfterFrontendExit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

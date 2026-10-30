@@ -521,16 +521,20 @@ class SweepTests(unittest.TestCase):
                 self.assertEqual(self.backend.policies,{policy,bound_policy})
                 self.assertFalse(any(c[:3]==("admin","policy","rm") for c in self.backend.calls))
 
-    def test_bounded_policy_inventory_does_not_infer_uniqueness_from_retained_subset(self):
+    def test_s3_pending_prefix_bound_does_not_truncate_complete_iam_inventory(self):
         user,policy=self.backend.provision(self.old)
         self.backend.user_info[user]["policyName"]=""
         _,other=self.backend.provision(identity(604801,token="c"*32))
         self.backend.users={user}
         with patch.object(scratch,"MAX_PENDING_PREFIXES",1):
             result=self.sweep()
-        self.assertFalse(result["complete"])
-        self.assertEqual(self.backend.users,{user})
-        self.assertEqual(self.backend.policies,{policy,other})
+        self.assertTrue(result["complete"],result)
+        self.assertTrue(result["enumeration_complete"])
+        self.assertEqual(self.backend.users,set())
+        self.assertEqual(self.backend.policies,set())
+        inspected={call[-1] for call in self.backend.calls
+                   if call[:3]==("admin","policy","info")}
+        self.assertEqual(inspected,{policy,other})
 
     def test_scratch_shaped_unmapped_user_is_preserved_not_guessed(self):
         user = self.old.iam_name("init")
@@ -996,6 +1000,41 @@ class SweepTests(unittest.TestCase):
                 self.assertEqual(result["errors"][-1]["code"], expected)
                 self.assertNotIn("SECRET", json.dumps(result))
 
+    @staticmethod
+    def large_success_mc_body():
+        # The observed cleanup returned 51,744 legitimate per-object receipts.
+        # Distinct normal-size keys keep the fixture representative without
+        # requiring a native object store or a timing/performance assertion.
+        return "\n".join(json.dumps(dict(status="success", key=f"object-{index:05d}-" + "x" * 300))
+                         for index in range(51744))
+
+    def test_complete_native_mc_receipts_over_sixteen_mib_are_not_rejected(self):
+        body=self.large_success_mc_body()
+        self.assertGreater(len(body.encode()),16 * 1024 * 1024)
+        self.backend.raw=body + "\nNOVA_SCRATCH_MC_EXIT=0\n"
+        rows=self.sweeper._mc(["ls","store"],self.clock.mono()+1)
+        self.assertEqual(len(rows),51744)
+        self.assertEqual(rows[0],dict(status="success",key="object-00000-" + "x" * 300))
+        self.assertEqual(rows[-1],dict(status="success",key="object-51743-" + "x" * 300))
+        self.assertEqual(self.backend.calls,[("ls","store")])
+
+    def test_large_captured_native_failure_keeps_priority_over_timeout(self):
+        body=self.large_success_mc_body()
+        self.assertGreater(len(body.encode()),16 * 1024 * 1024)
+        native_error='{"status":"error","error":{"cause":{"error":{"Code":"AccessDenied","Message":"SECRET"}}}}'
+        for timed_out in (False,True):
+            with self.subTest(timed_out=timed_out):
+                # A timed-out native command may retain a truncated tail, but
+                # its preceding complete native error remains authoritative.
+                output=body + "\n" + native_error + ("\n{\"truncated\":" if timed_out else "\nNOVA_SCRATCH_MC_EXIT=17\n")
+                failure=runtime.RuntimeFailure("DockerOperationTimeout","cleanup confirmed")
+                failure.stdout=output
+                with patch.object(self.backend,"run_mc",side_effect=failure) if timed_out else patch.object(self.backend,"run_mc",return_value=output):
+                    with self.assertRaises(runtime.RuntimeFailure) as caught:
+                        self.sweeper._mc(["rm","--recursive","--force","store/exact/"],self.clock.mono()+1)
+                self.assertEqual(caught.exception.code,"ScratchAccessDenied")
+                self.assertNotIn("SECRET",str(caught.exception))
+
     def test_malformed_native_response_cannot_become_empty_success(self):
         for output in ("not json\nNOVA_SCRATCH_MC_EXIT=0", "{}", "\nNOVA_SCRATCH_MC_EXIT=2",
                        '{}\nNOVA_SCRATCH_MC_EXIT=0'):
@@ -1361,6 +1400,148 @@ class FixedCollectionTests(unittest.TestCase):
         self.assertFalse(self.backend.objects)
         self.assertFalse(self.backend.users)
         self.assertIn(("rest", "DELETE", "namespaces/" + new_name + "/tables/renamed?purgeRequested=false"), self.sweeper.rest_calls)
+
+
+class ExactIamTests(unittest.TestCase):
+    setUp = SweepTests.setUp
+    provision_fixed = FixedCollectionTests.provision_fixed
+
+    def scope(self):
+        return scratch.RunStorageScope.from_record(self.young, self.record)
+
+    def pair(self, purpose="init"):
+        return {"user": self.young.iam_name(purpose), "policy": self.young.resource_name(purpose)}
+
+    def test_absence_checks_only_exact_user_and_policy_info(self):
+        result = self.sweeper.check_users_absent(self.scope(), [self.pair()], self.clock.mono() + 100)
+        self.assertTrue(result["complete"], result)
+        self.assertFalse(result["removed"])
+        self.assertEqual(self.backend.calls, [
+            ("admin", "user", "info", "store", self.pair()["user"]),
+            ("admin", "policy", "info", "store", self.pair()["policy"]),
+        ])
+        self.assertFalse(self.sweeper.rest_calls)
+
+    def test_preexisting_parent_user_or_policy_rejects_without_mutation(self):
+        for present in ("both", "user-only", "policy-only"):
+            with self.subTest(present=present):
+                self.setUp()
+                user, policy = self.provision_fixed(self.young)
+                if present == "user-only":
+                    self.backend.policies.clear()
+                    self.backend.user_info[user]["policyName"] = "parent-readwrite"
+                elif present == "policy-only":
+                    self.backend.users.clear()
+                users, policies = set(self.backend.users), set(self.backend.policies)
+                self.backend.objects = {self.young.scope_root + "/live-data"}
+                result = self.sweeper.check_users_absent(self.scope(), [self.pair()], self.clock.mono() + 100)
+                self.assertFalse(result["complete"])
+                self.assertEqual(result["errors"][0]["code"], "ScratchIamAlreadyExists")
+                self.assertFalse(result["removed"])
+                self.assertEqual(self.backend.users, users)
+                self.assertEqual(self.backend.policies, policies)
+                self.assertFalse(self.backend.disabled)
+                self.assertTrue(self.backend.objects)
+                self.assertFalse(self.sweeper.rest_calls)
+                self.assertTrue(all(call[:3] in (("admin", "user", "info"), ("admin", "policy", "info"))
+                                    for call in self.backend.calls))
+
+    def test_absence_does_not_turn_unrelated_native_errors_or_empty_success_into_missing(self):
+        for kind, code, expected in (
+                ("user", "AccessDenied", "ScratchAccessDenied"),
+                ("policy", "InternalError", "ScratchMcFailed"),
+                ("user", "NoSuchBucket", "ScratchMcFailed"),
+                ("user", "NoSuchPolicy", "ScratchMcFailed"),
+                ("policy", "NoSuchUser", "ScratchMcFailed")):
+            with self.subTest(kind=kind, code=code):
+                self.setUp()
+                name = self.pair()[kind]
+                self.backend.fail[("admin", kind, "info", "store", name)] = code
+                result = self.sweeper.check_users_absent(self.scope(), [self.pair()], self.clock.mono() + 100)
+                self.assertFalse(result["complete"])
+                self.assertEqual(result["errors"][0]["code"], expected)
+                self.assertFalse(result["removed"])
+        self.setUp()
+        self.backend.raw = "\nNOVA_SCRATCH_MC_EXIT=0"
+        result = self.sweeper.check_users_absent(self.scope(), [self.pair()], self.clock.mono() + 100)
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["errors"][0]["code"], "InvalidMcResponse")
+
+    def test_iam_only_cleanup_preserves_catalogs_and_objects_and_exact_peer_iam(self):
+        pairs = []
+        for purpose in ("init", "rot"):
+            user, policy = self.provision_fixed(self.young, purpose)
+            pairs.append(dict(user=user, policy=policy))
+        peer_user, peer_policy = self.provision_fixed(self.old)
+        objects = {self.young.scope_root + "/live-data", self.old.scope_root + "/live-data"}
+        self.backend.objects = set(objects)
+        catalogs = {self.young.resource_name("test"): dict(tables={"live": self.young.scope_root}, views={})}
+        self.sweeper.rest = copy.deepcopy(catalogs)
+        self.sweeper.rest_mv = copy.deepcopy(catalogs)
+        result = self.sweeper.cleanup_users(self.scope(), pairs, self.clock.mono() + 100)
+        self.assertTrue(result["complete"], result)
+        self.assertEqual(self.backend.users, {peer_user})
+        self.assertEqual(self.backend.policies, {peer_policy})
+        self.assertEqual(self.backend.objects, objects)
+        self.assertEqual(self.sweeper.rest, catalogs)
+        self.assertEqual(self.sweeper.rest_mv, catalogs)
+        self.assertFalse(self.sweeper.rest_calls)
+        self.assertFalse(any(call[0] in {"ls", "rm"} or call[2] == "list" for call in self.backend.calls))
+        self.assertTrue(all(item["kind"] in {"user", "policy"} for item in result["removed"]))
+        self.assertTrue(self.sweeper.cleanup_users(self.scope(), pairs, self.clock.mono() + 100)["complete"])
+
+    def test_exact_iam_pair_validation_precedes_all_remote_calls(self):
+        peer = {"user": self.old.iam_name("init"), "policy": self.old.resource_name("init")}
+        for operation in ("check_users_absent", "cleanup_users"):
+            for pairs in (None, [self.pair(), peer], [self.pair(), self.pair()],
+                          [dict(user=self.pair()["user"], policy=self.pair("rot")["policy"])],
+                          [dict(self.pair(), extra="unadmitted")]):
+                with self.subTest(operation=operation, pairs=pairs):
+                    self.setUp()
+                    self.provision_fixed(self.young)
+                    result = getattr(self.sweeper, operation)(self.scope(), pairs, self.clock.mono() + 100)
+                    self.assertFalse(result["complete"])
+                    self.assertEqual(result["errors"][0]["code"], "ScratchIamUnmapped")
+                    self.assertFalse(self.backend.calls)
+                    self.assertFalse(self.sweeper.rest_calls)
+                    self.assertFalse(self.backend.disabled)
+
+    def test_iam_cleanup_rejects_foreign_bindings_or_native_errors_before_mutation(self):
+        for change in ({"policyName": "parent-readwrite"}, {"memberOf": ["parent-group"]}):
+            with self.subTest(change=change):
+                self.setUp()
+                user, policy = self.provision_fixed(self.young)
+                self.backend.user_info[user].update(change)
+                result = self.sweeper.cleanup_users(self.scope(), [self.pair()], self.clock.mono() + 100)
+                self.assertFalse(result["complete"])
+                self.assertEqual(result["errors"][0]["code"], "ScratchIamUnmapped")
+                self.assertEqual(self.backend.users, {user})
+                self.assertEqual(self.backend.policies, {policy})
+                self.assertFalse(self.backend.disabled)
+        for kind, code in (("user", "NoSuchPolicy"), ("policy", "NoSuchUser")):
+            with self.subTest(kind=kind, code=code):
+                self.setUp()
+                self.provision_fixed(self.young)
+                self.backend.fail[("admin", kind, "info", "store", self.pair()[kind])] = code
+                result = self.sweeper.cleanup_users(self.scope(), [self.pair()], self.clock.mono() + 100)
+                self.assertFalse(result["complete"])
+                self.assertEqual(result["errors"][0]["code"], "ScratchMcFailed")
+                self.assertFalse(self.backend.disabled)
+                self.assertFalse(self.sweeper.rest_calls)
+
+    def test_iam_ports_recheck_scope_and_deadline_without_remote_effects(self):
+        for operation in ("check_users_absent", "cleanup_users"):
+            for expired in (False, True):
+                with self.subTest(operation=operation, expired=expired):
+                    self.setUp()
+                    scope = self.scope()
+                    if not expired:
+                        self.record["generation"] = "replacement-generation"
+                    deadline = self.clock.mono() + (0 if expired else 100)
+                    result = getattr(self.sweeper, operation)(scope, [self.pair()], deadline)
+                    self.assertFalse(result["complete"])
+                    self.assertFalse(self.backend.calls)
+                    self.assertFalse(self.sweeper.rest_calls)
 
 
 class RestTransportTests(unittest.TestCase):

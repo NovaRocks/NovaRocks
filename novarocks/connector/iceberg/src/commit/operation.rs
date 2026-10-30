@@ -85,6 +85,9 @@ struct OperationState {
     retired_objects: Mutex<BTreeSet<ObjectIdentity>>,
     attempt_ordinal: AtomicU32,
     object_ordinal: AtomicU64,
+    // The original payload pin follows retained journal/artifact backing; the
+    // process cache keeps only a value pin, never an admission port/WorkOwner.
+    _payload: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
 }
 
 impl std::fmt::Debug for OperationState {
@@ -130,6 +133,9 @@ impl IcebergCommitOperation {
             ));
         }
         let cancellation = FileCancellation::from_connector_request(&request);
+        let payload = request.retain_owned_metadata().map_err(|error| {
+            Error::new(ErrorKind::Unexpected, "retain original metadata payload").with_source(error)
+        })?;
         Ok(Self {
             inner: Arc::new(OperationState {
                 token,
@@ -147,6 +153,7 @@ impl IcebergCommitOperation {
                 retired_objects: Mutex::new(BTreeSet::new()),
                 attempt_ordinal: AtomicU32::new(0),
                 object_ordinal: AtomicU64::new(0),
+                _payload: payload,
             }),
         })
     }
@@ -295,7 +302,21 @@ impl IcebergCommitOperation {
             Ok(ledger) => ledger.selected(scope),
             Err(_) => return IcebergCleanupReport::NotAttempted,
         };
-        self.cleanup_records(records).await
+        self.cleanup_records(records, &self.inner.request).await
+    }
+
+    /// Same selected ledger and cleanup algorithm, borrowing the original
+    /// action's current settlement context. Caller must prove uncommitted.
+    pub(crate) async fn cleanup_in(
+        &self,
+        scope: CleanupScope,
+        current: &ConnectorRequestContext,
+    ) -> IcebergCleanupReport {
+        let records = match self.inner.ledger.lock() {
+            Ok(ledger) => ledger.selected(scope),
+            Err(_) => return IcebergCleanupReport::NotAttempted,
+        };
+        self.cleanup_records(records, current).await
     }
 
     /// Only a known committed request authorizes deletion of unreachable owned objects.
@@ -313,10 +334,33 @@ impl IcebergCommitOperation {
                 .collect(),
             Err(_) => return IcebergCleanupReport::NotAttempted,
         };
-        self.cleanup_records(records).await
+        self.cleanup_records(records, &self.inner.request).await
     }
 
-    async fn cleanup_records(&self, records: Vec<ArtifactRecord>) -> IcebergCleanupReport {
+    /// A replay uses its current registered Source, never the terminal record's
+    /// old source. Exact operation/object ownership remains unchanged.
+    pub(crate) async fn cleanup_after_commit_in(
+        &self,
+        retained: &[ObjectIdentity],
+        current: &ConnectorRequestContext,
+    ) -> IcebergCleanupReport {
+        let retained: BTreeSet<_> = retained.iter().collect();
+        let records = match self.inner.ledger.lock() {
+            Ok(ledger) => ledger
+                .records()
+                .filter(|record| !retained.contains(&record.object))
+                .cloned()
+                .collect(),
+            Err(_) => return IcebergCleanupReport::NotAttempted,
+        };
+        self.cleanup_records(records, current).await
+    }
+
+    async fn cleanup_records(
+        &self,
+        records: Vec<ArtifactRecord>,
+        current: &ConnectorRequestContext,
+    ) -> IcebergCleanupReport {
         if records.is_empty() {
             return IcebergCleanupReport::Complete { deleted: 0 };
         }
@@ -342,6 +386,11 @@ impl IcebergCommitOperation {
         };
         if let Some(resolver) = self.inner.request.storage_resolver() {
             request = request.with_storage_resolver(resolver.clone());
+        }
+        if current.io_admission().is_some() {
+            request = current
+                .for_existing_obligation(deadline, stop.view())
+                .after_external_effect();
         }
         let binding = self.inner.binding.for_request(request);
         // No object is removed while an admitted writer still owns its permit. Waiting itself
@@ -615,6 +664,23 @@ impl IcebergWriteAdmission for OperationState {
     }
 }
 
+impl IcebergCommitOperation {
+    pub(crate) fn fixed_backing_bytes() -> Result<usize> {
+        let arc = std::mem::size_of::<[usize; 2]>();
+        std::mem::size_of::<OperationState>()
+            .checked_add(arc)
+            .and_then(|n| n.checked_add(std::mem::size_of::<Semaphore>() + arc))
+            .and_then(|n| {
+                n.checked_add(if cfg!(target_os = "macos") {
+                    4 * 128
+                } else {
+                    0
+                })
+            })
+            .ok_or_else(|| invalid("original operation backing overflow"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,6 +865,14 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_is_independent_of_request_stop_and_retains_budget_remainder() {
+        assert_eq!(
+            novarocks_spi::connector::ConnectorCleanupScanSafety::Unproven
+                .require_scanned_object_gc()
+                .unwrap_err()
+                .kind(),
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+        );
+        // This exact original artifact ledger remains independently eligible.
         let dir = tempfile::tempdir().unwrap();
         let stop = ConnectorStopOwner::new();
         let operation = operation(

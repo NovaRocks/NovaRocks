@@ -221,7 +221,9 @@ fn nested_type(child_nullable: bool, origin: &str) -> ValueType {
                     DataType::Utf8,
                     child_nullable,
                 )
-                .with_metadata([("provider-origin".into(), origin.into())].into()),
+                .with_metadata(std::collections::HashMap::<String, String>::from(
+                    [("provider-origin".into(), origin.into())],
+                )),
             )]
             .into(),
         ),

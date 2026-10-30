@@ -15,28 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Transitional reverse port for frontend-owned UPDATE and MERGE routing.
-//!
-//! The frontend owns admission and durable operation lifecycle.  Core retains
-//! parser-private ASTs, Iceberg metadata, rewrite planning, and the exact
-//! connector write session behind opaque handles.
+//! Typed UPDATE/MERGE lowering and the supervised statement action capability.
 
-use std::any::Any;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use novarocks_parser::Span;
 use novarocks_parser::ast::{
     DmlStatement, MergeClause, MergeMatchedAction, MutationSource, ObjectName as ParsedObjectName,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
-use novarocks_query_application::admitted_query_context::QueryExecutionContext;
-use novarocks_spi::connector::LakePublicationId;
 use novarocks_sql::semantic::ObjectName;
-
-const PREPARED: u8 = 0;
-const STAGED: u8 = 1;
-const TERMINAL: u8 = 2;
 
 /// UPDATE and MERGE remain distinct frontend application commands while using
 /// the same narrow core reverse port.
@@ -46,174 +34,73 @@ pub enum MutationStatementKind {
     Merge,
 }
 
-/// One admitted frontend mutation request. The typed statement establishes the
-/// command family; `source` may only be read through spans carried by it.
-pub struct PrepareMutationRequest<'a> {
-    pub publication_id: LakePublicationId,
-    pub statement: &'a DmlStatement,
-    pub source: &'a str,
-    pub current_catalog: Option<String>,
-    pub current_database: String,
-    pub query_options: Option<QueryOptions>,
-    pub execution: QueryExecutionContext,
+/// Exact-span lowered input from the admitted parser statement. This retains
+/// the original SQL expression slices, without reparsing the statement source.
+#[derive(Clone, Debug)]
+pub(crate) enum OwnedMutationStatement {
+    Update(crate::query_execution::dml::mutation_flow::PreparedUpdateStatement),
+    Merge(crate::query_execution::dml::mutation_flow::PreparedMergeStatement),
 }
 
-pub trait MutationPrepared: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
+pub(crate) fn lower_statement(
+    statement: &DmlStatement,
+    source: &str,
+) -> Result<OwnedMutationStatement, String> {
+    match statement {
+        DmlStatement::Update(statement) => {
+            lower_update_statement(statement, source).map(OwnedMutationStatement::Update)
+        }
+        DmlStatement::Merge(statement) => {
+            lower_merge_statement(statement, source).map(OwnedMutationStatement::Merge)
+        }
+        _ => Err("mutation engine received a non-UPDATE/MERGE typed statement".to_string()),
+    }
 }
 
-pub trait MutationCommit: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
+pub(crate) fn resolve_target(
+    state: &crate::query_execution::kernels::DmlExecutionKernel,
+    statement: &OwnedMutationStatement,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<(crate::catalog_application::resolver::TargetBackend, String), String> {
+    match statement {
+        OwnedMutationStatement::Update(statement) => super::mutation_flow::resolve_update_target(
+            state,
+            statement,
+            current_catalog,
+            current_database,
+        ),
+        OwnedMutationStatement::Merge(statement) => super::mutation_flow::resolve_merge_target(
+            state,
+            statement,
+            current_catalog,
+            current_database,
+        ),
+    }
 }
 
-pub trait MutationAbort: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-}
-
-/// Stable facts available to the frontend before durable intent is created.
-/// The concrete COW/MOR provider action remains inside opaque handles/evidence.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MutationOperation {
-    pub publication_id: LakePublicationId,
-    pub kind: MutationStatementKind,
-    pub catalog: String,
-    pub namespace: String,
-    pub table: String,
-    pub target_ref: String,
-    pub attempt_id: String,
-    pub base_snapshot_id: Option<i64>,
-}
-
-pub struct PreparedMutation {
-    pub operation: MutationOperation,
-    pub handle: Arc<dyn MutationPrepared>,
-    pub sql_source: String,
-}
-
-pub enum MutationStageOutcome {
-    NoOp,
-    AbortRequired {
-        reason: Box<crate::dml::error::DmlExecutionError>,
-        handle: Arc<dyn MutationAbort>,
-    },
-    CommitRequired(Arc<dyn MutationCommit>),
+/// Complete admitted UPDATE/MERGE input held by the original statement Source.
+pub struct MutationStatementInput {
+    pub(crate) statement: OwnedMutationStatement,
+    pub(crate) sql: String,
+    pub(crate) context: novarocks_query_application::admitted_query_context::RequestContext,
+    pub(crate) query_options: QueryOptions,
+    pub(crate) launcher:
+        Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 
 /// One-to-one capability consumed only by the frontend DML application owner.
 // Design: ADR-0033 (docs/adr/ADR-0033-frontend-update-merge-application-owner.md)
 pub trait MutationEngine: Send + Sync {
-    fn prepare_mutation(
+    fn prepare_statement_action(
         &self,
-        request: PrepareMutationRequest<'_>,
-    ) -> Result<PreparedMutation, String>;
-
-    fn stage_mutation(
-        &self,
-        prepared: &dyn MutationPrepared,
-    ) -> Result<MutationStageOutcome, crate::dml::error::DmlExecutionError>;
-
-    fn abort_mutation_terminal(
-        &self,
-        _prepared: &dyn MutationPrepared,
-        _abort: &dyn MutationAbort,
-    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
-        Err("mutation engine does not expose a connector terminal abort outcome".to_string())
-    }
-
-    fn commit_mutation_terminal(
-        &self,
-        _prepared: &dyn MutationPrepared,
-        _commit: &dyn MutationCommit,
+        input: MutationStatementInput,
     ) -> Result<
-        novarocks_spi::connector::ExternalMutationOutcome<
-            novarocks_spi::connector::ConnectorWriteReceipt,
-        >,
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         String,
-    > {
-        Err("mutation engine does not expose a connector terminal commit outcome".to_string())
-    }
-
-    fn adjudicate_mutation_publication(
-        &self,
-        _prepared: &dyn MutationPrepared,
-        _commit: &dyn MutationCommit,
-        _evidence: novarocks_spi::connector::ExternalMutationEvidence,
-    ) -> Result<
-        novarocks_spi::connector::ExternalMutationOutcome<
-            novarocks_spi::connector::ConnectorWriteReceipt,
-        >,
-        String,
-    > {
-        Err("mutation engine does not expose same-session publication adjudication".to_string())
-    }
-
-    fn finalize_mutation(&self, prepared: &dyn MutationPrepared) -> Result<(), String>;
-}
-
-enum PreparedKernel {
-    Update(crate::query_execution::dml::mutation_flow::PreparedUpdateMutation),
-    Merge(crate::query_execution::dml::mutation_flow::PreparedMergeMutation),
-}
-
-struct CoreMutationPrepared {
-    operation: MutationOperation,
-    kernel: Mutex<Option<PreparedKernel>>,
-    finalizer:
-        Mutex<Option<Arc<dyn crate::query_execution::dml::mutation_flow::MutationExecution>>>,
-    state: AtomicU8,
-}
-
-/// One staged mutation's commit authority.
-///
-/// The completion is taken by the single commit, so a second attempt finds
-/// nothing rather than asking the connector twice. The publication authority
-/// stays beside it because a `CommitUnknown` must be resolved through the exact
-/// authority that issued the commit, never through a replacement -- and the
-/// completion itself is gone by then.
-struct CoreMutationCommit {
-    kind: MutationStatementKind,
-    attempt_id: String,
-    execution: Arc<dyn crate::query_execution::dml::mutation_flow::MutationExecution>,
-    publication_authority: crate::query_execution::dml::mutation_flow::MutationPublicationAuthority,
-    completion: Mutex<Option<crate::query_execution::dml::mutation_flow::MutationCommitCompletion>>,
-}
-
-struct CoreMutationAbort {
-    kind: MutationStatementKind,
-    attempt_id: String,
-    execution: Arc<dyn crate::query_execution::dml::mutation_flow::MutationExecution>,
-}
-
-impl MutationPrepared for CoreMutationPrepared {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl MutationCommit for CoreMutationCommit {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl MutationAbort for CoreMutationAbort {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-fn prepared_handle(prepared: &dyn MutationPrepared) -> Result<&CoreMutationPrepared, String> {
-    prepared
-        .as_any()
-        .downcast_ref::<CoreMutationPrepared>()
-        .ok_or_else(|| "mutation engine received a foreign prepared handle".to_string())
-}
-
-fn commit_handle(commit: &dyn MutationCommit) -> Result<&CoreMutationCommit, String> {
-    commit
-        .as_any()
-        .downcast_ref::<CoreMutationCommit>()
-        .ok_or_else(|| "mutation engine received a foreign commit handle".to_string())
+    >;
 }
 
 fn source_slice<'a>(source: &'a str, span: Span, context: &str) -> Result<&'a str, String> {
@@ -429,401 +316,21 @@ fn lower_merge_statement(
     })
 }
 
-fn abort_handle(abort: &dyn MutationAbort) -> Result<&CoreMutationAbort, String> {
-    abort
-        .as_any()
-        .downcast_ref::<CoreMutationAbort>()
-        .ok_or_else(|| "mutation engine received a foreign abort handle".to_string())
-}
-
 impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
-    fn prepare_mutation(
+    fn prepare_statement_action(
         &self,
-        request: PrepareMutationRequest<'_>,
-    ) -> Result<PreparedMutation, String> {
-        let connector_context = self.connector_request_context_for_execution(
-            request.query_options.as_ref(),
-            &request.execution,
-        )?;
-        let (kind, kernel, _target, base_snapshot_id) = match request.statement {
-            DmlStatement::Update(statement) => {
-                let stmt = lower_update_statement(statement, request.source)?;
-                let prepared = crate::query_execution::dml::mutation_flow::prepare_update_mutation(
-                    self,
-                    &stmt,
-                    request.current_catalog.as_deref(),
-                    &request.current_database,
-                    &request.execution,
-                    &connector_context,
-                    request.publication_id,
-                )?;
-                // The provider signed this during admission for the exact
-                // target ref; the journal records that value rather than
-                // re-reading a table handle here.
-                let base_snapshot_id = prepared.admitted_base_snapshot_id;
-                (
-                    MutationStatementKind::Update,
-                    PreparedKernel::Update(prepared),
-                    stmt.table,
-                    base_snapshot_id,
-                )
-            }
-            DmlStatement::Merge(statement) => {
-                let stmt = lower_merge_statement(statement, request.source)?;
-                let prepared = crate::query_execution::dml::mutation_flow::prepare_merge_mutation(
-                    self,
-                    &stmt,
-                    request.current_catalog.as_deref(),
-                    &request.current_database,
-                    &request.execution,
-                    &connector_context,
-                    request.publication_id,
-                )?;
-                let base_snapshot_id = prepared.admitted_base_snapshot_id;
-                (
-                    MutationStatementKind::Merge,
-                    PreparedKernel::Merge(prepared),
-                    stmt.table,
-                    base_snapshot_id,
-                )
-            }
-            _ => {
-                return Err(
-                    "mutation engine received a non-UPDATE/MERGE typed statement".to_string(),
-                );
-            }
-        };
-        let (catalog, namespace, table, target_ref) = match &kernel {
-            PreparedKernel::Update(prepared) => (
-                prepared.target.catalog.clone(),
-                prepared.target.namespace.clone(),
-                prepared.target.table.clone(),
-                prepared.target_ref.clone(),
-            ),
-            PreparedKernel::Merge(prepared) => (
-                prepared.target.catalog.clone(),
-                prepared.target.namespace.clone(),
-                prepared.target.table.clone(),
-                "main".to_string(),
-            ),
-        };
-        let operation = MutationOperation {
-            publication_id: request.publication_id,
-            kind,
-            catalog,
-            namespace,
-            table,
-            target_ref,
-            attempt_id: request.publication_id.to_string(),
-            base_snapshot_id,
-        };
-        let handle: Arc<dyn MutationPrepared> = Arc::new(CoreMutationPrepared {
-            operation: operation.clone(),
-            kernel: Mutex::new(Some(kernel)),
-            finalizer: Mutex::new(None),
-            state: AtomicU8::new(PREPARED),
-        });
-        Ok(PreparedMutation {
-            operation,
-            handle,
-            sql_source: request.source.to_string(),
-        })
-    }
-
-    fn stage_mutation(
-        &self,
-        prepared: &dyn MutationPrepared,
-    ) -> Result<MutationStageOutcome, crate::dml::error::DmlExecutionError> {
-        let prepared = prepared_handle(prepared)?;
-        if prepared
-            .state
-            .compare_exchange(PREPARED, STAGED, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(
-                "mutation prepared handle has already reached a terminal stage"
-                    .to_string()
-                    .into(),
-            );
-        }
-        let kernel = prepared
-            .kernel
-            .lock()
-            .expect("mutation prepared kernel lock poisoned")
-            .take()
-            .ok_or_else(|| "mutation prepared handle has no pending kernel".to_string())?;
-        match kernel {
-            PreparedKernel::Update(kernel) => {
-                match crate::query_execution::dml::mutation_flow::stage_prepared_update_mutation(self, kernel)? {
-                    crate::query_execution::dml::mutation_flow::MutationStagedWrite::NoOp => {
-                        prepared.state.store(TERMINAL, Ordering::Release);
-                        Ok(MutationStageOutcome::NoOp)
-                    }
-                    crate::query_execution::dml::mutation_flow::MutationStagedWrite::AbortRequired {
-                        reason,
-                        execution,
-                    } => Ok(MutationStageOutcome::AbortRequired {
-                        handle: Arc::new(CoreMutationAbort {
-                            kind: prepared.operation.kind,
-                            attempt_id: prepared.operation.attempt_id.clone(),
-                            execution,
-                        }),
-                        reason: Box::new(reason),
-                    }),
-                    crate::query_execution::dml::mutation_flow::MutationStagedWrite::CommitRequired {
-                        execution,
-                        completion,
-                    } => Ok(MutationStageOutcome::CommitRequired(Arc::new(
-                        CoreMutationCommit {
-                            kind: prepared.operation.kind,
-                            attempt_id: prepared.operation.attempt_id.clone(),
-                            execution,
-                            publication_authority: completion.publication_authority(),
-                            completion: Mutex::new(Some(completion)),
-                        },
-                    ))),
-                }
-            }
-            PreparedKernel::Merge(kernel) => {
-                match crate::query_execution::dml::mutation_flow::stage_prepared_merge_mutation(self, kernel)? {
-                    crate::query_execution::dml::mutation_flow::MutationStagedWrite::NoOp => {
-                        prepared.state.store(TERMINAL, Ordering::Release);
-                        Ok(MutationStageOutcome::NoOp)
-                    }
-                    crate::query_execution::dml::mutation_flow::MutationStagedWrite::AbortRequired {
-                        reason,
-                        execution,
-                    } => Ok(MutationStageOutcome::AbortRequired {
-                        handle: Arc::new(CoreMutationAbort {
-                            kind: prepared.operation.kind,
-                            attempt_id: prepared.operation.attempt_id.clone(),
-                            execution,
-                        }),
-                        reason: Box::new(reason),
-                    }),
-                    crate::query_execution::dml::mutation_flow::MutationStagedWrite::CommitRequired {
-                        execution,
-                        completion,
-                    } => Ok(MutationStageOutcome::CommitRequired(Arc::new(
-                        CoreMutationCommit {
-                            kind: prepared.operation.kind,
-                            attempt_id: prepared.operation.attempt_id.clone(),
-                            execution,
-                            publication_authority: completion.publication_authority(),
-                            completion: Mutex::new(Some(completion)),
-                        },
-                    ))),
-                }
-            }
-        }
-    }
-
-    fn abort_mutation_terminal(
-        &self,
-        prepared: &dyn MutationPrepared,
-        abort: &dyn MutationAbort,
-    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
-        let prepared = prepared_handle(prepared)?;
-        let abort = abort_handle(abort)?;
-        if prepared.operation.kind != abort.kind
-            || prepared.operation.attempt_id != abort.attempt_id
-        {
-            return Err(
-                "mutation abort handle does not belong to this prepared mutation".to_string(),
-            );
-        }
-        if prepared.state.swap(TERMINAL, Ordering::AcqRel) == TERMINAL {
-            return Err("mutation abort was decided more than once".to_string());
-        }
-        *prepared
-            .finalizer
-            .lock()
-            .expect("mutation finalizer lock poisoned") = Some(Arc::clone(&abort.execution));
-        abort.execution.abort_terminal()
-    }
-
-    fn commit_mutation_terminal(
-        &self,
-        prepared: &dyn MutationPrepared,
-        commit: &dyn MutationCommit,
+        input: MutationStatementInput,
     ) -> Result<
-        novarocks_spi::connector::ExternalMutationOutcome<
-            novarocks_spi::connector::ConnectorWriteReceipt,
-        >,
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         String,
     > {
-        let prepared = prepared_handle(prepared)?;
-        let commit = commit_handle(commit)?;
-        if prepared.operation.kind != commit.kind
-            || prepared.operation.attempt_id != commit.attempt_id
-        {
-            return Err(
-                "mutation commit handle does not belong to this prepared mutation".to_string(),
-            );
-        }
-        if prepared.state.swap(TERMINAL, Ordering::AcqRel) == TERMINAL {
-            return Err("mutation commit was decided more than once".to_string());
-        }
-        *prepared
-            .finalizer
-            .lock()
-            .expect("mutation finalizer lock poisoned") = Some(Arc::clone(&commit.execution));
-        let completion = commit
-            .completion
-            .lock()
-            .expect("mutation commit completion lock poisoned")
-            .take()
-            .ok_or_else(|| "mutation commit completion was already consumed".to_string())?;
-        commit.execution.commit_terminal(completion)
-    }
-
-    fn adjudicate_mutation_publication(
-        &self,
-        prepared: &dyn MutationPrepared,
-        commit: &dyn MutationCommit,
-        evidence: novarocks_spi::connector::ExternalMutationEvidence,
-    ) -> Result<
-        novarocks_spi::connector::ExternalMutationOutcome<
-            novarocks_spi::connector::ConnectorWriteReceipt,
-        >,
-        String,
-    > {
-        let _prepared = prepared_handle(prepared)?;
-        let commit = commit_handle(commit)?;
-        commit
-            .publication_authority
-            .adjudicate(evidence, commit.execution.terminal_context())
-    }
-
-    fn finalize_mutation(&self, prepared: &dyn MutationPrepared) -> Result<(), String> {
-        let prepared = prepared_handle(prepared)?;
-        if prepared.state.load(Ordering::Acquire) != TERMINAL {
-            return Err("mutation finalize requires a terminal commit decision".to_string());
-        }
-        let execution = prepared
-            .finalizer
-            .lock()
-            .expect("mutation finalizer lock poisoned")
-            .take()
-            .ok_or_else(|| "mutation finalizer has no committed execution".to_string())?;
-        execution.finalize()
+        crate::query::mutation_action::prepare(self.clone(), input)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    use super::{
-        CoreMutationAbort, CoreMutationPrepared, MutationAbort, MutationEngine, MutationOperation,
-        MutationStatementKind, STAGED,
-    };
-    use crate::query_execution::dml::mutation_flow::MutationExecution;
-    use crate::query_execution::outcome::QueryExecutionResult;
     use novarocks_parser::ast::DmlStatement;
-    use novarocks_spi::connector::{ConnectorWriteAbortOutcome, ExternalMutationFinalization};
-
-    fn test_dml_kernel() -> crate::query_execution::kernels::DmlExecutionKernel {
-        let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
-            Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
-        crate::query_execution::kernels::DmlExecutionKernel::new(
-            crate::query_execution::kernels::DmlPlanningServices::new(
-                Arc::new(
-                    novarocks_sql::compiler::build_builtin_engine_function_catalog()
-                        .expect("builtin function catalog"),
-                ),
-                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
-                crate::application::test_constant_policy(),
-                crate::query_execution::package_freeze::CompiledPackageCarrier::new(
-                    novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-                    novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
-                ),
-            ),
-            None,
-            Arc::clone(&connector_control),
-            std::sync::Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
-            Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
-            Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
-            crate::mv::domain::test_admission::test_readiness(),
-            crate::query_execution::compiler::test_query_execution_service(),
-        )
-    }
-
-    struct TestExecution {
-        abort_calls: AtomicUsize,
-    }
-
-    impl TestExecution {
-        fn known_uncommitted() -> Self {
-            Self {
-                abort_calls: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl MutationExecution for TestExecution {
-        fn stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
-            Err(crate::dml::error::DmlExecutionError::Engine(
-                "test execution must not stage".to_string(),
-            ))
-        }
-
-        fn abort_terminal(&self) -> Result<ConnectorWriteAbortOutcome, String> {
-            self.abort_calls.fetch_add(1, Ordering::AcqRel);
-            Ok(ConnectorWriteAbortOutcome::KnownUncommitted {
-                cleanup: ExternalMutationFinalization::Complete,
-            })
-        }
-
-        fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
-            panic!("test execution must not commit")
-        }
-
-        fn finalize(&self) -> Result<(), String> {
-            Ok(())
-        }
-    }
-
-    struct ForeignAbort;
-
-    impl MutationAbort for ForeignAbort {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    fn prepared(kind: MutationStatementKind, attempt_id: &str) -> CoreMutationPrepared {
-        CoreMutationPrepared {
-            operation: MutationOperation {
-                publication_id: novarocks_spi::connector::LakePublicationId::new_v7(),
-                kind,
-                catalog: "iceberg".to_string(),
-                namespace: "db".to_string(),
-                table: "t".to_string(),
-                target_ref: "main".to_string(),
-                attempt_id: attempt_id.to_string(),
-                base_snapshot_id: Some(7),
-            },
-            kernel: Mutex::new(None),
-            finalizer: Mutex::new(None),
-            state: super::AtomicU8::new(STAGED),
-        }
-    }
-
-    fn abort_handle(
-        kind: MutationStatementKind,
-        attempt_id: &str,
-        execution: Arc<TestExecution>,
-    ) -> CoreMutationAbort {
-        CoreMutationAbort {
-            kind,
-            attempt_id: attempt_id.to_string(),
-            execution,
-        }
-    }
-
     #[test]
     fn typed_mutation_family_is_statement_specific() {
         let update = novarocks_parser::parse("UPDATE t SET k = 1").expect("parse UPDATE");
@@ -879,86 +386,5 @@ mod tests {
             other => panic!("expected derived source, got {other:?}"),
         }
         assert_eq!(lowered.on_sql, "t.id = src.id");
-    }
-
-    #[test]
-    fn terminal_abort_rejects_foreign_and_cross_statement_handles_without_consuming_prepared_state()
-    {
-        let engine = test_dml_kernel();
-        let prepared = prepared(MutationStatementKind::Update, "update-attempt");
-        let execution = Arc::new(TestExecution::known_uncommitted());
-
-        let foreign = ForeignAbort;
-        let error = engine
-            .abort_mutation_terminal(&prepared, &foreign)
-            .unwrap_err();
-        assert!(error.contains("foreign abort handle"));
-        assert_eq!(prepared.state.load(Ordering::Acquire), STAGED);
-
-        let merge_abort = abort_handle(MutationStatementKind::Merge, "update-attempt", execution);
-        let error = engine
-            .abort_mutation_terminal(&prepared, &merge_abort)
-            .unwrap_err();
-        assert!(error.contains("does not belong"));
-        assert_eq!(prepared.state.load(Ordering::Acquire), STAGED);
-    }
-
-    #[test]
-    fn terminal_abort_keeps_its_execution_for_finalization() {
-        let engine = test_dml_kernel();
-        let prepared = prepared(MutationStatementKind::Update, "update-attempt");
-        let execution = Arc::new(TestExecution::known_uncommitted());
-        let abort = abort_handle(
-            MutationStatementKind::Update,
-            "update-attempt",
-            Arc::clone(&execution),
-        );
-
-        let outcome = engine.abort_mutation_terminal(&prepared, &abort).unwrap();
-        assert_eq!(
-            outcome,
-            ConnectorWriteAbortOutcome::KnownUncommitted {
-                cleanup: ExternalMutationFinalization::Complete,
-            }
-        );
-        assert_eq!(execution.abort_calls.load(Ordering::Acquire), 1);
-        assert_eq!(prepared.state.load(Ordering::Acquire), super::TERMINAL);
-        engine.finalize_mutation(&prepared).unwrap();
-
-        let error = engine
-            .abort_mutation_terminal(&prepared, &abort)
-            .unwrap_err();
-        assert!(error.contains("decided more than once"));
-        assert_eq!(execution.abort_calls.load(Ordering::Acquire), 1);
-    }
-
-    #[test]
-    fn terminal_abort_consumes_the_exact_handle_once_and_returns_connector_truth() {
-        let engine = test_dml_kernel();
-        let prepared = prepared(MutationStatementKind::Update, "update-attempt");
-        let execution = Arc::new(TestExecution::known_uncommitted());
-        let abort = abort_handle(
-            MutationStatementKind::Update,
-            "update-attempt",
-            Arc::clone(&execution),
-        );
-
-        let outcome = engine
-            .abort_mutation_terminal(&prepared, &abort)
-            .expect("terminal abort outcome");
-        assert_eq!(
-            outcome,
-            ConnectorWriteAbortOutcome::KnownUncommitted {
-                cleanup: ExternalMutationFinalization::Complete,
-            }
-        );
-        assert_eq!(execution.abort_calls.load(Ordering::Acquire), 1);
-        assert_eq!(prepared.state.load(Ordering::Acquire), super::TERMINAL);
-
-        let error = engine
-            .abort_mutation_terminal(&prepared, &abort)
-            .expect_err("terminal abort must be one-shot");
-        assert!(error.contains("decided more than once"));
-        assert_eq!(execution.abort_calls.load(Ordering::Acquire), 1);
     }
 }

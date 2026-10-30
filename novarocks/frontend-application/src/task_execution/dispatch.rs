@@ -32,8 +32,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::task_protocol_config::{DispatchBudget, DispatchLane};
+use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::task_execution::{OperationKind, TaskOperationId};
-use novarocks_query_application::coordination::{DispatchBudget, DispatchLane, MonotonicInstant};
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::BackendProcessId;
 
@@ -62,10 +63,15 @@ const fn lane_index(lane: DispatchLane) -> usize {
 /// One intent waiting in a bounded queue.
 #[derive(Debug)]
 struct QueuedOperation {
+    native_pending: Option<crate::native::task_transport::NativeBatchAdmission>,
     intent: OperationIntent,
     queue_permit: Box<dyn super::intent::TaskOperationQueuePermit>,
     queued_at: MonotonicInstant,
     queued_bytes: usize,
+}
+
+pub(crate) fn queued_operation_layout() -> std::alloc::Layout {
+    std::alloc::Layout::new::<QueuedOperation>()
 }
 
 /// One operation that waited past the frontend queue-residence bound.
@@ -273,6 +279,7 @@ impl OperationDispatcher {
             .into());
         }
         let entry = QueuedOperation {
+            native_pending: None,
             intent,
             queue_permit,
             queued_at: now,
@@ -473,6 +480,22 @@ impl OperationDispatcher {
                 else {
                     continue;
                 };
+                let retained_head = (0..=index).rev().find(|&head| {
+                    lane[head]
+                        .native_pending
+                        .as_ref()
+                        .is_some_and(|pending| index < head + pending.remaining)
+                });
+                if let Some(head) = retained_head {
+                    let mut pending = lane[head].native_pending.take().unwrap();
+                    pending.remaining -= 1;
+                    if pending.remaining != 0 {
+                        // Move only the same paid ticket. Its quoted vector
+                        // remains the original upper bound after withdrawal.
+                        let next = if head == index { head + 1 } else { head };
+                        lane[next].native_pending = Some(pending);
+                    }
+                }
                 let entry = lane
                     .remove(index)
                     .expect("queued operation index came from the same lane");
@@ -581,21 +604,6 @@ impl OperationDispatcher {
         self.take_backend_lane_batch(backend, lane_index(DispatchLane::Control))
     }
 
-    /// Takes from one exact lane without letting unrelated ordinary work hide
-    /// an urgent lifecycle operation queued for the same backend.
-    pub(super) fn take_priority_lane_batch(
-        &mut self,
-        backend: BackendProcessId,
-        lane: DispatchLane,
-    ) -> Option<DispatchBatch> {
-        let lane_index = lane_index(lane);
-        let queues = self.backends.get_mut(&backend)?;
-        if queues.credits[lane_index] == 0 {
-            queues.credits[lane_index] = self.budget.permits_for(lane);
-        }
-        self.take_backend_lane_batch(backend, lane_index)
-    }
-
     /// Takes only one already-queued exact head operation. Pending process
     /// observation uses this for actor-owned Abort, so ordinary lifecycle
     /// work cannot hitch a ride even though it shares the same lane.
@@ -633,7 +641,7 @@ impl OperationDispatcher {
         max_items: usize,
     ) -> Option<DispatchBatch> {
         let max_bytes = self.transport.max_batch_encoded_bytes();
-        let (operations, queue_permits, queued_bytes, queued_at) = {
+        let (operations, queue_permits, queued_bytes, queued_at, native_pending) = {
             let queues = self.backends.get_mut(&backend)?;
             if queues.lanes[lane].is_empty() {
                 return None;
@@ -644,26 +652,40 @@ impl OperationDispatcher {
             if allowance == 0 {
                 return None;
             }
+            let retained_items = queues.lanes[lane]
+                .front()
+                .and_then(|entry| entry.native_pending.as_ref())
+                .map(|pending| pending.remaining);
+            // A retained paid batch is never split, expanded or reticketed by
+            // a later credit/capacity observation. Other lanes remain eligible.
+            if retained_items.is_some_and(|items| items > allowance) {
+                return None;
+            }
+            let allowance = retained_items.unwrap_or(allowance);
+            let mut native_pending = None;
             let mut operations = Vec::new();
             let mut queue_permits = Vec::new();
             let mut queued_bytes = 0_usize;
             let mut queued_at = None;
-            let requires_control_progress = queues.lanes[lane]
+            let original_run = queues.lanes[lane]
                 .front()
                 .expect("the lane was observed nonempty")
                 .intent
-                .requires_control_progress();
+                .native_run_key();
             while operations.len() < allowance {
                 let Some(entry) = queues.lanes[lane].front() else {
                     break;
                 };
-                // A Native request is admitted as one process-level class.
-                // Do not let ordinary updates hitch a ride on the capacity
-                // reserved for a cancellation that shares their historical
-                // attempt-local lane.
-                if !operations.is_empty()
-                    && entry.intent.requires_control_progress() != requires_control_progress
-                {
+                // One original batch becomes one actual RPC/local offer.
+                // Keep a different method or max-wait at the SAME queue head
+                // for the next fair rotation, before moving any reservation.
+                // No operation is reticketed or reordered by this boundary.
+                if !operations.is_empty() && entry.intent.native_run_key() != original_run {
+                    break;
+                }
+                // Another original paid span is a separate ticket even when
+                // its method/deadline happen to match this run.
+                if !operations.is_empty() && entry.native_pending.is_some() {
                     break;
                 }
                 // Enqueueing already proved one operation fits. The aggregate
@@ -672,9 +694,12 @@ impl OperationDispatcher {
                 if queued_bytes.saturating_add(entry.queued_bytes) > max_bytes {
                     break;
                 }
-                let entry = queues.lanes[lane]
+                let mut entry = queues.lanes[lane]
                     .pop_front()
                     .expect("the front entry was just observed");
+                if operations.is_empty() {
+                    native_pending = entry.native_pending.take();
+                }
                 queued_bytes += entry.queued_bytes;
                 queued_at = Some(queued_at.map_or(entry.queued_at, |oldest| {
                     std::cmp::min(oldest, entry.queued_at)
@@ -693,18 +718,21 @@ impl OperationDispatcher {
                 queue_permits,
                 queued_bytes,
                 queued_at.expect("a nonempty batch has a queue timestamp"),
+                native_pending,
             )
         };
         self.queued_items -= operations.len();
         self.queued_bytes -= queued_bytes;
-        Some(DispatchBatch::with_queued_at(
+        let mut batch = DispatchBatch::with_queued_at(
             backend,
             LANES[lane],
             operations,
             queue_permits,
             queued_bytes,
             queued_at,
-        ))
+        );
+        batch.native_pending = native_pending;
+        Some(batch)
     }
 
     /// Commits transport acceptance and only then consumes dispatch permits.
@@ -749,13 +777,17 @@ impl OperationDispatcher {
     /// No dispatch permit was consumed, so this is a pure ownership return.
     /// The oldest residence timestamp is retained for every restored item to
     /// prevent repeated process-level backpressure from extending deadlines.
-    pub(super) fn restore_backpressured(&mut self, batch: DispatchBatch) {
+    pub(super) fn restore_backpressured(&mut self, mut batch: DispatchBatch) {
         let backend = batch.backend();
         let lane = lane_index(batch.lane());
         let queued_at = batch.queued_at();
         let batch_queued_bytes = batch.queued_bytes();
+        let mut native_pending = batch.native_pending.take();
         let (operations, queue_permits) = batch.into_queue_parts();
         let item_count = operations.len();
+        if let Some(pending) = native_pending.as_mut() {
+            pending.remaining = item_count;
+        }
         let recomputed_bytes = operations
             .iter()
             .map(OperationIntent::queued_bytes)
@@ -766,9 +798,16 @@ impl OperationDispatcher {
         );
         {
             let queues = self.backend_entry(backend);
-            for (intent, queue_permit) in operations.into_iter().zip(queue_permits).rev() {
+            for (index, (intent, queue_permit)) in
+                operations.into_iter().zip(queue_permits).enumerate().rev()
+            {
                 let queued_bytes = intent.queued_bytes();
                 let entry = QueuedOperation {
+                    native_pending: if index == 0 {
+                        native_pending.take()
+                    } else {
+                        None
+                    },
                     intent,
                     queue_permit,
                     queued_at,

@@ -528,7 +528,8 @@ impl ValueTypeRef {
             crate::ValueConstructionFailure::Rule(_)
             | crate::ValueConstructionFailure::Layout(_)
             | crate::ValueConstructionFailure::Vec(_)
-            | crate::ValueConstructionFailure::HashMap(_) => {
+            | crate::ValueConstructionFailure::HashMap(_)
+            | crate::ValueConstructionFailure::BTree(_) => {
                 unreachable!("pure semantic constructor has no allocation model observer")
             }
         })
@@ -1106,8 +1107,14 @@ mod tests {
 
     #[test]
     fn named_structs_and_nominal_children_remain_distinct() {
-        let nominal = Field::new("item", DataType::Utf8, true)
-            .with_metadata([(crate::NR_LOGICAL_TYPE_KEY.into(), "json".into())].into());
+        let nominal =
+            Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                crate::NR_LOGICAL_TYPE_KEY.into(),
+                "json".into(),
+            )]));
         let list = |field| {
             ValueTypeRef::try_from_declared_arrow(
                 &DataType::List(Arc::new(field)),

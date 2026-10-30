@@ -2510,7 +2510,10 @@ mod complete_fold_type_tests {
             73,
             true,
         )
-        .with_metadata([("provider.identity".into(), "source-field-9".into())].into());
+        .with_metadata(std::collections::HashMap::<String, String>::from([(
+            "provider.identity".into(),
+            "source-field-9".into(),
+        )]));
         let nested_type =
             FunctionValueType::new(DataType::Struct(vec![Arc::new(dictionary)].into()), true);
         let root_types = [
@@ -2623,7 +2626,7 @@ mod complete_fold_type_tests {
             assert_eq!(fields[0].data_type(), &DataType::Utf8);
             assert_eq!(fields[0].dict_id(), None);
             assert_eq!(fields[0].dict_is_ordered(), None);
-            assert_eq!(fields[0].metadata().capacity(), 0);
+            assert!(fields[0].metadata().as_arc().is_none());
         }
 
         // The old fixture incorrectly cast one nullable structure into unrelated

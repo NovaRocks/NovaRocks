@@ -28,17 +28,17 @@ use novarocks_fs::{
     AcquisitionFailure, AuthorityCapabilityPath, AuthorityMaterial, AuthorityMaterialSource,
     FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
     FsAccessResolver, FsAccessResources, FsScheme, ObjectStoreAccessContext,
-    ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig, ObjectStoreSecretMaterial,
-    RefreshExecutor, StorageAuthorityId,
+    ObjectStoreEndpointConfig, ObjectStoreSecretMaterial, RefreshExecutor, StorageAuthorityId,
 };
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
     CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind, ConnectorError,
     ConnectorErrorKind, ConnectorProviderId, ConnectorRequestContext, CredentialRenewalPath,
-    StaticCredentialReference, StorageAccessDomainId, StorageAccessRequest,
+    NodeLocalCredentialReference, StaticCredentialReference, StorageAccessDomainId,
+    StorageAccessRequest,
 };
 
-/// Role-local resolver for one exact static object-store credential reference.
+/// Role-local resolver for exact deployment-bound credential references.
 ///
 /// The composition root owns the immutable registry. This connector only
 /// receives a sealed resolver and never reads configuration or discovers
@@ -73,7 +73,18 @@ impl std::fmt::Debug for IcebergRestAuthMaterial {
     }
 }
 
-pub trait IcebergStaticCredentialResolver: Send + Sync {
+pub trait IcebergCredentialResolver: Send + Sync {
+    fn resolve_node_local_object_store(
+        &self,
+        _purpose: CatalogCredentialPurpose,
+        _reference: &NodeLocalCredentialReference,
+    ) -> Result<novarocks_fs::AliyunEcsRamRoleConfig, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "role-local resolver provides no node-local object-store source",
+        ))
+    }
+
     fn resolve_object_store_static(
         &self,
         reference: &StaticCredentialReference,
@@ -126,6 +137,12 @@ pub trait IcebergStaticCredentialResolver: Send + Sync {
 
 #[derive(Clone)]
 enum IcebergStorageAccess {
+    NodeLocalObjectStore {
+        owner: novarocks_spi::connector::CatalogHandle,
+        access_domain: StorageAccessDomainId,
+        endpoint_config: ObjectStoreEndpointConfig,
+        credential_reference: NodeLocalCredentialReference,
+    },
     StaticObjectStore {
         access_domain: StorageAccessDomainId,
         endpoint_config: ObjectStoreEndpointConfig,
@@ -156,7 +173,7 @@ pub struct IcebergReadBinding {
     observation_slot: Option<crate::test_observation::IcebergObservationSlot>,
     resources: FsAccessResources,
     range_service: Option<Arc<novarocks_fs::FileRangeService>>,
-    credential_resolver: Option<Arc<dyn IcebergStaticCredentialResolver>>,
+    credential_resolver: Option<Arc<dyn IcebergCredentialResolver>>,
     credential_purpose: CatalogCredentialPurpose,
     storage_access: Option<IcebergStorageAccess>,
     /// The coordinator identity the catalog definition names for its
@@ -185,7 +202,7 @@ pub struct IcebergReadBinding {
 #[derive(Clone, Debug)]
 pub struct IcebergObjectStoreBinding {
     bucket: String,
-    config: novarocks_fs::ObjectStoreConfig,
+    endpoint_config: ObjectStoreEndpointConfig,
 }
 
 impl IcebergObjectStoreBinding {
@@ -193,8 +210,8 @@ impl IcebergObjectStoreBinding {
         &self.bucket
     }
 
-    pub fn config(&self) -> &novarocks_fs::ObjectStoreConfig {
-        &self.config
+    pub fn endpoint_config(&self) -> &ObjectStoreEndpointConfig {
+        &self.endpoint_config
     }
 }
 
@@ -253,9 +270,9 @@ impl IcebergReadBinding {
 
     /// Build a role-local template that can be rebound only to an admitted
     /// immutable catalog definition.
-    pub fn with_static_credential_resolver(
+    pub fn with_credential_resolver(
         resources: FsAccessResources,
-        credential_resolver: Arc<dyn IcebergStaticCredentialResolver>,
+        credential_resolver: Arc<dyn IcebergCredentialResolver>,
     ) -> Self {
         Self {
             resources,
@@ -274,9 +291,9 @@ impl IcebergReadBinding {
 
     /// Build the FE generation template used only for metadata, manifest and
     /// statistics observation. It cannot select an execution-data credential.
-    pub fn with_static_metadata_credential_resolver(
+    pub fn with_metadata_credential_resolver(
         resources: FsAccessResources,
-        credential_resolver: Arc<dyn IcebergStaticCredentialResolver>,
+        credential_resolver: Arc<dyn IcebergCredentialResolver>,
     ) -> Self {
         Self {
             resources,
@@ -293,13 +310,13 @@ impl IcebergReadBinding {
         }
     }
 
-    /// Bind a catalog definition to its exact, role-local static credential
+    /// Bind a catalog definition to its exact, role-local credential
     /// resolver. The catalog carrier contains only non-secret facts. A vended
     /// data binding records the attempt-owned acquisition mode without placing
     /// response credentials in this generation template.
     pub fn from_catalog_properties(
         resources: FsAccessResources,
-        credential_resolver: Arc<dyn IcebergStaticCredentialResolver>,
+        credential_resolver: Arc<dyn IcebergCredentialResolver>,
         properties: &CatalogProperties,
     ) -> Result<Self, ConnectorError> {
         Self::from_catalog_properties_for_purpose(
@@ -312,7 +329,7 @@ impl IcebergReadBinding {
 
     fn from_catalog_properties_for_purpose(
         resources: FsAccessResources,
-        credential_resolver: Arc<dyn IcebergStaticCredentialResolver>,
+        credential_resolver: Arc<dyn IcebergCredentialResolver>,
         credential_purpose: CatalogCredentialPurpose,
         properties: &CatalogProperties,
     ) -> Result<Self, ConnectorError> {
@@ -360,6 +377,26 @@ impl IcebergReadBinding {
                             vec![],
                         )?;
                         IcebergStorageAccess::StaticObjectStore {
+                            access_domain: domain_input.derive_access_domain(),
+                            endpoint_config,
+                            credential_reference: reference.clone(),
+                        }
+                    }
+                    CatalogCredentialMode::NodeLocal(reference) => {
+                        let domain_input = CatalogStorageAccessDomainInput::try_new(
+                            provider_id,
+                            properties.handle().catalog_name().clone(),
+                            properties.config_format_version(),
+                            non_secret_properties,
+                            binding.clone(),
+                            vec![],
+                        )?;
+                        // Resolve only the immutable definition here. Material
+                        // acquisition starts at the actual signing boundary.
+                        credential_resolver
+                            .resolve_node_local_object_store(credential_purpose, reference)?;
+                        IcebergStorageAccess::NodeLocalObjectStore {
+                            owner: properties.handle().clone(),
                             access_domain: domain_input.derive_access_domain(),
                             endpoint_config,
                             credential_reference: reference.clone(),
@@ -601,25 +638,22 @@ impl IcebergReadBinding {
                 location.original()
             )
         })?;
-        let (endpoint_config, secret_material) = self
-            .object_store_access_context()
-            .map_err(|error| error.to_string())?;
-        let config = novarocks_fs::ObjectStoreConfig {
-            endpoint: endpoint_config.endpoint,
-            access_key_id: secret_material.access_key_id,
-            access_key_secret: secret_material.access_key_secret,
-            session_token: secret_material.session_token,
-            enable_path_style_access: endpoint_config.enable_path_style_access,
-            region: endpoint_config.region,
-            retry_max_times: endpoint_config.retry_max_times,
-            retry_min_delay_ms: endpoint_config.retry_min_delay_ms,
-            retry_max_delay_ms: endpoint_config.retry_max_delay_ms,
-            timeout_ms: endpoint_config.timeout_ms,
-            io_timeout_ms: endpoint_config.io_timeout_ms,
+        let endpoint_config = match self.storage_access.as_ref() {
+            Some(IcebergStorageAccess::StaticObjectStore {
+                endpoint_config, ..
+            })
+            | Some(IcebergStorageAccess::NodeLocalObjectStore {
+                endpoint_config, ..
+            }) => endpoint_config.clone(),
+            _ => {
+                return Err(
+                    "Iceberg output location lacks a deployment-bound object-store source".into(),
+                );
+            }
         };
         Ok(Some(IcebergObjectStoreBinding {
             bucket: bucket.to_string(),
-            config,
+            endpoint_config,
         }))
     }
 
@@ -629,6 +663,85 @@ impl IcebergReadBinding {
             .parse_location(location)
             .map(|location| location.scheme() == FsScheme::ObjectStore)
             .map_err(|error| format!("parse Iceberg output location: {error}"))
+    }
+
+    /// Borrow the original endpoint selection before any credential loader or
+    /// operator is constructed. Bucket/user/path never define an HTTP domain.
+    pub(crate) fn selected_io_dependency(
+        &self,
+        location: &str,
+    ) -> Result<novarocks_spi::connector::SharedDependency, ConnectorError> {
+        let endpoint = match self.storage_access.as_ref() {
+            Some(IcebergStorageAccess::StaticObjectStore {
+                endpoint_config, ..
+            })
+            | Some(IcebergStorageAccess::NodeLocalObjectStore {
+                endpoint_config, ..
+            })
+            | Some(IcebergStorageAccess::VendedObjectStore {
+                endpoint_config, ..
+            }) => Some(endpoint_config),
+            _ => None,
+        };
+        self.resources
+            .access_resolver()
+            .selected_dependency(location, endpoint)
+            .map_err(file_error)
+    }
+
+    /// Same explicit binding and pool, awaited directly by metadata I/O.
+    pub(crate) async fn resolve_access_for_request_async(
+        &self,
+        location: &str,
+    ) -> Result<FsAccessHandle, ConnectorError> {
+        let Some(request) = self.request_context.as_ref() else {
+            return self.resolve_access(location);
+        };
+        let (domain, locations, access) = self.access_resolution(std::iter::once(location))?;
+        let cancellation = novarocks_fs::FileCancellation::from_connector_request(request);
+        self.resources
+            .access_resolver()
+            .resolve_locations_async(domain, locations, access, &cancellation)
+            .await
+            .map(|access| access.with_request_context(request.clone()))
+            .map_err(file_error)
+    }
+    pub(crate) async fn admit_owned_stream(
+        &self,
+        location: &str,
+    ) -> Result<Option<novarocks_spi::connector::ConnectorIoPermit>, ConnectorError> {
+        match self.request_context.as_ref() {
+            Some(request) => {
+                request
+                    .admit_selected_io(self.selected_io_dependency(location)?)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn admit_non_http_io(
+        &self,
+        location: &str,
+    ) -> Result<Option<novarocks_spi::connector::ConnectorIoPermit>, ConnectorError> {
+        let Some(request) = self.request_context.as_ref() else {
+            return Ok(None);
+        };
+        if self
+            .resources
+            .access_resolver()
+            .parse_location(location)
+            .map_err(file_error)?
+            .scheme()
+            == FsScheme::ObjectStore
+        {
+            // The S3 signer admits the actual SDK-selected request before
+            // credential acquisition, and retains it in the real response.
+            return Ok(None);
+        }
+        request
+            .admit_selected_io(self.selected_io_dependency(location)?)
+            .await
     }
 
     pub fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
@@ -668,6 +781,10 @@ impl IcebergReadBinding {
             .access_resolver()
             .resolve_locations_async(access_domain, locations, object_store_access, &cancellation)
             .await
+            .map(|access| match self.request_context.as_ref() {
+                Some(request) => access.with_request_context(request.clone()),
+                None => access,
+            })
             .map_err(file_error)
     }
 
@@ -708,7 +825,14 @@ impl IcebergReadBinding {
             return self.vended_access_resolution(locations, parsed.scheme());
         }
         let access_domain = self.access_domain_for_location(&parsed)?;
-        let object_store_access = self.object_store_access_context_for_scheme(parsed.scheme())?;
+        let object_store_access = if matches!(
+            self.storage_access,
+            Some(IcebergStorageAccess::NodeLocalObjectStore { .. })
+        ) {
+            Some(self.node_local_object_store_access(&locations)?)
+        } else {
+            self.object_store_access_context_for_scheme(parsed.scheme())?
+        };
         Ok((access_domain, locations, object_store_access))
     }
 
@@ -719,7 +843,8 @@ impl IcebergReadBinding {
         match self.storage_access.as_ref().ok_or_else(|| {
             invalid("Iceberg filesystem operation has no admitted storage capability")
         })? {
-            IcebergStorageAccess::StaticObjectStore { access_domain, .. } => {
+            IcebergStorageAccess::StaticObjectStore { access_domain, .. }
+            | IcebergStorageAccess::NodeLocalObjectStore { access_domain, .. } => {
                 if location.scheme() != FsScheme::ObjectStore {
                     return Err(invalid(
                         "Iceberg object-store capability cannot resolve an uncredentialed location",
@@ -795,23 +920,26 @@ impl IcebergReadBinding {
         let resolver = context.storage_resolver().ok_or_else(|| {
             invalid("Iceberg vended object-store operation has no query storage resolver")
         })?;
-        let mut resolved = locations
+        let resolved = locations
             .iter()
             .map(|location| {
                 StorageAccessRequest::try_new(owner.clone(), location)
                     .and_then(|request| resolver.resolve_vended_s3(&request))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut resolved = resolved.into_iter();
         let selected = resolved
-            .drain(..)
             .next()
             .ok_or_else(|| invalid("Iceberg filesystem locations are empty"))?;
-        if resolved.iter().any(|other| {
+        if resolved.any(|other| {
             other.storage_access_domain_id() != selected.storage_access_domain_id()
                 || other.lease_id() != selected.lease_id()
                 || other.epoch() != selected.epoch()
                 || other.matched_prefix() != selected.matched_prefix()
                 || other.renewal_path() != selected.renewal_path()
+                || other.seed_grant() != selected.seed_grant()
+                || other.provider().map(|source| source.identity())
+                    != selected.provider().map(|source| source.identity())
         }) {
             return Err(invalid(
                 "Iceberg vended filesystem locations require different credential selections",
@@ -834,6 +962,11 @@ impl IcebergReadBinding {
         // an authority even when one process runs both roles (D0 with D9).
         // Neither is the seeded shape, which D11 keeps first-class rather than
         // degraded.
+        if selected.seed().is_some() && selected.seed_grant().is_none() {
+            return Err(invalid(
+                "Iceberg vended seed has no original grant identity",
+            ));
+        }
         let in_process_provider = selected.provider().cloned();
         let renewal = match in_process_provider {
             Some(_) => None,
@@ -842,9 +975,23 @@ impl IcebergReadBinding {
             }
         };
         let capability = match (&in_process_provider, &renewal) {
-            (Some(_), _) => AuthorityCapabilityPath::InProcessProvider,
+            (Some(provider), _) => {
+                if provider.identity().renewal_path() != selected.renewal_path()
+                    || !provider
+                        .identity()
+                        .prefixes()
+                        .contains(selected.matched_prefix())
+                {
+                    return Err(invalid(
+                        "Iceberg in-process acquisition differs from its original selection",
+                    ));
+                }
+                AuthorityCapabilityPath::InProcessProvider(provider.identity().clone())
+            }
             (None, Some(renewal)) => renewal.capability_path(),
-            (None, None) => AuthorityCapabilityPath::SeededWithoutRenewal,
+            (None, None) => AuthorityCapabilityPath::SeededWithoutRenewal {
+                grant: selected.seed_grant(),
+            },
         };
         let authority_id =
             StorageAuthorityId::new(owner.clone(), selected.matched_prefix().clone(), capability);
@@ -853,37 +1000,51 @@ impl IcebergReadBinding {
         // The factory runs only on first residence. Building the client on
         // every resolution would give a process-lived authority a fresh OAuth2
         // exchange per scan.
+        // Expiry retires only the material. The original authority still
+        // owns acquisition, even when no usable seed remains.
+        let seed_expiration = selected
+            .seed()
+            .map(|seed| credential_expiration(seed.not_after_unix_ms()))
+            .transpose()?
+            .flatten();
         let authority = self.resources.storage_authority_registry().authority(
             &authority_id,
             Instant::now(),
-            || match (in_process_provider, renewal) {
-                (Some(provider), _) => Arc::new(
-                    crate::authority_source::IcebergAuthorityMaterialSource::new(
-                        provider,
-                        selected.matched_prefix().clone(),
+            || {
+                let source: Arc<dyn AuthorityMaterialSource> = match (in_process_provider, renewal)
+                {
+                    (Some(provider), _) => Arc::new(
+                        crate::authority_source::IcebergAuthorityMaterialSource::new(
+                            Arc::clone(provider.refresher()),
+                            selected.matched_prefix().clone(),
+                        ),
                     ),
-                ) as Arc<dyn AuthorityMaterialSource>,
-                (None, Some(renewal)) => Arc::new(
-                    crate::authority_source::IcebergAuthorityMaterialSource::new(
-                        Arc::new(renewal.into_refresher(catalog_name, catalog_definition)),
-                        selected.matched_prefix().clone(),
+                    (None, Some(renewal)) => Arc::new(
+                        crate::authority_source::IcebergAuthorityMaterialSource::new(
+                            Arc::new(renewal.into_refresher(catalog_name, catalog_definition)),
+                            selected.matched_prefix().clone(),
+                        ),
                     ),
-                ) as Arc<dyn AuthorityMaterialSource>,
-                (None, None) => Arc::new(SeededWithoutRenewal) as Arc<dyn AuthorityMaterialSource>,
+                    (None, None) => Arc::new(SeededWithoutRenewal),
+                };
+                // This closure runs under the registry's unique miss. A hit
+                // neither clones old secrets nor overwrites renewed material.
+                let seed = selected
+                    .seed()
+                    .zip(seed_expiration)
+                    .and_then(|(seed, expiration)| {
+                        (expiration > Instant::now()).then(|| {
+                            AuthorityMaterial::new(
+                                seed.access_key_id().clone(),
+                                seed.secret_access_key().clone(),
+                                Some(seed.session_token().clone()),
+                                expiration,
+                            )
+                        })
+                    });
+                (source, seed)
             },
         );
-        // A seed is present only where the resolver is in this same process.
-        // An execution node has none and its authority acquires on first use,
-        // which is what makes material expiry stop meaning capability expiry
-        // (CAD-1 acceptance 11).
-        if let Some(seed) = selected.seed() {
-            authority.install_material(AuthorityMaterial::new(
-                seed.access_key_id().clone(),
-                seed.secret_access_key().clone(),
-                Some(seed.session_token().clone()),
-                credential_expiration(seed.not_after_unix_ms())?,
-            ));
-        }
         let object_store_access = ObjectStoreAccessContext::for_authority(
             endpoint_config.clone(),
             authority,
@@ -936,6 +1097,53 @@ impl IcebergReadBinding {
         }))
     }
 
+    fn node_local_object_store_access(
+        &self,
+        locations: &[String],
+    ) -> Result<ObjectStoreAccessContext<'_>, ConnectorError> {
+        let Some(IcebergStorageAccess::NodeLocalObjectStore {
+            owner,
+            endpoint_config,
+            credential_reference,
+            ..
+        }) = &self.storage_access
+        else {
+            return Err(invalid("Iceberg node-local storage binding is absent"));
+        };
+        let resolver = self
+            .credential_resolver
+            .as_ref()
+            .ok_or_else(|| invalid("Iceberg node-local binding has no role-local resolver"))?;
+        let definition = resolver
+            .resolve_node_local_object_store(self.credential_purpose, credential_reference)?;
+        let scope = definition
+            .scope_for_locations(locations)
+            .map_err(file_error)?;
+        let id = StorageAuthorityId::new(
+            owner.clone(),
+            scope,
+            AuthorityCapabilityPath::NodeLocalProvider {
+                purpose: self.credential_purpose,
+                principal: credential_reference.clone(),
+                provider: definition.clone(),
+            },
+        );
+        let authority =
+            self.resources
+                .storage_authority_registry()
+                .authority(&id, Instant::now(), || {
+                    (
+                        definition.material_source(self.resources.file_runtime().clone()),
+                        None,
+                    )
+                });
+        Ok(ObjectStoreAccessContext::for_authority(
+            endpoint_config.clone(),
+            authority,
+            self.resources.object_store_provider_pool(),
+        ))
+    }
+
     fn object_store_access_context_for_scheme(
         &self,
         scheme: FsScheme,
@@ -954,9 +1162,9 @@ impl IcebergReadBinding {
                     "Iceberg object-store operation lacks an exact binding",
                 ));
             };
-            return Ok(Some(ObjectStoreAccessContext::new(
+            return Ok(Some(ObjectStoreAccessContext::for_static(
                 endpoint_config,
-                ObjectStoreCredentialProviderIdentity::Static(credential_reference.clone()),
+                credential_reference.clone(),
                 secret_material,
                 self.resources.object_store_provider_pool(),
             )));
@@ -1076,7 +1284,9 @@ fn vending_reference(properties: &CatalogProperties) -> Option<StaticCredentialR
         .find(|binding| binding.purpose() == CatalogCredentialPurpose::DataCredentialVending)
         .and_then(|binding| match binding.mode() {
             CatalogCredentialMode::Static(reference) => Some(reference.clone()),
-            CatalogCredentialMode::Vended => None,
+            // Binding admission rejects NodeLocal for this purpose; neither
+            // storage mode is a catalog credential-vending principal.
+            CatalogCredentialMode::Vended | CatalogCredentialMode::NodeLocal(_) => None,
         })
 }
 
@@ -1178,18 +1388,22 @@ impl RefreshExecutor for SeededWithoutRenewal {
 
 /// Translate the vended grant's wall-clock deadline into the monotonic instant
 /// the authority judges usability against.
-fn credential_expiration(not_after_unix_ms: u64) -> Result<Instant, ConnectorError> {
+fn credential_expiration(not_after_unix_ms: u64) -> Result<Option<Instant>, ConnectorError> {
     let now_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX);
-    let remaining_ms = not_after_unix_ms
+    let Some(remaining_ms) = not_after_unix_ms
         .checked_sub(now_unix_ms)
-        .ok_or_else(|| invalid("Iceberg vended object-store credential has expired"))?;
+        .filter(|remaining| *remaining > 0)
+    else {
+        return Ok(None);
+    };
     Instant::now()
         .checked_add(Duration::from_millis(remaining_ms))
+        .map(Some)
         .ok_or_else(|| invalid("Iceberg vended object-store credential expiration is invalid"))
 }
 
@@ -1201,7 +1415,7 @@ struct TestCredentialResolver {
     object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
 }
 
-impl IcebergStaticCredentialResolver for TestCredentialResolver {
+impl IcebergCredentialResolver for TestCredentialResolver {
     fn resolve_object_store_static(
         &self,
         reference: &StaticCredentialReference,
@@ -1313,6 +1527,254 @@ mod tests {
         }
     }
 
+    const MULTI_VENDED_LOCATIONS: [&str; 2] = [
+        "s3://warehouse/table/a/data.parquet",
+        "s3://warehouse/table/b/data.parquet",
+    ];
+
+    #[derive(Clone, Copy, Debug)]
+    enum SelectionDifference {
+        Lease,
+        Epoch,
+        Domain,
+        Prefix,
+        RenewalPath,
+        MissingRenewalPath,
+    }
+
+    /// Both values come through the real request resolver. Only the second
+    /// location varies one actual selection dimension; no comparison is mocked.
+    struct TwoLocationVendedResolver {
+        difference: Option<SelectionDifference>,
+        calls: AtomicUsize,
+    }
+    impl ConnectorStorageResolver for TwoLocationVendedResolver {
+        fn resolve_vended_s3(
+            &self,
+            request: &StorageAccessRequest,
+        ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+            assert_eq!(request.owner(), vended_catalog_properties().handle());
+            assert!(MULTI_VENDED_LOCATIONS.contains(&request.location()));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let difference = (request.location() == MULTI_VENDED_LOCATIONS[1])
+                .then_some(self.difference)
+                .flatten();
+            let mut lease = [0x21; 16];
+            let mut epoch = 1;
+            let mut domain = [0x31; 32];
+            let mut prefix = "s3://warehouse/table";
+            let mut path = Some(endpoint_path());
+            match difference {
+                Some(SelectionDifference::Lease) => lease = [0x22; 16],
+                Some(SelectionDifference::Epoch) => epoch = 2,
+                Some(SelectionDifference::Domain) => domain = [0x32; 32],
+                Some(SelectionDifference::Prefix) => prefix = "s3://warehouse/table/b",
+                Some(SelectionDifference::RenewalPath) => {
+                    path = Some(CredentialRenewalPath::CredentialsEndpoint(routing(
+                        "https://rest/v2/credentials",
+                    )))
+                }
+                Some(SelectionDifference::MissingRenewalPath) => path = None,
+                None => {}
+            }
+            Ok(ResolvedVendedS3Access::new(
+                StorageAccessDomainId::from_bytes(domain),
+                novarocks_spi::connector::CredentialLeaseId::try_from_bytes(lease).unwrap(),
+                epoch,
+                novarocks_spi::connector::StorageCredentialScopePrefix::try_from_normalized(prefix)
+                    .unwrap(),
+                path,
+                None,
+                None,
+            ))
+        }
+    }
+
+    struct ExpiredSeedResolver {
+        grant: novarocks_spi::connector::VendedS3SeedGrantId,
+    }
+
+    impl ConnectorStorageResolver for ExpiredSeedResolver {
+        fn resolve_vended_s3(
+            &self,
+            request: &StorageAccessRequest,
+        ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+            let original = TwoLocationVendedResolver {
+                difference: None,
+                calls: AtomicUsize::new(0),
+            }
+            .resolve_vended_s3(request)?;
+            Ok(ResolvedVendedS3Access::new(
+                original.storage_access_domain_id(),
+                original.lease_id(),
+                original.epoch(),
+                original.matched_prefix().clone(),
+                original.renewal_path().cloned(),
+                Some(self.grant),
+                Some(novarocks_spi::connector::VendedS3SeedMaterial::new(
+                    1,
+                    novarocks_fs::SecretValue::new("expired-access"),
+                    novarocks_fs::SecretValue::new("expired-secret"),
+                    novarocks_fs::SecretValue::new("expired-token"),
+                )),
+            ))
+        }
+    }
+
+    #[test]
+    fn expired_seed_resolution_keeps_the_actual_renewing_authority_unseeded() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let binding = vending_binding(
+            &runtime,
+            Some(IcebergRestAuthMaterial::Bearer {
+                token: novarocks_fs::SecretValue::new("node-token"),
+            }),
+            true,
+        )
+        .for_request(
+            ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(1),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                1024,
+                2048,
+            )
+            .unwrap()
+            .with_storage_resolver(Arc::new(ExpiredSeedResolver {
+                grant: novarocks_spi::connector::VendedS3SeedGrantId::new(),
+            })),
+        );
+        binding
+            .resolve_access_for_locations(MULTI_VENDED_LOCATIONS)
+            .unwrap();
+        let id = StorageAuthorityId::new(
+            vended_catalog_properties().handle().clone(),
+            novarocks_spi::connector::StorageCredentialScopePrefix::try_from_normalized(
+                "s3://warehouse/table",
+            )
+            .unwrap(),
+            binding
+                .vended_renewal_identity(
+                    Some(&StaticCredentialReference::try_new("executor", "v1").unwrap()),
+                    Some(&endpoint_path()),
+                )
+                .unwrap()
+                .unwrap()
+                .capability_path(),
+        );
+        let registry = binding.resources.storage_authority_registry();
+        assert!(
+            registry.is_resident(&id),
+            "the original renewal path was retained"
+        );
+        let authority = registry.authority(&id, Instant::now(), || {
+            panic!("the actual resolution already installed this exact authority")
+        });
+        assert!(authority.id().capability().can_renew());
+        assert_eq!(authority.metrics().refreshes_applied, 0);
+        assert_eq!(registry.metrics().misses, 1);
+        // No signing or acquisition is requested here. The FS component test
+        // drives a real queued renewal and verifies the subsequent resident hit.
+    }
+
+    #[test]
+    fn vended_multi_location_refuses_each_different_original_selection() {
+        let runtime = tokio::runtime::Runtime::new().expect("binding runtime");
+        for difference in [
+            SelectionDifference::Lease,
+            SelectionDifference::Epoch,
+            SelectionDifference::Domain,
+            SelectionDifference::Prefix,
+            SelectionDifference::RenewalPath,
+            SelectionDifference::MissingRenewalPath,
+        ] {
+            let resolver = Arc::new(TwoLocationVendedResolver {
+                difference: Some(difference),
+                calls: AtomicUsize::new(0),
+            });
+            // Reuse the real catalog binding whose role has no independent
+            // vending identity. A selection refusal must precede authority or
+            // operator admission, rather than fail later for missing material.
+            let binding = vending_binding(&runtime, None, false).for_request(
+                ConnectorRequestContext::try_new(
+                    Instant::now() + Duration::from_secs(1),
+                    novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                    1024,
+                    2048,
+                )
+                .unwrap()
+                .with_storage_resolver(resolver.clone()),
+            );
+            let registry = Arc::clone(binding.resources.storage_authority_registry());
+            let error = binding
+                .resolve_access_for_locations(MULTI_VENDED_LOCATIONS)
+                .expect_err("different selections cannot share the first location's operator");
+            assert_eq!(
+                error.kind(),
+                ConnectorErrorKind::InvalidRequest,
+                "{difference:?}"
+            );
+            assert_eq!(
+                error.message(),
+                "Iceberg vended filesystem locations require different credential selections",
+                "{difference:?}: refusal must be the actual multi-location selection gate"
+            );
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 2, "{difference:?}");
+            assert_eq!(registry.metrics().resident, 0, "{difference:?}");
+            assert_eq!(registry.metrics().misses, 0, "{difference:?}");
+        }
+    }
+
+    #[test]
+    fn vended_multi_location_same_selection_resolves_both_paths_without_io() {
+        let runtime = tokio::runtime::Runtime::new().expect("binding runtime");
+        let resolver = Arc::new(TwoLocationVendedResolver {
+            difference: None,
+            calls: AtomicUsize::new(0),
+        });
+        let binding = vending_binding(&runtime, None, false).for_request(
+            ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(1),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                1024,
+                2048,
+            )
+            .unwrap()
+            .with_storage_resolver(resolver.clone()),
+        );
+        // Resolution builds the ordinary operator. No read, stat, signing, or
+        // acquisition is requested; no secret or network fixture is needed.
+        let access = binding
+            .resolve_access_for_locations(MULTI_VENDED_LOCATIONS)
+            .expect("the original same-selection path remains accepted");
+        assert_eq!(
+            access.access_domain(),
+            StorageAccessDomainId::from_bytes([0x31; 32])
+        );
+        assert_eq!(access.scheme(), FsScheme::ObjectStore);
+        assert_eq!(access.authority(), Some("warehouse"));
+        assert_eq!(access.paths().len(), 2);
+        for (actual, expected) in access.paths().iter().zip(MULTI_VENDED_LOCATIONS) {
+            assert_eq!(actual.location().original(), expected);
+        }
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            binding
+                .resources
+                .storage_authority_registry()
+                .metrics()
+                .resident,
+            1
+        );
+        assert_eq!(
+            binding
+                .resources
+                .storage_authority_registry()
+                .metrics()
+                .misses,
+            1
+        );
+    }
+
     fn vended_catalog_properties() -> CatalogProperties {
         CatalogProperties::new(
             CatalogHandle::new(
@@ -1391,7 +1853,7 @@ mod tests {
         material: Option<IcebergRestAuthMaterial>,
     }
 
-    impl IcebergStaticCredentialResolver for VendingResolver {
+    impl IcebergCredentialResolver for VendingResolver {
         fn resolve_object_store_static(
             &self,
             _reference: &StaticCredentialReference,
@@ -1628,7 +2090,7 @@ mod tests {
         let seeded = StorageAuthorityId::new(
             owner.clone(),
             scope.clone(),
-            AuthorityCapabilityPath::SeededWithoutRenewal,
+            AuthorityCapabilityPath::SeededWithoutRenewal { grant: None },
         );
         let acquiring = StorageAuthorityId::new(
             owner,
@@ -1694,7 +2156,7 @@ mod tests {
             .expect("select object store")
             .expect("object store binding");
         assert_eq!(selected.bucket(), "warehouse");
-        assert_eq!(selected.config().endpoint, "http://minio:9000");
+        assert_eq!(selected.endpoint_config().endpoint, "http://minio:9000");
         assert!(
             binding
                 .object_store_binding_for_location("file:///tmp/data.parquet")
@@ -1851,7 +2313,7 @@ mod catalog_control_tests {
         material: Option<IcebergRestAuthMaterial>,
     }
 
-    impl IcebergStaticCredentialResolver for ControlResolver {
+    impl IcebergCredentialResolver for ControlResolver {
         fn resolve_object_store_static(
             &self,
             _reference: &StaticCredentialReference,
@@ -1875,7 +2337,7 @@ mod catalog_control_tests {
 
     struct DefaultResolver;
 
-    impl IcebergStaticCredentialResolver for DefaultResolver {
+    impl IcebergCredentialResolver for DefaultResolver {
         fn resolve_object_store_static(
             &self,
             _reference: &StaticCredentialReference,
@@ -1903,7 +2365,7 @@ mod catalog_control_tests {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         // The coordinator's generation binds its metadata template to the
         // admitted definition; the control identity travels with that bind.
-        let template = IcebergReadBinding::with_static_metadata_credential_resolver(
+        let template = IcebergReadBinding::with_metadata_credential_resolver(
             resources(&runtime),
             Arc::new(ControlResolver {
                 material: Some(IcebergRestAuthMaterial::Bearer {
@@ -1932,7 +2394,7 @@ mod catalog_control_tests {
     #[test]
     fn the_coordinator_metadata_binding_reports_the_declared_vending_identity() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let template = IcebergReadBinding::with_static_metadata_credential_resolver(
+        let template = IcebergReadBinding::with_metadata_credential_resolver(
             resources(&runtime),
             Arc::new(DefaultResolver),
         );
@@ -1969,8 +2431,7 @@ mod catalog_control_tests {
     fn a_declared_control_identity_the_role_cannot_resolve_is_an_error() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         for resolver in [
-            Arc::new(ControlResolver { material: None })
-                as Arc<dyn IcebergStaticCredentialResolver>,
+            Arc::new(ControlResolver { material: None }) as Arc<dyn IcebergCredentialResolver>,
             Arc::new(DefaultResolver),
         ] {
             let binding = IcebergReadBinding::from_catalog_properties(
@@ -2008,6 +2469,126 @@ mod catalog_control_tests {
                 .resolve_catalog_control_identity()
                 .expect("projection has no control binding")
                 .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod node_local_tests {
+    use super::*;
+    use novarocks_fs::{
+        AliyunEcsRamRoleConfig, ObjectStoreProviderPool, TokioFileIoRuntime, TokioFileTaskSpawner,
+    };
+    use novarocks_spi::connector::{
+        CatalogCredentialBinding, CatalogHandle, CatalogProperty, CatalogVersion,
+        ConnectorInstanceId, CredentialConsumerRole,
+    };
+
+    struct NodeLocalResolver;
+    impl IcebergCredentialResolver for NodeLocalResolver {
+        fn resolve_object_store_static(
+            &self,
+            _: &StaticCredentialReference,
+        ) -> Result<ObjectStoreSecretMaterial, ConnectorError> {
+            panic!("node-local mode cannot export a static snapshot")
+        }
+        fn resolve_node_local_object_store(
+            &self,
+            purpose: CatalogCredentialPurpose,
+            reference: &NodeLocalCredentialReference,
+        ) -> Result<AliyunEcsRamRoleConfig, ConnectorError> {
+            assert_eq!(purpose, CatalogCredentialPurpose::ObjectStoreData);
+            assert_eq!(reference.name(), "ecs-data");
+            AliyunEcsRamRoleConfig::try_new("test-role", vec!["s3://bucket/allowed/".into()])
+                .map_err(file_error)
+        }
+    }
+    fn binding(runtime: &tokio::runtime::Runtime) -> IcebergReadBinding {
+        let properties = CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("node-local-test").unwrap(),
+                CatalogVersion::from_bytes([0x49; 32]),
+            ),
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            3,
+            vec![
+                CatalogProperty::new(
+                    "aws.s3.endpoint",
+                    "https://s3.oss-cn-beijing-internal.aliyuncs.com",
+                )
+                .unwrap(),
+                CatalogProperty::new("aws.s3.enable_path_style_access", "false").unwrap(),
+                CatalogProperty::new("aws.s3.region", "cn-beijing").unwrap(),
+            ],
+            vec![
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::Backend,
+                    CatalogCredentialMode::NodeLocal(
+                        NodeLocalCredentialReference::try_new("ecs-data", "v1").unwrap(),
+                    ),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let resources = FsAccessResources::new(
+            Arc::new(
+                ObjectStoreProviderPool::new(
+                    novarocks_fs::ObjectStoreProviderPoolOptions::default(),
+                )
+                .unwrap(),
+            ),
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        IcebergReadBinding::from_catalog_properties(
+            resources,
+            Arc::new(NodeLocalResolver),
+            &properties,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn node_local_binding_is_lazy_and_reuses_its_original_authority() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let binding = binding(&runtime);
+        let facts = binding
+            .object_store_binding_for_location("s3://bucket/allowed/data")
+            .unwrap()
+            .unwrap();
+        assert_eq!(facts.bucket(), "bucket");
+        assert_eq!(
+            facts.endpoint_config().region.as_deref(),
+            Some("cn-beijing")
+        );
+        // Both operations prepare handles only. An eager metadata request on
+        // this non-ECS test machine would fail rather than preparing a handle.
+        binding.resolve_access("s3://bucket/allowed/one").unwrap();
+        binding.resolve_access("s3a://bucket/allowed/two").unwrap();
+        let metrics = binding.resources.storage_authority_registry().metrics();
+        assert_eq!(metrics.misses, 1);
+        assert_eq!(metrics.hits, 1);
+    }
+
+    #[test]
+    fn node_local_binding_refuses_a_sibling_before_operator_or_metadata_access() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let binding = binding(&runtime);
+        assert!(
+            binding
+                .resolve_access("s3://bucket/allowed-sibling/data")
+                .is_err()
+        );
+        assert_eq!(
+            binding
+                .resources
+                .storage_authority_registry()
+                .metrics()
+                .misses,
+            0
         );
     }
 }

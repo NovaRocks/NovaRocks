@@ -94,7 +94,7 @@ impl ResourceWaitRegistration {
         scope.inner.update_facts(|state| {
             let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
             if class == ResourceClass::Data {
-                node.check()?;
+                node.check(&state.cancellations)?;
             }
             let key = (scope.id, class);
             if state.resource_waiters.contains(&key) {
@@ -138,7 +138,7 @@ fn check_capacity(
 ) -> Result<(), WorkError> {
     let node = state.nodes.get(&id).ok_or(WorkError::Released)?;
     if class == ResourceClass::Data {
-        node.check()?;
+        node.check(&state.cancellations)?;
     }
     let scope_held = node
         .reserved_bytes
@@ -351,7 +351,7 @@ impl Reservation {
         self.scope.inner.update_facts(|state| {
             let node = state.nodes.get_mut(&self.scope.id).unwrap();
             if self.class == ResourceClass::Data {
-                node.check()?;
+                node.check(&state.cancellations)?;
             }
             if bytes < self.remaining {
                 node.resource_holders = node
@@ -477,7 +477,7 @@ impl AllocationCharge {
         self.allocation.inner.update_facts(|state| {
             let target = state.nodes.get_mut(&scope.id).ok_or(WorkError::Released)?;
             if self.allocation.class == ResourceClass::Data {
-                target.check()?;
+                target.check(&state.cancellations)?;
             }
             let held = target
                 .used_bytes

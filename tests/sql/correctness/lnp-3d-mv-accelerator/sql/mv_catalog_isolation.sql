@@ -24,16 +24,16 @@ PROPERTIES (
   "uri" = "${iceberg_rest_uri}",
   "warehouse" = "${iceberg_rest_warehouse}",
   "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "static",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
+  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
   "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
   "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "static",
-  "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
+  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
   "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
   "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.region" = "us-east-1",
-  "aws.s3.enable_path_style_access" = "true"
+  "aws.s3.region" = "${oss_region}",
+  "aws.s3.enable_path_style_access" = "${oss_path_style}"
 );
 CREATE DATABASE lnp3d_pkg_${uuid0}.ns_${uuid0};
 CREATE TABLE lnp3d_pkg_${uuid0}.ns_${uuid0}.z_source (k1 INT NOT NULL, v1 BIGINT)
@@ -50,9 +50,11 @@ AS SELECT k1, v1 FROM z_source;
 REFRESH MATERIALIZED VIEW a_mv;
 
 -- query 2
--- `a_mv` sorts before `z_source` in the namespace enumeration, so the one
--- proxy fault corrupts precisely the MV package rather than a base table.
+-- Bind the fault to this case's exact MV package; startup request order
+-- does not determine which table reaches the proxy first.
 -- @publication_catalog_fault=table-load,corrupt-package
+-- @publication_catalog_fault_target=namespace=ns_${uuid0},table=a_mv
+-- @publication_catalog_fault_timing=after-frontend-exit
 -- @restart_fe_after_step=true
 -- @skip_result_check=true
 SELECT 1;

@@ -222,6 +222,61 @@ fn load_connector_table_materialization_with_resolution_typed(
         .map_err(CatalogResolutionError::failed)
 }
 
+pub(crate) async fn load_connector_table_materialization_with_resolution_async(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    resolution: novarocks_spi::connector::ConnectorTableResolution,
+) -> CatalogResolutionResult<ConnectorQueryTableMaterialization> {
+    use novarocks_spi::connector::{
+        ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableRequest,
+    };
+
+    let instance_id = ConnectorInstanceId::parse(catalog)
+        .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
+    let planning_lease = controls
+        .acquire_current(&instance_id)
+        .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
+    // The query-wide collector is attached at admitted query preparation, but
+    // only this exact planning lease knows which durable catalog generation a
+    // metadata response belongs to. Decorate this one request after acquiring
+    // the lease so a multi-catalog query cannot misattribute a vended seed.
+    let context = if context.vended_credential_lease_sink().is_some() {
+        context
+            .with_vended_credential_lease_collection(
+                planning_lease
+                    .binding()
+                    .catalog_properties()
+                    .map_err(|error| CatalogResolutionError::failed(error.to_string()))?
+                    .clone(),
+            )
+            .map_err(|error| CatalogResolutionError::failed(error.to_string()))?
+    } else {
+        context
+    };
+    let metadata = crate::connector::schema_creation::load_frontend_table_async(
+        planning_lease.binding().metadata().as_ref(),
+        ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution,
+            context,
+        },
+    )
+    .await
+    // An absent relation is a SQL name-resolution failure, not a provider
+    // incident: render the vocabulary the rest of the engine already
+    // recognizes instead of leaking the provider's own wording.
+    .map_err(|error| connector_table_resolution_error(error, namespace, table))?;
+    connector_table_materialization_from_metadata(metadata, planning_lease)
+        .map_err(CatalogResolutionError::failed)
+}
+
 fn connector_table_resolution_error(
     error: novarocks_spi::connector::ConnectorError,
     namespace: &str,

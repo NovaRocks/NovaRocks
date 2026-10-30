@@ -9,11 +9,12 @@
   "interface": {
     "displayName": "Workbench",
     "shortDescription": "Drive changes through explicit stages; capture and look up engineering knowledge.",
-    "longDescription": "Two halves sharing one documentation root. The development half explains, discusses, specifies, plans, executes, and finishes changes under explicit human gates, with persisted parallel-ready task graphs and local checkpoint commits. The knowledge half captures reproducible customer scenarios, first-hand debugging cases, and architecture decision records, then retrieves them by symptom when a problem recurs.",
+    "longDescription": "Two halves sharing one documentation root. The development half explains, discusses, reviews the direction of specs and plans, specifies, plans, executes, and finishes changes under explicit human gates, with persisted parallel-ready task graphs and local checkpoint commits. The knowledge half captures reproducible customer scenarios, first-hand debugging cases, and architecture decision records, then retrieves them by symptom when a problem recurs.",
     "developerName": "Workbench",
     "category": "Productivity",
     "capabilities": [
       "Design",
+      "Review",
       "Explanation",
       "Planning",
       "Implementation",

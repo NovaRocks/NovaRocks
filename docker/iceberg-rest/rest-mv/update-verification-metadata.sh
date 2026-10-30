@@ -31,10 +31,15 @@ from pathlib import Path
 repo = Path(sys.argv[1])
 parser = argparse.ArgumentParser(description="Regenerate rest-mv dependency checksums without publishing fixture inputs.")
 parser.add_argument("--image-source", action="append", default=[], metavar="NAME=REPOSITORY")
+parser.add_argument("--artifact-url-prefix", action="append", default=[], metavar="ORIGINAL=TRANSPORT")
 parser.add_argument("--docker-pull-timeout-seconds", type=int, default=180)
 args = parser.parse_args(sys.argv[2:])
 lock_path = repo / "docker/fixture-inputs/lock.json"
-lock = json.loads(lock_path.read_text())
+sys.path.insert(0, str(repo / "docker/fixture-inputs"))
+from fixture_inputs import load_lock
+from provision import parse_artifact_url_prefixes, artifact_url_prefix_build_args
+prefixes = parse_artifact_url_prefixes(args.artifact_url_prefix)
+lock, _ = load_lock(lock_path, consumer="derived:rest-mv")
 recipe = lock["derived_images"]["rest-mv"]
 with tempfile.TemporaryDirectory(prefix="novarocks-rest-mv-verification-") as temporary:
     work = Path(temporary)
@@ -45,6 +50,8 @@ with tempfile.TemporaryDirectory(prefix="novarocks-rest-mv-verification-") as te
                "--docker-pull-timeout-seconds", str(args.docker_pull_timeout_seconds)]
     for source in args.image_source:
         command += ["--image-source", source]
+    for prefix in args.artifact_url_prefix:
+        command += ["--artifact-url-prefix", prefix]
     subprocess.run(command, check=True)
     output = work / "output"
     command = ["docker", "build", "--platform", recipe["platform"],
@@ -52,6 +59,7 @@ with tempfile.TemporaryDirectory(prefix="novarocks-rest-mv-verification-") as te
                "--output", f"type=local,dest={output}", "--progress", "plain"]
     for argument, name in recipe["bases"].items():
         command += ["--build-arg", f"{argument}={lock['images'][name]['alias']}"]
+    command += artifact_url_prefix_build_args(recipe, prefixes)
     subprocess.run(command + [str(context)], check=True)
     generated = output / "verification-metadata.xml"
     if not generated.is_file() or generated.stat().st_size == 0:

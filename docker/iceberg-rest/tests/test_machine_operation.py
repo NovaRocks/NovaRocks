@@ -1028,6 +1028,62 @@ class MachineOperationTests(unittest.TestCase):
                 self.fail("liveness pipe descriptor leaked after monitor spawn failure")
 
 
+class MachineOperationDiagnosticTests(unittest.TestCase):
+    def test_original_failure_keeps_private_callsite_and_typed_refusal(self):
+        import errno
+
+        with tempfile.TemporaryDirectory(prefix="novarocks-operation-diagnostic-") as directory:
+            root = Path(directory)
+            secret = "request-only-" + root.name
+            for command, original_error in (
+                ("mc", PermissionError(errno.EACCES, "original output refused",
+                                       str(root / "original.stdout"))),
+                ("control", runtime.RuntimeFailure("RuntimeIdentityMismatch", "original identity refused")),
+            ):
+                with self.subTest(command=command):
+                    journal = root / (command + ".json")
+                    runtime.atomic_json(journal, dict(schema=1, phase="intent",
+                        command_succeeded=False, original_fact="retained"))
+                    request = dict(environment={"PRIVATE_TEST_INPUT": secret},
+                        deadline_monotonic=time.monotonic() + 5, script=secret)
+                    if command == "control":
+                        request["operation"] = "control"
+                    runtime.atomic_json(journal.with_suffix(".request"), request)
+                    request_bytes = journal.with_suffix(".request").read_bytes()
+
+                    def failing_native_operation(_owner):
+                        raise original_error
+
+                    method = "run_control" if command == "control" else "run"
+                    with (root / "lock").open("wb") as lock, \
+                            patch.object(sys, "argv", ["machine_operation.py", str(journal),
+                                "--control-fd", str(lock.fileno()), "--lock-fd", str(lock.fileno()),
+                                "--timeout", "1"]), \
+                            patch.object(operation.CommandOwner, method, new=failing_native_operation), \
+                            patch.object(operation.subprocess, "Popen") as launch:
+                        self.assertEqual(operation.main(), 1)
+                    launch.assert_not_called()
+                    fact = json.loads(journal.read_text())
+                    self.assertEqual(fact["phase"], "cleanup-failed")
+                    self.assertEqual(fact["error"], getattr(original_error, "code", type(original_error).__name__))
+                    self.assertEqual(fact["original_fact"], "retained")
+                    self.assertFalse(fact["command_succeeded"])
+                    diagnostic = fact["error_diagnostics"]
+                    self.assertEqual(diagnostic["message"], str(original_error))
+                    self.assertIn("failing_native_operation", diagnostic["traceback"])
+                    self.assertIn("raise original_error", diagnostic["traceback"])
+                    self.assertIn(str(original_error), diagnostic["traceback"])
+                    self.assertNotIn(secret, journal.read_text())
+                    self.assertEqual(journal.with_suffix(".request").read_bytes(), request_bytes)
+                    self.assertEqual(journal.stat().st_mode & 0o777, 0o600)
+                    if isinstance(original_error, OSError):
+                        self.assertEqual(diagnostic["errno"], errno.EACCES)
+                        self.assertEqual(diagnostic["filename"], original_error.filename)
+                    else:
+                        self.assertIsNone(diagnostic["errno"])
+                        self.assertIsNone(diagnostic["filename"])
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--fixture-owner":
         raise SystemExit(run_owner(Path(sys.argv[2])))

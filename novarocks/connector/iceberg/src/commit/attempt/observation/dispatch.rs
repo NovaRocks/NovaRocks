@@ -24,6 +24,89 @@ use crate::catalog::publication_dispatch::{PreparationResult, PreparedPublicatio
 use crate::commit::publication_descriptor::RecoveryBinding;
 use std::future::Future;
 
+/// Move-only continuation of the original dispatch, before its ready child
+/// and activity guards exit and before necessary finalization starts.
+pub(crate) struct PendingPublicationFinalization<R> {
+    journal: PublicationJournal<R>,
+    entry: JournalEntryRef,
+    policy: CatalogEvidencePolicy,
+    dispatch: Option<ReceivedCatalogDispatch>,
+}
+struct ReceivedCatalogDispatch {
+    future: std::pin::Pin<
+        Box<dyn Future<Output = crate::catalog::publication_dispatch::DispatchCompletion> + Send>,
+    >,
+    finalization: Option<Box<dyn crate::catalog::publication_dispatch::FinalizationWork>>,
+    dispatching: Option<crate::activity::ActivityGuard>,
+    evidence_wait: Option<crate::activity::ActivityGuard>,
+}
+impl<R: Clone + Send + Sync + 'static> PendingPublicationFinalization<R> {
+    fn settled(
+        journal: PublicationJournal<R>,
+        entry: JournalEntryRef,
+        policy: CatalogEvidencePolicy,
+    ) -> Self {
+        Self {
+            journal,
+            entry,
+            policy,
+            dispatch: None,
+        }
+    }
+    pub(crate) fn entry(&self) -> JournalEntryRef {
+        self.entry
+    }
+    pub(crate) fn evidence_policy(&self) -> CatalogEvidencePolicy {
+        self.policy
+    }
+    /// Continue only this journal's already-received dispatch. No second
+    /// preparation, dispatch claim, deadline, or finalization grant is minted.
+    pub(crate) async fn finish(self, policy: CatalogEvidencePolicy) -> Result<JournalEntryRef> {
+        let entry_ref = self.entry;
+        let journal = self.journal;
+        let Some(ReceivedCatalogDispatch {
+            future,
+            finalization,
+            dispatching,
+            evidence_wait,
+        }) = self.dispatch
+        else {
+            return Ok(entry_ref);
+        };
+        // The original positive fact is already in the journal and, for a
+        // catalog mutation, in its Source receiving before this foreign Drop.
+        drop(future);
+        if let Some(activity) = &journal.activity {
+            let state = journal
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(&state.entries[&entry_ref.0].phase,
+                EntryPhase::Concluded(DispatchEvidence::Unknown { failure, .. } | DispatchEvidence::NotDispatched { failure } | DispatchEvidence::Rejected { failure, .. })
+                if failure.kind() == ConnectorMutationFailureKind::DeadlineExceeded)
+            {
+                activity.evidence_expired();
+            }
+        }
+        drop(evidence_wait);
+        drop(dispatching);
+        if let Some(work) = finalization {
+            let finalization = match journal.finalization_context(entry_ref, policy) {
+                Ok(context) => {
+                    let _finalizing = journal.finalization_activity(entry_ref);
+                    work.run(context).await
+                }
+                Err(error) => ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Internal,
+                    error.message(),
+                )),
+            };
+            journal.record_entry_finalization(entry_ref, finalization);
+        }
+        Ok(entry_ref)
+    }
+}
+
 impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
     pub(crate) async fn publish_once<F, Fut>(
         &self,
@@ -31,6 +114,27 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         policy: CatalogEvidencePolicy,
         prepare: F,
     ) -> Result<JournalEntryRef>
+    where
+        F: FnOnce(
+                PublicationDescriptor,
+                novarocks_spi::connector::ProviderBindingEpoch,
+                ConnectorRequestContext,
+            ) -> Fut
+            + Send,
+        Fut: Future<Output = PreparationResult<PreparedPublication>> + Send,
+    {
+        let pending = self
+            .publish_once_to_finalization(preparation, policy, prepare)
+            .await?;
+        pending.finish(policy).await
+    }
+
+    pub(crate) async fn publish_once_to_finalization<F, Fut>(
+        &self,
+        preparation: ConnectorRequestContext,
+        policy: CatalogEvidencePolicy,
+        prepare: F,
+    ) -> Result<PendingPublicationFinalization<R>>
     where
         F: FnOnce(
                 PublicationDescriptor,
@@ -49,7 +153,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             .as_ref()
             .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::PreDispatch));
         let entry_ref = JournalEntryRef(claim.key);
-        let (descriptor, generation) = {
+        let (descriptor, generation, recorded_cap) = {
             let state = self
                 .state
                 .lock()
@@ -61,7 +165,18 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             (
                 entry.checked.descriptor.clone(),
                 entry.checked.evidence.incarnation(),
+                entry.finalization_deadline_cap,
             )
+        };
+        // A nested publication cannot use a later invocation or an independent
+        // cleanup projection to restart its necessary preparation budget.
+        let preparation = match recorded_cap {
+            Some(cap) => preparation.with_necessary_finalization_deadline_cap(cap),
+            None => preparation,
+        };
+        let preparation = match preparation.necessary_finalization_deadline_cap() {
+            Some(cap) => preparation.with_earlier_deadline(cap),
+            None => preparation,
         };
         if let Err(error) = preparation.check_active() {
             let failure = super::super::before_dispatch_failure(
@@ -72,7 +187,11 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 activity.preparation_failed(&failure);
             }
             claim.refuse(failure);
-            return Ok(entry_ref);
+            return Ok(PendingPublicationFinalization::settled(
+                self.clone(),
+                entry_ref,
+                policy,
+            ));
         }
         // Every adapter receives the original preparation control and owns
         // any started, non-abortable I/O to actual exit. The generic executor
@@ -85,7 +204,11 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                     activity.preparation_failed(&error.0);
                 }
                 claim.refuse(error.0);
-                return Ok(entry_ref);
+                return Ok(PendingPublicationFinalization::settled(
+                    self.clone(),
+                    entry_ref,
+                    policy,
+                ));
             }
         };
         let (binding, dispatch) = match prepared {
@@ -108,12 +231,20 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                         }
                     }
                 }
-                return Ok(entry_ref);
+                return Ok(PendingPublicationFinalization::settled(
+                    self.clone(),
+                    entry_ref,
+                    policy,
+                ));
             }
         };
         if let Err(error) = claim.bind(binding) {
             claim.refuse(super::super::before_dispatch_failure(&error));
-            return Ok(entry_ref);
+            return Ok(PendingPublicationFinalization::settled(
+                self.clone(),
+                entry_ref,
+                policy,
+            ));
         }
         if let Err(error) = claim
             .begin_dispatch(&preparation, &MemoryDispatchBarrier)
@@ -122,11 +253,19 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             if let Some(activity) = &self.activity {
                 activity.preparation_failed(&super::super::before_dispatch_failure(&error));
             }
-            return Ok(entry_ref);
+            return Ok(PendingPublicationFinalization::settled(
+                self.clone(),
+                entry_ref,
+                policy,
+            ));
         }
         let Some(evidence_context) = self.begin_entry_evidence(entry_ref, &preparation, policy)
         else {
-            return Ok(entry_ref);
+            return Ok(PendingPublicationFinalization::settled(
+                self.clone(),
+                entry_ref,
+                policy,
+            ));
         };
         drop(preparing);
         let dispatching = self
@@ -138,38 +277,34 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             .as_ref()
             .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::Evidence));
         self.mark_dispatch_start(entry_ref);
+        // The journal has entered its original non-abortable evidence interval;
+        // subsequent real requests continue as existing Settlement obligations.
+        preparation
+            .publication_obligation_started()
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Original publication I/O source is unavailable",
+                )
+                .with_source(error)
+            })?;
         // No statement cancellation branch may drop a dispatched mutation.
-        let completion = dispatch.dispatch_once(evidence_context).await;
-        // This is deliberately the first statement after adapter return.
+        let mut future = dispatch.dispatch_once(evidence_context);
+        let completion = std::future::poll_fn(|cx| future.as_mut().poll(cx)).await;
+        // Receive canonical dispatch evidence before the ready child's Drop.
+        // The caller may now preserve Applied without invoking foreign code.
         self.conclude_entry(entry_ref, completion.evidence);
-        if let Some(activity) = &self.activity {
-            let state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if matches!(&state.entries[&entry_ref.0].phase,
-                EntryPhase::Concluded(DispatchEvidence::Unknown { failure, .. } | DispatchEvidence::NotDispatched { failure } | DispatchEvidence::Rejected { failure, .. })
-                if failure.kind() == ConnectorMutationFailureKind::DeadlineExceeded)
-            {
-                activity.evidence_expired();
-            }
-        }
-        drop(evidence_wait);
-        drop(dispatching);
-        if let Some(work) = completion.finalization {
-            let finalization = match self.finalization_context(entry_ref, policy) {
-                Ok(context) => {
-                    let _finalizing = self.finalization_activity(entry_ref);
-                    work.run(context).await
-                }
-                Err(error) => ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Internal,
-                    error.message(),
-                )),
-            };
-            self.record_entry_finalization(entry_ref, finalization);
-        }
-        Ok(entry_ref)
+        Ok(PendingPublicationFinalization {
+            journal: self.clone(),
+            entry: entry_ref,
+            policy,
+            dispatch: Some(ReceivedCatalogDispatch {
+                future,
+                finalization: completion.finalization,
+                dispatching,
+                evidence_wait,
+            }),
+        })
     }
 
     fn begin_entry_evidence(
@@ -254,10 +389,13 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
 }
 
 impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
+    pub(crate) fn prepared_publisher_backing_bytes() -> usize {
+        std::mem::size_of::<PreparedObservedPublisher<R>>() + std::mem::size_of::<[usize; 2]>()
+    }
     pub(crate) fn observe_prepared(
         &self,
         inner: Arc<dyn super::super::prepared::PublicationPreparer>,
-    ) -> impl Publisher + use<R> {
+    ) -> PreparedObservedPublisher<R> {
         PreparedObservedPublisher {
             inner,
             journal: self.clone(),
@@ -286,10 +424,157 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         }
     }
 }
-struct PreparedObservedPublisher<R> {
+pub(crate) struct PreparedObservedPublisher<R> {
     inner: Arc<dyn super::super::prepared::PublicationPreparer>,
     journal: PublicationJournal<R>,
 }
+impl<R: Clone + Send + Sync + 'static> PreparedObservedPublisher<R> {
+    /// The same preparation and one dispatch, stopping before the ready child
+    /// Drop. Concrete original adapters receive their facts at this cut.
+    pub(crate) async fn dispatch_to_finalization(
+        &self,
+        request: FrozenRequest,
+    ) -> Result<PendingPublicationFinalization<R>> {
+        let preparation = self
+            .journal
+            .current_checked()
+            .and_then(|checked| checked.preparation)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Publication has no admitted preparation context",
+                )
+            })?;
+        let inner = Arc::clone(&self.inner);
+        let policy = inner.evidence_policy();
+        self.journal
+            .publish_once_to_finalization(
+                preparation,
+                policy,
+                move |descriptor, generation, preparation| {
+                    inner.prepare_dispatch(request, descriptor, generation, preparation)
+                },
+            )
+            .await
+    }
+    async fn finish_pending(
+        &self,
+        pending: PendingPublicationFinalization<R>,
+    ) -> CatalogOutcome<CommitProof> {
+        let policy = pending.evidence_policy();
+        match pending.finish(policy).await {
+            Ok(entry) => self.journal.commit_outcome(entry),
+            Err(_) => self.journal.invocation_error("Duplicate publication invocation refused; the original journal remains authoritative"),
+        }
+    }
+}
+
+impl PendingPublicationFinalization<novarocks_spi::connector::ConnectorCatalogMutationReceipt> {
+    /// This concrete catalog adapter stores only actual Applied. A NoOp may
+    /// complete successfully, but cannot expose a FE continuation capability.
+    pub(crate) fn receive_catalog_applied(
+        &self,
+        receiving: &novarocks_spi::connector::ConnectorCatalogMutationReceiving,
+        original: &ConnectorRequestContext,
+    ) -> std::result::Result<(), ConnectorError> {
+        if let ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            receipt,
+            ..
+        } = self.journal.catalog_entry_outcome(self.entry)
+        {
+            receiving.record_applied_receipt(&receipt)?;
+            let context = self
+                .journal
+                .finalization_context(self.entry, self.policy)
+                .and_then(|grant| grant.for_io(original));
+            receiving.record_finalization_context(&receipt, context)?;
+        }
+        Ok(())
+    }
+}
+
+impl PublicationJournal<novarocks_spi::connector::ConnectorCatalogMutationReceipt> {
+    pub(crate) fn observe_catalog_prepared<'a>(
+        &self,
+        inner: Arc<dyn super::super::prepared::PublicationPreparer>,
+        receiving: &'a novarocks_spi::connector::ConnectorCatalogMutationReceiving,
+        context: &'a ConnectorRequestContext,
+    ) -> impl Publisher + 'a {
+        CatalogReceivingPublisher {
+            inner: self.observe_prepared(inner),
+            receiving,
+            context,
+        }
+    }
+}
+struct CatalogReceivingPublisher<'a> {
+    inner: PreparedObservedPublisher<novarocks_spi::connector::ConnectorCatalogMutationReceipt>,
+    receiving: &'a novarocks_spi::connector::ConnectorCatalogMutationReceiving,
+    context: &'a ConnectorRequestContext,
+}
+#[async_trait]
+impl Publisher for CatalogReceivingPublisher<'_> {
+    async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
+        self.inner.load_target(attempt).await
+    }
+    async fn load_target_with_snapshots(
+        &self,
+        attempt: &IcebergCommitAttempt,
+        mode: crate::catalog::SnapshotLoading,
+    ) -> Result<StagingBase> {
+        self.inner.load_target_with_snapshots(attempt, mode).await
+    }
+    fn pinned_expiry_base(&self) -> Option<StagingBase> {
+        self.inner.pinned_expiry_base()
+    }
+    fn preflight_recovery(
+        &self,
+        request: &FrozenRequest,
+        operation: &IcebergCommitOperation,
+    ) -> Result<()> {
+        self.inner.preflight_recovery(request, operation)
+    }
+    fn preflight_recovery_in<'a>(
+        &'a self,
+        request: &'a mut Option<FrozenRequest>,
+        operation: &'a IcebergCommitOperation,
+    ) -> crate::commit::attempt::RecoveryPreflightFuture<'a> {
+        self.inner.preflight_recovery_in(request, operation)
+    }
+    async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
+        let pending = match self.inner.dispatch_to_finalization(request).await {
+            Ok(pending) => pending,
+            Err(_) => return self.inner.journal.invocation_error("Original catalog publication invocation refused; the journal remains authoritative"),
+        };
+        let entry = pending.entry();
+        let receiving_failure = pending
+            .receive_catalog_applied(self.receiving, self.context)
+            .err();
+        let outcome = self.inner.finish_pending(pending).await;
+        if let Some(failure) = receiving_failure {
+            // A receiving refusal cannot erase the real publication or detach
+            // its ready child. Keep its typed cause as necessary finalization.
+            if !matches!(
+                &outcome,
+                CatalogOutcome::KnownCommitted {
+                    finalization: ExternalMutationFinalization::Failed(_),
+                    ..
+                }
+            ) {
+                self.inner.journal.record_entry_finalization(
+                    entry,
+                    ExternalMutationFinalization::Failed(ConnectorMutationFailure::from_connector(
+                        failure,
+                    )),
+                );
+            }
+            return self.inner.journal.commit_outcome(entry);
+        }
+        outcome
+    }
+}
+
 #[async_trait]
 impl<R: Clone + Send + Sync + 'static> Publisher for PreparedObservedPublisher<R> {
     async fn load_target_with_snapshots(
@@ -314,29 +599,28 @@ impl<R: Clone + Send + Sync + 'static> Publisher for PreparedObservedPublisher<R
         self.journal
             .bind_preparation(operation.request_context().clone())
     }
+    fn preflight_recovery_in<'a>(
+        &'a self,
+        request: &'a mut Option<crate::commit::model::FrozenRequest>,
+        operation: &'a IcebergCommitOperation,
+    ) -> crate::commit::attempt::RecoveryPreflightFuture<'a> {
+        self.inner
+            .preflight_recovery_in(request, operation)
+            .bind_preparation(&self.journal, operation)
+    }
     async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
-        let Some(preparation) = self
+        if self
             .journal
             .current_checked()
             .and_then(|checked| checked.preparation)
-        else {
+            .is_none()
+        {
             return self
                 .journal
                 .invocation_error("Publication has no admitted preparation context");
-        };
-        let inner = Arc::clone(&self.inner);
-        let result = self
-            .journal
-            .publish_once(
-                preparation,
-                inner.evidence_policy(),
-                move |descriptor, generation, preparation| {
-                    inner.prepare_dispatch(request, descriptor, generation, preparation)
-                },
-            )
-            .await;
-        match result {
-            Ok(entry) => self.journal.commit_outcome(entry),
+        }
+        match self.dispatch_to_finalization(request).await {
+            Ok(pending) => self.finish_pending(pending).await,
             Err(_) => self.journal.invocation_error("Duplicate publication invocation refused; the original journal remains authoritative"),
         }
     }
@@ -387,6 +671,14 @@ impl<R> DispatchClaim<R> {
     }
 }
 
+impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
+    /// Actual Box pointee of the original observed preflight wrapper. The
+    /// inner producer's actual Box pointee is quoted by that producer.
+    pub(crate) fn prepared_preflight_future_bytes() -> usize {
+        crate::commit::attempt::RecoveryPreflightFuture::binding_future_bytes::<R>()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +687,9 @@ mod tests {
         DispatchCompletion, FinalizationWork, PreparationFailure, PreparedCatalogDispatch,
     };
     use crate::commit::publication_descriptor::RecoveryPrincipalScope;
+    use novarocks_spi::connector::{
+        ConnectorInstanceDescriptor, ConnectorMutationOperationId, ProviderBindingEpoch,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
@@ -854,8 +1149,15 @@ mod tests {
     #[async_trait]
     impl PreparedCatalogDispatch for RealRestActivityDispatch {
         async fn dispatch_once(self: Box<Self>, context: EvidenceContext) -> DispatchCompletion {
-            let observed = self.0.dispatch(context).await;
-            DispatchCompletion::evidence(observed.dispatch_evidence())
+            let observed = match self.0.dispatch(context).await {
+                Ok(observed) => observed.dispatch_evidence(),
+                Err(original) => DispatchEvidence::NotDispatched {
+                    failure: novarocks_spi::connector::ConnectorMutationFailure::from_connector(
+                        original,
+                    ),
+                },
+            };
+            DispatchCompletion::evidence(observed)
         }
     }
     #[tokio::test]
@@ -950,6 +1252,144 @@ mod tests {
         assert_eq!(snapshot.events.evidence_expired, 1);
         assert_eq!(snapshot.events.pre_dispatch_cancelled, 0);
         assert_eq!(server.count("POST", "/v1/namespaces/db/tables/t"), 1);
+    }
+
+    struct CapturedGrantDispatch {
+        journal: PublicationJournal<String>,
+        grants: Arc<std::sync::Mutex<Vec<EvidenceContext>>>,
+    }
+    struct CapturedGrantFinalization(CapturedGrantDispatch);
+    #[async_trait]
+    impl PreparedCatalogDispatch for CapturedGrantDispatch {
+        async fn dispatch_once(self: Box<Self>, context: EvidenceContext) -> DispatchCompletion {
+            self.grants.lock().unwrap().push(context);
+            DispatchCompletion {
+                evidence: DispatchEvidence::Applied {
+                    proof: CommitProof::applied(None),
+                },
+                finalization: Some(Box::new(CapturedGrantFinalization(*self))),
+            }
+        }
+    }
+    #[async_trait]
+    impl FinalizationWork for CapturedGrantFinalization {
+        async fn run(self: Box<Self>, context: EvidenceContext) -> ExternalMutationFinalization {
+            assert!(matches!(self.0.journal.phase(), Phase::Committed(_, _, _)));
+            self.0.grants.lock().unwrap().push(context);
+            ExternalMutationFinalization::Complete
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_publication_cannot_extend_the_original_positive_finalization() {
+        let (parent, preparation) = super::super::tests::catalog_journal();
+        let business_stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let preparation = preparation.with_additional_stop(business_stop.view());
+        let parent_grants = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatch = CapturedGrantDispatch {
+            journal: parent.clone(),
+            grants: parent_grants,
+        };
+        let parent_entry = parent
+            .publish_once(
+                preparation.clone(),
+                CatalogEvidencePolicy::default(),
+                move |_, _, _| async move {
+                    Ok(PreparedPublication::Mutation {
+                        binding: None,
+                        dispatch: Box::new(dispatch),
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        let grant = parent
+            .finalization_context(parent_entry, CatalogEvidencePolicy::default())
+            .unwrap();
+        let necessary = grant.for_io(&preparation).unwrap();
+        business_stop.request_stop();
+        assert!(necessary.check_active().is_ok());
+
+        let (nested, _) = super::super::tests::catalog_journal();
+        let grants = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatch = CapturedGrantDispatch {
+            journal: nested.clone(),
+            grants: grants.clone(),
+        };
+        let longer = CatalogEvidencePolicy {
+            evidence: std::time::Duration::from_secs(600),
+            finalization: std::time::Duration::from_secs(600),
+            ..Default::default()
+        };
+        let cap = grant.deadline();
+        let entry = nested
+            .publish_once(necessary, longer, move |_, _, context| async move {
+                assert_eq!(
+                    context.deadline(),
+                    cap,
+                    "preparation uses the same upper bound"
+                );
+                Ok(PreparedPublication::Mutation {
+                    binding: None,
+                    dispatch: Box::new(dispatch),
+                })
+            })
+            .await
+            .unwrap();
+        let observed = grants.lock().unwrap();
+        assert_eq!(
+            observed.len(),
+            2,
+            "one dispatch and one actual finalization"
+        );
+        assert_eq!(observed[0].deadline(), cap);
+        assert_eq!(observed[1].deadline(), cap);
+        let cached = nested.finalization_context(entry, longer).unwrap();
+        assert_eq!(cached.started(), observed[1].started());
+        assert_eq!(cached.deadline(), cap);
+        assert!(matches!(
+            nested.commit_outcome(entry),
+            CatalogOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                finalization: ExternalMutationFinalization::Complete,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_parent_cap_refuses_nested_preparation_even_from_cleanup_projection() {
+        let (journal, original) = super::super::tests::catalog_journal();
+        let cap = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let necessary = original.with_necessary_finalization_deadline_cap(cap);
+        let cleanup = CatalogEvidencePolicy::default()
+            .begin_reclamation()
+            .unwrap()
+            .for_io(&necessary)
+            .unwrap();
+        assert!(
+            cleanup.check_active().is_ok(),
+            "cleanup retains its independent budget"
+        );
+        let entry = journal
+            .publish_once(cleanup, CatalogEvidencePolicy::default(), |_, _, _| async {
+                panic!("expired parent cap must refuse before preparation I/O");
+                #[allow(unreachable_code)]
+                Ok(PreparedPublication::NoOp)
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(journal.commit_outcome(entry), CatalogOutcome::KnownUncommitted { failure }
+            if failure.kind() == ConnectorMutationFailureKind::DeadlineExceeded)
+        );
+        assert!(
+            journal
+                .entry_descriptor(entry)
+                .unwrap()
+                .first_dispatch_ms
+                .is_none()
+        );
     }
 
     struct BudgetDispatch {
@@ -1171,5 +1611,401 @@ mod tests {
                 ..
             }
         ));
+    }
+    struct CutDispatch {
+        child_drops: Arc<AtomicUsize>,
+        finalizations: Arc<AtomicUsize>,
+        panic_on_drop: bool,
+    }
+    struct CutChild {
+        completion: Option<DispatchCompletion>,
+        drops: Arc<AtomicUsize>,
+        panic_on_drop: bool,
+    }
+    impl Future for CutChild {
+        type Output = DispatchCompletion;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Ready(self.completion.take().expect("one actual dispatch poll"))
+        }
+    }
+    impl Drop for CutChild {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic_on_drop, "original dispatch child Drop panic");
+        }
+    }
+    struct CutFinalization(Arc<AtomicUsize>);
+    #[async_trait]
+    impl FinalizationWork for CutFinalization {
+        async fn run(self: Box<Self>, _: EvidenceContext) -> ExternalMutationFinalization {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ExternalMutationFinalization::Complete
+        }
+    }
+    impl PreparedCatalogDispatch for CutDispatch {
+        fn dispatch_once<'async_trait>(
+            self: Box<Self>,
+            _: EvidenceContext,
+        ) -> std::pin::Pin<Box<dyn Future<Output = DispatchCompletion> + Send + 'async_trait>>
+        where
+            Self: 'async_trait,
+        {
+            Box::pin(CutChild {
+                completion: Some(DispatchCompletion {
+                    evidence: DispatchEvidence::Applied {
+                        proof: CommitProof::applied(None),
+                    },
+                    finalization: Some(Box::new(CutFinalization(self.finalizations.clone()))),
+                }),
+                drops: self.child_drops.clone(),
+                panic_on_drop: self.panic_on_drop,
+            })
+        }
+    }
+
+    struct CatalogCutCapability {
+        descriptor: ConnectorInstanceDescriptor,
+        epoch: ProviderBindingEpoch,
+        journal: PublicationJournal<novarocks_spi::connector::ConnectorCatalogMutationReceipt>,
+        child_drops: Arc<AtomicUsize>,
+        finalizations: Arc<AtomicUsize>,
+        panic_on_drop: bool,
+        no_op: bool,
+    }
+    impl novarocks_spi::connector::ConnectorCatalogMutation for CatalogCutCapability {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            self.epoch
+        }
+        fn execute(
+            &self,
+            _: novarocks_spi::connector::ConnectorCatalogMutationRequest,
+        ) -> std::result::Result<
+            ExternalMutationOutcome<novarocks_spi::connector::ConnectorCatalogMutationReceipt>,
+            ConnectorError,
+        > {
+            panic!("the original catalog fixture must not use synchronous execution")
+        }
+        fn reconcile(
+            &self,
+            _: novarocks_spi::connector::ConnectorCatalogMutationReconcileRequest,
+        ) -> std::result::Result<
+            ExternalMutationOutcome<novarocks_spi::connector::ConnectorCatalogMutationReceipt>,
+            ConnectorError,
+        > {
+            panic!("the original catalog fixture must not replay publication")
+        }
+        fn execute_async<'a>(
+            &'a self,
+            request: novarocks_spi::connector::ConnectorCatalogMutationRequest,
+            receiving: &'a novarocks_spi::connector::ConnectorCatalogMutationReceiving,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = std::result::Result<
+                            ExternalMutationOutcome<
+                                novarocks_spi::connector::ConnectorCatalogMutationReceipt,
+                            >,
+                            ConnectorError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                use novarocks_spi::connector::{
+                    ConnectorCatalogMutationReceipt, ConnectorProcessLocalPayload,
+                };
+                let receipt = ConnectorCatalogMutationReceipt::try_new(
+                    self.descriptor.clone(),
+                    self.epoch,
+                    request.operation_id,
+                    request.operation.kind(),
+                    None,
+                )
+                .unwrap();
+                let evidence = ExternalMutationEvidence::try_new(
+                    2,
+                    self.descriptor.clone(),
+                    self.epoch,
+                    request.operation_id,
+                    request.operation.kind(),
+                    bytes::Bytes::from_static(b"{}"),
+                )
+                .unwrap();
+                self.journal
+                    .prepare_catalog(
+                        evidence,
+                        receipt,
+                        vec!["namespace:db".into()],
+                        b"drop db".to_vec(),
+                        crate::commit::publication_descriptor::AttributionPlan::ObserveOnly,
+                        request.context.clone(),
+                    )
+                    .unwrap();
+                receiving.retain_original_owner(ConnectorProcessLocalPayload::new(
+                    request.target.clone(),
+                    Arc::new(self.journal.clone()),
+                ))?;
+                let pending = self
+                    .journal
+                    .publish_once_to_finalization(
+                        request.context.clone(),
+                        CatalogEvidencePolicy::default(),
+                        |_, generation, _| async move {
+                            if self.no_op {
+                                Ok(PreparedPublication::NoOp)
+                            } else {
+                                Ok(PreparedPublication::Mutation {
+                                    binding: Some(binding(generation.to_bytes())),
+                                    dispatch: Box::new(CutDispatch {
+                                        child_drops: self.child_drops.clone(),
+                                        finalizations: self.finalizations.clone(),
+                                        panic_on_drop: self.panic_on_drop,
+                                    }),
+                                })
+                            }
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let entry = pending.entry();
+                // This is the same receiving author used by the Keyed publisher
+                // and the existing-object adapter, not a second fact projection.
+                pending.receive_catalog_applied(receiving, &request.context)?;
+                assert_eq!(self.child_drops.load(Ordering::SeqCst), 0);
+                assert_eq!(self.finalizations.load(Ordering::SeqCst), 0);
+                {
+                    let observed = receiving.observation();
+                    if self.no_op {
+                        assert!(observed.applied_receipt().is_none());
+                        assert!(observed.finalization_context().is_none());
+                    } else {
+                        let context = observed.finalization_context().unwrap().as_ref().unwrap();
+                        assert_eq!(
+                            context.deadline(),
+                            self.journal
+                                .finalization_context(entry, pending.evidence_policy(),)
+                                .unwrap()
+                                .deadline()
+                        );
+                        assert!(observed.applied_receipt().is_some());
+                        context.request_scope_extension_or_insert_with(|| 593_u64);
+                    }
+                    assert!(!observed.provider_exited());
+                }
+                let policy = pending.evidence_policy();
+                pending.finish(policy).await.unwrap();
+                let outcome = self.journal.catalog_entry_outcome(entry);
+                if let ExternalMutationOutcome::KnownCommitted {
+                    effect,
+                    receipt,
+                    finalization,
+                    ..
+                } = &outcome
+                {
+                    receiving.record_needed_committed(*effect, receipt, finalization)?;
+                }
+                Ok(outcome)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_applied_receiving_survives_ready_child_drop_and_noop_grants_nothing() {
+        use novarocks_spi::connector::{
+            ConnectorCatalogMutationLease, ConnectorCatalogMutationOperation,
+            ConnectorCatalogMutationReceiving, ConnectorCatalogMutationRequest,
+            ConnectorControlRuntimeId, ConnectorNamespaceIdentity, ConnectorProviderBindingKey,
+            ConnectorStopOwner, DropPolicy,
+        };
+        for (no_op, panic_on_drop) in [(false, false), (false, true), (true, false)] {
+            let descriptor = ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .unwrap(),
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("catalog-cut")
+                    .unwrap(),
+            };
+            let epoch = ProviderBindingEpoch::from_bytes([2; 16]);
+            let operation_id = ConnectorMutationOperationId::new();
+            let journal = PublicationJournal::new(OperationToken::from_mutation(operation_id));
+            let capability = Arc::new(CatalogCutCapability {
+                descriptor: descriptor.clone(),
+                epoch,
+                journal: journal.clone(),
+                child_drops: Arc::new(AtomicUsize::new(0)),
+                finalizations: Arc::new(AtomicUsize::new(0)),
+                panic_on_drop,
+                no_op,
+            });
+            let lease = ConnectorCatalogMutationLease::new(
+                descriptor.clone(),
+                ConnectorControlRuntimeId::new(),
+                epoch,
+                capability.clone(),
+                || {},
+            )
+            .unwrap();
+            let context = ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                ConnectorStopOwner::new().view(),
+                1024,
+                4096,
+            )
+            .unwrap();
+            let request = ConnectorCatalogMutationRequest {
+                operation_id,
+                target: ConnectorProviderBindingKey {
+                    instance_id: descriptor.instance_id.clone(),
+                    incarnation: epoch,
+                },
+                operation: ConnectorCatalogMutationOperation::DropNamespace {
+                    namespace: ConnectorNamespaceIdentity {
+                        instance_id: descriptor.instance_id.clone(),
+                        namespace: "db".into(),
+                    },
+                    policy: DropPolicy::NoOpIfMissing,
+                },
+                context,
+            };
+            let receiving = Arc::new(ConnectorCatalogMutationReceiving::new());
+            let original = receiving.clone();
+            let joined =
+                tokio::spawn(async move { lease.execute_async_in(request, &original).await }).await;
+            assert_eq!(
+                capability.child_drops.load(Ordering::SeqCst),
+                usize::from(!no_op)
+            );
+            assert_eq!(
+                capability.finalizations.load(Ordering::SeqCst),
+                usize::from(!no_op && !panic_on_drop)
+            );
+            let observed = receiving.observation();
+            assert!(observed.original_owner().is_some());
+            // Unwinding may finish the outer child's destructor, but it never
+            // turns the original foreign panic into proven healthy exit.
+            assert_eq!(receiving.foreign_exit_unproven(), panic_on_drop);
+            assert!(observed.provider_exited());
+            if no_op {
+                joined.unwrap().unwrap();
+                assert!(observed.applied_receipt().is_none());
+                assert!(observed.finalization_context().is_none());
+                assert_eq!(
+                    observed.needed_committed().unwrap().effect(),
+                    ExternalMutationEffect::NoOp
+                );
+            } else {
+                let receipt = observed.applied_receipt().unwrap();
+                assert_eq!(receipt.operation_id(), operation_id);
+                let context = observed.finalization_context().unwrap().as_ref().unwrap();
+                let retained = context
+                    .request_scope_extension_or_insert_with::<u64>(|| panic!("same request scope"));
+                assert_eq!(*retained, 593);
+                assert_eq!(
+                    context.deadline(),
+                    journal
+                        .finalization_context(
+                            journal.current_entry().unwrap(),
+                            CatalogEvidencePolicy::default(),
+                        )
+                        .unwrap()
+                        .deadline()
+                );
+                if panic_on_drop {
+                    let panic = joined.unwrap_err().into_panic();
+                    assert_eq!(
+                        panic.downcast_ref::<&'static str>(),
+                        Some(&"original dispatch child Drop panic")
+                    );
+                    assert!(observed.raw_outcome().is_none());
+                    assert!(observed.needed_committed().is_none());
+                } else {
+                    joined.unwrap().unwrap();
+                    assert!(observed.needed_committed().is_some());
+                }
+            }
+            assert!(
+                matches!(journal.catalog_outcome(), ExternalMutationOutcome::KnownCommitted { effect, .. }
+                if effect == if no_op { ExternalMutationEffect::NoOp } else { ExternalMutationEffect::Applied })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn original_dispatch_cut_keeps_canonical_applied_before_child_drop_and_finalization() {
+        for panic_on_drop in [false, true] {
+            let (journal, preparation) = super::super::tests::catalog_journal();
+            let child_drops = Arc::new(AtomicUsize::new(0));
+            let finalizations = Arc::new(AtomicUsize::new(0));
+            let drops = child_drops.clone();
+            let finishes = finalizations.clone();
+            let policy = CatalogEvidencePolicy::default();
+            let pending = journal
+                .publish_once_to_finalization(
+                    preparation,
+                    policy,
+                    move |_, generation, _| async move {
+                        Ok(PreparedPublication::Mutation {
+                            binding: Some(binding(generation.to_bytes())),
+                            dispatch: Box::new(CutDispatch {
+                                child_drops: drops,
+                                finalizations: finishes,
+                                panic_on_drop,
+                            }),
+                        })
+                    },
+                )
+                .await
+                .unwrap();
+            let entry = pending.entry();
+            assert!(matches!(
+                journal.commit_outcome(entry),
+                CatalogOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ));
+            assert_eq!(child_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(finalizations.load(Ordering::SeqCst), 0);
+            let grant = journal.finalization_context(entry, policy).unwrap();
+            let deadline = grant.deadline();
+            assert_eq!(
+                journal
+                    .finalization_context(entry, policy)
+                    .unwrap()
+                    .deadline(),
+                deadline
+            );
+            // The original proof is observable before any opaque child destructor.
+            let task = tokio::spawn(pending.finish(policy));
+            let result = task.await;
+            assert_eq!(child_drops.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                journal.commit_outcome(entry),
+                CatalogOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ));
+            if panic_on_drop {
+                assert!(result.unwrap_err().is_panic());
+                assert_eq!(finalizations.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(result.unwrap().unwrap(), entry);
+                assert_eq!(finalizations.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    journal
+                        .finalization_context(entry, policy)
+                        .unwrap()
+                        .deadline(),
+                    deadline
+                );
+            }
+        }
     }
 }

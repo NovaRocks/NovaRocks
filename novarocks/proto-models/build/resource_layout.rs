@@ -205,6 +205,26 @@ impl Generator {
                             })
                             .collect::<Vec<_>>();
                         implementations.push(self.implementation(&id, &message.ident, fields));
+                        let ident = &message.ident;
+                        let visitor = syn::Ident::new(
+                            if message.fields.iter().next().is_none() {
+                                "_visitor"
+                            } else {
+                                "visitor"
+                            },
+                            ident.span(),
+                        );
+                        let visits = message.fields.iter().map(|field| {
+                            let field = field.ident.as_ref().expect("named generated field");
+                            quote! { crate::resource_layout::GeneratedCloneBacking::visit_clone_backing(&self.#field, #visitor)?; }
+                        });
+                        implementations.push(syn::parse2(quote! {
+                            impl crate::resource_layout::GeneratedCloneBacking for #ident {
+                                fn visit_clone_backing<V: crate::resource_layout::CloneBackingVisitor>(&self, #visitor: &mut V) -> ::core::result::Result<(), V::Error> {
+                                    #(#visits)* ::core::result::Result::Ok(())
+                                }
+                            }
+                        }).expect("generated clone backing visitor"));
                         let mut path = modules.clone();
                         path.push(message.ident.clone());
                         types.push(path_tokens(&path));
@@ -231,6 +251,18 @@ impl Generator {
                             })
                             .collect();
                         implementations.push(self.implementation(&id, &oneof.ident, fields));
+                        let ident = &oneof.ident;
+                        let variants = oneof.variants.iter().map(|variant| {
+                            let variant = &variant.ident;
+                            quote! { Self::#variant(value) => crate::resource_layout::GeneratedCloneBacking::visit_clone_backing(value, visitor) }
+                        });
+                        implementations.push(syn::parse2(quote! {
+                            impl crate::resource_layout::GeneratedCloneBacking for #ident {
+                                fn visit_clone_backing<V: crate::resource_layout::CloneBackingVisitor>(&self, visitor: &mut V) -> ::core::result::Result<(), V::Error> {
+                                    match self { #(#variants),* }
+                                }
+                            }
+                        }).expect("generated oneof clone backing visitor"));
                         let mut path = modules.clone();
                         path.push(oneof.ident.clone());
                         types.push(path_tokens(&path));

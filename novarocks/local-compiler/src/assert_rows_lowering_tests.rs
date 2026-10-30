@@ -186,8 +186,12 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
         .add_values(empty, Box::from([Box::default()]), Box::default())
         .unwrap();
     let field = Arc::new(
-        Field::new("original-child", DataType::Int32, true)
-            .with_metadata([("source-key".to_owned(), "kept-λ".to_owned())].into()),
+        Field::new("original-child", DataType::Int32, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "source-key".to_owned(),
+                "kept-λ".to_owned(),
+            )]),
+        ),
     );
     let list = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>([
         Some(vec![Some(99)]),

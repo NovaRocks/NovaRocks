@@ -181,6 +181,21 @@ pub trait StateStore: Send + Sync {
 
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError>;
 
+    async fn begin_original_read_in(
+        &self,
+        _execution: &super::StateStoreExecutionContext,
+    ) -> Result<Box<dyn super::OriginalReadTransaction>, super::StateStoreExecutionFailure> {
+        Err(super::StateStoreOriginalUnsupported.into_original_failure())
+    }
+    async fn begin_original_write_in(
+        &self,
+        _attempt: WriteAttempt,
+        _purpose: &str,
+        _execution: &super::StateStoreExecutionContext,
+    ) -> Result<Box<dyn super::OriginalWriteTransaction>, super::StateStoreExecutionFailure> {
+        Err(super::StateStoreOriginalUnsupported.into_original_failure())
+    }
+
     /// Begins the one write this attempt authorises.
     ///
     /// The attempt is consumed: a reservation buys exactly one transaction

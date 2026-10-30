@@ -19,12 +19,12 @@ pub(crate) mod activity;
 pub(crate) mod background;
 pub(crate) mod background_engine;
 pub mod command;
-mod create;
 pub mod domain;
 pub(crate) mod maintenance_worker;
 pub mod management_audit;
 // Installed by the composition root so the frontend owns startup ordering.
 mod refresh;
+pub(crate) use refresh::bind_publication_documents;
 pub mod scheduler;
 mod service;
 #[allow(dead_code)]

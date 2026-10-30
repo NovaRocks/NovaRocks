@@ -39,6 +39,8 @@ pub struct StateStoreHostError {
     message: String,
     primary: Option<StateStoreError>,
     cleanup: Option<StateStoreError>,
+    original: Option<novarocks_state_store_api::StateStoreExecutionFailure>,
+    original_cleanup: Option<novarocks_state_store_api::StateStoreExecutionFailure>,
 }
 
 impl StateStoreHostError {
@@ -53,6 +55,8 @@ impl StateStoreHostError {
             message: message.into(),
             primary: None,
             cleanup: None,
+            original: None,
+            original_cleanup: None,
         }
     }
 
@@ -68,7 +72,50 @@ impl StateStoreHostError {
             message: message.into(),
             primary: Some(primary),
             cleanup: None,
+            original: None,
+            original_cleanup: None,
         }
+    }
+
+    pub fn from_original_failure(
+        kind: StateStoreHostErrorKind,
+        provider_id: StateStoreProviderId,
+        message: &'static str,
+        original: novarocks_state_store_api::StateStoreExecutionFailure,
+    ) -> Self {
+        let mut error = Self::new(kind, Some(provider_id), message);
+        error.original = Some(original);
+        error
+    }
+
+    pub fn original_failure(
+        &self,
+    ) -> Option<&novarocks_state_store_api::StateStoreExecutionFailure> {
+        self.original.as_ref()
+    }
+
+    pub fn original_cleanup_failure(
+        &self,
+    ) -> Option<&novarocks_state_store_api::StateStoreExecutionFailure> {
+        self.original_cleanup.as_ref()
+    }
+
+    pub fn with_original_cleanup(
+        mut self,
+        cleanup: novarocks_state_store_api::StateStoreExecutionFailure,
+    ) -> Self {
+        self.original_cleanup = Some(cleanup);
+        self
+    }
+
+    pub(crate) fn retain_original_primary(mut self) -> Self {
+        if self.original.is_none() {
+            self.original = self
+                .primary
+                .take()
+                .map(StateStoreError::into_original_failure);
+        }
+        self
     }
 
     pub(crate) fn with_cleanup(mut self, cleanup: StateStoreError) -> Self {
@@ -100,6 +147,12 @@ impl fmt::Display for StateStoreHostError {
             write!(formatter, " ({provider_id})")?;
         }
         write!(formatter, ": {}", self.message)?;
+        if let Some(primary) = &self.original {
+            write!(formatter, "; primary: {primary}")?;
+        }
+        if let Some(cleanup) = &self.original_cleanup {
+            write!(formatter, "; cleanup failed: {cleanup}")?;
+        }
         if let Some(primary) = &self.primary {
             write!(formatter, "; primary: {primary}")?;
         }
@@ -112,13 +165,23 @@ impl fmt::Display for StateStoreHostError {
 
 impl std::error::Error for StateStoreHostError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.primary
+        self.original
             .as_ref()
-            .map(|primary| primary as &(dyn std::error::Error + 'static))
+            .map(|source| source as &(dyn std::error::Error + 'static))
             .or_else(|| {
-                self.cleanup
+                self.primary
                     .as_ref()
-                    .map(|cleanup| cleanup as &(dyn std::error::Error + 'static))
+                    .map(|primary| primary as &(dyn std::error::Error + 'static))
+                    .or_else(|| {
+                        self.original_cleanup
+                            .as_ref()
+                            .map(|source| source as &(dyn std::error::Error + 'static))
+                    })
+                    .or_else(|| {
+                        self.cleanup
+                            .as_ref()
+                            .map(|cleanup| cleanup as &(dyn std::error::Error + 'static))
+                    })
             })
     }
 }

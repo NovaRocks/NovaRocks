@@ -662,7 +662,7 @@ fn merge_undecided_fields_with_construction<E>(
         data_type,
         existing.is_nullable() || incoming.is_nullable(),
     );
-    creation.cloned_annotations(existing.metadata().capacity())?;
+    // Metadata::clone shares its immutable Arc and requests no allocation.
     let field = field.with_metadata(existing.metadata().clone());
     creation.exact(|| {
         novarocks_type_contract::owned_resources::layout::arc_layout(

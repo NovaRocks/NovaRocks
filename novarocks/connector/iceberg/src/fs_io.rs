@@ -304,10 +304,7 @@ impl IcebergFsAccess {
     }
 
     pub fn supports_conditional_create(&self) -> bool {
-        self.operator()
-            .info()
-            .full_capability()
-            .write_with_if_not_exists
+        self.operator().info().capability().write_with_if_not_exists
     }
 
     pub async fn ensure_parent_directory(&self) -> std::result::Result<(), String> {
@@ -384,17 +381,26 @@ impl IcebergFsStorage {
         check_read_active(self.read_control().as_ref(), operation)
     }
 
-    fn resolve_path(&self, _operation: &str, path: &str) -> Result<(IcebergFsAccess, String)> {
+    async fn resolve_path(
+        &self,
+        _operation: &str,
+        path: &str,
+    ) -> Result<(IcebergFsAccess, String)> {
         let binding = self.binding.as_ref().ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
                 "Iceberg filesystem storage has no admitted storage capability",
             )
         })?;
-        let access = IcebergFsAccess::new(binding.resolve_access(path).map_err(|error| {
-            Error::new(ErrorKind::DataInvalid, "fs storage path resolution failed")
-                .with_source(error)
-        })?);
+        let access = IcebergFsAccess::new(
+            binding
+                .resolve_access_for_request_async(path)
+                .await
+                .map_err(|error| {
+                    Error::new(ErrorKind::DataInvalid, "fs storage path resolution failed")
+                        .with_source(error)
+                })?,
+        );
         let relative_path = access.single_relative_path().map_err(|error| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -403,6 +409,22 @@ impl IcebergFsStorage {
             .with_source(anyhow::Error::msg(error))
         })?;
         Ok((access.clone(), relative_path.to_string()))
+    }
+
+    async fn non_http_phase(
+        &self,
+        path: &str,
+    ) -> Result<Option<novarocks_spi::connector::ConnectorIoPermit>> {
+        match self.binding.as_ref() {
+            Some(binding) => binding.admit_non_http_io(path).await.map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "original filesystem I/O admission refused",
+                )
+                .with_source(e)
+            }),
+            None => Ok(None),
+        }
     }
 
     async fn ensure_parent_dir(op: &Operator, path: &str) -> Result<()> {
@@ -432,7 +454,8 @@ impl IcebergFsStorage {
             .unwrap_or((ConnectorListingBound::V1, HADOOP_LISTING_WORKSPACE_BYTES));
         let mut directories = DirectoryListing::new(bound, workspace_bytes)?;
         check_listing_path_size(path.len())?;
-        let (access, mut relative_path) = self.resolve_path("list_directories", path)?;
+        let _phase = self.non_http_phase(path).await?;
+        let (access, mut relative_path) = self.resolve_path("list_directories", path).await?;
         if !relative_path.ends_with('/') {
             relative_path.push('/');
         }
@@ -493,7 +516,8 @@ impl Storage for IcebergFsStorage {
     async fn exists(&self, path: &str) -> Result<bool> {
         self.check_read_active("exists")?;
         let _io = optional_io_permit(self.admission.as_ref()).await?;
-        let (access, relative_path) = self.resolve_path("exists", path)?;
+        let _phase = self.non_http_phase(path).await?;
+        let (access, relative_path) = self.resolve_path("exists", path).await?;
         let result = access.operator().exists(&relative_path).await;
         self.check_read_active("exists")?;
         result.map_err(|error| {
@@ -504,7 +528,8 @@ impl Storage for IcebergFsStorage {
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         self.check_read_active("metadata")?;
         let _io = optional_io_permit(self.admission.as_ref()).await?;
-        let (access, relative_path) = self.resolve_path("metadata", path)?;
+        let _phase = self.non_http_phase(path).await?;
+        let (access, relative_path) = self.resolve_path("metadata", path).await?;
         let result = access.operator().stat(&relative_path).await;
         self.check_read_active("metadata")?;
         let meta = result.map_err(|e| {
@@ -521,7 +546,8 @@ impl Storage for IcebergFsStorage {
     async fn read(&self, path: &str) -> Result<Bytes> {
         self.check_read_active("read")?;
         let _io = optional_io_permit(self.admission.as_ref()).await?;
-        let (access, relative_path) = self.resolve_path("read", path)?;
+        let _phase = self.non_http_phase(path).await?;
+        let (access, relative_path) = self.resolve_path("read", path).await?;
         let result = access.operator().read(&relative_path).await;
         self.check_read_active("read")?;
         let data = result.map_err(|error| {
@@ -535,13 +561,15 @@ impl Storage for IcebergFsStorage {
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
         self.check_read_active("reader")?;
         let _io = optional_io_permit(self.admission.as_ref()).await?;
-        let (access, relative_path) = self.resolve_path("reader", path)?;
+        let (access, relative_path) = self.resolve_path("reader", path).await?;
         self.check_read_active("reader")?;
         Ok(Box::new(IcebergFsFileRead {
             access,
             relative_path,
             control: self.read_control(),
             admission: self.admission.clone(),
+            binding: self.binding.clone(),
+            location: path.to_owned(),
         }))
     }
 
@@ -550,7 +578,8 @@ impl Storage for IcebergFsStorage {
             Some(admission) => Some(admission.clone().admit(path)?.acquire().await?),
             None => None,
         };
-        let (access, relative_path) = self.resolve_path("write", path)?;
+        let _phase = self.non_http_phase(path).await?;
+        let (access, relative_path) = self.resolve_path("write", path).await?;
         let op = access.operator();
         if let Some(permit) = &permit {
             permit.check_active()?;
@@ -579,7 +608,30 @@ impl Storage for IcebergFsStorage {
             Some(admission) => Some(admission.clone().admit(path)?.acquire().await?),
             None => None,
         };
-        let (access, relative_path) = self.resolve_path("writer", path)?;
+        let phase = match self.binding.as_ref() {
+            Some(binding) => binding.admit_owned_stream(path).await.map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "original writer I/O admission refused",
+                )
+                .with_source(error)
+            })?,
+            None => None,
+        };
+        let (access, relative_path) = self.resolve_path("writer", path).await?;
+        let access = match (
+            self.binding
+                .as_ref()
+                .and_then(IcebergReadBinding::request_context),
+            phase.as_ref(),
+        ) {
+            (Some(request), Some(phase)) => IcebergFsAccess::new(
+                access
+                    .handle
+                    .with_request_context(request.clone().with_io_weak_phase(phase.weak_phase())),
+            ),
+            _ => access,
+        };
         let op = access.operator();
         if let Some(permit) = &permit {
             permit.check_active()?;
@@ -588,28 +640,51 @@ impl Storage for IcebergFsStorage {
         if let Some(permit) = &permit {
             permit.check_active()?;
         }
-        let mut writer = op.writer(&relative_path).await.map_err(|e| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!("fs writer({path}) through {relative_path}: {e}"),
-            )
-        })?;
+        let stream = phase
+            .as_ref()
+            .map(novarocks_spi::connector::ConnectorIoPermit::begin_stream)
+            .transpose()
+            .map_err(|error| {
+                Error::new(ErrorKind::Unexpected, "original stream custody refused")
+                    .with_source(error)
+            })?;
+        let mut writer = match op.writer(&relative_path).await {
+            Ok(writer) => writer,
+            Err(error) => {
+                if let Some(stream) = stream {
+                    stream.closed();
+                }
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("fs writer({path}) through {relative_path}: {error}"),
+                ));
+            }
+        };
         if let Some(permit) = &permit {
             permit
                 .stream_started
                 .store(true, std::sync::atomic::Ordering::Release);
             if let Err(error) = permit.check_active() {
-                return Err(abort_after_failure(&mut writer, error, Some(permit)).await);
+                let error = abort_after_failure(&mut writer, error, Some(permit)).await;
+                drop(writer);
+                if let Some(stream) = stream {
+                    stream.closed();
+                }
+                return Err(error);
             }
         }
         Ok(Box::new(IcebergFsFileWrite {
             writer: Some(writer),
             permit,
+            _phase: phase,
+            stream,
+            local_closed: false,
         }))
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
-        let (access, relative_path) = self.resolve_path("delete", path)?;
+        let _phase = self.non_http_phase(path).await?;
+        let (access, relative_path) = self.resolve_path("delete", path).await?;
         access.operator().delete(&relative_path).await.map_err(|e| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -619,10 +694,12 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn delete_prefix(&self, path: &str) -> Result<()> {
-        let (access, relative_path) = self.resolve_path("delete_prefix", path)?;
+        let _phase = self.non_http_phase(path).await?;
+        let (access, relative_path) = self.resolve_path("delete_prefix", path).await?;
         access
             .operator()
-            .remove_all(&relative_path)
+            .delete_with(&relative_path)
+            .recursive(true)
             .await
             .map_err(|e| {
                 Error::new(
@@ -652,6 +729,8 @@ impl Storage for IcebergFsStorage {
 }
 
 struct IcebergFsFileRead {
+    binding: Option<IcebergReadBinding>,
+    location: String,
     access: IcebergFsAccess,
     relative_path: String,
     control: Option<Arc<dyn ConnectorOperationControl>>,
@@ -695,6 +774,19 @@ impl FileRead for IcebergFsFileRead {
         }
 
         let _io = optional_io_permit(self.admission.as_ref()).await?;
+        let _phase = match self.binding.as_ref() {
+            Some(binding) => binding
+                .admit_non_http_io(&self.location)
+                .await
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "original range I/O admission refused",
+                    )
+                    .with_source(e)
+                })?,
+            None => None,
+        };
         let operator = self.access.operator();
         let relative_path = self.relative_path.clone();
         let result = operator
@@ -720,6 +812,9 @@ impl FileRead for IcebergFsFileRead {
 struct IcebergFsFileWrite {
     writer: Option<crate::opendal::Writer>,
     permit: Option<WritePermit>,
+    _phase: Option<novarocks_spi::connector::ConnectorIoPermit>,
+    stream: Option<novarocks_spi::connector::ConnectorIoStreamCustody>,
+    local_closed: bool,
 }
 
 impl std::fmt::Debug for IcebergFsFileWrite {
@@ -759,6 +854,36 @@ async fn abort_after_failure(
 
 impl Drop for IcebergFsFileWrite {
     fn drop(&mut self) {
+        if self.stream.is_some() {
+            if let Some(writer) = self.writer.take() {
+                let permit = self.permit.take();
+                let mut cleanup: Option<novarocks_spi::connector::ConnectorIoCleanupFuture> =
+                    Some(Box::pin(governed_writer_abort(
+                        writer,
+                        permit,
+                        self._phase.as_ref().unwrap().weak_phase(),
+                    )));
+                let stream = self.stream.take().unwrap();
+                if let Err((stream, error)) = stream.install_cleanup_in(&mut cleanup) {
+                    // Whole concrete refusal retains all original custody in
+                    // the same Source's original panic packet, never strings.
+                    std::panic::panic_any(GovernedCleanupRefusal {
+                        _cleanup: cleanup,
+                        _stream: stream,
+                        _error: error,
+                        _phase: self._phase.take(),
+                    });
+                }
+                self._phase.take();
+                return;
+            }
+            if self.local_closed {
+                self.stream.take().unwrap().closed();
+            }
+            // Otherwise the unique disposition Drop marks the original cell
+            // unproven; None alone is never an actual-exit receipt.
+            return;
+        }
         // FileWrite has no public abort method. An abandoned governed writer must
         // still release its multipart upload before its operation's permit exits.
         if let (Some(mut writer), Some(permit)) = (self.writer.take(), self.permit.take()) {
@@ -840,7 +965,13 @@ impl FileWrite for IcebergFsFileWrite {
             }
             Ok(((), Some(error))) | Err(error) => {
                 let error = abort_after_failure(&mut writer, error, self.permit.as_ref()).await;
+                drop(writer);
+                self.local_closed = true;
                 self.permit.take();
+                if let Some(stream) = self.stream.take() {
+                    stream.closed();
+                }
+                self._phase.take();
                 Err(error)
             }
         }
@@ -852,11 +983,17 @@ impl FileWrite for IcebergFsFileWrite {
                 .writer
                 .take()
                 .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "fs file already closed"))?;
-            writer
+            let result = writer
                 .close()
                 .await
-                .map_err(|e| Error::new(ErrorKind::Unexpected, format!("fs close: {e}")))?;
-            return Ok(());
+                .map_err(|e| Error::new(ErrorKind::Unexpected, format!("fs close: {e}")));
+            drop(writer);
+            self.local_closed = true;
+            if let Some(stream) = self.stream.take() {
+                stream.closed();
+            }
+            self._phase.take();
+            return result.map(|_metadata| ());
         }
         let mut writer = self
             .writer
@@ -877,7 +1014,13 @@ impl FileWrite for IcebergFsFileWrite {
             }
             Err(error) => Err(abort_after_failure(&mut writer, error, self.permit.as_ref()).await),
         };
+        drop(writer);
+        self.local_closed = true;
         self.permit.take();
+        if let Some(stream) = self.stream.take() {
+            stream.closed();
+        }
+        self._phase.take();
         result
     }
 }
@@ -914,7 +1057,10 @@ pub(crate) async fn write_finalization_document(
 ) -> Result<()> {
     finalization_active(context)?;
     let storage = IcebergFsStorage::new(binding);
-    let (access, relative) = storage.resolve_path("write finalization document", location)?;
+    let _phase = storage.non_http_phase(location).await?;
+    let (access, relative) = storage
+        .resolve_path("write finalization document", location)
+        .await?;
     write_finalization_document_to_operator(access.operator(), &relative, context, bytes).await
 }
 
@@ -999,7 +1145,8 @@ where
         Error::new(ErrorKind::DataInvalid, "Invalid Hadoop listing bound").with_source(error)
     })?;
     check_listing_path_size(location.len())?;
-    let (access, mut relative) = storage.resolve_path("list version files", location)?;
+    let _phase = storage.non_http_phase(location).await?;
+    let (access, mut relative) = storage.resolve_path("list version files", location).await?;
     if !relative.ends_with('/') {
         relative.push('/');
     }
@@ -1225,30 +1372,95 @@ mod tests {
         delay_close: bool,
         fail_write: bool,
     }
-    impl crate::opendal::raw::Access for ControlledWriterService {
-        type Reader = crate::opendal::raw::oio::Reader;
+    impl crate::opendal::raw::Service for ControlledWriterService {
+        type Reader = ();
         type Writer = crate::opendal::raw::oio::Writer;
-        type Lister = crate::opendal::raw::oio::Lister;
-        type Deleter = crate::opendal::raw::oio::Deleter;
-        fn info(&self) -> Arc<crate::opendal::raw::AccessorInfo> {
-            let info = crate::opendal::raw::AccessorInfo::default();
-            info.set_scheme("mock")
-                .set_native_capability(crate::opendal::Capability {
-                    write: true,
-                    write_can_multi: true,
-                    ..Default::default()
-                });
-            Arc::new(info)
+        type Lister = ();
+        type Deleter = ();
+        type Copier = ();
+        fn info(&self) -> crate::opendal::raw::ServiceInfo {
+            crate::opendal::raw::ServiceInfo::with_scheme("mock")
         }
-        async fn write(
+        fn capability(&self) -> crate::opendal::Capability {
+            crate::opendal::Capability {
+                write: true,
+                write_can_multi: true,
+                ..Default::default()
+            }
+        }
+        async fn create_dir(
             &self,
-            _: &str,
-            _: crate::opendal::raw::OpWrite,
-        ) -> crate::opendal::Result<(crate::opendal::raw::RpWrite, Self::Writer)> {
-            Ok((
-                crate::opendal::raw::RpWrite::new(),
-                Box::new(ControlledWriter(self.clone())),
-            ))
+            ctx: &crate::opendal::OperationContext,
+            path: &str,
+            args: crate::opendal::raw::OpCreateDir,
+        ) -> crate::opendal::Result<crate::opendal::raw::RpCreateDir> {
+            crate::opendal::raw::Service::create_dir(&(), ctx, path, args).await
+        }
+        async fn stat(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            path: &str,
+            args: crate::opendal::raw::OpStat,
+        ) -> crate::opendal::Result<crate::opendal::raw::RpStat> {
+            crate::opendal::raw::Service::stat(&(), ctx, path, args).await
+        }
+        fn read(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            path: &str,
+            args: crate::opendal::raw::OpRead,
+        ) -> crate::opendal::Result<Self::Reader> {
+            crate::opendal::raw::Service::read(&(), ctx, path, args)
+        }
+        fn write(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            path: &str,
+            args: crate::opendal::raw::OpWrite,
+        ) -> crate::opendal::Result<Self::Writer> {
+            let _ = (ctx, path, args);
+            Ok(Box::new(ControlledWriter(self.clone())))
+        }
+        fn delete(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+        ) -> crate::opendal::Result<Self::Deleter> {
+            crate::opendal::raw::Service::delete(&(), ctx)
+        }
+        fn list(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            path: &str,
+            args: crate::opendal::raw::OpList,
+        ) -> crate::opendal::Result<Self::Lister> {
+            crate::opendal::raw::Service::list(&(), ctx, path, args)
+        }
+        fn copy(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            from: &str,
+            to: &str,
+            args: crate::opendal::raw::OpCopy,
+            opts: crate::opendal::raw::OpCopier,
+        ) -> crate::opendal::Result<Self::Copier> {
+            crate::opendal::raw::Service::copy(&(), ctx, from, to, args, opts)
+        }
+        async fn rename(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            from: &str,
+            to: &str,
+            args: crate::opendal::raw::OpRename,
+        ) -> crate::opendal::Result<crate::opendal::raw::RpRename> {
+            crate::opendal::raw::Service::rename(&(), ctx, from, to, args).await
+        }
+        async fn presign(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            path: &str,
+            args: crate::opendal::raw::OpPresign,
+        ) -> crate::opendal::Result<crate::opendal::raw::RpPresign> {
+            crate::opendal::raw::Service::presign(&(), ctx, path, args).await
         }
     }
     #[derive(Debug)]
@@ -1312,10 +1524,13 @@ mod tests {
             delay_close,
             fail_write,
         };
-        let accessor: crate::opendal::raw::Accessor = Arc::new(service);
+        let service: crate::opendal::raw::Servicer = Arc::new(service);
         // Exercise the exact SDK wrapper which moves inner ownership into the pending future.
-        let operator = crate::opendal::Operator::from_inner(accessor)
-            .layer(crate::opendal::layers::RetryLayer::new().with_max_times(0));
+        let operator = crate::opendal::Operator::from_parts(
+            crate::opendal::OperationContext::default(),
+            service,
+        )
+        .layer(crate::opendal::layers::RetryLayer::new().with_max_times(0));
         let admission = Arc::new(ControlledAdmission {
             cancellation: novarocks_fs::FileCancellation::new(),
             semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1338,6 +1553,9 @@ mod tests {
             super::IcebergFsFileWrite {
                 writer: Some(writer),
                 permit: Some(permit),
+                _phase: None,
+                stream: None,
+                local_closed: false,
             },
             admission,
             events,
@@ -1362,13 +1580,16 @@ mod tests {
         .unwrap();
         let context = grant.for_io(&original).unwrap();
         let events = Arc::new(WriterEvents::default());
-        let accessor: crate::opendal::raw::Accessor = Arc::new(ControlledWriterService {
+        let service: crate::opendal::raw::Servicer = Arc::new(ControlledWriterService {
             events: events.clone(),
             delay_close: true,
             fail_write: false,
         });
-        let operator = crate::opendal::Operator::from_inner(accessor)
-            .layer(crate::opendal::layers::RetryLayer::new().with_max_times(0));
+        let operator = crate::opendal::Operator::from_parts(
+            crate::opendal::OperationContext::default(),
+            service,
+        )
+        .layer(crate::opendal::layers::RetryLayer::new().with_max_times(0));
         let used_operator = operator.clone();
         let used_context = context.clone();
         let task = tokio::spawn(async move {
@@ -1482,6 +1703,103 @@ mod tests {
         drop(writer);
         assert_eq!(*events.log.lock().unwrap(), ["abort-exit"]);
         assert_eq!(admission.semaphore.available_permits(), 1);
+    }
+
+    struct AbortErrorReceiver {
+        original: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>,
+    }
+    impl novarocks_spi::connector::ConnectorIoRequestSource for AbortErrorReceiver {
+        fn exit_waker(&self) -> std::task::Waker {
+            std::task::Waker::noop().clone()
+        }
+        fn reserve_stream(&self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+        fn stream_closed(&self) {}
+        fn install_stream_cleanup_in(
+            &self,
+            _: &mut Option<novarocks_spi::connector::ConnectorIoCleanupFuture>,
+        ) -> Result<(), ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "test does not dispatch cleanup",
+            ))
+        }
+        fn stream_custody_lost(&self) {}
+        fn record_cleanup_failure(
+            &self,
+            cause: Box<dyn std::any::Any + Send>,
+        ) -> Result<(), Box<dyn std::any::Any + Send>> {
+            let mut original = self.original.lock().unwrap();
+            if original.is_some() {
+                return Err(cause);
+            }
+            *original = Some(cause);
+            Ok(())
+        }
+        fn attach_original_progress(
+            &self,
+            _: Arc<dyn novarocks_spi::connector::ConnectorIoProgressSource>,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+        fn poll_admitted(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_include_dependency(
+            &self,
+            _: &novarocks_spi::connector::SharedDependency,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    #[tokio::test]
+    async fn two_real_abort_errors_exit_and_deliver_their_original_errors_once() {
+        let source = Arc::new(AbortErrorReceiver {
+            original: std::sync::Mutex::new(None),
+        });
+        for _ in 0..2 {
+            let (mut wrapper, admission, events) = governed_mock_writer(false, false).await;
+            events
+                .fail_abort
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let writer = wrapper.writer.take().unwrap();
+            let permit = wrapper.permit.take();
+            drop(wrapper);
+            let request =
+                novarocks_spi::connector::ConnectorIoRequest::from_original(Arc::clone(&source)
+                    as Arc<dyn novarocks_spi::connector::ConnectorIoRequestSource>);
+            let phase = request.admitted().await.unwrap();
+            let result = super::governed_writer_abort(writer, permit, phase.weak_phase()).await;
+            assert!(result.is_err());
+            assert_eq!(*events.log.lock().unwrap(), ["abort-exit"]);
+            assert_eq!(
+                admission.semaphore.available_permits(),
+                1,
+                "actual helper returns after the original physical permit exits"
+            );
+            assert_eq!(admission.exit_failures.lock().unwrap().len(), 1);
+            let original = source
+                .original
+                .lock()
+                .unwrap()
+                .take()
+                .expect("received before writer Drop");
+            assert_eq!(
+                original
+                    .downcast_ref::<crate::opendal::Error>()
+                    .unwrap()
+                    .kind(),
+                crate::opendal::ErrorKind::Unexpected
+            );
+            drop(original);
+            drop(phase);
+            assert!(source.original.lock().unwrap().is_none());
+        }
     }
 
     #[tokio::test]
@@ -2010,7 +2328,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod manifest_stream_tests {
+pub(crate) mod manifest_stream_tests {
     //! Protect the SDK manifest/list streaming boundary and real operation ownership.
     //! Expected allocation/admission/cleanup ordering comes from the 0.9 behavior
     //! and ADR-0171, not from a replacement ledger. The only injected behavior is
@@ -2054,10 +2372,70 @@ mod manifest_stream_tests {
     }
 
     #[derive(Debug)]
-    struct AtomicManifestWriterBoundary {
+    pub(crate) struct AtomicManifestWriterBoundary {
         operator: Operator,
         root: std::path::PathBuf,
         temporary: std::path::PathBuf,
+    }
+
+    impl AtomicManifestWriterBoundary {
+        pub(crate) fn new(root: &Path) -> Self {
+            let root = root.to_path_buf();
+            let temporary = root.join(".atomic");
+            std::fs::create_dir_all(&temporary).unwrap();
+            let operator = Operator::new(
+                crate::opendal::services::Fs::default()
+                    .root(root.to_str().unwrap())
+                    .atomic_write_dir(temporary.to_str().unwrap()),
+            )
+            .unwrap();
+            Self {
+                operator,
+                root,
+                temporary,
+            }
+        }
+
+        pub(crate) async fn writer(
+            &self,
+            operation: &IcebergCommitOperation,
+            path: &str,
+        ) -> Result<Box<dyn FileWrite>> {
+            let target = url::Url::parse(path).unwrap().to_file_path().unwrap();
+            let relative = target.strip_prefix(&self.root).unwrap().to_string_lossy();
+            let permit = operation
+                .write_admission_for_test()
+                .admit(path)?
+                .acquire()
+                .await?;
+            permit.check_active()?;
+            IcebergFsStorage::ensure_parent_dir(&self.operator, &relative).await?;
+            permit.check_active()?;
+            // For this fresh owned path, append selects FS's serial writer
+            // while still creating an atomic temporary file. The default
+            // positional writer caches its first segment until a later write.
+            assert!(!target.exists(), "test artifact must be a fresh owned path");
+            let mut writer = self
+                .operator
+                .writer_with(&relative)
+                .append(true)
+                .await
+                .map_err(|error| {
+                    Error::new(ErrorKind::Unexpected, "open atomic artifact test writer")
+                        .with_source(error)
+                })?;
+            permit.stream_started.store(true, Ordering::Release);
+            if let Err(error) = permit.check_active() {
+                return Err(abort_after_failure(&mut writer, error, Some(&permit)).await);
+            }
+            Ok(Box::new(IcebergFsFileWrite {
+                writer: Some(writer),
+                permit: Some(permit),
+                _phase: None,
+                stream: None,
+                local_closed: false,
+            }))
+        }
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2098,38 +2476,7 @@ mod manifest_stream_tests {
                 // local operator. Use a real private atomic FS backend (default
                 // FS abort is Unsupported), preserving the real operation's
                 // admission, WritePermit and IcebergFsFileWrite lifecycle.
-                let target = url::Url::parse(path).unwrap().to_file_path().unwrap();
-                let relative = target.strip_prefix(&atomic.root).unwrap().to_string_lossy();
-                let permit = probe
-                    .operation
-                    .write_admission_for_test()
-                    .admit(path)?
-                    .acquire()
-                    .await?;
-                permit.check_active()?;
-                IcebergFsStorage::ensure_parent_dir(&atomic.operator, &relative).await?;
-                permit.check_active()?;
-                // For this fresh owned path, append selects FS's serial writer
-                // while still creating an atomic temporary file. The default
-                // positional writer caches its first segment until a later write.
-                assert!(!target.exists(), "test artifact must be a fresh owned path");
-                let mut writer = atomic
-                    .operator
-                    .writer_with(&relative)
-                    .append(true)
-                    .await
-                    .map_err(|error| {
-                        Error::new(ErrorKind::Unexpected, "open atomic manifest test writer")
-                            .with_source(error)
-                    })?;
-                permit.stream_started.store(true, Ordering::Release);
-                if let Err(error) = permit.check_active() {
-                    return Err(abort_after_failure(&mut writer, error, Some(&permit)).await);
-                }
-                Box::new(IcebergFsFileWrite {
-                    writer: Some(writer),
-                    permit: Some(permit),
-                })
+                atomic.writer(&probe.operation, path).await?
             } else {
                 // Normal manifest and list outputs exercise the complete original
                 // IcebergFsStorage path, including resolution and writer opening.
@@ -2256,23 +2603,9 @@ mod manifest_stream_tests {
         gate: Option<Arc<HalfWriteGate>>,
     ) -> (ManifestProbeArtifacts, Arc<ManifestStreamProbe>) {
         let attempt = fixture.operation.begin_attempt().unwrap();
-        let atomic = gate.as_ref().map(|_| {
-            let root = fixture.directory.path().to_path_buf();
-            let temporary = root.join(".atomic");
-            std::fs::create_dir_all(&temporary).unwrap();
-            let operator = Operator::new(
-                crate::opendal::services::Fs::default()
-                    .root(root.to_str().unwrap())
-                    .atomic_write_dir(temporary.to_str().unwrap()),
-            )
-            .unwrap()
-            .finish();
-            AtomicManifestWriterBoundary {
-                operator,
-                root,
-                temporary,
-            }
-        });
+        let atomic = gate
+            .as_ref()
+            .map(|_| AtomicManifestWriterBoundary::new(fixture.directory.path()));
         let probe = Arc::new(ManifestStreamProbe {
             operation: fixture.operation.clone(),
             original: attempt.file_io().clone(),
@@ -2490,4 +2823,81 @@ mod manifest_stream_tests {
         assert!(fixture.operation.artifacts().unwrap().is_empty());
         assert!(!Path::new(records[0].object.path().strip_prefix("file://").unwrap()).exists());
     }
+}
+
+// The panic packet owns these originals until its receiving owner disposes it.
+struct GovernedCleanupRefusal {
+    _cleanup: Option<novarocks_spi::connector::ConnectorIoCleanupFuture>,
+    _stream: novarocks_spi::connector::ConnectorIoStreamCustody,
+    _error: ConnectorError,
+    _phase: Option<novarocks_spi::connector::ConnectorIoPermit>,
+}
+async fn governed_writer_abort(
+    mut writer: crate::opendal::Writer,
+    permit: Option<WritePermit>,
+    phase: novarocks_spi::connector::ConnectorIoWeakPhase,
+) -> std::result::Result<(), ConnectorError> {
+    let result = match writer.abort().await {
+        Ok(()) => Ok(()),
+        Err(cause) => {
+            if let Err(cause) = phase.record_cleanup_failure(Box::new(cause)) {
+                std::panic::panic_any(GovernedAbortErrorRefusal {
+                    _cause: cause,
+                    _writer: writer,
+                    _permit: permit,
+                    _phase: phase,
+                });
+            }
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "original multipart abort failed",
+            ))
+        }
+    };
+    if let Some(permit) = permit.as_ref() {
+        match &result {
+            Ok(()) => permit.confirm_exit(),
+            Err(error) => permit.admission.record_exit_failure(
+                &permit.object,
+                StreamExitFailure::AbortFailed(error.to_string()),
+            ),
+        }
+    }
+    // Result is retained by the same original cell before F destruction.
+    drop(writer);
+    drop(permit);
+    result.map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            format!("original multipart abort failed: {error}"),
+        )
+    })
+}
+pub(crate) fn governed_writer_backing_bytes() -> std::result::Result<usize, ConnectorError> {
+    fn future_size<A, B, C, F: std::future::Future>(_: fn(A, B, C) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+    std::mem::size_of::<IcebergFsFileWrite>()
+        .checked_add(future_size(governed_writer_abort))
+        .and_then(|n| n.checked_add(std::mem::size_of::<GovernedCleanupRefusal>()))
+        .and_then(|n| {
+            n.checked_add(
+                std::mem::size_of::<GovernedAbortErrorRefusal>()
+                    + std::mem::size_of::<crate::opendal::Error>(),
+            )
+        })
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "governed writer backing overflow",
+            )
+        })
+}
+
+// This original failure also owns the writer and its pending exit responsibility.
+struct GovernedAbortErrorRefusal {
+    _cause: Box<dyn std::any::Any + Send>,
+    _writer: crate::opendal::Writer,
+    _permit: Option<WritePermit>,
+    _phase: novarocks_spi::connector::ConnectorIoWeakPhase,
 }

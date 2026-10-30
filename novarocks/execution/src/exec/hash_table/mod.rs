@@ -14,15 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+//! Instance-local key equality and canonical distribution helpers.
+//! Consumer row topology and aggregate state stay with their original owners.
+
 pub mod hash;
 pub mod key_builder;
-pub mod key_column;
-pub mod key_layout;
-pub mod key_storage;
-pub mod key_strategy;
-pub mod key_table;
+pub(crate) mod key_index;
 
 pub(crate) mod allocation;
-pub mod array_views;
 
 pub(crate) mod partition_keys;

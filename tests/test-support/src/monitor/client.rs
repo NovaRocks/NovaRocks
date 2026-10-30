@@ -179,6 +179,7 @@ pub(crate) struct Final {
     pub status: ExitStatus,
     pub owner_lost: bool,
     pub cleanup_complete: bool,
+    pub group_exit_observed: bool,
     pub errors: Vec<String>,
     pub lifetime_expired: bool,
 }
@@ -759,6 +760,16 @@ impl OwnedMonitor {
                     cleanup_complete: value["cleanup_complete"]
                         .as_bool()
                         .context("monitor Final lacks cleanup fact")?,
+                    // Absence is unknown, never a positive whole-group receipt.
+                    group_exit_observed: value
+                        .get("group_exit_observed")
+                        .map(|value| {
+                            value
+                                .as_bool()
+                                .context("monitor Final has invalid group exit fact")
+                        })
+                        .transpose()?
+                        .unwrap_or(false),
                     errors,
                     lifetime_expired: value
                         .get("lifetime_expired")

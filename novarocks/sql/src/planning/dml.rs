@@ -3009,6 +3009,103 @@ mod tests {
     }
 
     #[test]
+    fn mor_replacement_binds_new_partition_value_and_old_row_identity_once() {
+        use crate::optimizer::operator::Operator;
+        use arrow::datatypes::DataType;
+        use novarocks_types::schema::ColumnDef;
+        let columns = [ColumnDef {
+            name: "p".into(),
+            data_type: DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        }];
+        for merge in [false, true] {
+            let mut input = mor_match_producer();
+            for (id, name) in [(8, "p"), (9, "__nr_new_p")] {
+                let column = crate::analysis::OutputColumn {
+                    column_id: crate::column_id::ColumnId(id),
+                    name: name.into(),
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+                    is_internal: false,
+                };
+                input.output_columns.push(column.clone());
+                let Operator::PhysicalValues(values) = &mut input.op else {
+                    unreachable!()
+                };
+                values.columns.push(column);
+            }
+            let expanded = if merge {
+                super::build_merge_change_event_expand(
+                    input,
+                    &columns,
+                    true,
+                    false,
+                    false,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap()
+                .0
+            } else {
+                super::build_update_change_event_expand(
+                    input,
+                    &columns,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap()
+            };
+            assert_replace_inherits_sequence_and_preserves_row_id(&expanded);
+            let Operator::PhysicalChangeEventExpand(expand) = &expanded.op else {
+                unreachable!()
+            };
+            assert_eq!(
+                expand.events.len(),
+                1,
+                "one logical Replace must not become two actions"
+            );
+            let output = expanded
+                .output_columns
+                .iter()
+                .find(|output| output.name == "p")
+                .unwrap();
+            assert!(
+                output.value_type.nullable(),
+                "nullable after-image keeps the signed null domain"
+            );
+            let event = &expand.events[0];
+            let expr = event
+                .assignments
+                .iter()
+                .find(|assignment| assignment.output_column_id == output.column_id)
+                .and_then(|assignment| assignment.expr)
+                .unwrap();
+            let arena = expanded.execution_props.scalar_arena.as_deref().unwrap();
+            assert!(
+                matches!(arena.node(expr), crate::optimizer::scalar::ScalarNode::ColumnRef(id) if *id == crate::column_id::ColumnId(9)),
+                "partition output must use new p, never before-image p"
+            );
+            let file = expanded
+                .output_columns
+                .iter()
+                .find(|output| output.name == super::ICEBERG_FILE_PATH_COLUMN)
+                .unwrap();
+            let expr = event
+                .assignments
+                .iter()
+                .find(|assignment| assignment.output_column_id == file.column_id)
+                .and_then(|assignment| assignment.expr)
+                .unwrap();
+            assert!(
+                matches!(arena.node(expr), crate::optimizer::scalar::ScalarNode::ColumnRef(id) if *id == crate::column_id::ColumnId(1)),
+                "old data file identity must not change with new p"
+            );
+        }
+    }
+
+    #[test]
     fn mor_update_replace_inherits_actual_commit_sequence() {
         let columns = [novarocks_types::schema::ColumnDef {
             name: "id".into(),

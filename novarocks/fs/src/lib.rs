@@ -19,7 +19,8 @@
 //!
 //! This crate deliberately has no connector identity and owns no table-format
 //! correctness. Connector implementations bind authorized storage access and
-//! ask this crate to read physical Parquet or ORC columns.
+//! ask this crate to read physical Parquet columns. ORC reads are suspended
+//! until orc-rust releases support for Arrow 60 and Zstd 0.14.
 
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
@@ -33,9 +34,12 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
 }
 
 mod access;
+mod aliyun_ecs_credentials;
 mod cache;
 mod catalog_properties;
 mod error;
+mod hdfs_service;
+mod http_transport;
 mod list_body_limit;
 
 /// Read the fixed per-response byte limit used only for OpenDAL List.
@@ -57,11 +61,12 @@ mod storage_authority;
 pub use access::{
     BoundFile, ConditionalCreateOutcome, FileIdentity, FsAccessHandle, FsAccessResolver,
     FsListEntry, FsListStream, FsListingBound, FsLocation, FsScheme, ObjectStoreAccessContext,
-    ObjectStoreConfig, ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig,
-    ObjectStoreProviderPool, ObjectStoreProviderPoolMetrics, ObjectStoreProviderPoolOptions,
-    ObjectStoreSecretMaterial, ResolvedFsPath, is_object_store_location_parse_only,
-    map_object_store_listing_error, parse_object_store_path_parse_only,
+    ObjectStoreConfig, ObjectStoreEndpointConfig, ObjectStoreProviderPool,
+    ObjectStoreProviderPoolMetrics, ObjectStoreProviderPoolOptions, ObjectStoreSecretMaterial,
+    ResolvedFsPath, is_object_store_location_parse_only, map_object_store_listing_error,
+    parse_object_store_path_parse_only,
 };
+pub use aliyun_ecs_credentials::AliyunEcsRamRoleConfig;
 pub use cache::{
     BlockCache, BlockCacheOptions, CacheBlockRead, CacheDomain, CacheInputStream, CacheKey,
     CacheOptions, DataCacheContext, DataCacheIoOptions, DataCacheManager, DataCacheMetricsRecorder,

@@ -33,3 +33,5 @@ pub(crate) mod testing;
 mod consumer_failure_tests;
 
 pub use sweeper::AbandonedAttemptSweeper;
+
+pub(crate) mod execution;

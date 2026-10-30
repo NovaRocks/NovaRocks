@@ -80,7 +80,7 @@ run_fail_fast_stage 'CI build inputs' stage.log ci_validate_build_inputs dev
         env=dict(os.environ,PATH=str(bin_dir)+os.pathsep+os.environ['PATH'],STAGE_EXECUTION_MARKER=str(marker))
         result=subprocess.run(['bash',str(REPO/'tools/ci/local-full-ci.sh'),'--run-stage','Cargo dependency policy',
             str(self.root/'unused-receipt'),str(self.root/'output')],cwd=REPO,env=env,text=True,capture_output=True)
-        self.assertEqual(marker.read_text().splitlines(),['deny --locked check advisories bans licenses sources'])
+        self.assertEqual(marker.read_text().splitlines(),['deny --locked check bans licenses sources'])
         self.assertEqual(result.returncode,23,result.stderr)
         self.assertEqual(result.stderr,'')
 

@@ -16,13 +16,12 @@
 // under the License.
 
 // Preserve the original sealed route validation at the private COW boundary.
-// whole-target preflight is a mandatory caller input, not a fallback constant.
+// Original signed types and exact routing remain mandatory caller inputs.
 use super::cow_closed_ast as closed;
 use closed::BuildError;
 use novarocks_parser::ast::{BinaryOperator, Expr, Ident, Query};
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
 
-type Gate<'a> = &'a dyn Fn(&dyn arrow::array::Array, usize) -> closed::Result<()>;
 type Check<'a> = &'a dyn Fn() -> closed::Result<()>;
 
 type Input = novarocks_spi::connector::ConnectorWriteInputShape;
@@ -80,7 +79,6 @@ fn selection_value_ast(
     row: novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal,
     field_ordinal: u32,
     declared: &novarocks_type_contract::FunctionValueType,
-    preflight: Gate<'_>,
     check: Check<'_>,
 ) -> closed::Result<Expr> {
     let view = selection.locate(row).ok_or(BuildError::InvalidSource(
@@ -93,7 +91,7 @@ fn selection_value_ast(
             .ok_or(BuildError::InvalidSource(
                 "COW selection field ordinal is out of bounds",
             ))?;
-    let value = closed::checked_value(array.as_ref(), view.row_index(), &preflight, &check)?;
+    let value = closed::checked_value(array.as_ref(), view.row_index(), &check)?;
     closed::cast(value, declared, &check)
 }
 
@@ -101,7 +99,6 @@ fn selection_effect_ast(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     row: novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal,
     field_ordinal: u32,
-    preflight: Gate<'_>,
     check: Check<'_>,
 ) -> closed::Result<Expr> {
     let view = selection.locate(row).ok_or(BuildError::InvalidSource(
@@ -114,7 +111,7 @@ fn selection_effect_ast(
             .ok_or(BuildError::InvalidSource(
                 "COW selection field ordinal is out of bounds",
             ))?;
-    let value = closed::checked_value(array.as_ref(), view.row_index(), &preflight, &check)?;
+    let value = closed::checked_value(array.as_ref(), view.row_index(), &check)?;
     closed::cast_effect(value, &check)
 }
 fn writer_type(
@@ -140,7 +137,7 @@ pub(super) fn build_cow_append_query_materialized(
     contract: &novarocks_spi::connector::ConnectorMutationMatchContract,
     check: Check<'_>,
 ) -> closed::Result<Query> {
-    build_cow_append_query_core(selection, rows, input, route, contract, None, check, true)
+    build_cow_append_query_core(selection, rows, input, route, contract, check, true)
 }
 
 fn build_cow_append_query_core(
@@ -149,7 +146,6 @@ fn build_cow_append_query_core(
     input: &novarocks_spi::connector::ConnectorWriteInputShape,
     route: &novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
     contract: &novarocks_spi::connector::ConnectorMutationMatchContract,
-    preflight: Option<Gate<'_>>,
     check: Check<'_>,
     materialized: bool,
 ) -> closed::Result<Query> {
@@ -188,7 +184,6 @@ fn build_cow_append_query_core(
                     *row,
                     signed.ordinal(),
                     signed_type(signed)?,
-                    preflight.ok_or(BuildError::InvalidSource("literal adapter is absent"))?,
                     check,
                 )?);
             }
@@ -234,20 +229,10 @@ pub(super) fn build_cow_rewrite_query_closed(
     source: &novarocks_spi::connector::write_stack::ConnectorWriteRewriteSource,
     contract: &novarocks_spi::connector::ConnectorMutationMatchContract,
     identity: &FrozenConnectorScanIdentity,
-    preflight: Gate<'_>,
     check: Check<'_>,
 ) -> closed::Result<Query> {
     build_cow_rewrite_query_core(
-        selection,
-        rows,
-        input,
-        route,
-        source,
-        contract,
-        identity,
-        Some(preflight),
-        check,
-        false,
+        selection, rows, input, route, source, contract, identity, check, false,
     )
 }
 
@@ -262,7 +247,7 @@ pub(super) fn build_cow_rewrite_query_materialized(
     check: Check<'_>,
 ) -> closed::Result<Query> {
     build_cow_rewrite_query_core(
-        selection, rows, input, route, source, contract, identity, None, check, true,
+        selection, rows, input, route, source, contract, identity, check, true,
     )
 }
 
@@ -274,7 +259,6 @@ fn build_cow_rewrite_query_core(
     source: &novarocks_spi::connector::write_stack::ConnectorWriteRewriteSource,
     contract: &novarocks_spi::connector::ConnectorMutationMatchContract,
     identity: &FrozenConnectorScanIdentity,
-    preflight: Option<Gate<'_>>,
     check: Check<'_>,
     materialized: bool,
 ) -> closed::Result<Query> {
@@ -381,21 +365,13 @@ fn build_cow_rewrite_query_core(
             let mut values = closed::exact_vec(width)?;
             for token in &values_tokens {
                 let (ordinal, field) = selection_field(*token)?;
-                values.push(selection_value_ast(
-                    selection,
-                    *row,
-                    ordinal,
-                    field,
-                    preflight.ok_or(BuildError::InvalidSource("literal adapter is absent"))?,
-                    check,
-                )?);
+                values.push(selection_value_ast(selection, *row, ordinal, field, check)?);
             }
             values.push(closed::bool_value(true));
             values.push(selection_effect_ast(
                 selection,
                 *row,
                 contract.effect_field().target_ordinal(),
-                preflight.ok_or(BuildError::InvalidSource("literal adapter is absent"))?,
                 check,
             )?);
             value_rows.push(values);
@@ -525,7 +501,6 @@ pub(super) fn materialized_columns<'a>(
     route: &novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
     contract: &'a novarocks_spi::connector::ConnectorMutationMatchContract,
     rewrite: Option<&novarocks_spi::connector::write_stack::ConnectorWriteRewriteSource>,
-    before: &mut impl FnMut(std::alloc::Layout) -> closed::Result<()>,
     check: Check<'_>,
 ) -> closed::Result<Vec<(u32, &'a novarocks_type_contract::FunctionValueType)>> {
     route
@@ -545,7 +520,7 @@ pub(super) fn materialized_columns<'a>(
         let novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
             token,
             ordinal,
-            ..
+            role,
         } = binding(writer_token)?.source()
         else {
             return Err(BuildError::InvalidSource(
@@ -562,6 +537,12 @@ pub(super) fn materialized_columns<'a>(
                 "COW compact source ordinal differs from its signer",
             ));
         }
+        if rewrite.is_none()
+            && (role != novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::AfterImage
+                || field.role() != novarocks_spi::connector::ConnectorMutationSelectionFieldRole::AfterImage)
+        {
+            return Err(BuildError::InvalidSource("COW append selection differs from its signed field"));
+        }
         Ok((ordinal, signed_type(field)?))
     };
     let is_after = |token| -> closed::Result<bool> {
@@ -570,6 +551,7 @@ pub(super) fn materialized_columns<'a>(
     let mut count = rewrite.map_or(0, |source| source.match_tokens().len());
     for field in input_fields(input) {
         check()?;
+        writer_type(field)?;
         if rewrite.is_none()
             || (is_after(field.token())?
                 && !rewrite
@@ -580,14 +562,26 @@ pub(super) fn materialized_columns<'a>(
             count = count.checked_add(1).ok_or(BuildError::ResourceExhausted)?;
         }
     }
-    before(
-        std::alloc::Layout::array::<(u32, &novarocks_type_contract::FunctionValueType)>(count)
-            .map_err(|_| BuildError::ResourceExhausted)?,
-    )?;
     let mut columns = closed::exact_vec(count)?;
     if let Some(source) = rewrite {
         for token in source.match_tokens() {
             check()?;
+            let novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
+                token: selection_token,
+                role:
+                    novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::Identity,
+                ..
+            } = binding(*token)?.source()
+            else {
+                return Err(BuildError::InvalidSource(
+                    "COW match token is not bound to a signed uniqueness identity",
+                ));
+            };
+            if !contract.uniqueness_tokens().contains(&selection_token) {
+                return Err(BuildError::InvalidSource(
+                    "COW match token is not bound to a signed uniqueness identity",
+                ));
+            }
             columns.push(signed(*token)?);
         }
     }
@@ -609,412 +603,4 @@ pub(super) fn materialized_columns<'a>(
         ));
     }
     Ok(columns)
-}
-
-use super::cow_compile_receipt::{
-    borrowed_value_footprint as value_footprint, recipe::Recipe, route_skeleton, type_footprint,
-};
-pub(super) fn map_footprint(f: value_footprint::Failure) -> BuildError {
-    match f {
-        value_footprint::Failure::ResourceExhausted => BuildError::ResourceExhausted,
-        value_footprint::Failure::Stopped => {
-            BuildError::InvalidSource("original COW scope stopped")
-        }
-        value_footprint::Failure::InvalidSource(s) => BuildError::InvalidSource(s),
-        value_footprint::Failure::OriginalSemantic(s) => BuildError::OriginalSemantic(s.into()),
-    }
-}
-fn slots<T>(len: usize) -> closed::Result<u64> {
-    (len as u64)
-        .checked_mul(std::mem::size_of::<T>() as u64)
-        .ok_or(BuildError::ResourceExhausted)
-}
-fn add_bytes(a: u64, b: u64) -> closed::Result<u64> {
-    a.checked_add(b).ok_or(BuildError::ResourceExhausted)
-}
-
-// Caller first validates the sealed target/proof/base/single-file facts and
-// produces actual new target metadata layout. This scalar is NOT a public
-// authority: the private all-target caller must derive it before any clone.
-pub(super) fn preflight_materialized_target(
-    selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
-    rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
-    input: &Input,
-    route: &novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
-    contract: &novarocks_spi::connector::ConnectorMutationMatchContract,
-    rewrite: Option<(
-        &novarocks_spi::connector::write_stack::ConnectorWriteRewriteSource,
-        &FrozenConnectorScanIdentity,
-    )>,
-    owned_target_metadata_upper: u64,
-    compiler_handoff_upper: u64,
-    recipe: &mut Recipe,
-    check: Check<'_>,
-) -> closed::Result<()> {
-    preflight_target_core(
-        selection,
-        rows,
-        input,
-        route,
-        contract,
-        rewrite,
-        owned_target_metadata_upper,
-        compiler_handoff_upper,
-        recipe,
-        check,
-        true,
-    )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The COW preflight validates separately owned selection, schema, and connector facts; a wrapper would duplicate the route-specific contract."
-)]
-fn preflight_target_core(
-    selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
-    rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
-    input: &Input,
-    route: &novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
-    contract: &novarocks_spi::connector::ConnectorMutationMatchContract,
-    rewrite: Option<(
-        &novarocks_spi::connector::write_stack::ConnectorWriteRewriteSource,
-        &FrozenConnectorScanIdentity,
-    )>,
-    owned_target_metadata_upper: u64,
-    compiler_handoff_upper: u64,
-    recipe: &mut Recipe,
-    check: Check<'_>,
-    materialized: bool,
-) -> closed::Result<()> {
-    check()?;
-    route
-        .validate_selection_contract(input, contract)
-        .map_err(|e| BuildError::OriginalSemantic(e.to_string()))?;
-    let input_width = check_input_order(input, route)?;
-    let remaining = recipe.remaining_for_target().map_err(map_footprint)?;
-    let selection_binding = |token| {
-        route
-            .selection_bindings()
-            .iter()
-            .find(|b| b.writer_token() == token)
-            .ok_or(BuildError::InvalidSource(
-                "COW rewrite token has no provider selection binding",
-            ))
-    };
-    let selected = |token| {
-        let novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
-            token,
-            ordinal,
-            ..
-        } = selection_binding(token)?.source()
-        else {
-            return Err(BuildError::InvalidSource(
-                "COW derived writer value has no selection field",
-            ));
-        };
-        let signed = contract
-            .selection_field(token)
-            .ok_or(BuildError::InvalidSource("COW foreign selection token"))?;
-        if signed.ordinal() != ordinal {
-            return Err(BuildError::InvalidSource("COW tampered selection ordinal"));
-        }
-        Ok::<_, BuildError>(signed)
-    };
-    let mut values_tokens = Vec::new();
-    let mut template = match rewrite {
-        None => {
-            let transient = slots::<route_skeleton::AppendColumn<'_>>(input_width)?;
-            if transient > remaining {
-                return Err(BuildError::ResourceExhausted);
-            }
-            let mut append = closed::exact_vec(input_width)?;
-            for binding in input_fields(input) {
-                let novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
-                    role,
-                    ..
-                } = selection_binding(binding.token())?.source()
-                else {
-                    return Err(BuildError::InvalidSource(
-                        "COW append writer is not bound to an after-image",
-                    ));
-                };
-                let signed = selected(binding.token())?;
-                if role != novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::AfterImage
-                    || signed.role() != novarocks_spi::connector::ConnectorMutationSelectionFieldRole::AfterImage {
-                    return Err(BuildError::InvalidSource("COW append selection differs from its signed field"));
-                }
-                append.push(route_skeleton::AppendColumn {
-                    writer: binding.field(),
-                    writer_type: writer_type(binding)?,
-                    signed_selection_type: signed_type(signed)?,
-                });
-            }
-            route_skeleton::append_in(
-                rows.len() as u64,
-                &append,
-                owned_target_metadata_upper,
-                transient,
-                materialized,
-            )
-            .map_err(map_footprint)?
-        }
-        Some((source, identity)) => {
-            let count = source.match_tokens().len().checked_add(input_fields(input).filter(|b| {
-                matches!(route.selection_bindings().iter().find(|s| s.writer_token() == b.token()).map(|s| s.source()),
-                    Some(novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
-                        role: novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::AfterImage, .. }))
-                    && !source.match_tokens().contains(&b.token())
-            }).count()).ok_or(BuildError::ResourceExhausted)?;
-            // Every temporary Vec is charged before allocation. Vec<Token> is
-            // separately charged by route_skeleton for the actual builder.
-            let views = add_bytes(
-                add_bytes(
-                    slots::<route_skeleton::RewriteWriter<'_>>(input_width)?,
-                    slots::<route_skeleton::MatchKey<'_>>(source.match_tokens().len())?,
-                )?,
-                slots::<&novarocks_type_contract::FunctionValueType>(count)?,
-            )?;
-            let preflight_transient = add_bytes(
-                views,
-                slots::<novarocks_spi::connector::ConnectorWriteFieldToken>(count)?,
-            )?;
-            if preflight_transient > remaining {
-                return Err(BuildError::ResourceExhausted);
-            }
-            values_tokens = closed::exact_vec(count)?;
-            values_tokens.extend_from_slice(source.match_tokens());
-            for binding in input_fields(input) {
-                if matches!(selection_binding(binding.token())?.source(), novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
-                    role: novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::AfterImage, .. })
-                    && !values_tokens.contains(&binding.token()) { values_tokens.push(binding.token()); }
-            }
-            if values_tokens.len() != count {
-                return Err(BuildError::InvalidSource("COW duplicated writer token"));
-            }
-            let mut value_fields = closed::exact_vec(count)?;
-            for token in &values_tokens {
-                value_fields.push(signed_type(selected(*token)?)?);
-            }
-            let scan = |token| {
-                let b = source
-                    .scan_bindings()
-                    .iter()
-                    .find(|b| b.token() == token)
-                    .ok_or(BuildError::InvalidSource("COW missing scan token"))?;
-                source
-                    .scan_schema()
-                    .fields()
-                    .get(b.scan_ordinal() as usize)
-                    .map(|f| f.as_ref())
-                    .ok_or(BuildError::InvalidSource("COW scan ordinal"))
-            };
-            let position = |token| {
-                values_tokens
-                    .iter()
-                    .position(|t| *t == token)
-                    .map(|n| n as u64)
-                    .ok_or(BuildError::InvalidSource("COW missing VALUES token"))
-            };
-            let mut writers = closed::exact_vec(input_width)?;
-            for binding in input_fields(input) {
-                let value = match selection_binding(binding.token())?.source() {
-                    novarocks_spi::connector::write_stack::ConnectorWriteValueSource::ProviderDerived(
-                        novarocks_spi::connector::write_stack::ConnectorWriteProviderDerivedValue::Inherit) => {
-                        if Some(binding.token()) != source.written_version_token() { return Err(BuildError::InvalidSource("COW inherited writer token")); }
-                        route_skeleton::RewriteValue::InheritWrittenVersion
-                    }
-                    novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
-                        role: novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::Identity, .. } => route_skeleton::RewriteValue::Identity,
-                    novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
-                        role: novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::AfterImage, .. } =>
-                        route_skeleton::RewriteValue::AfterImage { values_ordinal: position(binding.token())? },
-                };
-                writers.push(route_skeleton::RewriteWriter {
-                    writer: binding.field(),
-                    writer_type: writer_type(binding)?,
-                    original_scan_field: scan(binding.token())?,
-                    value,
-                });
-            }
-            let mut keys = closed::exact_vec(source.match_tokens().len())?;
-            for token in source.match_tokens() {
-                let signed = selected(*token)?;
-                if signed.role()
-                    != novarocks_spi::connector::ConnectorMutationSelectionFieldRole::Identity
-                    || !contract.uniqueness_tokens().contains(&signed.token())
-                {
-                    return Err(BuildError::InvalidSource("COW unsigned match identity"));
-                }
-                keys.push(route_skeleton::MatchKey {
-                    original_scan_field: scan(*token)?,
-                    values_ordinal: position(*token)?,
-                });
-            }
-            route_skeleton::rewrite_in(
-                route_skeleton::Rewrite {
-                    rows: rows.len() as u64,
-                    original_values_types: &value_fields,
-                    writers: &writers,
-                    original_match_keys: &keys,
-                    frozen_catalog: identity.catalog(),
-                    frozen_namespace: identity.namespace(),
-                    frozen_table: identity.table(),
-                    owned_target_metadata_upper,
-                    construction_views_upper: views,
-                },
-                materialized,
-            )
-            .map_err(map_footprint)?
-        }
-    };
-    template.constructor_transient_upper = template
-        .constructor_transient_upper
-        .max(compiler_handoff_upper);
-    // The whole original window, including all four compiler copies, rejects
-    // before any row/cell AST constructor. No row recipe storage is created.
-    let mut target = recipe.begin_target(template).map_err(map_footprint)?;
-    if !materialized {
-        for row in rows {
-            check()?;
-            match rewrite {
-                None => {
-                    for binding in input_fields(input) {
-                        let signed = selected(binding.token())?;
-                        preflight_signed_cell(
-                            selection,
-                            *row,
-                            signed.ordinal(),
-                            || {
-                                type_footprint::exact_type_heap(signed_type(signed)?)
-                                    .map_err(map_footprint)
-                            },
-                            remaining,
-                            &mut target,
-                            check,
-                        )?;
-                    }
-                }
-                Some(_) => {
-                    for token in &values_tokens {
-                        let signed = selected(*token)?;
-                        preflight_signed_cell(
-                            selection,
-                            *row,
-                            signed.ordinal(),
-                            || {
-                                type_footprint::exact_type_heap(signed_type(signed)?)
-                                    .map_err(map_footprint)
-                            },
-                            remaining,
-                            &mut target,
-                            check,
-                        )?;
-                    }
-                    target
-                        .fixed_cell(std::mem::size_of::<Expr>() as u64, 0)
-                        .map_err(map_footprint)?;
-                    let effect = contract.effect_field();
-                    preflight_signed_cell(
-                        selection,
-                        *row,
-                        effect.target_ordinal(),
-                        || type_footprint::effect_type_heap().map_err(map_footprint),
-                        remaining,
-                        &mut target,
-                        check,
-                    )?;
-                }
-            }
-        }
-    }
-    check()?;
-    recipe.finish_target(target).map_err(map_footprint)
-}
-
-fn preflight_signed_cell(
-    selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
-    row: novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal,
-    ordinal: u32,
-    exact_type_heap: impl FnOnce() -> closed::Result<u64>,
-    remaining: u64,
-    target: &mut super::cow_compile_receipt::recipe::TargetAccumulator,
-    check: Check<'_>,
-) -> closed::Result<()> {
-    let view = selection
-        .locate(row)
-        .ok_or(BuildError::InvalidSource("COW selection ordinal"))?;
-    let array = view
-        .batch()
-        .columns()
-        .get(ordinal as usize)
-        .ok_or(BuildError::InvalidSource("COW field ordinal"))?;
-    let value = borrowed_checked(array.as_ref(), view.row_index(), remaining, check)?;
-    target
-        .selection_cast(value, exact_type_heap()?)
-        .map_err(map_footprint)
-}
-
-pub(super) fn borrowed_checked(
-    array: &dyn arrow::array::Array,
-    row: usize,
-    remaining: u64,
-    check: Check<'_>,
-) -> closed::Result<value_footprint::ValueFootprint> {
-    // Keep the original check error object. The footprint's Stopped enum is
-    // only a control signal, not a replacement for the caller's primary.
-    let mut first_error = None;
-    let outcome =
-        value_footprint::borrowed_value_with_control(
-            array,
-            row,
-            remaining,
-            &mut || match check() {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    first_error = Some(error);
-                    Err(value_footprint::Failure::Stopped)
-                }
-            },
-        );
-    match first_error {
-        Some(error) => Err(error),
-        None => outcome.map_err(map_footprint),
-    }
-}
-
-/// Exact borrowed-view scratch requested by the first pass. The caller checks
-/// this together with the original session and target containers before any
-/// first-pass Vec or query-local identity is constructed.
-pub(super) fn prospective_views_upper(
-    input: &Input,
-    source: Option<&novarocks_spi::connector::write_stack::ConnectorWriteRewriteSource>,
-) -> closed::Result<u64> {
-    let (first, second) = input_slices(input);
-    let width = first
-        .len()
-        .checked_add(second.len())
-        .ok_or(BuildError::ResourceExhausted)?;
-    let views = if let Some(source) = source {
-        let maximum_tokens = source
-            .match_tokens()
-            .len()
-            .checked_add(width)
-            .ok_or(BuildError::ResourceExhausted)?;
-        add_bytes(
-            add_bytes(
-                slots::<route_skeleton::RewriteWriter<'_>>(width)?,
-                slots::<route_skeleton::MatchKey<'_>>(source.match_tokens().len())?,
-            )?,
-            add_bytes(
-                slots::<&novarocks_type_contract::FunctionValueType>(maximum_tokens)?,
-                slots::<novarocks_spi::connector::ConnectorWriteFieldToken>(maximum_tokens)?,
-            )?,
-        )?
-    } else {
-        slots::<route_skeleton::AppendColumn<'_>>(width)?
-    };
-    add_bytes(
-        views,
-        super::cow_compile_receipt::skeleton_shape::generated_value_alias_bytes(usize::MAX as u64),
-    )
 }

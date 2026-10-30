@@ -1239,7 +1239,12 @@ mod bridge_tests {
                             dictionary_id,
                             ordered,
                         )
-                        .with_metadata([("provider.field-id".into(), annotation.into())].into()),
+                        .with_metadata(std::collections::HashMap::<
+                            String,
+                            String,
+                        >::from([
+                            ("provider.field-id".into(), annotation.into()),
+                        ])),
                     )]
                     .into(),
                 ),

@@ -1169,21 +1169,21 @@ impl<'a> super::AnalyzerContext<'a> {
                 span,
             ));
         };
-        // STRUCT field names are case-insensitive for resolution (Iceberg and
-        // StarRocks both treat them as identifiers). The literal we pass to
-        // `__struct_subfield` must be the *canonical* name from the schema so
-        // the downstream evaluator (which does an exact-byte match against
-        // `StructArray::fields()`) succeeds regardless of how the user spelled
-        // it in the SQL.
-        let field = fields
-            .iter()
-            .find(|field| field.name().eq_ignore_ascii_case(&field_name))
-            .ok_or_else(|| {
-                AnalyzeError::unknown_column(
-                    format!("struct field '{}' does not exist", field_name),
-                    span,
-                )
-            })?;
+        // Canonical spelling is presentation only. The same Functions author
+        // rejects case collisions before either SQL or binding can pick a field.
+        let mut field_work = novarocks_type_contract::CompileCheckpoints::try_new(
+            self.control,
+            novarocks_type_contract::CompilePhase::Validate,
+        )
+        .map_err(AnalyzeError::control)?;
+        let ordinal = novarocks_functions::builtin::struct_field_resolution::resolve_struct_field_ordinal_observed(
+            fields, &field_name, || field_work.step().map_err(novarocks_functions::FunctionBindingError::Control),
+        ).map_err(|source| match source {
+            novarocks_functions::FunctionBindingError::Control(source) => AnalyzeError::control(source),
+            source => AnalyzeError::invalid_argument(source.to_string(), span),
+        })?.ok_or_else(|| AnalyzeError::unknown_column(format!("struct field '{}' does not exist", field_name), span))?;
+        field_work.finish().map_err(AnalyzeError::control)?;
+        let field = &fields[ordinal];
         let field_type = field.data_type().clone();
         let canonical_field_name = field.name().clone();
         let field_name_expr = TypedExpr {
@@ -3377,18 +3377,20 @@ impl<'a> super::AnalyzerContext<'a> {
                 span,
             ));
         };
-        // Same case-insensitive resolution + canonical name forwarding as the
-        // plain struct subfield path above; the array-of-struct variant
-        // (`array_sortby(...).field`) needs to match identically.
-        let field = fields
-            .iter()
-            .find(|field| field.name().eq_ignore_ascii_case(&field_name))
-            .ok_or_else(|| {
-                AnalyzeError::unknown_column(
-                    format!("struct field '{}' does not exist", field_name),
-                    span,
-                )
-            })?;
+        // Use the same unique identifier resolver as dot access and binding.
+        let mut field_work = novarocks_type_contract::CompileCheckpoints::try_new(
+            self.control,
+            novarocks_type_contract::CompilePhase::Validate,
+        )
+        .map_err(AnalyzeError::control)?;
+        let ordinal = novarocks_functions::builtin::struct_field_resolution::resolve_struct_field_ordinal_observed(
+            fields, &field_name, || field_work.step().map_err(novarocks_functions::FunctionBindingError::Control),
+        ).map_err(|source| match source {
+            novarocks_functions::FunctionBindingError::Control(source) => AnalyzeError::control(source),
+            source => AnalyzeError::invalid_argument(source.to_string(), span),
+        })?.ok_or_else(|| AnalyzeError::unknown_column(format!("struct field '{}' does not exist", field_name), span))?;
+        field_work.finish().map_err(AnalyzeError::control)?;
+        let field = &fields[ordinal];
         let field_type = field.data_type().clone();
         let canonical_field_name = field.name().clone();
         let field_name_expr = TypedExpr {
@@ -7551,8 +7553,12 @@ mod tests {
                 let DataType::Struct(fields) = entries.data_type() else {
                     panic!("entries")
                 };
-                assert_eq!(entries.metadata().capacity(), 0);
-                assert!(fields.iter().all(|field| field.metadata().capacity() == 0));
+                assert!(entries.metadata().as_arc().is_none());
+                assert!(
+                    fields
+                        .iter()
+                        .all(|field| field.metadata().as_arc().is_none())
+                );
                 outputs.push(expression.value_type);
             }
             assert_eq!(outputs[0].data_type(), outputs[1].data_type());
@@ -7667,7 +7673,7 @@ mod tests {
                 .domain(),
             Some(novarocks_type_contract::ValueLogicalType::Json)
         );
-        assert_eq!(item.metadata().capacity(), 0);
+        assert!(item.metadata().as_arc().is_none());
         let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
             panic!("expected direct exact scalar owner");
         };
@@ -7766,7 +7772,7 @@ mod tests {
                 .domain(),
             Some(novarocks_type_contract::ValueLogicalType::Json)
         );
-        assert_eq!(item.metadata().capacity(), 0);
+        assert!(item.metadata().as_arc().is_none());
         let (binding, arguments) = match &expression.kind {
             ExprKind::AggregateCall { resolved, args, .. } => (resolved, args),
             ExprKind::WindowCall {
@@ -7785,7 +7791,7 @@ mod tests {
         let selected = crate::functions::aggregate_selection(binding);
         match &selected.intermediate_type.data_type() {
             DataType::List(item) => {
-                assert_eq!(item.metadata().capacity(), 0);
+                assert!(item.metadata().as_arc().is_none());
                 assert_eq!(
                     selected
                         .intermediate_type
@@ -7800,7 +7806,7 @@ mod tests {
                 let DataType::List(item) = fields[0].data_type() else {
                     panic!("expected update channel List");
                 };
-                assert_eq!(item.metadata().capacity(), 0);
+                assert!(item.metadata().as_arc().is_none());
                 assert_eq!(
                     selected
                         .intermediate_type

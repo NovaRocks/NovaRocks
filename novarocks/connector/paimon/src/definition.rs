@@ -66,8 +66,7 @@ pub fn paimon_contract_definition() -> Result<ProviderContractDefinition, Connec
     )
 }
 
-// Retained while Paimon-specific tests are suspended.
-#[cfg(all(test, any()))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

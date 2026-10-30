@@ -9,10 +9,14 @@ RUNTIME FILTER GRAPH
     consumer binding 2, fragment = 1, node = 6, expr = (a2), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:GATHER stats={rows=2}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 0
@@ -31,6 +35,8 @@ PLAN FRAGMENT 1
     8:BROADCAST EXCHANGE stats={rows=2}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 7
@@ -42,6 +48,8 @@ PLAN FRAGMENT 2
      predicates: b.b IS NOT NULL
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 8
@@ -63,10 +71,14 @@ RUNTIME FILTER GRAPH
     consumer binding 2, fragment = 1, node = 6, expr = (a2), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:GATHER stats={rows=2}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 0
@@ -85,6 +97,8 @@ PLAN FRAGMENT 1
     8:BROADCAST EXCHANGE stats={rows=2}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 7
@@ -96,6 +110,8 @@ PLAN FRAGMENT 2
      predicates: b.b IS NOT NULL
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 8

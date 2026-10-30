@@ -425,22 +425,21 @@ mod tests {
             assert!(project_column(&facts, 0, &original, semantic).is_err());
         }
         for marker in ["unknown", "bitmap", "json"] {
-            let field = original.clone().with_metadata(
-                [(
-                    novarocks_types::logical::NR_LOGICAL_TYPE_KEY.to_string(),
-                    marker.to_string(),
-                )]
-                .into(),
-            );
+            let field =
+                original
+                    .clone()
+                    .with_metadata(std::collections::HashMap::<String, String>::from([(
+                        novarocks_types::logical::NR_LOGICAL_TYPE_KEY.to_string(),
+                        marker.to_string(),
+                    )]));
             assert!(
                 project_column(&facts, 0, &field, ConnectorTableColumnSemanticKind::None).is_err()
             );
             let child = Field::new("id", DataType::Int32, false).with_metadata(
-                [(
+                std::collections::HashMap::<String, String>::from([(
                     novarocks_types::logical::NR_LOGICAL_TYPE_KEY.to_string(),
                     marker.to_string(),
-                )]
-                .into(),
+                )]),
             );
             let record = Field::new(
                 "r",

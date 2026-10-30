@@ -95,7 +95,7 @@ fn original_pool() -> ConstantPool {
             Field::new("request.original", DataType::Int64, true).with_metadata(
                 [("source".to_owned(), "original".to_owned())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         ),
         integer(),

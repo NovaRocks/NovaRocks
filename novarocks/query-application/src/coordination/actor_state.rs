@@ -29,11 +29,11 @@ use novarocks_execution_contract::{
 use novarocks_types::identity::{QueryExecutionId, QueryId};
 
 use super::{
-    AttemptFailureClass, BeginSchemaDelivery, CompletedDelivery, DeliveryCompletion,
-    DeliveryCompletionError, DeliveryGate, DeliveryGateError, DeliveryPermit, DeliveryPhase,
-    DeliveryRejection, ExecutionEffect, RecoveryDecision, RecoveryInput, RecoveryMode,
-    ResultPacket, SchemaDeliveryPermit, evaluate_recovery,
+    BeginSchemaDelivery, CompletedDelivery, DeliveryCompletion, DeliveryCompletionError,
+    DeliveryGate, DeliveryGateError, DeliveryPermit, DeliveryPhase, DeliveryRejection,
+    RecoveryDecision, RecoveryInput, ResultPacket, SchemaDeliveryPermit, evaluate_recovery,
 };
+use novarocks_coordination_contract::{AttemptFailureClass, ExecutionEffect, RecoveryMode};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AttemptConvergenceFacts {
@@ -88,14 +88,15 @@ impl AttemptRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalConclusion {
     Succeeded,
+    ComputationReady,
     Failed,
     Cancelled,
-    BusinessDecisionRequired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalOutputMode {
     ResultStream,
+    InternalResultStream,
     CompletionOnly,
 }
 
@@ -401,16 +402,21 @@ pub enum WakeKey {
 pub struct ScheduledWakeup {
     pub key: WakeKey,
     pub generation: u64,
-    pub deadline: super::MonotonicInstant,
+    pub deadline: novarocks_coordination_contract::MonotonicInstant,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct NextWakeup {
-    deadlines: BTreeMap<(WakeKey, u64), super::MonotonicInstant>,
+    deadlines: BTreeMap<(WakeKey, u64), novarocks_coordination_contract::MonotonicInstant>,
 }
 
 impl NextWakeup {
-    pub fn schedule(&mut self, key: WakeKey, generation: u64, deadline: super::MonotonicInstant) {
+    pub fn schedule(
+        &mut self,
+        key: WakeKey,
+        generation: u64,
+        deadline: novarocks_coordination_contract::MonotonicInstant,
+    ) {
         self.deadlines.insert((key, generation), deadline);
     }
 
@@ -429,7 +435,10 @@ impl NextWakeup {
             })
     }
 
-    pub fn take_due(&mut self, now: super::MonotonicInstant) -> Vec<ScheduledWakeup> {
+    pub fn take_due(
+        &mut self,
+        now: novarocks_coordination_contract::MonotonicInstant,
+    ) -> Vec<ScheduledWakeup> {
         let mut due = self
             .deadlines
             .iter()
@@ -502,7 +511,10 @@ impl LogicalExecutionState {
                 current.checked_add(1)
             })
             .map_err(|_| ActorStateError::StaleAttemptCapability)?;
-        let delivery = DeliveryGate::new(initial);
+        let delivery = match output_mode {
+            LogicalOutputMode::InternalResultStream => DeliveryGate::internal(initial),
+            _ => DeliveryGate::new(initial),
+        };
         let capability_generation = delivery.eligibility_generation();
         Ok(Self {
             actor_instance_id,
@@ -591,11 +603,27 @@ impl LogicalExecutionState {
         self.attempts.get(&execution).copied()
     }
 
+    /// Read-only opportunity to observe independent replacement evidence. This
+    /// neither consumes the running capability nor authorizes a successor.
+    pub(crate) fn may_observe_pre_ready_replacement(&self, deadline_reached: bool) -> bool {
+        self.conclusion.is_none()
+            && super::recovery::recovery_window_refusal(super::recovery::RecoveryWindowInput {
+                mode: self.recovery_mode,
+                effect: self.effect,
+                output_visible: self.delivery.output_visible(),
+                attempts_started: self.attempts_started,
+                max_attempts: self.max_attempts,
+                deadline_reached,
+            })
+            .is_none()
+    }
+
     pub(crate) fn begin_replacement(
         &mut self,
         failed: &AttemptCapability,
         replacement: QueryExecutionId,
         failure: AttemptFailureClass,
+        pre_ready_replacement: Option<&crate::api::PreReadyProcessReplacementWitness>,
         deadline_reached: bool,
     ) -> Result<ReplacementToken, ActorStateError> {
         if self.conclusion.is_some() {
@@ -603,6 +631,11 @@ impl LogicalExecutionState {
         }
         self.require_current_capability(failed)?;
         let failed_execution = failed.execution;
+        if pre_ready_replacement
+            .is_some_and(|witness| witness.context().query_execution_id() != failed_execution)
+        {
+            return Err(ActorStateError::NotCurrent);
+        }
         match self.phase {
             ExecutionPhase::Running { execution, .. } if execution == failed_execution => {}
             ExecutionPhase::Running { .. } => return Err(ActorStateError::NotCurrent),
@@ -613,6 +646,7 @@ impl LogicalExecutionState {
             mode: self.recovery_mode,
             effect: self.effect,
             failure,
+            pre_ready_replacement,
             output_visible: self.delivery.output_visible(),
             attempts_started: self.attempts_started,
             max_attempts: self.max_attempts,
@@ -876,7 +910,10 @@ impl LogicalExecutionState {
         sequence: u64,
         packet: ResultPacket<P>,
     ) -> Result<DeliveryPermit<P>, DeliveryRejection<P>> {
-        if !matches!(self.output_mode, LogicalOutputMode::ResultStream) {
+        if !matches!(
+            self.output_mode,
+            LogicalOutputMode::ResultStream | LogicalOutputMode::InternalResultStream
+        ) {
             return Err(DeliveryRejection::new(
                 DeliveryGateError::WrongOutputMode,
                 packet,
@@ -903,6 +940,35 @@ impl LogicalExecutionState {
         permit: DeliveryPermit<P>,
     ) -> Result<CompletedDelivery<P>, DeliveryCompletionError<P>> {
         self.delivery.complete_delivery(permit)
+    }
+
+    pub(crate) fn begin_internal_end(
+        &mut self,
+        capability: &AttemptCapability,
+        sequence: u64,
+    ) -> Result<DeliveryPermit<()>, DeliveryRejection<()>> {
+        if self.output_mode != LogicalOutputMode::InternalResultStream
+            || self.require_running_capability(capability).is_err()
+        {
+            return Err(DeliveryRejection::new(
+                DeliveryGateError::WrongExecutionPhase,
+                ResultPacket::EndOfStream,
+            ));
+        }
+        self.delivery
+            .begin_delivery(capability.execution, sequence, ResultPacket::EndOfStream)
+    }
+
+    pub(crate) fn accept_computation_ready(
+        &mut self,
+        capability: &AttemptCapability,
+    ) -> Result<(), ActorStateError> {
+        self.require_running_capability(capability)?;
+        if self.output_mode != LogicalOutputMode::InternalResultStream {
+            return Err(ActorStateError::WrongPhase);
+        }
+        self.delivery.accept_internal_ready(capability.execution)?;
+        self.conclude_current_execution(capability.execution, LogicalConclusion::ComputationReady)
     }
 
     pub(crate) fn fail_result_delivery<P>(
@@ -1159,6 +1225,9 @@ impl LogicalExecutionState {
         current: &AttemptCapability,
         conclusion: LogicalConclusion,
     ) -> Result<(), ActorStateError> {
+        if conclusion == LogicalConclusion::ComputationReady {
+            return Err(ActorStateError::WrongPhase);
+        }
         if matches!(conclusion, LogicalConclusion::Succeeded) {
             self.require_running_capability(current)?;
         } else {
@@ -1192,7 +1261,10 @@ impl LogicalExecutionState {
         if !exact {
             return Err(ActorStateError::StaleReplacement);
         }
-        if matches!(conclusion, LogicalConclusion::Succeeded) {
+        if matches!(
+            conclusion,
+            LogicalConclusion::Succeeded | LogicalConclusion::ComputationReady
+        ) {
             return Err(ActorStateError::WrongPhase);
         }
         self.conclusion = Some(conclusion);
@@ -1213,7 +1285,10 @@ impl LogicalExecutionState {
             return Err(ActorStateError::SuccessAlreadyAuthorized);
         }
         if matches!(conclusion, LogicalConclusion::Succeeded)
-            && matches!(self.output_mode, LogicalOutputMode::ResultStream)
+            && matches!(
+                self.output_mode,
+                LogicalOutputMode::ResultStream | LogicalOutputMode::InternalResultStream
+            )
         {
             return Err(ActorStateError::SuccessRequiresEndOfStream);
         }
@@ -1374,6 +1449,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             ),
             Err(ActorStateError::WrongPhase)
@@ -1429,6 +1505,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             ),
             Err(ActorStateError::RecoveryRefused(
@@ -1454,6 +1531,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             )
             .unwrap();
@@ -1703,6 +1781,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             )
             .unwrap();
@@ -1744,6 +1823,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             )
             .unwrap();
@@ -1778,6 +1858,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             )
             .unwrap();
@@ -1809,6 +1890,7 @@ mod tests {
                 &initial,
                 execution(2),
                 AttemptFailureClass::RecoverableInfrastructure,
+                None,
                 false,
             )
             .unwrap();
@@ -1938,7 +2020,7 @@ mod tests {
     #[test]
     fn exact_timer_keys_do_not_overwrite_attempts() {
         let mut wakeup = NextWakeup::default();
-        let origin = super::super::MonotonicInstant::ORIGIN;
+        let origin = novarocks_coordination_contract::MonotonicInstant::ORIGIN;
         wakeup.schedule(
             WakeKey::AttemptBackoff(execution(1)),
             1,
@@ -1971,7 +2053,7 @@ mod tests {
     #[test]
     fn stale_timer_generation_cannot_replace_or_clear_the_current_generation() {
         let mut wakeup = NextWakeup::default();
-        let origin = super::super::MonotonicInstant::ORIGIN;
+        let origin = novarocks_coordination_contract::MonotonicInstant::ORIGIN;
         let key = WakeKey::Statement;
         wakeup.schedule(key, 2, origin.saturating_add(Duration::from_secs(2)));
         wakeup.schedule(key, 1, origin.saturating_add(Duration::from_secs(1)));
@@ -1983,6 +2065,67 @@ mod tests {
                 generation: 2,
                 deadline: origin.saturating_add(Duration::from_secs(2)),
             })
+        );
+    }
+    #[test]
+    fn replacement_witness_is_rechecked_against_actual_running_attempt() {
+        use novarocks_execution_contract::QueryContextRef;
+        use novarocks_types::{BackendProcessId, FrontendProcessId};
+        let mut state = LogicalExecutionState::new(
+            execution(1),
+            RecoveryMode::RestartAttemptBeforeVisibility,
+            ExecutionEffect::None,
+            LogicalOutputMode::ResultStream,
+            2,
+        )
+        .unwrap();
+        let initial = running_capability(&mut state, execution(1));
+        let foreign = QueryContextRef::new(
+            execution(2),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let (_, witness, _) = crate::api::pre_ready_identity_refusal_test_fixture(foreign);
+        assert_eq!(
+            state.begin_replacement(
+                &initial,
+                execution(2),
+                AttemptFailureClass::ContractViolation,
+                Some(&witness),
+                false
+            ),
+            Err(ActorStateError::NotCurrent)
+        );
+        assert_eq!(
+            state.begin_replacement(
+                &initial,
+                execution(2),
+                AttemptFailureClass::ContractViolation,
+                None,
+                false
+            ),
+            Err(ActorStateError::RecoveryRefused(
+                RecoveryRefusal::FailureClass
+            ))
+        );
+        let current = QueryContextRef::new(
+            execution(1),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let (_, witness, _) = crate::api::pre_ready_identity_refusal_test_fixture(current);
+        let _replacement = state
+            .begin_replacement(
+                &initial,
+                execution(2),
+                AttemptFailureClass::ContractViolation,
+                Some(&witness),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            state.attempt(execution(1)).unwrap().disposition,
+            AttemptDisposition::Residual
         );
     }
 }

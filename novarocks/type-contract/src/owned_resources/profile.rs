@@ -38,7 +38,7 @@ const fn matches_compiler(actual: &[u8]) -> bool {
 
 pub const fn require_locked_bytes_request_model() {
     let actual = env!("NOVAROCKS_OWNED_RESOURCE_BYTES").as_bytes();
-    let expected = b"1.11.0";
+    let expected = b"1.11.1";
     assert!(
         actual.len() == expected.len(),
         "bytes request model requires re-audit"

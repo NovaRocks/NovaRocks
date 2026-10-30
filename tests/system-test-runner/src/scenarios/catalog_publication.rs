@@ -108,6 +108,19 @@ impl Scenario for PublicationScenario {
                 identity.secret_access_key.clone(),
             );
         }
+        if matches!(self.property, Property::ExpiryConcurrency) {
+            // Retain this FE's original file diagnostics with its scenario.
+            let diagnostics = root.join("provider-diagnostics");
+            fs::create_dir_all(&diagnostics)?;
+            environment.fe.insert(
+                "NOVAROCKS_LOG_DIR".into(),
+                diagnostics.to_string_lossy().into_owned(),
+            );
+            environment.fe.insert(
+                "NOVAROCKS_LOG_BASENAME".into(),
+                "publication-maintenance".into(),
+            );
+        }
         let credential = r#"
 [[connector.credentials]]
 purpose = "object-store-metadata"
@@ -1189,23 +1202,36 @@ fn expiry_properties(context: &mut ScenarioContext, fixture: &PublicationFixture
                 );
             }
             "lost_tag" => {
-                let diagnostic = format!(
-                    "{:#}",
-                    outcome
-                        .err()
-                        .context("lost tag expiry did not report Applied anomaly")?
-                );
-                // The maintenance FE currently stringifies EngineError, whose
-                // Display omits its typed code. Require the actual canonical
-                // known-Applied reclamation failure, not an invented wire code.
+                // Expiration committed and necessary finalization completed.
+                // Retained GC failure is independent of the successful SQL result.
+                outcome.context("Applied expiry was changed into failure by retained GC")?;
                 let committed_failure =
                     "Expiration Applied with unexpectedly lost refs (files protected): ";
                 let lost_ref =
                     format!("unexpected_tag: snapshot={candidate}, manifest-list={candidate_list}");
-                ensure!(
-                    diagnostic.contains(committed_failure) && diagnostic.contains(&lost_ref),
-                    "lost tag diagnostic lacks canonical known-Applied failure and exact recovery facts: {diagnostic}"
-                );
+                let diagnostic = loop {
+                    let diagnostic_path = context
+                        .scenario_root()
+                        .join("provider-diagnostics/publication-maintenance.WARNING");
+                    let log = fs::read_to_string(&diagnostic_path).with_context(|| {
+                        format!("read original FE diagnostic {}", diagnostic_path.display())
+                    })?;
+                    if let Some(line) = log.lines().find(|line| {
+                        line.contains("committed metadata maintenance retains incomplete cleanup")
+                            && line.contains(committed_failure)
+                            && line.contains(&lost_ref)
+                    }) {
+                        break line.to_owned();
+                    }
+                    context.remaining("observe original lost-ref cleanup diagnostic")?;
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                save(
+                    context,
+                    "lost_tag-cleanup-diagnostic.json",
+                    &json!({"diagnostic":diagnostic,"candidate":candidate,
+                        "candidate_manifest_list":candidate_list}),
+                )?;
                 ensure!(forwarded == 1, "Applied lost-tag mutation was replayed");
                 ensure!(
                     after["refs"].get("unexpected_tag").is_none(),

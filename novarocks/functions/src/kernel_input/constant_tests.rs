@@ -288,13 +288,14 @@ fn equal_arrow_carriers_do_not_exchange_json_variant_and_physical_roots() {
 
 #[test]
 fn nested_field_metadata_logical_identity_and_nullability_are_exact() {
-    let child = Field::new("payload", DataType::Utf8, false).with_metadata(
-        [
+    let child =
+        Field::new("payload", DataType::Utf8, false).with_metadata(std::collections::HashMap::<
+            String,
+            String,
+        >::from([
             ("nr_logical_type".into(), "json".into()),
             ("provider.field-id".into(), "17".into()),
-        ]
-        .into(),
-    );
+        ]));
     let array = StructArray::new(
         vec![Arc::new(child.clone())].into(),
         vec![Arc::new(StringArray::from(vec![
@@ -337,7 +338,7 @@ fn nested_field_metadata_logical_identity_and_nullability_are_exact() {
     )
     .unwrap();
     let mut metadata = child.metadata().clone();
-    metadata.insert("provider.field-id".into(), "18".into());
+    metadata.insert("provider.field-id".to_owned(), "18".to_owned());
     let mut physical_metadata = child.metadata().clone();
     physical_metadata.remove("nr_logical_type");
     let same_semantics = FunctionValueType::from_legacy_declared_projection(
@@ -538,9 +539,12 @@ fn run_end_ordinal_uses_logical_address_without_slicing_or_expanding() {
     let wrong = FunctionValueType::new(
         DataType::RunEndEncoded(
             Arc::new(
-                ends.as_ref()
-                    .clone()
-                    .with_metadata([("provider.id".into(), "other".into())].into()),
+                ends.as_ref().clone().with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider.id".into(),
+                        "other".into(),
+                    )]),
+                ),
             ),
             values.clone(),
         ),

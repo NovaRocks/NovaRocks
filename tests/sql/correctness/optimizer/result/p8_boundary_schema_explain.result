@@ -2,6 +2,8 @@
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:PROJECT [k, sum(v)] stats={rows=2}
   1:HASH AGGREGATE (SINGLE, group by: [k]) stats={rows=2}
@@ -9,6 +11,8 @@ PLAN FRAGMENT 0
     2:GATHER stats={rows=2}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 2

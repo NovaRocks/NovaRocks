@@ -37,7 +37,7 @@ struct LiveManifestEntry {
 }
 
 #[derive(Default)]
-struct LiveFiles {
+pub(crate) struct LiveFiles {
     data_files: Vec<LiveManifestEntry>,
     delete_files: Vec<LiveManifestEntry>,
 }
@@ -60,6 +60,14 @@ pub async fn current_live_data_file_compaction_stats(
     preserve_row_lineage: bool,
 ) -> Result<LiveDataFileCompactionStats, String> {
     let live = enumerate_live_files(table, file_io).await?;
+    compactable_file_groups(&live, preserve_row_lineage).map_err(|error| error.to_string())
+}
+
+/// The same grouping author serves the original CPU source and legacy caller.
+pub(crate) fn compactable_file_groups(
+    live: &LiveFiles,
+    preserve_row_lineage: bool,
+) -> crate::iceberg::Result<LiveDataFileCompactionStats> {
     let mut groups: HashMap<String, i64> = HashMap::new();
     for entry in &live.data_files {
         let sequence = if preserve_row_lineage {
@@ -76,7 +84,7 @@ pub async fn current_live_data_file_compaction_stats(
         let count = groups.entry(key).or_insert(0);
         *count = count
             .checked_add(1)
-            .ok_or_else(|| "live data file compaction group count overflow".to_string())?;
+            .ok_or_else(|| rewrite_invalid("live data file compaction group count overflow"))?;
     }
     Ok(LiveDataFileCompactionStats {
         max_compactable_data_files: groups.into_values().max().unwrap_or(0),
@@ -98,22 +106,33 @@ async fn enumerate_live_files(table: &Table, file_io: &FileIO) -> Result<LiveFil
         let manifest = crate::manifest::load_manifest(mf, file_io)
             .await
             .map_err(|e| format!("load manifest {} failed: {e}", mf.manifest_path))?;
-        for entry in manifest.entries() {
-            if !entry.is_alive() {
-                continue;
-            }
-            let live = LiveManifestEntry {
-                data_file: entry.data_file().clone(),
-                partition_spec_id: mf.partition_spec_id,
-                sequence_number: entry.sequence_number().unwrap_or(mf.sequence_number),
-            };
-            match mf.content {
-                ManifestContentType::Data => out.data_files.push(live),
-                ManifestContentType::Deletes => out.delete_files.push(live),
-            }
-        }
+        append_live_manifest(&mut out, mf, &manifest);
     }
     Ok(out)
+}
+
+/// Preserve exact live-file and inherited-sequence semantics in one author.
+pub(crate) fn append_live_manifest(
+    out: &mut LiveFiles,
+    descriptor: &crate::iceberg::spec::ManifestFile,
+    manifest: &crate::iceberg::spec::Manifest,
+) {
+    for entry in manifest.entries() {
+        if !entry.is_alive() {
+            continue;
+        }
+        let live = LiveManifestEntry {
+            data_file: entry.data_file().clone(),
+            partition_spec_id: descriptor.partition_spec_id,
+            sequence_number: entry
+                .sequence_number()
+                .unwrap_or(descriptor.sequence_number),
+        };
+        match descriptor.content {
+            ManifestContentType::Data => out.data_files.push(live),
+            ManifestContentType::Deletes => out.delete_files.push(live),
+        }
+    }
 }
 
 /// Whole-table physical replacement under the operation's frozen dependency.

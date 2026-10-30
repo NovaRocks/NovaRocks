@@ -35,14 +35,14 @@ PROPERTIES (
   "iceberg.catalog.warehouse" = "${iceberg_hms_warehouse}",
   "aws.s3.endpoint" = "${oss_endpoint}",
   "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "static",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
+  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
   "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
   "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "static",
-  "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
+  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
   "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.enable_path_style_access" = "true"
+  "aws.s3.enable_path_style_access" = "${oss_path_style}"
 );
 
 -- query 3
@@ -227,22 +227,31 @@ ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 REWRITE MANIFESTS;
 
 -- query 43
 -- Remove orphan files
--- @expect_error=Hive Metastore catalog is a read-only compatibility entry
+-- Governed preparation preserves the original HMS refusal through its safe typed projection.
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.unsupported] table-maintenance original operation failed
 ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 44
 -- Rewrite data files
--- @expect_error=Hive Metastore catalog is a read-only compatibility entry
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.unsupported] table-maintenance original operation failed
 CALL ice_hms_${uuid0}.system.rewrite_data_files(table => 'iru7_${uuid0}.v3', options => map('rewrite-all','true'));
 
 -- query 45
 -- Rewrite position deletes
--- @expect_error=Hive Metastore catalog is a read-only compatibility entry
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.unsupported] table-maintenance original operation failed
 CALL ice_hms_${uuid0}.system.rewrite_position_delete_files(table => 'iru7_${uuid0}.v2', options => map('rewrite-all','true'));
 
 -- query 46
 -- Optimize admission
--- @expect_error=Hive Metastore catalog is a read-only compatibility entry
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.unsupported] table-maintenance original operation failed
 ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 OPTIMIZE;
 
 -- query 47

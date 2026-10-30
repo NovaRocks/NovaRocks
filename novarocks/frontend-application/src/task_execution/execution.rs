@@ -29,20 +29,22 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::task_execution::completion_facts::parent_released_children;
+use crate::task_execution::conclusion::{LatchOutcome, TerminationLatch};
+use crate::task_execution::operation::OperationDispatchResult;
+use crate::task_execution::status_validation::GoneObservation;
+use crate::task_protocol_config::DispatchBudget;
+use novarocks_coordination_contract::{MonotonicInstant, StatusObservation};
 use novarocks_execution::task_execution::{
-    AbortCause, AdmissionEpochCapability, CancelReason, ExchangeEdgeId, OperationKind,
-    QueryContextRef, TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus,
-    TaskStatusCursor, TerminationDetail,
+    AdmissionEpochCapability, CancelReason, ExchangeEdgeId, OperationKind, QueryContextRef,
+    TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus, TaskStatusCursor,
+    TerminationDetail,
 };
 use novarocks_execution::task_execution::{
     QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QuiesceQueryContextReceipt,
     TaskConvergenceCursor, TaskConvergenceReceipt,
 };
-use novarocks_query_application::coordination::{
-    AttemptDrainFacts, DispatchBudget, DispatchLane, GoneObservation, LatchOutcome,
-    MonotonicInstant, OperationDispatchResult, ReplacementWorkerAdmissionEvidence,
-    StatusObservation, TerminationLatch, parent_released_children,
-};
+use novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence;
 use novarocks_task_codec::TransportBudget;
 use novarocks_task_codec::operation::{
     CoveredStatusStreamEvent, CoveredStatusStreamFact, DecodedCoveredSubscription,
@@ -51,15 +53,14 @@ use novarocks_task_codec::operation::{
 use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::{StageId, TaskId};
 
-use super::clock::TaskProtocolClock;
-use super::completion::{ReadCompletionTracker, ReadVerdict};
+use novarocks_coordination_contract::MonotonicClock;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::coordination::AcceptedRootControlRequest;
 use novarocks_types::identity::BackendProcessId;
 
 use super::context_owner::{ContextEstablishSource, QueryContextOwner, ReleaseSettlement};
 use super::dispatch::{DispatchOperationState, LocalQueueCapacity, OperationDispatcher};
-use super::error::{CapacityBound, TaskExecutionError};
+use super::error::TaskExecutionError;
 use super::graph::TaskGraph;
 use super::intent::{
     DispatchBatch, OperationAcknowledgement, OperationIntent, TaskOperationQueueAdmission,
@@ -104,6 +105,25 @@ enum EdgeControlEffect {
         producer: TaskIdentity,
         edge: ExchangeEdgeId,
     },
+}
+
+/// The original graph row keeps its exact generated input and paid ticket
+/// through a capacity wait. No process physical position is held while Joint
+/// admission is waiting, and polling never removes this row from its owner.
+#[derive(Debug)]
+struct PendingEdgeControlEffect {
+    effect: EdgeControlEffect,
+    input: Option<TaskDomainUpdate>,
+    preparation: super::intent::TaskOperationQueuePreparation,
+}
+impl From<EdgeControlEffect> for PendingEdgeControlEffect {
+    fn from(effect: EdgeControlEffect) -> Self {
+        Self {
+            effect,
+            input: None,
+            preparation: super::intent::TaskOperationQueuePreparation::new(),
+        }
+    }
 }
 
 impl EdgeControlEffect {
@@ -315,7 +335,7 @@ pub struct QueryTaskExecution {
     owners: BTreeMap<QueryContextRef, QueryContextOwner>,
     dispatcher: OperationDispatcher,
     edges: EdgeOpenTracker,
-    clock: Arc<dyn TaskProtocolClock>,
+    clock: Arc<dyn MonotonicClock>,
     sink: Arc<dyn TaskOperationSink>,
     intake: StatusIntake,
     covered_observation_active: bool,
@@ -326,33 +346,28 @@ pub struct QueryTaskExecution {
     deployment_window: BTreeMap<BackendProcessId, BTreeSet<TaskIdentity>>,
     /// The frozen graph bounds this by sum(producers * (destinations + 1)):
     /// the edge tracker emits each close member and each open only once.
-    edge_control_effects: VecDeque<EdgeControlEffect>,
+    edge_control_effects: VecDeque<PendingEdgeControlEffect>,
+    actor_abort_queue_preparation: super::intent::TaskOperationQueuePreparation,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     expired_actor_aborts: Vec<TaskOperationId>,
     status_reconciliations: BTreeSet<QueryContextRef>,
     covered_reconciliations: BTreeSet<QueryContextRef>,
+    normal_drain_requested: bool,
     normal_drain_started: bool,
+    profile_release_deadline: Option<MonotonicInstant>,
     terminal_cleanup_started: bool,
     failure: TerminationLatch,
-    read: ReadCompletionTracker,
-    required_evidence_deadlines: BTreeMap<TaskIdentity, MonotonicInstant>,
+    accepted_protocol_revision: u64,
+    // One ordinal per frozen Task, appended only on its first accepted terminal.
+    // Diagnostic readers keep their own cursor; no idle graph scan is needed.
+    accepted_terminal_tasks: Vec<TaskIdentity>,
+    accepted_terminal_seen: BTreeSet<TaskIdentity>,
+    accepted_protocol_dirty_tasks: BTreeSet<TaskId>,
+    accepted_protocol_writer_evidence: BTreeMap<TaskId, Arc<TaskStatus>>,
     required_result_terminal_control_deadline: Option<MonotonicInstant>,
     drained_tasks: BTreeSet<TaskId>,
     released_outputs: BTreeSet<TaskId>,
     released_children_of: BTreeSet<StageId>,
-}
-
-/// What happened when an urgent context abort reached transport admission.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum AbortSubmission {
-    /// The context owner had already minted or completed its abort.
-    NoIntent,
-    /// The transport owns this abort and will publish its acknowledgement.
-    Accepted,
-    /// The abort never entered an owner or dispatcher queue. The
-    /// process-level transport supervisor owns the capacity-change wake that
-    /// will schedule its next turn.
-    Backpressured,
 }
 
 /// Real dispatcher and process-transport capacity reserved for one exact
@@ -459,7 +474,7 @@ impl QueryTaskExecution {
         native_compatibility_id: NativeCompatibilityId,
         admission_epochs: &BTreeMap<BackendProcessId, AdmissionEpochCapability>,
         preparing_positions: &BTreeMap<BackendProcessId, usize>,
-        clock: Arc<dyn TaskProtocolClock>,
+        clock: Arc<dyn MonotonicClock>,
         sink: Arc<dyn TaskOperationSink>,
         intake: StatusIntake,
     ) -> Result<Self, TaskExecutionError> {
@@ -576,7 +591,6 @@ impl QueryTaskExecution {
             stages.insert(stage_id, StageExecution::new(node.stage(), root, tasks)?);
         }
 
-        let read = ReadCompletionTracker::new(graph.root_identity());
         let covered_observation = graph
             .contexts()
             .copied()
@@ -599,15 +613,21 @@ impl QueryTaskExecution {
             deployment_window_limits,
             deployment_window: BTreeMap::new(),
             edge_control_effects: VecDeque::new(),
+            actor_abort_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
             operation_targets: BTreeMap::new(),
             expired_actor_aborts: Vec::new(),
             status_reconciliations: BTreeSet::new(),
             covered_reconciliations: BTreeSet::new(),
+            normal_drain_requested: false,
             normal_drain_started: false,
+            profile_release_deadline: None,
             terminal_cleanup_started: false,
             failure: TerminationLatch::open(),
-            read,
-            required_evidence_deadlines: BTreeMap::new(),
+            accepted_protocol_revision: 0,
+            accepted_terminal_tasks: Vec::new(),
+            accepted_terminal_seen: BTreeSet::new(),
+            accepted_protocol_dirty_tasks: BTreeSet::new(),
+            accepted_protocol_writer_evidence: BTreeMap::new(),
             required_result_terminal_control_deadline: None,
             drained_tasks: BTreeSet::new(),
             released_outputs: BTreeSet::new(),
@@ -647,6 +667,21 @@ impl QueryTaskExecution {
         &self.graph
     }
 
+    pub(crate) fn monotonic_now(&self) -> MonotonicInstant {
+        self.clock.now()
+    }
+
+    pub(crate) fn retain_profile_diagnostics_until(&mut self, deadline: MonotonicInstant) {
+        self.profile_release_deadline = Some(
+            self.profile_release_deadline
+                .map_or(deadline, |old| old.min(deadline)),
+        );
+    }
+
+    pub(crate) fn release_profile_diagnostics(&mut self) {
+        self.profile_release_deadline = None;
+    }
+
     #[cfg(test)]
     pub const fn dispatcher(&self) -> &OperationDispatcher {
         &self.dispatcher
@@ -674,6 +709,32 @@ impl QueryTaskExecution {
             .iter()
             .find(|(context, _)| context.backend_process_id() == backend)
             .and_then(|(_, owner)| owner.pre_ready_observation_remaining(self.clock.now()))
+    }
+
+    pub(crate) fn rejected_establish_observation_remaining(
+        &self,
+        context: QueryContextRef,
+        operation_id: TaskOperationId,
+    ) -> Option<Duration> {
+        self.owners
+            .get(&context)?
+            .rejected_establish_observation_remaining(operation_id, self.clock.now())
+    }
+
+    /// Only the Task that accepted this exact Create refusal retains its
+    /// snapshot. A context/op correlation cannot manufacture that evidence.
+    pub(crate) fn rejected_create_observation_remaining(
+        &self,
+        context: QueryContextRef,
+        operation_id: TaskOperationId,
+    ) -> Option<Duration> {
+        self.graph
+            .tasks()
+            .filter(|task| task.context() == context)
+            .find_map(|task| {
+                self.task_by_identity_ref(task.identity())?
+                    .rejected_create_observation_remaining(operation_id, self.clock.now())
+            })
     }
 
     /// Takes contexts whose task-operation acknowledgement requires an
@@ -718,6 +779,83 @@ impl QueryTaskExecution {
         }
     }
 
+    pub(crate) const fn accepted_protocol_revision(&self) -> u64 {
+        self.accepted_protocol_revision
+    }
+
+    pub(crate) fn accepted_terminal_tasks(&self) -> &[TaskIdentity] {
+        &self.accepted_terminal_tasks
+    }
+
+    pub(crate) fn accepted_protocol_task_changes(&self) -> &BTreeSet<TaskId> {
+        &self.accepted_protocol_dirty_tasks
+    }
+
+    pub(crate) fn clear_accepted_protocol_task_changes(&mut self) {
+        self.accepted_protocol_dirty_tasks.clear();
+    }
+
+    pub(crate) fn accepted_protocol_writer_witness(
+        &self,
+        task: TaskId,
+    ) -> Option<&Arc<TaskStatus>> {
+        self.accepted_protocol_writer_evidence.get(&task)
+    }
+
+    fn note_accepted_protocol_task(
+        &mut self,
+        identity: TaskIdentity,
+    ) -> Result<(), TaskExecutionError> {
+        let task_id = identity.task_id();
+        if !self
+            .accepted_protocol_writer_evidence
+            .contains_key(&task_id)
+            && let Some(status) = self
+                .task(task_id)
+                .and_then(RemoteTask::status)
+                .filter(|status| status.writer().is_some())
+        {
+            // One original accepted writer witness per frozen Task. A later
+            // coalesced status cannot erase the undeclared-writer evidence.
+            let witness = Arc::new(status.clone());
+            self.accepted_protocol_writer_evidence
+                .insert(task_id, witness);
+        }
+        if self
+            .task(task_id)
+            .and_then(RemoteTask::status)
+            .is_some_and(|status| status.is_terminal())
+            && self.accepted_terminal_seen.insert(identity)
+        {
+            self.accepted_terminal_tasks.push(identity);
+        }
+        self.accepted_protocol_dirty_tasks.insert(task_id);
+        self.note_accepted_protocol_change()
+    }
+
+    fn note_accepted_protocol_change(&mut self) -> Result<(), TaskExecutionError> {
+        self.accepted_protocol_revision = self
+            .accepted_protocol_revision
+            .checked_add(1)
+            .ok_or_else(|| {
+                TaskExecutionError::Schedule(
+                    "accepted protocol owner revision exhausted".to_owned(),
+                )
+            })?;
+        Ok(())
+    }
+
+    fn latch_accepted_task_failure(
+        &mut self,
+        identity: TaskIdentity,
+        detail: TerminationDetail,
+    ) -> Result<(), TaskExecutionError> {
+        match self.failure.latch(identity, detail) {
+            LatchOutcome::Won | LatchOutcome::Refined(_) => self.note_accepted_protocol_change(),
+            LatchOutcome::Lost(_) => Ok(()),
+        }
+    }
+
     pub fn task(&self, task_id: TaskId) -> Option<&RemoteTask> {
         self.stage_of_task
             .get(&task_id)
@@ -735,6 +873,7 @@ impl QueryTaskExecution {
         &mut self,
         establish: &dyn ContextEstablishSource,
     ) -> Result<PumpReport, TaskExecutionError> {
+        self.advance_normal_drain();
         self.refresh_deployment_window();
         let now = self.clock.now();
         self.expire_queued_operations(now)?;
@@ -747,6 +886,14 @@ impl QueryTaskExecution {
             return Ok(report);
         }
 
+        // One bounded pass of original Task rows. Each owner withdraws closed
+        // input before reserving; exact destination-close input remains live
+        // during normal drain. A blocked source cannot stop an independent row.
+        for stage in self.stages.values_mut() {
+            for (_, task) in stage.tasks_mut() {
+                task.poll_input_preparation(self.sink.as_ref())?;
+            }
+        }
         self.flush_edge_control_effects()?;
 
         let mut lifecycle = Vec::<AdmissionCandidate>::new();
@@ -842,7 +989,10 @@ impl QueryTaskExecution {
                     intent,
                 ));
             }
-            if release_ready.get(&context) == Some(&true)
+            if !self
+                .profile_release_deadline
+                .is_some_and(|deadline| !now.has_reached(deadline))
+                && release_ready.get(&context) == Some(&true)
                 && let Some(intent) = owner.release_intent(now)
             {
                 lifecycle.push(AdmissionCandidate::minted(
@@ -946,6 +1096,10 @@ impl QueryTaskExecution {
                 // Retry only after an original capacity wake or another turn.
                 Ok(false)
             }
+            TaskOperationSubmit::AdmissionFailed { batch, error } => {
+                self.rollback_rejected_batch(batch)?;
+                Err(TaskExecutionError::Workload(error))
+            }
             TaskOperationSubmit::Rejected { batch, reason } => {
                 self.rollback_rejected_batch(batch)?;
                 Err(TaskExecutionError::Schedule(reason))
@@ -971,23 +1125,16 @@ impl QueryTaskExecution {
             .stage_of_task
             .get(&task_id)
             .ok_or(TaskExecutionError::UnknownOperation)?;
-        let backend = self
+        let remote = self
             .stages
-            .get(&stage_id)
-            .and_then(|stage| stage.task(task_id))
-            .ok_or(TaskExecutionError::UnknownOperation)?
-            .identity()
-            .backend_process_id();
-        let request = TaskOperationQueueRequest::task_update(backend, &update);
-        self.dispatcher.validate_queue_request(request)?;
-        let queue_permit = self
-            .reserve_process_request(request)
-            .ok_or_else(|| Self::process_queue_backpressure(request))?;
-        self.stages
             .get_mut(&stage_id)
             .and_then(|stage| stage.task_mut(task_id))
-            .ok_or(TaskExecutionError::UnknownOperation)?
-            .enqueue_update(update, queue_permit)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        let request =
+            TaskOperationQueueRequest::task_update(remote.identity().backend_process_id(), &update);
+        self.dispatcher.validate_queue_request(request)?;
+        remote.begin_input_preparation(update)?;
+        remote.poll_input_preparation(self.sink.as_ref())
     }
 
     /// Reserves the two capacities an actor-owned Abort needs before its
@@ -998,7 +1145,7 @@ impl QueryTaskExecution {
     /// proved that the exact backend's lifecycle lane can advance now. The
     /// adapter slot is never treated as either authority.
     pub(crate) fn try_reserve_actor_abort(
-        &self,
+        &mut self,
         intent: &OperationIntent,
     ) -> Result<Option<ActorAbortReservation>, TaskExecutionError> {
         let OperationIntent::AbortQueryContext(request) = intent else {
@@ -1021,7 +1168,13 @@ impl QueryTaskExecution {
         if !self.dispatcher.priority_capacity_available(intent)? {
             return Ok(None);
         }
-        let Some(queue_permit) = self.reserve_process_queue(intent)? else {
+        self.dispatcher.validate_operation_carrier(intent)?;
+        let Some(queue_permit) = Self::reserve_process_request(
+            self.sink.as_ref(),
+            intent.queue_request(),
+            &mut self.actor_abort_queue_preparation,
+        )?
+        else {
             return Ok(None);
         };
         Ok(Some(ActorAbortReservation {
@@ -1113,11 +1266,30 @@ impl QueryTaskExecution {
         Ok(())
     }
 
-    /// Keeps observation and context closure live after a successful root
-    /// seal while stopping unsent task and input work. In-flight operations
-    /// may still settle; only exact destination-close controls may replay.
+    /// Requests normal closure after the root seal. Strict producers and
+    /// consumers keep their original admission and input owners until their
+    /// Task terminals arrive; result demand cannot quiesce required work.
     pub(crate) fn begin_normal_drain(&mut self) {
-        if self.normal_drain_started {
+        self.normal_drain_requested = true;
+        self.advance_normal_drain();
+    }
+
+    pub(crate) fn normal_drain_started(&self) -> bool {
+        self.normal_drain_started
+    }
+
+    fn advance_normal_drain(&mut self) {
+        if !self.normal_drain_requested
+            || self.normal_drain_started
+            || self.terminal_cleanup_started
+            || self.failure_cause().is_some()
+            || self.graph.tasks().any(|task| {
+                self.edges.requires_drain(task.identity())
+                    && !self
+                        .task_by_identity_ref(task.identity())
+                        .is_some_and(RemoteTask::is_terminal)
+            })
+        {
             return;
         }
         let destinations = self
@@ -1148,6 +1320,47 @@ impl QueryTaskExecution {
         }
     }
 
+    /// Project only this sealed read's actual, complete output-demand
+    /// withdrawals. Context custody and Worker settlements remain untouched.
+    pub(crate) fn result_context_withdrawals(
+        &self,
+        activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    ) -> Vec<novarocks_coordination_contract::ResultContextWithdrawal> {
+        let root = self.graph.root_identity();
+        if !self.normal_drain_started
+            || self.failure_cause().is_some()
+            || activation.execution() != self.graph.execution_id()
+            || !self
+                .task_by_identity_ref(root)
+                .and_then(RemoteTask::status)
+                .is_some_and(|status| status.state() == TaskState::Finished)
+        {
+            return Vec::new();
+        }
+        let outputs = self.edges.normal_output_withdrawals(&self.graph);
+        let mut contexts = BTreeMap::<QueryContextRef, bool>::new();
+        for task in self.graph.tasks() {
+            // No output edge supplies no result-withdrawal evidence.
+            let withdrawn = outputs.get(&task.identity()) == Some(&true);
+            contexts
+                .entry(task.context())
+                .and_modify(|all| *all &= withdrawn)
+                .or_insert(withdrawn);
+        }
+        self.graph
+            .contexts()
+            .filter(|&&context| {
+                context.backend_process_id() != root.backend_process_id()
+                    && contexts.get(&context) == Some(&true)
+            })
+            .map(|&context| {
+                novarocks_coordination_contract::ResultContextWithdrawal::new(
+                    activation, root, context,
+                )
+            })
+            .collect()
+    }
+
     /// Applies one exact local no-more-input authorization. An unknown Create
     /// outcome is kept for Context fencing, but cannot keep this destination
     /// in the producer's opening barrier or revive its normal input need.
@@ -1158,6 +1371,11 @@ impl QueryTaskExecution {
         let task = self
             .task_by_identity_ref(identity)
             .ok_or(TaskExecutionError::UnknownOperation)?;
+        // Strict participants finish their own inputs and outputs. A demand
+        // release cannot suppress an unsent Create/update or cancel that work.
+        if self.edges.requires_drain(identity) && !task.is_terminal() {
+            return Ok(());
+        }
         if task
             .status()
             .and_then(TaskStatus::termination)
@@ -1230,57 +1448,6 @@ impl QueryTaskExecution {
         }
     }
 
-    /// Forces one context down, ahead of everything queued for it.
-    pub fn abort_context(
-        &mut self,
-        context: QueryContextRef,
-        cause: AbortCause,
-    ) -> Result<AbortSubmission, TaskExecutionError> {
-        let now = self.clock.now();
-        let Some(intent) = self
-            .owners
-            .get_mut(&context)
-            .and_then(|owner| owner.abort_intent(cause))
-        else {
-            return Ok(AbortSubmission::NoIntent);
-        };
-        let operation_id = intent.operation_id();
-        let Some(queue_permit) = self.reserve_process_queue(&intent)? else {
-            self.rollback_unsent(OperationTarget::Context(context), operation_id);
-            return Ok(AbortSubmission::Backpressured);
-        };
-        if let Err(error) = self
-            .dispatcher
-            .enqueue_priority_reserved(intent, now, queue_permit)
-        {
-            self.rollback_unsent(OperationTarget::Context(context), operation_id);
-            return Err(error);
-        }
-        self.operation_targets
-            .insert(operation_id, OperationTarget::Context(context));
-        let Some(batch) = self
-            .dispatcher
-            .take_priority_lane_batch(context.backend_process_id(), DispatchLane::Lifecycle)
-        else {
-            return Ok(AbortSubmission::Backpressured);
-        };
-        let acceptance = batch.acceptance();
-        match self.sink.try_submit(batch) {
-            TaskOperationSubmit::Accepted => {
-                self.dispatcher.accept(acceptance)?;
-                Ok(AbortSubmission::Accepted)
-            }
-            TaskOperationSubmit::Backpressured(batch) => {
-                self.dispatcher.restore_backpressured(batch);
-                Ok(AbortSubmission::Backpressured)
-            }
-            TaskOperationSubmit::Rejected { batch, reason } => {
-                self.rollback_rejected_batch(batch)?;
-                Err(TaskExecutionError::Schedule(reason))
-            }
-        }
-    }
-
     /// Settles one released operation.
     pub fn acknowledge(
         &mut self,
@@ -1326,7 +1493,19 @@ impl QueryTaskExecution {
                     .owners
                     .get(&context)
                     .is_some_and(QueryContextOwner::establish_acknowledged);
-                let settlement = task.on_create_ack(ack, self.clock.now(), context_established)?;
+                let observation_horizon = self
+                    .owners
+                    .get(&context)
+                    .and_then(QueryContextOwner::create_refusal_observation_horizon);
+                let previous_status = task.status().map(TaskStatus::version);
+                let settlement = task.on_create_ack(
+                    ack,
+                    self.clock.now(),
+                    context_established,
+                    observation_horizon,
+                )?;
+                let accepted_status_changed =
+                    previous_status != task.status().map(TaskStatus::version);
                 if !matches!(settlement, CreateSettlement::Created) {
                     if let CreateSettlement::FailedClosed(_) = settlement {
                         return Err(TaskExecutionError::OperationFailed {
@@ -1348,9 +1527,14 @@ impl QueryTaskExecution {
                 {
                     owner.note_create_owned();
                 }
+                // An applied Create ACK can adopt its original TaskStatus;
+                // this path does not contribute to StatusReport.accepted.
+                if accepted_status_changed {
+                    self.note_accepted_protocol_task(identity)?;
+                }
                 self.reconcile_destination_input(identity)?;
                 self.settle_task_drain(stage_id, task_id);
-                self.accept_task_failure(identity);
+                self.accept_task_failure(identity)?;
                 Ok(())
             }
             OperationKind::UpdateTask => match task.on_update_ack(ack)? {
@@ -1422,7 +1606,6 @@ impl QueryTaskExecution {
                         _ => Ok(()),
                     })
             }
-            OperationKind::AbortQueryContext => owner.on_abort_ack(ack),
             kind => Err(TaskExecutionError::MissingReceipt(kind)),
         }
     }
@@ -1517,11 +1700,13 @@ impl QueryTaskExecution {
                 "exchange edge decided; recording the open on every producer"
             );
             for producer in producers {
-                self.edge_control_effects
-                    .push_back(EdgeControlEffect::Open {
+                self.edge_control_effects.push_back(
+                    EdgeControlEffect::Open {
                         producer,
                         edge: edge_id,
-                    });
+                    }
+                    .into(),
+                );
             }
         }
     }
@@ -1534,12 +1719,14 @@ impl QueryTaskExecution {
         for effect in resolution.closed() {
             let producers = self.edges.producers_of(effect.edge_id()).to_vec();
             for producer in producers {
-                self.edge_control_effects
-                    .push_back(EdgeControlEffect::Close {
+                self.edge_control_effects.push_back(
+                    EdgeControlEffect::Close {
                         producer,
                         edge: effect.edge_id(),
                         destination: effect.destination(),
-                    });
+                    }
+                    .into(),
+                );
             }
         }
         self.apply_open_decisions(resolution.opened().to_vec());
@@ -1554,45 +1741,60 @@ impl QueryTaskExecution {
         let mut blocked_producers = BTreeSet::new();
         let pass_len = self.edge_control_effects.len();
         for _ in 0..pass_len {
-            let Some(effect) = self.edge_control_effects.pop_front() else {
+            let Some(row) = self.edge_control_effects.front() else {
                 break;
             };
-            if self.normal_drain_started && matches!(effect, EdgeControlEffect::Open { .. }) {
-                continue;
-            }
+            let effect = row.effect;
             let producer = effect.producer();
-            if blocked_producers.contains(&producer) {
-                self.edge_control_effects.push_back(effect);
+            if (self.normal_drain_started && matches!(effect, EdgeControlEffect::Open { .. }))
+                || self
+                    .task_by_identity_ref(producer)
+                    .is_some_and(RemoteTask::fenced_out)
+                || self.task_actual_stopped(producer)
+            {
+                drop(self.edge_control_effects.pop_front());
                 continue;
             }
             let task = self
                 .task_by_identity_ref(producer)
                 .ok_or(TaskExecutionError::UnknownOperation)?;
-            if task.fenced_out() || self.task_actual_stopped(producer) {
-                continue;
-            }
-            if task.is_terminal() && self.covered_observation_active {
+            if blocked_producers.contains(&producer)
+                || (task.is_terminal() && self.covered_observation_active)
+            {
                 blocked_producers.insert(producer);
-                self.edge_control_effects.push_back(effect);
+                self.edge_control_effects.rotate_left(1);
                 continue;
             }
-            let update = match effect {
-                EdgeControlEffect::Close {
-                    edge, destination, ..
-                } => task.prepare_destination_close(edge, destination)?,
-                EdgeControlEffect::Open { edge, .. } => task.prepare_edge_open(edge)?,
-            };
-            let request =
-                TaskOperationQueueRequest::task_update(producer.backend_process_id(), &update);
+            if self.edge_control_effects.front().unwrap().input.is_none() {
+                let input = match effect {
+                    EdgeControlEffect::Close {
+                        edge, destination, ..
+                    } => task.prepare_destination_close(edge, destination)?,
+                    EdgeControlEffect::Open { edge, .. } => task.prepare_edge_open(edge)?,
+                };
+                self.edge_control_effects.front_mut().unwrap().input = Some(input);
+            }
+            let row = self.edge_control_effects.front_mut().unwrap();
+            let request = TaskOperationQueueRequest::task_update(
+                producer.backend_process_id(),
+                row.input.as_ref().unwrap(),
+            );
             self.dispatcher.validate_queue_request(request)?;
-            let Some(permit) = self.reserve_process_request(request) else {
+            let Some(permit) =
+                Self::reserve_process_request(self.sink.as_ref(), request, &mut row.preparation)?
+            else {
                 blocked_producers.insert(producer);
-                self.edge_control_effects.push_back(effect);
+                self.edge_control_effects.rotate_left(1);
                 continue;
             };
+            let mut row = self
+                .edge_control_effects
+                .pop_front()
+                .expect("same original edge decision");
+            let input = row.input.take().expect("prepared original edge input");
             self.task_by_identity(producer)
                 .ok_or(TaskExecutionError::UnknownOperation)?
-                .enqueue_update(update, permit)?;
+                .enqueue_update(input, permit)?;
         }
         Ok(())
     }
@@ -1618,6 +1820,9 @@ impl QueryTaskExecution {
                 .is_none_or(|detail| detail.is_success_compatible())
             {
                 self.close_destination_normally(destination);
+                // Strict edges ignored the demand withdrawal above. This
+                // installed Task still supplies their real opening fact.
+                self.open_ready_edges(destination)?;
             }
         } else {
             self.open_ready_edges(destination)?;
@@ -2100,24 +2305,30 @@ impl QueryTaskExecution {
             .expect("the stage was just located");
         let task = stage.task_mut(task_id).expect("the task was just located");
         let was_owned = task.create_ownership_proven();
-        match task.observe_status(status)? {
-            StatusObservation::Accept => report.accepted += 1,
-            _ => report.ignored += 1,
-        }
+        let accepted = match task.observe_status(status)? {
+            StatusObservation::Accept => {
+                report.accepted += 1;
+                true
+            }
+            _ => {
+                report.ignored += 1;
+                false
+            }
+        };
         let became_owned = !was_owned && task.create_ownership_proven();
         let installed = task.installed();
         if became_owned && let Some(owner) = self.owners.get_mut(&task.context()) {
             owner.note_create_owned();
         }
-        if let Some(terminal) = task.terminal_report() {
+        let terminal = task.terminal_report();
+        if accepted {
+            self.note_accepted_protocol_task(identity)?;
+        }
+        if let Some(terminal) = terminal {
             if let Some(detail) = &terminal.termination
                 && !detail.is_success_compatible()
-                && matches!(
-                    self.failure.latch(identity, detail.clone()),
-                    LatchOutcome::Won
-                )
             {
-                // The first cause wins and is the one every observer sees.
+                self.latch_accepted_task_failure(identity, detail.clone())?;
             }
             report.terminal.push(terminal);
         }
@@ -2125,11 +2336,11 @@ impl QueryTaskExecution {
             self.reconcile_destination_input(identity)?;
         }
         self.settle_task_drain(stage_id, task_id);
-        self.accept_task_failure(identity);
+        self.accept_task_failure(identity)?;
         Ok(())
     }
 
-    fn accept_task_failure(&mut self, identity: TaskIdentity) {
+    fn accept_task_failure(&mut self, identity: TaskIdentity) -> Result<(), TaskExecutionError> {
         let detail = self
             .task_by_identity_ref(identity)
             .and_then(|task| task.status())
@@ -2137,11 +2348,12 @@ impl QueryTaskExecution {
             .filter(|detail| !detail.is_success_compatible())
             .cloned();
         if let Some(detail) = detail {
-            self.failure.latch(identity, detail);
+            self.latch_accepted_task_failure(identity, detail)?;
             // Freeze normal admission in the fact's own serial turn. Returning
             // W cannot authorize another Create after the attempt has failed.
             self.begin_terminal_cleanup();
         }
+        Ok(())
     }
 
     /// Publishes one task's drain facts to its context owner, once each.
@@ -2230,7 +2442,7 @@ impl QueryTaskExecution {
                     .stages
                     .get_mut(&child)
                     .expect("the child stage was just located")
-                    .cancel_non_root_tasks();
+                    .cancel_normally_stood_down_tasks();
                 for intent in intents {
                     let identity = match &intent {
                         OperationIntent::CancelTask(request) => request.identity(),
@@ -2251,46 +2463,6 @@ impl QueryTaskExecution {
             if self.enqueue_candidates(candidates, now)?.complete() {
                 self.released_children_of.insert(stage_id);
             }
-        }
-        Ok(())
-    }
-
-    /// Records one packet the root result data plane delivered.
-    ///
-    /// This is the frontend's own evidence about its result stream, and it is
-    /// the only thing that can satisfy the end-of-stream half of a read
-    /// completion. A backend's claim that its output responsibility is
-    /// complete is a different fact, published on a different channel, and it
-    /// cannot substitute for what this process received.
-    pub fn consume_root_result_packet(
-        &mut self,
-        root: TaskIdentity,
-        packet_sequence: u64,
-        end_of_stream: bool,
-    ) -> Result<(), TaskExecutionError> {
-        self.read
-            .consume_packet(root, packet_sequence, end_of_stream)?;
-        if end_of_stream {
-            self.require_terminal_evidence(std::iter::once(root))?;
-        }
-        Ok(())
-    }
-
-    /// Registers exact terminal evidence required after the consumer's result
-    /// proof arrives. Repeated declarations cannot renew an earlier budget;
-    /// unrelated Context coverage does not register any requirement.
-    pub(crate) fn require_terminal_evidence(
-        &mut self,
-        identities: impl IntoIterator<Item = TaskIdentity>,
-    ) -> Result<(), TaskExecutionError> {
-        let deadline = self.clock.now().saturating_add(Duration::from_secs(30));
-        for identity in identities {
-            if self.task_by_identity_ref(identity).is_none() {
-                return Err(TaskExecutionError::UnknownOperation);
-            }
-            self.required_evidence_deadlines
-                .entry(identity)
-                .or_insert(deadline);
         }
         Ok(())
     }
@@ -2320,70 +2492,15 @@ impl QueryTaskExecution {
             })
     }
 
-    pub(crate) fn required_terminal_evidence_expired(&self) -> Option<TaskIdentity> {
-        let now = self.clock.now();
-        self.required_evidence_deadlines
-            .iter()
-            .find_map(|(&identity, &deadline)| {
-                let task = self.task_by_identity_ref(identity)?;
-                if task.is_terminal() {
-                    return None;
-                }
-                // A newly required consumer cannot grant an existing source
-                // debt a fresh recovery window. Only this exact Task's Context
-                // is relevant; unrelated coverage never gates read success.
-                let debt_expired = self
-                    .covered_observation
-                    .get(&task.context())
-                    .and_then(|state| state.coverage_debt)
-                    .is_some_and(|(_, since)| {
-                        now.has_reached(since.saturating_add(Duration::from_secs(30)))
-                    });
-                (now.has_reached(deadline) || debt_expired).then_some(identity)
-            })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn required_root_evidence_expired(&self) -> bool {
-        self.required_evidence_deadlines
-            .get(&self.read.root())
-            .is_some_and(|&deadline| {
-                self.clock.now().has_reached(deadline)
-                    && !self
-                        .task_by_identity_ref(self.read.root())
-                        .is_some_and(RemoteTask::is_terminal)
-            })
-    }
-
-    /// Whether the client may be told the read is complete, and why not when
-    /// it may not.
-    ///
-    /// This deliberately does not wait for upstream tasks to finish standing
-    /// down, and it does not wait for any context to be released. Draining is
-    /// internal resource closure and never gates a completion that has
-    /// already been linearized.
-    pub fn read_completion(&self) -> ReadVerdict {
-        let root_state = self
-            .task_by_identity_ref(self.read.root())
-            .map_or(TaskState::Planned, RemoteTask::task_state);
-        self.read.verdict(root_state, self.failure.is_latched())
-    }
-
-    /// Whether the client may be told the read is complete.
-    pub fn client_visible_completion(&self) -> bool {
-        self.read_completion().is_complete()
-    }
-
-    /// Whether this frontend consumed the end of the root result stream.
-    #[cfg(test)]
-    pub fn root_end_of_stream_observed(&self) -> bool {
-        self.read.end_of_stream_observed()
-    }
-
-    /// Whether the whole attempt has drained.
+    /// Test observation of accepted Task/output/Release facts, never actual exit.
     #[cfg(test)]
     pub fn attempt_drained(&self) -> bool {
-        self.attempt_drain_facts().drained()
+        self.stages.values().all(StageExecution::all_terminal)
+            && self
+                .stages
+                .values()
+                .all(StageExecution::all_output_released)
+            && self.owners.values().all(QueryContextOwner::is_released)
     }
 
     /// The exact immutable Worker proof applied by the original covered owner.
@@ -2412,24 +2529,6 @@ impl QueryTaskExecution {
             .is_some_and(QueryContextOwner::never_attempted_establish)
     }
 
-    /// The three facts a drain waits on, separately.
-    ///
-    /// A conjunction that fails has to be able to say which conjunct failed.
-    /// Reporting only "not drained" cost a full cluster run to narrow the one
-    /// time it mattered, and the three have entirely different causes: tasks
-    /// not terminal is the backends still working, output not released is this
-    /// frontend not having consumed what they produced, and contexts not
-    /// released is the release operation itself outstanding.
-    pub fn attempt_drain_facts(&self) -> AttemptDrainFacts {
-        AttemptDrainFacts::new(
-            self.stages.values().all(StageExecution::all_terminal),
-            self.stages
-                .values()
-                .all(StageExecution::all_output_released),
-            self.owners.values().all(QueryContextOwner::is_released),
-        )
-    }
-
     /// Where every task of one context has been observed to.
     ///
     /// This is what a subscription starts from, so a transport that dropped
@@ -2450,7 +2549,7 @@ impl QueryTaskExecution {
 
     pub(crate) fn selected_task_failure(
         &self,
-    ) -> Option<&novarocks_query_application::coordination::SelectedTaskTermination> {
+    ) -> Option<&novarocks_coordination_contract::SelectedTaskTermination> {
         self.failure.selected()
     }
 
@@ -2470,7 +2569,7 @@ impl QueryTaskExecution {
     fn enqueue_candidates(
         &mut self,
         candidates: VecDeque<AdmissionCandidate>,
-        now: novarocks_query_application::coordination::MonotonicInstant,
+        now: novarocks_coordination_contract::MonotonicInstant,
     ) -> Result<AdmissionPass, TaskExecutionError> {
         let mut pass = AdmissionPass::default();
         for candidate in candidates {
@@ -2551,15 +2650,17 @@ impl QueryTaskExecution {
     /// Checks this attempt's own queue bounds for one request, then reserves
     /// it against process transport.
     fn reserve_candidate(
-        &self,
+        dispatcher: &OperationDispatcher,
+        sink: &dyn TaskOperationSink,
+        preparation: &mut super::intent::TaskOperationQueuePreparation,
         request: TaskOperationQueueRequest,
         holds_queue_permit: bool,
     ) -> Result<
         Result<Option<Box<dyn TaskOperationQueuePermit>>, CandidateAdmission>,
         TaskExecutionError,
     > {
-        self.dispatcher.validate_queue_request(request)?;
-        match self.dispatcher.local_capacity(request) {
+        dispatcher.validate_queue_request(request)?;
+        match dispatcher.local_capacity(request) {
             LocalQueueCapacity::Fits => {}
             LocalQueueCapacity::TargetFull => return Ok(Err(CandidateAdmission::TargetFull)),
             LocalQueueCapacity::AttemptFull => {
@@ -2571,8 +2672,11 @@ impl QueryTaskExecution {
         if holds_queue_permit {
             return Ok(Ok(None));
         }
-        Ok(match self.sink.try_reserve_queue(request) {
+        Ok(match sink.try_reserve_queue(request, preparation) {
             TaskOperationQueueAdmission::Admitted(permit) => Ok(Some(permit)),
+            TaskOperationQueueAdmission::Rejected(error) => {
+                return Err(TaskExecutionError::Workload(error));
+            }
             TaskOperationQueueAdmission::TargetFull => Err(CandidateAdmission::TargetFull),
             TaskOperationQueueAdmission::ProcessFull => Err(CandidateAdmission::Ended(
                 AdmissionPassEnd::ProcessTransport,
@@ -2596,7 +2700,7 @@ impl QueryTaskExecution {
     fn admit_candidate(
         &mut self,
         candidate: AdmissionCandidate,
-        now: novarocks_query_application::coordination::MonotonicInstant,
+        now: novarocks_coordination_contract::MonotonicInstant,
     ) -> Result<CandidateAdmission, TaskExecutionError> {
         match candidate {
             AdmissionCandidate::Minted { target, intent } => {
@@ -2605,7 +2709,28 @@ impl QueryTaskExecution {
                     self.rollback_unsent(target, operation_id);
                     return Err(error);
                 }
-                let permit = match self.reserve_candidate(intent.queue_request(), false) {
+                let permit = match Self::reserve_candidate(
+                    &self.dispatcher,
+                    self.sink.as_ref(),
+                    match target {
+                        OperationTarget::Context(context) => self
+                            .owners
+                            .get_mut(&context)
+                            .ok_or(TaskExecutionError::UnknownOperation)?
+                            .queue_preparation(&intent),
+                        OperationTarget::Task { stage, task } => {
+                            &mut self
+                                .stages
+                                .get_mut(&stage)
+                                .and_then(|stage| stage.task_mut(task))
+                                .ok_or(TaskExecutionError::UnknownOperation)?
+                                .cancel_queue_preparation
+                        }
+                        OperationTarget::ActorAbort => &mut self.actor_abort_queue_preparation,
+                    },
+                    intent.queue_request(),
+                    false,
+                ) {
                     Ok(Ok(permit)) => permit.expect("a minted candidate reserves its own permit"),
                     Ok(Err(refusal)) => {
                         self.rollback_unsent(target, operation_id);
@@ -2661,7 +2786,18 @@ impl QueryTaskExecution {
                 };
                 self.dispatcher
                     .validate_plan_carrier_bytes(candidate.plan_carrier_bytes())?;
-                let permit = match self.reserve_candidate(candidate.request(), false)? {
+                let permit = match Self::reserve_candidate(
+                    &self.dispatcher,
+                    self.sink.as_ref(),
+                    &mut self
+                        .stages
+                        .get_mut(&stage)
+                        .and_then(|stage| stage.task_mut(task))
+                        .ok_or(TaskExecutionError::UnknownOperation)?
+                        .create_queue_preparation,
+                    candidate.request(),
+                    false,
+                )? {
                     Ok(permit) => permit.expect("a create reserves its own permit"),
                     Err(refusal) => return Ok(refusal),
                 };
@@ -2671,7 +2807,10 @@ impl QueryTaskExecution {
                     .and_then(|stage| stage.task_mut(task))
                     .ok_or(TaskExecutionError::UnknownOperation)?;
                 // A freeze failure drops the permit it was admitted with.
-                let intent = remote.release_create(now)?;
+                let retention = permit
+                    .native_input_retention()
+                    .map_err(TaskExecutionError::Workload)?;
+                let intent = remote.release_create(now, retention)?;
                 let target = OperationTarget::Task { stage, task };
                 if let Err(error) = self.dispatcher.enqueue_reserved(intent, now, permit) {
                     self.rollback_unsent(target, candidate.operation_id());
@@ -2695,9 +2834,18 @@ impl QueryTaskExecution {
                 else {
                     return Ok(CandidateAdmission::Nothing);
                 };
-                let reserved = match self
-                    .reserve_candidate(candidate.request(), candidate.holds_queue_permit())?
-                {
+                let reserved = match Self::reserve_candidate(
+                    &self.dispatcher,
+                    self.sink.as_ref(),
+                    &mut self
+                        .stages
+                        .get_mut(&stage)
+                        .and_then(|stage| stage.task_mut(task))
+                        .ok_or(TaskExecutionError::UnknownOperation)?
+                        .update_queue_preparation,
+                    candidate.request(),
+                    candidate.holds_queue_permit(),
+                )? {
                     Ok(reserved) => reserved,
                     Err(refusal) => return Ok(refusal),
                 };
@@ -2773,38 +2921,20 @@ impl QueryTaskExecution {
         }
     }
 
-    fn reserve_process_queue(
-        &self,
-        intent: &OperationIntent,
-    ) -> Result<Option<Box<dyn TaskOperationQueuePermit>>, TaskExecutionError> {
-        self.dispatcher.validate_operation_carrier(intent)?;
-        Ok(self.reserve_process_request(intent.queue_request()))
-    }
-
-    /// Reserves one single-operation request against process transport.
-    ///
-    /// The single-operation owners -- a domain update, an actor Abort, a
-    /// cleanup Abort -- have no successor candidate a full target could
-    /// reorder, so both refusals mean the same thing to them: not now. Each
-    /// keeps its own retry or failure rule for that answer.
     fn reserve_process_request(
-        &self,
+        sink: &dyn TaskOperationSink,
         request: TaskOperationQueueRequest,
-    ) -> Option<Box<dyn TaskOperationQueuePermit>> {
-        match self.sink.try_reserve_queue(request) {
-            TaskOperationQueueAdmission::Admitted(permit) => Some(permit),
+        preparation: &mut super::intent::TaskOperationQueuePreparation,
+    ) -> Result<Option<Box<dyn TaskOperationQueuePermit>>, TaskExecutionError> {
+        match sink.try_reserve_queue(request, preparation) {
+            TaskOperationQueueAdmission::Admitted(permit) => Ok(Some(permit)),
             TaskOperationQueueAdmission::TargetFull | TaskOperationQueueAdmission::ProcessFull => {
-                None
+                Ok(None)
+            }
+            TaskOperationQueueAdmission::Rejected(error) => {
+                Err(TaskExecutionError::Workload(error))
             }
         }
-    }
-
-    fn process_queue_backpressure(request: TaskOperationQueueRequest) -> TaskExecutionError {
-        CapacityBound::ProcessTransportQueue {
-            lane: request.lane(),
-            bytes: request.queued_bytes(),
-        }
-        .into()
     }
 
     fn locate(&self, identity: TaskIdentity) -> Option<(StageId, TaskId)> {

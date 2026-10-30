@@ -229,7 +229,7 @@ RAW_TEXT_ENCODINGS = {
 }
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Write standard benchmark raw files to Iceberg"
     )
@@ -241,15 +241,29 @@ def parse_args():
     parser.add_argument("--warehouse", required=True)
     parser.add_argument("--manifest-output", required=True)
     parser.add_argument("--s3-endpoint", required=True)
-    parser.add_argument("--s3-access-key", default=os.environ.get("AWS_ACCESS_KEY_ID"))
-    parser.add_argument("--s3-secret-key", default=os.environ.get("AWS_SECRET_ACCESS_KEY"))
+    parser.add_argument("--object-store-kind", choices=("minio", "aliyun-oss"), default="minio")
+    parser.add_argument("--s3-region")
+    parser.add_argument("--s3-role-name")
+    parser.add_argument("--s3-access-key")
+    parser.add_argument("--s3-secret-key")
     parser.add_argument("--generator", required=True)
     parser.add_argument("--generator-version", required=True)
     parser.add_argument("--schema-ddl")
     parser.add_argument("--fixture-contract-json")
-    args = parser.parse_args()
-    if not args.s3_access_key or not args.s3_secret_key:
-        parser.error("S3 credentials require the explicit arguments or the producer environment")
+    args = parser.parse_args(argv)
+    if args.object_store_kind == "aliyun-oss":
+        if args.s3_access_key or args.s3_secret_key:
+            parser.error("OSS node-local producers cannot contain static credential material")
+        if (not args.s3_role_name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]*", args.s3_role_name)
+                or not args.s3_region or not re.fullmatch(r"[a-z0-9-]+", args.s3_region)
+                or args.s3_endpoint != f"https://s3.oss-{args.s3_region}-internal.aliyuncs.com"):
+            parser.error("OSS producers require an explicit role, region and exact regional internal S3 endpoint")
+    else:
+        args.s3_access_key = args.s3_access_key or os.environ.get("AWS_ACCESS_KEY_ID")
+        args.s3_secret_key = args.s3_secret_key or os.environ.get("AWS_SECRET_ACCESS_KEY")
+        args.s3_region = args.s3_region or "us-east-1"
+        if not args.s3_access_key or not args.s3_secret_key:
+            parser.error("S3 credentials require the explicit arguments or the producer environment")
     return args
 
 
@@ -284,48 +298,59 @@ def load_fixture_contract(args):
         or contract.get("normalized_scale") != args.scale
         or contract.get("generator", {}).get("name") != args.generator
         or contract.get("generator", {}).get("version") != args.generator_version
+        or resolved["producer_fingerprint"].get("object_store_kind", "minio") != args.object_store_kind
     ):
         raise ValueError("fixture contract does not match the requested benchmark load")
     return resolved
 
 
+def s3_settings(args):
+    cloud = args.object_store_kind == "aliyun-oss"
+    catalog = {"s3.endpoint": args.s3_endpoint,
+               "s3.path-style-access": "false" if cloud else "true",
+               "s3.region": args.s3_region, "client.region": args.s3_region}
+    hadoop = {"fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
+              "fs.s3a.endpoint": args.s3_endpoint,
+              "fs.s3a.path.style.access": "false" if cloud else "true",
+              "fs.s3a.connection.ssl.enabled": "true" if args.s3_endpoint.startswith("https://") else "false"}
+    if cloud:
+        catalog.update({"client.credentials-provider": "org.novarocks.fixture.auth.AliyunEcsCredentialsProvider",
+                        "client.credentials-provider.role-name": args.s3_role_name})
+        hadoop["fs.s3a.aws.credentials.provider"] = "org.novarocks.fixture.auth.AliyunEcsV1CredentialsProvider"
+    else:
+        catalog.update({"s3.access-key-id": args.s3_access_key, "s3.secret-access-key": args.s3_secret_key})
+        hadoop.update({"fs.s3a.access.key": args.s3_access_key, "fs.s3a.secret.key": args.s3_secret_key,
+                       "fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"})
+    return catalog, hadoop
+
+
 def configure_catalog(spark, args):
     configure_s3a(spark, args)
     configure_parquet_writer(spark)
-
     catalog_prefix = f"spark.sql.catalog.{args.catalog}"
     spark.conf.set(catalog_prefix, "org.apache.iceberg.spark.SparkCatalog")
     spark.conf.set(f"{catalog_prefix}.type", "hadoop")
     spark.conf.set(f"{catalog_prefix}.warehouse", spark_s3_uri(args.warehouse))
     spark.conf.set(f"{catalog_prefix}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
-    spark.conf.set(f"{catalog_prefix}.s3.endpoint", args.s3_endpoint)
-    spark.conf.set(f"{catalog_prefix}.s3.path-style-access", "true")
-    spark.conf.set(f"{catalog_prefix}.s3.access-key-id", args.s3_access_key)
-    spark.conf.set(f"{catalog_prefix}.s3.secret-access-key", args.s3_secret_key)
-    spark.conf.set(f"{catalog_prefix}.s3.region", "us-east-1")
-    spark.conf.set("spark.hadoop.fs.s3a.endpoint", args.s3_endpoint)
-    spark.conf.set("spark.hadoop.fs.s3a.access.key", args.s3_access_key)
-    spark.conf.set("spark.hadoop.fs.s3a.secret.key", args.s3_secret_key)
-    spark.conf.set("spark.hadoop.fs.s3a.path.style.access", "true")
-    spark.conf.set("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-    spark.conf.set(
-        "spark.hadoop.fs.s3a.aws.credentials.provider",
-        "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
-    )
+    catalog, hadoop = s3_settings(args)
+    if args.object_store_kind == "aliyun-oss":
+        for key in ["s3.access-key-id", "s3.secret-access-key", "s3.session-token"]:
+            spark.conf.unset(f"{catalog_prefix}.{key}")
+    for key, value in catalog.items():
+        spark.conf.set(f"{catalog_prefix}.{key}", value)
+    for key, value in hadoop.items():
+        spark.conf.set(f"spark.hadoop.{key}", value)
 
 
 def configure_s3a(spark, args):
     hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
-    hadoop_conf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-    hadoop_conf.set("fs.s3a.endpoint", args.s3_endpoint)
-    hadoop_conf.set("fs.s3a.access.key", args.s3_access_key)
-    hadoop_conf.set("fs.s3a.secret.key", args.s3_secret_key)
-    hadoop_conf.set("fs.s3a.path.style.access", "true")
-    hadoop_conf.set("fs.s3a.connection.ssl.enabled", "false")
-    hadoop_conf.set(
-        "fs.s3a.aws.credentials.provider",
-        "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
-    )
+    if args.object_store_kind == "aliyun-oss":
+        for key in ["fs.s3a.access.key", "fs.s3a.secret.key", "fs.s3a.session.token"]:
+            hadoop_conf.unset(key)
+            spark.conf.unset(f"spark.hadoop.{key}")
+    _, hadoop = s3_settings(args)
+    for key, value in hadoop.items():
+        hadoop_conf.set(key, value)
 
 
 def configure_parquet_writer(spark):
@@ -517,8 +542,17 @@ def main():
     fixture_contract = load_fixture_contract(args)
     fixture_layouts = parse_fixture_layouts(fixture_contract)
 
+    if args.object_store_kind == "aliyun-oss":
+        if os.environ.get("NOVA_OSS_ROLE_NAME") != args.s3_role_name:
+            raise ValueError("Spark driver role differs from the explicit fixture role")
+        os.environ["NOVA_OSS_ROLE_NAME"] = args.s3_role_name
+        for key in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]:
+            os.environ.pop(key, None)
+    builder = SparkSession.builder.appName("NovaRocksBenchmarkBootstrap")
+    if args.object_store_kind == "aliyun-oss":
+        builder = builder.config("spark.executorEnv.NOVA_OSS_ROLE_NAME", args.s3_role_name)
     spark = (
-        SparkSession.builder.appName("NovaRocksBenchmarkBootstrap")
+        builder
         .config(
             "spark.sql.extensions",
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",

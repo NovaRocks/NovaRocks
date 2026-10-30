@@ -145,7 +145,7 @@ impl FsAccessResources {
         Self {
             object_store_provider_pool: Arc::clone(&self.object_store_provider_pool),
             storage_authority_registry: Arc::clone(&self.storage_authority_registry),
-            access_resolver: self.access_resolver,
+            access_resolver: self.access_resolver.clone(),
             file_runtime,
             file_task_spawner,
         }
@@ -164,7 +164,7 @@ impl FsAccessResources {
     }
 
     pub fn access_resolver(&self) -> FsAccessResolver {
-        self.access_resolver
+        self.access_resolver.clone()
     }
 
     pub fn file_runtime(&self) -> &Arc<dyn FileIoRuntime> {
@@ -298,7 +298,7 @@ mod tests {
         });
         let read_authority =
             read.storage_authority_registry()
-                .authority(&id, Instant::now(), || source.clone());
+                .authority(&id, Instant::now(), || (source.clone(), None));
         let write_authority =
             write
                 .storage_authority_registry()

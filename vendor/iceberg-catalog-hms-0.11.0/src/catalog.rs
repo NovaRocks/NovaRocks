@@ -259,6 +259,61 @@ impl HmsCatalog {
     pub fn file_io(&self) -> FileIO {
         self.file_io.clone()
     }
+    /// Load metadata through the caller's admitted FileIO while reusing this
+    /// catalog's original HMS client and selected service.
+    pub async fn load_table_with_file_io(
+        &self,
+        table: &TableIdent,
+        file_io: &FileIO,
+    ) -> Result<Table> {
+        let db_name = validate_namespace(table.namespace())?;
+
+        // A NoSuchObjectException is the metastore stating the table is absent.
+        // Upstream funnels it into the generic `Unexpected` alongside real
+        // transport failures, while `table_exists` in this same file already
+        // matches the typed variant -- so callers that must distinguish absence
+        // from "could not tell" had nothing to read. It now says TableNotFound.
+        let hive_table = match self
+            .client
+            .0
+            .get_table(db_name.clone().into(), table.name.clone().into())
+            .await
+        {
+            Ok(MaybeException::Ok(value)) => value,
+            Ok(MaybeException::Exception(ThriftHiveMetastoreGetTableException::O2(_))) => {
+                return Err(Error::new(
+                    ErrorKind::TableNotFound,
+                    format!("no such table: {}.{}", db_name, table.name),
+                ));
+            }
+            Ok(MaybeException::Exception(exception)) => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Operation failed for hitting thrift error".to_string(),
+                )
+                .with_source(anyhow!("thrift error: {exception:?}")));
+            }
+            Err(err) => return Err(from_thrift_error(err)),
+        };
+
+        let metadata_location = get_metadata_location(&hive_table.parameters)?;
+
+        let metadata = TableMetadata::read_from(file_io, &metadata_location).await?;
+
+        let mut builder = Table::builder()
+            .file_io(file_io.clone())
+            .metadata_location(metadata_location)
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new(db_name),
+                table.name.clone(),
+            ))
+            .runtime(self.runtime.clone());
+        if let Some(kms_client) = self.kms_client.clone() {
+            builder = builder.kms_client(kms_client);
+        }
+        builder.build()
+    }
 }
 
 #[async_trait]
@@ -592,53 +647,7 @@ impl Catalog for HmsCatalog {
     /// - Absence of metadata location information in the table's properties.
     /// - Issues reading or deserializing the table's metadata file.
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
-        let db_name = validate_namespace(table.namespace())?;
-
-        // A NoSuchObjectException is the metastore stating the table is absent.
-        // Upstream funnels it into the generic `Unexpected` alongside real
-        // transport failures, while `table_exists` in this same file already
-        // matches the typed variant -- so callers that must distinguish absence
-        // from "could not tell" had nothing to read. It now says TableNotFound.
-        let hive_table = match self
-            .client
-            .0
-            .get_table(db_name.clone().into(), table.name.clone().into())
-            .await
-        {
-            Ok(MaybeException::Ok(value)) => value,
-            Ok(MaybeException::Exception(ThriftHiveMetastoreGetTableException::O2(_))) => {
-                return Err(Error::new(
-                    ErrorKind::TableNotFound,
-                    format!("no such table: {}.{}", db_name, table.name),
-                ));
-            }
-            Ok(MaybeException::Exception(exception)) => {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "Operation failed for hitting thrift error".to_string(),
-                )
-                .with_source(anyhow!("thrift error: {exception:?}")));
-            }
-            Err(err) => return Err(from_thrift_error(err)),
-        };
-
-        let metadata_location = get_metadata_location(&hive_table.parameters)?;
-
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
-
-        let mut builder = Table::builder()
-            .file_io(self.file_io())
-            .metadata_location(metadata_location)
-            .metadata(metadata)
-            .identifier(TableIdent::new(
-                NamespaceIdent::new(db_name),
-                table.name.clone(),
-            ))
-            .runtime(self.runtime.clone());
-        if let Some(kms_client) = self.kms_client.clone() {
-            builder = builder.kms_client(kms_client);
-        }
-        builder.build()
+        self.load_table_with_file_io(table, &self.file_io).await
     }
 
     /// Asynchronously drops a table from the database.

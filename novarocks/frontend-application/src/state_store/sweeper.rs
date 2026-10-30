@@ -30,9 +30,14 @@
 //! bounded-evidence rule exists to prevent. A mechanism with no caller is not a
 //! mechanism.
 
+use crate::state_store::execution::StateStoreOriginalProgress;
+use novarocks_state_store_api::StateStoreExecutionFailure;
+use novarocks_state_store_runtime::StateStoreRunPolicy;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::task::Poll;
+use std::time::{Duration, Instant};
 
 use novarocks_state_store_api::StateStore;
 use tokio::task::JoinHandle;
@@ -46,56 +51,65 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Returns abandoned attempts to the store on a fixed cadence.
 pub struct AbandonedAttemptSweeper {
-    store: Arc<dyn StateStore>,
+    pass: AbandonedAttemptSweep,
     interval: Duration,
     stopping: Arc<AtomicBool>,
-    worker: std::sync::Mutex<Option<JoinHandle<()>>>,
+    // Stable receiving belongs to the unique Host, outside its borrowed wait.
+    worker: Option<JoinHandle<()>>,
+}
+#[derive(Clone)]
+struct AbandonedAttemptSweep {
+    store: Arc<dyn StateStore>,
+    original: StateStoreOriginalProgress,
+    policy: StateStoreRunPolicy,
 }
 
 impl AbandonedAttemptSweeper {
-    pub fn new(store: Arc<dyn StateStore>) -> Self {
-        Self::with_interval(store, DEFAULT_SWEEP_INTERVAL)
+    pub(crate) fn new(
+        store: Arc<dyn StateStore>,
+        original: StateStoreOriginalProgress,
+        policy: StateStoreRunPolicy,
+    ) -> Self {
+        Self::with_interval(store, DEFAULT_SWEEP_INTERVAL, original, policy)
     }
 
-    pub fn with_interval(store: Arc<dyn StateStore>, interval: Duration) -> Self {
+    pub(crate) fn with_interval(
+        store: Arc<dyn StateStore>,
+        interval: Duration,
+        original: StateStoreOriginalProgress,
+        policy: StateStoreRunPolicy,
+    ) -> Self {
         Self {
-            store,
+            pass: AbandonedAttemptSweep {
+                store,
+                original,
+                policy,
+            },
             interval,
             stopping: Arc::new(AtomicBool::new(false)),
-            worker: std::sync::Mutex::new(None),
+            worker: None,
         }
     }
 
-    /// Runs one sweep and reports how many attempts were released.
-    ///
-    /// A provider that is not ready to release yet says so without it counting
-    /// as a fault, so an ordinary sweep on a busy instance is quiet rather than
-    /// noisy.
-    pub async fn sweep_once(&self) -> Result<usize, String> {
-        self.store
-            .attempts()
-            .drain_abandoned_attempts()
-            .await
-            .map_err(|error| error.to_string())
+    pub async fn sweep_once(&self) -> Result<usize, StateStoreExecutionFailure> {
+        self.pass.sweep_once().await
     }
 
-    pub fn start(self: &Arc<Self>) -> Result<(), String> {
-        let mut worker = self
-            .worker
-            .lock()
-            .map_err(|_| "abandoned attempt sweeper worker lock is poisoned".to_string())?;
-        if worker.is_some() {
+    pub fn start(&mut self) -> Result<(), String> {
+        if self.worker.is_some() {
             return Err("abandoned attempt sweeper is already running".to_string());
         }
         self.stopping.store(false, Ordering::Release);
-        let sweeper = Arc::clone(self);
-        *worker = Some(tokio::spawn(async move {
-            while !sweeper.stopping.load(Ordering::Acquire) {
-                tokio::time::sleep(sweeper.interval).await;
-                if sweeper.stopping.load(Ordering::Acquire) {
+        let pass = self.pass.clone();
+        let stopping = self.stopping.clone();
+        let interval = self.interval;
+        self.worker = Some(tokio::spawn(async move {
+            while !stopping.load(Ordering::Acquire) {
+                tokio::time::sleep(interval).await;
+                if stopping.load(Ordering::Acquire) {
                     break;
                 }
-                match sweeper.sweep_once().await {
+                match pass.sweep_once().await {
                     Ok(0) => {}
                     Ok(released) => {
                         tracing::debug!(released, "released abandoned state store attempts");
@@ -111,13 +125,57 @@ impl AbandonedAttemptSweeper {
         Ok(())
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&mut self) {
         self.stopping.store(true, Ordering::Release);
-        let handle = self.worker.lock().ok().and_then(|mut worker| worker.take());
-        if let Some(handle) = handle {
+        if let Some(handle) = self.worker.as_mut() {
             handle.abort();
             let _ = handle.await;
         }
+        // Cancellation before the await returns leaves the exact original
+        // handle installed, so the next borrowed wait must join it too.
+        self.worker.take();
+    }
+}
+impl AbandonedAttemptSweep {
+    /// Runs one sweep and reports how many attempts were released.
+    ///
+    /// A provider that is not ready to release yet says so without it counting
+    /// as a fault, so an ordinary sweep on a busy instance is quiet rather than
+    /// noisy.
+    pub async fn sweep_once(&self) -> Result<usize, StateStoreExecutionFailure> {
+        // The actual existing operation policy supplies this waiting view.
+        // Evidence settlement itself remains possible after the view expires.
+        let context = self
+            .original
+            .context(Instant::now() + self.policy.operation_timeout())?;
+        let mut pass = Box::pin(self.store.attempts().drain_abandoned_attempts_in(&context));
+        let mut result = None;
+        let mut started = false;
+        std::future::poll_fn(|cx| {
+            // An interrupted prior cadence may have returned its debt while
+            // its original physical receipt is still held by this Host. Finish
+            // that same inventory before starting the next serial pass.
+            if !started {
+                if !self.original.poll_progress(cx)? {
+                    return Poll::Pending;
+                }
+                started = true;
+            } else {
+                self.original.poll_progress(cx)?;
+            }
+            if result.is_none()
+                && let Poll::Ready(done) = pass.as_mut().poll(cx)
+            {
+                result = Some(done);
+            }
+            // The pass can install a Source during this very poll. A previous
+            // empty observation cannot prove that newly installed source exited.
+            match (&result, self.original.poll_progress(cx)?) {
+                (Some(_), true) => Poll::Ready(result.take().unwrap()),
+                _ => Poll::Pending,
+            }
+        })
+        .await
     }
 }
 
@@ -129,6 +187,47 @@ mod tests {
 
     use super::*;
 
+    fn fixture(
+        store: Arc<dyn StateStore>,
+    ) -> (
+        AbandonedAttemptSweeper,
+        crate::state_store::execution::StateStoreOriginalOwner,
+        novarocks_query_application::cpu::QueryBlockingExecutorOwner,
+    ) {
+        use novarocks_query_application::cpu::{
+            QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
+        };
+        let workers = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        ))
+        .unwrap();
+        let policy = StateStoreRunPolicy::default();
+        let owner = crate::state_store::execution::StateStoreOriginalOwner::instance_evidence(
+            &workers.executor(),
+            novarocks_state_store_testkit::testing::pure_memory_original_vocabulary(
+                novarocks_state_store_api::StateStoreProviderId::new("sweeper-pure-fixture"),
+            ),
+            store.attempts().scope(),
+            policy,
+        )
+        .unwrap();
+        let sweeper = AbandonedAttemptSweeper::new(store, owner.progress_handle(), policy);
+        (sweeper, owner, workers)
+    }
+    async fn closed(
+        mut owner: crate::state_store::execution::StateStoreOriginalOwner,
+        mut workers: novarocks_query_application::cpu::QueryBlockingExecutorOwner,
+    ) {
+        std::future::poll_fn(|cx| owner.poll_closed(cx))
+            .await
+            .unwrap();
+        workers
+            .shutdown_until(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn a_sweep_returns_an_abandoned_attempt_to_the_instance() {
         let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::with_limits_and_capacity(
@@ -136,7 +235,7 @@ mod tests {
             Default::default(),
             NonZeroUsize::new(1).expect("capacity"),
         ));
-        let sweeper = AbandonedAttemptSweeper::new(Arc::clone(&store));
+        let (sweeper, owner, workers) = fixture(Arc::clone(&store));
 
         // Dispatch, then lose every handle without settling: the slot stays
         // charged because the write may still be landing.
@@ -156,13 +255,104 @@ mod tests {
             .attempts()
             .reserve()
             .expect("capacity comes back once the attempt is returned");
+        drop(sweeper);
+        closed(owner, workers).await;
     }
 
     #[tokio::test]
     async fn an_idle_sweep_reports_nothing_and_changes_nothing() {
         let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new("sweeper-idle"));
-        let sweeper = AbandonedAttemptSweeper::new(Arc::clone(&store));
+        let (sweeper, owner, workers) = fixture(Arc::clone(&store));
         assert_eq!(sweeper.sweep_once().await.expect("sweep"), 0);
         assert_eq!(store.attempts().outstanding(), 0);
+        drop(sweeper);
+        closed(owner, workers).await;
+    }
+    // This gate pauses actual Tokio future destruction, not a fabricated join.
+    // Rescue releases it on assertion/error paths before runtime teardown.
+    struct JoinGate {
+        release: std::sync::Mutex<bool>,
+        condition: std::sync::Condvar,
+        entered: tokio::sync::Notify,
+        exited: tokio::sync::Notify,
+    }
+    impl JoinGate {
+        fn release(&self) {
+            *self.release.lock().unwrap() = true;
+            self.condition.notify_all();
+        }
+    }
+    struct HeldCadenceDrop(Arc<JoinGate>);
+    impl Drop for HeldCadenceDrop {
+        fn drop(&mut self) {
+            self.0.entered.notify_one();
+            let mut released = self.0.release.lock().unwrap();
+            while !*released {
+                released = self.0.condition.wait(released).unwrap();
+            }
+            self.0.exited.notify_one();
+        }
+    }
+    struct JoinRescue(Arc<JoinGate>);
+    impl Drop for JoinRescue {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_shutdown_borrow_retains_the_same_cadence_join_until_actual_drop() {
+        let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new("join-custody"));
+        let (mut sweeper, owner, workers) = fixture(store);
+        let gate = Arc::new(JoinGate {
+            release: std::sync::Mutex::new(false),
+            condition: std::sync::Condvar::new(),
+            entered: tokio::sync::Notify::new(),
+            exited: tokio::sync::Notify::new(),
+        });
+        let _rescue = JoinRescue(gate.clone());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let original = tokio::spawn({
+            let gate = gate.clone();
+            let started = started.clone();
+            async move {
+                let _actual_drop = HeldCadenceDrop(gate);
+                started.notify_one();
+                std::future::pending::<()>().await;
+            }
+        });
+        let original_id = original.id();
+        started.notified().await;
+        sweeper.worker = Some(original);
+        let mut first = Box::pin(sweeper.shutdown());
+        let early = tokio::select! {
+            _ = &mut first => true,
+            _ = gate.entered.notified() => false,
+        };
+        let pending = if early {
+            false
+        } else {
+            std::future::poll_fn(|cx| Poll::Ready(first.as_mut().poll(cx).is_pending())).await
+        };
+        drop(first);
+        let retained = sweeper.worker.as_ref().map(JoinHandle::id);
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(3), sweeper.shutdown())
+            .await
+            .expect("same original join is reborrowed and actually exits");
+        gate.exited.notified().await;
+        let completed = sweeper.worker.is_none();
+        drop(sweeper);
+        closed(owner, workers).await;
+        assert!(
+            !early,
+            "shutdown cannot report join while original task Drop is held"
+        );
+        assert!(pending);
+        assert_eq!(
+            retained,
+            Some(original_id),
+            "dropping the wait cannot detach the original task"
+        );
+        assert!(completed);
     }
 }

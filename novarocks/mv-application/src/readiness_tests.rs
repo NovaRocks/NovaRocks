@@ -942,3 +942,6 @@ async fn bounded_dependency_display_requires_ready_and_exact_installed_root_vers
         MvRepositoryErrorKind::Unavailable
     );
 }
+
+#[path = "readiness_original_tests.rs"]
+mod original;

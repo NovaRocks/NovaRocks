@@ -33,7 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
-    AuthorityMaterialSource, RefreshExecutor, RefreshPolicy, StorageAuthority, StorageAuthorityId,
+    AuthorityMaterial, AuthorityMaterialSource, RefreshExecutor, RefreshPolicy, StorageAuthority,
+    StorageAuthorityId,
 };
 use crate::{FileError, FileResult};
 
@@ -194,7 +195,8 @@ impl StorageAuthorityRegistry {
 
     /// The authority for this identity, built once and reused afterwards.
     ///
-    /// `make_source` runs only on a miss. A hit returns the authority a
+    /// `initialize` runs only on a miss. Its seed is installed before the
+    /// authority becomes visible in the registry. A hit returns the authority a
     /// previous query already built, with whatever material it currently
     /// holds — which is exactly the cross-query reuse CAD-1 D10 requires and
     /// acceptance 16 measures.
@@ -202,10 +204,10 @@ impl StorageAuthorityRegistry {
         &self,
         id: &StorageAuthorityId,
         now: Instant,
-        make_source: F,
+        initialize: F,
     ) -> Arc<StorageAuthority>
     where
-        F: FnOnce() -> Arc<dyn AuthorityMaterialSource>,
+        F: FnOnce() -> (Arc<dyn AuthorityMaterialSource>, Option<AuthorityMaterial>),
     {
         let mut inner = self.lock_inner();
         self.expire_idle(&mut inner, now);
@@ -217,12 +219,16 @@ impl StorageAuthorityRegistry {
         }
 
         self.misses.fetch_add(1, Ordering::Relaxed);
+        let (source, initial_material) = initialize();
         let authority = Arc::new(StorageAuthority::new(
             id.clone(),
-            make_source(),
+            source,
             Arc::clone(&self.executor),
             self.policy,
         ));
+        if let Some(material) = initial_material {
+            authority.install_material(material);
+        }
         #[cfg(novarocks_dev_controls)]
         if let Some(controls) = self
             .close_controls

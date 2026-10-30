@@ -26,6 +26,7 @@ use std::time::Duration;
 use reqwest::Method;
 use serde::Deserialize;
 
+use super::attempt::BindingStepError;
 use super::auth::RestAuthOwner;
 use super::binding::{SessionBinding, protocol_headers};
 use super::evidence::{BindingFailure, DispatchStage};
@@ -145,7 +146,14 @@ fn parse_lifetime(value: &str) -> Option<Duration> {
 pub(crate) async fn establish(
     owner: &RestAuthOwner,
     properties: &HashMap<String, String>,
-) -> Result<SessionBinding, BindingFailure> {
+) -> Result<SessionBinding, BindingStepError> {
+    establish_in(owner, properties, &RequestContext::for_read()).await
+}
+pub(crate) async fn establish_in(
+    owner: &RestAuthOwner,
+    properties: &HashMap<String, String>,
+    context: &RequestContext,
+) -> Result<SessionBinding, BindingStepError> {
     let mut url = reqwest::Url::parse(&format!("{}/v1/config", owner.persistent().uri()))
         .map_err(|_| BindingFailure::InvalidServerConfig)?;
     if let Some(warehouse) = properties.get("warehouse") {
@@ -156,20 +164,23 @@ pub(crate) async fn establish(
         headers.insert(name.clone(), value.clone());
     }
     owner
-        .authorize(&mut headers)
+        .authorize_in(&mut headers, context)
         .await
-        .map_err(|failure| failure.step)?;
+        .map_err(BindingStepError::from)?;
     let (stage, body) = owner
         .http()
         .send_once(
             Ok(RestRequest::new(Method::GET, url.to_string(), headers)),
             &[200],
-            &RequestContext::for_read(),
+            context,
         )
-        .await;
+        .await
+        .map_err(|original| {
+            BindingStepError::from_original(BindingFailure::ConfigFetch, original)
+        })?;
     let body = match (stage, body) {
         (DispatchStage::Status { code: 200, .. }, Some(body)) => body,
-        _ => return Err(BindingFailure::ConfigFetch),
+        _ => return Err(BindingFailure::ConfigFetch.into()),
     };
     let bytes = body
         .read_to_end()

@@ -42,7 +42,7 @@ INSERT INTO ${case_db}.sqlx2_mor_update_target VALUES (1, 'a');
 INSERT INTO ${case_db}.sqlx2_mor_update_source VALUES (1, 'x'), (1, 'y');
 
 -- query 2
--- @expect_error=MOR UPDATE matched target row: duplicate _row_id=
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 7:317)
 UPDATE ${case_db}.sqlx2_mor_update_target AS t
 SET v = s.new_v
 FROM ${case_db}.sqlx2_mor_update_source AS s

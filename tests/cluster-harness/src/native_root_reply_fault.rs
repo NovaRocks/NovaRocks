@@ -2117,23 +2117,45 @@ async fn recover_covered_status_cancel(
     inbound: &mut RecvStream,
     core: &Core,
 ) -> bool {
-    if class != StreamClass::CoveredStatusSubscription
-        || failure
-            .downcast_ref::<CapacityClosed>()
-            .is_none_or(|closed| closed.stream != inbound.stream_id().as_u32())
-    {
+    let Some(closed) = failure
+        .downcast_ref::<CapacityClosed>()
+        .filter(|closed| closed.stream == inbound.stream_id().as_u32())
+    else {
+        return false;
+    };
+    if class != StreamClass::CoveredStatusSubscription {
         return false;
     }
     // One nonblocking poll, using the same request stream after its EOF/trailers.
     // No diagnostic write, additional IO wait, retry or synthesized H2 error.
     let observed = poll_fn(|cx| std::task::Poll::Ready(inbound.poll_data(cx))).await;
-    let std::task::Poll::Ready(Some(Err(error))) = observed else {
-        return false;
+    let digest = match observed {
+        // A reset received before the request reached END_STREAM stays typed on
+        // the inbound half.
+        std::task::Poll::Ready(Some(Err(error))) => {
+            if !(error.is_reset()
+                && error.is_remote()
+                && error.reason() == Some(h2::Reason::CANCEL))
+            {
+                return false;
+            }
+            digest_display("covered-status-subscription-remote-cancel", &error)
+        }
+        // h2 0.4.16+ keeps a reset received after END_STREAM for the send half
+        // only, so the inbound half reports a clean EOF. This actor never resets a
+        // forwarded stream with CANCEL, so an output-side CANCEL is the peer's.
+        // The public h2 API cannot separate it from a GOAWAY carrying CANCEL.
+        std::task::Poll::Ready(None) => {
+            if !matches!(
+                closed.reset,
+                CapacityResetObservation::Reason(reason) if reason == u32::from(h2::Reason::CANCEL)
+            ) {
+                return false;
+            }
+            digest_display("covered-status-subscription-remote-cancel", closed)
+        }
+        _ => return false,
     };
-    if !(error.is_reset() && error.is_remote() && error.reason() == Some(h2::Reason::CANCEL)) {
-        return false;
-    }
-    let digest = digest_display("covered-status-subscription-remote-cancel", &error);
     let mut state = core.state.lock().expect("root fault state lock");
     state.status_subscription_peer_cancels =
         state.status_subscription_peer_cancels.saturating_add(1);
@@ -2464,8 +2486,8 @@ async fn send_bytes(output: &mut SendStream<Bytes>, mut bytes: Bytes) -> Result<
             match poll_fn(|cx| output.poll_capacity(cx)).await {
                 Some(capacity) => capacity?,
                 None => {
-                    // This output-side Reason remains diagnostic only. The
-                    // original inbound must supply an actual remote typed reset.
+                    // Recovery consumes this output-side Reason only after the
+                    // original inbound reached a clean END_STREAM.
                     let reset = poll_fn(|cx| std::task::Poll::Ready(output.poll_reset(cx))).await;
                     return Err(CapacityClosed {
                         stream: output.stream_id().as_u32(),
@@ -3758,7 +3780,7 @@ mod tests {
         assert_actual_transparent_response(
             |expected| {
                 Ok(novarocks_task_codec::root_result::encode_response(
-                    &RootReadResponse::Refused(RootReadRefusal::for_request(
+                    &RootReadResponse::Refused(Box::new(RootReadRefusal::for_request(
                         expected,
                         FailureFact::new(
                             FailureClass::Data,
@@ -3768,7 +3790,7 @@ mod tests {
                             ),
                         ),
                         SafeDetail::truncating("component root read domain refusal"),
-                    )),
+                    ))),
                 )?)
             },
             false,

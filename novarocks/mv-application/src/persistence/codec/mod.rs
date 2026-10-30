@@ -82,6 +82,35 @@ pub enum PersistenceCodecError {
     ProtobufDecode(prost::DecodeError),
 }
 
+/// These reasons belong to the persistence codec, not a repository or compiler.
+pub mod failure_reason {
+    use std::num::NonZeroU16;
+    pub const RESOURCE_BUDGET: NonZeroU16 = NonZeroU16::new(930).unwrap();
+    pub const MALFORMED_WIRE: NonZeroU16 = NonZeroU16::new(931).unwrap();
+    pub const UNKNOWN_FORMAT: NonZeroU16 = NonZeroU16::new(932).unwrap();
+    pub const MISSING_FIELD: NonZeroU16 = NonZeroU16::new(933).unwrap();
+    pub const UNKNOWN_ENUM: NonZeroU16 = NonZeroU16::new(934).unwrap();
+    pub const INVALID_IDENTITY: NonZeroU16 = NonZeroU16::new(935).unwrap();
+    pub const INVALID_DOCUMENT: NonZeroU16 = NonZeroU16::new(936).unwrap();
+    pub const PROTOBUF_DECODE: NonZeroU16 = NonZeroU16::new(937).unwrap();
+}
+impl novarocks_failure_contract::FailureProjection for PersistenceCodecError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass as C, FailureFact, FailureReason, domain};
+        let (class, reason) = match self {
+            Self::ResourceBudget { .. } => (C::Resource, failure_reason::RESOURCE_BUDGET),
+            Self::MalformedWire(_) => (C::Data, failure_reason::MALFORMED_WIRE),
+            Self::UnknownFormatVersion { .. } => (C::Unsupported, failure_reason::UNKNOWN_FORMAT),
+            Self::MissingField(_) => (C::Data, failure_reason::MISSING_FIELD),
+            Self::UnknownEnum { .. } => (C::Data, failure_reason::UNKNOWN_ENUM),
+            Self::InvalidIdentity(_) => (C::Data, failure_reason::INVALID_IDENTITY),
+            Self::InvalidDocument(_) => (C::Data, failure_reason::INVALID_DOCUMENT),
+            Self::ProtobufDecode(_) => (C::Data, failure_reason::PROTOBUF_DECODE),
+        };
+        FailureFact::new(class, FailureReason::new(domain::METADATA, reason))
+    }
+}
+
 impl std::fmt::Display for PersistenceCodecError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

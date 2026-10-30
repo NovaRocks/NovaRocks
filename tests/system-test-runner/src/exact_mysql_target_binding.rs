@@ -38,7 +38,7 @@ pub(crate) struct OriginalTargetBinding {
     pub(crate) connection_id: u32,
     pub(crate) connection_generation: u64,
     pub(crate) session_connection_id: u32,
-    pub(crate) session_epoch: u64,
+    pub(crate) session_key: u64,
     pub(crate) statement_generation: u64,
     pub(crate) sql_sha256: [u8; 32],
 }
@@ -48,7 +48,7 @@ struct RawBound {
     connection_id: u32,
     connection_generation: u64,
     session_connection_id: u32,
-    session_epoch: u64,
+    session_key: u64,
     statement_generation: u64,
     sql_sha256: [u8; 32],
 }
@@ -134,7 +134,7 @@ fn parse_bound(line: &[u8]) -> Result<RawBound> {
     let connection_generation = number(&mut rest, b"connection_generation=", u64::MAX)?;
     let session_connection_id =
         number(&mut rest, b"session_connection_id=", u64::from(u32::MAX))? as u32;
-    let session_epoch = number(&mut rest, b"session_epoch=", u64::MAX)?;
+    let session_key = number(&mut rest, b"session_key=", u64::MAX)?;
     let statement_generation = number(&mut rest, b"statement_generation=", u64::MAX)?;
     let digest = rest
         .strip_prefix(b"sql_sha256=")
@@ -155,7 +155,7 @@ fn parse_bound(line: &[u8]) -> Result<RawBound> {
         connection_id,
         connection_generation,
         session_connection_id,
-        session_epoch,
+        session_key,
         statement_generation,
         sql_sha256,
     })
@@ -311,7 +311,7 @@ pub(crate) fn scan(
         connection_id: bound.connection_id,
         connection_generation: bound.connection_generation,
         session_connection_id: bound.session_connection_id,
-        session_epoch: bound.session_epoch,
+        session_key: bound.session_key,
         statement_generation: bound.statement_generation,
         sql_sha256: bound.sql_sha256,
     })

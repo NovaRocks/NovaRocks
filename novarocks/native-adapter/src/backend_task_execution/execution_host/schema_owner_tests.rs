@@ -232,8 +232,8 @@ fn candidate_selected_schema_keeps_only_its_fields_after_namespace_and_main_exit
     let shape = selected.shape().clone();
     assert_eq!(shape.schema().fields().len(), 1);
     assert_eq!(shape.schema().fields()[0].name(), "source_shape_0");
-    assert_eq!(shape.schema().metadata().capacity(), 0);
-    assert_eq!(shape.schema().fields()[0].metadata().capacity(), 0);
+    assert!(shape.schema().metadata().as_arc().is_none());
+    assert!(shape.schema().fields()[0].metadata().as_arc().is_none());
     assert!(tracker.current() > 0);
     assert_eq!(
         tracker.current(),

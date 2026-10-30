@@ -17,69 +17,11 @@
 
 //! Iceberg materialized-view metadata statement dispatch.
 
-use std::sync::Arc;
-
-use crate::mv::domain::application::{
-    MvAlterAction, MvAlterStatement, MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement,
-    MvShowStatement,
-};
-use crate::mv::domain::iceberg_backend::IcebergMvBackend;
-use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use crate::mv::domain::lifecycle::ListMvsRequest;
-use crate::mv::domain::model::MvStorageEngine;
-use crate::mv::domain::readiness::MvReadinessPort;
-use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
+use crate::mv::domain::application::{MvAlterAction, MvCreateRefreshPolicy};
 use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
 use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
-use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_parser::ast::Visit;
-use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
-use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_types::naming::normalize_identifier;
-
-fn default_mv_storage_engine() -> &'static str {
-    "iceberg"
-}
-
-fn storage_engine_for_create(stmt: &MvCreateStatement) -> Result<MvStorageEngine, String> {
-    let configured = stmt
-        .properties
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case("storage_engine"))
-        .map(|(_, value)| value.clone());
-    let raw = match configured.as_deref() {
-        Some(value) => value.trim(),
-        None => default_mv_storage_engine(),
-    };
-    match raw.to_ascii_lowercase().as_str() {
-        "iceberg" => Ok(MvStorageEngine::Iceberg),
-        "starrocks" => Err(
-            "storage_engine='starrocks' is no longer supported for standalone materialized views; use storage_engine='iceberg'"
-                .to_string(),
-        ),
-        _ => Err(format!(
-            "unknown materialized view storage_engine `{raw}`"
-        )),
-    }
-}
-
-fn existing_mv_storage_engine_by_target(
-    readiness: &MvReadinessPort,
-    target: &IcebergMvTarget,
-) -> Result<Option<MvStorageEngine>, String> {
-    let Some(_projection) = readiness
-        .load_ready(&MvTarget {
-            catalog: Some(target.catalog.clone()),
-            database: target.namespace.clone(),
-            name: target.table.clone(),
-        })
-        .map_err(|e| format!("load MV definition by target failed: {e}"))?
-    else {
-        return Ok(None);
-    };
-    // The product currently admits only Iceberg MV document projections.
-    Ok(Some(MvStorageEngine::Iceberg))
-}
 
 fn stored_refresh_policy(policy: &MvCreateRefreshPolicy) -> (MvDesiredRefreshPolicy, Option<i64>) {
     match policy {
@@ -131,204 +73,26 @@ pub(crate) fn initial_refresh_configuration_for_create(
     }
 }
 
-fn load_definition_for_alter(
-    readiness: &MvReadinessPort,
-    current_catalog: Option<&str>,
-    db: &str,
-    name_parts: &[String],
-) -> Result<StoredKeyedMvProjection, String> {
-    let target = resolve_refresh_target(current_catalog, db, name_parts)?;
-    let Some(definition) = readiness
-        .load_ready(&MvTarget {
-            catalog: Some(target.catalog.clone()),
-            database: target.namespace.clone(),
-            name: target.table.clone(),
-        })
-        .map_err(|e| format!("load MV definition by target failed: {e}"))?
-    else {
-        return Err(format!(
-            "materialized view does not exist: {}.{}.{}",
-            target.catalog, target.namespace, target.table
-        ));
-    };
-    Ok(definition.projection)
-}
-
-/// Create an MV from the explicit MV ports composed by the frontend.
-///
-/// The SQL surface admits only Iceberg-backed MVs, so this uses the single
-/// injected backend rather than a string-keyed connector registry lookup.
-pub fn create_mv_with_ports(
-    ports: &IcebergMvCorePorts,
-    service: &crate::mv::FrontendMvProductAdapter,
-    current_catalog: Option<&str>,
-    db: &str,
-    stmt: &MvCreateStatement,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
-    crate::connector::validate_request_context(connector_context)?;
-    if storage_engine_for_create(stmt)? != MvStorageEngine::Iceberg {
-        return Err("materialized view backend must be Iceberg"
-            .to_string()
-            .into());
-    }
-    let engine = crate::mv::domain::iceberg_refresh::IcebergMvCreateProviderAdapter::new_with_ports(
-        ports.clone(),
-        connector_context.clone(),
-    );
-    service
-        .execute_create(
-            &engine,
-            stmt,
-            crate::mv::domain::application::MvRequestContext {
-                current_catalog,
-                current_database: db,
-            },
-        )
-        .map_err(|error| match error.compile_control_error() {
-            Some(control) => control.into(),
-            None => novarocks_sql::compiler::SqlCompileError::Compilation(error.to_string()),
-        })?;
-    Ok(StatementResult::Ok)
-}
-
-/// Drop an MV through the readiness-aware Accelerator view and the injected
-/// MV backend.
-pub fn drop_mv_with_ports(
-    product: &novarocks_mv_application::service::MvKeyedProductService,
-    ports: &IcebergMvCorePorts,
-    current_catalog: Option<&str>,
-    db: &str,
-    stmt: &MvDropStatement,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    crate::connector::validate_request_context(connector_context)?;
-    crate::mv::domain::iceberg_refresh::drop_iceberg_mv_with_product(
-        product,
-        ports,
-        current_catalog,
-        db,
-        stmt,
-        connector_context,
-    )
-}
-
-/// Alter Iceberg MV metadata through the explicit frontend-composed MV ports.
-/// Repartition remains a request-frozen frontend refresh operation and is
-/// deliberately rejected here so its lifecycle cannot fall back to a generic
-/// command route.
-pub fn alter_mv_with_ports(
-    ports: &IcebergMvCorePorts,
-    current_catalog: Option<&str>,
-    db: &str,
-    stmt: &MvAlterStatement,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    crate::connector::validate_request_context(connector_context)?;
-    if matches!(stmt.action, MvAlterAction::Repartition(_)) {
-        return Err(
-            "ALTER MATERIALIZED VIEW ... REPARTITION requires the frontend MV lifecycle"
-                .to_string(),
-        );
-    }
-    if matches!(stmt.action, MvAlterAction::SetProperties(_)) {
-        let current_catalog = current_catalog.ok_or_else(|| {
-            "ALTER MATERIALIZED VIEW requires current Iceberg catalog".to_string()
-        })?;
-        let target = resolve_refresh_target(Some(current_catalog), db, &stmt.name_parts)?;
-        let engine = existing_mv_storage_engine_by_target(ports.readiness().as_ref(), &target)?
-            .ok_or_else(|| {
-                format!(
-                    "materialized view {}.{}.{} not found",
-                    target.catalog, target.namespace, target.table
-                )
-            })?;
-        if engine != MvStorageEngine::Iceberg {
-            return Err(
-                "ALTER MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
-                    .to_string(),
-            );
+/// The pure configuration transition used by original control preparation.
+pub(crate) fn configuration_after_alter(
+    configuration: &ConfigurationDocument,
+    action: &MvAlterAction,
+) -> Result<novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration, String>
+{
+    let current = desired_refresh_configuration(configuration)
+        .map_err(|error| format!("stored Iceberg MV refresh configuration is invalid: {error}"))?;
+    match action {
+        MvAlterAction::SetRefresh(policy) => {
+            let (policy, interval_ms) = stored_refresh_policy(policy);
+            current.with_policy(policy, interval_ms)
         }
-        let MvAlterAction::SetProperties(entries) = &stmt.action else {
-            unreachable!("properties branch was checked above")
-        };
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| error.to_string())?;
-        crate::connector::mutation::execute_catalog_mutation(
-            ports.connector_control(),
-            &instance_id,
-            novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
-                table: novarocks_spi::connector::ConnectorTableIdentity {
-                    instance_id: instance_id.clone(),
-                    namespace: Arc::from(target.namespace.as_str()),
-                    table: Arc::from(target.table.as_str()),
-                },
-                changes: entries
-                    .iter()
-                    .map(
-                        |(key, value)| novarocks_spi::connector::ConnectorPropertyChange::Set {
-                            key: Arc::from(key.as_str()),
-                            value: Arc::from(value.as_str()),
-                        },
-                    )
-                    .collect(),
-                authority: novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
-                expected_committed_partitioning: None,
-            },
-            connector_context.clone(),
-        )?;
-        crate::mv::domain::iceberg_refresh::reobserve_configured_iceberg_mv_with_ports(
-            ports,
-            &target,
-            connector_context.clone(),
-        )
-        .map_err(|error| format!("reobserve Iceberg MV after property update failed: {error}"))?;
-        return Ok(StatementResult::Ok);
+        MvAlterAction::PauseRefresh => current.with_paused(true),
+        MvAlterAction::ResumeRefresh => current.with_paused(false),
+        MvAlterAction::Repartition(_) | MvAlterAction::SetProperties(_) => {
+            unreachable!("repartition and properties returned before metadata update")
+        }
     }
-    let definition = load_definition_for_alter(
-        ports.readiness().as_ref(),
-        current_catalog,
-        db,
-        &stmt.name_parts,
-    )?;
-    crate::mv::domain::iceberg_refresh::update_iceberg_mv_configuration_with_ports(
-        ports,
-        &definition,
-        |configuration| {
-            let current = desired_refresh_configuration(configuration).map_err(|error| {
-                format!("stored Iceberg MV refresh configuration is invalid: {error}")
-            })?;
-            match &stmt.action {
-                MvAlterAction::SetRefresh(policy) => {
-                    let (policy, interval_ms) = stored_refresh_policy(policy);
-                    current.with_policy(policy, interval_ms)
-                }
-                MvAlterAction::PauseRefresh => current.with_paused(true),
-                MvAlterAction::ResumeRefresh => current.with_paused(false),
-                MvAlterAction::Repartition(_) | MvAlterAction::SetProperties(_) => {
-                    unreachable!("repartition and properties returned before metadata update")
-                }
-            }
-            .map_err(|error| format!("invalid Iceberg MV refresh transition: {error}"))
-        },
-        connector_context,
-    )
-    .map_err(|error| format!("update Iceberg MV refresh configuration failed: {error}"))?;
-    Ok(StatementResult::Ok)
-}
-
-/// List MVs through the injected backend, with no registry lookup. Sorting is
-/// retained here because it is part of the SQL presentation contract.
-pub fn list_mvs_with_backend(
-    mv_backend: &IcebergMvBackend,
-    current_catalog: Option<&str>,
-    stmt: &MvShowStatement,
-) -> Result<StatementResult, String> {
-    let req = ListMvsRequest {
-        stmt: stmt.clone(),
-        current_catalog: current_catalog.map(str::to_string),
-    };
-    Ok(StatementResult::Query(mv_backend.list_mvs(req)?))
+    .map_err(|error| format!("invalid Iceberg MV refresh transition: {error}"))
 }
 
 /// Analyze the output column types of a MV SELECT SQL without executing it.

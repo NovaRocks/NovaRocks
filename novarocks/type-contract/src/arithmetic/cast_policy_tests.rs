@@ -233,8 +233,13 @@ fn observed_cast_policy_preserves_arrow_dictionary_compatibility_and_metadata_re
     );
     let retag = |tag: &str| {
         DataType::List(Arc::new(
-            Field::new("item", DataType::Utf8, true)
-                .with_metadata([(crate::NR_LOGICAL_TYPE_KEY.into(), tag.into())].into()),
+            Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                crate::NR_LOGICAL_TYPE_KEY.into(),
+                tag.into(),
+            )])),
         ))
     };
     let plain = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
@@ -254,8 +259,13 @@ fn observed_cast_policy_preserves_arrow_dictionary_compatibility_and_metadata_re
 #[test]
 fn observed_cast_policy_keeps_output_null_early_return_and_reports_invalid_report_error_types() {
     let invalid = DataType::List(Arc::new(
-        Field::new("v", DataType::Utf8, true)
-            .with_metadata([(crate::NR_LOGICAL_TYPE_KEY.into(), "unknown".into())].into()),
+        Field::new("v", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+            String,
+            String,
+        >::from([(
+            crate::NR_LOGICAL_TYPE_KEY.into(),
+            "unknown".into(),
+        )])),
     ));
     let mut observations = 0;
     assert_eq!(
@@ -366,7 +376,10 @@ fn observed_cast_policy_wide_first_and_late_changes_preserve_all_control_callbac
                         true,
                     );
                     if n % 37 == 0 {
-                        field.with_metadata([("provider.id".into(), n.to_string())].into())
+                        field.with_metadata(std::collections::HashMap::<String, String>::from([(
+                            "provider.id".into(),
+                            n.to_string(),
+                        )]))
                     } else {
                         field
                     }

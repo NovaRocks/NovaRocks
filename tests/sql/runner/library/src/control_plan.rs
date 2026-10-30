@@ -45,6 +45,7 @@ pub(crate) struct SqlControlExecution {
     pub deadline: Instant,
     pub has_restarts: bool,
     pub steps: BTreeMap<(String, String, usize), StepControl>,
+    pub step_role_launches: BTreeMap<(String, String, usize), Vec<(RoleSlot, RoleLaunchReference)>>,
     #[cfg(test)]
     planned_launches: Vec<PlannedLaunchInspection>,
 }
@@ -493,6 +494,7 @@ pub(crate) fn build(
                         .is_some()
             }),
         steps: BTreeMap::new(),
+        step_role_launches: BTreeMap::new(),
         #[cfg(test)]
         planned_launches: Vec::new(),
     };
@@ -541,10 +543,20 @@ pub(crate) fn build(
                     *next = next
                         .checked_add(1)
                         .context("pre-query role generation overflow")?;
+                    let reference = plan.reserve_launch(role)?;
+                    execution
+                        .step_role_launches
+                        .entry((
+                            input.suite_name.clone(),
+                            case.case_id.clone(),
+                            step.query_number,
+                        ))
+                        .or_default()
+                        .push((role, reference.clone()));
                     refs.insert(
                         (role, *next),
                         Launch {
-                            reference: plan.reserve_launch(role)?,
+                            reference,
                             grants: vec![],
                         },
                     );
@@ -735,10 +747,20 @@ pub(crate) fn build(
                     );
                     let next = generation.get_mut(&role).context("unknown restart role")?;
                     *next = next.checked_add(1).context("role generation overflow")?;
+                    let reference = plan.reserve_launch(role)?;
+                    execution
+                        .step_role_launches
+                        .entry((
+                            input.suite_name.clone(),
+                            case.case_id.clone(),
+                            step.query_number,
+                        ))
+                        .or_default()
+                        .push((role, reference.clone()));
                     refs.insert(
                         (role, *next),
                         Launch {
-                            reference: plan.reserve_launch(role)?,
+                            reference,
                             grants: vec![],
                         },
                     );
@@ -1076,7 +1098,6 @@ mod tests {
             "SELECT 1",
             QueryMeta {
                 query_lifecycle_structured_assertion: Some(QueryLifecycleStructuredAssertion {
-                    error_source: None,
                     runtime_filter_availability: None,
                     runtime_filter_details: vec![],
                     runtime_filter_totals_at_least: vec![],
@@ -1469,5 +1490,95 @@ mod tests {
                 .to_string()
                 .contains("requires a selected Native observation marker")
         );
+    }
+    #[test]
+    fn post_step_restart_references_keep_their_original_case_and_step() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut input = inputs(vec![step(
+            4,
+            "CALL ice.system.novarocks_imv_stateless_rebuild(table => 'db.mv', level => 'package')",
+            QueryMeta {
+                tags: vec![crate::parser::MV_DOCUMENT_OBSERVATION_TAG.into()],
+                restart_fe_after_step: true,
+                ..Default::default()
+            },
+        )]);
+        input[0].cases[0].case_id = "a".into();
+        let mut b = input[0].cases[0].clone();
+        b.case_id = "b".into();
+        b.steps[0].query_number = 7;
+        input[0].cases.push(b);
+        let (_, execution) = plan(&input, file.path()).unwrap();
+        let a = &execution.step_role_launches[&("selected".into(), "a".into(), 4)][0].1;
+        let b = &execution.step_role_launches[&("selected".into(), "b".into(), 7)][0].1;
+        assert!(
+            execution
+                .step_role_launches
+                .values()
+                .all(|launches| { launches.len() == 1 && launches[0].0 == RoleSlot::Frontend })
+        );
+        assert_ne!(a.session_id, b.session_id);
+        assert_ne!(a.process_receipt, b.process_receipt);
+        assert_eq!(execution.step_role_launches.len(), 2);
+        for (generation, reference) in [(1, a), (2, b)] {
+            let original = execution
+                .planned_launches
+                .iter()
+                .find(|launch| launch.role == RoleSlot::Frontend && launch.generation == generation)
+                .unwrap();
+            assert_eq!(reference.session_id, original.reference.session_id);
+            assert_eq!(
+                reference.process_receipt,
+                original.reference.process_receipt
+            );
+        }
+    }
+    #[test]
+    fn same_step_post_role_references_preserve_backend_and_frontend_originals() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut input = inputs(vec![step(
+            4,
+            "SELECT 1",
+            QueryMeta {
+                kill_be_index: Some(1),
+                restart_be_delay_ms: Some(0),
+                restart_fe_after_step: true,
+                restart_be_after_establish_context_index: Some(1),
+                ..Default::default()
+            },
+        )]);
+        input[0].cases[0].case_id = "a".into();
+        let mut b = input[0].cases[0].clone();
+        b.case_id = "b".into();
+        b.steps[0].query_number = 7;
+        input[0].cases.push(b);
+        let (_, execution) = plan(&input, file.path()).unwrap();
+        assert_eq!(execution.step_role_launches.len(), 2);
+        let mut all_references = BTreeSet::new();
+        for (case, query, fe_generation, be_first_generation) in [("a", 4, 1, 1), ("b", 7, 2, 3)] {
+            let launches = &execution.step_role_launches[&("selected".into(), case.into(), query)];
+            assert_eq!(launches.len(), 3);
+            let expected = [
+                (RoleSlot::Backend(1), be_first_generation),
+                (RoleSlot::Frontend, fe_generation),
+                (RoleSlot::Backend(1), be_first_generation + 1),
+            ];
+            for ((role, reference), (expected_role, generation)) in launches.iter().zip(expected) {
+                assert_eq!(*role, expected_role);
+                let original = execution
+                    .planned_launches
+                    .iter()
+                    .find(|launch| launch.role == *role && launch.generation == generation)
+                    .unwrap();
+                assert_eq!(reference.session_id, original.reference.session_id);
+                assert_eq!(
+                    reference.process_receipt,
+                    original.reference.process_receipt
+                );
+                assert!(all_references.insert(reference.session_id.as_str()));
+                assert_ne!(generation, 0, "initial startup is not a step reservation");
+            }
+        }
+        assert_eq!(all_references.len(), 6);
     }
 }

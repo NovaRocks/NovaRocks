@@ -270,7 +270,19 @@ fn a_coordinator_and_an_execution_node_never_share_one_authority() {
     let coordinator = StorageAuthorityId::new(
         owner.clone(),
         scope.clone(),
-        AuthorityCapabilityPath::InProcessProvider,
+        AuthorityCapabilityPath::InProcessProvider(
+            novarocks_spi::connector::VendedS3InProcessAcquisitionIdentity::try_new(
+                novarocks_spi::connector::CredentialAcquisitionOwnerId::new(),
+                Some(
+                    novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint(routing(
+                        "https://catalog/credentials",
+                        &[],
+                    )),
+                ),
+                vec![scope.clone()],
+            )
+            .unwrap(),
+        ),
     );
     let executor = StorageAuthorityId::new(
         owner,
@@ -918,7 +930,7 @@ fn a_seeded_authority_has_no_refreshing_principal() {
     let id = StorageAuthorityId::new(
         catalog("lake"),
         prefix("s3://warehouse/sales/orders/"),
-        AuthorityCapabilityPath::SeededWithoutRenewal,
+        AuthorityCapabilityPath::SeededWithoutRenewal { grant: None },
     );
 
     assert!(id.principal().is_none());
@@ -935,7 +947,7 @@ fn a_seeded_authority_without_renewal_serves_material_then_refuses() {
     let id = StorageAuthorityId::new(
         catalog("lake"),
         prefix("s3://warehouse/sales/orders/"),
-        AuthorityCapabilityPath::SeededWithoutRenewal,
+        AuthorityCapabilityPath::SeededWithoutRenewal { grant: None },
     );
     let fixture = fixture_with(id, vec![], policy());
     fixture
@@ -979,8 +991,8 @@ fn registry() -> (StorageAuthorityRegistry, Arc<QueuedExecutor>) {
     (registry, executor)
 }
 
-fn empty_source() -> Arc<dyn AuthorityMaterialSource> {
-    Arc::new(ScriptedSource::new(vec![])) as Arc<dyn AuthorityMaterialSource>
+fn empty_source() -> (Arc<dyn AuthorityMaterialSource>, Option<AuthorityMaterial>) {
+    (Arc::new(ScriptedSource::new(vec![])), None)
 }
 
 #[test]
@@ -1225,7 +1237,7 @@ fn a_short_lived_credential_is_usable_the_instant_it_arrives() {
         StorageAuthorityId::new(
             catalog("lake"),
             prefix("s3://warehouse/sales/orders/"),
-            AuthorityCapabilityPath::SeededWithoutRenewal,
+            AuthorityCapabilityPath::SeededWithoutRenewal { grant: None },
         ),
         vec![],
         policy(),
@@ -1873,4 +1885,149 @@ fn ordinary_file_failures_do_not_acquire_an_authority_reason() {
         let fact = ConnectorError::from(error).failure_fact();
         assert_eq!((fact.reason().domain(), fact.reason().code()), (4, code));
     }
+}
+
+#[test]
+fn registry_hit_preserves_material_acquired_after_original_seed() {
+    let now = Instant::now();
+    let (registry, executor) = registry();
+    let id = identity("https://catalog/credentials");
+    let source = Arc::new(ScriptedSource::new(vec![Ok(renewed_material(
+        now + Duration::from_secs(3600),
+    ))]));
+    let authority = registry.authority(&id, now, || {
+        (
+            Arc::clone(&source) as Arc<dyn AuthorityMaterialSource>,
+            Some(material(now + Duration::from_secs(60))),
+        )
+    });
+    let handle = runtime();
+    let inside_window = now + Duration::from_secs(50);
+    let original = handle
+        .block_on(
+            authority.material_for_request(inside_window, inside_window + Duration::from_secs(10)),
+        )
+        .expect("the seed was installed before registry publication");
+    assert_eq!(original.access_key_id().expose_secret(), "ak");
+    assert_eq!(executor.pending(), 1);
+    assert!(
+        executor.run_one(),
+        "run the original authority's actual renewal"
+    );
+    assert_eq!(source.calls(), 1);
+    let resident = registry.authority(&id, inside_window, || {
+        panic!("a resident authority must not recreate its source or reinstall an old seed")
+    });
+    assert!(Arc::ptr_eq(&authority, &resident));
+    let renewed = handle
+        .block_on(
+            resident.material_for_request(inside_window, inside_window + Duration::from_secs(10)),
+        )
+        .unwrap();
+    assert_eq!(renewed.access_key_id().expose_secret(), "renewed-ak");
+    assert_eq!(executor.pending(), 0);
+    assert_eq!(resident.metrics().refreshes_applied, 1);
+}
+
+#[test]
+fn seed_grant_copies_reuse_but_new_authorization_does_not_reuse_expired_authority() {
+    let now = Instant::now();
+    let (registry, executor) = registry();
+    let original_grant = novarocks_spi::connector::VendedS3SeedGrantId::new();
+    let key = |grant| {
+        StorageAuthorityId::new(
+            catalog("lake"),
+            prefix("s3://warehouse/sales/orders/"),
+            AuthorityCapabilityPath::SeededWithoutRenewal { grant: Some(grant) },
+        )
+    };
+    let original = registry.authority(&key(original_grant), now, || {
+        let (source, _) = empty_source();
+        (source, Some(material(now + Duration::from_secs(60))))
+    });
+    let copied_grant = original_grant;
+    let later = now + Duration::from_secs(90);
+    let same = registry.authority(&key(copied_grant), later, || {
+        panic!("copying the same original seed identity cannot install another seed")
+    });
+    assert!(Arc::ptr_eq(&same, &original));
+    let expired = runtime()
+        .block_on(same.material_for_request(later, later + Duration::from_secs(1)))
+        .expect_err("the original unrenewable grant is expired");
+    assert_eq!(expired.kind(), FileErrorKind::Permission);
+    let new_grant = novarocks_spi::connector::VendedS3SeedGrantId::new();
+    assert_ne!(new_grant, original_grant);
+    let next = registry.authority(&key(new_grant), later, || {
+        let (source, _) = empty_source();
+        (
+            source,
+            Some(renewed_material(later + Duration::from_secs(3600))),
+        )
+    });
+    assert!(!Arc::ptr_eq(&original, &next));
+    let usable = runtime()
+        .block_on(next.material_for_request(later, later + Duration::from_secs(1)))
+        .expect("the new grant has its own initial material");
+    assert_eq!(usable.access_key_id().expose_secret(), "renewed-ak");
+    assert_eq!(
+        executor.accepted(),
+        0,
+        "neither seed-only authority may acquire"
+    );
+}
+
+#[test]
+fn original_acquisition_owner_path_and_full_scope_are_all_registry_key_facts() {
+    use novarocks_spi::connector::{
+        CredentialAcquisitionOwnerId, CredentialRenewalPath, VendedS3InProcessAcquisitionIdentity,
+    };
+    let owner = CredentialAcquisitionOwnerId::new();
+    let other_owner = CredentialAcquisitionOwnerId::new();
+    let a = prefix("s3://warehouse/a/");
+    let b = prefix("s3://warehouse/b/");
+    let original_path = CredentialRenewalPath::CredentialsEndpoint(routing(
+        "https://catalog/credentials",
+        &[("x-tenant", "a")],
+    ));
+    let other_path = CredentialRenewalPath::CredentialsEndpoint(routing(
+        "https://catalog/credentials",
+        &[("x-tenant", "b")],
+    ));
+    let key = |owner, path, prefixes| {
+        StorageAuthorityId::new(
+            catalog("lake"),
+            a.clone(),
+            AuthorityCapabilityPath::InProcessProvider(
+                VendedS3InProcessAcquisitionIdentity::try_new(owner, Some(path), prefixes).unwrap(),
+            ),
+        )
+    };
+    let original_key = key(owner, original_path.clone(), vec![a.clone(), b.clone()]);
+    let (registry, _) = registry();
+    let now = Instant::now();
+    let original = registry.authority(&original_key, now, empty_source);
+    let same = registry.authority(
+        &key(owner, original_path.clone(), vec![b.clone(), a.clone()]),
+        now,
+        || panic!("the same owner/path/scope reuses its original resident source"),
+    );
+    assert!(Arc::ptr_eq(&original, &same));
+    for distinct in [
+        key(
+            other_owner,
+            original_path.clone(),
+            vec![a.clone(), b.clone()],
+        ),
+        key(owner, other_path, vec![a.clone(), b]),
+        key(owner, original_path, vec![a.clone()]),
+    ] {
+        let independent = registry.authority(&distinct, now, empty_source);
+        assert!(!Arc::ptr_eq(&original, &independent));
+        #[cfg(novarocks_dev_controls)]
+        assert_ne!(
+            super::debug_close::control_key(&original_key),
+            super::debug_close::control_key(&distinct)
+        );
+    }
+    assert_eq!(registry.metrics().resident, 4);
 }

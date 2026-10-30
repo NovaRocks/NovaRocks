@@ -127,71 +127,168 @@ pub(crate) fn downstream_floor(
     }
 }
 
-/// Read one MV storage table's maintenance facts through the neutral surface.
-/// `projections` is the full ready MV list from the same pass, used for the
-/// downstream floor.
-///
-/// The compaction observation runs first on purpose. Answering it forces the
-/// provider to discard its cached table and re-read the catalog, and the
-/// provider repopulates that cache with what it read, so the metadata load
-/// below observes the very table version the count was taken from. Reversing
-/// the two would let the projected facts describe an older table than the
-/// count, and would drop the forced refresh this pass has always performed.
-/// Read one MV storage table's maintenance facts through explicit frontend
-/// control and observation ports. Background policy must retain only these
-/// leaves, never the aggregate standalone engine state.
-pub fn collect_table_stats_with_ports(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
-    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+/// Stable fields of one actual cadence observation. Capture owns its Provider
+/// loader/CPU/footer before any foreign poll; the observation owns the same
+/// generation's compaction F, including after a borrowed wait disappears.
+pub(crate) struct OriginalMaintenanceFacts {
+    capture: Arc<super::super::staged_create::CurrentMetadataCapture>,
+    lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    table: ConnectorTableIdentity,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    first_metadata: Option<novarocks_spi::connector::ConnectorTableObjectBinding>,
+    observation: Option<novarocks_spi::connector::ConnectorMaxCompactableDataFilesExecution>,
+    compactable: Option<Result<Option<u64>, novarocks_spi::connector::ConnectorError>>,
+    observation_closed: bool,
+    current_metadata: Option<novarocks_spi::connector::ConnectorTableObjectBinding>,
+    raw: Option<Result<TableMaintenanceStats, crate::mv::domain::application::MvApplicationError>>,
+}
+impl OriginalMaintenanceFacts {
+    pub(crate) fn try_new(
+        controls: &dyn novarocks_spi::connector::ConnectorControlRegistry,
+        target: &novarocks_table_maintenance::MaintenanceTarget,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<Self, novarocks_spi::connector::ConnectorError> {
+        use novarocks_spi::connector::{
+            ConnectorControlResolver, ConnectorError, ConnectorErrorKind,
+        };
+        let instance = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
+            ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+        })?;
+        let lease = ConnectorControlResolver::acquire_current(controls, &instance)?;
+        Ok(Self {
+            capture: super::super::staged_create::CurrentMetadataCapture::new(),
+            lease,
+            table: ConnectorTableIdentity {
+                instance_id: instance,
+                namespace: target.namespace.clone().into(),
+                table: target.table.clone().into(),
+            },
+            context,
+            first_metadata: None,
+            observation: None,
+            compactable: None,
+            observation_closed: false,
+            current_metadata: None,
+            raw: None,
+        })
+    }
+    pub(crate) async fn observe_in(
+        &mut self,
+        controls: &dyn novarocks_spi::connector::ConnectorControlRegistry,
+        storage: &dyn novarocks_spi::connector::MvStorageObservationPort,
+        factory: &super::super::staged_create::CurrentProjectionMetadataCpu,
+        projections: &[StoredKeyedMvProjection],
+    ) {
+        use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
+        use novarocks_spi::connector::{
+            ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector,
+        };
+        fn provider(error: novarocks_spi::connector::ConnectorError) -> MvApplicationError {
+            MvApplicationError::from_connector(MvApplicationErrorKind::Engine, error)
+        }
+        let result = async {
+            if self.first_metadata.is_none() {
+                let metadata = self.capture.capture(&self.lease, factory, ConnectorTableObjectCaptureRequest {
+                    table: self.table.clone(), resolution: ConnectorTableResolution::StrictBaseTable,
+                    selector: ConnectorTableObjectSelector::Current, context: self.context.clone(),
+                }).await.map_err(|failure| failure.into_application())?;
+                self.first_metadata = Some(metadata);
+            }
+            if self.observation.is_none() {
+                let cpu = factory.port_for(&self.lease).map_err(|error| {
+                    let cause = novarocks_failure_contract::SharedFailureCause::new(error);
+                    MvApplicationError::new(MvApplicationErrorKind::Engine, cause.detail()).with_original_failure(cause)
+                })?;
+                self.observation = Some(crate::connector::metadata_maintenance::begin_captured_max_compactable_data_files(
+                    controls, &self.lease, &self.first_metadata.as_ref().unwrap().metadata, self.context.clone(), cpu,
+                ).map_err(provider)?);
+            }
+            if self.compactable.is_none() {
+                let raw = std::future::poll_fn(|cx| {
+                    let original = self.observation.as_mut().unwrap();
+                    let polled = original.poll_result(cx);
+                    if polled.is_pending()
+                        && let Some(cause) = original.local_failure() {
+                            std::panic::panic_any(novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven("MV compaction facts original CPU exit is unproven", cause));
+                        }
+                    polled
+                }).await;
+                // Scalar/error reaches this stable original field before its
+                // Provider/CPU footer can be retired, including refusal paths.
+                self.compactable = Some(raw.map(|value| value.value()));
+            }
+            if !self.observation_closed {
+                let closed = std::future::poll_fn(|cx| {
+                    let original = self.observation.as_mut().unwrap();
+                    let polled = original.poll_closed(cx);
+                    if let Some(cause) = original.local_failure() {
+                        std::panic::panic_any(novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven("MV compaction facts original CPU exit is unproven", cause));
+                    }
+                    polled
+                }).await;
+                if let Some(cause) = self.observation.as_ref().unwrap().local_failure() {
+                    std::panic::panic_any(novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven("MV compaction facts original CPU exit is unproven", cause));
+                }
+                if let Err(error) = closed {
+                    std::panic::panic_any(novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven("MV compaction facts original close is unproven", Arc::new(error)));
+                }
+                self.observation_closed = true;
+            }
+            let compactable = self.compactable.as_ref().unwrap().clone().map_err(provider)?;
+            // Same ordering as the existing author: compaction forces the
+            // Provider refresh before the maintenance metadata observation.
+            if self.current_metadata.is_none() {
+                let metadata = self.capture.capture(&self.lease, factory, ConnectorTableObjectCaptureRequest {
+                    table: self.table.clone(), resolution: ConnectorTableResolution::StrictBaseTable,
+                    selector: ConnectorTableObjectSelector::Current, context: self.context.clone(),
+                }).await.map_err(|failure| failure.into_application())?;
+                self.current_metadata = Some(metadata);
+            }
+            let metadata = &self.current_metadata.as_ref().unwrap().metadata;
+            let observed = crate::mv::domain::storage_observation::observe_maintenance_metadata(storage, &self.lease, metadata, self.context.clone()).map_err(provider)?;
+            finish_table_stats_original(&self.lease, metadata, &observed, self.table.instance_id.as_str(), &self.table.namespace, &self.table.table, projections, compactable)
+                .map_err(|(_context, error)| provider(error))
+        }.await;
+        assert!(self.raw.is_none(), "one original maintenance facts outcome");
+        self.raw = Some(result);
+    }
+    pub(crate) fn take_result_in(
+        &mut self,
+        target: &mut Option<
+            Result<TableMaintenanceStats, crate::mv::domain::application::MvApplicationError>,
+        >,
+    ) {
+        assert!(
+            target.is_none(),
+            "original maintenance facts destination is occupied"
+        );
+        *target = self.raw.take();
+    }
+    pub(crate) fn capture_observer(
+        &self,
+    ) -> Arc<super::super::staged_create::CurrentMetadataCapture> {
+        self.capture.clone()
+    }
+    pub(crate) fn local_health_failure(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
+        self.capture.local_health_failure()
+    }
+    pub(crate) fn poll_closed(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        self.capture.poll_closed(cx)
+    }
+}
+
+fn finish_table_stats_original(
+    exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    observed: &crate::mv::domain::storage_observation::MvMaintenanceMetadataObservation,
     catalog: &str,
     namespace: &str,
     table: &str,
     projections: &[StoredKeyedMvProjection],
-) -> Result<TableMaintenanceStats, String> {
-    let context = crate::connector::connector_request_context(
-        None,
-        novarocks_spi::connector::ConnectorStopOwner::new().view(),
-    )?
-    .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background);
-    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-    let identity = ConnectorTableIdentity {
-        instance_id: instance_id.clone(),
-        namespace: Arc::from(namespace),
-        table: Arc::from(table),
-    };
-
-    let max_compactable_data_files =
-        crate::connector::metadata_maintenance::read_max_compactable_data_files(
-            connector_control,
-            &instance_id,
-            identity,
-            context.clone(),
-        )
-        .map_err(|error| {
-            format!(
-                "observe {catalog}.{namespace}.{table} compaction groups for maintenance: {error}"
-            )
-        })?;
-
-    let exact_lease =
-        crate::connector::acquire_metadata_planning_lease(connector_control, catalog)?;
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &exact_lease,
-        context.clone(),
-        namespace,
-        table,
-        ConnectorTableResolution::StrictBaseTable,
-    )?;
-    let observed = crate::mv::domain::storage_observation::observe_maintenance_metadata(
-        storage_observation,
-        &exact_lease,
-        &metadata,
-        context,
-    )
-    .map_err(|error| {
-        format!("observe {catalog}.{namespace}.{table} maintenance metadata: {error}")
-    })?;
-
+    max_compactable_data_files: Option<u64>,
+) -> Result<TableMaintenanceStats, (String, novarocks_spi::connector::ConnectorError)> {
     let snapshots: Vec<SnapshotInfo> = observed
         .snapshots()
         .iter()
@@ -205,7 +302,10 @@ pub fn collect_table_stats_with_ports(
         .metadata()
         .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
         .map_err(|error| {
-            format!("observe exact {catalog}.{namespace}.{table} maintenance identity: {error}")
+            (
+                format!("observe exact {catalog}.{namespace}.{table} maintenance identity"),
+                error,
+            )
         })?;
     let timestamp_by_revision = snapshots
         .iter()
@@ -219,9 +319,12 @@ pub fn collect_table_stats_with_ports(
                 )
                 .map(|revision| (revision, snapshot.timestamp_ms))
                 .map_err(|error| {
-                    format!(
-                        "observe exact {catalog}.{namespace}.{table} snapshot {}: {error}",
-                        snapshot.snapshot_id
+                    (
+                        format!(
+                            "observe exact {catalog}.{namespace}.{table} snapshot {}",
+                            snapshot.snapshot_id
+                        ),
+                        error,
                     )
                 })
         })

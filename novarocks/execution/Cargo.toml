@@ -21,7 +21,9 @@ base64.workspace = true
 bytes.workspace = true
 datasketches = { workspace = true, features = ["hll"] }
 futures.workspace = true
-hashbrown = { workspace = true, features = ["raw"] }
+hashbrown.workspace = true
+xxhash-rust.workspace = true
+rand.workspace = true
 allocator-api2.workspace = true
 novarocks-arrow-ipc-frame.workspace = true
 novarocks-types.workspace = true
@@ -44,9 +46,9 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+novarocks-coordination-contract.workspace = true
 chrono.workspace = true
 hex.workspace = true
-rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
 uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 prost.workspace = true

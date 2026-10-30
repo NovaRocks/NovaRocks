@@ -95,6 +95,91 @@ impl MvTargetCreationObservation {
     }
 }
 
+/// Source schema facts from the selected To author, without target/default-spec state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MvSourceSchemaObservation {
+    table: ConnectorTableIdentity,
+    object_id: ConnectorTableObjectId,
+    schema_version: bytes::Bytes,
+    fields: Vec<novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts>,
+    format_v3: bool,
+    stored_row_lineage_enabled: bool,
+}
+impl MvSourceSchemaObservation {
+    pub(crate) fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
+    }
+    pub(crate) fn table_object_id(&self) -> &ConnectorTableObjectId {
+        &self.object_id
+    }
+    pub(crate) fn schema_version(&self) -> &bytes::Bytes {
+        &self.schema_version
+    }
+    pub(crate) fn fields(
+        &self,
+    ) -> &[novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts] {
+        &self.fields
+    }
+    pub(crate) fn is_format_v3(&self) -> bool {
+        self.format_v3
+    }
+    pub(crate) fn stored_row_lineage_enabled(&self) -> bool {
+        self.stored_row_lineage_enabled
+    }
+}
+
+pub(crate) fn observe_source_schema(
+    observer: &dyn MvStorageObservationPort,
+    exact_lease: &ConnectorControlPlanningLease,
+    metadata: &ConnectorTableMetadata,
+    context: ConnectorRequestContext,
+) -> Result<MvSourceSchemaObservation, ConnectorError> {
+    source_schema_from_spi(
+        observer.observe_source_schema(exact_lease, metadata, context.clone())?,
+        &context,
+    )
+}
+
+pub(crate) fn source_schema_from_spi(
+    observation: novarocks_spi::connector::MvSourceSchemaObservation,
+    context: &ConnectorRequestContext,
+) -> Result<MvSourceSchemaObservation, ConnectorError> {
+    use novarocks_mv_application::persistence::{
+        identity::FieldIdentity, runtime_bindings::MvPhysicalFieldFacts,
+    };
+    validate_request_context(context)?;
+    let fields = observation
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| {
+            Ok(MvPhysicalFieldFacts {
+                field_id: FieldIdentity::try_new(field.provider_field_id().to_vec()).map_err(
+                    |error| ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string()),
+                )?,
+                name: field.name().to_owned(),
+                ordinal: u32::try_from(ordinal).map_err(|_| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        "source schema ordinal exceeds u32",
+                    )
+                })?,
+                type_signature: field.type_signature().to_owned(),
+                nullable: field.nullable(),
+            })
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    validate_request_context(context)?;
+    Ok(MvSourceSchemaObservation {
+        table: observation.table().clone(),
+        object_id: observation.object_id().clone(),
+        schema_version: observation.schema_version().clone(),
+        fields,
+        format_v3: observation.is_format_v3(),
+        stored_row_lineage_enabled: observation.stored_row_lineage_enabled(),
+    })
+}
+
 /// Exact provider-owned schema facts used by canonical D/L validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvSchemaValidationObservation {
@@ -125,12 +210,6 @@ impl MvSchemaValidationObservation {
 
     pub const fn stored_row_lineage_enabled(&self) -> bool {
         self.stored_row_lineage_enabled
-    }
-
-    pub fn fields(
-        &self,
-    ) -> &[novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts] {
-        &self.exact_schema.fields
     }
 }
 
@@ -1028,9 +1107,12 @@ mod tests {
             observed.exact_schema().partition_spec_version.as_bytes(),
             &[0xff, 9]
         );
-        assert_eq!(observed.fields()[0].field_id.as_bytes(), &[0xff, 7]);
-        assert_eq!(observed.fields()[0].ordinal, 3);
-        assert_eq!(observed.fields()[0].name, "physical_name");
+        assert_eq!(
+            observed.exact_schema().fields[0].field_id.as_bytes(),
+            &[0xff, 7]
+        );
+        assert_eq!(observed.exact_schema().fields[0].ordinal, 3);
+        assert_eq!(observed.exact_schema().fields[0].name, "physical_name");
         assert!(observed.is_format_v3());
         assert!(observed.stored_row_lineage_enabled());
         assert_eq!(

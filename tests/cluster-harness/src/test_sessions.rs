@@ -56,6 +56,14 @@ pub struct RoleLaunchReference {
     pub process_receipt: PathBuf,
 }
 
+/// Progress of one original reserved launch, never a process-exit receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoleLaunchProgress {
+    Reserved,
+    Issued,
+    RetiredUnissued,
+}
+
 struct ActiveLaunch {
     runner: RunnerSession,
     grants: Vec<DomainGrant>,
@@ -94,6 +102,9 @@ pub struct ClusterTestSessionPlan {
     private_directory: Option<tempfile::TempDir>,
     deadline: Instant,
     intents: BTreeMap<RoleSlot, VecDeque<LaunchIntent>>,
+    // Only original references move here after leaving the pending queue.
+    // Issued includes ordinary launches and does not claim a process started.
+    launch_progress: Vec<(RoleSlot, RoleLaunchReference, RoleLaunchProgress)>,
     transports: BTreeMap<String, PathBuf>,
     active: BTreeMap<RoleSlot, ActiveLaunch>,
     selected_native: Mutex<BTreeMap<(usize, String, String), SelectedNativeFault>>,
@@ -122,6 +133,7 @@ impl ClusterTestSessionPlan {
             private_directory: Some(private_directory),
             deadline,
             intents: BTreeMap::new(),
+            launch_progress: Vec::new(),
             transports: BTreeMap::new(),
             active: BTreeMap::new(),
             selected_native: Mutex::new(BTreeMap::new()),
@@ -331,6 +343,73 @@ impl ClusterTestSessionPlan {
         intent.binary = Some(binary);
         Ok(())
     }
+    /// Observe only this plan's exact original slot. Unknown references fail.
+    pub fn role_launch_progress(
+        &self,
+        role: RoleSlot,
+        reference: &RoleLaunchReference,
+    ) -> Result<RoleLaunchProgress> {
+        ensure!(self.frozen, "role launch progress requires a frozen plan");
+        let matches = |original: &RoleLaunchReference| {
+            original.session_id == reference.session_id
+                && original.process_receipt == reference.process_receipt
+        };
+        if self
+            .intents
+            .get(&role)
+            .is_some_and(|queue| queue.iter().any(|intent| matches(&intent.reference)))
+        {
+            return Ok(RoleLaunchProgress::Reserved);
+        }
+        self.launch_progress
+            .iter()
+            .find(|(original_role, original, _)| *original_role == role && matches(original))
+            .map(|(_, _, progress)| *progress)
+            .context("unknown original role launch progress")
+    }
+
+    /// Retire exactly one never-issued intent; preserve all issued role owners.
+    /// Private frozen declarations remain evidence, not reusable permissions.
+    pub fn retire_unissued_role_launch(
+        &mut self,
+        role: RoleSlot,
+        reference: &RoleLaunchReference,
+    ) -> Result<()> {
+        ensure!(self.frozen, "role launch retirement requires a frozen plan");
+        let queue = self
+            .intents
+            .get_mut(&role)
+            .context("unknown original role")?;
+        let index = queue
+            .iter()
+            .position(|intent| {
+                intent.reference.session_id == reference.session_id
+                    && intent.reference.process_receipt == reference.process_receipt
+            })
+            .context("role launch is unknown, already issued or already retired")?;
+        let intent = queue
+            .remove(index)
+            .expect("exact pending role intent exists");
+        self.launch_progress.push((
+            role,
+            intent.reference.clone(),
+            RoleLaunchProgress::RetiredUnissued,
+        ));
+        drop(intent);
+        Ok(())
+    }
+
+    fn take_next_launch(&mut self, role: RoleSlot) -> Result<LaunchIntent> {
+        let intent = self
+            .intents
+            .get_mut(&role)
+            .and_then(VecDeque::pop_front)
+            .context("role restart exceeds frozen launch slots")?;
+        self.launch_progress
+            .push((role, intent.reference.clone(), RoleLaunchProgress::Issued));
+        Ok(intent)
+    }
+
     pub(crate) fn binary_for_next_launch(
         &self,
         role: RoleSlot,
@@ -467,7 +546,7 @@ impl ClusterTestSessionPlan {
             deadline,
             evidence,
         )?;
-        let intent = queue.pop_front().expect("checked finite launch intent");
+        let intent = self.take_next_launch(role)?;
         if intent.ordinary {
             return Ok(None);
         }
@@ -1260,7 +1339,7 @@ mod tests {
         role: RoleSlot,
     ) -> std::os::unix::net::UnixStream {
         use std::io::Write;
-        let intent = plan.intents.get_mut(&role).unwrap().pop_front().unwrap();
+        let intent = plan.take_next_launch(role).unwrap();
         let declaration = intent.declaration;
         let runner = RunnerSession::start_until(declaration.clone(), plan.deadline).unwrap();
         let mut peer =
@@ -1466,6 +1545,365 @@ mod tests {
         assert!(plan.end_and_join().is_err());
         assert!(plan.active.is_empty());
         drop(peer);
+    }
+
+    struct OriginalLaunchOwner(ClusterTestSessionPlan);
+
+    impl crate::ServerHandle for OriginalLaunchOwner {
+        fn target_host(&self) -> Option<&str> {
+            None
+        }
+        fn target_port(&self) -> Option<u16> {
+            None
+        }
+        fn role_launch_progress(
+            &self,
+            role: RoleSlot,
+            reference: &RoleLaunchReference,
+        ) -> Result<RoleLaunchProgress> {
+            self.0.role_launch_progress(role, reference)
+        }
+        fn retire_unissued_role_launch(
+            &mut self,
+            role: RoleSlot,
+            reference: &RoleLaunchReference,
+        ) -> Result<()> {
+            self.0.retire_unissued_role_launch(role, reference)
+        }
+    }
+
+    #[test]
+    fn skipped_launch_cannot_shift_a_later_original_grant_or_retire_its_issued_owner() {
+        let mut plan =
+            ClusterTestSessionPlan::new(Instant::now() + Duration::from_secs(10)).unwrap();
+        let directory = plan.reserve_transport("skipped-launch").unwrap();
+        let grant = |name: &str| DomainGrant {
+            domain: "mv".into(),
+            grant_id: format!("outcome-{name}"),
+            parameters: serde_json::json!({"action":"scheduler-outcome","catalog":"ice","namespace":"ns","mv":name,"directory":directory}),
+        };
+        let a = plan
+            .declare_launch(RoleSlot::Frontend, vec![grant("a")], vec![])
+            .unwrap();
+        let b = plan
+            .declare_launch(RoleSlot::Frontend, vec![grant("b")], vec![])
+            .unwrap();
+        plan.validate_and_freeze(1).unwrap();
+        let foreign = RoleLaunchReference {
+            session_id: a.session_id.clone(),
+            process_receipt: directory.join("foreign.process.json"),
+        };
+        assert!(
+            plan.retire_unissued_role_launch(RoleSlot::Frontend, &foreign)
+                .is_err()
+        );
+        assert!(
+            plan.retire_unissued_role_launch(RoleSlot::Backend(0), &a)
+                .is_err()
+        );
+        assert_eq!(
+            plan.role_launch_progress(RoleSlot::Frontend, &a).unwrap(),
+            RoleLaunchProgress::Reserved
+        );
+        assert!(!a.process_receipt.exists());
+        assert!(!b.process_receipt.exists());
+        let probe = tempfile::TempDir::new().unwrap();
+        let missing_binary = probe.path().join("never-created-server");
+        assert!(
+            plan.prepare_launch(
+                RoleSlot::Frontend,
+                &missing_binary,
+                &probe.path().join("failed-build-info.json"),
+                plan.deadline,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            plan.role_launch_progress(RoleSlot::Frontend, &a).unwrap(),
+            RoleLaunchProgress::Reserved
+        );
+        assert!(!a.process_receipt.exists());
+        // The runner's common step-exit author consults this exact original owner.
+        let mut owner = OriginalLaunchOwner(plan);
+        assert!(
+            crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+                &mut owner,
+                RoleSlot::Frontend,
+                &foreign,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+                &mut owner,
+                RoleSlot::Backend(0),
+                &a,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+                &mut owner,
+                RoleSlot::Frontend,
+                &a,
+            )
+            .unwrap()
+        );
+        let plan = &mut owner.0;
+        assert_eq!(
+            plan.role_launch_progress(RoleSlot::Frontend, &a).unwrap(),
+            RoleLaunchProgress::RetiredUnissued
+        );
+        assert!(
+            plan.retire_unissued_role_launch(RoleSlot::Frontend, &a)
+                .is_err()
+        );
+        assert_eq!(
+            plan.role_launch_progress(RoleSlot::Frontend, &b).unwrap(),
+            RoleLaunchProgress::Reserved
+        );
+        assert!(
+            plan.mv_scheduler_outcome_binding("outcome-b", "ice", "ns", "b", &directory)
+                .is_err()
+        );
+        // The original next-role author binds B, never A's skipped declaration.
+        let peer = start_role_hello_at(plan, RoleSlot::Frontend);
+        let receipt = plan
+            .mv_scheduler_outcome_binding("outcome-b", "ice", "ns", "b", &directory)
+            .unwrap();
+        assert_eq!(receipt.session_id, b.session_id);
+        assert_eq!(
+            plan.role_launch_progress(RoleSlot::Frontend, &b).unwrap(),
+            RoleLaunchProgress::Issued
+        );
+        assert!(
+            plan.mv_scheduler_outcome_binding("outcome-a", "ice", "ns", "a", &directory)
+                .is_err()
+        );
+        assert!(
+            plan.retire_unissued_role_launch(RoleSlot::Frontend, &b)
+                .is_err()
+        );
+        assert_eq!(
+            plan.process_receipt(RoleSlot::Frontend).unwrap().unwrap(),
+            receipt
+        );
+        assert_eq!(
+            plan.mv_scheduler_outcome_binding("outcome-b", "ice", "ns", "b", &directory)
+                .unwrap(),
+            receipt
+        );
+        plan.end_role(RoleSlot::Frontend).unwrap();
+        assert!(
+            plan.retire_unissued_role_launch(RoleSlot::Frontend, &b)
+                .is_err()
+        );
+        assert!(
+            plan.mv_scheduler_outcome_binding("outcome-b", "ice", "ns", "b", &directory)
+                .is_err()
+        );
+        assert!(
+            !crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+                &mut owner,
+                RoleSlot::Frontend,
+                &b,
+            )
+            .unwrap()
+        );
+        drop(peer);
+    }
+
+    #[test]
+    fn an_ordinary_unissued_slot_can_retire_without_changing_the_next_controlled_slot() {
+        let mut plan =
+            ClusterTestSessionPlan::new(Instant::now() + Duration::from_secs(2)).unwrap();
+        let issued_ordinary = plan.reserve_launch(RoleSlot::Frontend).unwrap();
+        plan.authorize_ordinary_launch(&issued_ordinary, std::env::current_exe().unwrap())
+            .unwrap();
+        let a = plan.reserve_launch(RoleSlot::Frontend).unwrap();
+        plan.authorize_ordinary_launch(&a, std::env::current_exe().unwrap())
+            .unwrap();
+        let b = plan
+            .declare_launch(
+                RoleSlot::Frontend,
+                vec![DomainGrant {
+                    domain: "statement-observation".into(),
+                    grant_id: "original-b".into(),
+                    parameters: serde_json::json!({"action":"observe"}),
+                }],
+                vec![],
+            )
+            .unwrap();
+        plan.validate_and_freeze(1).unwrap();
+        let original = plan.take_next_launch(RoleSlot::Frontend).unwrap();
+        assert!(original.ordinary);
+        assert_eq!(original.reference.session_id, issued_ordinary.session_id);
+        assert!(
+            plan.retire_unissued_role_launch(RoleSlot::Frontend, &issued_ordinary)
+                .is_err()
+        );
+        assert_eq!(
+            plan.role_launch_progress(RoleSlot::Frontend, &issued_ordinary)
+                .unwrap(),
+            RoleLaunchProgress::Issued
+        );
+        plan.retire_unissued_role_launch(RoleSlot::Frontend, &a)
+            .unwrap();
+        let next = plan.take_next_launch(RoleSlot::Frontend).unwrap();
+        assert_eq!(next.reference.session_id, b.session_id);
+        assert_eq!(next.reference.process_receipt, b.process_receipt);
+        assert!(!next.ordinary);
+        assert_eq!(next.declaration.domain_grants[0].grant_id, "original-b");
+        assert_eq!(
+            plan.role_launch_progress(RoleSlot::Frontend, &a).unwrap(),
+            RoleLaunchProgress::RetiredUnissued
+        );
+        assert_eq!(
+            plan.role_launch_progress(RoleSlot::Frontend, &b).unwrap(),
+            RoleLaunchProgress::Issued
+        );
+        assert!(
+            plan.retire_unissued_role_launch(RoleSlot::Frontend, &b)
+                .is_err()
+        );
+        assert!(
+            !b.process_receipt.exists(),
+            "issuing a declaration is not process start"
+        );
+    }
+
+    #[test]
+    fn skipped_backend_launch_keeps_its_successor_and_the_issued_frontend_original() {
+        let mut plan =
+            ClusterTestSessionPlan::new(Instant::now() + Duration::from_secs(10)).unwrap();
+        let fe = plan.reserve_launch(RoleSlot::Frontend).unwrap();
+        plan.authorize_ordinary_launch(&fe, std::env::current_exe().unwrap())
+            .unwrap();
+        let a = reserve_native_role(&mut plan, 1, &["statement-a"]);
+        let a_post = reserve_native_role(&mut plan, 1, &["statement-a-post"]);
+        let b = reserve_native_role(&mut plan, 1, &["statement-b"]);
+        plan.validate_and_freeze(2).unwrap();
+        let original_fe = plan.take_next_launch(RoleSlot::Frontend).unwrap();
+        assert_eq!(original_fe.reference.session_id, fe.session_id);
+        assert!(!fe.process_receipt.exists(), "issued is not process start");
+        let probe = tempfile::TempDir::new().unwrap();
+        assert!(
+            plan.prepare_launch(
+                RoleSlot::Backend(1),
+                &probe.path().join("never-created-server"),
+                &probe.path().join("failed-build-info.json"),
+                plan.deadline,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            plan.role_launch_progress(RoleSlot::Backend(1), &a).unwrap(),
+            RoleLaunchProgress::Reserved
+        );
+        let mut owner = OriginalLaunchOwner(plan);
+        assert!(
+            crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+                &mut owner,
+                RoleSlot::Frontend,
+                &a,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+                &mut owner,
+                RoleSlot::Backend(1),
+                &a,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            owner
+                .0
+                .role_launch_progress(RoleSlot::Backend(1), &a)
+                .unwrap(),
+            RoleLaunchProgress::RetiredUnissued
+        );
+        assert_eq!(
+            owner
+                .0
+                .role_launch_progress(RoleSlot::Backend(1), &a_post)
+                .unwrap(),
+            RoleLaunchProgress::Reserved
+        );
+        assert!(
+            crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+                &mut owner,
+                RoleSlot::Backend(1),
+                &a_post,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            owner
+                .0
+                .role_launch_progress(RoleSlot::Backend(1), &a_post)
+                .unwrap(),
+            RoleLaunchProgress::RetiredUnissued
+        );
+        assert_eq!(
+            owner
+                .0
+                .role_launch_progress(RoleSlot::Backend(1), &b)
+                .unwrap(),
+            RoleLaunchProgress::Reserved
+        );
+        assert!(
+            !crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+                &mut owner,
+                RoleSlot::Frontend,
+                &fe,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            owner
+                .0
+                .role_launch_progress(RoleSlot::Frontend, &fe)
+                .unwrap(),
+            RoleLaunchProgress::Issued
+        );
+        assert_eq!(original_fe.reference.process_receipt, fe.process_receipt);
+        assert!(!fe.process_receipt.exists());
+        assert!(!a.process_receipt.exists());
+        assert!(!a_post.process_receipt.exists());
+        let peer = start_role_hello_at(&mut owner.0, RoleSlot::Backend(1));
+        let receipt = owner
+            .0
+            .process_receipt(RoleSlot::Backend(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.session_id, b.session_id);
+        assert_eq!(
+            owner
+                .0
+                .domain_secret(RoleSlot::Backend(1), "native", "statement_run_token")
+                .unwrap(),
+            Some("statement-b".into())
+        );
+        assert!(
+            !crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+                &mut owner,
+                RoleSlot::Backend(1),
+                &b,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            owner
+                .0
+                .role_launch_progress(RoleSlot::Frontend, &fe)
+                .unwrap(),
+            RoleLaunchProgress::Issued
+        );
+        owner.0.end_role(RoleSlot::Backend(1)).unwrap();
+        drop(peer);
+        drop(original_fe);
     }
 
     #[test]

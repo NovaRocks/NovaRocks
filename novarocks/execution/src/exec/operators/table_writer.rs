@@ -1036,7 +1036,7 @@ impl TableWriterOperator {
                 self.writer.request_finish()?;
                 self.writer_finish_requested = true;
             }
-            if let Some(completion) = self.writer.take_output() {
+            if let std::task::Poll::Ready(completion) = self.writer.poll_output()? {
                 if completion.accepted_rows != self.physical_rows {
                     return Err(WriterFailure::RowCountDrift {
                         expected: self.physical_rows,
@@ -1046,11 +1046,6 @@ impl TableWriterOperator {
                 }
                 self.writer_completion = Some(completion);
                 self.state = TableWriterState::Producing;
-            } else if self.writer.is_done() {
-                return Err(
-                    crate::exec::pipeline::writer_failure::WriterFailure::MissingTerminalOutcome
-                        .into(),
-                );
             }
         }
         let output = if self.state == TableWriterState::Producing {
@@ -3804,8 +3799,20 @@ pub(crate) mod tests {
 
     #[test]
     fn sparse_packer_splits_1024_typed_channels_across_multiple_batches() {
+        assert_sparse_packer_splits_1024_channels(20 * 1024, false);
+    }
+
+    #[test]
+    fn sparse_packer_splits_144_byte_channels_without_single_channel_exception() {
+        // Exact retained n=16 Theta v3 states carry 16 + 8*16 = 144 bytes.
+        assert_sparse_packer_splits_1024_channels(144, true);
+    }
+
+    fn assert_sparse_packer_splits_1024_channels(
+        value_bytes: usize,
+        require_multiple_channels_per_batch: bool,
+    ) {
         const CHANNELS: usize = 1_024;
-        const VALUE_BYTES: usize = 20 * 1024;
         const PACKET_BYTES: usize = 320 * 1024;
 
         let stats = Arc::new(WriteExecutionStats::default());
@@ -3848,7 +3855,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         let arrays = (0..CHANNELS)
             .map(|index| {
-                let value = vec![u8::try_from(index % 251).expect("byte"); VALUE_BYTES];
+                let value = vec![u8::try_from(index % 251).expect("byte"); value_bytes];
                 Arc::new(BinaryArray::from(vec![Some(value.as_slice())])) as ArrayRef
             })
             .collect::<Vec<_>>();
@@ -3924,12 +3931,24 @@ pub(crate) mod tests {
                         .downcast_ref::<BinaryArray>()
                         .expect("binary partial")
                         .value(0);
-                    assert_eq!(value.len(), VALUE_BYTES);
+                    assert_eq!(value.len(), value_bytes);
                     assert_eq!(value[0], u8::try_from(index % 251).expect("byte"));
+                    assert!(
+                        value
+                            .iter()
+                            .all(|byte| *byte == u8::try_from(index % 251).expect("byte")),
+                        "channel {index} changed its complete payload"
+                    );
                     seen[index] = true;
                 }
             }
             assert!(populated > 0 && populated < CHANNELS);
+            if require_multiple_channels_per_batch {
+                assert!(
+                    populated > 1,
+                    "the 144-byte fixture must not rely on the single-channel size exception"
+                );
+            }
         }
         assert!(output_batches > 1, "the wide row must be split by bytes");
         assert_eq!(operator.kernel_for_test().partial_batches, output_batches);

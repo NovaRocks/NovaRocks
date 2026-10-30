@@ -400,7 +400,7 @@ fn preflight_field<E: From<ExecutionValueTypeError>>(
         .into());
     }
     if normalized {
-        if field.metadata().capacity() != 0 {
+        if !field.metadata().is_empty() {
             return Err(ExecutionValueTypeError::Invalid(
                 "value layout projection contains field annotations",
             )
@@ -503,7 +503,7 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
             observe(1)?;
             if normalized {
                 observe(1)?;
-                if entries.name().len() != "entries".len() || entries.metadata().capacity() != 0 {
+                if entries.name().len() != "entries".len() || !entries.metadata().is_empty() {
                     return Err(ExecutionValueTypeError::Invalid(
                         "value layout Map entries wrapper is not canonical",
                     )
@@ -701,7 +701,7 @@ fn normalize<E>(
             DataType::Map(Arc::new(entry), *ordered)
         }
         DataType::Union(fields, mode) => {
-            construction.collected_arc_slice::<(i8, Arc<Field>)>(fields.len())?;
+            construction.collected_union_fields(fields.len())?;
             let fields = fields
                 .iter()
                 .map(|(id, source)| {
@@ -896,14 +896,14 @@ mod tests {
 
     fn annotated(name: &str, data_type: DataType, nullable: bool) -> Arc<Field> {
         Arc::new(
-            Field::new(name, data_type, nullable).with_metadata(
-                [
-                    ("provider.field_id".into(), "123".into()),
-                    // A layout author must not parse or validate this annotation.
-                    (crate::NR_LOGICAL_TYPE_KEY.into(), "uninterpreted".into()),
-                ]
-                .into(),
-            ),
+            Field::new(name, data_type, nullable).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([
+                ("provider.field_id".into(), "123".into()),
+                // A layout author must not parse or validate this annotation.
+                (crate::NR_LOGICAL_TYPE_KEY.into(), "uninterpreted".into()),
+            ])),
         )
     }
 
@@ -967,8 +967,12 @@ mod tests {
         for invalid in [
             DataType::List(Arc::new(Field::new("provider_item", DataType::Utf8, true))),
             DataType::List(Arc::new(
-                Field::new("item", DataType::Utf8, true)
-                    .with_metadata([("source".into(), "value".into())].into()),
+                Field::new("item", DataType::Utf8, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "source".into(),
+                        "value".into(),
+                    )]),
+                ),
             )),
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
         ] {

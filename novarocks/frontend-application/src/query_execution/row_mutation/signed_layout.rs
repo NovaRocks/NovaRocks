@@ -135,6 +135,182 @@ pub(super) fn validate_declarations(
     Ok(())
 }
 
+/// The actual completed SQL root is distinct from the Provider's target.
+/// All column associations originate in its frozen generated output aliases.
+pub(super) struct CowSqlOutput {
+    declarations: Vec<FunctionValueType>,
+    target_to_source: Vec<usize>,
+    after: Vec<bool>,
+}
+impl CowSqlOutput {
+    pub(super) fn try_new(
+        output: &[novarocks_query_application::api::ResultField],
+        target: &SchemaRef,
+        validator: &super::RowMutationMatchValidator,
+        work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
+    ) -> Result<Self, ConnectorError> {
+        validator.validate_schema(target)?;
+        if output.len() != target.fields().len() {
+            return Err(value_error(ValueError::Invariant(
+                novarocks_value_arrays::ValueViolation::Layout,
+            )));
+        }
+        let mut target_to_source = Vec::new();
+        target_to_source
+            .try_reserve_exact(output.len())
+            .map_err(allocation)?;
+        target_to_source.resize(output.len(), usize::MAX);
+        for (source, field) in output.iter().enumerate() {
+            work(1)?;
+            let ordinal = field
+                .name()
+                .strip_prefix("__nr_sel_")
+                .and_then(|ordinal| ordinal.parse::<usize>().ok())
+                .filter(|&ordinal| ordinal < output.len())
+                .ok_or_else(|| {
+                    value_error(ValueError::Invariant(
+                        novarocks_value_arrays::ValueViolation::Layout,
+                    ))
+                })?;
+            if field.name() != format!("__nr_sel_{ordinal}")
+                || target_to_source[ordinal] != usize::MAX
+            {
+                return Err(value_error(ValueError::Invariant(
+                    novarocks_value_arrays::ValueViolation::Layout,
+                )));
+            }
+            target_to_source[ordinal] = source;
+        }
+        let mut after = Vec::new();
+        after.try_reserve_exact(output.len()).map_err(allocation)?;
+        after.resize(output.len(), false);
+        for field in validator.contract.after_fields() {
+            work(1)?;
+            let ordinal = usize::try_from(field.target_ordinal()).map_err(|_| {
+                value_error(ValueError::Invariant(
+                    novarocks_value_arrays::ValueViolation::Layout,
+                ))
+            })?;
+            *after.get_mut(ordinal).ok_or_else(|| {
+                value_error(ValueError::Invariant(
+                    novarocks_value_arrays::ValueViolation::Layout,
+                ))
+            })? = true;
+        }
+        let mut declarations = Vec::new();
+        declarations
+            .try_reserve_exact(output.len())
+            .map_err(allocation)?;
+        for field in output {
+            work(1)?;
+            declarations.push(field.value_type().clone());
+        }
+        Ok(Self {
+            declarations,
+            target_to_source,
+            after,
+        })
+    }
+
+    pub(super) fn validate_and_project<'a>(
+        &self,
+        batch: &'a RecordBatch,
+        targets: &[FunctionValueType],
+        work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
+    ) -> Result<std::borrow::Cow<'a, RecordBatch>, ConnectorError> {
+        use novarocks_value_arrays::hydrate::{
+            required_values_satisfied_observed, validate_required_with_options_observed,
+        };
+        if batch.num_columns() != self.declarations.len() || targets.len() != self.after.len() {
+            return Err(value_error(ValueError::Invariant(
+                novarocks_value_arrays::ValueViolation::Layout,
+            )));
+        }
+        let options = HydrateOptions {
+            dictionary_value_layout: None,
+            projection: HydrateProjection::FrozenNamesAndNullability,
+        };
+        // Validate every actual SQL promise before inspecting any business
+        // target. A required SQL value containing NULL is still an invariant.
+        for (array, declaration) in batch.columns().iter().zip(&self.declarations) {
+            validate_required_with_options_observed(
+                array,
+                declaration.typed_binding(),
+                options,
+                work,
+                &mut |_| Ok(()),
+            )
+            .map_err(failure)?;
+        }
+        // The ordinary order stays borrowed. A real permutation only reorders
+        // existing Arc columns; no payload is copied or cast.
+        let projected = if self
+            .target_to_source
+            .iter()
+            .enumerate()
+            .all(|(target, &source)| target == source)
+        {
+            std::borrow::Cow::Borrowed(batch)
+        } else {
+            std::borrow::Cow::Owned(
+                batch
+                    .project(&self.target_to_source)
+                    .map_err(arrow_assembly)?,
+            )
+        };
+        // SQL may be wider than a target. Identity/Before/effect promises must
+        // all hold before an After business refusal can be selected. Only an
+        // exact complete binding can reuse the SQL validation for this middle
+        // check; the original Hydrate validation below remains independent.
+        for (ordinal, ((array, target), after)) in projected
+            .columns()
+            .iter()
+            .zip(targets)
+            .zip(&self.after)
+            .enumerate()
+        {
+            if !*after
+                && !self.declarations[self.target_to_source[ordinal]]
+                    .exactly_equals_checked_observed(target, || work(1))?
+            {
+                validate_required_with_options_observed(
+                    array,
+                    target.typed_binding(),
+                    options,
+                    work,
+                    &mut |_| Ok(()),
+                )
+                .map_err(failure)?;
+            }
+        }
+        for (ordinal, ((array, target), after)) in projected
+            .columns()
+            .iter()
+            .zip(targets)
+            .zip(&self.after)
+            .enumerate()
+        {
+            if *after
+                && !self.declarations[self.target_to_source[ordinal]]
+                    .exactly_equals_checked_observed(target, || work(1))?
+                && !required_values_satisfied_observed(
+                    array,
+                    target.typed_binding(),
+                    options,
+                    work,
+                    &mut |_| Ok(()),
+                )
+                .map_err(failure)?
+            {
+                return Err(super::invalid_match(
+                    "COW assignment value does not satisfy its required target",
+                ));
+            }
+        }
+        Ok(projected)
+    }
+}
+
 pub(super) struct CowSignedLayoutPlan {
     pub columns: Vec<HydratePlan>,
     schema: SchemaRef,
@@ -207,9 +383,18 @@ impl CowSignedLayoutPlan {
             planning_requested_bytes: requested,
         })
     }
+    #[cfg(test)]
     pub fn execute(
         &self,
         context: &mut ValueConversionContext,
+        work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
+    ) -> Result<RecordBatch, ConnectorError> {
+        self.execute_with_growth(context, &mut |_| Ok(()), work)
+    }
+    pub(super) fn execute_with_growth(
+        &self,
+        context: &mut ValueConversionContext,
+        growth: &mut dyn FnMut(std::alloc::Layout) -> Result<(), ConnectorError>,
         work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
     ) -> Result<RecordBatch, ConnectorError> {
         let mut columns = Vec::new();
@@ -218,7 +403,7 @@ impl CowSignedLayoutPlan {
             .map_err(allocation)?;
         for (plan, field) in self.columns.iter().zip(self.schema.fields()) {
             let output = plan
-                .execute_observed(context, &mut |_| Ok(()), work, &mut |_| Ok(()))
+                .execute_observed(context, growth, work, &mut |_| Ok(()))
                 .map_err(failure)?;
             columns.push(attach_signed_type(&output, field.data_type(), work)?);
         }

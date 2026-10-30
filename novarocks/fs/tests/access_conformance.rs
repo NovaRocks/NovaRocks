@@ -17,8 +17,8 @@
 
 use novarocks_fs::{
     FileCancellation, FileErrorKind, FileIdentity, FileReadRange, FsAccessResolver, FsLocation,
-    FsScheme, ObjectStoreAccessContext, ObjectStoreConfig, ObjectStoreCredentialProviderIdentity,
-    ObjectStoreProviderPool, ObjectStoreProviderPoolOptions, SecretValue,
+    FsScheme, ObjectStoreAccessContext, ObjectStoreConfig, ObjectStoreProviderPool,
+    ObjectStoreProviderPoolOptions, SecretValue,
 };
 use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
 
@@ -177,9 +177,9 @@ fn object_store_configuration_error_redacts_secrets() {
         .resolve_location(
             domain(1),
             "s3://bucket/data.parquet",
-            Some(ObjectStoreAccessContext::new(
+            Some(ObjectStoreAccessContext::for_static(
                 config.endpoint_config(),
-                ObjectStoreCredentialProviderIdentity::Static(credential_reference),
+                credential_reference,
                 config.secret_material(),
                 &provider_pool,
             )),

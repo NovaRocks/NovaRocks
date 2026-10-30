@@ -35,7 +35,7 @@ const fn matches_at(haystack: &[u8], needle: &[u8], start: usize) -> bool {
 
 pub(crate) const fn locked_bytes_matches(haystack: &[u8]) -> bool {
     let name = b"\nname = \"bytes\"\n";
-    let expected = b"\nname = \"bytes\"\nversion = \"1.11.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3\"\n";
+    let expected = b"\nname = \"bytes\"\nversion = \"1.11.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33\"\n";
     let mut start = 0;
     let mut found = false;
     while start < haystack.len() {
@@ -61,15 +61,15 @@ mod tests {
         for (from, to) in [
             ("name = \"bytes\"", "name = \"other-bytes\""),
             (
-                "name = \"bytes\"\nversion = \"1.11.0\"",
+                "name = \"bytes\"\nversion = \"1.11.1\"",
                 "name = \"bytes\"\nversion = \"1.12.0\"",
             ),
             (
-                "name = \"bytes\"\nversion = \"1.11.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"",
-                "name = \"bytes\"\nversion = \"1.11.0\"\nsource = \"git+https://example.invalid/fork\"",
+                "name = \"bytes\"\nversion = \"1.11.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"",
+                "name = \"bytes\"\nversion = \"1.11.1\"\nsource = \"git+https://example.invalid/fork\"",
             ),
             (
-                "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3",
+                "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33",
                 "changed-source-checksum",
             ),
         ] {
@@ -79,12 +79,12 @@ mod tests {
         let mixed = format!("{lock}\n[[package]]\nname = \"bytes\"\nversion = \"1.12.0\"\n");
         assert!(!locked_bytes_matches(mixed.as_bytes()));
         let duplicate = format!(
-            "{lock}\n[[package]]\nname = \"bytes\"\nversion = \"1.11.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3\"\n"
+            "{lock}\n[[package]]\nname = \"bytes\"\nversion = \"1.11.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33\"\n"
         );
         assert!(!locked_bytes_matches(duplicate.as_bytes()));
         assert!(!locked_bytes_matches(b""));
         assert!(!locked_bytes_matches(
-            b"\nname = \"bytes\"\nversion = \"1.11.0\"\n"
+            b"\nname = \"bytes\"\nversion = \"1.11.1\"\n"
         ));
     }
 }

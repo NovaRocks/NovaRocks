@@ -25,8 +25,9 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 pub(crate) const DOMAIN: &str = "table-maintenance";
 const HOLD: &str = "hold-before-rebind";
@@ -67,7 +68,7 @@ struct Slot {
     hold: GrantHandle,
     observe: GrantHandle,
     state: Mutex<State>,
-    changed: Condvar,
+    changed: Notify,
 }
 pub(crate) struct MaintenanceTestControls {
     process: ProcessBinding,
@@ -137,7 +138,7 @@ impl MaintenanceTestControls {
                 observe: observe
                     .ok_or("maintenance rendezvous lacks its dispatch observer grant")?,
                 state: Mutex::new(State::default()),
-                changed: Condvar::new(),
+                changed: Notify::new(),
             }));
         }
         Ok(Some(Arc::new(Self { process, slots })))
@@ -269,44 +270,63 @@ impl MaintenanceTestControls {
         }
         Ok(None)
     }
-    pub(crate) fn before_rebind(
+    pub(crate) async fn before_rebind(
         &self,
         job: &OptimizeJob,
         capacity: &QueryResultCapacityBinding,
     ) -> Result<Option<AuthorizedJob>, String> {
-        for slot in &self.slots {
+        'slots: for slot in &self.slots {
             if slot.parameters.target() != job.target {
                 continue;
             }
-            let mut state = slot
-                .state
-                .lock()
-                .map_err(|_| "maintenance association lock failed")?;
-            // Publication cannot precede capture. Only this captured incarnation
-            // may wait for its already-running submit operation to return its ID.
-            if state.captured_object.as_deref() != Some(job.object_id.as_slice()) || state.abandoned
-            {
-                continue;
+            let deadline = {
+                let state = slot
+                    .state
+                    .lock()
+                    .map_err(|_| "maintenance association lock failed")?;
+                // Publication cannot precede capture. Only this captured incarnation
+                // may wait for its already-running submit operation to return its ID.
+                if state.captured_object.as_deref() != Some(job.object_id.as_slice())
+                    || state.abandoned
+                {
+                    continue;
+                }
+                (Instant::now() + BARRIER_LIMIT).min(slot.hold.cancellation().deadline())
+            };
+            loop {
+                // Register before reading State so bind/close cannot be lost
+                // between checking the original receipt and yielding this poll.
+                let changed = slot.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let bound = {
+                    let mut state = slot
+                        .state
+                        .lock()
+                        .map_err(|_| "maintenance association lock failed")?;
+                    if state.job_id.is_none() && !state.abandoned {
+                        check_live(slot, capacity, deadline)?;
+                        false
+                    } else {
+                        if state.abandoned || state.job_id != Some(job.job_id) {
+                            continue 'slots;
+                        }
+                        check_live(slot, capacity, deadline)?;
+                        let work_id = capacity.scope().id().get();
+                        if work_id == 0 || state.work_id.replace(work_id).is_some() {
+                            return Err("maintenance job was already bound to a work scope".into());
+                        }
+                        true
+                    }
+                };
+                if bound {
+                    break;
+                }
+                tokio::select! {
+                    _ = changed => {},
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+                }
             }
-            let deadline =
-                (Instant::now() + BARRIER_LIMIT).min(slot.hold.cancellation().deadline());
-            while state.job_id.is_none() && !state.abandoned {
-                check_live(slot, capacity, deadline)?;
-                state = slot
-                    .changed
-                    .wait_timeout(state, Duration::from_millis(10))
-                    .map_err(|_| "maintenance association wait failed")?
-                    .0;
-            }
-            if state.abandoned || state.job_id != Some(job.job_id) {
-                continue;
-            }
-            check_live(slot, capacity, deadline)?;
-            let work_id = capacity.scope().id().get();
-            if work_id == 0 || state.work_id.replace(work_id).is_some() {
-                return Err("maintenance job was already bound to a work scope".into());
-            }
-            drop(state);
             let hold = slot
                 .hold
                 .claim_once(self.process)
@@ -323,7 +343,7 @@ impl MaintenanceTestControls {
                 observe,
                 dispatches: 0,
             };
-            authorized.wait_before_rebind(deadline)?;
+            authorized.wait_before_rebind(deadline).await?;
             return Ok(Some(authorized));
         }
         Ok(None)
@@ -335,7 +355,8 @@ impl MaintenanceTestControls {
                 .lock()
                 .map_err(|_| "maintenance close lock failed")?;
             state.abandoned = true;
-            slot.changed.notify_all();
+            drop(state);
+            slot.changed.notify_waiters();
         }
         Ok(())
     }
@@ -382,7 +403,8 @@ impl SubmissionReceipt {
         }
         state.job_id = Some(job_id);
         self.finished = true;
-        self.slot.changed.notify_all();
+        drop(state);
+        self.slot.changed.notify_waiters();
         Ok(())
     }
 }
@@ -393,7 +415,8 @@ impl Drop for SubmissionReceipt {
         }
         if let Ok(mut state) = self.slot.state.lock() {
             state.abandoned = true;
-            self.slot.changed.notify_all();
+            drop(state);
+            self.slot.changed.notify_waiters();
         }
     }
 }
@@ -413,7 +436,7 @@ impl AuthorizedJob {
             self.slot.parameters.statement_run_token, suffix
         ))
     }
-    fn wait_before_rebind(&mut self, deadline: Instant) -> Result<(), String> {
+    async fn wait_before_rebind(&mut self, deadline: Instant) -> Result<(), String> {
         check_live(&self.slot, &self.capacity, deadline)?;
         if self.path("before-rebind.resume").exists() {
             return Err("maintenance resume existed before its exact barrier".into());
@@ -439,7 +462,7 @@ impl AuthorizedJob {
                 "statement_run_token": nomination.statement_run_token,
                 "frontend_process_id": nomination.frontend_process_id,
                 "connection_id": nomination.connection_id,
-                "session_epoch": nomination.session_epoch,
+                "session_key": nomination.session_key,
                 "statement_generation": nomination.statement_generation,
             },
         });
@@ -451,21 +474,26 @@ impl AuthorizedJob {
         fs::hard_link(&staged_ready, self.path("before-rebind.ready"))
             .map_err(|error| format!("publish exact maintenance receipt: {error}"))?;
         while !self.path("before-rebind.resume").exists() {
+            let changed = self.slot.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             check_live(&self.slot, &self.capacity, deadline)?;
-            let state = self
-                .slot
-                .state
-                .lock()
-                .map_err(|_| "maintenance barrier lock failed")?;
-            if state.abandoned {
-                return Err("maintenance observation closed during hold".into());
+            {
+                let state = self
+                    .slot
+                    .state
+                    .lock()
+                    .map_err(|_| "maintenance barrier lock failed")?;
+                if state.abandoned {
+                    return Err("maintenance observation closed during hold".into());
+                }
             }
-            drop(
-                self.slot
-                    .changed
-                    .wait_timeout(state, Duration::from_millis(10))
-                    .map_err(|_| "maintenance barrier wait failed")?,
-            );
+            // Resume is an external file; retain the original finite 10 ms
+            // observation policy without blocking the common Action poll.
+            tokio::select! {
+                _ = changed => {},
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+            }
         }
         check_live(&self.slot, &self.capacity, deadline)
     }
@@ -645,7 +673,7 @@ mod tests {
                 statement_run_token: "selected-statement".into(),
                 frontend_process_id: process.to_string(),
                 connection_id: 17,
-                session_epoch: 3,
+                session_key: 3,
                 statement_generation: 2,
             };
             Self {
@@ -663,7 +691,7 @@ mod tests {
                 statement_run_token: self.nomination.statement_run_token.clone(),
                 frontend_process_id: self.nomination.frontend_process_id.clone(),
                 connection_id: self.nomination.connection_id,
-                session_epoch: self.nomination.session_epoch,
+                session_key: self.nomination.session_key,
                 sql_sha256: sha2::Sha256::digest(b"ALTER TABLE orders OPTIMIZE").into(),
             }
         }
@@ -726,6 +754,13 @@ mod tests {
                 "actual maintenance hold was not reached"
             );
         }
+    }
+    fn drive<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
     }
     fn target(table: &str) -> MaintenanceTarget {
         MaintenanceTarget {
@@ -933,7 +968,7 @@ mod tests {
         controls.pin_statement_input(&original).unwrap();
         controls.pin_statement_input(&original).unwrap();
         let mut client = original.clone();
-        client.session_epoch += 1;
+        client.session_key += 1;
         let mut connection = original.clone();
         connection.connection_id += 1;
         let mut sql = original.clone();
@@ -964,10 +999,10 @@ mod tests {
         assert_eq!(controls.slots.len(), 2);
         let mut fresh = original.clone();
         fresh.statement_run_token = "fresh-statement".into();
-        fresh.session_epoch += 1;
+        fresh.session_key += 1;
         let mut fresh_nom = session.nomination.clone();
         fresh_nom.statement_run_token = fresh.statement_run_token.clone();
-        fresh_nom.session_epoch = fresh.session_epoch;
+        fresh_nom.session_key = fresh.session_key;
         controls.pin_statement_input(&fresh).unwrap();
         controls.nominate_statement(&fresh, &fresh_nom).unwrap();
         controls
@@ -1042,9 +1077,7 @@ mod tests {
         let (receipt, job) = pending(&fixture, &jobs);
         let other = jobs.claim("other", None);
         assert!(
-            fixture
-                .controls
-                .before_rebind(&other, admitted.capacity())
+            drive(fixture.controls.before_rebind(&other, admitted.capacity()))
                 .unwrap()
                 .is_none()
         );
@@ -1052,7 +1085,8 @@ mod tests {
             let controls = &fixture.controls;
             let selected_job = &job;
             let capacity = admitted.capacity();
-            let worker = threads.spawn(move || controls.before_rebind(selected_job, capacity));
+            let worker =
+                threads.spawn(move || drive(controls.before_rebind(selected_job, capacity)));
             receipt.bind(job.job_id).unwrap();
             fixture.wait_until_held();
             fs::write(fixture.resume(), "resume\n").unwrap();
@@ -1093,6 +1127,40 @@ mod tests {
         });
     }
     #[test]
+    fn one_async_poll_owner_can_bind_receipt_and_resume_its_original_hold() {
+        let fixture = Fixture::new();
+        let admitted = Admitted::new();
+        let jobs = RealJobs::new();
+        let (receipt, job) = pending(&fixture, &jobs);
+        drive(async {
+            let hold = fixture.controls.before_rebind(&job, admitted.capacity());
+            tokio::pin!(hold);
+            assert!(futures::poll!(hold.as_mut()).is_pending());
+            assert!(!fixture.ready().exists());
+            assert!(!fixture.count().exists());
+            let resume = async {
+                receipt.bind(job.job_id).unwrap();
+                let failure_watchdog =
+                    (Instant::now() + Duration::from_secs(2)).min(fixture.role.scope().deadline());
+                while !fixture.ready().exists() {
+                    assert!(
+                        Instant::now() < failure_watchdog,
+                        "actual hold was not reached"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(fs::read_to_string(fixture.count()).unwrap(), "0\n");
+                fs::write(fixture.resume(), "resume\n").unwrap();
+            };
+            let (authorized, ()) = tokio::join!(hold, resume);
+            let mut authorized = authorized.unwrap().unwrap();
+            authorized
+                .record_dispatch(&job, admitted.capacity())
+                .unwrap();
+            assert_eq!(fs::read_to_string(fixture.count()).unwrap(), "1\n");
+        });
+    }
+    #[test]
     fn session_close_ends_actual_hold_and_joins_original_worker() {
         let fixture = Fixture::new();
         let admitted = Admitted::new();
@@ -1103,7 +1171,8 @@ mod tests {
             let controls = &fixture.controls;
             let selected_job = &job;
             let capacity = admitted.capacity();
-            let worker = threads.spawn(move || controls.before_rebind(selected_job, capacity));
+            let worker =
+                threads.spawn(move || drive(controls.before_rebind(selected_job, capacity)));
             fixture.wait_until_held();
             fixture.role.close();
             let error = worker
@@ -1127,7 +1196,8 @@ mod tests {
             let controls = &fixture.controls;
             let selected_job = &job;
             let capacity = admitted.capacity();
-            let worker = threads.spawn(move || controls.before_rebind(selected_job, capacity));
+            let worker =
+                threads.spawn(move || drive(controls.before_rebind(selected_job, capacity)));
             fixture.wait_until_held();
             admitted.cancel();
             let error = worker
@@ -1152,7 +1222,8 @@ mod tests {
             let controls = &fixture.controls;
             let selected_job = &job;
             let capacity = admitted.capacity();
-            let worker = threads.spawn(move || controls.before_rebind(selected_job, capacity));
+            let worker =
+                threads.spawn(move || drive(controls.before_rebind(selected_job, capacity)));
             let error = worker
                 .join()
                 .unwrap()

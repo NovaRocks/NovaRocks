@@ -33,10 +33,9 @@ use std::time::Duration;
 use novarocks_execution_contract::{
     QueryContextReceipt, QueryContextRef, QueryContextState, TaskOperationId,
 };
-use tokio::sync::mpsc;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
-use super::{AttemptActivationIdentity, MonotonicInstant};
+use novarocks_coordination_contract::{AttemptActivationIdentity, MonotonicInstant};
 
 const DEFAULT_ABORT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
@@ -383,7 +382,7 @@ struct ContextStandDownRecord {
     authorization_generation: u64,
     worker_settled: bool,
     worker_branch: Option<WorkerClosureBranch>,
-    retry_not_before: Option<super::MonotonicInstant>,
+    retry_not_before: Option<novarocks_coordination_contract::MonotonicInstant>,
     registry_fenced: bool,
 }
 
@@ -594,7 +593,7 @@ impl ContextStandDownLedger {
 
     pub(crate) fn authorize_next_at(
         &mut self,
-        now: super::MonotonicInstant,
+        now: novarocks_coordination_contract::MonotonicInstant,
     ) -> Result<Option<AbortQueryContextIssuePermit>, ContextStandDownError> {
         self.drain_events_at(now)?;
         let contexts: Vec<_> = self
@@ -660,7 +659,9 @@ impl ContextStandDownLedger {
     pub(crate) fn authorize_next(
         &mut self,
     ) -> Result<Option<AbortQueryContextIssuePermit>, ContextStandDownError> {
-        self.authorize_next_at(super::MonotonicInstant::from_origin(Duration::MAX))
+        self.authorize_next_at(
+            novarocks_coordination_contract::MonotonicInstant::from_origin(Duration::MAX),
+        )
     }
 
     pub(crate) fn snapshot(&self, context: QueryContextRef) -> Option<ContextStandDownSnapshot> {
@@ -741,7 +742,9 @@ impl ContextStandDownLedger {
         Ok(())
     }
 
-    pub(crate) fn next_retry_at(&self) -> Option<super::MonotonicInstant> {
+    pub(crate) fn next_retry_at(
+        &self,
+    ) -> Option<novarocks_coordination_contract::MonotonicInstant> {
         self.records
             .values()
             .filter(|record| record.closure == ContextClosureState::AbortPending)
@@ -751,7 +754,7 @@ impl ContextStandDownLedger {
 
     pub(crate) fn drain_events_at(
         &mut self,
-        now: super::MonotonicInstant,
+        now: novarocks_coordination_contract::MonotonicInstant,
     ) -> Result<usize, ContextStandDownError> {
         let mut applied = 0;
         loop {
@@ -770,13 +773,13 @@ impl ContextStandDownLedger {
 
     #[cfg(test)]
     pub(crate) fn drain_events(&mut self) -> Result<usize, ContextStandDownError> {
-        self.drain_events_at(super::MonotonicInstant::ORIGIN)
+        self.drain_events_at(novarocks_coordination_contract::MonotonicInstant::ORIGIN)
     }
 
     #[cfg(test)]
     pub(crate) async fn apply_next_event(
         &mut self,
-        now: impl FnOnce() -> super::MonotonicInstant,
+        now: impl FnOnce() -> novarocks_coordination_contract::MonotonicInstant,
     ) -> Result<(), ContextStandDownError> {
         let event = self
             .event_rx
@@ -801,7 +804,7 @@ impl ContextStandDownLedger {
     fn apply_event(
         &mut self,
         event: AbortIssueEvent,
-        now: super::MonotonicInstant,
+        now: novarocks_coordination_contract::MonotonicInstant,
     ) -> Result<(), ContextStandDownError> {
         let record = self
             .records
@@ -2054,7 +2057,7 @@ mod tests {
         let (work_owner, stage) = governed_work();
         let config = crate::coordination::LogicalExecutionActorConfig::single_attempt_completion(
             execution,
-            crate::coordination::ExecutionEffect::None,
+            novarocks_coordination_contract::ExecutionEffect::None,
             NonZeroUsize::new(2).unwrap(),
             vec![context],
             NonZeroUsize::new(2).unwrap(),
@@ -2165,7 +2168,7 @@ mod tests {
         let (work_owner, stage) = governed_work();
         let config = crate::coordination::LogicalExecutionActorConfig::single_attempt_completion(
             execution,
-            crate::coordination::ExecutionEffect::None,
+            novarocks_coordination_contract::ExecutionEffect::None,
             NonZeroUsize::new(1).unwrap(),
             vec![context],
             NonZeroUsize::new(1).unwrap(),

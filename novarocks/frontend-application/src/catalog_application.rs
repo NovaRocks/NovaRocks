@@ -48,12 +48,36 @@ pub mod query_catalog;
 pub mod query_materializer;
 pub mod resolver;
 pub mod statement;
+pub(crate) mod statement_action;
 pub mod system_catalog_facts;
 
 /// Frontend's narrow best-effort observation of its MV accelerator state.
 pub struct MvCatalogReferenceReader;
 
 impl CatalogReferenceReader for MvCatalogReferenceReader {
+    fn observe_references_in<'a>(
+        &'a self,
+        store: &'a dyn StateStore,
+        instance_id: &'a ConnectorInstanceId,
+        page_size: usize,
+        execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> BoxFuture<
+        'a,
+        Result<Option<&'static str>, novarocks_state_store_api::StateStoreExecutionFailure>,
+    > {
+        Box::pin(async move {
+            novarocks_mv_application::state_store_repository::observe_catalog_references_in(
+                store,
+                instance_id.as_str(),
+                page_size,
+                execution,
+            )
+            .await
+            .map(|reference| reference.map(|reference| reference.describe()))
+            .map_err(novarocks_failure_contract::SharedFailureCause::new)
+        })
+    }
+
     fn observe_references<'a>(
         &'a self,
         store: &'a dyn StateStore,
@@ -415,6 +439,35 @@ struct PublishedCatalogApplicationPort {
 }
 
 impl CatalogApplicationPort for PublishedCatalogApplicationPort {
+    fn require_catalog_mutation_admission(&self) -> Result<(), CatalogApplicationError> {
+        self.application.require_catalog_mutation_admission()
+    }
+
+    fn create_catalog_in<'a>(
+        &'a self,
+        command: CatalogCreateCommand,
+        execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+        receipt: &'a novarocks_catalog_application::CatalogMutationReceipt,
+    ) -> BoxFuture<'a, Result<CatalogRuntimeObservation, CatalogApplicationError>> {
+        Box::pin(async move {
+            let observation = self
+                .application
+                .create_catalog_in(command, execution, receipt)
+                .await?;
+            self.projection.require_exact(&observation)?;
+            Ok(observation)
+        })
+    }
+    fn drop_catalog_in<'a>(
+        &'a self,
+        command: CatalogDropCommand,
+        execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+        receipt: &'a novarocks_catalog_application::CatalogMutationReceipt,
+    ) -> BoxFuture<'a, Result<(), CatalogApplicationError>> {
+        self.application
+            .drop_catalog_in(command, execution, receipt)
+    }
+
     fn create_catalog(
         &self,
         command: CatalogCreateCommand,

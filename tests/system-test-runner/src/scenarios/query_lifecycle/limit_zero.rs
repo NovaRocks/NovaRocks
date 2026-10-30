@@ -14,8 +14,7 @@
 // under the License.
 
 use super::*;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use crate::scenarios::native_create_hold::{HeldCreate, HoldListener};
 use std::time::Instant;
 
 const FAULT: &str = "create-task-before-worker-hold";
@@ -103,7 +102,7 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
     control.finish()?;
     context.action("created three independent Iceberg scan files before arming exact Create holds");
     let baseline = resource_snapshot(context)?;
-    let listener = HoldListener::bind(&selected.token)?;
+    let listener = HoldListener::bind(&selected.token, context.process_ids().backends.len())?;
     let connection = mysql_actor::connect_until(
         context.mysql_user(),
         context.mysql_port(),
@@ -258,21 +257,17 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
         drop(restore);
         Ok(execution)
     })();
-    // Disable future holds before releasing the observed requests. Listener
-    // drop also releases pending connections and unlinks the socket, so a
-    // late hook cannot remain parked while the bounded client is joined.
-    let cleared = context.handle().clear_query_lifecycle_faults();
-    let mut released = Ok(());
-    for create in &mut held {
-        released =
-            crate::scenarios::paimon::scan_statement_actor::combine(released, create.release());
-    }
+    // Keep observed peers alive until their release bytes are written. Ending
+    // the action lets those peers close their sockets without reading a release.
+    let released_and_cleared = release_observed_then_clear(&mut held, || {
+        context.handle().clear_query_lifecycle_faults()
+    });
+    // The grant is now retired. Listener drop releases pending connections and
+    // unlinks the socket before joining the bounded client.
     drop(listener);
     let joined = query.join();
-    let cleanup = crate::scenarios::paimon::scan_statement_actor::combine(
-        crate::scenarios::paimon::scan_statement_actor::combine(cleared, released),
-        joined,
-    );
+    let cleanup =
+        crate::scenarios::paimon::scan_statement_actor::combine(released_and_cleared, joined);
     let execution = crate::scenarios::paimon::scan_statement_actor::combine(result, cleanup)?;
     // The public answer above is the seal witness. Full background cleanup
     // evidence is read only after restoring transport and releasing every
@@ -289,6 +284,18 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
     );
     await_resource_convergence(context, &baseline)?;
     Ok(())
+}
+
+fn release_observed_then_clear(
+    held: &mut [HeldCreate],
+    clear: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut released = Ok(());
+    for create in held {
+        released =
+            crate::scenarios::paimon::scan_statement_actor::combine(released, create.release());
+    }
+    crate::scenarios::paimon::scan_statement_actor::combine(released, clear())
 }
 
 struct QueryRead(Option<thread::JoinHandle<Result<()>>>);
@@ -318,160 +325,5 @@ impl Drop for RestoreProxy {
             .set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Forward);
         self.0
             .set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Forward);
-    }
-}
-
-struct HoldListener {
-    path: PathBuf,
-    listener: UnixListener,
-}
-impl HoldListener {
-    fn bind(token: &str) -> Result<Self> {
-        let path = novarocks_failpoint::create_before_worker_rendezvous_socket_path(token)
-            .map_err(anyhow::Error::msg)?;
-        let listener = UnixListener::bind(&path)?;
-        listener.set_nonblocking(true)?;
-        Ok(Self { path, listener })
-    }
-    fn try_receive(&self, token: &str, deadline: Instant) -> Result<Option<HeldCreate>> {
-        let (mut stream, _) = match self.listener.accept() {
-            Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let payload = crate::scenarios::native_direct_controls::read_marker(
-            &mut stream,
-            deadline.min(Instant::now() + Duration::from_secs(1)),
-        )?;
-        let field = |name: &str| -> Result<String> {
-            payload
-                .split_whitespace()
-                .find_map(|value| value.strip_prefix(&format!("{name}=")))
-                .map(str::to_owned)
-                .with_context(|| format!("missing {name} in held Create {payload:?}"))
-        };
-        let backend = field("backend_index")?.parse::<usize>()?;
-        ensure!(
-            field("token")? == token && backend < REQUIRED_BACKENDS,
-            "held Create rendezvous identity differs from arming: {payload}"
-        );
-        let create = HeldCreate {
-            backend,
-            deadline,
-            execution: field("execution_id")?,
-            stage: field("stage")?,
-            process: field("process_id")?,
-            task: field("task")?,
-            outbound_edges: field("outbound_edges")?.parse()?,
-            payload,
-            stream: Some(stream),
-        };
-        Ok(Some(create))
-    }
-}
-impl Drop for HoldListener {
-    fn drop(&mut self) {
-        // Any connection that the main loop has not yet observed still owns
-        // an exact parked Native request. Release it before unlinking.
-        while let Ok((mut stream, _)) = self.listener.accept() {
-            crate::scenarios::native_direct_controls::close_hold(&mut stream);
-        }
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-struct HeldCreate {
-    deadline: Instant,
-    backend: usize,
-    execution: String,
-    stage: String,
-    task: String,
-    process: String,
-    outbound_edges: usize,
-    payload: String,
-    stream: Option<UnixStream>,
-}
-impl HeldCreate {
-    fn identity_marker(&self) -> String {
-        format!(
-            "execution_id={} stage={} task={}",
-            self.execution, self.stage, self.task
-        )
-    }
-    fn release(&mut self) -> Result<()> {
-        if let Some(mut stream) = self.stream.take() {
-            crate::scenarios::native_direct_controls::release_hold(&mut stream, self.deadline)?;
-        }
-        Ok(())
-    }
-}
-impl Drop for HeldCreate {
-    fn drop(&mut self) {
-        if let Some(mut stream) = self.stream.take() {
-            crate::scenarios::native_direct_controls::close_hold(&mut stream);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-    use std::net::Shutdown;
-
-    #[test]
-    fn listener_drop_releases_unobserved_parked_create_and_unlinks_socket() {
-        let token = format!(
-            "cbw-pending-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let listener = HoldListener::bind(&token).unwrap();
-        let path = listener.path.clone();
-        let mut backend = UnixStream::connect(&path).unwrap();
-        backend.write_all(format!("token={token} execution_id=10:20:1 stage=2 task=3 backend_index=1 process_id=exact-process outbound_edges=1\n").as_bytes()).unwrap();
-        backend.shutdown(Shutdown::Write).unwrap();
-        drop(listener);
-        let mut release = [0_u8; 1];
-        backend.read_exact(&mut release).unwrap();
-        assert_eq!(release, [b'R']);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn held_create_rendezvous_preserves_identity_until_explicit_release() {
-        let token = format!(
-            "cbw-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let listener = HoldListener::bind(&token).unwrap();
-        let mut backend = UnixStream::connect(&listener.path).unwrap();
-        backend.write_all(format!(
-            "token={token} execution_id=10:20:1 stage=2 task=3 backend_index=1 process_id=exact-process outbound_edges=1\n"
-        ).as_bytes()).unwrap();
-        backend.shutdown(Shutdown::Write).unwrap();
-        let mut create = listener
-            .try_receive(&token, Instant::now() + Duration::from_secs(1))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            create.identity_marker(),
-            "execution_id=10:20:1 stage=2 task=3"
-        );
-        assert_eq!(create.process, "exact-process");
-        assert_eq!(create.outbound_edges, 1);
-        create.release().unwrap();
-        let mut release = [0_u8; 1];
-        backend.read_exact(&mut release).unwrap();
-        assert_eq!(release, [b'R']);
-        let path = listener.path.clone();
-        drop(listener);
-        assert!(!path.exists());
     }
 }

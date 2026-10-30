@@ -219,7 +219,7 @@ fn encode_preflight(
         // Shape namespace cannot retain even empty spare annotation backing.
         // Source annotations are authored independently in public source facts.
         work.step()?;
-        if entry.source.metadata().capacity() != 0 {
+        if entry.source.metadata().as_arc().is_some() {
             return Err(invalid("Schema shape retains retired annotation backing"));
         }
         let fields = entry.source.fields();

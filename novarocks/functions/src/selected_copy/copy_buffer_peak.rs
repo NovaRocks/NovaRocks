@@ -28,7 +28,7 @@ pub(super) struct CopyBufferPeak {
     transient_upper: usize,
 }
 impl CopyBufferPeak {
-    /// Arrow 58.2 MutableBuffer::reserve grows to
+    /// Arrow 60.1.0 MutableBuffer::try_reserve/reserve grows to
     /// max(round64(required), 2 * previous_capacity). For any append sequence
     /// bounded by maximum_required, every grown capacity is <= 2 * max(initial,
     /// round64(maximum_required)); its previous buffer is <= that same maximum.

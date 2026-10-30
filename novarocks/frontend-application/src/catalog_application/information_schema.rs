@@ -78,21 +78,70 @@ impl InfoColumn {
     }
 }
 
-/// The materialized-views virtual table consumes only ready Accelerator
-/// projections, never a retained row from a quarantined lake package.
-pub fn try_query_materialized_views(
+/// The caller retains the original owner and result delivery capability.
+/// Missing/expired original execution never selects the synchronous adapter.
+pub(crate) async fn try_query_materialized_views_in(
     readiness: &MvReadinessPort,
     query: &ast::Query,
-) -> Result<Option<StatementResult>, String> {
+    execution: std::sync::Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>,
+) -> Result<Option<StatementResult>, novarocks_query_application::session_error::QueryServiceError>
+{
+    let Some(projection) = materialized_view_projection(query).map_err(local_query_error)? else {
+        return Ok(None);
+    };
+    let view = readiness.in_requests(execution);
+    let mut inventory = view
+        .local_projection_inventory()
+        .await
+        .map_err(repository_query_error)?;
+    let mut rows = MaterializedViewRows::default();
+    while let Some(loaded) = inventory
+        .next_ready()
+        .await
+        .map_err(repository_query_error)?
+    {
+        rows.push(&loaded.projection).map_err(local_query_error)?;
+    }
+    render_materialized_view_rows(query, &projection, rows.rows)
+        .map(Some)
+        .map_err(local_query_error)
+}
+
+fn repository_query_error(
+    error: novarocks_mv_application::repository::MvRepositoryError,
+) -> novarocks_query_application::session_error::QueryServiceError {
+    novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+        novarocks_failure_contract::SharedFailureCause::from_static_detail(
+            error,
+            "load materialized view metadata failed",
+        ),
+    )
+}
+fn local_query_error(
+    message: impl Into<String>,
+) -> novarocks_query_application::session_error::QueryServiceError {
+    novarocks_query_application::session_error::QueryServiceError::new(
+        novarocks_query_application::session_error::QueryServiceErrorKind::Internal,
+        message,
+    )
+}
+fn materialized_view_projection(query: &ast::Query) -> Result<Option<Vec<InfoColumn>>, String> {
     if !is_local_materialized_views_query(query) {
         return Ok(None);
     }
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         unreachable!("local materialized-view admission requires SELECT");
     };
-
-    let projection = projection_columns(select)?;
-    let mut rows = materialized_view_rows(readiness)?;
+    projection_columns(select).map(Some)
+}
+fn render_materialized_view_rows(
+    query: &ast::Query,
+    projection: &[InfoColumn],
+    mut rows: Vec<MaterializedViewInfoRow>,
+) -> Result<StatementResult, String> {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        unreachable!("local materialized-view admission requires SELECT");
+    };
     if let Some(selection) = select.selection.as_ref() {
         let mut filtered = Vec::with_capacity(rows.len());
         for row in rows {
@@ -103,26 +152,19 @@ pub fn try_query_materialized_views(
         rows = filtered;
     }
     apply_order_by(query, &mut rows)?;
-    build_query_result(&projection, &rows)
-        .map(StatementResult::Query)
-        .map(Some)
+    build_query_result(projection, &rows).map(StatementResult::Query)
 }
-
-fn materialized_view_rows(
-    readiness: &MvReadinessPort,
-) -> Result<Vec<MaterializedViewInfoRow>, String> {
-    let mut inventory = readiness
-        .local_projection_inventory()
-        .map_err(|e| format!("load materialized view metadata inventory failed: {e}"))?;
-    let bound = novarocks_query_application::api::LocalResultBound::V1;
-    let mut rows = Vec::new();
-    let mut bytes = 0usize;
-    let mut workspace_payload = 0usize;
-    while let Some(loaded) = inventory
-        .next_ready()
-        .map_err(|e| format!("load materialized view metadata failed: {e}"))?
-    {
-        let target = loaded.projection.facts.target();
+#[derive(Default)]
+struct MaterializedViewRows {
+    rows: Vec<MaterializedViewInfoRow>,
+    bytes: usize,
+    workspace_payload: usize,
+}
+impl MaterializedViewRows {
+    // Shared row/byte/workspace author for legacy and original inventories.
+    fn push(&mut self, projection: &StoredKeyedMvProjection) -> Result<(), String> {
+        let bound = novarocks_query_application::api::LocalResultBound::V1;
+        let target = projection.facts.target();
         let row_bytes = [target.namespace().len(), target.name().len(), 4, 0]
             .into_iter()
             .fold(0usize, |total, n| {
@@ -130,16 +172,21 @@ fn materialized_view_rows(
                     novarocks_query_application::api::LocalResultBound::cell_bytes(n),
                 )
             });
-        bytes = bytes.saturating_add(row_bytes);
+        self.bytes = self.bytes.saturating_add(row_bytes);
         bound
-            .admit(rows.len().saturating_add(1), bytes)
+            .admit(self.rows.len().saturating_add(1), self.bytes)
             .map_err(|e| format!("information_schema.materialized_views: {e}"))?;
-        let capacity = if rows.len() == rows.capacity() {
-            rows.capacity().saturating_mul(2).max(1).min(bound.rows)
+        let capacity = if self.rows.len() == self.rows.capacity() {
+            self.rows
+                .capacity()
+                .saturating_mul(2)
+                .max(1)
+                .min(bound.rows)
         } else {
-            rows.capacity()
+            self.rows.capacity()
         };
-        workspace_payload = workspace_payload
+        self.workspace_payload = self
+            .workspace_payload
             .saturating_add(target.namespace().len())
             .saturating_add(target.name().len())
             .saturating_add(2 * 64);
@@ -148,20 +195,21 @@ fn materialized_view_rows(
         if capacity
             .saturating_mul(2)
             .saturating_mul(std::mem::size_of::<MaterializedViewInfoRow>())
-            .saturating_add(workspace_payload)
+            .saturating_add(self.workspace_payload)
             > bound.bytes
         {
             return Err(
                 "information_schema.materialized_views exceeds its row workspace bound".into(),
             );
         }
-        if capacity != rows.capacity() {
-            rows.try_reserve_exact(capacity - rows.len())
+        if capacity != self.rows.capacity() {
+            self.rows
+                .try_reserve_exact(capacity - self.rows.len())
                 .map_err(|_| "information_schema.materialized_views workspace allocation failed")?;
         }
-        rows.push(materialized_view_row(&loaded.projection));
+        self.rows.push(materialized_view_row(projection));
+        Ok(())
     }
-    Ok(rows)
 }
 
 fn materialized_view_row(projection: &StoredKeyedMvProjection) -> MaterializedViewInfoRow {
@@ -501,5 +549,130 @@ mod bounded_source_tests {
         )
         .unwrap_err();
         assert!(error.contains("column bound"));
+    }
+}
+
+#[cfg(test)]
+mod original_read_tests {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_state_store_api::{StateStoreExecutionContext, StateStoreExecutionPort};
+    use std::time::{Duration, Instant};
+    struct NoPhysicalPort;
+    impl StateStoreExecutionPort for NoPhysicalPort {
+        fn bind_original_in(
+            &self,
+            _: &Arc<dyn novarocks_state_store_api::StateStoreBlockingOriginal>,
+            _: Instant,
+            _: &mut Option<Box<dyn novarocks_state_store_api::StateStoreBlockingSlot>>,
+        ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+            panic!("pure information_schema fixture must not dispatch physical work")
+        }
+        fn request_progress(&self) {}
+    }
+    fn execution() -> (Arc<dyn StateStoreExecutionPort>, StateStoreExecutionContext) {
+        let owner: Arc<dyn StateStoreExecutionPort> = Arc::new(NoPhysicalPort);
+        let context =
+            StateStoreExecutionContext::new(&owner, Instant::now() + Duration::from_secs(5));
+        (owner, context)
+    }
+    fn query(sql: &str) -> ast::Query {
+        let mut statements = novarocks_parser::parse(sql).unwrap();
+        match statements.remove(0) {
+            ast::Statement::Query(query) => query,
+            _ => panic!("expected a parsed query"),
+        }
+    }
+    async fn readiness(store: Arc<dyn novarocks_state_store_api::StateStore>) -> MvReadinessPort {
+        let repository =
+            novarocks_mv_application::state_store_repository::StateStoreMvRepository::open(
+                store,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        MvReadinessPort::from_product(
+            novarocks_mv_application::readiness::MvKeyedReadinessService::new(
+                repository,
+                Arc::default(),
+            ),
+            tokio::runtime::Handle::current(),
+            crate::mv::domain::test_admission::management_entrance(),
+        )
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn original_information_schema_keeps_repository_refusal_and_does_not_select_legacy() {
+        let (_owner, execution) = execution();
+        let port = readiness(Arc::new(
+            novarocks_state_store_testkit::testing::InMemoryStateStore::new(
+                "information-schema-no-original",
+            ),
+        ))
+        .await;
+        let query = query("SELECT TABLE_NAME FROM information_schema.materialized_views");
+        let error =
+            match try_query_materialized_views_in(&port, &query, Arc::new(execution.clone())).await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("unsupported Original must not become a legacy empty result"),
+            };
+        let repository = error
+            .failure_cause()
+            .unwrap()
+            .downcast_ref::<novarocks_mv_application::repository::MvRepositoryError>()
+            .unwrap();
+        assert!(repository.original_failure().is_some());
+        assert_eq!(
+            repository.failure_fact(),
+            novarocks_state_store_api::StateStoreOriginalUnsupported.failure_fact()
+        );
+        assert_eq!(
+            error.execution_failure().unwrap().fact(),
+            repository.failure_fact()
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn original_information_schema_awaits_pure_inventory_and_keeps_recognition_and_column_errors()
+     {
+        let mut host = crate::state_store::testing::open_persistent(format!(
+            "information-schema-original-{}",
+            uuid::Uuid::now_v7()
+        ))
+        .await;
+        let (_owner, execution) = execution();
+        let port = readiness(host.state_store().unwrap()).await;
+        let selected = query(
+            "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.materialized_views WHERE TABLE_SCHEMA = 'sales' ORDER BY TABLE_NAME",
+        );
+        match try_query_materialized_views_in(&port, &selected, Arc::new(execution.clone()))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            StatementResult::Query(result) => assert_eq!(result.row_count(), 0),
+            _ => panic!("expected the existing local Arrow result"),
+        }
+        let other = query("SELECT 1");
+        let expired = execution.with_deadline(Instant::now() - Duration::from_secs(1));
+        assert!(
+            try_query_materialized_views_in(&port, &other, Arc::new(expired.clone()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let invalid = query("SELECT unknown_mv_column FROM information_schema.materialized_views");
+        let local_column_error = materialized_view_projection(&invalid).unwrap_err();
+        let new = try_query_materialized_views_in(&port, &invalid, Arc::new(expired.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(new.to_string(), local_column_error);
+        assert!(
+            new.failure_cause().is_none(),
+            "a local column error must not invent a provider fact"
+        );
+        drop(port);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
     }
 }

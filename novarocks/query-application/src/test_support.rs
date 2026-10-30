@@ -39,13 +39,14 @@ use crate::api::{
     ResultSchema,
 };
 use crate::coordination::{
-    AdmissionIssueReceipt, AdmissionIssueSettlement, AttemptActivationIdentity,
-    ContextStandDownSnapshot, LogicalExecutionActor, LogicalExecutionActorConfig,
-    LogicalExecutionActorError, LogicalExecutionActorSnapshot, LogicalExecutionJoinReadiness,
-    LogicalExecutionOutputTransfer, LogicalExecutionRegistration, LogicalExecutionRuntimeRegistry,
+    AdmissionIssueReceipt, AdmissionIssueSettlement, ContextStandDownSnapshot,
+    LogicalExecutionActor, LogicalExecutionActorConfig, LogicalExecutionActorError,
+    LogicalExecutionActorSnapshot, LogicalExecutionJoinReadiness, LogicalExecutionOutputTransfer,
+    LogicalExecutionRegistration, LogicalExecutionRuntimeRegistry,
     LogicalExecutionRuntimeRegistryError, LogicalExecutionRuntimeRegistryHandle,
     LogicalExecutionRuntimeShutdownError, RunningAttemptPermit,
 };
+use novarocks_coordination_contract::AttemptActivationIdentity;
 
 use crate::api::result::{
     EndDelivery, QueryResultTransport, ResultDelivery, ResultDeliveryDisposition,
@@ -493,6 +494,391 @@ impl LogicalExecutionTestHarness {
         })
     }
 
+    /// Installs the real internal-result actor for role-local integration tests.
+    /// The description, clock and budgets follow the production validation path;
+    /// this helper does not construct a readiness token or a decoded receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_internal(
+        runtime: Handle,
+        config: LogicalExecutionActorConfig,
+        description: &crate::preparation::FrozenExecutionDescription,
+        delivery_capacity: std::num::NonZeroUsize,
+        clock: std::sync::Arc<dyn novarocks_coordination_contract::MonotonicClock>,
+        budgets: crate::api::ComputationObservationBudgets,
+        initial_execution: QueryExecutionId,
+        contexts: Vec<QueryContextRef>,
+    ) -> Result<Self, LogicalExecutionRuntimeRegistryError> {
+        let config = config
+            .with_internal_computation(description, delivery_capacity)?
+            .with_clock(clock)
+            .with_internal_observation_budgets(budgets);
+        Self::install(runtime, config, initial_execution, contexts)
+    }
+
+    /// Exposes the original effect-free recovery configuration only to the
+    /// existing integration harness. install_internal still validates the
+    /// actual description's effect, recovery policy, and internal carrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn internal_pre_visibility_recovery_config(
+        initial_execution: QueryExecutionId,
+        mailbox_capacity: std::num::NonZeroUsize,
+        contexts: Vec<QueryContextRef>,
+        max_admission_issues: std::num::NonZeroUsize,
+        max_establish_authorizations: std::num::NonZeroUsize,
+        max_attempts: std::num::NonZeroU32,
+        qualification: std::sync::Arc<dyn crate::coordination::ReplacementQualificationEffectPort>,
+        owner: novarocks_workload_control::WorkOwner,
+        stage: novarocks_workload_control::StagePermit,
+        reservation_valid_for: std::time::Duration,
+    ) -> Result<LogicalExecutionActorConfig, LogicalExecutionActorError> {
+        LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+            initial_execution,
+            mailbox_capacity,
+            contexts,
+            max_admission_issues,
+            max_establish_authorizations,
+            max_attempts,
+            qualification,
+            owner,
+            stage,
+            reservation_valid_for,
+        )
+    }
+
+    /// Consume the same original running authority through the actor's real
+    /// failure/visibility/attempt-budget gate, qualification and activation.
+    /// Failure/cancellation leaves the original actor/registry owned by self;
+    /// this helper never reconstructs a consumed permit or a Ready token.
+    pub async fn replace_original_running_attempt(
+        &mut self,
+        failure: novarocks_coordination_contract::AttemptFailureClass,
+        successor: QueryExecutionId,
+        contexts: Vec<QueryContextRef>,
+    ) -> Result<AttemptActivationIdentity, LogicalExecutionActorError> {
+        let running = self
+            .running
+            .take()
+            .ok_or(LogicalExecutionActorError::WrongPhase)?;
+        let qualification = self
+            .actor()
+            .begin_replacement(running, failure, successor, contexts)
+            .await?;
+        let initial = self.actor().activate_replacement(qualification).await?;
+        let running = self.actor().activate(initial.ready()).await?;
+        let identity = running.identity();
+        self.running = Some(running);
+        Ok(identity)
+    }
+
+    /// Replays the fixture's original accepted admission and Establish facts
+    /// through the real actor-owned permit/transport/Worker-settlement path.
+    /// The caller supplies the already-observed operation identities and ACKs;
+    /// this helper never clears required contexts or writes a ledger state.
+    pub async fn settle_original_applied_establish(
+        &self,
+        admission_request: novarocks_execution_contract::AcquireQueryContextAdmissionTicket,
+        admission_settlement: crate::coordination::AdmissionIssueSettlement,
+        establish_request: std::sync::Arc<novarocks_execution_contract::EstablishQueryContext>,
+        establish_ack_operation: novarocks_execution_contract::TaskOperationId,
+        establish_outcome: novarocks_execution_contract::OperationOutcome,
+    ) -> Result<(), LogicalExecutionActorError> {
+        self.settle_original_establish(
+            admission_request,
+            Some(admission_settlement),
+            establish_request,
+            establish_ack_operation,
+            establish_outcome,
+        )
+        .await
+    }
+
+    /// A replacement's admission was already installed by its actual qualified
+    /// reservation. Reuse that exact grant without issuing admission twice.
+    pub async fn settle_original_qualified_establish(
+        &self,
+        admission_request: novarocks_execution_contract::AcquireQueryContextAdmissionTicket,
+        establish_request: std::sync::Arc<novarocks_execution_contract::EstablishQueryContext>,
+        establish_ack_operation: novarocks_execution_contract::TaskOperationId,
+        establish_outcome: novarocks_execution_contract::OperationOutcome,
+    ) -> Result<(), LogicalExecutionActorError> {
+        self.settle_original_establish(
+            admission_request,
+            None,
+            establish_request,
+            establish_ack_operation,
+            establish_outcome,
+        )
+        .await
+    }
+
+    async fn settle_original_establish(
+        &self,
+        admission_request: novarocks_execution_contract::AcquireQueryContextAdmissionTicket,
+        admission_settlement: Option<crate::coordination::AdmissionIssueSettlement>,
+        establish_request: std::sync::Arc<novarocks_execution_contract::EstablishQueryContext>,
+        establish_ack_operation: novarocks_execution_contract::TaskOperationId,
+        establish_outcome: novarocks_execution_contract::OperationOutcome,
+    ) -> Result<(), LogicalExecutionActorError> {
+        use crate::coordination::{
+            EstablishIssueIdentity, EstablishIssueSubmit, EstablishTransportAdmission,
+            EstablishTransportReservation, EstablishTransportSink, EstablishTransportSubmission,
+        };
+        use std::sync::{Arc, Mutex};
+        #[derive(Debug, Default)]
+        struct FixtureTransport(Arc<Mutex<Option<EstablishTransportSubmission>>>);
+        #[derive(Debug)]
+        struct FixtureReservation(Arc<Mutex<Option<EstablishTransportSubmission>>>);
+        impl EstablishTransportReservation for FixtureReservation {
+            fn submit(self: Box<Self>, submission: EstablishTransportSubmission) {
+                assert!(self.0.lock().unwrap().replace(submission).is_none());
+            }
+        }
+        impl EstablishTransportSink for FixtureTransport {
+            fn try_reserve(&self, _: EstablishIssueIdentity) -> EstablishTransportAdmission {
+                EstablishTransportAdmission::Admitted(Box::new(FixtureReservation(Arc::clone(
+                    &self.0,
+                ))))
+            }
+        }
+        if establish_request.envelope().operation_id() != establish_ack_operation
+            || establish_request.context() != admission_request.context()
+            || !matches!(
+                establish_outcome,
+                novarocks_execution_contract::OperationOutcome::Accepted
+                    | novarocks_execution_contract::OperationOutcome::Idempotent
+            )
+        {
+            return Err(LogicalExecutionActorError::InvariantViolation);
+        }
+        let running = self.running.as_ref().expect("fixture attempt is active");
+        if let Some(admission_settlement) = admission_settlement {
+            let receipt = running.begin_admission_issue(admission_request).await?;
+            running
+                .settle_admission_issue(receipt, admission_settlement)
+                .await?;
+        }
+        let permit = running
+            .authorize_establish(
+                establish_request,
+                admission_request.native_compatibility_id(),
+            )
+            .await?;
+        let transport = FixtureTransport::default();
+        assert_eq!(
+            permit
+                .try_submit(&transport)
+                .map_err(LogicalExecutionActorError::Establish)?,
+            EstablishIssueSubmit::Accepted
+        );
+        transport
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the original request crossed transport ownership")
+            .worker_settled(establish_outcome)
+            .map_err(LogicalExecutionActorError::Establish)?;
+        // Actor mailbox roundtrip is an observation/barrier, never a direct
+        // assignment to the Establish ledger or the Ready state.
+        self.actor()
+            .establish_snapshot(admission_request.context())
+            .await?;
+        Ok(())
+    }
+
+    /// Binds the real current running permit; no source or receipt is forged.
+    pub async fn internal_consumer_activation(
+        &self,
+        root: novarocks_execution_contract::TaskIdentity,
+    ) -> Result<crate::api::InternalConsumerActivation, LogicalExecutionActorError> {
+        self.running
+            .as_ref()
+            .expect("the internal test attempt is active")
+            .bind_internal_consumer(root)
+            .await
+    }
+
+    /// Feature-gated borrow for component tests that retain the whole original
+    /// activation until the real End path consumes it.
+    pub fn internal_consumer_source(
+        activation: &crate::api::InternalConsumerActivation,
+    ) -> &crate::api::ComputationReadySource {
+        &activation.source
+    }
+
+    pub async fn accept_internal_end(
+        &self,
+        root: novarocks_execution_contract::TaskIdentity,
+        status: novarocks_execution_contract::TaskStatus,
+        end: novarocks_execution_contract::root_result::RootResultEnd,
+    ) -> Result<crate::api::ComputationReadyToken, QueryExecutionError> {
+        let activation = self
+            .internal_consumer_activation(root)
+            .await
+            .map_err(|error| {
+                QueryExecutionError::new(
+                    crate::api::QueryExecutionErrorKind::Failed,
+                    format!("internal integration fixture actor failed: {error}"),
+                )
+            })?;
+        self.accept_internal_end_from(activation, root, status, end)
+            .await
+    }
+
+    /// Feeds the original End through the actual actor delivery/decoding path
+    /// and submits the real registered source after its root status is observed.
+    pub async fn accept_internal_end_from(
+        &self,
+        activation: crate::api::InternalConsumerActivation,
+        root: novarocks_execution_contract::TaskIdentity,
+        status: novarocks_execution_contract::TaskStatus,
+        end: novarocks_execution_contract::root_result::RootResultEnd,
+    ) -> Result<crate::api::ComputationReadyToken, QueryExecutionError> {
+        fn actor_error(error: LogicalExecutionActorError) -> QueryExecutionError {
+            QueryExecutionError::new(
+                crate::api::QueryExecutionErrorKind::Failed,
+                format!("internal integration fixture actor failed: {error}"),
+            )
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let running = self
+                .running
+                .as_ref()
+                .expect("the internal test attempt is active");
+            let exit = activation.supervise_exit().await.map_err(actor_error)?;
+            let (mut stream, source) = activation.into_parts();
+            let observer = running.bind_root_result(root).await.map_err(actor_error)?;
+            observer
+                .observe_local_root_end(root, end)
+                .await
+                .map_err(actor_error)?;
+            observer
+                .observe_status_with_failure(
+                    status,
+                    crate::coordination::RootTerminalFailure::Unspecified,
+                )
+                .await
+                .map_err(actor_error)?;
+            let (delivery, decoded) =
+                tokio::join!(running.deliver_internal_end(root, end), async {
+                    match stream.next().await? {
+                        Some(crate::api::InternalResultDelivery::End(end)) => end.complete().await,
+                        _ => Err(QueryExecutionError::new(
+                            crate::api::QueryExecutionErrorKind::Failed,
+                            "internal integration fixture did not receive its original End",
+                        )),
+                    }
+                },);
+            let outcome = match delivery {
+                Ok(()) => match decoded {
+                    Ok(decoded) => source.accept(decoded).await,
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(actor_error(error)),
+            };
+            exit.complete(outcome.as_ref().map(|_| ()).map_err(Clone::clone));
+            outcome
+        })
+        .await
+        .expect("test-only watchdog: original End delivery, decoding and Ready acceptance")
+    }
+
+    /// Drives the real registered consumer and reports its actual future exit.
+    /// No End receipt or Ready proposal is authored by this harness helper.
+    pub async fn run_registered_internal_consumer(
+        &self,
+        consumer: std::sync::Arc<dyn crate::api::InternalComputationConsumer>,
+        activation: crate::api::InternalConsumerActivation,
+    ) -> Result<(), QueryExecutionError> {
+        let exit = activation.supervise_exit().await.map_err(|error| {
+            QueryExecutionError::new(
+                crate::api::QueryExecutionErrorKind::Failed,
+                format!("internal consumer fixture supervision failed: {error}"),
+            )
+        })?;
+        let result = consumer.consume(activation).await;
+        exit.complete(result.clone());
+        result
+    }
+
+    /// Delivers only the original input. The fixed consumer must decode End
+    /// and propose readiness through its own original source.
+    pub async fn deliver_original_internal_end(
+        &self,
+        root: novarocks_execution_contract::TaskIdentity,
+        status: novarocks_execution_contract::TaskStatus,
+        end: novarocks_execution_contract::root_result::RootResultEnd,
+    ) -> Result<(), LogicalExecutionActorError> {
+        let running = self.running.as_ref().expect("fixture attempt is active");
+        let observer = running.bind_root_result(root).await?;
+        observer.observe_local_root_end(root, end).await?;
+        observer
+            .observe_status_with_failure(
+                status,
+                crate::coordination::RootTerminalFailure::Unspecified,
+            )
+            .await?;
+        running.deliver_internal_end(root, end).await
+    }
+
+    /// Transfers one original retained internal segment through its real
+    /// actor delivery receipt. The concrete consumer performs actual decoding.
+    pub async fn deliver_original_internal_segment(
+        &self,
+        sequence: novarocks_execution_contract::ResultPacketSequence,
+        segment: std::sync::Arc<crate::api::RetainedRootReply>,
+        rows: u64,
+    ) -> Result<(), LogicalExecutionActorError> {
+        self.running
+            .as_ref()
+            .expect("fixture attempt is active")
+            .deliver_root_segment(
+                sequence,
+                segment,
+                None,
+                rows,
+                crate::api::RootRelayResidentWindow::default(),
+            )
+            .await
+    }
+
+    /// The exact same failure-freeze entry used by the real root pump. This
+    /// helper cannot replace its running authority or conclude the statement.
+    pub async fn freeze_original_internal_failure(
+        &self,
+        error: QueryExecutionError,
+    ) -> Result<(), LogicalExecutionActorError> {
+        self.running
+            .as_ref()
+            .expect("fixture attempt is active")
+            .freeze_result_attempt_failure(error)
+            .await
+    }
+
+    /// Completes the real Native pump's NoRecovery decision with its original
+    /// running authority. Freezing an attempt error alone is not a conclusion.
+    pub async fn fail_original_running_attempt(
+        &mut self,
+        error: QueryExecutionError,
+    ) -> Result<crate::coordination::LogicalConclusion, LogicalExecutionActorError> {
+        let running = self
+            .running
+            .take()
+            .ok_or(LogicalExecutionActorError::WrongPhase)?;
+        self.actor().fail_attempt_with_error(running, error).await
+    }
+
+    /// The original actor's logical outcome watch, retained across activation
+    /// retirement. This accessor cannot manufacture a cut or decoded receipt.
+    pub fn original_internal_outcome(
+        &self,
+    ) -> watch::Receiver<Option<Result<crate::api::ComputationReadyToken, QueryExecutionError>>>
+    {
+        self.actor()
+            .internal_outcome()
+            .expect("the fixture installed the real internal computation actor")
+    }
+
     pub async fn activate_initial(
         &mut self,
     ) -> Result<AttemptActivationIdentity, LogicalExecutionActorError> {
@@ -575,6 +961,14 @@ impl LogicalExecutionTestHarness {
         self.actor().snapshot().await
     }
 
+    pub async fn establish_snapshot(
+        &self,
+        context: QueryContextRef,
+    ) -> Result<Option<crate::coordination::EstablishIssueSnapshot>, LogicalExecutionActorError>
+    {
+        self.actor().establish_snapshot(context).await
+    }
+
     pub async fn join_readiness(
         &self,
     ) -> Result<LogicalExecutionJoinReadiness, LogicalExecutionRuntimeRegistryError> {
@@ -629,4 +1023,35 @@ impl LogicalExecutionTestHarness {
             .as_ref()
             .expect("the test registration remains owned until finish")
     }
+}
+
+/// Build a real QA schedule for a role adapter's exact frozen fixture facts.
+/// This test-support module is absent from production composition.
+pub fn qualification_schedule(
+    execution: novarocks_types::QueryExecutionId,
+    frontend: novarocks_types::identity::FrontendProcessId,
+    eligible: &[novarocks_types::identity::BackendProcessId],
+    facts: &crate::api::ExecutionSchedulingFacts,
+) -> crate::coordination::AttemptSchedule {
+    crate::coordination::build_attempt_schedule(
+        execution,
+        frontend,
+        eligible,
+        facts,
+        #[cfg(novarocks_dev_controls)]
+        Ok(None),
+    )
+    .expect("fixture uses the original QA schedule builder")
+}
+
+/// Schedule only the explicit placements of a finite role protocol fixture.
+/// No actor, Root, request ticket, runtime or execution capability is created.
+pub fn protocol_fixture_schedule(
+    execution: novarocks_types::QueryExecutionId,
+    frontend: novarocks_types::identity::FrontendProcessId,
+    facts: &crate::api::ExecutionSchedulingFacts,
+    placements: &std::collections::BTreeMap<u32, Vec<novarocks_types::identity::BackendProcessId>>,
+) -> Result<crate::coordination::AttemptSchedule, String> {
+    crate::coordination::protocol_fixture_schedule(execution, frontend, facts, placements)
+        .map_err(|error| error.to_string())
 }

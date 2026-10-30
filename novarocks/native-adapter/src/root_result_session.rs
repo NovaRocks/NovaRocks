@@ -41,7 +41,7 @@ use novarocks_result_contract::{
     ScalarLeafCursor,
 };
 use novarocks_result_render::{
-    ArrowMysqlTextEncoder, BoundedMysqlTextEncoder, RenderTurn, RenderTurnStatus,
+    BoundedClientRowEncoder, ClientRowEncoder, RenderTurn, RenderTurnStatus,
 };
 use novarocks_worker::root_result_channel::{
     RootMetadataReservation, RootProducerExit, RootResultChannel, RootSegmentBuilder,
@@ -179,7 +179,7 @@ impl From<RootSessionFailure> for ExecutionFailure {
     }
 }
 enum InputEncoder {
-    Client(Box<ArrowMysqlTextEncoder>),
+    Client(Box<ClientRowEncoder>),
     Statistics(Box<StatisticsArtifactEncoder>),
     WriteCommit(Box<WriteCommitEncoder>),
     CowSelection(Box<CowSelectionEncoder>),
@@ -374,7 +374,7 @@ struct ProducerState {
     input: Option<Input>,
     /// Reuse a proof only for the same immutable typed input owner. The cursor
     /// also retains the proof; no whole input or query is kept by this cache.
-    client_types: Option<novarocks_result_render::ValidatedMysqlInput>,
+    client_types: Option<novarocks_result_render::ValidatedClientInput>,
     builder: Option<RootSegmentBuilder>,
     used: usize,
     statistics_totals: StatisticsCodecTotals,
@@ -948,7 +948,7 @@ impl RootSessionState {
         statistics_totals: StatisticsCodecTotals,
         write_totals: WriteCommitTotals,
         cow_totals: &CowSelectionTotals,
-        client_types: &mut Option<novarocks_result_render::ValidatedMysqlInput>,
+        client_types: &mut Option<novarocks_result_render::ValidatedClientInput>,
     ) -> ExecutionResult<InputEncoder> {
         let fits = |inline: usize| inline.checked_add(cloning).is_some_and(|n| n <= capacity);
         match self.spec().contract.output() {
@@ -1031,7 +1031,7 @@ impl RootSessionState {
                         .and_then(|proof| proof.rebind_shared(types.clone()));
                     *client_types = Some(match shared {
                         Some(proof) => proof,
-                        None => novarocks_result_render::ValidatedMysqlInput::try_new(
+                        None => novarocks_result_render::ValidatedClientInput::try_new(
                             novarocks_type_contract::ValidatedClientInputTypes::try_new(
                                 Arc::clone(&self.spec().contract),
                                 types,
@@ -1041,14 +1041,14 @@ impl RootSessionState {
                         .map_err(ExecutionFailure::from_domain)?,
                     });
                 }
-                let encoder = ArrowMysqlTextEncoder::try_new_typed_root(
+                let encoder = ClientRowEncoder::try_new_typed_root(
                     client_types.as_ref().unwrap().clone(),
                     input.chunk().record_batch().clone(),
                 )
                 .map_err(ExecutionFailure::from_domain)?;
                 if !encoder
                     .scratch_capacity_bytes()
-                    .checked_add(size_of::<ArrowMysqlTextEncoder>())
+                    .checked_add(size_of::<ClientRowEncoder>())
                     .is_some_and(fits)
                 {
                     return Err(RootSessionFailure::RendererScratch.into());
@@ -2861,6 +2861,84 @@ mod terminal_observation_tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_client_root_dispatches_from_frozen_family() {
+        use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultRead};
+        use novarocks_result_contract::{
+            ClientPresentationFamily, ClientRenderSchema, NativeRenderType, RenderColumn,
+            RenderField, RenderPresentation,
+        };
+        for (family, presentation, expected) in [
+            (
+                ClientPresentationFamily::MysqlText,
+                RenderPresentation::ScalarText,
+                b"\x03\0\0\0\x0242".as_slice(),
+            ),
+            (
+                ClientPresentationFamily::TrinoJson(Default::default()),
+                RenderPresentation::TrinoValue,
+                b"\x04\0\0\0[42]".as_slice(),
+            ),
+        ] {
+            let output = FrozenRootOutput::ClientRows(
+                ClientRenderSchema::try_new(
+                    family,
+                    vec![RenderColumn {
+                        source_ordinal: 0,
+                        source_slot: Some(1),
+                        name: "value".into(),
+                        field: RenderField {
+                            native_type: NativeRenderType::SignedInteger(64),
+                            presentation,
+                            nullable: false,
+                        },
+                    }],
+                    1,
+                )
+                .unwrap(),
+            );
+            let (fixture, _, _) = input_resource_fixture(output);
+            let (chunk, allocation) = actual_foreign_input();
+            let RootInputAdmission::Granted(permit) = fixture.session.try_acquire_input().unwrap()
+            else {
+                panic!("the ClientRows root must admit its original input");
+            };
+            let mut submitted = Some(
+                novarocks_execution::runtime::fragment::io::RootResultInput::new(chunk, permit),
+            );
+            fixture.session.submit_input(&mut submitted).unwrap();
+            assert!(submitted.is_none());
+            fixture.session.finish_input().unwrap();
+            fixture.release();
+            fixture.wait_terminal("finished");
+            fixture.pool.shutdown().unwrap();
+            assert_eq!(
+                fixture.session.producer_exit_progress(),
+                RootWorkExitProgress::Exited
+            );
+            let channel = fixture.session.channel();
+            let request = RootResultRead::try_new(
+                channel.spec().task,
+                channel.spec().contract.profile(),
+                channel.spec().contract.kind(),
+                Some(std::num::NonZeroU64::new(1).unwrap()),
+                0,
+                Duration::from_millis(1),
+            )
+            .unwrap();
+            let delivery = channel.read(&request).await.unwrap();
+            let RootReadOutcome::Data(data) = &delivery.reply().outcome else {
+                panic!("the finished ClientRows root must retain its encoded segment");
+            };
+            assert_eq!(data.body().as_ref(), expected);
+            assert_eq!(data.end_after_data().unwrap().output_rows, 1);
+            assert!(
+                allocation.data.upgrade().is_none(),
+                "actual typed input exits before retained delivery"
+            );
+        }
+    }
+
     #[test]
     fn native_chunk_unknown_exit_keeps_funding_and_allows_accepted_sibling_exit() {
         use novarocks_result_contract::{
@@ -2870,6 +2948,7 @@ mod terminal_observation_tests {
             let output = if client {
                 FrozenRootOutput::ClientRows(
                     ClientRenderSchema::try_new(
+                        novarocks_result_contract::ClientPresentationFamily::MysqlText,
                         vec![RenderColumn {
                             source_ordinal: 0,
                             source_slot: Some(1),

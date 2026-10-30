@@ -24,7 +24,7 @@ use novarocks_result_contract::{
     RenderTimeUnit as U, RootProfileV1 as V,
 };
 use novarocks_result_render::{
-    ArrowMysqlTextEncoder, BoundedMysqlTextEncoder, RenderErrorKind as E, RenderTurnStatus,
+    ArrowMysqlTextEncoder, BoundedClientRowEncoder, RenderErrorKind as E, RenderTurnStatus,
 };
 use std::sync::Arc;
 fn field(n: N, p: P, nullable: bool) -> RenderField {
@@ -54,7 +54,14 @@ fn encoder(batch: RecordBatch, fields: Vec<RenderField>) -> ArrowMysqlTextEncode
         })
         .collect();
     ArrowMysqlTextEncoder::try_new(
-        Arc::new(ClientRenderSchema::try_new(cols, batch.num_columns()).unwrap()),
+        Arc::new(
+            ClientRenderSchema::try_new(
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                cols,
+                batch.num_columns(),
+            )
+            .unwrap(),
+        ),
         batch,
     )
     .unwrap()
@@ -348,7 +355,14 @@ fn repeated_occurrences_and_dictionary() {
             field: f,
         },
     ];
-    let schema = Arc::new(ClientRenderSchema::try_new(cols, 1).unwrap());
+    let schema = Arc::new(
+        ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            cols,
+            1,
+        )
+        .unwrap(),
+    );
     let e = ArrowMysqlTextEncoder::try_new(schema, batch).unwrap();
     let expected = [
         row(&[cell(b"alpha"), cell(b"alpha")].concat()),
@@ -364,6 +378,7 @@ fn opaque_closed_and_binary_named_like_aggregate() {
     let f = field(N::Binary, P::ScalarText, true);
     let schema = Arc::new(
         ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: None,
@@ -648,6 +663,7 @@ fn native_and_dynamic_depth_boundaries() {
     let pair = wrap_list(pair.0, pair.1);
     assert!(
         ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: None,
@@ -823,7 +839,14 @@ fn elements_reset_between_passes_and_sum_occurrences() {
         })
         .collect();
     let mut e = ArrowMysqlTextEncoder::try_new(
-        Arc::new(ClientRenderSchema::try_new(cols, 1).unwrap()),
+        Arc::new(
+            ClientRenderSchema::try_new(
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                cols,
+                1,
+            )
+            .unwrap(),
+        ),
         batch,
     )
     .unwrap();
@@ -842,7 +865,14 @@ fn wide_columns_and_many_small_rows() {
         })
         .collect();
     let e = ArrowMysqlTextEncoder::try_new(
-        Arc::new(ClientRenderSchema::try_new(cols, 1).unwrap()),
+        Arc::new(
+            ClientRenderSchema::try_new(
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                cols,
+                1,
+            )
+            .unwrap(),
+        ),
         batch,
     )
     .unwrap();

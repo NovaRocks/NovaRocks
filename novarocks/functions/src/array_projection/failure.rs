@@ -133,6 +133,7 @@ pub enum ArrayProjectionFailure {
     Value(novarocks_value_arrays::ValueError),
     ValueType(ValueTypeError),
     Layout(LayoutResourceError),
+    UnionFields(novarocks_type_contract::owned_resources::arrow_union::UnionFieldsRequestError),
     Contract(ArrayProjectionViolation),
     RequestArithmetic,
     ArrayLayout {
@@ -154,6 +155,7 @@ impl fmt::Display for ArrayProjectionFailure {
         match self {
             Self::Value(source) => source.fmt(f),
             Self::ValueType(source) => source.fmt(f),
+            Self::UnionFields(source) => source.fmt(f),
             Self::Layout(source) => write!(f, "array construction layout request: {source:?}"),
             Self::Contract(source) => source.fmt(f),
             Self::RequestArithmetic => {
@@ -178,6 +180,7 @@ impl Error for ArrayProjectionFailure {
         match self {
             Self::Value(source) => Some(source),
             Self::ValueType(source) => Some(source),
+            Self::UnionFields(source) => Some(source),
             Self::ArrayLayout { source, .. } => Some(source),
             Self::Arrow { source, .. } => Some(source),
             _ => None,
@@ -212,6 +215,7 @@ impl FailureProjection for ArrayProjectionFailure {
         match self {
             Self::Value(source) => source.failure_fact(),
             Self::ValueType(source) => source.failure_fact(),
+            Self::UnionFields(source) => source.failure_fact(),
             Self::Layout(source) => source.failure_fact(),
             Self::Contract(source) => fact(FailureClass::Invariant, *source as u16),
             Self::RequestArithmetic => fact(FailureClass::Resource, 140),

@@ -429,7 +429,7 @@ fn project_plan_error(outcome: ResolvedDataMutation) -> TruncatePlanError {
 
 fn project_outcome(outcome: ResolvedDataMutation) -> TruncateOutcome {
     match outcome {
-        ResolvedDataMutation::KnownCommitted(completed) => project_committed(completed),
+        ResolvedDataMutation::KnownCommitted(completed) => project_committed(*completed),
         ResolvedDataMutation::KnownUncommitted { failure, cleanup } => {
             TruncateOutcome::KnownUncommitted {
                 failure: project_uncommitted(failure, cleanup),

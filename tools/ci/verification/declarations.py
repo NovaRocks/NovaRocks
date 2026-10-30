@@ -129,6 +129,9 @@ def validate_declarations(metadata, native_list, test_bindings, selector_results
                     or not isinstance(entry.get("reason"), str) or not entry["reason"].strip()):
                 errors.append(key + ": ignored declaration needs filter, class and reason")
                 continue
+            if 'input-owner' in entry and (entry['input-owner'] != 'iceberg-java-rest-interop'
+                    or name != 'novarocks-connector-iceberg' or entry['class'] != 'heavy'):
+                errors.append(key + ': unsupported native input owner')
             if entry["class"] == "heavy" and (not isinstance(entry.get("requires"), list)
                     or not entry["requires"] or any(not isinstance(value, str) or not value for value in entry["requires"])):
                 errors.append(key + ": heavy ignored test needs external requirements")

@@ -11,7 +11,7 @@ provenance:
   - "implementation: provider-owned row-mutation planning and activation"
 code-anchors:
   - "novarocks/spi/src/connector/row_mutation.rs (ConnectorRowMutationPreparation)"
-  - "novarocks/core/src/connector/iceberg/provider.rs (prepare_iceberg_row_mutation)"
+  - "novarocks/connector/iceberg/src/commit/row_mutation_preparation.rs (prepare_row_mutation)"
 ---
 
 ## 问题

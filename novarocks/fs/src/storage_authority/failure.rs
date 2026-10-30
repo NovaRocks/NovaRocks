@@ -31,6 +31,7 @@ pub(crate) enum AuthorityFailureReason {
     AcquisitionDenied = 2,
     CatalogUnreachable = 3,
     NoRenewalCapability = 4,
+    MetadataUnreachable = 5,
 }
 
 /// The local source stays private; the neutral fact carries no provider text.

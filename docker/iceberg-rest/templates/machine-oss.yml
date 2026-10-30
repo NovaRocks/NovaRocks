@@ -1,0 +1,83 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+x-resource-labels: &resource-labels
+  novarocks.fixture.owner: ${NOVA_FIXTURE_OWNER}
+  novarocks.fixture.key: machine
+  novarocks.fixture.kind: machine
+  novarocks.fixture.control-root: ${NOVA_FIXTURE_CONTROL_ROOT}
+x-service-labels: &service-labels
+  <<: *resource-labels
+  novarocks.fixture.version: ${NOVA_FIXTURE_VERSION}
+  novarocks.fixture.activation: ${NOVA_FIXTURE_GENERATION}
+x-cloud-environment: &cloud-environment
+  AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+  AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+  AWS_REGION: ${NOVA_OSS_REGION}
+  NOVA_OSS_ROLE_NAME: ${NOVA_OSS_ROLE_NAME}
+x-rest-environment: &rest-environment
+  <<: *cloud-environment
+  CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+  CATALOG_S3_ENDPOINT: ${NOVA_OSS_S3_ENDPOINT}
+  CATALOG_S3_REGION: ${NOVA_OSS_REGION}
+  CATALOG_S3_PATH__STYLE__ACCESS: 'false'
+  CATALOG_CLIENT_REGION: ${NOVA_OSS_REGION}
+  CATALOG_CLIENT_CREDENTIALS__PROVIDER: org.novarocks.fixture.auth.AliyunEcsCredentialsProvider
+  CATALOG_CLIENT_CREDENTIALS__PROVIDER_ROLE__NAME: ${NOVA_OSS_ROLE_NAME}
+  CATALOG_URI: jdbc:sqlite:/tmp/iceberg-rest-catalog.db
+  CATALOG_CLIENTS: '1'
+services:
+  rest:
+    image: ${REST_IMAGE:?verified image required}
+    pull_policy: never
+    labels: *service-labels
+    environment:
+      <<: *rest-environment
+      CATALOG_WAREHOUSE: ${NOVA_ENV_REST_SERVER_WAREHOUSE_URI}
+    ports: ['${NOVA_ENV_REST_PORT}:8181']
+    volumes: [rest-catalog:/tmp]
+    networks: [iceberg_net]
+  rest-mv:
+    image: ${REST_MV_IMAGE:?verified image required}
+    pull_policy: never
+    labels: *service-labels
+    environment:
+      <<: *rest-environment
+      CATALOG_WAREHOUSE: ${NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI}
+    ports: ['${NOVA_ENV_REST_MV_PORT}:8181']
+    volumes: [rest-mv-catalog:/tmp]
+    networks: [iceberg_net]
+  spark:
+    image: ${SPARK_IMAGE:?verified image required}
+    pull_policy: never
+    labels: *service-labels
+    environment:
+      <<: *cloud-environment
+      SPARK_LOCAL_HOSTNAME: localhost
+    ports: ['${NOVA_ENV_SPARK_PORT}:4040']
+    entrypoint: [/bin/bash, -lc]
+    command: ["trap 'exit 0' TERM INT; sleep infinity & wait"]
+    networks: [iceberg_net]
+volumes:
+  rest-catalog:
+    labels: *resource-labels
+  rest-mv-catalog:
+    labels: *resource-labels
+networks:
+  iceberg_net:
+    name: nr-fixture-machine_iceberg_net
+    labels: *resource-labels

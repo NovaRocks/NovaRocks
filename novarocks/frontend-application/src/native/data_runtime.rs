@@ -43,18 +43,40 @@ pub(super) struct NativeChannelSlot {
 /// not identify the cache entry that supplied an older request.
 #[derive(Clone)]
 pub(super) struct CachedNativeChannel {
-    pub(super) channel: NativeLaneChannel,
-    pub(super) slot: NativeChannelSlot,
+    original: Arc<CachedNativeChannelBody>,
+}
+
+/// One immutable publication template, shared by the cache and escaped identities.
+/// Actual calls clone the channel to obtain their own poll/readiness state.
+struct CachedNativeChannelBody {
+    channel: NativeLaneChannel,
+    slot: NativeChannelSlot,
     generation: Arc<DialGeneration>,
 }
 
 impl CachedNativeChannel {
+    pub(super) fn channel(&self) -> &NativeLaneChannel {
+        &self.original.channel
+    }
+
+    pub(super) fn slot(&self) -> &NativeChannelSlot {
+        &self.original.slot
+    }
+
+    fn generation(&self) -> &Arc<DialGeneration> {
+        &self.original.generation
+    }
+
+    pub(super) fn is_retired(&self) -> bool {
+        self.generation().retired.load(Ordering::Acquire)
+    }
+
     /// Read-only component identity; grants no selection or dial authority.
     #[cfg(test)]
     pub(super) fn same_generation_for_test(&self, other: &Self) -> bool {
-        self.slot == other.slot
-            && Arc::ptr_eq(&self.generation, &other.generation)
-            && !self.generation.retired.load(Ordering::Acquire)
+        self.slot() == other.slot()
+            && Arc::ptr_eq(self.generation(), other.generation())
+            && !self.generation().retired.load(Ordering::Acquire)
     }
 }
 
@@ -64,14 +86,14 @@ struct DialGeneration {
 
 enum NativeChannelCacheRow {
     Dialing(Arc<DialGeneration>),
-    Ready(Box<CachedNativeChannel>),
+    Ready(CachedNativeChannel),
 }
 
 impl NativeChannelCacheRow {
     fn generation(&self) -> &Arc<DialGeneration> {
         match self {
             Self::Dialing(generation) => generation,
-            Self::Ready(channel) => &channel.generation,
+            Self::Ready(channel) => channel.generation(),
         }
     }
 }
@@ -153,7 +175,39 @@ pub(super) struct NativeDialReservation {
     leader: bool,
 }
 
+// A test-only, non-owning observer of the original election. It cannot
+// publish, retire, acquire a lane, or mint another cache/Work identity.
+#[cfg(test)]
+pub(super) struct NativeDialObservationForTest {
+    pub(super) slot: NativeChannelSlot,
+    generation: std::sync::Weak<DialGeneration>,
+}
+
+#[cfg(test)]
+impl NativeDialObservationForTest {
+    pub(super) fn matches(&self, reservation: &NativeDialReservation) -> bool {
+        self.slot == reservation.slot
+            && std::sync::Weak::ptr_eq(&self.generation, &Arc::downgrade(&reservation.generation))
+    }
+}
+
 impl NativeDialReservation {
+    #[cfg(test)]
+    pub(super) fn observe_for_test(&self) -> NativeDialObservationForTest {
+        NativeDialObservationForTest {
+            slot: self.slot.clone(),
+            generation: Arc::downgrade(&self.generation),
+        }
+    }
+
+    pub(super) fn data_runtime(&self) -> &FrontendDataRuntime {
+        &self.runtime
+    }
+
+    pub(super) fn lane(&self) -> FrontendNativeLane {
+        self.slot.key.lane
+    }
+
     pub(super) fn is_retired(&self) -> bool {
         self.generation.retired.load(Ordering::Acquire)
     }
@@ -172,7 +226,7 @@ impl NativeDialReservation {
         }
         match channels.row(&self.slot) {
             Some(NativeChannelCacheRow::Ready(channel))
-                if Arc::ptr_eq(&channel.generation, &self.generation) =>
+                if Arc::ptr_eq(channel.generation(), &self.generation) =>
             {
                 Ok(Some(CachedNativeChannel::clone(channel)))
             }
@@ -202,15 +256,23 @@ impl NativeDialReservation {
             return Err("Native channel generation retired before publication".to_owned());
         }
         let acquired = CachedNativeChannel {
-            channel,
-            slot: self.slot.clone(),
-            generation: Arc::clone(&self.generation),
+            original: Arc::new(CachedNativeChannelBody {
+                // Preserve the cache's original fresh-clone state. The shared
+                // template is never polled through a mutable reference.
+                channel: channel.clone(),
+                slot: self.slot.clone(),
+                generation: Arc::clone(&self.generation),
+            }),
         };
         *channels
             .row_mut(&self.slot)
             .expect("exact dialing row exists") =
-            Some(NativeChannelCacheRow::Ready(Box::new(acquired.clone())));
+            Some(NativeChannelCacheRow::Ready(acquired.clone()));
         self.published = true;
+        // The original fresh input can retire only after the same cache guard.
+        // Escaped/cache aliases retain the one immutable publication template.
+        drop(channels);
+        drop(channel);
         Ok(acquired)
     }
 }
@@ -246,7 +308,7 @@ pub(crate) struct FrontendDataRuntime {
     native_transport: FrontendNativeTransport,
     transport_admission: NativeTransportAdmission,
     channels: Arc<Mutex<ChannelPools>>,
-    dial_gates: Arc<[tokio::sync::Mutex<()>; 4]>,
+    dial_gates: [Arc<tokio::sync::Mutex<()>>; 4],
     task_transport_supervisor: NativeTransportSupervisor,
     connector_blocking_io: ConnectorBlockingIoSupervisor,
     apply_send_port: ApplySendPort,
@@ -264,7 +326,7 @@ impl Clone for FrontendDataRuntime {
             native_transport: self.native_transport.clone(),
             transport_admission: self.transport_admission.clone(),
             channels: Arc::clone(&self.channels),
-            dial_gates: Arc::clone(&self.dial_gates),
+            dial_gates: self.dial_gates.clone(),
             task_transport_supervisor: self.task_transport_supervisor.clone(),
             connector_blocking_io: self.connector_blocking_io.clone(),
             apply_send_port: self.apply_send_port.clone(),
@@ -276,6 +338,23 @@ impl Clone for FrontendDataRuntime {
 }
 
 impl FrontendDataRuntime {
+    /// Capture facts from the original installed owners without requiring a
+    /// predicted layout of their records or SDK pointees.
+    pub(crate) fn installed_runtime_sources(
+        &self,
+    ) -> Result<
+        crate::native_workload::NativeProcessCapacitySources,
+        novarocks_workload_control::WorkError,
+    > {
+        Ok(crate::native_workload::NativeProcessCapacitySources {
+            apply_records: self.apply_send_port.installed_records()?,
+            subscription_records: self.subscription_port.installed_records()?,
+            transport: self.task_transport_supervisor.capacity_sources(),
+            #[cfg(test)]
+            physical: self.transport_admission.dimensions(),
+        })
+    }
+
     pub(crate) fn handle(&self) -> &Handle {
         &self.handle
     }
@@ -310,7 +389,7 @@ impl FrontendDataRuntime {
         let task_transport_supervisor =
             NativeTransportSupervisor::from_transport(task_transport_budget)?;
         let channels = Arc::new(Mutex::new(ChannelPools::default()));
-        let dial_gates = Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(())));
+        let dial_gates = std::array::from_fn(|_| Arc::new(tokio::sync::Mutex::new(())));
         let connector_blocking_io = ConnectorBlockingIoSupervisor::new(handle.clone());
         let (original_apply_owner, apply_send_port) =
             ApplySendOwner::new(handle.clone(), task_transport_budget)
@@ -680,14 +759,14 @@ impl FrontendDataRuntime {
             .channels
             .lock()
             .expect("frontend native channel cache lock");
-        let Some(row) = channels.row_mut(&acquired.slot) else {
+        let Some(row) = channels.row_mut(acquired.slot()) else {
             return false;
         };
-        if !matches!(row, Some(NativeChannelCacheRow::Ready(current)) if Arc::ptr_eq(&current.generation, &acquired.generation))
+        if !matches!(row, Some(NativeChannelCacheRow::Ready(current)) if Arc::ptr_eq(current.generation(), acquired.generation()))
         {
             return false;
         }
-        acquired.generation.retired.store(true, Ordering::Release);
+        acquired.generation().retired.store(true, Ordering::Release);
         *row = None;
         true
     }
@@ -715,6 +794,21 @@ impl FrontendDataRuntime {
             }
             false
         });
+    }
+
+    /// Try the original lane's existing dial position. The owned guard can
+    /// enter the original stable input without borrowing a movable runtime.
+    pub(super) fn try_dial_lane(
+        &self,
+        lane: FrontendNativeLane,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let index = match lane {
+            FrontendNativeLane::ResultData => 0,
+            FrontendNativeLane::Submission => 1,
+            FrontendNativeLane::Observation => 2,
+            FrontendNativeLane::LifecycleControl => 3,
+        };
+        Arc::clone(&self.dial_gates[index]).try_lock_owned().ok()
     }
 
     pub(super) async fn dial_lane(
@@ -775,6 +869,106 @@ mod tests {
             novarocks_workload_control::WorkloadConfig::default().scope_records_limit,
         )
         .expect("the default task transport budget is valid")
+    }
+
+    #[tokio::test]
+    async fn capacity_capture_reads_the_original_pools_factory_and_subscription_inventory() {
+        use crate::native_workload::{
+            FrontendNativeCapacityInputs, FrontendWorkloadCapacityConfig,
+        };
+        use crate::query_execution::internal_result_cpu::{
+            FrontendResultCapacityProfile, InternalResultCpuOwner,
+        };
+        use novarocks_query_application::cpu::{
+            QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
+        };
+        use novarocks_workload_control::{WorkError, WorkloadConfig, WorkloadControl};
+        use std::{
+            num::NonZeroUsize,
+            time::{Duration, Instant},
+        };
+        let native = data_runtime(tokio::runtime::Handle::current());
+        let workload = WorkloadConfig::default();
+        let mut control = WorkloadControl::try_new_counted(workload.clone()).unwrap();
+        let result = FrontendResultCapacityProfile::for_test();
+        let config = QueryBlockingExecutorConfig::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
+        let mut internal = InternalResultCpuOwner::try_new(config, &mut control.owner).unwrap();
+        let mut blocking = QueryBlockingExecutorOwner::try_new(config).unwrap();
+        let policy = |slots| {
+            FrontendWorkloadCapacityConfig::try_new(
+                slots,
+                NonZeroUsize::new(7).unwrap(),
+                Duration::from_millis(25),
+            )
+            .unwrap()
+        };
+        let inputs =
+            FrontendNativeCapacityInputs::try_new(policy(workload.scope_records_limit), config)
+                .unwrap()
+                .with_native_sources(&native)
+                .unwrap();
+        let captured = inputs
+            .capture_sources(&workload, result, &blocking.executor(), &internal.runtime())
+            .unwrap();
+        let wrong_pool = FrontendNativeCapacityInputs::try_new(
+            policy(workload.scope_records_limit),
+            QueryBlockingExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ),
+        )
+        .unwrap();
+        let pool_refused = matches!(
+            wrong_pool.capture_sources(
+                &workload,
+                result,
+                &blocking.executor(),
+                &internal.runtime()
+            ),
+            Err(WorkError::InvalidConfig(
+                "frontend actual source configuration"
+            ))
+        );
+        let wrong_inventory = FrontendNativeCapacityInputs::try_new(policy(4), config).unwrap();
+        let inventory_refused = matches!(
+            wrong_inventory.with_native_sources(&native),
+            Err(WorkError::InvalidConfig(
+                "frontend actual subscription inventory"
+            ))
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        internal.shutdown_until(deadline).await.unwrap();
+        blocking.shutdown_until(deadline).await.unwrap();
+        control.owner.close_admission();
+        control.owner.shutdown().unwrap_or_else(|failure| {
+            panic!(
+                "empty capacity-capture workload did not close: {}",
+                failure.error()
+            )
+        });
+        assert_eq!(captured.query_blocking, config);
+        assert_eq!(captured.internal_cpu.configured_capacity(), config);
+        assert_eq!(
+            captured.native.unwrap().subscription_records,
+            workload.scope_records_limit
+        );
+        assert_eq!(
+            captured.native.unwrap().transport,
+            native.task_transport_supervisor().capacity_sources()
+        );
+        assert_eq!(
+            captured.native.unwrap().physical,
+            native.transport_admission().dimensions()
+        );
+        assert_eq!(
+            captured.native.unwrap().apply_records,
+            native.apply_send_port.installed_records().unwrap(),
+        );
+        assert!(pool_refused);
+        assert!(inventory_refused);
     }
 
     #[test]
@@ -902,7 +1096,7 @@ mod tests {
         let (late, _updates) = tonic::transport::Channel::balance_channel::<String>(1);
         let rejected = original_dial.publish(lane_channel(late)).is_err();
         let retired_ready = escaped
-            .generation
+            .generation()
             .retired
             .load(std::sync::atomic::Ordering::Acquire);
         let retired_follower = follower.is_retired() && follower.ready_channel().is_err();
@@ -933,8 +1127,8 @@ mod tests {
             tonic::transport::Channel::balance_channel::<String>(1);
         let current = replacement.publish(lane_channel(current_channel)).unwrap();
         assert!(Arc::ptr_eq(
-            &runtime.cached_channel(&key).unwrap().generation,
-            &current.generation
+            runtime.cached_channel(&key).unwrap().generation(),
+            current.generation()
         ));
         let mut other = key.clone();
         other.key.peer = novarocks_types::BackendProcessId::new_v7();

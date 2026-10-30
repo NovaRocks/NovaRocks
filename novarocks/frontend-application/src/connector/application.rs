@@ -40,15 +40,6 @@ impl Drop for QueryStopRelay {
     }
 }
 
-pub(crate) fn query_connector_request_context(
-    deadline: Instant,
-    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-) -> Result<ConnectorRequestContext, String> {
-    let runtime = tokio::runtime::Handle::try_current()
-        .map_err(|_| "connector query cancellation requires the FE runtime".to_string())?;
-    query_connector_request_context_on_runtime(&runtime, deadline, cancellation)
-}
-
 pub(crate) fn query_connector_request_context_on_runtime(
     runtime: &tokio::runtime::Handle,
     deadline: Instant,
@@ -138,15 +129,6 @@ pub(crate) fn connector_planning_context_for_query_on_runtime(
         cancellation,
     )?)
     .map_err(|error| error.to_string())
-}
-
-/// Freeze a Connector request context to the execution round's authoritative
-/// statement deadline and cancellation identity.
-pub fn connector_request_context_for_deadline(
-    deadline: std::time::Instant,
-    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-) -> Result<ConnectorRequestContext, String> {
-    query_connector_request_context(deadline, cancellation)
 }
 
 /// Derive connector admission from the immutable query execution captured by
@@ -241,6 +223,7 @@ mod request_context_tests {
             cancellation.view(),
             SessionOptimizerSettings::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ));
 
         let connector = connector_request_context_for_execution(None, request.execution()).unwrap();
@@ -268,6 +251,7 @@ mod request_context_tests {
             QueryCancellationSource::new().view(),
             SessionOptimizerSettings::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ));
         let before = Instant::now();
         let connector = connector_request_context_for_execution(None, request.execution()).unwrap();
@@ -371,24 +355,27 @@ pub(crate) fn metadata_binding_typed(
     controls.acquire_current(&instance_id)
 }
 
-pub fn metadata_namespace_exists(
+/// Await namespace existence using the same exact planning generation.
+pub(crate) async fn metadata_namespace_exists_async(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
 ) -> Result<bool, String> {
+    validate_request_context(&context)?;
     let binding = metadata_binding(controls, catalog)?;
     let instance_id = binding.binding().descriptor().instance_id.clone();
     binding
         .binding()
         .metadata()
-        .namespace_exists(novarocks_spi::connector::ConnectorNamespaceRequest {
+        .namespace_exists_async(novarocks_spi::connector::ConnectorNamespaceRequest {
             namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
                 instance_id,
                 namespace: Arc::from(namespace),
             },
             context,
         })
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -448,6 +435,30 @@ pub fn metadata_table_exists_with_planning_lease(
         .map_err(|error| error.to_string())
 }
 
+pub(crate) async fn metadata_table_exists_with_planning_lease_async(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+) -> Result<bool, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(&binding, context)?;
+    binding
+        .binding()
+        .metadata()
+        .table_exists_async(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context,
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Enumerate namespaces through an admission-frozen connector control lease.
 /// Ordering and duplicate handling stay application-owned so providers only
 /// expose their authoritative catalog facts. The provider refuses a listing
@@ -467,6 +478,25 @@ pub fn metadata_list_namespaces_with_planning_lease(
             bound,
             context,
         })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn metadata_list_namespaces_with_planning_lease_async(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    bound: novarocks_spi::connector::ConnectorListingBound,
+) -> Result<Vec<ConnectorNamespaceIdentity>, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(&binding, context)?;
+    binding
+        .binding()
+        .metadata()
+        .list_namespaces_async(ConnectorListNamespacesRequest {
+            instance_id,
+            bound,
+            context,
+        })
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -505,6 +535,35 @@ pub fn metadata_list_tables_with_planning_lease(
     Ok(tables)
 }
 
+pub(crate) async fn metadata_list_tables_with_planning_lease_async(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    bound: novarocks_spi::connector::ConnectorListingBound,
+) -> Result<Vec<String>, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(binding, context)?;
+    let mut tables = binding
+        .binding()
+        .metadata()
+        .list_tables_async(novarocks_spi::connector::ConnectorListTablesRequest {
+            namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+            },
+            bound,
+            context,
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|identity| identity.table.to_string())
+        .collect::<Vec<_>>();
+    tables.sort();
+    tables.dedup();
+    Ok(tables)
+}
+
 /// Read immutable branch/tag/snapshot facts through the same exact lease that
 /// admitted the table.  SQL owns the projection of these neutral facts.
 pub fn metadata_read_reference_facts_with_planning_lease(
@@ -526,6 +585,29 @@ pub fn metadata_read_reference_facts_with_planning_lease(
             },
             context,
         })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn metadata_read_reference_facts_with_planning_lease_async(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+) -> Result<ConnectorReadReferenceFacts, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(&binding, context)?;
+    binding
+        .binding()
+        .metadata()
+        .read_reference_facts_async(ConnectorReadReferenceFactsRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            context,
+        })
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -928,7 +1010,10 @@ mod source_value_type_tests {
         let source = DataType::Struct(
             vec![
                 Field::new("u", DataType::FixedSizeBinary(16), false).with_metadata(
-                    [("nr_logical_type".into(), "unknown-source-attribute".into())].into(),
+                    std::collections::HashMap::<String, String>::from([(
+                        "nr_logical_type".into(),
+                        "unknown-source-attribute".into(),
+                    )]),
                 ),
                 Field::new(
                     "items",

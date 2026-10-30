@@ -22,6 +22,8 @@
 //! atomicity, no shared revision, and no batch-global success, and this codec
 //! never collapses their outcomes.
 
+pub mod wire_size;
+
 use novarocks_execution_contract::operation::{
     DomainFailureOutcome, OperationDomainFailure, OperationResult,
 };
@@ -1814,6 +1816,23 @@ pub fn decode_release_ack(
     })
 }
 
+/// Decode the original owned Release body without cloning its generated
+/// terminal graph. The existing borrowed decoder remains a pure projection.
+pub fn decode_release_ack_owned(
+    mut src: novarocks::ReleaseQueryContextAck,
+    path: FieldPath,
+) -> Result<DecodedReleaseAck, ProtocolError> {
+    let telemetry = src.runtime_filter.take();
+    let mut decoded = decode_release_ack(&src, path.clone())?;
+    decoded.runtime_filter = telemetry.map(|raw| {
+        QueryTerminalProfileContributionTelemetry::parse(raw).map_err(|error| invalid(
+            path.clone().field("runtime_filter"),
+            format!("a release acknowledgement carries an invalid runtime-filter contribution: {error}"),
+        ))
+    }).transpose()?;
+    Ok(decoded)
+}
+
 /// Encodes a cancel reason back onto the wire, for a receipt or a status.
 pub fn encode_cancel_reason_field(
     value: novarocks_execution_contract::task_execution::status::CancelReason,
@@ -3432,7 +3451,7 @@ mod covered_wire_tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
 
-    fn context_and_task() -> (QueryContextRef, TaskIdentity) {
+    pub(super) fn context_and_task() -> (QueryContextRef, TaskIdentity) {
         let execution =
             QueryExecutionId::new(QueryId::new(13, 14), AttemptId::new(1).unwrap()).unwrap();
         let backend = BackendProcessId::new_v7();
@@ -3631,3 +3650,7 @@ mod canonical_assignment_size_tests {
         assert!(check_canonical_assignment_size(&assignment, usize::MAX, budget, path).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "operation/wire_size_tests.rs"]
+mod wire_size_tests;

@@ -84,7 +84,7 @@ pub(super) fn ensure_operation(
     Ok(operation)
 }
 
-fn create_intent(
+pub(super) fn create_intent(
     prepared: &PreparedOperation,
     token: OperationToken,
 ) -> crate::iceberg::Result<OperationIntent> {
@@ -121,7 +121,7 @@ fn create_intent(
     })
 }
 
-fn create_prefix(prepared: &PreparedOperation) -> PreparedChange {
+pub(super) fn create_prefix(prepared: &PreparedOperation) -> PreparedChange {
     let mut updates = prepared.staged.publication_updates.clone();
     if let Some(properties) = &prepared.document_properties {
         updates.push(TableUpdate::SetProperties {
@@ -134,11 +134,11 @@ fn create_prefix(prepared: &PreparedOperation) -> PreparedChange {
     }
 }
 
-struct CreatePublisher {
-    adapter: IcebergStagedCreateAdapter,
-    prepared: PreparedOperation,
-    operation_id: ConnectorStagedCreateOperationId,
-    journal: PublicationJournal<ConnectorStagedCreateReceipt>,
+pub(super) struct CreatePublisher {
+    pub(super) adapter: IcebergStagedCreateAdapter,
+    pub(super) prepared: Arc<PreparedOperation>,
+    pub(super) operation_id: ConnectorStagedCreateOperationId,
+    pub(super) journal: PublicationJournal<ConnectorStagedCreateReceipt>,
 }
 
 #[async_trait]
@@ -205,7 +205,17 @@ impl PublicationPreparer for CreatePublisher {
             expected_snapshot_id,
         )
         .map_err(|error| iceberg_error(error.to_string()))?;
-        self.journal.record(evidence, receipt, request)
+        let no_op = self
+            .adapter
+            .receipt(
+                self.operation_id,
+                ConnectorStagedCreateReceiptPhase::Published,
+                ExternalMutationEffect::NoOp,
+                Bytes::new(),
+            )
+            .map_err(|error| iceberg_error(error.to_string()))?;
+        self.journal
+            .record_for_effects(evidence, receipt, no_op, request)
     }
 
     fn evidence_policy(&self) -> CatalogEvidencePolicy {
@@ -263,7 +273,7 @@ pub(super) fn publish(
     prepared.final_publication = Some(journal.clone());
     let publisher = journal.observe_prepared(Arc::new(CreatePublisher {
         adapter: adapter.clone(),
-        prepared: prepared.clone(),
+        prepared: Arc::new(prepared.clone()),
         operation_id,
         journal: journal.clone(),
     }));
@@ -307,6 +317,45 @@ pub(super) fn publish(
             ),
         },
     })
+}
+
+pub(super) async fn publish_async(
+    adapter: &IcebergStagedCreateAdapter,
+    prepared: &mut PreparedOperation,
+    operation_id: ConnectorStagedCreateOperationId,
+    context: &ConnectorRequestContext,
+) -> Result<ExternalMutationOutcome<ConnectorStagedCreateReceipt>, ConnectorError> {
+    if operation_id.to_bytes() != prepared.operation_id().to_bytes() {
+        return Err(invalid(
+            "Create publication must preserve the original staged operation token",
+        ));
+    }
+    let operation = ensure_operation(adapter, prepared, operation_id, context)?;
+    let intent =
+        create_intent(prepared, operation.token()).map_err(|error| corrupt(error.to_string()))?;
+    let prefix = create_prefix(prepared);
+    let policy = RetryPolicy::from_properties(prepared.staged.table.metadata().properties())
+        .map_err(|error| invalid(error.to_string()))?;
+    let journal = prepared
+        .stage_publication
+        .journal
+        .next_frontier()
+        .map_err(|error| internal(error.to_string()))?;
+    prepared.final_publication = Some(journal.clone());
+    let publisher = journal.observe_prepared(Arc::new(CreatePublisher {
+        adapter: adapter.clone(),
+        prepared: Arc::new(prepared.clone()),
+        operation_id,
+        journal: journal.clone(),
+    }));
+    let append = crate::commit::FastAppendPreparer;
+    let preparers: Vec<&dyn Preparer> = if intent.changes().added.is_empty() {
+        vec![]
+    } else {
+        vec![&append]
+    };
+    let report = attempt::run(&operation, &intent, &prefix, &preparers, &publisher, policy).await;
+    Ok(journal.project(report))
 }
 
 /// Append a fresh exact positive observation to the final request's entry.
@@ -609,6 +658,291 @@ mod tests {
         }
     }
 
+    // Only the prepare/bind setup is pure here. Publication uses the actual
+    // ICE Source and original inventory; no physical grant is fabricated.
+    struct OriginalFixtureCapability {
+        adapter: IcebergStagedCreateAdapter,
+        handle: ConnectorStagedTableHandle,
+        write: ConnectorStagedWriteProof,
+        source:
+            Mutex<Option<std::sync::Weak<super::super::scoped_publication::PublicationOriginal>>>,
+    }
+    impl ConnectorStagedCreate for OriginalFixtureCapability {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.adapter.descriptor
+        }
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            self.adapter.incarnation
+        }
+        fn prepare(
+            &self,
+            request: ConnectorStagedCreatePrepareRequest,
+        ) -> Result<ConnectorStagedCreatePrepareOutcome, ConnectorError> {
+            Ok(ConnectorStagedCreatePrepareOutcome::Prepared {
+                handle: self.handle.clone(),
+                receipt: self.adapter.receipt(
+                    request.operation_id,
+                    ConnectorStagedCreateReceiptPhase::Prepared,
+                    ExternalMutationEffect::Applied,
+                    Bytes::new(),
+                )?,
+                finalization: ExternalMutationFinalization::Complete,
+            })
+        }
+        fn bind_write(
+            &self,
+            handle: ConnectorStagedTableHandle,
+            write: ConnectorStagedWriteProof,
+        ) -> Result<(), ConnectorError> {
+            if handle != self.handle || write != self.write {
+                return Err(invalid(
+                    "pure original fixture received a foreign bound write",
+                ));
+            }
+            Ok(())
+        }
+        fn begin_publish_original(
+            &self,
+            request: ConnectorStagedCreatePublishRequest,
+            receiving: novarocks_spi::connector::ConnectorStagedCreatePublicationRecorder,
+        ) -> Result<
+            Arc<dyn novarocks_spi::connector::ConnectorStagedCreatePublicationSource>,
+            ConnectorError,
+        > {
+            let source = super::super::scoped_publication::PublicationOriginal::new(
+                self.adapter.clone(),
+                request,
+                receiving,
+            )?;
+            *self.source.lock().unwrap() = Some(Arc::downgrade(&source));
+            Ok(source)
+        }
+        fn plan_write(
+            &self,
+            _: ConnectorStagedWritePlanningRequest,
+        ) -> Result<ConnectorStagedWritePlanningBinding, ConnectorError> {
+            unreachable!("the actual sealed fixture write is already bound")
+        }
+        fn publish(
+            &self,
+            _: ConnectorStagedCreatePublishRequest,
+        ) -> Result<ConnectorStagedCreatePublishOutcome, ConnectorError> {
+            unreachable!("original fixture cannot fall back to synchronous publication")
+        }
+        fn abort(
+            &self,
+            _: ConnectorStagedCreateAbortRequest,
+        ) -> Result<ConnectorStagedCreateAbortOutcome, ConnectorError> {
+            unreachable!("publication fixture never invokes the separate abort entrance")
+        }
+        fn adjudicate_publication(
+            &self,
+            _: ConnectorStagedCreatePublicationAdjudicationRequest,
+        ) -> Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError> {
+            unreachable!("publication fixture never invents an adjudication")
+        }
+    }
+    fn original_publication_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Arc<OriginalFixtureCapability>,
+        novarocks_spi::connector::ConnectorStagedCreateLease,
+        ConnectorStagedCreatePublishRequest,
+    ) {
+        let mut fixture = Fixture::new(true);
+        let operation = fixture.prepared.operation_id();
+        let handle = ConnectorStagedTableHandle::try_new(
+            fixture.adapter.owner(),
+            operation,
+            Bytes::from_static(b"original-staged-handle"),
+        )
+        .unwrap();
+        fixture.prepared.handle_digest = handle.digest();
+        let data = fixture.data_path();
+        let write = fixture.prepared.write.as_ref().unwrap().write.clone();
+        let publication = fixture.prepared.publication_id;
+        fixture
+            .adapter
+            .record_terminal(operation, OperationState::Prepared(fixture.prepared));
+        let capability = Arc::new(OriginalFixtureCapability {
+            adapter: fixture.adapter,
+            handle: handle.clone(),
+            write: write.clone(),
+            source: Mutex::new(None),
+        });
+        let lease = novarocks_spi::connector::ConnectorStagedCreateLease::new_with_control_runtime(
+            capability.adapter.descriptor.clone(),
+            novarocks_spi::connector::ConnectorControlRuntimeId::new(),
+            capability.adapter.incarnation,
+            capability.clone(),
+            || {},
+        )
+        .unwrap();
+        lease
+            .prepare(ConnectorStagedCreatePrepareRequest {
+                owner: lease.owner().clone(),
+                publication_id: publication,
+                operation_id: operation,
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: lease.owner().instance_id.clone(),
+                    namespace: "db".into(),
+                    table: "t".into(),
+                },
+                columns: vec![],
+                partitioning: vec![],
+                properties: BTreeMap::new(),
+                policy: CreatePolicy::FailIfExists,
+                mode: ConnectorStagedCreateMode::Ordinary,
+                context: fixture.context.clone(),
+            })
+            .unwrap();
+        lease.bind_write(handle.clone(), write.clone()).unwrap();
+        let request = ConnectorStagedCreatePublishRequest {
+            operation_id: operation,
+            handle,
+            write,
+            payload: ConnectorStagedCreatePublicationPayload::Ordinary,
+            context: fixture.context,
+        };
+        (fixture.directory, data, capability, lease, request)
+    }
+
+    #[tokio::test]
+    async fn original_publication_factory_keeps_the_actual_prepared_inventory_before_poll() {
+        let (_directory, data, capability, lease, request) = original_publication_fixture();
+        let operation = request.operation_id;
+        let mut wrong = request.clone();
+        wrong.operation_id = ConnectorMutationOperationId::new();
+        assert!(
+            lease
+                .begin_publish_original(wrong, &Default::default())
+                .is_err()
+        );
+        assert!(matches!(
+            capability
+                .adapter
+                .operations
+                .lock()
+                .unwrap()
+                .get(&operation),
+            Some(OperationState::Prepared(_))
+        ));
+        let receiving =
+            novarocks_spi::connector::ConnectorStagedCreatePublicationReceiving::default();
+        let execution = lease
+            .begin_publish_original(request.clone(), &receiving)
+            .unwrap();
+        assert!(
+            lease
+                .begin_publish_original(request, &Default::default())
+                .is_err(),
+            "the original operation stays busy while its Source owns Prepared"
+        );
+        let source = capability
+            .source
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        assert_eq!(source.body_for_test(), (true, false));
+        assert!(matches!(
+            capability
+                .adapter
+                .operations
+                .lock()
+                .unwrap()
+                .get(&operation),
+            Some(OperationState::Publishing { .. })
+        ));
+        assert!(!receiving.observation().provider_exited());
+        assert!(data.exists());
+        drop(source);
+        drop(execution);
+        assert!(
+            matches!(
+                capability
+                    .adapter
+                    .operations
+                    .lock()
+                    .unwrap()
+                    .get(&operation),
+                Some(OperationState::Publishing { .. })
+            ),
+            "dropping a borrowed execution does not drop the stable Source"
+        );
+        drop(receiving);
+        assert!(
+            matches!(
+                capability
+                    .adapter
+                    .operations
+                    .lock()
+                    .unwrap()
+                    .get(&operation),
+                Some(OperationState::Prepared(_))
+            ),
+            "an unpolled original returns the same prepared inventory"
+        );
+        assert!(data.exists());
+    }
+
+    #[tokio::test]
+    async fn original_publication_destructor_panic_keeps_the_same_body_and_is_not_repolled() {
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Poll},
+        };
+        struct OriginalDropPanic;
+        struct ReadyOriginal(Arc<AtomicUsize>);
+        impl Future for ReadyOriginal {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+        }
+        impl Drop for ReadyOriginal {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::panic::panic_any(OriginalDropPanic);
+            }
+        }
+        let (_directory, data, capability, lease, request) = original_publication_fixture();
+        let receiving =
+            novarocks_spi::connector::ConnectorStagedCreatePublicationReceiving::default();
+        let mut execution = lease.begin_publish_original(request, &receiving).unwrap();
+        let source = capability
+            .source
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        source.install_ready_original_for_test(Box::pin(ReadyOriginal(drops.clone())));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let cause = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execution.poll_result(&mut cx)
+        }))
+        .unwrap_err();
+        assert!(cause.is::<OriginalDropPanic>());
+        assert!(receiving.observation().foreign_exit_unproven());
+        assert!(!receiving.observation().provider_exited());
+        assert_eq!(source.body_for_test(), (true, true));
+        assert!(execution.poll_closed(&mut cx).is_pending());
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "poison never retries the original destructor"
+        );
+        assert!(data.exists());
+    }
+
     #[tokio::test]
     async fn positive_observation_appends_only_to_the_retained_final_frontier() {
         use crate::commit::attempt::observation::{DispatchEvidence, MemoryDispatchBarrier};
@@ -653,7 +987,7 @@ mod tests {
             let intent = create_intent(&fixture.prepared, operation.token()).unwrap();
             let publisher = CreatePublisher {
                 adapter: fixture.adapter.clone(),
-                prepared: fixture.prepared.clone(),
+                prepared: Arc::new(fixture.prepared.clone()),
                 operation_id,
                 journal: journal.clone(),
             };
@@ -766,7 +1100,7 @@ mod tests {
                 let journal = PublicationJournal::new(operation.token());
                 let publisher = CreatePublisher {
                     adapter: fixture.adapter.clone(),
-                    prepared: fixture.prepared.clone(),
+                    prepared: Arc::new(fixture.prepared.clone()),
                     operation_id,
                     journal: journal.clone(),
                 };
@@ -963,7 +1297,7 @@ mod tests {
             let journal = PublicationJournal::new(operation.token());
             let publisher = CreatePublisher {
                 adapter: fixture.adapter.clone(),
-                prepared: fixture.prepared.clone(),
+                prepared: Arc::new(fixture.prepared.clone()),
                 operation_id,
                 journal: journal.clone(),
             };

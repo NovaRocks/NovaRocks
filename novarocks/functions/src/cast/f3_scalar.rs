@@ -311,10 +311,21 @@ impl Body {
             selected
         };
         work.flush()?;
-        let output = match arrow_cast::cast(selected.as_ref(), recipe.result.data_type()) {
+        let converted = if matches!(self, Self::TextFloat | Self::TextDecimal) {
+            let text = selected
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| internal("raw numeric parser has a foreign text carrier"))?;
+            crate::math_numeric::cast_raw_numeric(text, recipe.result.data_type())
+                .map_err(super::f3_array::ArrayCastFailure::RawNumeric)
+        } else {
+            arrow_cast::cast(selected.as_ref(), recipe.result.data_type())
+                .map_err(super::f3_array::ArrayCastFailure::Arrow)
+        };
+        let output = match converted {
             Ok(output) => output,
             Err(error) => {
-                let row = super::f3_array::ArrayCastFailure::Arrow(error).into_row(ordinal)?;
+                let row = error.into_row(ordinal)?;
                 work.flush()?;
                 return Ok(CastRowResult::RowError(row));
             }

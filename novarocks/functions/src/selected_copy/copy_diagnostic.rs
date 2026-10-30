@@ -58,8 +58,8 @@ impl std::ops::Deref for OriginalCopyData {
     }
 }
 
-/// All allocating take(None) error descriptions in pinned Arrow58.2 are static
-/// Union validation text or numeric Run/FixedSizeBinary/primitive lengths.
+/// Allocating take(None) descriptions include Arrow60.1 nullable Union/Run
+/// and checked FixedSizeList offset errors beside original validation text.
 /// The caller supplies UInt32/UInt64, so the noninteger-index type formatter
 /// and check_bounds formatter are not reachable. Unsupported value types panic
 /// in the original kernel and keep their original host panic path.
@@ -95,7 +95,21 @@ impl OriginalTakeDiagnosticFacts {
         let union =
             "Sparse union child arrays must be equal in length to the length of the union".len();
         let fixed = add("Cannot convert size '' to usize".len(), "-2147483648".len())?;
-        let description_upper = run.max(primitive).max(union).max(fixed);
+        let nullable_union =
+            "Cannot take null indices from a union with no field that can represent nulls".len();
+        let nullable_run =
+            "Cannot take null indices from a RunEndEncoded array with a non-nullable values field"
+                .len();
+        let fixed_offset = "FixedSizeList offset overflows u32".len();
+        let index_cast = "Cast to usize failed".len();
+        let description_upper = run
+            .max(primitive)
+            .max(union)
+            .max(fixed)
+            .max(nullable_union)
+            .max(nullable_run)
+            .max(fixed_offset)
+            .max(index_cast);
         let display_upper = add(description_upper, "Invalid argument error: ".len())?;
         // std String/Vec<u8> growth: initial literal hint <=2*formatted length;
         // reserve doubles or uses required length, with minimum nonzero 8.
@@ -110,6 +124,19 @@ impl OriginalTakeDiagnosticFacts {
             display_upper,
             peak,
         })
+    }
+    pub(super) fn try_new_observed<E: From<CopyError>>(
+        ty: &arrow_schema::DataType,
+        work: &mut impl FnMut(bool) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        let mut facts = Self::try_new()?;
+        if let Some((display, peak)) =
+            super::concat_diagnostic::original_take_validation_diagnostic_observed(ty, work)?
+        {
+            facts.display_upper = facts.display_upper.max(display);
+            facts.peak = facts.peak.max(peak);
+        }
+        Ok(facts)
     }
     pub(super) fn operation_peak_bytes(&self) -> usize {
         self.peak

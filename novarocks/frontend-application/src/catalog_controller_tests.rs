@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use super::tests::{OriginalBootstrapFixture, bootstrap_original};
 use super::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::application::{
     FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
@@ -374,6 +375,41 @@ impl ReadTransaction for ScanFailingRead {
     }
 }
 
+struct ScanFailingOriginalRead {
+    inner: Box<dyn novarocks_state_store_api::OriginalReadTransaction>,
+    scans_available: bool,
+}
+
+#[async_trait::async_trait]
+impl novarocks_state_store_api::OriginalReadTransaction for ScanFailingOriginalRead {
+    async fn get_in(
+        &mut self,
+        key: &Key,
+    ) -> Result<Option<StateRecord>, novarocks_state_store_api::StateStoreExecutionFailure> {
+        self.inner.get_in(key).await
+    }
+
+    async fn range_in(
+        &mut self,
+        request: &RangeRequest,
+    ) -> Result<RangePage, novarocks_state_store_api::StateStoreExecutionFailure> {
+        if !self.scans_available {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "injected catalog enumeration failure",
+            )
+            .into_original_failure());
+        }
+        self.inner.range_in(request).await
+    }
+
+    async fn close_in(
+        &mut self,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        self.inner.close_in().await
+    }
+}
+
 #[async_trait::async_trait]
 impl StateStore for ScanFailingStore {
     fn limits(&self) -> &StateStoreLimits {
@@ -389,6 +425,19 @@ impl StateStore for ScanFailingStore {
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
         Ok(Box::new(ScanFailingRead {
             inner: self.inner.begin_read().await?,
+            scans_available: self.scans_available.load(Ordering::Acquire),
+        }))
+    }
+
+    async fn begin_original_read_in(
+        &self,
+        execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Result<
+        Box<dyn novarocks_state_store_api::OriginalReadTransaction>,
+        novarocks_state_store_api::StateStoreExecutionFailure,
+    > {
+        Ok(Box::new(ScanFailingOriginalRead {
+            inner: self.inner.begin_original_read_in(execution).await?,
             scans_available: self.scans_available.load(Ordering::Acquire),
         }))
     }
@@ -609,8 +658,7 @@ async fn dynamic_state_store_mode_survives_a_frontend_restart_through_one_snapsh
         SelectivelyFailingFactory::ready(),
     );
     let restarted = controller(Arc::clone(&store), &port);
-    restarted
-        .bootstrap()
+    bootstrap_original(&restarted, &second_host)
         .await
         .expect("bootstrap after restart");
 
@@ -628,7 +676,9 @@ async fn dynamic_state_store_mode_survives_a_frontend_restart_through_one_snapsh
         if_exists: false,
     })
     .expect("DROP CATALOG");
-    restarted.bootstrap().await.expect("bootstrap after drop");
+    bootstrap_original(&restarted, &second_host)
+        .await
+        .expect("bootstrap after drop");
     assert!(matches!(
         port.admit_catalog(&catalog("catalog.raw")),
         CatalogAdmission::Absent
@@ -720,7 +770,9 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
     for mode in [CatalogDesiredStateSourceMode::ManagedController] {
         // No StateStore input at all: if the rejection depended on anything the
         // frontend opens, this could not fail here.
+        let mut host_receiving_1 = None;
         let error = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_1,
             None,
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -774,6 +826,7 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_incomplete_enumeration_blocks_bootstrap_instead_of_becoming_an_empty_snapshot() {
+    use novarocks_failure_contract::FailureProjection;
     let host = state_store_fixture::open_persistent(format!(
         "catalog-desired-state-enumeration-{}",
         Uuid::now_v7()
@@ -796,8 +849,7 @@ async fn an_incomplete_enumeration_blocks_bootstrap_instead_of_becoming_an_empty
 
     port.create_catalog(create_command("catalog.analytics"))
         .expect("CREATE CATALOG");
-    catalog_controller
-        .bootstrap()
+    bootstrap_original(&catalog_controller, &host)
         .await
         .expect("bootstrap with a healthy source");
     let admitted = ready_attachment_id(&port, "catalog.analytics").await;
@@ -817,10 +869,19 @@ async fn an_incomplete_enumeration_blocks_bootstrap_instead_of_becoming_an_empty
          never as a snapshot that happens to hold zero catalogs: {error}"
     );
 
-    catalog_controller
-        .bootstrap()
+    let error = bootstrap_original(&catalog_controller, &host)
         .await
         .expect_err("an incomplete enumeration must block frontend bootstrap");
+    assert_eq!(
+        error.kind(),
+        CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete
+    );
+    let enumeration_failure = StateStoreError::new(
+        StateStoreErrorKind::ProviderUnavailable,
+        "injected catalog enumeration failure",
+    )
+    .failure_fact();
+    assert_eq!(error.failure_fact(), enumeration_failure);
 
     // A cold frontend has no local projection to preserve. It must still fail
     // closed before scheduling any provider work from the incomplete source.
@@ -828,10 +889,14 @@ async fn an_incomplete_enumeration_blocks_bootstrap_instead_of_becoming_an_empty
         CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
         SelectivelyFailingFactory::ready(),
     );
-    controller(Arc::clone(&store), &cold_port)
-        .bootstrap()
+    let error = bootstrap_original(&controller(Arc::clone(&store), &cold_port), &host)
         .await
         .expect_err("an incomplete enumeration must block a cold frontend too");
+    assert_eq!(
+        error.kind(),
+        CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete
+    );
+    assert_eq!(error.failure_fact(), enumeration_failure);
     assert!(
         matches!(
             cold_port.admit_catalog(&catalog("catalog.analytics")),
@@ -895,8 +960,7 @@ async fn one_catalogs_materialization_failure_leaves_every_other_catalog_serving
         SelectivelyFailingFactory::failing_for("catalog.broken"),
     );
     let catalog_controller = controller(Arc::clone(&store), &port);
-    catalog_controller
-        .bootstrap()
+    bootstrap_original(&catalog_controller, &host)
         .await
         .expect("one provider failure must not fail the whole bootstrap");
 
@@ -922,8 +986,7 @@ async fn one_catalogs_materialization_failure_leaves_every_other_catalog_serving
         CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
         SelectivelyFailingFactory::ready(),
     );
-    controller(Arc::clone(&store), &retry_port)
-        .bootstrap()
+    bootstrap_original(&controller(Arc::clone(&store), &retry_port), &host)
         .await
         .expect("retry bootstrap");
     let _ = ready_attachment_id(&retry_port, "catalog.broken").await;
@@ -989,8 +1052,11 @@ async fn bootstrap_submits_63_healthy_catalogs_without_waiting_for_one_hanging_p
     // The provider is held on an explicit Notify gate. The timeout prevents a
     // regression from hanging the test; it is not used to order successful
     // work or to paper over a race with a sleep.
-    tokio::time::timeout(Duration::from_secs(1), catalog_controller.bootstrap())
-        .await
+    let bootstrap = OriginalBootstrapFixture::new(&host);
+    let result =
+        tokio::time::timeout(Duration::from_secs(1), bootstrap.drive(&catalog_controller)).await;
+    bootstrap.close().await;
+    result
         .expect("bootstrap must complete after scheduler ownership")
         .expect("provider failure is local, not a bootstrap failure");
     entered.notified().await;
@@ -1041,8 +1107,7 @@ async fn bootstrap_enqueues_complete_no_io_snapshots_through_1024_catalogs() {
         )
         .expect("one-worker catalog controller");
 
-        catalog_controller
-            .bootstrap()
+        bootstrap_original(&catalog_controller, &host)
             .await
             .expect("complete no-I/O snapshot must submit successfully");
         for name in &names {
@@ -1107,8 +1172,7 @@ async fn a_catalog_removed_from_the_source_is_not_revived_by_the_next_bootstrap(
         CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
         SelectivelyFailingFactory::ready(),
     );
-    controller(Arc::clone(&store), &port)
-        .bootstrap()
+    bootstrap_original(&controller(Arc::clone(&store), &port), &second_host)
         .await
         .expect("bootstrap after removal");
 

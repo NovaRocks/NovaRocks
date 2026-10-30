@@ -92,8 +92,13 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
         assert_eq!(result.fields[0].ty.data_type(), &carrier, "{sql}");
         assert_eq!(result.fields[0].ty.logical_type(), domain, "{sql}");
         assert!(result.fields[0].ty.nullable(), "missing lookup key: {sql}");
-        crate::compiler::root_render_type::client_render_schema(completed.plan(), 0)
-            .unwrap_or_else(|error| panic!("client render declaration for {sql}: {error}"));
+        crate::compiler::root_render_type::client_render_schema(
+            completed.plan(),
+            crate::compiler::RenderFamilyRequest::MysqlText {
+                timezone_offset_seconds: 0,
+            },
+        )
+        .unwrap_or_else(|error| panic!("client render declaration for {sql}: {error}"));
         novarocks_physical_plan::validate_plan(completed.plan()).unwrap();
     }
 }

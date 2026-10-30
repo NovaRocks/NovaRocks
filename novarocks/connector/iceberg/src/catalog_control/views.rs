@@ -37,6 +37,9 @@ use crate::iceberg::spec::{Schema, ViewMetadata, ViewRepresentation};
 use crate::iceberg::{NamespaceIdent, TableIdent};
 use crate::metadata_context::IcebergMetadataContext;
 
+#[path = "views/async_listing.rs"]
+pub(crate) mod async_listing;
+
 const NOVAROCKS_ENGINE_NAME: &str = "novarocks";
 const NOVAROCKS_SOURCE_FORMAT_KEY: &str = "novarocks.source-format";
 const EFFECTIVE_USER_SOURCE_V1: &str = "effective-user-source-v1";
@@ -296,6 +299,31 @@ pub(super) fn load_view_metadata_for_request(
         })
 }
 
+pub(super) async fn load_view_metadata_for_request_async(
+    runtime: &IcebergMetadataContext,
+    namespace: &str,
+    view: &str,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ViewMetadata, ConnectorError> {
+    let (_, ident) = view_ident(namespace, view).map_err(unavailable)?;
+    let owner = std::sync::Arc::clone(runtime.novarocks_catalog());
+    let target =
+        crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
+    let context = context.clone();
+    owner
+        .load_view_for_request(target, context)
+        .await
+        .map_err(|error| match error.kind() {
+            // Absence is read from the error's kind. The owner classifies it,
+            // so there is nothing here to recognize by substring.
+            ConnectorErrorKind::NotFound => ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                format!("unknown view: {ident}"),
+            ),
+            _ => error,
+        })
+}
+
 #[cfg(test)]
 pub(crate) fn drop_view(
     runtime: &IcebergMetadataContext,
@@ -490,27 +518,105 @@ impl ConnectorViewMetadata for IcebergMetadata {
         )
     }
 
+    fn load_view_async(
+        &self,
+        request: ConnectorViewRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorViewMetadataValue, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            ensure_request(self, &request.view.instance_id, &request.context)?;
+            let (_, ident) =
+                view_ident(&request.view.namespace, &request.view.view).map_err(unavailable)?;
+            let metadata = load_view_metadata_for_request_async(
+                self.runtime(),
+                &request.view.namespace,
+                &request.view.view,
+                &request.context,
+            )
+            .await?;
+            let loaded = loaded_view_from_metadata(&ident, &metadata).map_err(unavailable)?;
+            if !loaded.dialect.eq_ignore_ascii_case(VIEW_DIALECT_STARROCKS) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    format!(
+                        "Iceberg view uses unsupported SQL dialect {}",
+                        loaded.dialect
+                    ),
+                ));
+            }
+            ConnectorViewMetadataValue::try_new(
+                request.view,
+                ConnectorViewDefinition {
+                    dialect: ConnectorViewDialect::StarRocks,
+                    raw_sql: loaded.raw_sql.into(),
+                    default_catalog: loaded.default_catalog.map(Into::into),
+                    default_namespace: loaded.default_namespace.into(),
+                    source_format: loaded.source_format,
+                },
+                loaded.column_names.into_iter().map(Into::into).collect(),
+                loaded.comment.map(Into::into),
+                loaded
+                    .properties
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+                &request.context,
+            )
+        })
+    }
+
     fn list_views(
         &self,
         request: ConnectorListViewsRequest,
     ) -> Result<Vec<ConnectorViewIdentity>, ConnectorError> {
         ensure_request(self, &request.namespace.instance_id, &request.context)?;
-        list_views(
+        let listed = list_views(
             self.runtime(),
             &request.namespace.namespace,
             request.bound,
             &request.context,
-        )?
+        );
+        listed_view_identities(self, &request, listed)
+    }
+
+    fn list_views_async(
+        &self,
+        request: ConnectorListViewsRequest,
+        cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorViewIdentity>, ConnectorError>> {
+        Box::pin(async move {
+            ensure_request(self, &request.namespace.instance_id, &request.context)?;
+            let catalog = Arc::clone(self.runtime().novarocks_catalog());
+            let source = crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal::view_listing(self.clone(), request);
+            catalog.list_views_with_metadata_cpu(source, cpu).await
+        })
+    }
+}
+
+fn listed_view_identities(
+    provider: &IcebergMetadata,
+    request: &ConnectorListViewsRequest,
+    listed: Result<Vec<String>, ConnectorError>,
+) -> Result<Vec<ConnectorViewIdentity>, ConnectorError> {
+    // The catalog selected this original cause before any later local stop.
+    let listed = listed?;
+    ensure_request(provider, &request.namespace.instance_id, &request.context)?;
+    listed
         .into_iter()
         .map(|view| {
+            ensure_request(provider, &request.namespace.instance_id, &request.context)?;
             Ok(ConnectorViewIdentity {
-                instance_id: self.descriptor().instance_id.clone(),
+                instance_id: provider.descriptor().instance_id.clone(),
                 namespace: request.namespace.namespace.clone(),
                 view: view.into(),
             })
         })
         .collect()
-    }
 }
 
 fn ensure_request(
@@ -870,6 +976,108 @@ mod tests {
             (executor, runtime)
         }
 
+        #[test]
+        fn asynchronous_view_listing_keeps_original_paging_bound_and_exact_identities() {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on_sequence(
+                        "GET",
+                        "/v1/namespaces/db/views",
+                        vec![
+                            Reply::json(
+                                200,
+                                &serde_json::json!({
+                                    "identifiers": [{"namespace": ["db"], "name": "first"}],
+                                    "next-page-token": "p1"
+                                }),
+                            ),
+                            Reply::json(
+                                200,
+                                &serde_json::json!({
+                                    "identifiers": [{"namespace": ["db"], "name": "second"}]
+                                }),
+                            ),
+                        ],
+                    ),
+            );
+            let (executor, runtime) = rest_runtime(&server);
+            let provider = view_provider(runtime);
+            let mut request = listing_request(&provider, test_context());
+            request.bound = novarocks_spi::connector::ConnectorListingBound {
+                entries: 2,
+                page_entries: 1,
+                ..novarocks_spi::connector::ConnectorListingBound::V1
+            };
+            let identities = executor
+                .block_on(provider.list_views_async(request.clone(), listing_cpu(&provider)))
+                .expect("the complete original bounded listing is returned");
+            assert_eq!(
+                identities,
+                ["first", "second"]
+                    .into_iter()
+                    .map(|name| ConnectorViewIdentity {
+                        instance_id: request.namespace.instance_id.clone(),
+                        namespace: request.namespace.namespace.clone(),
+                        view: Arc::from(name),
+                    })
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                server
+                    .requests_to("GET", "/v1/namespaces/db/views")
+                    .iter()
+                    .map(|request| request.target.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "/v1/namespaces/db/views?pageSize=1",
+                    "/v1/namespaces/db/views?pageSize=1&pageToken=p1"
+                ]
+            );
+        }
+
+        #[test]
+        fn governed_view_pages_keep_decode_namespace_and_whole_listing_refusals() {
+            for (reply, entries, expected) in [
+                (
+                    Reply::bytes(200, b"not-json".to_vec()),
+                    2,
+                    ConnectorErrorKind::Unavailable,
+                ),
+                (
+                    Reply::json(
+                        200,
+                        &serde_json::json!({"identifiers":[{"namespace":["other"],"name":"v"}]}),
+                    ),
+                    2,
+                    ConnectorErrorKind::CorruptData,
+                ),
+                (
+                    Reply::json(
+                        200,
+                        &serde_json::json!({"identifiers":[{"namespace":["db"],"name":"a"},{"namespace":["db"],"name":"b"}]}),
+                    ),
+                    1,
+                    ConnectorErrorKind::ResourceExhausted,
+                ),
+            ] {
+                let server = TestServer::start(
+                    Script::new()
+                        .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                        .on("GET", "/v1/namespaces/db/views", reply),
+                );
+                let (executor, runtime) = rest_runtime(&server);
+                let provider = view_provider(runtime);
+                let mut request = listing_request(&provider, test_context());
+                request.bound.entries = entries;
+                let error = executor
+                    .block_on(provider.list_views_async(request, listing_cpu(&provider)))
+                    .unwrap_err();
+                assert_eq!(error.kind(), expected);
+                assert_eq!(server.count("GET", "/v1/namespaces/db/views"), 1);
+            }
+        }
+
         fn column() -> ConnectorColumnDefinition {
             ConnectorColumnDefinition {
                 name: "a".into(),
@@ -951,5 +1159,237 @@ mod tests {
             assert_eq!(server.count("POST", "/v1/namespaces/db/views"), 0);
             assert_eq!(server.count("POST", "/v1/namespaces/db/views/v"), 0);
         }
+    }
+
+    fn view_provider(runtime: IcebergMetadataContext) -> IcebergMetadata {
+        IcebergMetadata::new(
+            ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .unwrap(),
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("ice").unwrap(),
+            },
+            ProviderBindingEpoch::new(),
+            Arc::new(runtime),
+        )
+    }
+
+    struct ListingCpu {
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ProviderBindingEpoch,
+    }
+    impl novarocks_spi::connector::ProviderMetadataCpuPort for ListingCpu {
+        fn submit_metadata_in(
+            &self,
+            input: &mut Option<novarocks_spi::connector::ProviderMetadataCpuInput>,
+        ) -> Result<(), ConnectorError> {
+            let phase = input.as_ref().expect("one original listing CPU input");
+            assert_eq!(phase.descriptor(), &self.descriptor);
+            assert_eq!(phase.incarnation(), self.incarnation);
+            assert_eq!(
+                phase.original_source_type_id(),
+                std::any::TypeId::of::<
+                    crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                >()
+            );
+            input.take().unwrap().run_original_phase();
+            Ok(())
+        }
+        fn poll_finished(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_closed(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            None
+        }
+    }
+    // Provider algorithm fixture only. The FE owner tests the actual worker,
+    // queue grant, footer and Root lifetime; this fixture grants none of them.
+    fn listing_cpu(
+        provider: &IcebergMetadata,
+    ) -> Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort> {
+        Arc::new(ListingCpu {
+            descriptor: provider.descriptor().clone(),
+            incarnation: provider.incarnation(),
+        })
+    }
+
+    fn listing_request(
+        provider: &IcebergMetadata,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> ConnectorListViewsRequest {
+        ConnectorListViewsRequest {
+            namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
+                instance_id: provider.descriptor().instance_id.clone(),
+                namespace: Arc::from("db"),
+            },
+            bound: novarocks_spi::connector::ConnectorListingBound::V1,
+            context,
+        }
+    }
+
+    #[test]
+    fn asynchronous_view_listing_keeps_real_unsupported_instead_of_empty_success() {
+        let (executor, _warehouse, runtime) = hadoop_runtime();
+        let provider = view_provider(runtime);
+        let synchronous = provider
+            .list_views(listing_request(&provider, test_context()))
+            .expect_err("Hadoop cannot author an authoritative view listing");
+        let asynchronous = executor
+            .block_on(provider.list_views_async(
+                listing_request(&provider, test_context()),
+                listing_cpu(&provider),
+            ))
+            .expect_err("the async path cannot fabricate authoritative absence");
+        assert_eq!(asynchronous.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(asynchronous.kind(), synchronous.kind());
+        assert_eq!(asynchronous.message(), synchronous.message());
+    }
+
+    #[test]
+    fn asynchronous_view_listing_rejects_foreign_owner_stop_and_deadline_before_catalog() {
+        let (executor, _warehouse, runtime) = hadoop_runtime();
+        let provider = view_provider(runtime);
+        let mut foreign = listing_request(&provider, test_context());
+        foreign.namespace.instance_id =
+            novarocks_spi::connector::ConnectorInstanceId::parse("other").unwrap();
+        let error = executor
+            .block_on(provider.list_views_async(foreign, listing_cpu(&provider)))
+            .expect_err("the exact provider owner is checked before catalog work");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let stopped = novarocks_spi::connector::ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            stop.view(),
+            65536,
+            262144,
+        )
+        .unwrap();
+        stop.request_stop();
+        let error = executor
+            .block_on(
+                provider
+                    .list_views_async(listing_request(&provider, stopped), listing_cpu(&provider)),
+            )
+            .expect_err("the original stop cannot reach an unsupported catalog call");
+        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+
+        let expired = novarocks_spi::connector::ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            65536,
+            262144,
+        )
+        .unwrap();
+        // Use the existing deadline projection rather than changing a live clock.
+        let expired = expired.with_earlier_deadline(std::time::Instant::now());
+        let error = executor
+            .block_on(
+                provider
+                    .list_views_async(listing_request(&provider, expired), listing_cpu(&provider)),
+            )
+            .expect_err("the original expired deadline cannot reach the catalog");
+        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+    }
+
+    #[test]
+    fn view_listing_mapping_keeps_exact_identity_and_rechecks_original_control() {
+        let (_executor, _warehouse, runtime) = hadoop_runtime();
+        let provider = view_provider(runtime);
+        let request = listing_request(&provider, test_context());
+        let identities = listed_view_identities(
+            &provider,
+            &request,
+            Ok(vec!["v2".to_owned(), "v1".to_owned()]),
+        )
+        .unwrap();
+        assert_eq!(
+            identities
+                .iter()
+                .map(|view| view.view.as_ref())
+                .collect::<Vec<_>>(),
+            ["v2", "v1"],
+            "Provider identity projection does not invent ordering or drop names"
+        );
+        assert!(identities.iter().all(|view| {
+            view.instance_id == provider.descriptor().instance_id
+                && view.namespace == request.namespace.namespace
+        }));
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let stopped = listing_request(
+            &provider,
+            novarocks_spi::connector::ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                stop.view(),
+                65536,
+                262144,
+            )
+            .unwrap(),
+        );
+        stop.request_stop();
+        assert_eq!(
+            listed_view_identities(&provider, &stopped, Ok(Vec::new()))
+                .expect_err("even an empty result must recheck the original stop")
+                .kind(),
+            ConnectorErrorKind::Cancelled
+        );
+    }
+
+    #[test]
+    fn selected_view_listing_error_keeps_original_source_before_later_stop() {
+        use novarocks_failure_contract::FailureProjection;
+
+        let (_executor, _warehouse, runtime) = hadoop_runtime();
+        let provider = view_provider(runtime);
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let request = listing_request(
+            &provider,
+            novarocks_spi::connector::ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                stop.view(),
+                65536,
+                262144,
+            )
+            .unwrap(),
+        );
+        let original_source = novarocks_type_contract::CompileControlError::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+        );
+        let original = ConnectorError::compile_interruption(original_source.clone());
+        let expected_fact = original.failure_fact();
+        let selected = Err(original.clone());
+        stop.request_stop();
+        let actual = listed_view_identities(&provider, &request, selected)
+            .expect_err("later stop cannot overwrite a catalog-selected Source");
+        assert_eq!(actual, original, "including the same opaque cause identity");
+        assert_eq!(actual.failure_fact(), expected_fact);
+        let preserved = std::error::Error::source(&actual)
+            .unwrap()
+            .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            .unwrap()
+            .downcast_ref::<novarocks_type_contract::CompileControlError>();
+        assert_eq!(preserved, Some(&original_source));
+        let mut work = async_listing::Work::new(provider.clone(), request.clone());
+        work.receive(Err(actual.clone()));
+        work.run();
+        assert_eq!(
+            work.error(),
+            Some(actual),
+            "the closed phase also preserves raw Err before later stop/CPU work"
+        );
+        assert_eq!(
+            listed_view_identities(&provider, &request, Ok(Vec::new()))
+                .expect_err("a successful empty listing still observes the original stop")
+                .kind(),
+            ConnectorErrorKind::Cancelled
+        );
     }
 }

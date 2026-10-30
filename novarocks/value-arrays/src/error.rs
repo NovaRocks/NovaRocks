@@ -63,6 +63,7 @@ pub fn field_representation(
 
 #[derive(Debug)]
 pub enum ValueError {
+    Layout(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
     Invariant(ValueViolation),
     Representation(RepresentationFacts),
     Allocation {
@@ -89,6 +90,7 @@ impl ValueError {
 impl fmt::Display for ValueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Layout(source) => source.fmt(f),
             Self::Invariant(violation) => write!(f, "value array contract violated: {violation:?}"),
             Self::Representation(facts) => write!(
                 f,
@@ -105,6 +107,7 @@ impl fmt::Display for ValueError {
 impl Error for ValueError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Layout(source) => Some(source),
             Self::Allocation { source, .. } => Some(source),
             Self::Allocator { source, .. } => Some(source),
             Self::Arrow(source) => Some(source),
@@ -115,6 +118,7 @@ impl Error for ValueError {
 impl FailureProjection for ValueError {
     fn failure_fact(&self) -> FailureFact {
         let (class, code) = match self {
+            Self::Layout(source) => return source.failure_fact(),
             Self::Invariant(violation) => (FailureClass::Invariant, *violation as u16),
             Self::Representation(_) => (FailureClass::Representation, 1),
             Self::Allocation { .. } | Self::Allocator { .. } => (FailureClass::Resource, 2),
@@ -258,6 +262,26 @@ mod tests {
                 .representable_prefix,
             None
         );
+    }
+    #[test]
+    fn shared_layout_error_preserves_the_original_neutral_source_projection() {
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+        for source in [
+            LayoutResourceError::SourceModel,
+            LayoutResourceError::ArcBacking,
+            LayoutResourceError::Arithmetic,
+        ] {
+            let expected = source.failure_fact();
+            let error = ValueError::Layout(source);
+            assert_eq!(error.failure_fact(), expected);
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<LayoutResourceError>(),
+                Some(&source)
+            );
+        }
     }
     #[test]
     fn arrow_growth_and_extent_keep_their_source_and_semantic_class() {

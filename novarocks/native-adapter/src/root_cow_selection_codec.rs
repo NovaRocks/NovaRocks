@@ -146,6 +146,48 @@ impl std::fmt::Display for CowSelectionCodecError {
 }
 impl std::error::Error for CowSelectionCodecError {}
 
+/// Owned construction distinguishes immutable wire grammar from the actual
+/// allocation/budget author. Pure codec errors remain the original Copy kind.
+#[derive(Debug)]
+pub enum CowOwnedDecodeError {
+    Codec(CowSelectionCodecError),
+    Source(novarocks_spi::connector::ConnectorError),
+}
+impl From<CowSelectionCodecError> for CowOwnedDecodeError {
+    fn from(error: CowSelectionCodecError) -> Self {
+        Self::Codec(error)
+    }
+}
+impl From<novarocks_spi::connector::ConnectorError> for CowOwnedDecodeError {
+    fn from(error: novarocks_spi::connector::ConnectorError) -> Self {
+        Self::Source(error)
+    }
+}
+impl std::fmt::Display for CowOwnedDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Codec(error) => error.fmt(f),
+            Self::Source(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for CowOwnedDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Codec(error) => Some(error),
+            Self::Source(error) => Some(error),
+        }
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for CowOwnedDecodeError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        match self {
+            Self::Codec(error) => error.failure_fact(),
+            Self::Source(error) => error.failure_fact(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CowSelectionRecordKind {
     Schema,
@@ -961,7 +1003,7 @@ impl CowSelectionDecoder {
     pub fn decode_batch_owned(
         schema: &SchemaRef,
         record: &[u8],
-    ) -> Result<ConnectorRowMutationSourceBatch, CowSelectionCodecError> {
+    ) -> Result<ConnectorRowMutationSourceBatch, CowOwnedDecodeError> {
         Self::decode_batch_owned_inner(schema, record, None)
     }
 
@@ -969,7 +1011,7 @@ impl CowSelectionDecoder {
         schema: &SchemaRef,
         record: &[u8],
         guard: ConnectorPayloadRetentionGuard,
-    ) -> Result<ConnectorRowMutationSourceBatch, CowSelectionCodecError> {
+    ) -> Result<ConnectorRowMutationSourceBatch, CowOwnedDecodeError> {
         Self::decode_batch_owned_inner(schema, record, Some(guard))
     }
 
@@ -977,16 +1019,16 @@ impl CowSelectionDecoder {
         schema: &SchemaRef,
         record: &[u8],
         guard: Option<ConnectorPayloadRetentionGuard>,
-    ) -> Result<ConnectorRowMutationSourceBatch, CowSelectionCodecError> {
+    ) -> Result<ConnectorRowMutationSourceBatch, CowOwnedDecodeError> {
         let header = CowSelectionRecordHeader::parse(record)?;
         header.validate_record_bytes(record.len())?;
         if header.kind != CowSelectionRecordKind::Batch {
-            return Err(CowSelectionCodecError::MalformedBatch);
+            return Err(CowSelectionCodecError::MalformedBatch.into());
         }
         if record.len() > MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES
             || header.rows > RootProfileV1::MAX_ELEMENTS_PER_ROW as u64
         {
-            return Err(CowSelectionCodecError::SourceLimit);
+            return Err(CowSelectionCodecError::SourceLimit.into());
         }
         let malformed = CowSelectionCodecError::MalformedBatch;
         let nodes = header.nodes as usize;
@@ -1008,28 +1050,22 @@ impl CowSelectionDecoder {
             }
             None => ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema)),
         }
-        .map_err(|_| CowSelectionCodecError::SourceLimit)?;
+        .map_err(CowOwnedDecodeError::Source)?;
         let rows = usize::try_from(header.rows).map_err(|_| malformed)?;
         let mut columns = owner
             .children(schema.fields().len())
-            .map_err(source_error)?;
+            .map_err(CowOwnedDecodeError::Source)?;
         for field in schema.fields() {
             columns
                 .push(state.array_owned(field.data_type(), &mut owner)?)
-                .map_err(source_error)?;
+                .map_err(CowOwnedDecodeError::Source)?;
         }
         if state.node != nodes || state.buffer != buffers || state.position != state.payload.len() {
-            return Err(malformed);
+            return Err(malformed.into());
         }
-        owner.finish(rows, columns).map_err(source_error)
-    }
-}
-
-fn source_error(error: novarocks_spi::connector::ConnectorError) -> CowSelectionCodecError {
-    if error.kind() == novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted {
-        CowSelectionCodecError::SourceLimit
-    } else {
-        CowSelectionCodecError::MalformedBatch
+        owner
+            .finish(rows, columns)
+            .map_err(CowOwnedDecodeError::Source)
     }
 }
 
@@ -1085,7 +1121,7 @@ impl CowSelectionStreamDecoder {
     pub fn apply_owned_record(
         &mut self,
         record: &[u8],
-    ) -> Result<Option<ConnectorRowMutationSourceBatch>, CowSelectionCodecError> {
+    ) -> Result<Option<ConnectorRowMutationSourceBatch>, CowOwnedDecodeError> {
         self.apply_owned_record_inner(record, None)
     }
 
@@ -1094,7 +1130,7 @@ impl CowSelectionStreamDecoder {
         &mut self,
         record: &[u8],
         guard: ConnectorPayloadRetentionGuard,
-    ) -> Result<Option<ConnectorRowMutationSourceBatch>, CowSelectionCodecError> {
+    ) -> Result<Option<ConnectorRowMutationSourceBatch>, CowOwnedDecodeError> {
         self.apply_owned_record_inner(record, Some(guard))
     }
 
@@ -1102,10 +1138,10 @@ impl CowSelectionStreamDecoder {
         &mut self,
         record: &[u8],
         guard: Option<ConnectorPayloadRetentionGuard>,
-    ) -> Result<Option<ConnectorRowMutationSourceBatch>, CowSelectionCodecError> {
+    ) -> Result<Option<ConnectorRowMutationSourceBatch>, CowOwnedDecodeError> {
         let header = CowSelectionRecordHeader::parse(record)?;
         if record.len() > MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES {
-            return Err(CowSelectionCodecError::SourceLimit);
+            return Err(CowSelectionCodecError::SourceLimit.into());
         }
         match (header.kind, &self.schema) {
             (CowSelectionRecordKind::Schema, None) => {
@@ -1114,23 +1150,23 @@ impl CowSelectionStreamDecoder {
                 // Source construction does not start until the complete
                 // decoded immutable schema passes its source-owner profile.
                 ConnectorRowMutationSourceBuilder::try_new(Arc::clone(&schema))
-                    .map_err(|_| CowSelectionCodecError::SourceLimit)?;
+                    .map_err(CowOwnedDecodeError::Source)?;
                 self.schema = Some(schema);
                 self.retention = guard;
                 Ok(None)
             }
             (CowSelectionRecordKind::Schema, Some(_)) => {
-                Err(CowSelectionCodecError::MalformedSchema)
+                Err(CowSelectionCodecError::MalformedSchema.into())
             }
-            (CowSelectionRecordKind::Batch, None) => Err(CowSelectionCodecError::MalformedBatch),
+            (CowSelectionRecordKind::Batch, None) => {
+                Err(CowSelectionCodecError::MalformedBatch.into())
+            }
             (CowSelectionRecordKind::Batch, Some(schema)) => {
                 if self.batches >= MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES {
-                    return Err(CowSelectionCodecError::BatchLimit);
+                    return Err(CowSelectionCodecError::BatchLimit.into());
                 }
                 let guard = match (guard, self.retention.clone()) {
-                    (Some(batch), Some(schema)) => {
-                        Some(ConnectorPayloadRetentionGuard::new((schema, batch)))
-                    }
+                    (Some(batch), Some(schema)) => Some(batch.with_lifetime_retention(schema)),
                     (batch, schema) => batch.or(schema),
                 };
                 let batch = match guard {
@@ -1534,7 +1570,7 @@ impl<'a> BatchState<'a> {
         &mut self,
         data_type: &DataType,
         owner: &mut ConnectorRowMutationSourceBuilder,
-    ) -> Result<ConnectorRowMutationSourceArray, CowSelectionCodecError> {
+    ) -> Result<ConnectorRowMutationSourceArray, CowOwnedDecodeError> {
         let malformed = CowSelectionCodecError::MalformedBatch;
         let (_, shape) = shape(data_type).map_err(|_| malformed)?;
         let node = self.node;
@@ -1543,19 +1579,23 @@ impl<'a> BatchState<'a> {
         let len =
             usize::try_from(u64::from_le_bytes(word.try_into().unwrap())).map_err(|_| malformed)?;
         if len > RootProfileV1::MAX_ELEMENTS_PER_ROW {
-            return Err(CowSelectionCodecError::SourceLimit);
+            return Err(CowSelectionCodecError::SourceLimit.into());
         }
         self.node += 1;
         let copy = |bytes: Option<&[u8]>, owner: &mut ConnectorRowMutationSourceBuilder| {
             bytes
-                .map(|bytes| owner.copy_buffer(bytes).map_err(source_error))
+                .map(|bytes| {
+                    owner
+                        .copy_buffer(bytes)
+                        .map_err(CowOwnedDecodeError::Source)
+                })
                 .transpose()
         };
         let validity_bytes = self.buffer_bytes(None)?;
         if validity_bytes
             .is_some_and(|bytes| bytes.len() != len.div_ceil(8) || matches!(shape, Shape::Null))
         {
-            return Err(malformed);
+            return Err(malformed.into());
         }
         let validity = copy(validity_bytes, owner)?;
         let (first, second) = match shape {
@@ -1593,7 +1633,7 @@ impl<'a> BatchState<'a> {
                     Some(
                         owner
                             .copy_buffer(self.buffer_bytes(None)?.unwrap_or(&[]))
-                            .map_err(source_error)?,
+                            .map_err(CowOwnedDecodeError::Source)?,
                     )
                 } else {
                     None
@@ -1606,26 +1646,26 @@ impl<'a> BatchState<'a> {
             DataType::Struct(fields) => fields.len(),
             _ => 0,
         };
-        let mut children = owner.children(count).map_err(source_error)?;
+        let mut children = owner.children(count).map_err(CowOwnedDecodeError::Source)?;
         match data_type {
             DataType::List(item) | DataType::LargeList(item) => children
                 .push(self.array_owned(item.data_type(), owner)?)
-                .map_err(source_error)?,
+                .map_err(CowOwnedDecodeError::Source)?,
             DataType::Struct(fields) => {
                 for child in fields {
                     children
                         .push(self.array_owned(child.data_type(), owner)?)
-                        .map_err(source_error)?;
+                        .map_err(CowOwnedDecodeError::Source)?;
                 }
             }
             DataType::Dictionary(_, value) => children
                 .push(self.array_owned(value, owner)?)
-                .map_err(source_error)?,
+                .map_err(CowOwnedDecodeError::Source)?,
             _ => {}
         }
         owner
             .array(node, len, validity, first, second, children)
-            .map_err(source_error)
+            .map_err(CowOwnedDecodeError::Source)
     }
 }
 
@@ -1634,7 +1674,7 @@ mod owned_source_tests {
     use super::*;
     use arrow::array::{Int32Array, NullArray, StringArray, StructArray};
 
-    fn encode(batch: &RecordBatch) -> Vec<u8> {
+    pub(super) fn encode(batch: &RecordBatch) -> Vec<u8> {
         let mut encoder =
             CowSelectionEncoder::try_new(batch, CowSelectionTotals::default(), usize::MAX).unwrap();
         let mut output = [0_u8; 8192];
@@ -1725,10 +1765,10 @@ mod owned_source_tests {
             Err(CowSelectionCodecError::MalformedSchema)
         );
         let mut decoder = CowSelectionStreamDecoder::new();
-        assert_eq!(
+        assert!(matches!(
             decoder.apply_owned_record(record).unwrap_err(),
-            CowSelectionCodecError::SourceLimit
-        );
+            CowOwnedDecodeError::Codec(CowSelectionCodecError::SourceLimit)
+        ));
         assert!(decoder.schema().is_none());
     }
 
@@ -1745,15 +1785,15 @@ mod owned_source_tests {
         record[COW_SELECTION_HEADER_BYTES..COW_SELECTION_HEADER_BYTES + 8]
             .copy_from_slice(&rows.to_le_bytes());
         let mut decoder = CowSelectionStreamDecoder::new();
-        assert_eq!(
+        assert!(matches!(
             decoder.apply_owned_record(&stream[split..]).unwrap_err(),
-            CowSelectionCodecError::MalformedBatch
-        );
+            CowOwnedDecodeError::Codec(CowSelectionCodecError::MalformedBatch)
+        ));
         decoder.apply_owned_record(&stream[..split]).unwrap();
-        assert_eq!(
+        assert!(matches!(
             decoder.apply_owned_record(&record).unwrap_err(),
-            CowSelectionCodecError::SourceLimit
-        );
+            CowOwnedDecodeError::Codec(CowSelectionCodecError::SourceLimit)
+        ));
         assert_eq!(decoder.batches, 0);
     }
 }
@@ -1762,6 +1802,125 @@ mod owned_source_tests {
 mod retention_tests {
     use super::*;
     use arrow::array::Int32Array;
+
+    struct OriginalBudget {
+        holder: Arc<()>,
+        held: Arc<std::sync::atomic::AtomicUsize>,
+        bytes: usize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        refusal: Option<novarocks_spi::connector::ConnectorError>,
+    }
+    struct OriginalBufferReceipt {
+        _holder: Arc<()>,
+        held: Arc<std::sync::atomic::AtomicUsize>,
+        bytes: usize,
+    }
+    impl Drop for OriginalBufferReceipt {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.held
+                    .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel),
+                self.bytes
+            );
+        }
+    }
+    impl novarocks_spi::connector::ConnectorPayloadByteBudget for OriginalBudget {
+        fn reserve_bytes(
+            &self,
+            bytes: usize,
+        ) -> Result<ConnectorPayloadRetentionGuard, novarocks_spi::connector::ConnectorError>
+        {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if bytes > self.bytes
+                || self
+                    .held
+                    .compare_exchange(0, bytes, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                return Err(self.refusal.clone().unwrap_or_else(|| {
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+                        "original test Arrow buffer budget is full",
+                    )
+                }));
+            }
+            Ok(ConnectorPayloadRetentionGuard::new(OriginalBufferReceipt {
+                _holder: self.holder.clone(),
+                held: self.held.clone(),
+                bytes,
+            }))
+        }
+    }
+
+    #[test]
+    fn owned_budget_refusal_preserves_original_typed_cause_and_first_buffer_receipt() {
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_spi::connector::{
+            ConnectorCodecError, ConnectorCodecErrorKind, ConnectorError, ConnectorErrorKind,
+            ConnectorFieldPath,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![3, 4]))]).unwrap();
+        let stream = super::owned_source_tests::encode(&batch);
+        let split = CowSelectionRecordHeader::parse(&stream)
+            .unwrap()
+            .record_bytes() as usize;
+        let typed = ConnectorCodecError::new(
+            ConnectorFieldPath::root("original_byte_budget"),
+            ConnectorCodecErrorKind::Capacity,
+            "original allocation author has no second buffer slot",
+        );
+        let original = ConnectorError::from_domain(ConnectorErrorKind::ResourceExhausted, typed);
+        let held = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let guard = ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(OriginalBudget {
+            holder: Arc::new(()),
+            held: held.clone(),
+            bytes: 64,
+            calls: calls.clone(),
+            refusal: Some(original.clone()),
+        }));
+        let mut decoder = CowSelectionStreamDecoder::new();
+        decoder
+            .apply_owned_record_with_guard(
+                &stream[..split],
+                ConnectorPayloadRetentionGuard::new(()),
+            )
+            .unwrap();
+        let first = decoder
+            .apply_owned_record_with_guard(&stream[split..], guard.clone())
+            .unwrap()
+            .unwrap();
+        let last = first.batch().column(0).to_data().buffers()[0].slice_with_length(4, 4);
+        drop(first);
+        assert_eq!(held.load(Ordering::Acquire), 64);
+        let refused = decoder
+            .apply_owned_record_with_guard(&stream[split..], guard)
+            .unwrap_err();
+        let CowOwnedDecodeError::Source(refused) = refused else {
+            panic!("byte author must not become a grammar kind");
+        };
+        assert_eq!(refused, original);
+        assert_eq!(refused.failure_fact(), original.failure_fact());
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            2,
+            "second allocation is refused by its original pre-copy author"
+        );
+        assert_eq!(held.load(Ordering::Acquire), 64);
+        assert_eq!(
+            decoder.batches, 1,
+            "failed receipt cannot publish another source batch"
+        );
+        drop((decoder, stream));
+        assert_eq!(last.as_slice(), 4_i32.to_ne_bytes());
+        assert_eq!(held.load(Ordering::Acquire), 64);
+        drop(last);
+        assert_eq!(held.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn guarded_owned_codec_keeps_last_arrow_slice_after_decoder_and_receipt_exit() {
@@ -1780,28 +1939,51 @@ mod retention_tests {
                 break;
             }
         }
+        let schema_holder = Arc::new(());
+        let schema_weak = Arc::downgrade(&schema_holder);
+        let schema_guard = ConnectorPayloadRetentionGuard::new(schema_holder);
         let holder = Arc::new(());
         let weak = Arc::downgrade(&holder);
-        let guard = ConnectorPayloadRetentionGuard::new(holder);
+        // The original codec copies one two-row Int32 buffer, rounded to the
+        // pinned Arrow constructor's actual 64-byte payload allocation.
+        let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bytes = (2 * std::mem::size_of::<i32>() + 63) & !63;
+        let guard = ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(OriginalBudget {
+            holder,
+            held: held.clone(),
+            bytes,
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            refusal: None,
+        }));
         let mut decoder = CowSelectionStreamDecoder::new();
         let split = CowSelectionRecordHeader::parse(&stream)
             .unwrap()
             .record_bytes() as usize;
         decoder
-            .apply_owned_record_with_guard(&stream[..split], guard.clone())
+            .apply_owned_record_with_guard(&stream[..split], schema_guard)
             .unwrap();
         let source = decoder
             .apply_owned_record_with_guard(&stream[split..], guard)
             .unwrap()
             .unwrap();
         let alias = source.batch().column(0).to_data().buffers()[0].slice_with_length(4, 4);
-        drop(source);
         drop(decoder);
+        assert!(
+            schema_weak.upgrade().is_some(),
+            "source keeps the original schema lifetime"
+        );
+        drop(source);
         drop(stream);
+        assert!(
+            schema_weak.upgrade().is_none(),
+            "raw buffer receipt does not pin the schema source"
+        );
         assert!(weak.upgrade().is_some());
+        assert_eq!(held.load(std::sync::atomic::Ordering::Acquire), bytes);
         assert_eq!(alias.as_slice(), 4_i32.to_ne_bytes());
         drop(alias);
         assert!(weak.upgrade().is_none());
+        assert_eq!(held.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 }
 

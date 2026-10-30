@@ -333,10 +333,12 @@ mod tests {
         let value_type =
             FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
                 .unwrap();
-        let field = Arc::new(
-            Field::new("literal", DataType::Utf8, false)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "json".into())].into()),
-        );
+        let field = Arc::new(Field::new("literal", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                NR_LOGICAL_TYPE_KEY.into(),
+                "json".into(),
+            )]),
+        ));
         let json = ConstantPool::try_new(
             field,
             value_type.clone(),

@@ -260,8 +260,12 @@ fn collection_gate_preserves_complete_domains_and_rejects_wrong_nullable_profile
     // remains an independent obligation before complete package publication.
     let child = |metadata: bool, nullable: bool| {
         Arc::new(if metadata {
-            Field::new("item", DataType::Int32, nullable)
-                .with_metadata([("source.field".into(), "changed".into())].into())
+            Field::new("item", DataType::Int32, nullable).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "source.field".into(),
+                    "changed".into(),
+                )]),
+            )
         } else {
             Field::new("item", DataType::Int32, nullable)
         })

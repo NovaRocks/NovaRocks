@@ -41,7 +41,7 @@ impl Drop for HeldReadExit {
 struct HeldStatisticsReader {
     identity: Arc<ContextObservingProvider>,
     started: mpsc::Sender<()>,
-    release: Mutex<mpsc::Receiver<()>>,
+    release: Arc<tokio::sync::Notify>,
     exit: Mutex<Option<HeldReadExit>>,
     reads: AtomicUsize,
     stop_seen: AtomicBool,
@@ -56,31 +56,45 @@ impl StatisticsReader for HeldStatisticsReader {
     }
     fn read_statistics(
         &self,
-        request: StatisticsReadRequest,
+        _: StatisticsReadRequest,
     ) -> Result<StatisticsEvidence, ConnectorError> {
-        self.reads.fetch_add(1, Ordering::AcqRel);
-        let _exit = self.exit.lock().unwrap().take();
-        self.exact_request.store(
-            request.table.owner() == &self.identity.descriptor.instance_id
-                && request.table.payload().as_ref() == b"orders"
-                && request.data_version
-                    == StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1")).unwrap()
-                && request.metrics.metrics() == [StatisticsMetric::RowCount]
-                && request.narrowed_read.is_none(),
-            Ordering::Release,
-        );
-        let _ = self.started.send(());
-        let _ = self.release.lock().unwrap().recv();
-        let stopped = request.context.is_cancelled();
-        self.stop_seen.store(stopped, Ordering::Release);
-        Err(ConnectorError::new(
-            if stopped {
-                ConnectorErrorKind::Cancelled
-            } else {
-                ConnectorErrorKind::Internal
-            },
-            "held statistics reader reached its actual stop check",
-        ))
+        panic!("the real async statistics port must not fall back to a synchronous reader")
+    }
+    fn read_statistics_async(
+        &self,
+        request: StatisticsReadRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<StatisticsEvidence, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.reads.fetch_add(1, Ordering::AcqRel);
+            let _exit = self.exit.lock().unwrap().take();
+            self.exact_request.store(
+                request.table.owner() == &self.identity.descriptor.instance_id
+                    && request.table.payload().as_ref() == b"orders"
+                    && request.data_version
+                        == StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1")).unwrap()
+                    && request.metrics.metrics() == [StatisticsMetric::RowCount]
+                    && request.narrowed_read.is_none(),
+                Ordering::Release,
+            );
+            let _ = self.started.send(());
+            self.release.notified().await;
+            let stopped = request.context.is_cancelled();
+            self.stop_seen.store(stopped, Ordering::Release);
+            Err(ConnectorError::new(
+                if stopped {
+                    ConnectorErrorKind::Cancelled
+                } else {
+                    ConnectorErrorKind::Internal
+                },
+                "held statistics reader reached its actual stop check",
+            ))
+        })
     }
 }
 impl ConnectorStatistics for HeldStatisticsReader {}
@@ -139,7 +153,53 @@ fn empty_completion_owners(
     )
 }
 
+#[derive(Debug)]
+struct StatisticsNoNativeStart;
+impl novarocks_query_application::api::LogicalExecutionNativePort for StatisticsNoNativeStart {
+    fn bind_in(
+        &self,
+        _: &mut Option<novarocks_query_application::api::LogicalNativeOpenRequest>,
+        _: &mut Option<novarocks_query_application::api::LogicalNativeSession>,
+    ) -> Result<(), novarocks_query_application::api::LogicalNativeOpenError> {
+        panic!("statistics completion facts cannot start Native work")
+    }
+}
+struct ActualStatisticsAction {
+    original: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
+impl novarocks_query_application::session_control::GovernedStatementAction
+    for ActualStatisticsAction
+{
+    fn poll_action(
+        &mut self,
+        _: &mut novarocks_query_application::session_control::GovernedActionContext<'_>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<
+        Result<
+            novarocks_query_application::session_control::StatementActionValue,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+    > {
+        self.original.as_mut().poll(cx).map(|()| {
+            Ok(
+                novarocks_query_application::session_control::StatementActionValue::Ok(
+                    novarocks_query_application::session_control::StatementCommandCompletion::new(
+                        0,
+                    ),
+                ),
+            )
+        })
+    }
+}
+
 fn observe_real_statistics_port(class: ResultWindowClass) {
+    use novarocks_query_application::{
+        client_connection::ClientConnectionToken,
+        coordination::{LogicalExecutionRowsConfig, LogicalExecutionSupervisorConfig},
+        query_control::QueryApplicationControl,
+        session_control::{QueryControlService, SessionIdentity},
+    };
+    use std::num::{NonZeroU32, NonZeroUsize};
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(2)
@@ -149,28 +209,82 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
     let blocking = crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
         runtime.handle().clone(),
     );
-    let (control, root, window) = crate::task_execution::blocking_io::tests::admitted_class(class);
+    let service = QueryControlService::new(Arc::new(QueryApplicationControl::default()));
+    let session = service
+        .register_session(SessionIdentity::new(
+            ClientConnectionToken::new(7, 1).unwrap(),
+            "root",
+        ))
+        .unwrap();
+    let (mut fixture, client) =
+        crate::query_execution::logical_execution_test_profile::process_with_statement_control(
+            runtime.handle().clone(),
+            Arc::new(StatisticsNoNativeStart),
+            novarocks_types::identity::QueryProcessNamespace::new(0x9b1),
+            novarocks_types::identity::FrontendProcessId::new_v7(),
+            LogicalExecutionSupervisorConfig::new(
+                NonZeroUsize::new(8).unwrap(),
+                NonZeroUsize::MIN,
+                NonZeroUsize::MIN,
+                LogicalExecutionRowsConfig::new(
+                    NonZeroUsize::MIN,
+                    NonZeroU32::MIN,
+                    Duration::from_secs(1),
+                ),
+            ),
+            service.clone(),
+        );
+    let mut owner = runtime
+        .block_on(service.begin_queued_governed_query_statement_with_result(
+            session.token(),
+            &fixture.control().root_admission(),
+            None,
+            None,
+            None,
+            class,
+        ))
+        .unwrap();
+    runtime.block_on(fixture.bind_local_root(owner.execution_owner_slot().as_ref().unwrap()));
+    let original_id = owner.scope().id();
+    let cancel = owner
+        .execution_owner_slot()
+        .as_ref()
+        .unwrap()
+        .cancellation_requester();
+    let observation = fixture.control().observation();
     let capacity =
-        QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
+        QueryResultCapacityBinding::try_new(owner.scope(), owner.result_window_alias().unwrap())
+            .unwrap();
+    if class == ResultWindowClass::Internal {
+        // Original Internal statement admission now pins its configured Root
+        // byte owner, not a computation position or a fabricated payload.
+        let retention = capacity.try_window_alias().unwrap();
+        assert!(retention.is_for_scope(owner.scope()));
+        assert!(retention.is_root_backed_internal());
+        assert_eq!(retention.class(), ResultWindowClass::Internal);
+        assert!(retention.internal_manifest_binding().unwrap().is_none());
+        assert_eq!(observation.snapshot().result_windows.held_positions, [0; 4]);
+    }
     let (started, entered) = mpsc::channel();
-    let (release_call, held_call) = mpsc::channel();
+    let release_call = Arc::new(tokio::sync::Notify::new());
     let (exit_started, exit_entered) = mpsc::channel();
     let (release_exit, held_exit) = mpsc::channel();
     let exited = Arc::new(AtomicBool::new(false));
-    // Rescue exists before the original actual provider callback is submitted.
+    // Rescue exists before the actual Reader future is submitted. It retains
+    // only gates, never the provider, action, result window or Root owner.
     let (disarm, watch) = mpsc::channel();
-    let rescue_call = release_call.clone();
+    let rescue_call = Arc::clone(&release_call);
     let rescue_exit = release_exit.clone();
     let watchdog = std::thread::spawn(move || {
         if watch.recv_timeout(Duration::from_secs(6)).is_err() {
-            let _ = rescue_call.send(());
+            rescue_call.notify_one();
             let _ = rescue_exit.send(());
         }
     });
     let provider = Arc::new(HeldStatisticsReader {
         identity: observing_provider(),
         started,
-        release: Mutex::new(held_call),
+        release: Arc::clone(&release_call),
         exit: Mutex::new(Some(HeldReadExit {
             entered: exit_started,
             release: held_exit,
@@ -198,11 +312,11 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
     .unwrap();
-    let scope = StatementFactScope::new(
+    let scope = StatementFactScope::binding_only(
         bindings.clone(),
         context,
         Some("ice.main"),
-        &root.owner.scope(),
+        owner.scope(),
         capacity.clone(),
     )
     .unwrap();
@@ -214,54 +328,116 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
         vec![StatisticsMetric::RowCount],
     )
     .unwrap();
+    let original = Box::pin(async move {
+        let answer = port.resolve_statistics(&[need]).await;
+        drop(answer);
+    });
+    let mut owner = Some(owner);
+    let mut action: Option<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+    > = Some(Box::new(ActualStatisticsAction { original }));
+    let mut receive = None;
+    service
+        .publish_statement_action_in(&mut owner, &mut action, &mut receive)
+        .unwrap()
+        .finish()
+        .unwrap();
+    assert!(owner.is_none() && action.is_none());
+    let receive = receive.take().unwrap();
     let delivered = Arc::new(AtomicBool::new(false));
     let published = Arc::clone(&delivered);
+    // This original JoinHandle is ONLY the UI observer. The already-installed
+    // same supervisor drives the actual Statistics F in its stable Source.
     let mut waiter = runtime.spawn(async move {
-        let answer = port.resolve_statistics(&[need]).await;
+        let answer = receive.await;
+        drop(answer);
         published.store(true, Ordering::Release);
-        answer
     });
     let call_entered = entered.recv_timeout(Duration::from_secs(2)).is_ok();
     stop.request_stop();
-    root.owner.cancel(CancellationReason::Requested);
-    // Exercise the production-derived local child Cancel, without test ack.
-    control.expire_deadlines();
+    cancel.request(CancellationReason::Requested).unwrap();
+    fixture.control().expire_deadlines();
     waiter.abort();
-    let waiter_join =
+    let joined =
         runtime.block_on(async { tokio::time::timeout(Duration::from_secs(2), &mut waiter).await });
-    let waiter_cancelled = matches!(waiter_join, Ok(Err(ref e)) if e.is_cancelled());
-    drop(waiter_join);
-    drop(waiter);
+    let waiter_cancelled = matches!(joined, Ok(Err(ref e)) if e.is_cancelled());
     drop(capacity);
-    root.owner.complete_after_terminal_cancel_settled();
-    root.business.release();
-    drop(window);
-    let during_call = control.snapshot();
-    let _ = release_call.send(());
+    let during_call = observation.snapshot();
+    release_call.notify_one();
     let drop_entered = exit_entered.recv_timeout(Duration::from_secs(2)).is_ok();
-    let during_exit = control.snapshot();
+    let during_exit = observation.snapshot();
     let still_held = !exited.load(Ordering::Acquire);
     let _ = release_exit.send(());
     let _ = disarm.send(());
-    let watchdog_joined = watchdog.join().is_ok();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let after = loop {
-        let facts = control.snapshot();
-        if facts.scopes.is_empty() || Instant::now() >= deadline {
-            break facts;
-        }
-        std::thread::sleep(Duration::from_millis(1));
+    let watchdog_join = watchdog.join();
+    let watchdog_joined = watchdog_join.is_ok();
+    drop(cancel);
+    drop(session);
+    drop(service);
+    drop(client);
+    let shutdown =
+        runtime.block_on(fixture.shutdown_until(Instant::now() + Duration::from_secs(2)));
+    let after = observation.snapshot();
+    let expected = if class == ResultWindowClass::Local {
+        [0, 1, 0, 0]
+    } else {
+        // No computation was dispatched by these fact-only callbacks. The
+        // exact Root retention pin below must still survive actual exit.
+        [0; 4]
     };
-    control.close_admission();
-    let workload_exit = control.shutdown();
-    // No arbitrary error/panic payload formatting, and no synthetic completion.
-    if let Some(error) = blocking.take_original_failure() {
-        blocking.retire_original_failure(error);
+    let held = [&during_call, &during_exit].iter().all(|facts| {
+        facts.root_responsibilities == 1
+            && facts.result_windows.held_positions == expected
+            && facts.scopes.iter().any(|s| {
+                s.id == original_id
+                    && s.parent.is_none()
+                    && !s.own_completed
+                    && s.resource_holders > 0
+            })
+    });
+    let success = call_entered
+        && drop_entered
+        && still_held
+        && waiter_cancelled
+        && watchdog_joined
+        && held
+        && provider.reads.load(Ordering::Acquire) == 1
+        && provider.exact_request.load(Ordering::Acquire)
+        && provider.stop_seen.load(Ordering::Acquire)
+        && exited.load(Ordering::Acquire)
+        && !delivered.load(Ordering::Acquire)
+        && after.result_windows.held_positions == [0; 4]
+        && after.scopes.is_empty()
+        && shutdown.is_ok();
+    struct Failure {
+        _waiter: Result<Result<(), tokio::task::JoinError>, tokio::time::error::Elapsed>,
+        _waiter_handle: tokio::task::JoinHandle<()>,
+        _watchdog: std::thread::Result<()>,
+        _shutdown: Result<
+            (),
+            novarocks_query_application::coordination::LogicalExecutionSupervisorShutdownError,
+        >,
+        _blocking: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        _fixture: crate::query_execution::logical_execution_test_profile::IdentityTestOwner,
+        _runtime: tokio::runtime::Runtime,
     }
-    drop(bindings);
-    drop(blocking);
-    drop(runtime);
-
+    if !success {
+        eprintln!(
+            "statistics held phases: entered={call_entered} drop={drop_entered} held={still_held} cancelled={waiter_cancelled} root_held={held} watchdog={watchdog_joined} shutdown_ok={}",
+            shutdown.is_ok()
+        );
+        std::panic::panic_any(Failure {
+            _waiter: joined,
+            _waiter_handle: waiter,
+            _watchdog: watchdog_join,
+            _shutdown: shutdown,
+            _blocking: blocking,
+            _fixture: fixture,
+            _runtime: runtime,
+        });
+    }
+    // Same old responsibility predicates, now tied to the actual GovRoot.
+    // A retired QB child is not recreated just to satisfy the old mock shape.
     assert!(call_entered, "original provider callback was not entered");
     assert!(
         drop_entered,
@@ -273,22 +449,10 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
         "original caller did not join as cancelled"
     );
     assert!(watchdog_joined, "rescue watchdog did not join");
-    let expected = if class == ResultWindowClass::Local {
-        [0, 1, 0, 0]
-    } else {
-        [0, 0, 1, 0]
-    };
-    for facts in [&during_call, &during_exit] {
-        assert_eq!(facts.root_responsibilities, 1);
-        assert_eq!(facts.result_windows.held_positions, expected);
-        assert!(
-            facts
-                .scopes
-                .iter()
-                .any(|s| s.parent.is_some() && !s.own_completed),
-            "real StatisticsFacts call omitted its admitted local child"
-        );
-    }
+    assert!(
+        held,
+        "same original statement Root/result owner was not retained"
+    );
     assert_eq!(provider.reads.load(Ordering::Acquire), 1);
     assert!(provider.exact_request.load(Ordering::Acquire));
     assert!(provider.stop_seen.load(Ordering::Acquire));
@@ -299,10 +463,12 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
     );
     assert_eq!(after.result_windows.held_positions, [0; 4]);
     assert!(after.scopes.is_empty());
-    assert!(
-        workload_exit.is_ok(),
-        "same original workload did not drain"
-    );
+    assert!(shutdown.is_ok(), "same original workload did not drain");
+    drop(waiter);
+    drop(bindings);
+    drop(blocking);
+    drop(fixture);
+    drop(runtime);
 }
 
 #[test]
@@ -310,6 +476,6 @@ fn actual_statistics_port_keeps_local_window_through_stop_and_original_callback_
     observe_real_statistics_port(ResultWindowClass::Local);
 }
 #[test]
-fn actual_statistics_port_keeps_internal_window_through_stop_and_original_callback_exit() {
+fn actual_statistics_port_keeps_root_retention_through_stop_and_original_callback_exit() {
     observe_real_statistics_port(ResultWindowClass::Internal);
 }

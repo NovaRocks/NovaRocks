@@ -531,6 +531,8 @@ pub(crate) fn build_compiled_pipeline_graph(
         function_set,
         error,
         None,
+        1,
+        0,
     )
 }
 
@@ -550,6 +552,8 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
     _function_set: Arc<SealedExecutionFunctionSet>,
     error: Arc<RuntimeErrorState>,
     ordered: Option<&CompiledOrderedFilterContext>,
+    local_exchange_bytes_per_driver: usize,
+    local_exchange_max_rows: i64,
 ) -> ExecutionResult<PipelineGraph> {
     let graph = program.graph();
     if graph
@@ -577,8 +581,8 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
         operator_buffer_chunks: 1,
-        local_exchange_buffer_mem_limit_per_driver: 1,
-        local_exchange_max_buffered_rows: 0,
+        local_exchange_buffer_mem_limit_per_driver: local_exchange_bytes_per_driver,
+        local_exchange_max_buffered_rows: local_exchange_max_rows,
     };
     let mut build = build_node(program, graph.root(), &mut ctx, &error, ordered)?;
     // Statistics owns its specific original bounded materializer. Other root
@@ -1031,36 +1035,48 @@ fn build_node(
             Ok(build)
         }
         ProgramNodeKind::AssertNumRows { input, mode } => {
-            let factory = AssertNumRowsProcessorFactory::new(node_id, assertion_mode(mode))?;
-            // Existing keyed assertions receive their exact frozen declarations.
-            // This is construction metadata, not a type inferred from an encoded
-            // first batch. New stage/applicability routing is installed separately.
-            let factory = if let AssertRowsMode::PerKeyAtMostOne { key_slots, .. } = mode {
-                let layout = program.graph().nodes()[input.index()].output_layout();
-                let types = key_slots
-                    .iter()
-                    .map(|slot| {
-                        let binding = layout.value_binding(*slot).ok_or_else(|| {
-                            program_failure(
-                                FragmentBindingErrorKind::InvalidAssignment,
-                                "compiled assertion key has no frozen type",
-                            )
-                        })?;
-                        novarocks_type_contract::FunctionValueType::try_from_typed_binding(
-                            binding.clone(),
-                        )
-                        .map_err(ExecutionFailure::from_domain)
-                    })
-                    .collect::<ExecutionResult<Vec<_>>>()?;
-                factory.with_key_types(types)?
-            } else {
-                factory
+            let applies = match mode {
+                AssertRowsMode::PerKeyAtMostOne {
+                    applicability:
+                        novarocks_local_program::ProgramAssertionApplicability::WhenTrue(slot),
+                    ..
+                } => Some(*slot),
+                _ => None,
             };
-            // Existing global and instance-wide assertions remain on one driver.
+            let factory = match applies {
+                Some(slot) => AssertNumRowsProcessorFactory::new_with_applicability(
+                    node_id,
+                    assertion_mode(mode),
+                    slot,
+                )?,
+                None => AssertNumRowsProcessorFactory::new(node_id, assertion_mode(mode))?,
+            };
+            let keys = if let AssertRowsMode::PerKeyAtMostOne { key_slots, .. } = mode {
+                frozen_routing_keys(
+                    program.graph().nodes()[input.index()].output_layout(),
+                    key_slots,
+                )?
+            } else {
+                Vec::new()
+            };
+            let factory = if keys.is_empty() {
+                factory
+            } else {
+                factory.with_key_types(keys.iter().map(|(_, ty)| ty.clone()).collect())?
+            };
             let build = build_node(program, *input, ctx, error, ordered)?;
-            let mut build = gather_to_one(build, ctx, node_id);
+            let partitions = ctx.pipeline_dop as usize;
+            let mut build = if matches!(mode, AssertRowsMode::PerKeyAtMostOne { .. }) {
+                shuffle_compiled_typed_keys(build, ctx, node_id, keys, applies, partitions)
+            } else {
+                gather_to_one(build, ctx, node_id)
+            };
             build.pipeline.factories.push(Box::new(factory));
-            build.stream = StreamDesc::single();
+            build.stream = if matches!(mode, AssertRowsMode::PerKeyAtMostOne { .. }) {
+                StreamDesc::any(build.pipeline.dop)
+            } else {
+                StreamDesc::single()
+            };
             Ok(build)
         }
         ProgramNodeKind::Repeat { input, .. } => {
@@ -1324,6 +1340,32 @@ fn validate_union_branches(
         }
     }
     Ok(())
+}
+
+fn frozen_routing_keys(
+    layout: &novarocks_local_program::StaticLayout,
+    slots: &[novarocks_types::SlotId],
+) -> ExecutionResult<
+    Vec<(
+        novarocks_types::SlotId,
+        novarocks_type_contract::FunctionValueType,
+    )>,
+> {
+    slots
+        .iter()
+        .map(|slot| {
+            let binding = layout.value_binding(*slot).ok_or_else(|| {
+                program_failure(
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    "compiled routing key has no frozen type",
+                )
+            })?;
+            let ty =
+                novarocks_type_contract::FunctionValueType::try_from_typed_binding(binding.clone())
+                    .map_err(ExecutionFailure::from_domain)?;
+            Ok((*slot, ty))
+        })
+        .collect()
 }
 
 /// The frozen assertion mode in the existing row-count owner's vocabulary.

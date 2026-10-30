@@ -267,10 +267,56 @@ struct StorageMachine {
     generation: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StorageOwner {
+    Minio(MinioStorageOwner),
+    Oss(OssStorageOwner),
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StorageOwner {
+struct MinioStorageOwner {
     daemon_id: String,
     minio_volume: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OssStorageOwner {
+    provider: String,
+    endpoint: String,
+    region: String,
+    bucket: String,
+    root_prefix: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OssMachineConfig {
+    kind: String,
+    region: String,
+    bucket: String,
+    role_name: String,
+    root_prefix: String,
+}
+impl OssStorageOwner {
+    fn root(&self) -> Result<String> {
+        ensure!(
+            self.provider == "aliyun-oss"
+                && !self.region.is_empty()
+                && self
+                    .region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && self.endpoint == format!("https://s3.oss-{}-internal.aliyuncs.com", self.region)
+                && !self.root_prefix.is_empty()
+                && self.root_prefix.ends_with('/'),
+            "FixtureBudgetRejected: invalid OSS storage owner"
+        );
+        let root = canonical_s3(&format!("s3://{}/{}", self.bucket, self.root_prefix))?;
+        ensure!(
+            format!("{root}/") == format!("s3://{}/{}", self.bucket, self.root_prefix),
+            "FixtureBudgetRejected: invalid OSS storage root"
+        );
+        Ok(root)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -311,8 +357,36 @@ impl RunStorageScope {
                 namespace_prefix: format!("{}_", identity.run_id),
             })
         };
+        let storage_owner = match record["config"].get("object_store") {
+            Some(value)
+                if value.get("kind").and_then(serde_json::Value::as_str) == Some("aliyun-oss") =>
+            {
+                let config: OssMachineConfig = serde_json::from_value(value.clone())
+                    .context("FixtureBudgetRejected: invalid machine OSS configuration")?;
+                ensure!(
+                    config.kind == "aliyun-oss" && !config.role_name.is_empty(),
+                    "FixtureBudgetRejected: invalid machine OSS provider or role"
+                );
+                StorageOwner::Oss(OssStorageOwner {
+                    provider: config.kind,
+                    endpoint: format!("https://s3.oss-{}-internal.aliyuncs.com", config.region),
+                    region: config.region,
+                    bucket: config.bucket,
+                    root_prefix: config.root_prefix,
+                })
+            }
+            None => StorageOwner::Minio(MinioStorageOwner {
+                daemon_id: field(record, "daemon_id")?,
+                minio_volume: field(&record["config"], "minio_volume")?,
+            }),
+            Some(_) => anyhow::bail!("FixtureBudgetRejected: unsupported machine storage provider"),
+        };
         let result = Self {
-            schema: 1,
+            schema: if matches!(storage_owner, StorageOwner::Oss(_)) {
+                2
+            } else {
+                1
+            },
             identity: identity.clone(),
             machine: StorageMachine {
                 id: field(record, "id")?,
@@ -321,10 +395,7 @@ impl RunStorageScope {
                 version: field(record, "version")?,
                 generation: field(record, "generation")?,
             },
-            storage_owner: StorageOwner {
-                daemon_id: field(record, "daemon_id")?,
-                minio_volume: field(&record["config"], "minio_volume")?,
-            },
+            storage_owner,
             ranges: StorageRanges {
                 run_root: format!("{}/", identity.scope_root),
                 rest: range("rest")?,
@@ -373,6 +444,11 @@ impl RunStorageScope {
     }
 
     pub fn from_publication(env_file: &Path, budget: &RunBudget) -> Result<Self> {
+        let manifest = Self::publication_manifest(env_file, budget)?;
+        Self::from_environment(budget.identity(), &manifest["runtime"]["machine"])
+    }
+
+    fn publication_manifest(env_file: &Path, budget: &RunBudget) -> Result<serde_json::Value> {
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
             env_file
                 .parent()
@@ -385,9 +461,8 @@ impl RunStorageScope {
                 && manifest["runtime"]["machine"]["phase"] == "ready",
             "FixtureBudgetRejected: storage requires a ready shared machine publication"
         );
-        let record = &manifest["runtime"]["machine"];
-        budget.validate_machine(record)?;
-        Self::from_environment(budget.identity(), record)
+        budget.validate_machine(&manifest["runtime"]["machine"])?;
+        Ok(manifest)
     }
 
     fn roots(&self) -> [&str; 3] {
@@ -401,21 +476,39 @@ impl RunStorageScope {
     fn validate(&self) -> Result<()> {
         self.identity.validate()?;
         ensure!(
-            self.schema == 1
-                && self.ranges.run_root == format!("{}/", self.identity.scope_root)
-                && self.storage_owner.daemon_id == self.machine.daemon_id
+            self.ranges.run_root == format!("{}/", self.identity.scope_root)
                 && [
                     &self.machine.id,
                     &self.machine.control_root,
                     &self.machine.daemon_id,
                     &self.machine.version,
-                    &self.machine.generation,
-                    &self.storage_owner.minio_volume
+                    &self.machine.generation
                 ]
                 .iter()
                 .all(|v| !v.is_empty()),
             "FixtureBudgetRejected: invalid run storage owner or ranges"
         );
+        match &self.storage_owner {
+            StorageOwner::Minio(owner) => ensure!(
+                self.schema == 1
+                    && owner.daemon_id == self.machine.daemon_id
+                    && !owner.minio_volume.is_empty(),
+                "FixtureBudgetRejected: invalid MinIO storage owner or schema"
+            ),
+            StorageOwner::Oss(owner) => {
+                ensure!(
+                    self.schema == 2,
+                    "FixtureBudgetRejected: invalid OSS storage schema"
+                );
+                let owner_root = owner.root()?;
+                for root in self.roots() {
+                    ensure!(
+                        contains_s3(&owner_root, &canonical_s3(root)?),
+                        "FixtureBudgetRejected: run storage leaves its OSS owner root"
+                    );
+                }
+            }
+        }
         for range in [&self.ranges.rest, &self.ranges.rest_mv] {
             ensure!(
                 range.namespace_prefix == format!("{}_", self.identity.run_id)
@@ -465,7 +558,7 @@ impl RunStorageScope {
     pub fn belongs(&self, uri: &str) -> Result<bool> {
         self.validate()?;
         // Scheme aliases are comparisons only and require the exact common
-        // MinIO owner captured in this validated projection.
+        // storage owner captured in this validated projection.
         let alias;
         let uri = if let Some(rest) = uri.strip_prefix("s3a://") {
             alias = format!("s3://{rest}");
@@ -489,6 +582,10 @@ impl RunStorageScope {
 
     pub fn iam_policy(&self) -> Result<serde_json::Value> {
         self.validate()?;
+        ensure!(
+            matches!(self.storage_owner, StorageOwner::Minio(_)),
+            "FixtureBudgetRejected: MinIO IAM policies are unavailable for OSS node-local storage"
+        );
         let prefixes = [
             self.ranges.run_root.clone(),
             format!(
@@ -748,6 +845,25 @@ pub fn startup_sweep(
         .canonicalize()
         .context("resolve startup sweep immutable publication")?;
     let storage = RunStorageScope::from_publication(&env_file, budget)?;
+    startup_sweep_with_storage(repo_root, &env_file, budget, &storage)
+}
+
+/// Sweep using the caller's explicit original storage fact. The fact must
+/// agree exactly with the pinned publication and the original budget identity;
+/// no ambient process input substitutes for or relaxes that agreement.
+/// The ordinary entry above still rejects conflicting inherited environment.
+pub fn startup_sweep_with_storage(
+    repo_root: &Path,
+    pinned_env_file: &Path,
+    budget: &RunBudget,
+    storage: &RunStorageScope,
+) -> Result<serde_json::Value> {
+    budget.check_work()?;
+    let env_file = pinned_env_file
+        .canonicalize()
+        .context("resolve startup sweep immutable publication")?;
+    let manifest = RunStorageScope::publication_manifest(&env_file, budget)?;
+    storage.validate_against(budget.identity(), &manifest["runtime"]["machine"])?;
     let mut completed = budget
         .startup_sweep
         .lock()
@@ -826,7 +942,7 @@ fn unix_ms() -> Result<u64> {
 mod tests {
     use super::*;
 
-    fn sweep_fixture(script: &str) -> (tempfile::TempDir, PathBuf, RunBudget) {
+    fn sweep_fixture(script: &str) -> (tempfile::TempDir, PathBuf, RunBudget, RunStorageScope) {
         let directory = tempfile::tempdir().unwrap();
         let scripts = directory.path().join("docker/iceberg-rest");
         std::fs::create_dir_all(&scripts).unwrap();
@@ -844,15 +960,17 @@ mod tests {
             None,
         )
         .unwrap();
-        (directory, publication, budget)
+        let storage = RunStorageScope::from_record(budget.identity(), &record).unwrap();
+        (directory, publication, budget, storage)
     }
 
     #[test]
     fn startup_sweep_runs_once_across_clones_with_original_context_and_pinned_publication() {
-        let (directory, publication, budget) = sweep_fixture(
+        let (directory, publication, budget, storage) = sweep_fixture(
             "import json,os,pathlib,sys\np=pathlib.Path('calls.json')\np.write_text(json.dumps({'args':sys.argv[1:],'context':json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT']),'storage':json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE'])}))\nprint(json.dumps({'complete':False,'errors':[{'code':'ScratchSweepTimeout'}],'enumeration_complete':False}))\n",
         );
-        let report = startup_sweep(directory.path(), &publication, &budget).unwrap();
+        let report =
+            startup_sweep_with_storage(directory.path(), &publication, &budget, &storage).unwrap();
         assert_eq!(report["complete"], false);
         let recorded: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.path().join("calls.json")).unwrap())
@@ -861,8 +979,7 @@ mod tests {
             recorded["context"],
             serde_json::to_value(budget.context()).unwrap()
         );
-        let scope = RunStorageScope::from_publication(&publication, &budget).unwrap();
-        assert_eq!(recorded["storage"], serde_json::to_value(scope).unwrap());
+        assert_eq!(recorded["storage"], serde_json::to_value(&storage).unwrap());
         assert_eq!(
             recorded["args"],
             serde_json::json!([
@@ -873,20 +990,22 @@ mod tests {
         );
         std::fs::remove_file(directory.path().join("docker/iceberg-rest/fixture_run.py")).unwrap();
         assert_eq!(
-            startup_sweep(directory.path(), &publication, &budget.clone()).unwrap(),
+            startup_sweep_with_storage(directory.path(), &publication, &budget.clone(), &storage)
+                .unwrap(),
             report
         );
         let other = directory.path().join("different-env.sh");
         std::fs::write(&other, "# other publication").unwrap();
-        assert!(startup_sweep(directory.path(), &other, &budget).is_err());
+        assert!(startup_sweep_with_storage(directory.path(), &other, &budget, &storage).is_err());
     }
 
     #[test]
     fn startup_sweep_native_failure_is_not_partial_success() {
-        let (directory, publication, budget) = sweep_fixture(
+        let (directory, publication, budget, storage) = sweep_fixture(
             "import sys\nprint('AccessDenied: native S3 failure',file=sys.stderr)\nsys.exit(17)\n",
         );
-        let error = startup_sweep(directory.path(), &publication, &budget).unwrap_err();
+        let error = startup_sweep_with_storage(directory.path(), &publication, &budget, &storage)
+            .unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("17"));
         assert!(message.contains("AccessDenied: native S3 failure"));
@@ -894,13 +1013,37 @@ mod tests {
     }
 
     #[test]
+    fn explicit_startup_storage_rejects_another_original_run_before_dispatch() {
+        let (directory, publication, budget, storage) = sweep_fixture(
+            "from pathlib import Path\nPath('calls.json').write_text('model-dispatched')\nraise RuntimeError('must not dispatch')\n",
+        );
+        let another_budget = RunBudget::admit(
+            FixturePolicy::default(),
+            ScratchIdentity::create("s3://novarocks/another-run").unwrap(),
+            3600,
+            None,
+        )
+        .unwrap();
+        let error =
+            startup_sweep_with_storage(directory.path(), &publication, &another_budget, &storage)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("inherited storage projection differs")
+        );
+        assert!(!directory.path().join("calls.json").exists());
+        assert_ne!(budget.identity(), another_budget.identity());
+    }
+
+    #[test]
     fn expired_startup_sweep_does_not_dispatch_or_resolve_publication() {
-        let (directory, publication, budget) =
+        let (directory, publication, budget, storage) =
             sweep_fixture("raise RuntimeError('must not run')\n");
         let expired = budget.with_work_deadline_limit(Instant::now() - Duration::from_secs(1));
         std::fs::remove_file(&publication).unwrap();
         assert!(
-            startup_sweep(directory.path(), &publication, &expired)
+            startup_sweep_with_storage(directory.path(), &publication, &expired, &storage)
                 .unwrap_err()
                 .is::<FixtureBudgetExpired>()
         );
@@ -908,7 +1051,7 @@ mod tests {
 
     #[test]
     fn invalid_publication_storage_is_rejected_before_startup_dispatch() {
-        let (directory, publication, budget) =
+        let (directory, publication, budget, storage) =
             sweep_fixture("raise RuntimeError('must not dispatch')\n");
         let path = directory.path().join("manifest.json");
         let mut manifest: serde_json::Value =
@@ -917,7 +1060,7 @@ mod tests {
             serde_json::json!(&budget.identity().scope_root);
         std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert!(
-            startup_sweep(directory.path(), &publication, &budget)
+            startup_sweep_with_storage(directory.path(), &publication, &budget, &storage)
                 .unwrap_err()
                 .to_string()
                 .contains("overlap")
@@ -959,6 +1102,101 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    fn oss_storage_fixture() -> (ScratchIdentity, serde_json::Value) {
+        let mut record = storage_vectors()["record"].clone();
+        let identity = ScratchIdentity::create_at(
+            "s3://novarocks-ci/fixture/worktree",
+            1_800_000_000_000,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        record["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("minio_volume");
+        record["config"]["object_store"] = serde_json::json!({"kind":"aliyun-oss", "region":"cn-beijing", "bucket":"novarocks-ci", "role_name":"fixture-role", "root_prefix":"fixture/"});
+        record["config"]["benchmark_root"] =
+            serde_json::json!("s3://novarocks-ci/fixture/benchmarks");
+        record["protected_benchmark_roots"] =
+            serde_json::json!(["s3://novarocks-ci/fixture/benchmarks"]);
+        record["server_warehouses"] = serde_json::json!({"rest":"s3://novarocks-ci/fixture/service/rest", "rest-mv":"s3://novarocks-ci/fixture/service/rest-mv"});
+        (identity, record)
+    }
+
+    #[test]
+    fn oss_storage_scope_has_closed_owner_without_a_minio_volume() {
+        let (identity, record) = oss_storage_fixture();
+        let scope = RunStorageScope::from_record(&identity, &record).unwrap();
+        let wire = serde_json::to_value(&scope).unwrap();
+        assert_eq!(wire["schema"], 2);
+        assert_eq!(
+            wire["storage_owner"],
+            serde_json::json!({"provider":"aliyun-oss", "endpoint":"https://s3.oss-cn-beijing-internal.aliyuncs.com", "region":"cn-beijing", "bucket":"novarocks-ci", "root_prefix":"fixture/"})
+        );
+        let restored = RunStorageScope::from_json(&scope.to_json().unwrap()).unwrap();
+        restored.validate_against(&identity, &record).unwrap();
+        assert!(
+            restored
+                .belongs(&format!(
+                    "s3a://novarocks-ci/fixture/service/rest/{}_table/data/a",
+                    identity.run_id
+                ))
+                .unwrap()
+        );
+        assert!(
+            !restored
+                .belongs("s3://novarocks-ci/fixture/service/rest/foreign_table/data/a")
+                .unwrap()
+        );
+        assert!(
+            !restored
+                .belongs("s3://other-bucket/fixture/outside")
+                .unwrap()
+        );
+        assert!(restored.iam_policy().is_err());
+    }
+
+    #[test]
+    fn oss_storage_scope_rejects_schema_owner_and_root_mismatches() {
+        let (identity, record) = oss_storage_fixture();
+        let scope = RunStorageScope::from_record(&identity, &record).unwrap();
+        let wire = serde_json::to_value(&scope).unwrap();
+        for (key, replacement) in [
+            ("provider", "minio"),
+            ("endpoint", "https://foreign.invalid"),
+            ("region", "cn-shanghai"),
+            ("bucket", "other-bucket"),
+            ("root_prefix", "other/"),
+            ("minio_volume", "invented-volume"),
+        ] {
+            let mut changed = wire.clone();
+            changed["storage_owner"][key] = serde_json::json!(replacement);
+            assert!(
+                RunStorageScope::from_json(&changed.to_string())
+                    .and_then(|s| s.validate_against(&identity, &record))
+                    .is_err(),
+                "{key}"
+            );
+        }
+        let mut changed = wire.clone();
+        changed["schema"] = serde_json::json!(1);
+        assert!(RunStorageScope::from_json(&changed.to_string()).is_err());
+        for warehouse in [
+            "s3://other-bucket/fixture/service/rest",
+            "s3://novarocks-ci/fixture-sibling/service/rest",
+        ] {
+            let mut changed = record.clone();
+            changed["server_warehouses"]["rest"] = serde_json::json!(warehouse);
+            assert!(RunStorageScope::from_record(&identity, &changed).is_err());
+        }
+        let mut changed = record.clone();
+        changed["config"]["object_store"]["unexpected"] = serde_json::json!(true);
+        assert!(RunStorageScope::from_record(&identity, &changed).is_err());
+        let mut changed = record.clone();
+        changed["generation"] = serde_json::json!("next");
+        assert!(scope.validate_against(&identity, &changed).is_err());
     }
 
     #[test]

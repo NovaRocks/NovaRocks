@@ -42,22 +42,6 @@ impl PaimonRequestControl {
         }
     }
 
-    /// Bound the whole SDK operation, including pending IO, by this request.
-    pub(crate) async fn until<T>(
-        &self,
-        future: impl std::future::Future<Output = T>,
-    ) -> Result<T, ConnectorError> {
-        self.checkpoint()?;
-        tokio::select! {
-            biased;
-            _ = self.stop.stopped() => Err(ConnectorError::new(
-                ConnectorErrorKind::Cancelled, "Paimon listing was cancelled")),
-            _ = tokio::time::sleep_until(self.deadline.into()) => Err(ConnectorError::new(
-                ConnectorErrorKind::DeadlineExceeded, "Paimon listing deadline elapsed")),
-            result = future => Ok(result),
-        }
-    }
-
     pub fn checkpoint(&self) -> Result<(), ConnectorError> {
         if self.stop.is_stopped() {
             return Err(ConnectorError::new(

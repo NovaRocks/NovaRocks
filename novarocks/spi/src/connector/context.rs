@@ -27,8 +27,7 @@ use super::read_stack::ConnectorSourceOperations;
 use super::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind, ConnectorStopView,
     ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
-    ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseId,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
 };
 
@@ -46,9 +45,21 @@ pub struct ConnectorOperationControlView {
     deadline: Instant,
     stop: ConnectorStopView,
 }
+const OPERATION_CANCELLED_DETAIL: &str = "connector operation was cancelled";
+const OPERATION_DEADLINE_DETAIL: &str = "connector operation deadline elapsed";
+
 impl ConnectorOperationControlView {
     pub const fn deadline(&self) -> Instant {
         self.deadline
+    }
+    /// One failed check creates one String from one of these closed literals.
+    /// This excludes the inline ConnectorError and grants no capacity.
+    pub const fn failure_backing_bytes() -> usize {
+        if OPERATION_CANCELLED_DETAIL.len() > OPERATION_DEADLINE_DETAIL.len() {
+            OPERATION_CANCELLED_DETAIL.len()
+        } else {
+            OPERATION_DEADLINE_DETAIL.len()
+        }
     }
 }
 impl ConnectorOperationControl for ConnectorOperationControlView {
@@ -64,13 +75,13 @@ fn check_operation_control(
     if stop.is_stopped() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
-            "connector operation was cancelled",
+            OPERATION_CANCELLED_DETAIL,
         ));
     }
     if Instant::now() >= deadline {
         return Err(ConnectorError::new(
             ConnectorErrorKind::DeadlineExceeded,
-            "connector operation deadline elapsed",
+            OPERATION_DEADLINE_DETAIL,
         ));
     }
     Ok(())
@@ -140,6 +151,17 @@ pub struct ConnectorRequestScope {
 }
 
 impl ConnectorRequestScope {
+    /// Requested fixed header of the same attempt-local sidecar. Extension
+    /// entries/payloads remain their actual creators' admitted backing.
+    pub fn fixed_backing_layout() -> Result<
+        std::alloc::Layout,
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
+        >())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -306,6 +328,7 @@ pub struct ResolvedVendedS3Access {
     /// path. Absent means this lease cannot renew (CAD-1 D11).
     renewal_path: Option<crate::connector::CredentialRenewalPath>,
     /// Present only when the resolver is in the consumer's own process.
+    seed_grant: Option<super::VendedS3SeedGrantId>,
     seed: Option<VendedS3SeedMaterial>,
     /// The provider capability this consumer already holds, when the resolver
     /// and the consumer share a process.
@@ -315,7 +338,7 @@ pub struct ResolvedVendedS3Access {
     /// authenticating an announced path. An execution node never has one --
     /// it is a capability, not a value, and capabilities do not travel
     /// (CAD-1 D1).
-    provider: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
+    provider: Option<super::VendedS3InProcessAcquisition>,
 }
 
 impl ResolvedVendedS3Access {
@@ -325,6 +348,7 @@ impl ResolvedVendedS3Access {
         epoch: u64,
         matched_prefix: StorageCredentialScopePrefix,
         renewal_path: Option<crate::connector::CredentialRenewalPath>,
+        seed_grant: Option<super::VendedS3SeedGrantId>,
         seed: Option<VendedS3SeedMaterial>,
     ) -> Self {
         Self {
@@ -333,6 +357,7 @@ impl ResolvedVendedS3Access {
             epoch,
             matched_prefix,
             renewal_path,
+            seed_grant,
             seed,
             provider: None,
         }
@@ -341,10 +366,7 @@ impl ResolvedVendedS3Access {
     /// Attach the in-process provider capability this consumer already holds.
     ///
     /// Only a resolver running in the consumer's own process may call this.
-    pub fn with_provider(
-        mut self,
-        provider: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>,
-    ) -> Self {
+    pub fn with_provider(mut self, provider: super::VendedS3InProcessAcquisition) -> Self {
         self.provider = Some(provider);
         self
     }
@@ -373,14 +395,19 @@ impl ResolvedVendedS3Access {
         self.renewal_path.as_ref()
     }
 
-    /// Material handed over with this selection, when the resolver is in the
-    /// consumer's own process.
+    /// The original local seed authorization, retained even after its material
+    /// expires. This identity grants no signing or acquisition capability.
+    pub const fn seed_grant(&self) -> Option<super::VendedS3SeedGrantId> {
+        self.seed_grant
+    }
+
+    /// Usable material handed over with this selection, when present.
     pub const fn seed(&self) -> Option<&VendedS3SeedMaterial> {
         self.seed.as_ref()
     }
 
     /// The in-process provider capability, when this consumer holds one.
-    pub fn provider(&self) -> Option<&Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>> {
+    pub fn provider(&self) -> Option<&super::VendedS3InProcessAcquisition> {
         self.provider.as_ref()
     }
 }
@@ -414,6 +441,10 @@ pub struct ConnectorRequestContext {
     // Design: ADR-0156. Operation control and authorized access do not imply
     // task memory admission; the BE factory receives that separately.
     deadline: Instant,
+    // A restriction inherited from an already-positive necessary finalization.
+    // It grants no dispatch, source or capacity. Independent cleanup retains
+    // this restriction for later publications without shortening its own phase.
+    necessary_finalization_deadline_cap: Option<Instant>,
     stop: ConnectorStopView,
     max_handle_payload_bytes: usize,
     max_total_payload_bytes: usize,
@@ -422,6 +453,9 @@ pub struct ConnectorRequestContext {
     vended_credential_lease_collection: Option<ConnectorVendedCredentialLeaseCollectionPort>,
     request_scope: ConnectorRequestScope,
     execution_source: Option<ExecutionSource>,
+    io_admission: Option<std::sync::Weak<dyn super::ConnectorIoAdmissionPort>>,
+    io_phase: Option<super::ConnectorIoPermit>,
+    io_weak_phase: Option<super::ConnectorIoWeakPhase>,
     fresh_catalog_observation_required: bool,
     initiation: ConnectorRequestInitiation,
 }
@@ -505,6 +539,7 @@ impl ConnectorRequestContext {
         }
         Ok(Self {
             deadline,
+            necessary_finalization_deadline_cap: None,
             stop,
             max_handle_payload_bytes,
             max_total_payload_bytes,
@@ -513,9 +548,67 @@ impl ConnectorRequestContext {
             vended_credential_lease_collection: None,
             request_scope: ConnectorRequestScope::new(),
             execution_source: None,
+            io_admission: None,
+            io_phase: None,
+            io_weak_phase: None,
             fresh_catalog_observation_required: false,
             initiation: ConnectorRequestInitiation::Statement,
         })
+    }
+
+    /// Explicit same-action capability; never inferred from request extensions.
+    pub fn with_io_admission(mut self, port: Arc<dyn super::ConnectorIoAdmissionPort>) -> Self {
+        self.io_admission = Some(Arc::downgrade(&port));
+        self
+    }
+    pub fn io_admission(&self) -> Option<&std::sync::Weak<dyn super::ConnectorIoAdmissionPort>> {
+        self.io_admission.as_ref()
+    }
+
+    /// Continue the SAME already-admitted position in a nested serial request
+    /// (for example credential acquisition before signing). It grants no new
+    /// position; include_dependency still asks the original atomic D author.
+    pub fn with_io_phase(mut self, phase: super::ConnectorIoPermit) -> Self {
+        self.io_phase = Some(phase);
+        self.io_weak_phase = None;
+        self
+    }
+    pub fn with_io_weak_phase(mut self, phase: super::ConnectorIoWeakPhase) -> Self {
+        self.io_phase = None;
+        self.io_weak_phase = Some(phase);
+        self
+    }
+    pub fn io_weak_phase(&self) -> Option<&super::ConnectorIoWeakPhase> {
+        self.io_weak_phase.as_ref()
+    }
+    pub fn io_phase(&self) -> Option<&super::ConnectorIoPermit> {
+        self.io_phase.as_ref()
+    }
+
+    /// The original journal has already entered an existing obligation. Keep
+    /// its exact scope/lease/I/O source while using that obligation's independent
+    /// stop/deadline. This method itself grants no dispatch or capacity.
+    pub fn for_existing_obligation(&self, deadline: Instant, stop: ConnectorStopView) -> Self {
+        let mut context = self.clone();
+        context.deadline = deadline;
+        context.stop = stop;
+        context
+    }
+
+    /// Preserve the upper bound of an already-authorized necessary finalization.
+    /// This is only a restriction, never evidence of Applied or new authority.
+    /// The phase owner still chooses the actual control deadline: independent
+    /// cleanup must not inherit this deadline as its own time budget.
+    pub fn with_necessary_finalization_deadline_cap(mut self, deadline: Instant) -> Self {
+        self.necessary_finalization_deadline_cap = Some(
+            self.necessary_finalization_deadline_cap
+                .map_or(deadline, |existing| existing.min(deadline)),
+        );
+        self
+    }
+
+    pub const fn necessary_finalization_deadline_cap(&self) -> Option<Instant> {
+        self.necessary_finalization_deadline_cap
     }
 
     /// A nested preparation budget may only shorten the admitted deadline.
@@ -989,6 +1082,7 @@ mod tests {
             1,
             StorageCredentialScopePrefix::try_from_normalized("s3://bucket/table").expect("prefix"),
             None,
+            Some(crate::connector::VendedS3SeedGrantId::new()),
             Some(VendedS3SeedMaterial::new(
                 42,
                 SecretValue::new("access-canary"),
@@ -1063,5 +1157,31 @@ mod tests {
         .expect("collection")
         .without_attempt_capabilities();
         assert!(ConnectorPlanningContext::try_from_request(projected).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod control_failure_geometry_tests {
+    use super::*;
+    #[test]
+    fn original_control_failure_strings_fit_their_actual_author_quote() {
+        let stopped = super::super::ConnectorStopOwner::new();
+        stopped.request_stop();
+        let cancelled = check_operation_control(
+            Instant::now() + std::time::Duration::from_secs(60),
+            &stopped.view(),
+        )
+        .unwrap_err();
+        let running = super::super::ConnectorStopOwner::new();
+        let deadline = check_operation_control(Instant::now(), &running.view()).unwrap_err();
+        assert_eq!(cancelled.kind(), ConnectorErrorKind::Cancelled);
+        assert_eq!(deadline.kind(), ConnectorErrorKind::DeadlineExceeded);
+        assert_eq!(cancelled.message(), OPERATION_CANCELLED_DETAIL);
+        assert_eq!(deadline.message(), OPERATION_DEADLINE_DETAIL);
+        for error in [cancelled, deadline] {
+            assert!(
+                error.message().len() <= ConnectorOperationControlView::failure_backing_bytes()
+            );
+        }
     }
 }

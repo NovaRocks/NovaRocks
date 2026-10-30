@@ -27,6 +27,9 @@ use novarocks_native_adapter::native_lane::{
     NativeLane, NativeLaneChannel, configure_native_endpoint, frontend_lane_connector,
 };
 
+mod cold_dial;
+pub(super) use cold_dial::{NativeChannelSource, NativeDialAttempt, NativeDialHandoff};
+
 const MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
 
@@ -331,6 +334,23 @@ impl Client {
             .map(|(grpc, _)| grpc)
     }
 
+    pub(in crate::native) fn grpc_for_reserved_call(
+        &self,
+        call: novarocks_native_adapter::native_lane::ReservedNativeCall,
+    ) -> tonic::client::Grpc<
+        InterceptedService<
+            novarocks_native_adapter::native_lane::ReservedNativeCall,
+            NativeClientAuthInterceptor,
+        >,
+    > {
+        tonic::client::Grpc::new(InterceptedService::new(
+            call,
+            NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
+        ))
+        .max_encoding_message_size(MAX_MESSAGE_BYTES)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+    }
+
     pub(super) async fn grpc_with_channel_identity(
         &self,
         method: NativeRpcMethod,
@@ -338,7 +358,7 @@ impl Client {
     {
         let acquired = channel(&self.data_runtime, self.channel_key(method)?).await?;
         let grpc = NovaRocksGrpcClient::with_interceptor(
-            acquired.channel.clone(),
+            acquired.channel().clone(),
             NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
         )
         .max_encoding_message_size(MAX_MESSAGE_BYTES)
@@ -354,7 +374,7 @@ impl Client {
         let method = NativeRpcMethod::FetchRootResult;
         let acquired = channel(&self.data_runtime, self.channel_key(method)?).await?;
         let service = InterceptedService::new(
-            acquired.channel.clone(),
+            acquired.channel().clone(),
             NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
         );
         let grpc = tonic::client::Grpc::new(service)
@@ -369,7 +389,7 @@ impl Client {
         acquired: &CachedNativeChannel,
     ) -> bool {
         self.channel_key(method).is_ok_and(|key| {
-            key == acquired.slot.key && self.data_runtime.invalidate_channel_if_current(acquired)
+            key == acquired.slot().key && self.data_runtime.invalidate_channel_if_current(acquired)
         })
     }
 }
@@ -931,7 +951,7 @@ mod routing_tests {
                 .await
                 .unwrap()
                 .unwrap();
-                assert_eq!(acquired.slot.index, index);
+                assert_eq!(acquired.slot().index, index);
             }
             assert_eq!(*accepted.borrow(), 3);
             Self {
@@ -989,7 +1009,7 @@ mod routing_tests {
         .await;
         case.accept_gate.add_permits(1);
         let (_, acquired) = fourth.await.unwrap().unwrap();
-        assert_eq!(acquired.slot.index, 3);
+        assert_eq!(acquired.slot().index, 3);
         assert_eq!(*case.accepted.borrow(), 4);
     }
 
@@ -1089,9 +1109,9 @@ mod routing_tests {
                 .await
                 .unwrap()
                 .unwrap();
-                assert_eq!(acquired.slot.key.lane, lane);
-                assert_eq!(acquired.channel.lane(), NativeLane::frontend(lane));
-                slots.push(acquired.slot.index);
+                assert_eq!(acquired.slot().key.lane, lane);
+                assert_eq!(acquired.channel().lane(), NativeLane::frontend(lane));
+                slots.push(acquired.slot().index);
             }
             let expected: Vec<_> = (0..connections).chain(0..connections).collect();
             assert_eq!(slots, expected, "{lane:?} rotates over its connections");

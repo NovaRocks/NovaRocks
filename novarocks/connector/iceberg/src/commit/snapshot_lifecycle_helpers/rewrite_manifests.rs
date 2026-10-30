@@ -341,11 +341,20 @@ struct ReusableRewrite {
 
 pub(crate) struct RewriteManifestsPreparer {
     reusable: Mutex<Option<ReusableRewrite>>,
+    request: Option<novarocks_spi::connector::ConnectorRequestContext>,
 }
 impl RewriteManifestsPreparer {
+    pub(crate) fn for_request(request: novarocks_spi::connector::ConnectorRequestContext) -> Self {
+        Self {
+            reusable: Mutex::new(None),
+            request: Some(request),
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self {
             reusable: Mutex::new(None),
+            request: None,
         }
     }
 }
@@ -378,6 +387,35 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
                 .await?;
         view.artifacts().check_active()?;
         let latest = latest.entries();
+        if let Some(request) = &self.request {
+            // These are actual borrowed descriptor facts, not compressed-file
+            // bytes or an invented bound for the SDK's decoded DataFile graph.
+            let old = {
+                let cache = self
+                    .reusable
+                    .lock()
+                    .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))?;
+                cache
+                    .as_ref()
+                    .map(|c| {
+                        descriptor_owned_bytes(&c.sources).and_then(|a| {
+                            descriptor_owned_bytes(&c.outputs).and_then(|b| {
+                                a.checked_add(b)
+                                    .ok_or_else(|| rewrite_error("manifest backing overflow"))
+                            })
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(0)
+            };
+            let required=descriptor_owned_bytes(latest)?.checked_add(old).and_then(|v|v.checked_mul(8)).and_then(|v|v.checked_add(2*(novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES+novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES) as u64)).and_then(std::num::NonZeroU64::new).ok_or_else(||rewrite_error("manifest backing overflow"))?;
+            request
+                .reserve_owned_metadata(required)
+                .await
+                .map_err(|e| {
+                    rewrite_error("original manifest backing admission refused").with_source(e)
+                })?;
+        }
         let cached = self
             .reusable
             .lock()
@@ -939,4 +977,38 @@ mod row_id_rewrite_tests {
         assert_eq!(actual["memory://rewrite/explicit.parquet"], Some(700));
         assert_eq!(actual["memory://rewrite/inherited.parquet"], Some(100));
     }
+}
+
+/// Exact public descriptor payloads used by first-party group/cache/list copies.
+/// The SDK DataFile clone's two owned-only getters are a separate qualification
+/// gap; this quote deliberately does not pretend to observe them without allocation.
+fn descriptor_owned_bytes(files: &[ManifestFile]) -> crate::iceberg::Result<u64> {
+    let mut bytes = files
+        .len()
+        .checked_mul(2 * std::mem::size_of::<ManifestFile>())
+        .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?;
+    for file in files {
+        bytes = bytes
+            .checked_add(file.manifest_path.len())
+            .and_then(|v| v.checked_add(file.key_metadata.as_ref().map_or(0, Vec::len)))
+            .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?;
+        if let Some(partitions) = &file.partitions {
+            bytes = bytes
+                .checked_add(
+                    partitions
+                        .len()
+                        .checked_mul(2 * std::mem::size_of::<crate::iceberg::spec::FieldSummary>())
+                        .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?,
+                )
+                .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?;
+            for p in partitions {
+                for bound in [&p.lower_bound, &p.upper_bound].into_iter().flatten() {
+                    bytes = bytes
+                        .checked_add(bound.len())
+                        .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?;
+                }
+            }
+        }
+    }
+    u64::try_from(bytes).map_err(|_| rewrite_error("manifest descriptor overflow"))
 }

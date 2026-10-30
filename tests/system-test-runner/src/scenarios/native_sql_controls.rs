@@ -116,6 +116,11 @@ struct Frozen {
 }
 #[derive(Default)]
 pub(in crate::scenarios) struct SqlIntentOwner(Mutex<Option<Frozen>>);
+#[derive(Clone, Copy)]
+enum StatementRefinement {
+    BeforeSchemaFailure,
+    RemoteWriterSender(usize),
+}
 impl SqlIntentOwner {
     pub fn freeze(
         &self,
@@ -125,7 +130,7 @@ impl SqlIntentOwner {
         binary: &Path,
         deadline: Instant,
     ) -> Result<ClusterTestSessionPlan> {
-        self.freeze_internal(specs, replacements, cluster_size, binary, deadline, false)
+        self.freeze_internal(specs, replacements, cluster_size, binary, deadline, None)
     }
 
     /// Coordinate the first declared Root failure with the original FE protocol handoff.
@@ -144,7 +149,48 @@ impl SqlIntentOwner {
                 .any(|(_, kind)| *kind == "root-task-execution-failure-before-data")),
             "before-schema handoff requires the declared first Root failure"
         );
-        self.freeze_internal(specs, replacements, cluster_size, binary, deadline, true)
+        self.freeze_internal(
+            specs,
+            replacements,
+            cluster_size,
+            binary,
+            deadline,
+            Some(StatementRefinement::BeforeSchemaFailure),
+        )
+    }
+
+    /// Refine the existing pair of actions to one actual remote writer Task.
+    pub fn freeze_remote_writer_sender(
+        &self,
+        specs: Vec<StatementSpec>,
+        statement_index: usize,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<ClusterTestSessionPlan> {
+        let selected = specs
+            .get(statement_index)
+            .context("remote writer statement is absent")?;
+        let expected = (0..cluster_size)
+            .flat_map(|index| {
+                [
+                    (index, "task-execution-failure"),
+                    (index, "create-task-before-worker-hold"),
+                ]
+            })
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            selected.faults.iter().copied().collect::<BTreeSet<_>>() == expected,
+            "remote writer selection requires its declared hold/failure candidates on each actual backend"
+        );
+        self.freeze_internal(
+            specs,
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+            Some(StatementRefinement::RemoteWriterSender(statement_index)),
+        )
     }
 
     fn freeze_internal(
@@ -154,7 +200,7 @@ impl SqlIntentOwner {
         cluster_size: usize,
         binary: &Path,
         deadline: Instant,
-        before_schema_failure: bool,
+        refinement: Option<StatementRefinement>,
     ) -> Result<ClusterTestSessionPlan> {
         let mut owner = self
             .0
@@ -192,7 +238,9 @@ impl SqlIntentOwner {
                 "Native SQL submission must be complete"
             );
             let token = plan.fresh_domain_secret()?;
-            if before_schema_failure && statement_index == 0 {
+            if matches!(refinement, Some(StatementRefinement::BeforeSchemaFailure))
+                && statement_index == 0
+            {
                 add(
                     launches.get_mut(&RoleSlot::Frontend).unwrap(),
                     "result-handoff",
@@ -208,15 +256,22 @@ impl SqlIntentOwner {
                 novarocks_failpoint::QueryLifecycleFaultKind::parse(kind)
                     .context("unsupported finite Native fault")?;
                 let target = launches[&RoleSlot::Backend(index)].reference.clone();
+                let mut bind = json!({"action":format!("bind-{kind}"),"root":root,"backend_index":index,"statement_run_token":token,"target_session_id":target.session_id,"target_process_receipt":target.process_receipt});
+                let mut fault = json!({"action":kind,"root":root,"backend_index":index,"statement_run_token":token,"target_session_id":target.session_id});
+                if matches!(refinement, Some(StatementRefinement::RemoteWriterSender(selected)) if selected == statement_index)
+                {
+                    bind["task_selector"] = json!("remote-writer-sender");
+                    fault["task_selector"] = json!("remote-writer-sender");
+                }
                 add(
                     launches.get_mut(&RoleSlot::Frontend).unwrap(),
                     "native",
-                    json!({"action":format!("bind-{kind}"),"root":root,"backend_index":index,"statement_run_token":token,"target_session_id":target.session_id,"target_process_receipt":target.process_receipt}),
+                    bind,
                 );
                 add(
                     launches.get_mut(&RoleSlot::Backend(index)).unwrap(),
                     "native",
-                    json!({"action":kind,"root":root,"backend_index":index,"statement_run_token":token,"target_session_id":target.session_id}),
+                    fault,
                 );
             }
             let mut seen = BTreeSet::new();
@@ -336,6 +391,60 @@ mod tests {
     fn deadline() -> Instant {
         Instant::now() + std::time::Duration::from_secs(10)
     }
+    #[test]
+    fn remote_writer_selection_declares_both_candidates_before_launch_without_touching_other_statements()
+     {
+        let binary = std::env::current_exe().unwrap();
+        let owner = SqlIntentOwner::default();
+        let mut incomplete = spec("INSERT INTO t SELECT * FROM s");
+        incomplete.faults = vec![(0, "task-execution-failure")];
+        assert!(
+            owner
+                .freeze_remote_writer_sender(vec![incomplete], 0, 3, &binary, deadline())
+                .is_err()
+        );
+        let mut selected = spec("INSERT INTO t SELECT * FROM s");
+        selected.faults = (0..3)
+            .flat_map(|index| {
+                [
+                    (index, "task-execution-failure"),
+                    (index, "create-task-before-worker-hold"),
+                ]
+            })
+            .collect();
+        let plan = owner
+            .freeze_remote_writer_sender(
+                vec![selected, spec("INSERT INTO t VALUES (1)")],
+                0,
+                3,
+                &binary,
+                deadline(),
+            )
+            .unwrap();
+        let chosen = owner.take(0).unwrap();
+        assert_eq!(chosen.faults.len(), 6);
+        assert!(owner.take(1).unwrap().faults.is_empty());
+        let summary = plan.planned_launch_summaries();
+        let launches = summary.as_array().unwrap();
+        for index in 0..3 {
+            let backend = launches
+                .iter()
+                .find(|launch| launch["role"] == format!("be-{index}"))
+                .unwrap();
+            let actions = backend["grants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|grant| grant["action"].as_str().unwrap())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                actions,
+                BTreeSet::from(["task-execution-failure", "create-task-before-worker-hold"])
+            );
+        }
+        assert_eq!(chosen.deadline, plan.deadline());
+    }
+
     #[test]
     fn same_sql_has_separate_once_submissions_and_fault_does_not_spill_to_baseline() {
         let binary = std::env::current_exe().unwrap();

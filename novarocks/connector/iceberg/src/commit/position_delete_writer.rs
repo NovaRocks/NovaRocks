@@ -39,6 +39,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
+use super::data_writer::StagedPathJournal;
 use super::types::WrittenFile;
 
 /// Reserved Iceberg v2 field-id for the `file_path` column of a position
@@ -66,6 +67,24 @@ pub async fn write_position_delete_files(
     staging_dir: &str,
     groups: Vec<PositionDeleteGroup>,
 ) -> Result<Vec<WrittenFile>, String> {
+    write_position_delete_files_with_journal(file_io, staging_dir, groups, None).await
+}
+
+pub(crate) async fn write_position_delete_files_journaled(
+    file_io: &FileIO,
+    staging_dir: &str,
+    groups: Vec<PositionDeleteGroup>,
+    journal: &StagedPathJournal,
+) -> Result<Vec<WrittenFile>, String> {
+    write_position_delete_files_with_journal(file_io, staging_dir, groups, Some(journal)).await
+}
+
+async fn write_position_delete_files_with_journal(
+    file_io: &FileIO,
+    staging_dir: &str,
+    groups: Vec<PositionDeleteGroup>,
+    journal: Option<&StagedPathJournal>,
+) -> Result<Vec<WrittenFile>, String> {
     let mut out = Vec::with_capacity(groups.len());
     for (idx, group) in groups.into_iter().enumerate() {
         if group.positions.is_empty() {
@@ -80,6 +99,9 @@ pub async fn write_position_delete_files(
         );
         let bytes = encode_position_delete_parquet(&group.referenced_data_file, &sorted)?;
         let file_size = bytes.len() as u64;
+        if let Some(journal) = journal {
+            journal.record(&path);
+        }
         write_bytes_via_file_io(file_io, &path, bytes).await?;
 
         out.push(WrittenFile {

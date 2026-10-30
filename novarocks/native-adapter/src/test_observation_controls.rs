@@ -844,7 +844,7 @@ mod tests {
                 statement_run_token: run_token.into(),
                 frontend_process_id: self.role.scope().process().process_id(),
                 connection_id: 7,
-                session_epoch: 1,
+                session_key: 1,
                 statement_generation: generation,
             }
         }
@@ -860,7 +860,7 @@ mod tests {
                 statement_run_token: nomination.statement_run_token.clone(),
                 frontend_process_id: nomination.frontend_process_id.clone(),
                 connection_id: nomination.connection_id,
-                session_epoch: nomination.session_epoch,
+                session_key: nomination.session_key,
                 sql_sha256: Sha256::digest(sql.as_bytes()).into(),
             }
         }
@@ -1399,7 +1399,7 @@ mod tests {
         assert!(!path.exists());
         assert!(session.role.scope().observations().is_empty());
         let mut replacements = vec![session.nomination("statement-run", 2), a.clone(), a.clone()];
-        replacements[1].session_epoch = 2;
+        replacements[1].session_key = 2;
         replacements[2].connection_id = 8;
         for b in replacements {
             assert!(
@@ -1469,7 +1469,7 @@ mod tests {
                 .is_none())
         );
         let replacement = StatementWorkNomination {
-            session_epoch: 2,
+            session_key: 2,
             ..nomination.clone()
         };
         let replacement_input = session.input(&replacement, "SELECT 1");

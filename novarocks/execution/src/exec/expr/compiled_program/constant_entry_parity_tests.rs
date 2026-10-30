@@ -944,7 +944,11 @@ fn metadata_cv_source_cross_entry(functions: &PureEngineFunctionCatalog, spare_e
         builtin_sql_function_catalog, noop_constant_evaluator,
     };
     let metadata = if spare_empty {
-        std::collections::HashMap::with_capacity(16)
+        let mut staging = std::collections::HashMap::<String, String>::with_capacity(16);
+        staging.insert("removed".into(), "source".into());
+        staging.clear();
+        assert!(staging.capacity() >= 16);
+        staging
     } else {
         [("provider.fact".into(), "kept".into())].into()
     };
@@ -1115,7 +1119,7 @@ fn metadata_cv_source_cross_entry(functions: &PureEngineFunctionCatalog, spare_e
     assert_eq!(field.name(), if spare_empty { "item" } else { "source" });
     if spare_empty {
         assert!(field.metadata().is_empty());
-        assert!(field.metadata().capacity() > 0);
+        assert!(field.metadata().as_arc().is_none());
     } else {
         assert_eq!(field.metadata()["provider.fact"], "kept");
     }
@@ -1123,5 +1127,5 @@ fn metadata_cv_source_cross_entry(functions: &PureEngineFunctionCatalog, spare_e
         panic!("canonical List")
     };
     assert_eq!(field.name(), "item");
-    assert_eq!(field.metadata().capacity(), 0);
+    assert!(field.metadata().as_arc().is_none());
 }

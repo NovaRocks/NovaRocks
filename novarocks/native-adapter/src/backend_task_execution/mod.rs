@@ -36,7 +36,7 @@
 //!
 //! The transport ingress is a sibling adapter. It routes no traffic: the
 //! task protocol owner is bound directly to these execution hosts.
-// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
+// Design: ADR-0161 (docs/adr/ADR-0161-pure-local-programs-and-supervised-task-lifecycle.md)
 
 mod compiled_package;
 mod context_host;

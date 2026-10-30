@@ -29,7 +29,7 @@ fn main() {
         byte_request_model_profile::locked_bytes_matches(include_bytes!("../../Cargo.lock")),
         "owned-resource bytes request model requires re-audit after a locked source change"
     );
-    println!("cargo:rustc-env=NOVAROCKS_OWNED_RESOURCE_BYTES=1.11.0");
+    println!("cargo:rustc-env=NOVAROCKS_OWNED_RESOURCE_BYTES=1.11.1");
     let compiler = env::var_os("RUSTC").expect("Cargo must provide RUSTC");
     let result = Command::new(compiler)
         .arg("--version")

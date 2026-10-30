@@ -31,6 +31,7 @@ pub enum ComparisonCoercionFailure {
     Layout(crate::owned_resources::layout::LayoutResourceError),
     Vec(crate::ControlResourceError),
     HashMap(crate::owned_resources::hashmap::HashMapResourceError),
+    BTree(crate::owned_resources::btree::BTreeResourceError),
 }
 impl ComparisonCoercionFailure {
     fn operands(detail: impl std::fmt::Display) -> Self {
@@ -48,6 +49,7 @@ impl ComparisonCoercionFailure {
             crate::ValueConstructionFailure::Layout(cause) => Self::Layout(cause),
             crate::ValueConstructionFailure::Vec(cause) => Self::Vec(cause),
             crate::ValueConstructionFailure::HashMap(cause) => Self::HashMap(cause),
+            crate::ValueConstructionFailure::BTree(cause) => Self::BTree(cause),
         }
     }
 }
@@ -67,6 +69,7 @@ impl std::fmt::Display for ComparisonCoercionFailure {
             Self::Layout(cause) => cause.fmt(f),
             Self::Vec(cause) => write!(f, "comparison type construction: {cause:?}"),
             Self::HashMap(cause) => cause.fmt(f),
+            Self::BTree(cause) => cause.fmt(f),
         }
     }
 }
@@ -76,6 +79,7 @@ impl std::error::Error for ComparisonCoercionFailure {
             Self::ValueType(cause) => Some(cause),
             Self::Layout(cause) => Some(cause),
             Self::HashMap(cause) => Some(cause),
+            Self::BTree(cause) => Some(cause),
             _ => None,
         }
     }
@@ -94,6 +98,7 @@ impl novarocks_failure_contract::FailureProjection for ComparisonCoercionFailure
             Self::ValueType(cause) => return cause.failure_fact(),
             Self::Layout(cause) => return cause.failure_fact(),
             Self::HashMap(cause) => return cause.failure_fact(),
+            Self::BTree(cause) => return cause.failure_fact(),
             Self::Vec(crate::ControlResourceError::Control(cause)) => return cause.failure_fact(),
             Self::Vec(crate::ControlResourceError::SourceModel(_)) => (FailureClass::Invariant, 70),
         };
@@ -1052,7 +1057,12 @@ mod value_tests {
                             id,
                             true,
                         )
-                        .with_metadata([("provider.field-id".into(), "91".into())].into()),
+                        .with_metadata(std::collections::HashMap::<
+                            String,
+                            String,
+                        >::from([
+                            ("provider.field-id".into(), "91".into()),
+                        ])),
                     ]
                     .into(),
                 ),

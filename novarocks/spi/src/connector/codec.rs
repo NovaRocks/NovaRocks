@@ -253,7 +253,7 @@ impl novarocks_failure_contract::FailureProjection for ConnectorCodecError {
 
 impl From<CompileControlError> for ConnectorCodecError {
     fn from(error: CompileControlError) -> Self {
-        let detail = Arc::from(error.to_string());
+        let detail = Arc::from(error.detail());
         Self {
             path: ConnectorFieldPath::root("connector_payload"),
             kind: ConnectorCodecErrorKind::CompileControl(error),
@@ -1092,11 +1092,132 @@ mod tests {
     }
 
     #[test]
+    fn compile_control_bridge_keeps_each_fixed_diagnostic_and_original_fact() {
+        use novarocks_failure_contract::FailureProjection;
+        for (cause, detail) in [
+            (
+                CompileControlError::Cancelled,
+                "pure compilation was cancelled",
+            ),
+            (
+                CompileControlError::DeadlineExceeded,
+                "pure compilation deadline was exceeded",
+            ),
+            (
+                CompileControlError::ResourceExhausted,
+                "pure compilation work budget was exhausted",
+            ),
+        ] {
+            let expected = cause.failure_fact();
+            let error = ConnectorCodecError::from(cause.clone());
+            assert_eq!(error.detail(), detail);
+            assert_eq!(error.failure_fact(), expected);
+            assert_eq!(error.path().to_string(), "connector_payload");
+            assert_eq!(error.compile_control_error(), Some(&cause));
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<CompileControlError>(),
+                Some(&cause)
+            );
+        }
+    }
+
+    #[test]
+    fn compile_control_source_bridge_keeps_the_bounded_snapshot_and_last_real_cause_holder() {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, SharedFailureCause, domain,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct Original {
+            displays: Arc<AtomicUsize>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl fmt::Display for Original {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.displays.fetch_add(1, Ordering::SeqCst);
+                f.write_str("provider token=original-value ")?;
+                for _ in 0..1024 {
+                    f.write_str("界")?;
+                }
+                Ok(())
+            }
+        }
+        impl Error for Original {}
+        impl FailureProjection for Original {
+            fn failure_fact(&self) -> FailureFact {
+                FailureFact::new(
+                    FailureClass::Data,
+                    FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(301).unwrap()),
+                )
+            }
+        }
+        impl Drop for Original {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let displays = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let source = SharedFailureCause::new(Original {
+            displays: displays.clone(),
+            drops: drops.clone(),
+        });
+        let expected = source.detail().to_owned();
+        let fact = source.failure_fact();
+        let original = source.downcast_ref::<Original>().unwrap() as *const Original;
+        let prefix = "provider token=original-value ";
+        assert_eq!(
+            expected.len(),
+            prefix.len()
+                + (novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES - prefix.len()) / "界".len()
+                    * "界".len(),
+        );
+        let error = ConnectorCodecError::from(CompileControlError::Source(source.clone()));
+        assert_eq!(error.detail(), expected);
+        assert!(error.detail().starts_with(prefix));
+        assert_eq!(error.failure_fact(), fact);
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        assert_eq!(displays.load(Ordering::SeqCst), 1);
+        match error.compile_control_error().unwrap() {
+            CompileControlError::Source(held) => {
+                assert_eq!(held, &source);
+                assert_eq!(
+                    held.downcast_ref::<Original>().unwrap() as *const Original,
+                    original
+                );
+            }
+            _ => panic!("the original source must remain typed"),
+        }
+        let clone = error
+            .clone()
+            .with_path(ConnectorFieldPath::root("fragment"));
+        assert!(Arc::ptr_eq(&error.detail, &clone.detail));
+        let diagnostic = Arc::downgrade(&error.detail);
+        drop(source);
+        drop(error);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(clone.detail(), expected);
+        assert!(diagnostic.upgrade().is_some());
+        drop(clone);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(diagnostic.upgrade().is_none());
+        assert_eq!(displays.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn compile_decode_entry_refuses_each_control_cause_before_work() {
         for cause in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
+            CompileControlError::Source(novarocks_failure_contract::SharedFailureCause::new(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+            )),
         ] {
             let owner = CompileOwner {
                 calls: Default::default(),

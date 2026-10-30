@@ -47,7 +47,7 @@ pub const CATALOG_DESIRED_STATE_FAMILY: PersistentStateFamily = PersistentStateF
 pub use key::{attachment_key, attachment_prefix};
 pub use repository::{
     CatalogAttachment, CatalogAttachmentError, CatalogAttachmentErrorKind,
-    CatalogAttachmentRepository, CatalogAttachmentVersioned,
+    CatalogAttachmentFailureParts, CatalogAttachmentRepository, CatalogAttachmentVersioned,
 };
 pub use wakeup::{CatalogAttachmentWakeup, CatalogAttachmentWakeupSignal};
 
@@ -63,6 +63,23 @@ pub trait CatalogReferenceReader: Send + Sync {
         instance_id: &'a ConnectorInstanceId,
         page_size: usize,
     ) -> BoxFuture<'a, Result<Option<&'static str>, String>>;
+
+    /// Explicit original read under the caller's stable execution owner.
+    /// Implementations without this capability never call the legacy reader.
+    fn observe_references_in<'a>(
+        &'a self,
+        _store: &'a dyn novarocks_state_store_api::StateStore,
+        _instance_id: &'a ConnectorInstanceId,
+        _page_size: usize,
+        _execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> BoxFuture<
+        'a,
+        Result<Option<&'static str>, novarocks_state_store_api::StateStoreExecutionFailure>,
+    > {
+        Box::pin(async {
+            Err(novarocks_state_store_api::StateStoreOriginalUnsupported.into_original_failure())
+        })
+    }
 }
 
 /// Rechecks frozen attachment observations in a caller-owned write transaction.

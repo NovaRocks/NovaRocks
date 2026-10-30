@@ -54,13 +54,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use crate::task_execution::operation::{FrontendAction, frontend_action};
 use novarocks_execution::task_execution::{
     ContentFingerprint, DomainProgression, OperationKind, PlanNodeId, SplitAssignmentIntent,
     SplitSequence, TaskDomainReceipt, TaskDomainUpdate, TaskOperationId, UpdateTaskReceipt,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_query_application::coordination::{FrontendAction, frontend_action};
 use novarocks_task_codec::domain::{split_offer, wire_split_assignment};
 use novarocks_types::UniqueId;
 use novarocks_types::identity::TaskId;
@@ -279,10 +279,17 @@ impl SplitDeliveryBridge {
         admitted: Result<UpdateAdmission, &TaskExecutionError>,
     ) -> Result<(), SplitDeliveryError> {
         let outcome = match admitted {
-            Ok(UpdateAdmission::Queued) => return self.expect_live(delivery),
-            // The destination is terminal, so the fact was dropped before it
-            // could reach a backend. Nothing was established remotely and
-            // resending cannot change that.
+            Ok(UpdateAdmission::Queued | UpdateAdmission::Preparing) => {
+                return self.expect_live(delivery);
+            }
+            Ok(UpdateAdmission::DiscardedNoLongerNeeded) => {
+                DeliveryOutcome::DestinationFinished(format!(
+                    "the original owner no longer needs input for task {}",
+                    self.task_of(delivery)?
+                ))
+            }
+            // A missing or contrary Task fact cannot become normal completion
+            // merely because this input was discarded before remote dispatch.
             Ok(UpdateAdmission::DiscardedTerminal) => DeliveryOutcome::Local(format!(
                 "task update discarded: task {} is terminal",
                 self.task_of(delivery)?
@@ -627,8 +634,12 @@ struct SplitDeliverySink {
 }
 
 impl TaskOperationSink for SplitDeliverySink {
-    fn try_reserve_queue(&self, request: TaskOperationQueueRequest) -> TaskOperationQueueAdmission {
-        self.inner.try_reserve_queue(request)
+    fn try_reserve_queue(
+        &self,
+        request: TaskOperationQueueRequest,
+        preparation: &mut super::intent::TaskOperationQueuePreparation,
+    ) -> TaskOperationQueueAdmission {
+        self.inner.try_reserve_queue(request, preparation)
     }
 
     fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
@@ -662,6 +673,9 @@ impl TaskOperationSink for SplitDeliverySink {
                 // batch the inner transport refused.
                 self.bridge.note_released(&released);
                 TaskOperationSubmit::Accepted
+            }
+            TaskOperationSubmit::AdmissionFailed { batch, error } => {
+                TaskOperationSubmit::AdmissionFailed { batch, error }
             }
             TaskOperationSubmit::Backpressured(batch) => TaskOperationSubmit::Backpressured(batch),
             TaskOperationSubmit::Rejected { batch, reason } => {
@@ -777,11 +791,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use crate::task_protocol_config::DispatchLane;
     use novarocks_execution::task_execution::{
         DomainProgression, OperationOutcome, PlanNodeSplitReceipt, SplitOffer, SplitWatermark,
         TaskIdentity, UpdateTask,
     };
-    use novarocks_query_application::coordination::DispatchLane;
     use novarocks_spi::connector::ConnectorReadWireEncoder;
     use novarocks_types::identity::{BackendProcessId, StageId};
     use novarocks_types::{AttemptId, QueryId};
@@ -854,6 +868,7 @@ mod tests {
         fn try_reserve_queue(
             &self,
             _request: TaskOperationQueueRequest,
+            _preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
         ) -> TaskOperationQueueAdmission {
             TaskOperationQueueAdmission::Admitted(crate::task_execution::intent::test_queue_permit())
         }

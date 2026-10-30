@@ -1,0 +1,115 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Design: ADR-0200 (docs/adr/ADR-0200-advisory-discovery-is-independent-of-admission.md)
+name: Dependency advisories
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to check (empty uses the triggering ref)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-advisories-${{ github.event.pull_request.number || inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-advisories:
+    name: dependency-advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      NOVA_ADVISORY_RUNNER_LABEL: ubuntu-24.04
+      NOVA_CI_CARGO_DENY_VERSION: "0.20.2"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || '' }}
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      # Restore admission's downloads without publishing a discovery-owned cache.
+      - name: Restore Cargo downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-downloads-v1-${{ hashFiles('**/Cargo.lock') }}-deny-${{ env.NOVA_CI_CARGO_DENY_VERSION }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-downloads-v1-
+
+      - name: Add pinned cargo-deny to PATH
+        run: echo "$RUNNER_TEMP/advisory-tools/bin" >> "$GITHUB_PATH"
+
+      - name: Restore pinned cargo-deny
+        id: cargo_deny
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/advisory-tools
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ env.NOVA_ADVISORY_RUNNER_LABEL }}-advisory-tools-v1-${{ hashFiles('rust-toolchain.toml') }}-deny-${{ env.NOVA_CI_CARGO_DENY_VERSION }}
+
+      - name: Install pinned cargo-deny
+        if: steps.cargo_deny.outputs.cache-hit != 'true'
+        run: cargo install cargo-deny --version "$NOVA_CI_CARGO_DENY_VERSION" --locked --root "$RUNNER_TEMP/advisory-tools"
+
+      - name: Verify pinned cargo-deny
+        run: |
+          deny_version="$(cargo deny --version)"
+          echo "$deny_version"
+          [[ "$deny_version" == "cargo-deny $NOVA_CI_CARGO_DENY_VERSION" ]]
+
+      - name: Save pinned cargo-deny
+        if: steps.cargo_deny.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/advisory-tools
+          key: ${{ steps.cargo_deny.outputs.cache-primary-key }}
+
+      - name: Check latest dependency advisories
+        run: tools/ci/local-full-ci.sh --run-stage "Cargo dependency advisories" "$RUNNER_TEMP/no-artifacts.json" "$RUNNER_TEMP/advisories"
+
+      - name: Publish advisory summary
+        if: always()
+        run: |
+          summary="$RUNNER_TEMP/advisories/dependency-advisories/summary.md"
+          if [ -f "$summary" ]; then
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Advisory summary unavailable; inspect the failed preparation or stage logs." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload advisory materials
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-advisories-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/advisories
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 90

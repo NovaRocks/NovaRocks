@@ -183,7 +183,7 @@ fn output_identity_rejects_replacement_and_tail_is_bounded() {
     assert!(source.read_tail(3).unwrap().bytes.len() <= 3);
     let identity = source.original_durable_log_identity().unwrap();
     assert!(identity.1 != 0);
-    fs::rename(source.path(), directory.0.join("old-stdout")).unwrap();
+    fs::rename(source.path(), source.path().with_file_name("old-stdout")).unwrap();
     fs::write(source.path(), b"READY fake\n").unwrap();
     assert!(source.read_tail(64).is_err());
     process.stop().unwrap();
@@ -612,7 +612,10 @@ fn original_snapshot_accepts_append_but_rejects_replacement_and_truncation() {
         .with_bounded_snapshot_reader(128, |reader, _| {
             let mut bytes = Vec::new();
             reader.read_to_end(&mut bytes)?;
-            fs::rename(source.path(), directory.0.join("retained-original"))?;
+            fs::rename(
+                source.path(),
+                source.path().with_file_name("retained-original"),
+            )?;
             fs::write(source.path(), b"forged replacement\n")?;
             Ok(())
         })
@@ -634,7 +637,10 @@ fn original_snapshot_preserves_visitor_io_error_even_after_replacement() {
     let source = process.stdout_log_source();
     let error = source
         .with_bounded_snapshot_reader(128, |_, _| -> anyhow::Result<()> {
-            fs::rename(source.path(), directory.0.join("retained-original"))?;
+            fs::rename(
+                source.path(),
+                source.path().with_file_name("retained-original"),
+            )?;
             fs::write(source.path(), b"forged replacement\n")?;
             Err(File::open(directory.0.join("absent-visitor-input"))
                 .unwrap_err()
@@ -1059,7 +1065,11 @@ fn original_log_identity_is_the_spawn_time_scalar_after_path_replacement() {
     let mut process = service(&directory, SERVICE);
     let source = process.stdout_log_source();
     let original = source.original_durable_log_identity().unwrap();
-    fs::rename(source.path(), directory.0.join("retained-original")).unwrap();
+    fs::rename(
+        source.path(),
+        source.path().with_file_name("retained-original"),
+    )
+    .unwrap();
     fs::write(source.path(), b"unrelated replacement\n").unwrap();
     assert_eq!(
         source.original_durable_log_identity().unwrap(),

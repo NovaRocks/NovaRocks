@@ -105,13 +105,22 @@ pub struct ConnectorOpenWriterRequest {
 pub trait ConnectorBatchWriter: Send {
     async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError>;
 
-    /// Close this writer and describe every artifact it staged. A writer that
-    /// staged nothing returns an empty vector; that is a legal outcome and is
-    /// not the same as a failure.
+    /// Seal this writer's complete output and describe every staged artifact.
+    /// Before returning success, revoke this writer's local deletion authority
+    /// over those artifacts. Later abort, Drop, transport loss, task/context
+    /// retirement and an absent FE receipt must not regain that authority.
+    /// The original supervised output carrier owns transport custody; only the
+    /// FE's complete receiving path can authorize subsequent publication or
+    /// exact cleanup. Sealing itself neither commits nor proves FE receipt.
+    ///
+    /// Failure before sealing keeps local cleanup with this same writer. An
+    /// empty successful output is sealed too and is not a failure.
     async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError>;
 
-    /// Best-effort local cleanup after a failure or cancellation. It never
-    /// reaches external catalog metadata.
+    /// Local cleanup of still-unsealed artifacts after failure or cancellation.
+    /// A successfully sealed writer must treat this as an idempotent no-op.
+    /// It never reaches external catalog metadata. Unconfirmed deletions remain
+    /// the same writer's responsibility until actual disposition.
     async fn abort(&mut self) -> Result<(), ConnectorError>;
 }
 

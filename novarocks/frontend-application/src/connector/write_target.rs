@@ -37,12 +37,12 @@
 //! meaning for an INSERT or a row mutation.
 
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorRequestContext,
-    ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
-    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorTableColumnRole, ConnectorTableColumnVisibility, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableResolution, ConnectorWriteLease,
-    ConnectorWriteOperationId, ConnectorWriteTargetRef,
+    ConnectorControlPlanningLease, ConnectorRequestContext, ConnectorRowMutationIntent,
+    ConnectorRowMutationPreparation, ConnectorRowMutationPreparationOutcome,
+    ConnectorRowMutationPreparationRequest, ConnectorTableColumnRole,
+    ConnectorTableColumnVisibility, ConnectorTableHandle, ConnectorTableIdentity,
+    ConnectorTableMetadata, ConnectorWriteLease, ConnectorWriteOperationId,
+    ConnectorWriteTargetRef,
 };
 
 /// One write target, resolved once against a single provider generation.
@@ -173,56 +173,6 @@ impl ConnectorWriteTargetBinding {
         };
         Ok((lease, preparation))
     }
-
-    /// Resolve the current head used by the existing durable DML journal.
-    ///
-    /// This intentionally preserves the historical RefHead observation rather
-    /// than claiming it is the opaque base sealed into a write preparation.
-    /// Those two facts can differ if the external ref moves; harmonizing them
-    /// is a separate lifecycle change.
-    pub fn journal_ref_head_snapshot_id(
-        &self,
-        target_ref: &str,
-        context: ConnectorRequestContext,
-    ) -> Result<Option<i64>, String> {
-        let facts = super::metadata_read_reference_facts_with_planning_lease(
-            self.lease.clone(),
-            context,
-            self.identity().namespace.as_ref(),
-            self.identity().table.as_ref(),
-        )?;
-        if target_ref == "main" {
-            return Ok(facts.current_snapshot_id());
-        }
-        facts
-            .named_references()
-            .iter()
-            .find(|reference| reference.name.as_ref() == target_ref)
-            .map(|reference| Some(reference.snapshot_id))
-            .ok_or_else(|| {
-                format!("iceberg ref: branch '{target_ref}' not found in table metadata")
-            })
-    }
-}
-
-/// Resolve a SQL write target into a neutral binding.
-///
-/// Mirrors `load_mv_target_binding`: acquire one planning lease, then load the
-/// table metadata through that same lease, so the schema, planning facts and
-/// opaque handle cannot drift apart.
-pub fn load_write_target_binding(
-    controls: &dyn ConnectorControlResolver,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-    resolution: ConnectorTableResolution,
-    context: ConnectorRequestContext,
-) -> Result<ConnectorWriteTargetBinding, String> {
-    let lease = super::acquire_metadata_planning_lease(controls, catalog)?;
-    let metadata = super::metadata_load_connector_table_with_planning_lease(
-        &lease, context, namespace, table, resolution,
-    )?;
-    Ok(ConnectorWriteTargetBinding::new(metadata, lease))
 }
 
 /// Derive the NCP-6 write-stack lease from a retained planning generation.

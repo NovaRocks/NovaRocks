@@ -17,14 +17,11 @@
 
 //! Frontend provider-observation adapter for product-owned MV scheduling.
 
-use super::background::MvBackgroundEngine;
-use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_mv_application::repository::MvRepositoryError;
 use novarocks_mv_application::{
     product::MvTarget as ProductMvTarget,
     scheduler::MvScheduledRefreshRequest,
     scheduler_runtime::{MvRefreshDisposition, MvRefreshRuntimeDecision},
-    service::MvKeyedProductService,
 };
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
@@ -47,69 +44,73 @@ impl ScheduledRefreshRequest {
     }
 }
 
-/// The worker-owned execution seam. Implementations acquire the activity gate,
-/// build the bounded request context, and run provider/query effects. Scheduler
-/// policy never observes an effect adapter display string.
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) trait ScheduledRefreshRunner: Send + Sync {
-    fn execute(&self, request: ScheduledRefreshRequest) -> ScheduledRefreshDisposition;
-}
-
-/// Drive the product-owned scheduler with exact outer observations. Frontend
-/// neither constructs nor retains queue, backoff, source-revision or policy
-/// state; it supplies the one provider snapshot read the product admits.
-pub(crate) fn poll(
-    product: &MvKeyedProductService,
-    readiness: &MvReadinessPort,
-    engine: &dyn MvBackgroundEngine,
+/// The same policy snapshots are borrowed only for pure transitions. No
+/// StateStore, Provider, future poll or foreign destructor runs under its lock.
+pub(crate) async fn poll_async(
+    product: &novarocks_mv_application::service::MvProductOperations,
+    readiness: &crate::mv::domain::readiness::MvReadinessExecution<'_>,
+    ports: &crate::mv::domain::iceberg_refresh::IcebergMvCorePorts,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    factory: &crate::mv::domain::staged_create::CurrentProjectionMetadataCpu,
+    capture: &std::sync::Arc<crate::mv::domain::staged_create::CurrentMetadataCapture>,
     now_ms: i64,
 ) -> Result<Vec<ScheduledRefreshRequest>, MvRepositoryError> {
-    product.with_refresh_scheduler(|scheduler| {
-        if !scheduler.enabled() {
-            return Ok(Vec::new());
-        }
-
-        for projection in readiness.list_ready_projections()? {
-            let Some(observation) = scheduler.observe_projection(projection.projection, now_ms)
-            else {
-                continue;
-            };
-            match engine.current_source_inputs(observation.occurrences()) {
-                Ok(current_inputs) => {
-                    scheduler.resolve_current_inputs(observation, current_inputs, now_ms)
-                }
-                Err(error) => scheduler.record_observation_failure(
-                    &observation,
-                    ScheduledRefreshDisposition::from_background_error(error),
-                    now_ms,
-                ),
+    if !product.with_refresh_scheduler(|scheduler| scheduler.enabled()) {
+        return Ok(Vec::new());
+    }
+    for projection in readiness.list_ready_projections().await? {
+        let observation = product.with_refresh_scheduler(|scheduler| {
+            scheduler.observe_projection(projection.projection, now_ms)
+        });
+        let Some(observation) = observation else {
+            continue;
+        };
+        let current = super::background_engine::current_source_inputs_in(
+            ports,
+            observation.occurrences(),
+            context,
+            factory,
+            capture,
+        )
+        .await;
+        match current {
+            Ok(inputs) => product.with_refresh_scheduler(|scheduler| {
+                scheduler.resolve_current_inputs(observation, inputs, now_ms)
+            }),
+            Err(error) => {
+                let disposition = ScheduledRefreshDisposition::from_background_error(error);
+                product.with_refresh_scheduler(|scheduler| {
+                    scheduler.record_observation_failure(&observation, disposition, now_ms)
+                });
             }
         }
-
-        Ok(scheduler
-            .take_ready()
-            .into_iter()
-            .map(|product| ScheduledRefreshRequest {
-                target: sql_target(product.target()),
-                product,
-            })
-            .collect())
-    })
+    }
+    Ok(product
+        .with_refresh_scheduler(|scheduler| scheduler.take_ready())
+        .into_iter()
+        .map(|product| ScheduledRefreshRequest {
+            target: sql_target(product.target()),
+            product,
+        })
+        .collect())
 }
 
-pub(crate) fn mark_started(product: &MvKeyedProductService, mv_id: i64) -> bool {
+pub(crate) fn mark_started(
+    product: &novarocks_mv_application::service::MvProductOperations,
+    mv_id: i64,
+) -> bool {
     product.with_refresh_scheduler(|scheduler| scheduler.mark_started(mv_id))
 }
 
-pub(crate) fn requeue(product: &MvKeyedProductService, request: ScheduledRefreshRequest) {
+pub(crate) fn requeue(
+    product: &novarocks_mv_application::service::MvProductOperations,
+    request: ScheduledRefreshRequest,
+) {
     product.with_refresh_scheduler(|scheduler| scheduler.requeue(request.product));
 }
 
 pub(crate) fn complete(
-    product: &MvKeyedProductService,
+    product: &novarocks_mv_application::service::MvProductOperations,
     request: &ScheduledRefreshRequest,
     disposition: ScheduledRefreshDisposition,
     now_ms: i64,

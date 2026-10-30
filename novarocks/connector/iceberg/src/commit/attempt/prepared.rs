@@ -53,6 +53,24 @@ pub(crate) trait PublicationPreparer: Send + Sync + 'static {
         request: &FrozenRequest,
         operation: &IcebergCommitOperation,
     ) -> Result<()>;
+    /// Borrow the original request slot. A scoped producer may move it only
+    /// into its stable original Source while the same CPU receipt is awaited.
+    /// Other existing families keep their original pure preflight author until
+    /// their P06 interface retirement; no network or refused CPU fallback.
+    fn preflight_recovery_in<'a>(
+        &'a self,
+        request: &'a mut Option<crate::commit::model::FrozenRequest>,
+        operation: &'a IcebergCommitOperation,
+    ) -> crate::commit::attempt::RecoveryPreflightFuture<'a> {
+        crate::commit::attempt::RecoveryPreflightFuture::ready(
+            request
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::new(ErrorKind::DataInvalid, "Original frozen request is absent")
+                })
+                .and_then(|request| self.preflight_recovery(request, operation)),
+        )
+    }
     fn evidence_policy(&self) -> CatalogEvidencePolicy;
     async fn prepare_dispatch(
         self: Arc<Self>,
@@ -192,6 +210,13 @@ impl PublicationPreparer for PinnedExpiryPreparer {
         operation: &IcebergCommitOperation,
     ) -> Result<()> {
         self.inner.preflight_recovery(request, operation)
+    }
+    fn preflight_recovery_in<'a>(
+        &'a self,
+        request: &'a mut Option<crate::commit::model::FrozenRequest>,
+        operation: &'a IcebergCommitOperation,
+    ) -> crate::commit::attempt::RecoveryPreflightFuture<'a> {
+        self.inner.preflight_recovery_in(request, operation)
     }
     fn evidence_policy(&self) -> CatalogEvidencePolicy {
         self.inner.evidence_policy()

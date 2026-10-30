@@ -316,7 +316,7 @@ fn compiled_repeat_prepare_requires_actual_creator_and_releases_schema_at_last_r
         schema
             .slots()
             .iter()
-            .all(|slot| slot.field_ref().metadata().capacity() == 0)
+            .all(|slot| slot.field_ref().metadata().as_arc().is_none())
     );
     drop(output);
     drop(processor);

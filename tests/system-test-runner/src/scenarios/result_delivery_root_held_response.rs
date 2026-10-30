@@ -32,11 +32,12 @@ use novarocks_execution_contract::{
     TaskIdentity,
     root_result::{RootReadOutcome, RootResultRead, RootResultReply},
 };
-use novarocks_native_trust::{BoxedNativeIo, NativeEndpointConnector};
+use novarocks_native_trust::NativeEndpointConnector;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as wire;
 use novarocks_result_contract::{RootOutputKind, RootProfileId};
 use novarocks_task_codec::root_result::decode_read;
+use novarocks_transport_io::BoxedIo;
 use prost::Message;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -498,7 +499,7 @@ impl HeldRootResponse {
             Err(error) => Err(self.fail(FailureClass::Clock, error.into())),
         }
     }
-    async fn attach_and_capture(&mut self, io: BoxedNativeIo) -> Result<()> {
+    async fn attach_and_capture(&mut self, io: BoxedIo) -> Result<()> {
         let (sender, connection) = client::handshake(io).await?;
         // No await/fallible call between spawn and installation of its original handle.
         self.driver = Some(tokio::spawn(connection));

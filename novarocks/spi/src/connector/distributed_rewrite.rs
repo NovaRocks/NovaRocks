@@ -34,6 +34,13 @@ use super::{
     ConnectorWriteReceipt, ProviderBindingEpoch,
 };
 
+mod async_plan;
+pub use async_plan::{
+    ConnectorRewritePlanSource, ConnectorRewritePrepared, ConnectorRewriteSelection,
+    ConnectorRewriteSourceRequest, ConnectorRewriteWriteBeginSource, RewriteCpuInput,
+    RewriteCpuPort, RewritePlanCpuSource,
+};
+
 pub const CONNECTOR_DISTRIBUTED_REWRITE_CONTRACT_VERSION: u16 = 1;
 pub const MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS: usize = 4096;
@@ -725,6 +732,36 @@ impl ConnectorDistributedRewriteReceipt {
 }
 
 pub trait ConnectorDistributedRewrite: Send + Sync {
+    /// Initial selected routes of THIS original planning factory. Facts do
+    /// not grant I/O, bytes or concurrency; discovered routes extend the SAME
+    /// Root before their first actual dispatch.
+    fn planning_initial_dependencies(
+        &self,
+    ) -> Result<Vec<crate::connector::SharedDependency>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "selected Rewrite planning factory has no original route facts",
+        ))
+    }
+
+    /// Exact first-party planning source type for this selected generation.
+    /// This observation grants no CPU, I/O or payload capacity.
+    fn scoped_cpu_source_type_id(&self) -> Option<std::any::TypeId> {
+        None
+    }
+    /// Install the stable original source before any foreign poll. An
+    /// unsupported capability preserves the request and receiving slots;
+    /// there is no synchronous planning fallback.
+    fn prepare_plan_source_in(
+        &self,
+        _request: &mut Option<ConnectorRewriteSourceRequest>,
+        _receiving: &mut Option<Box<dyn ConnectorRewritePlanSource>>,
+    ) -> Result<(), ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "asynchronous distributed rewrite source is unsupported",
+        ))
+    }
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn binding_key(&self) -> &ConnectorProviderBindingKey;
     fn plan_rewrite(
@@ -817,6 +854,9 @@ impl ConnectorDistributedRewriteLease {
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
+    pub const fn incarnation(&self) -> ProviderBindingEpoch {
+        self.provider_binding_key.incarnation
+    }
     pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
         self.control_runtime_id
     }
@@ -853,6 +893,63 @@ impl ConnectorDistributedRewriteLease {
             ));
         }
         Ok(declaration)
+    }
+    /// The original metadata CPU author must belong to this exact lease,
+    /// before any input can move into its selected closed CPU port.
+    pub fn metadata_cpu_source_type_id(&self) -> Result<std::any::TypeId, ConnectorError> {
+        let metadata = self.metadata();
+        let (key, source) = metadata.provider_metadata_cpu_author().ok_or_else(|| {
+            ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "selected metadata binding CPU author is unsupported",
+            )
+        })?;
+        if key != self.provider_binding_key
+            || metadata.instance_id() != &self.descriptor.instance_id
+        {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "Rewrite metadata CPU author belongs to another exact generation",
+            ));
+        }
+        Ok(source)
+    }
+    pub fn planning_initial_dependencies(
+        &self,
+    ) -> Result<Vec<crate::connector::SharedDependency>, ConnectorError> {
+        if self.rewrite.descriptor() != &self.descriptor
+            || self.rewrite.binding_key() != &self.provider_binding_key
+        {
+            return Err(invalid(
+                "Rewrite planning route author belongs to another exact generation",
+            ));
+        }
+        self.rewrite.planning_initial_dependencies()
+    }
+    pub fn scoped_cpu_source_type_id(&self) -> Result<std::any::TypeId, ConnectorError> {
+        self.rewrite.scoped_cpu_source_type_id().ok_or_else(|| {
+            ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "original rewrite CPU source is unsupported",
+            )
+        })
+    }
+    pub fn prepare_plan_source_in(
+        &self,
+        request: &mut Option<ConnectorRewriteSourceRequest>,
+        receiving: &mut Option<Box<dyn ConnectorRewritePlanSource>>,
+    ) -> Result<(), ConnectorError> {
+        if receiving.is_some() {
+            return Err(invalid("rewrite source receiver is occupied"));
+        }
+        let original = request
+            .as_ref()
+            .ok_or_else(|| invalid("rewrite source request is empty"))?;
+        original.validate()?;
+        if original.table.instance_id != self.provider_binding_key.instance_id {
+            return Err(invalid("rewrite source request has a foreign instance"));
+        }
+        self.rewrite.prepare_plan_source_in(request, receiving)
     }
     pub fn rewrite(&self) -> &Arc<dyn ConnectorDistributedRewrite> {
         &self.rewrite

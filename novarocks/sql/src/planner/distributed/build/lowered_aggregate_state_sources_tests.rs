@@ -573,8 +573,13 @@ fn state_sources_none_and_nonzero_cv_keep_own_backing_and_same_lineage_new_revis
     };
     let old = spec.aggregates[0].source.clone();
     let field = Arc::new(
-        Field::new("actual_cv", DataType::Int64, false)
-            .with_metadata([("provider-origin".into(), "original".into())].into()),
+        Field::new("actual_cv", DataType::Int64, false).with_metadata(std::collections::HashMap::<
+            String,
+            String,
+        >::from([(
+            "provider-origin".into(),
+            "original".into(),
+        )])),
     );
     let pool = ConstantPool::try_new(
         field.clone(),

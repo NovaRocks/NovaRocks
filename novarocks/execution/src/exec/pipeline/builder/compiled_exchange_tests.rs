@@ -1280,7 +1280,7 @@ fn compiled_receiver_schema_uses_real_creator_until_last_slot_after_program_exit
         schema
             .slots()
             .iter()
-            .all(|slot| slot.field_ref().metadata().capacity() == 0)
+            .all(|slot| slot.field_ref().metadata().as_arc().is_none())
     );
     drop(receivers);
     drop(factory);
@@ -1352,3 +1352,5 @@ fn compiled_stream_materialization_keeps_its_exact_edge_gate() {
         assert_eq!(factory.create(1, 0).name(), expected);
     }
 }
+
+include!("compiled_router_runtime_tests.rs");

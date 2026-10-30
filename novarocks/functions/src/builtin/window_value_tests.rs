@@ -428,8 +428,12 @@ fn ignore_nulls_follows_dictionary_selected_values_after_explicit_plain_ingress(
 #[test]
 fn exact_nested_metadata_fresh_frozen_owner_and_empty_frames_preserve_full_source_type() {
     let field = Arc::new(
-        Field::new("source-field", DataType::Int32, false)
-            .with_metadata([("long-source".into(), "z".repeat(1300))].into()),
+        Field::new("source-field", DataType::Int32, false).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "long-source".into(),
+                "z".repeat(1300),
+            )]),
+        ),
     );
     let fields: arrow_schema::Fields = vec![field.clone()].into();
     let values: ArrayRef = Arc::new(StructArray::new(
@@ -1004,8 +1008,12 @@ fn wide_full_field_binding_observation_crosses_actual_compile_quantum_without_ty
     let fields: arrow_schema::Fields = (0..320)
         .map(|at| {
             Arc::new(
-                Field::new(format!("source-{at}"), DataType::Int32, false)
-                    .with_metadata([("original".into(), format!("value-{at}"))].into()),
+                Field::new(format!("source-{at}"), DataType::Int32, false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "original".into(),
+                        format!("value-{at}"),
+                    )]),
+                ),
             )
         })
         .collect::<Vec<_>>()

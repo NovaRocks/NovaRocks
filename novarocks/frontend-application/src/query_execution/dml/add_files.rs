@@ -464,7 +464,7 @@ fn project_plan_error(outcome: ResolvedDataMutation) -> AddFilesPlanError {
 
 fn project_outcome(outcome: ResolvedDataMutation) -> AddFilesOutcome {
     match outcome {
-        ResolvedDataMutation::KnownCommitted(completed) => project_committed(completed),
+        ResolvedDataMutation::KnownCommitted(completed) => project_committed(*completed),
         ResolvedDataMutation::KnownUncommitted { failure, cleanup } => {
             AddFilesOutcome::KnownUncommitted {
                 failure: project_uncommitted(failure, cleanup),
@@ -727,6 +727,7 @@ mod tests {
         )
         .expect("receipt");
         let outcome = project_committed(CompletedDataMutation {
+            cleanup: ExternalMutationFinalization::Complete,
             effect: ExternalMutationEffect::Applied,
             receipt,
             finalization: ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(

@@ -55,6 +55,82 @@ pub(crate) type FrozenReadCapability = (
     CatalogProperties,
 );
 
+/// Proof of the immutable static plan's complete placement validation. The
+/// temporary scan indexes leave on the CPU; no extra mapping graph is retained.
+pub(crate) struct PreparedAttemptAccess {
+    _checked: (),
+}
+impl PreparedAttemptAccess {
+    pub(crate) fn prepare<A>(
+        plan: &novarocks_physical_plan::PhysicalPlan,
+        reads: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<A>,
+    ) -> Result<Self, String> {
+        let mut occurrences = std::collections::BTreeSet::new();
+        let mut destinations = std::collections::BTreeSet::new();
+        for fragment in plan.fragments().values() {
+            for node in fragment.nodes().values() {
+                let novarocks_physical_plan::NodeKind::Scan { occurrence, .. } = &node.kind else {
+                    continue;
+                };
+                if reads.get(*occurrence).is_none() {
+                    return Err(format!(
+                        "completed plan scans provider read occurrence {} with no frozen read",
+                        occurrence.get(),
+                    ));
+                }
+                let node_id = i32::try_from(node.id.get()).map_err(|_| {
+                    format!("scan node {} exceeds the wire node identity", node.id.get())
+                })?;
+                let destination = (FragmentId::from(fragment.id().get()), node_id);
+                if !destinations.insert(destination) || !occurrences.insert(*occurrence) {
+                    return Err("completed plan has duplicate frozen read placement".into());
+                }
+            }
+        }
+        if occurrences.len() != reads.len() {
+            return Err("completed plan has unused frozen read access".into());
+        }
+        Ok(Self { _checked: () })
+    }
+
+    /// The sealed static-plan caller retains the exact immutable plan and
+    /// unchanged access used by prepare. No original capability is moved
+    /// until the entire mapping has passed validation.
+    pub(crate) fn bind(
+        self,
+        plan: &novarocks_physical_plan::PhysicalPlan,
+        mut reads: BTreeMap<
+            novarocks_physical_plan::ProviderReadOccurrenceId,
+            FrozenReadCapability,
+        >,
+    ) -> ConnectorAttemptAccessPlan {
+        let mut entries = BTreeMap::new();
+        for fragment in plan.fragments().values() {
+            for node in fragment.nodes().values() {
+                let novarocks_physical_plan::NodeKind::Scan { occurrence, .. } = &node.kind else {
+                    continue;
+                };
+                let (_, access, generation, catalog) = reads
+                    .remove(occurrence)
+                    .expect("same original read prepared for this placement");
+                let node_id =
+                    i32::try_from(node.id.get()).expect("same validated wire node identity");
+                let destination = (FragmentId::from(fragment.id().get()), node_id);
+                entries.insert(
+                    destination,
+                    Arc::new(ConnectorAttemptAccessEntry {
+                        catalog_properties: catalog,
+                        planning_lease: generation,
+                        access,
+                    }),
+                );
+            }
+        }
+        assert!(reads.is_empty(), "same prepared read inventory");
+        LogicalExecutionAccessScope { entries }
+    }
+}
+
 pub(crate) fn attempt_access_for_completed_plan(
     plan: &novarocks_physical_plan::PhysicalPlan,
     mut reads: BTreeMap<novarocks_physical_plan::ProviderReadOccurrenceId, FrozenReadCapability>,
@@ -117,6 +193,27 @@ impl LogicalExecutionAccessScope {
 }
 
 impl ConnectorAttemptAccessEntry {
+    #[cfg(test)]
+    pub(crate) fn for_initializer_test(
+        catalog_properties: CatalogProperties,
+        planning_lease: ConnectorControlPlanningLease,
+        access: ConnectorReadAttemptAccess,
+    ) -> Arc<Self> {
+        assert_eq!(
+            access.frozen().binding().catalog_handle(),
+            catalog_properties.handle()
+        );
+        assert_eq!(
+            access.frozen().binding().descriptor(),
+            planning_lease.binding().descriptor()
+        );
+        Arc::new(Self {
+            catalog_properties,
+            planning_lease,
+            access,
+        })
+    }
+
     pub(crate) const fn access(&self) -> &ConnectorReadAttemptAccess {
         &self.access
     }

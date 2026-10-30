@@ -20,15 +20,15 @@ use std::fmt::Write;
 #[cfg(test)]
 thread_local! {static FLOAT_FORMATS:std::cell::Cell<usize>=const{std::cell::Cell::new(0)};}
 use crate::{
-    BoundedMysqlTextEncoder, RenderError, RenderErrorKind as E, RenderTurn, RenderTurnStatus,
+    BoundedClientRowEncoder, RenderError, RenderErrorKind as E, RenderTurn, RenderTurnStatus,
 };
 use arrow::array::*;
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, Timelike};
 use novarocks_result_contract::{
-    ClientRenderSchema, FrozenRootOutput, NativeRenderType as N, RenderField,
-    RenderPresentation as P, RenderTimeUnit, RootOutputContract, RootProfileV1 as V,
+    ClientPresentationFamily, ClientRenderSchema, FrozenRootOutput, NativeRenderType as N,
+    RenderField, RenderPresentation as P, RenderTimeUnit, RootOutputContract, RootProfileV1 as V,
 };
 use std::mem::size_of;
 use std::ops::Range;
@@ -193,6 +193,7 @@ enum Mode {
     Double,
     Single,
     LatinJson,
+    Json,
     Lossy,
     Base64,
 }
@@ -262,6 +263,12 @@ struct Variant {
     offset: i32,
 }
 enum Task {
+    JsonEscape(bool),
+    TrinoKey {
+        array: ArrayRef,
+        row: usize,
+        path: Path,
+    },
     Value {
         array: ArrayRef,
         row: usize,
@@ -426,6 +433,12 @@ fn stream_next(
                         stream.pending[..2].copy_from_slice(&[b'\\', c]);
                         stream.pending_len = 2;
                     }
+                    Mode::Json => {
+                        let mut escaped = [0; 6];
+                        let n = trino_json::escape_byte(c, &mut escaped);
+                        stream.pending[..n].copy_from_slice(&escaped[..n]);
+                        stream.pending_len = n;
+                    }
                     Mode::LatinJson => {
                         let escaped = match c {
                             b'"' => Some(b"\\\"".as_slice()),
@@ -451,7 +464,7 @@ fn stream_next(
                                 HEX[(c & 15) as usize],
                             ]);
                             stream.pending_len = 6;
-                        } else if c < 0x80 {
+                        } else if c < 0x80 || matches!(mode, Mode::Json) {
                             stream.pending[0] = c;
                             stream.pending_len = 1;
                         } else {
@@ -508,24 +521,37 @@ enum Poll {
     Done,
     Yield,
 }
+const CELL_TASK_CAPACITY: usize = 196;
+
 struct CellCursor {
+    json_escape: bool,
+    escaped: [u8; 6],
+    escaped_at: usize,
+    escaped_len: usize,
     stack: Vec<Task>,
     elements: usize,
 }
 impl CellCursor {
     fn new() -> Self {
         Self {
-            stack: Vec::with_capacity(196),
+            json_escape: false,
+            escaped: [0; 6],
+            escaped_at: 0,
+            escaped_len: 0,
+            stack: Vec::with_capacity(CELL_TASK_CAPACITY),
             elements: 0,
         }
     }
     fn reset(&mut self, array: ArrayRef, row: usize, path: Path, base: usize) {
         self.stack.clear();
+        self.json_escape = false;
+        self.escaped_at = 0;
+        self.escaped_len = 0;
         self.elements = base;
         self.stack.push(Task::Value { array, row, path });
     }
     fn push(&mut self, t: Task) -> Result<(), RenderError> {
-        if self.stack.len() >= 196 {
+        if self.stack.len() >= CELL_TASK_CAPACITY {
             return Err(extent_error(E::WorkStackLimit, self.stack.len() + 1));
         }
         self.stack.push(t);
@@ -546,7 +572,11 @@ impl CellCursor {
     }
     fn quoted(&mut self, source: Source, mode: Mode, quote: u8) -> Result<(), RenderError> {
         self.literal(&[quote])?;
-        self.push(Task::Stream(Stream::new(source, mode)))?;
+        let mut stream = Stream::new(source, mode);
+        if matches!(mode, Mode::Json) {
+            stream.utf8 = Some(Utf8::default());
+        }
+        self.push(Task::Stream(stream))?;
         self.literal(&[quote])
     }
     fn drain(
@@ -557,6 +587,9 @@ impl CellCursor {
         limit: usize,
         external: bool,
     ) -> Result<usize, RenderError> {
+        if self.json_escape || self.escaped_at < self.escaped_len {
+            return Ok(0);
+        }
         let limit = limit.min((V::EMIT_BYTES_PER_TURN - b.work) / 2);
         if limit == 0 {
             return Ok(0);
@@ -622,6 +655,27 @@ impl CellCursor {
         }
     }
     fn next(&mut self, s: &ClientRenderSchema, b: &mut Budget) -> Result<Poll, RenderError> {
+        if !b.room(4096) {
+            return Ok(Poll::Yield);
+        }
+        if self.escaped_at < self.escaped_len {
+            let byte = self.escaped[self.escaped_at];
+            self.escaped_at += 1;
+            b.scan(1);
+            return Ok(Poll::Byte(byte));
+        }
+        let poll = self.next_raw(s, b)?;
+        if let Poll::Byte(byte) = poll
+            && self.json_escape
+        {
+            self.escaped_len = trino_json::escape_byte(byte, &mut self.escaped);
+            self.escaped_at = 1;
+            b.scan(1);
+            return Ok(Poll::Byte(self.escaped[0]));
+        }
+        Ok(poll)
+    }
+    fn next_raw(&mut self, s: &ClientRenderSchema, b: &mut Budget) -> Result<Poll, RenderError> {
         loop {
             // Leave capacity for both a maximum fixed descriptor/atom operation
             // and the caller's destination byte. No uncharged scans occur here.
@@ -685,6 +739,16 @@ impl CellCursor {
                 return Ok(Poll::Done);
             };
             match task {
+                Task::JsonEscape(enabled) => self.json_escape = enabled,
+                Task::TrinoKey { array, row, path } => {
+                    if !b.cell() {
+                        self.push(Task::TrinoKey { array, row, path })?;
+                        return Ok(Poll::Yield);
+                    }
+                    self.element()?;
+                    b.scan(32 + usize::from(path.depth) * 2);
+                    self.trino_value(array, row, path, s, true, b)?;
+                }
                 Task::Stream(_) | Task::Atom(_) => unreachable!("byte tasks are advanced in place"),
                 Task::Value { array, row, path } => {
                     if !b.cell() {
@@ -703,7 +767,19 @@ impl CellCursor {
                         if !f.nullable && !matches!(f.native_type, N::Null | N::Opaque(_)) {
                             return Err(error(E::SchemaMismatch));
                         }
-                        self.literal(if nested { b"null" } else { &[0xfb] })?;
+                        self.literal(
+                            if nested
+                                || matches!(s.family(), ClientPresentationFamily::TrinoJson(_))
+                            {
+                                b"null"
+                            } else {
+                                &[0xfb]
+                            },
+                        )?;
+                        continue;
+                    }
+                    if matches!(s.family(), ClientPresentationFamily::TrinoJson(_)) {
+                        self.trino_value(array, row, path, s, false, b)?;
                         continue;
                     }
                     match &f.native_type {
@@ -899,11 +975,24 @@ impl CellCursor {
                             phase: 1 - phase,
                             first: false,
                         })?;
-                        self.push(Task::Value {
-                            array: a,
-                            row: next,
-                            path: path.child(phase as usize)?,
-                        })?;
+                        let child = path.child(phase as usize)?;
+                        self.push(
+                            if phase == 0
+                                && matches!(s.family(), ClientPresentationFamily::TrinoJson(_))
+                            {
+                                Task::TrinoKey {
+                                    array: a,
+                                    row: next,
+                                    path: child,
+                                }
+                            } else {
+                                Task::Value {
+                                    array: a,
+                                    row: next,
+                                    path: child,
+                                }
+                            },
+                        )?;
                         if phase == 1 {
                             self.literal(b":")?;
                         } else if !first {
@@ -924,6 +1013,25 @@ impl CellCursor {
                         return Err(invalid());
                     };
                     if next < fields.len() {
+                        if matches!(s.family(), ClientPresentationFamily::TrinoJson(_)) {
+                            let a = down::<StructArray>(&array)?.column(next).clone();
+                            self.push(Task::Struct {
+                                array,
+                                row,
+                                path,
+                                next: next + 1,
+                                phase: 0,
+                            })?;
+                            self.push(Task::Value {
+                                array: a,
+                                row,
+                                path: path.child(next)?,
+                            })?;
+                            if next != 0 {
+                                self.literal(b",")?;
+                            }
+                            continue;
+                        }
                         if phase == 0 {
                             self.push(Task::Struct {
                                 array,
@@ -999,7 +1107,14 @@ impl CellCursor {
                                 phase: 1,
                                 object,
                             })?;
-                            let mut stream = Stream::new(source, Mode::LatinJson);
+                            let mut stream = Stream::new(
+                                source,
+                                if matches!(s.family(), ClientPresentationFamily::TrinoJson(_)) {
+                                    Mode::Json
+                                } else {
+                                    Mode::LatinJson
+                                },
+                            );
                             stream.utf8 = Some(Utf8::default());
                             self.literal(b"\"")?;
                             self.push(Task::Stream(stream))?;
@@ -1036,6 +1151,7 @@ impl CellCursor {
         s: &ClientRenderSchema,
         b: &mut Budget,
     ) -> Result<(), RenderError> {
+        let trino = matches!(s.family(), ClientPresentationFamily::TrinoJson(_));
         let data = v.source.data(s)?;
         let bytes = data
             .get(v.range.clone())
@@ -1068,7 +1184,7 @@ impl CellCursor {
                 }
                 self.quoted(
                     v.source.slice(v.range.start + 1..v.range.end)?,
-                    Mode::LatinJson,
+                    if trino { Mode::Json } else { Mode::LatinJson },
                     b'"',
                 )?;
             }
@@ -1113,6 +1229,21 @@ impl CellCursor {
                             payload.try_into().map_err(|_| error(E::InvalidVariant))?
                         )
                     )),
+                    7 | 14 if trino => Some(if tag == 7 {
+                        trino_json::float64(
+                            f64::from_le_bytes(
+                                payload.try_into().map_err(|_| error(E::InvalidVariant))?,
+                            ),
+                            b,
+                        )?
+                    } else {
+                        trino_json::float32(
+                            f32::from_le_bytes(
+                                payload.try_into().map_err(|_| error(E::InvalidVariant))?,
+                            ),
+                            b,
+                        )?
+                    }),
                     7 | 14 => {
                         let n = if tag == 7 {
                             f64::from_le_bytes(
@@ -1154,7 +1285,9 @@ impl CellCursor {
                         }
                         let mut a =
                             decimal128(i128::from_le_bytes(raw), payload[0] as usize, None)?;
-                        if payload[0] != 0 {
+                        if trino {
+                            a = trino_json::variant_decimal(a, payload[0])?;
+                        } else if payload[0] != 0 {
                             while a.len > 1
                                 && a.data[a.len - 1] == b'0'
                                 && a.data[a.len - 2] != b'.'
@@ -1169,6 +1302,29 @@ impl CellCursor {
                             payload.try_into().map_err(|_| error(E::InvalidVariant))?,
                         );
                         Some(atom!("\"{}\"", date_atom(days, true, false)?))
+                    }
+                    12 | 13 | 17 | 18 | 19 if trino => {
+                        let raw = i64::from_le_bytes(
+                            payload.try_into().map_err(|_| error(E::InvalidVariant))?,
+                        );
+                        let unit = if matches!(tag, 18 | 19) {
+                            RenderTimeUnit::Nanosecond
+                        } else {
+                            RenderTimeUnit::Microsecond
+                        };
+                        let ty = if tag == 17 {
+                            N::Time { unit }
+                        } else {
+                            N::Timestamp {
+                                unit,
+                                timezone: None,
+                            }
+                        };
+                        let mut text = trino_json::temporal(raw, unit, &ty, true)?;
+                        if matches!(tag, 12 | 18) {
+                            text.write_str(" UTC").map_err(|_| invalid())?;
+                        }
+                        Some(atom!("\"{}\"", text))
                     }
                     12 | 13 => {
                         let raw = i64::from_le_bytes(
@@ -1240,6 +1396,8 @@ impl CellCursor {
                             v.source.slice(v.range.start + 5..v.range.end)?,
                             if tag == 15 {
                                 Mode::Base64
+                            } else if trino {
+                                Mode::Json
                             } else {
                                 Mode::LatinJson
                             },
@@ -1689,7 +1847,7 @@ enum Phase {
 enum SchemaOwner {
     Standalone(Arc<ClientRenderSchema>),
     Root(Arc<RootOutputContract>),
-    TypedRoot(ValidatedMysqlInput),
+    TypedRoot(ValidatedClientInput),
 }
 impl std::ops::Deref for SchemaOwner {
     type Target = ClientRenderSchema;
@@ -1711,10 +1869,10 @@ impl std::ops::Deref for SchemaOwner {
         }
     }
 }
-pub struct ArrowMysqlTextEncoder {
+struct ArrowClientRowEncoder {
     batch: RecordBatch,
-    stage: Box<[u8; 65536]>,
-    lengths: Box<[u32; 4096]>,
+    stage: Box<[u8; V::SMALL_ROW_BYTES]>,
+    lengths: Box<[u32; V::MAX_COLUMNS]>,
     cursor: CellCursor,
     phase: Phase,
     row: usize,
@@ -1740,10 +1898,10 @@ pub struct ArrowMysqlTextEncoder {
 /// are checked once. The retained input owner proves each batch schema before
 /// a cursor can reuse the result, independently of per-row encoding checks.
 #[derive(Clone)]
-pub struct ValidatedMysqlInput {
+pub struct ValidatedClientInput {
     types: novarocks_type_contract::ValidatedClientInputTypes,
 }
-impl ValidatedMysqlInput {
+impl ValidatedClientInput {
     pub fn try_new(
         types: novarocks_type_contract::ValidatedClientInputTypes,
     ) -> Result<Self, RenderError> {
@@ -1781,7 +1939,7 @@ impl ValidatedMysqlInput {
         self.types.rebind_shared(input).map(|types| Self { types })
     }
 }
-impl ArrowMysqlTextEncoder {
+impl ArrowClientRowEncoder {
     pub fn try_new(
         schema: Arc<ClientRenderSchema>,
         batch: RecordBatch,
@@ -1804,12 +1962,15 @@ impl ArrowMysqlTextEncoder {
     /// independently of the input Chunk. Physical array validation remains
     /// separate from this previously established render-purpose proof.
     pub fn try_new_typed_root(
-        input: ValidatedMysqlInput,
+        input: ValidatedClientInput,
         batch: RecordBatch,
     ) -> Result<Self, RenderError> {
         Self::try_new_with_owner(SchemaOwner::TypedRoot(input), batch)
     }
     fn try_new_with_owner(schema: SchemaOwner, batch: RecordBatch) -> Result<Self, RenderError> {
+        if matches!(schema.family(), ClientPresentationFamily::TrinoJson(_)) {
+            trino_json::validate_schema(&schema)?;
+        }
         if schema.columns().is_empty() || schema.columns().len() > V::MAX_COLUMNS {
             return Err(error(E::SchemaMismatch));
         }
@@ -1846,8 +2007,8 @@ impl ArrowMysqlTextEncoder {
         Ok(Self {
             schema,
             batch,
-            stage: Box::new([0; 65536]),
-            lengths: Box::new([0; 4096]),
+            stage: Box::new([0; V::SMALL_ROW_BYTES]),
+            lengths: Box::new([0; V::MAX_COLUMNS]),
             cursor: CellCursor::new(),
             phase: Phase::Small,
             row: 0,
@@ -1881,15 +2042,17 @@ impl ArrowMysqlTextEncoder {
         self.cursor.stack.clear();
     }
     fn start_cell(&mut self, b: &mut Budget) -> Result<bool, RenderError> {
-        if !b.room(32) || !b.cell() {
+        let trino = matches!(self.schema.family(), ClientPresentationFamily::TrinoJson(_));
+        if !b.room(if trino { 4096 } else { 32 }) || !b.cell() {
             return Ok(false);
         }
         b.scan(16);
         let column = &self.schema.columns()[self.column];
         let array = self.batch.column(column.source_ordinal as usize).clone();
         let (resolved, row) = resolve_dictionary(array.clone(), self.row)?;
-        self.cell_null =
-            resolved.is_null(row) || matches!(column.field.native_type, N::Null | N::Opaque(_));
+        self.cell_null = !trino
+            && (resolved.is_null(row)
+                || matches!(column.field.native_type, N::Null | N::Opaque(_)));
         self.cell_started = true;
         self.cell_length = 0;
         if self.cell_null {
@@ -1905,7 +2068,14 @@ impl ArrowMysqlTextEncoder {
         } else {
             self.cursor
                 .reset(array, self.row, Path::root(self.column), self.elements);
-            self.cell_atom = if self.phase == Phase::Emit {
+            if trino && self.column + 1 == self.schema.columns().len() {
+                // Closing delimiter is part of this last cell's measured payload.
+                self.cursor.stack.insert(0, Task::Atom(Atom::literal(b"]")));
+                b.scan(size_of::<Task>());
+            }
+            self.cell_atom = if self.phase == Phase::Emit && trino {
+                Atom::literal(if self.column == 0 { b"[" } else { b"," })
+            } else if self.phase == Phase::Emit {
                 lenenc(self.lengths[self.column] as usize)
             } else {
                 Atom::new()
@@ -1917,7 +2087,11 @@ impl ArrowMysqlTextEncoder {
                 return Ok(true);
             }
             self.cell_prefix = self.stage_len;
-            self.stage[self.stage_len] = 0;
+            self.stage[self.stage_len] = if trino {
+                if self.column == 0 { b'[' } else { b',' }
+            } else {
+                0
+            };
             self.stage_len += 1;
             b.scan(1);
         }
@@ -1939,7 +2113,9 @@ impl ArrowMysqlTextEncoder {
         }
         match self.phase {
             Phase::Small => {
-                if !self.cell_null {
+                if !self.cell_null
+                    && matches!(self.schema.family(), ClientPresentationFamily::MysqlText)
+                {
                     let prefix = lenenc(self.cell_length);
                     let extra = prefix.len - 1;
                     if self
@@ -1985,6 +2161,8 @@ impl ArrowMysqlTextEncoder {
                 self.lengths[self.column] = self.cell_length as u32;
                 self.add_length(if self.cell_null {
                     1
+                } else if matches!(self.schema.family(), ClientPresentationFamily::TrinoJson(_)) {
+                    1 + self.cell_length
                 } else {
                     lenenc(self.cell_length).len + self.cell_length
                 })?;
@@ -2226,7 +2404,7 @@ impl ArrowMysqlTextEncoder {
         })
     }
 }
-impl BoundedMysqlTextEncoder for ArrowMysqlTextEncoder {
+impl BoundedClientRowEncoder for ArrowClientRowEncoder {
     fn step(&mut self, output: &mut [u8]) -> Result<RenderTurn, RenderError> {
         let length = output.len().min(V::SEGMENT_BYTES);
         let result = self.run(&mut output[..length]);
@@ -2246,11 +2424,81 @@ impl BoundedMysqlTextEncoder for ArrowMysqlTextEncoder {
     }
     fn scratch_capacity_bytes(&self) -> usize {
         size_of::<Self>()
-            + size_of::<[u8; 65536]>()
-            + size_of::<[u32; 4096]>()
+            + size_of::<[u8; V::SMALL_ROW_BYTES]>()
+            + size_of::<[u32; V::MAX_COLUMNS]>()
             + self.cursor.stack.capacity() * size_of::<Task>()
     }
 }
+
+/// All encoder allocations are fixed before the first turn. The stack refuses
+/// an additional task before its original allocation could grow.
+pub(super) const fn scratch_capacity_bound_bytes() -> usize {
+    size_of::<ArrowClientRowEncoder>()
+        + size_of::<[u8; V::SMALL_ROW_BYTES]>()
+        + size_of::<[u32; V::MAX_COLUMNS]>()
+        + CELL_TASK_CAPACITY * size_of::<Task>()
+}
+
+/// Existing MySQL text presentation over the shared bounded row machine.
+pub struct ArrowMysqlTextEncoder(ArrowClientRowEncoder);
+impl ArrowMysqlTextEncoder {
+    pub fn try_new(
+        schema: Arc<ClientRenderSchema>,
+        batch: RecordBatch,
+    ) -> Result<Self, RenderError> {
+        if !matches!(
+            schema.family(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText
+        ) {
+            return Err(error(E::UnsupportedPresentation));
+        }
+        ArrowClientRowEncoder::try_new(schema, batch).map(Self)
+    }
+    pub fn try_new_root(
+        contract: Arc<RootOutputContract>,
+        batch: RecordBatch,
+    ) -> Result<Self, RenderError> {
+        let FrozenRootOutput::ClientRows(schema) = contract.output() else {
+            return Err(error(E::SchemaMismatch));
+        };
+        if !matches!(
+            schema.family(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText
+        ) {
+            return Err(error(E::UnsupportedPresentation));
+        }
+        ArrowClientRowEncoder::try_new_root(contract, batch).map(Self)
+    }
+    pub fn try_new_typed_root(
+        input: ValidatedClientInput,
+        batch: RecordBatch,
+    ) -> Result<Self, RenderError> {
+        let FrozenRootOutput::ClientRows(schema) = input.contract().output() else {
+            return Err(error(E::SchemaMismatch));
+        };
+        if !matches!(
+            schema.family(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText
+        ) {
+            return Err(error(E::UnsupportedPresentation));
+        }
+        ArrowClientRowEncoder::try_new_typed_root(input, batch).map(Self)
+    }
+}
+impl BoundedClientRowEncoder for ArrowMysqlTextEncoder {
+    fn step(&mut self, out: &mut [u8]) -> Result<RenderTurn, RenderError> {
+        self.0.step(out)
+    }
+    fn cancel(&mut self) {
+        self.0.cancel();
+    }
+    fn scratch_capacity_bytes(&self) -> usize {
+        self.0.scratch_capacity_bytes()
+    }
+}
+#[path = "trino_json.rs"]
+mod trino_json;
+pub use trino_json::ArrowTrinoJsonEncoder;
 
 #[cfg(test)]
 #[path = "encoder_tests.rs"]

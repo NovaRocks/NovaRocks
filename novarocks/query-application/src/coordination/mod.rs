@@ -17,55 +17,40 @@
 
 mod actor;
 mod actor_state;
-mod completion;
-mod conclusion;
-mod context;
 mod delivery;
-mod dispatch;
-mod domain_tracker;
 mod establish;
-mod lease;
 mod native_active_custody;
-mod operation;
+mod original_exit;
 mod plan_activation;
 mod recovery;
 mod replacement;
-mod result;
 mod result_pump;
 mod root_relay;
 mod runtime_registry;
 mod schedule;
 mod stand_down;
-mod statement_native_residual;
-mod status;
 mod supervisor;
-mod task_update_retry;
 
+pub(crate) use actor::InternalReadyActorPort;
 pub use actor::*;
 pub use actor_state::*;
-pub use completion::*;
-pub use conclusion::*;
-pub use context::*;
 pub use delivery::*;
-pub use dispatch::*;
-pub use domain_tracker::*;
 pub use establish::*;
-pub use lease::*;
 pub(crate) use native_active_custody::*;
-pub use operation::*;
+pub use original_exit::{
+    LocalExecutionDisposition, LogicalActorExitPhase, LogicalExecutionExitGeometry,
+    LogicalExecutionExitObserver, LogicalExecutionExitReceipt, LogicalExecutionExitView,
+    RemoteExecutionDisposition,
+};
 pub(crate) use plan_activation::ActiveLogicalPlan;
 pub use recovery::*;
 pub use replacement::*;
-pub use result::*;
 pub use result_pump::*;
 pub use root_relay::*;
 pub use runtime_registry::*;
 pub use schedule::*;
 pub use stand_down::*;
-pub use statement_native_residual::*;
-pub use status::*;
 pub use supervisor::*;
-pub use task_update_retry::*;
 
 /// Enforces a process owner's explicit-shutdown invariant from its `Drop`.
 ///

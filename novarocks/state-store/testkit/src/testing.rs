@@ -80,9 +80,8 @@ struct InMemoryEvidence {
     inner: Arc<Mutex<Inner>>,
 }
 
-#[async_trait]
-impl InDoubtAdjudicator for InMemoryEvidence {
-    async fn adjudicate(&self, attempt: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
+impl InMemoryEvidence {
+    fn adjudicate_pure(&self, attempt: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
         // A read that cannot be performed is not proof that nothing happened.
         let Ok(inner) = self.inner.lock() else {
             return Ok(AttemptOutcome::Unresolved);
@@ -95,7 +94,7 @@ impl InDoubtAdjudicator for InMemoryEvidence {
             .unwrap_or(AttemptOutcome::Unresolved))
     }
 
-    async fn release_evidence(&self, attempt: AttemptId) -> Result<(), StateStoreError> {
+    fn release_pure(&self, attempt: AttemptId) -> Result<(), StateStoreError> {
         let mut inner = self.inner.lock().map_err(|_| {
             StateStoreError::new(
                 StateStoreErrorKind::Internal,
@@ -104,6 +103,34 @@ impl InDoubtAdjudicator for InMemoryEvidence {
         })?;
         inner.commits.remove(&attempt);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl InDoubtAdjudicator for InMemoryEvidence {
+    async fn adjudicate(&self, attempt: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
+        self.adjudicate_pure(attempt)
+    }
+    async fn release_evidence(&self, attempt: AttemptId) -> Result<(), StateStoreError> {
+        self.release_pure(attempt)
+    }
+    async fn adjudicate_in(
+        &self,
+        attempt: AttemptId,
+        _execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Result<AttemptOutcome, novarocks_state_store_api::StateStoreExecutionFailure> {
+        // This explicit testkit implementation has no physical source. Both
+        // API shapes consume the same pure algorithm, never a legacy future.
+        self.adjudicate_pure(attempt)
+            .map_err(StateStoreError::into_original_failure)
+    }
+    async fn release_evidence_in(
+        &self,
+        attempt: AttemptId,
+        _execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        self.release_pure(attempt)
+            .map_err(StateStoreError::into_original_failure)
     }
 }
 
@@ -217,14 +244,178 @@ impl InMemoryStateStoreProviderFactory {
     }
 }
 
+/// Closed vocabulary for this explicitly pure test implementation. None of
+/// these marker types can publish physical work or authorize a transaction.
+pub fn pure_memory_original_vocabulary(
+    provider: novarocks_state_store_api::StateStoreProviderId,
+) -> novarocks_state_store_api::StateStoreBlockingSourceVocabulary {
+    novarocks_state_store_api::StateStoreBlockingSourceVocabulary::for_provider::<
+        PureMemorySource,
+        PureMemorySource,
+        PureMemorySource,
+    >(provider)
+}
+struct PureMemorySource;
+impl novarocks_state_store_api::StateStoreBlockingOriginal for PureMemorySource {
+    fn origin(&self) -> novarocks_state_store_api::StateStoreBlockingOrigin {
+        unreachable!("pure memory has no physical source")
+    }
+    fn requested(&self) -> Option<novarocks_state_store_api::StateStoreBlockingRequest> {
+        None
+    }
+    fn publication_refusal(
+        &self,
+        _: novarocks_state_store_api::StateStoreBlockingRequest,
+    ) -> Option<novarocks_state_store_api::StateStoreExecutionFailure> {
+        unreachable!("no physical phase")
+    }
+    fn before_publish(
+        &self,
+        _: novarocks_state_store_api::StateStoreBlockingRequest,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        unreachable!("no physical phase")
+    }
+    fn run_original_phase(&self, _: novarocks_state_store_api::StateStoreBlockingRequest) {
+        unreachable!("no physical phase")
+    }
+    fn receive_result(
+        &self,
+        _: novarocks_state_store_api::StateStoreBlockingRequest,
+        _: Result<(), novarocks_state_store_api::StateStoreExecutionFailure>,
+    ) {
+        unreachable!("no physical phase")
+    }
+    fn receive_exit(
+        &self,
+        _: novarocks_state_store_api::StateStoreBlockingRequest,
+        _: Result<
+            novarocks_state_store_api::StateStoreBlockingExit,
+            novarocks_state_store_api::StateStoreExecutionFailure,
+        >,
+    ) {
+        unreachable!("no physical phase")
+    }
+    fn is_complete(&self) -> bool {
+        true
+    }
+    fn local_failure(&self) -> Option<novarocks_state_store_api::StateStoreExecutionFailure> {
+        None
+    }
+    fn request_close(&self) {}
+    fn request_interrupt(&self) {}
+}
+struct PureMemoryOpen {
+    instance: Option<Box<dyn StateStoreProviderInstance>>,
+}
+impl novarocks_state_store_api::StateStoreOriginalOpen for PureMemoryOpen {
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), novarocks_state_store_api::StateStoreExecutionFailure>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn take_instance_in(
+        &mut self,
+        target: &mut Option<Box<dyn StateStoreProviderInstance>>,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        if target.is_some() || self.instance.is_none() {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidRequest,
+                "pure memory instance receiver is occupied or consumed",
+            )
+            .into_original_failure());
+        }
+        *target = self.instance.take();
+        Ok(())
+    }
+}
+pub fn prepare_pure_memory_open_in(
+    instance: Box<dyn StateStoreProviderInstance>,
+    target: &mut Option<Box<dyn novarocks_state_store_api::StateStoreOriginalOpen>>,
+) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+    if target.is_some() {
+        return Err(StateStoreError::new(
+            StateStoreErrorKind::InvalidRequest,
+            "pure memory opening receiver is occupied",
+        )
+        .into_original_failure());
+    }
+    *target = Some(Box::new(PureMemoryOpen {
+        instance: Some(instance),
+    }));
+    Ok(())
+}
+struct PureMemoryClose;
+impl novarocks_state_store_api::StateStoreOriginalClose for PureMemoryClose {
+    fn poll_closed(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), novarocks_state_store_api::StateStoreExecutionFailure>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+/// There is no physical destructor or external lock in this pure fixture.
+pub fn prepare_pure_memory_close_in(
+    target: &mut Option<Box<dyn novarocks_state_store_api::StateStoreOriginalClose>>,
+) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+    if target.is_some() {
+        return Err(StateStoreError::new(
+            StateStoreErrorKind::InvalidRequest,
+            "pure memory close receiver is occupied",
+        )
+        .into_original_failure());
+    }
+    *target = Some(Box::new(PureMemoryClose));
+    Ok(())
+}
+
 #[async_trait]
 impl StateStoreProviderFactory for InMemoryStateStoreProviderFactory {
     fn descriptor(&self) -> &StateStoreProviderDescriptor {
         &self.descriptor
     }
 
+    fn blocking_dependency_facts(
+        &self,
+    ) -> Option<Vec<novarocks_state_store_api::SharedDependency>> {
+        // This fixture performs no external physical work.
+        Some(Vec::new())
+    }
+    fn blocking_source_vocabulary(
+        &self,
+    ) -> Option<novarocks_state_store_api::StateStoreBlockingSourceVocabulary> {
+        Some(pure_memory_original_vocabulary(self.descriptor.id))
+    }
+    fn prepare_open_in(
+        self: Box<Self>,
+        request: StateStoreOpenRequest,
+        _: &novarocks_state_store_api::StateStoreExecutionContext,
+        target: &mut Option<Box<dyn novarocks_state_store_api::StateStoreOriginalOpen>>,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        if target.is_some() {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidRequest,
+                "pure memory opening receiver is occupied",
+            )
+            .into_original_failure());
+        }
+        prepare_pure_memory_open_in(
+            self.open_instance(request)
+                .map_err(StateStoreError::into_original_failure)?,
+            target,
+        )
+    }
     async fn open(
         self: Box<Self>,
+        request: StateStoreOpenRequest,
+    ) -> Result<Box<dyn StateStoreProviderInstance>, StateStoreError> {
+        self.open_instance(request)
+    }
+}
+
+impl InMemoryStateStoreProviderFactory {
+    fn open_instance(
+        &self,
         request: StateStoreOpenRequest,
     ) -> Result<Box<dyn StateStoreProviderInstance>, StateStoreError> {
         if std::time::Instant::now() >= request.deadline {
@@ -235,6 +426,7 @@ impl StateStoreProviderFactory for InMemoryStateStoreProviderFactory {
         }
         Ok(Box::new(InMemoryStateStoreProviderInstance {
             descriptor: self.descriptor,
+            scope: novarocks_state_store_api::InstanceScope::new(),
             state_store: Some(Arc::new(InMemoryStateStore::with_limits(
                 request.cluster_id,
                 request.limits,
@@ -244,6 +436,7 @@ impl StateStoreProviderFactory for InMemoryStateStoreProviderFactory {
 }
 
 struct InMemoryStateStoreProviderInstance {
+    scope: novarocks_state_store_api::InstanceScope,
     descriptor: StateStoreProviderDescriptor,
     state_store: Option<Arc<dyn StateStore>>,
 }
@@ -254,6 +447,29 @@ impl StateStoreProviderInstance for InMemoryStateStoreProviderInstance {
         &self.descriptor
     }
 
+    fn blocking_dependency_facts(
+        &self,
+    ) -> Option<Vec<novarocks_state_store_api::SharedDependency>> {
+        // This fixture performs no external physical work.
+        Some(Vec::new())
+    }
+    fn blocking_source_vocabulary(
+        &self,
+    ) -> Option<novarocks_state_store_api::StateStoreBlockingSourceVocabulary> {
+        Some(pure_memory_original_vocabulary(self.descriptor.id))
+    }
+    fn blocking_instance_scope(&self) -> Option<novarocks_state_store_api::InstanceScope> {
+        Some(self.scope)
+    }
+    fn prepare_close_in(
+        &mut self,
+        _: &novarocks_state_store_api::StateStoreExecutionContext,
+        target: &mut Option<Box<dyn novarocks_state_store_api::StateStoreOriginalClose>>,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        prepare_pure_memory_close_in(target)?;
+        self.state_store.take();
+        Ok(())
+    }
     fn lifecycle(&self) -> StateStoreProviderLifecycle {
         if self.state_store.is_some() {
             StateStoreProviderLifecycle::Ready

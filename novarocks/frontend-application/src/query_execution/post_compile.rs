@@ -15,36 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Move-only handoff of a completed plan and its Native attempt template.
+//! Identity shared by the artifacts produced by one Native plan encoding.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// The description and Native template created by one final-plan encode.
-pub(crate) struct FinalizedDistributedExecution {
-    description: novarocks_query_application::preparation::FrozenExecutionDescription,
-    attempt_template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
-}
-
-impl FinalizedDistributedExecution {
-    pub(crate) const fn for_completed_plan(
-        description: novarocks_query_application::preparation::FrozenExecutionDescription,
-        attempt_template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
-    ) -> Self {
-        Self {
-            description,
-            attempt_template,
-        }
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        novarocks_query_application::preparation::FrozenExecutionDescription,
-        crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
-    ) {
-        (self.description, self.attempt_template)
-    }
-}
 
 /// One encoding identity; fragments from another encode cannot join this template.
 pub(crate) fn mint_native_encoding_provenance() -> u64 {

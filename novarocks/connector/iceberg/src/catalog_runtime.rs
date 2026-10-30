@@ -31,6 +31,7 @@ use crate::catalog_config::{IcebergCatalogConfiguration, IcebergCatalogKind};
 /// client; REST retains only the provider-owned endpoints and their session.
 /// Production has no generic REST SDK facade or second configuration owner.
 pub struct IcebergCatalogClient {
+    hms: Option<Arc<crate::iceberg_catalog_hms::HmsCatalog>>,
     generic: Option<Arc<dyn crate::iceberg::Catalog>>,
     hadoop: Option<Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>>,
     rest_endpoints: Option<Arc<crate::rest_protocol::endpoints::RestEndpoints>>,
@@ -46,6 +47,10 @@ pub(crate) enum RestAccessDelegationMode {
 }
 
 impl IcebergCatalogClient {
+    pub(crate) fn hms(&self) -> Option<&Arc<crate::iceberg_catalog_hms::HmsCatalog>> {
+        self.hms.as_ref()
+    }
+
     pub fn generic(&self) -> Option<&Arc<dyn crate::iceberg::Catalog>> {
         self.generic.as_ref()
     }
@@ -310,6 +315,7 @@ pub(crate) async fn build_catalog_client_with_rest_access_delegation(
             let hadoop = Arc::new(build_hadoop_catalog(configuration, binding, runtime)?);
             let generic: Arc<dyn crate::iceberg::Catalog> = hadoop.clone();
             Ok(IcebergCatalogClient {
+                hms: None,
                 generic: Some(generic),
                 hadoop: Some(hadoop),
                 rest_endpoints: None,
@@ -326,20 +332,23 @@ pub(crate) async fn build_catalog_client_with_rest_access_delegation(
             )
             .await?;
             Ok(IcebergCatalogClient {
+                hms: None,
                 generic: None,
                 hadoop: None,
                 rest_endpoints: Some(endpoints),
                 rest_access_delegation,
             })
         }
-        IcebergCatalogKind::Hive => Ok(IcebergCatalogClient {
-            generic: Some(Arc::new(
-                build_hms_catalog(configuration, binding, runtime).await?,
-            )),
-            hadoop: None,
-            rest_endpoints: None,
-            rest_access_delegation: RestAccessDelegationMode::Static,
-        }),
+        IcebergCatalogKind::Hive => {
+            let hms = Arc::new(build_hms_catalog(configuration, binding, runtime).await?);
+            Ok(IcebergCatalogClient {
+                generic: Some(hms.clone() as Arc<dyn crate::iceberg::Catalog>),
+                hms: Some(hms),
+                hadoop: None,
+                rest_endpoints: None,
+                rest_access_delegation: RestAccessDelegationMode::Static,
+            })
+        }
     }
 }
 

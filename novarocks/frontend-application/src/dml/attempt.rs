@@ -84,6 +84,8 @@ pub(crate) const fn publication_next_action_name(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DmlPublicationAdjudicationOutcome {
     KnownCommitted,
+    /// The original journal has an authoritative non-publication verdict.
+    KnownUncommitted,
     CommitUnknown,
 }
 
@@ -213,26 +215,6 @@ impl DmlPublicationAttempt {
         }
     }
 
-    /// Maps an outer failure by the frozen dispatch boundary without inspecting
-    /// an error string. A caller uses it when no typed provider outcome exists.
-    pub(crate) fn terminal_after_outer_failure(
-        &mut self,
-    ) -> Result<&LakePublicationTerminal, DmlPublicationAttemptError> {
-        match self.phase {
-            DmlPublicationPhase::PreDispatch => self.assign_terminal(
-                LakePublicationDisposition::KnownUncommitted,
-                DmlPublicationFinalization::NotApplicable,
-            ),
-            DmlPublicationPhase::DispatchPossible => self.assign_terminal(
-                LakePublicationDisposition::CommitUnknown,
-                DmlPublicationFinalization::NotApplicable,
-            ),
-            DmlPublicationPhase::Terminal => {
-                Err(DmlPublicationAttemptError::TerminalAlreadyAssigned)
-            }
-        }
-    }
-
     pub(crate) fn terminal_pre_dispatch_uncommitted(
         &mut self,
     ) -> Result<&LakePublicationTerminal, DmlPublicationAttemptError> {
@@ -314,6 +296,10 @@ impl DmlPublicationAttempt {
                 validate_committed_finalization(finalization)?;
                 self.assign_terminal(LakePublicationDisposition::KnownCommitted, finalization)
             }
+            DmlPublicationAdjudicationOutcome::KnownUncommitted => self.assign_terminal(
+                LakePublicationDisposition::KnownUncommitted,
+                DmlPublicationFinalization::NotApplicable,
+            ),
             DmlPublicationAdjudicationOutcome::CommitUnknown => self.assign_terminal(
                 LakePublicationDisposition::CommitUnknown,
                 DmlPublicationFinalization::NotApplicable,
@@ -424,7 +410,7 @@ mod tests {
             Err(DmlPublicationAttemptError::InvalidPreDispatchTerminal)
         ));
         let terminal = attempt
-            .terminal_after_outer_failure()
+            .terminal_commit_unknown()
             .expect("possible-dispatch terminal");
 
         assert_eq!(
@@ -522,6 +508,28 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_uncommitted_adjudication_preserves_the_original_verdict() {
+        let mut original = attempt();
+        original.mark_dispatch_possible().unwrap();
+        let token = original.begin_adjudication().unwrap();
+        let terminal = original
+            .finish_adjudication(
+                token,
+                DmlPublicationAdjudicationOutcome::KnownUncommitted,
+                DmlPublicationFinalization::NotApplicable,
+            )
+            .unwrap();
+        assert_eq!(
+            terminal.disposition(),
+            LakePublicationDisposition::KnownUncommitted
+        );
+        assert!(
+            original.begin_adjudication().is_err(),
+            "one original adjudication only"
+        );
+    }
+
+    #[test]
     fn known_committed_requires_a_finalization_result() {
         let mut attempt = attempt();
         attempt
@@ -537,10 +545,10 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_or_deadline_before_and_after_dispatch_use_the_same_phase_mapping() {
+    fn explicit_terminals_preserve_before_and_after_dispatch_uncertainty() {
         let mut before_dispatch = attempt();
         let before = before_dispatch
-            .terminal_after_outer_failure()
+            .terminal_pre_dispatch_uncommitted()
             .expect("before dispatch");
 
         let mut after_dispatch = attempt();
@@ -548,7 +556,7 @@ mod tests {
             .mark_dispatch_possible()
             .expect("mark dispatch possible");
         let after = after_dispatch
-            .terminal_after_outer_failure()
+            .terminal_commit_unknown()
             .expect("after dispatch");
 
         assert_eq!(

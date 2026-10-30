@@ -405,7 +405,21 @@ pub(super) fn control_key(id: &StorageAuthorityId) -> String {
     // The full identity participates, including catalog version and endpoint.
     // Only its digest is written to runner-owned files; an advertised endpoint
     // may contain query parameters and must not be copied into evidence.
-    let digest = Sha256::digest(format!("{id:?}").as_bytes());
+    struct IdentityDigest(Sha256);
+    impl std::hash::Hasher for IdentityDigest {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.update(bytes);
+        }
+        fn finish(&self) -> u64 {
+            let digest = self.0.clone().finalize();
+            u64::from_le_bytes(digest[..8].try_into().expect("SHA-256 prefix"))
+        }
+    }
+    // Debug deliberately redacts routing values and opaque owner identities.
+    // Hash consumes their typed equality facts without exposing those values.
+    let mut hasher = IdentityDigest(Sha256::new());
+    std::hash::Hash::hash(id, &mut hasher);
+    let digest = hasher.0.finalize();
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
         write!(&mut encoded, "{byte:02x}").expect("write to String");
@@ -419,10 +433,11 @@ fn identity_record(id: &StorageAuthorityId, key: &str) -> String {
         write!(&mut version, "{byte:02x}").expect("write to String");
     }
     let path = match id.capability() {
+        AuthorityCapabilityPath::NodeLocalProvider { .. } => "node-local-provider",
         AuthorityCapabilityPath::CredentialsEndpoint { .. } => "credentials-endpoint",
         AuthorityCapabilityPath::LoadTableDelegation { .. } => "load-table-delegation",
-        AuthorityCapabilityPath::InProcessProvider => "in-process-provider",
-        AuthorityCapabilityPath::SeededWithoutRenewal => "seeded-without-renewal",
+        AuthorityCapabilityPath::InProcessProvider(_) => "in-process-provider",
+        AuthorityCapabilityPath::SeededWithoutRenewal { .. } => "seeded-without-renewal",
     };
     let principal = id.principal().map_or_else(
         || "none".to_string(),

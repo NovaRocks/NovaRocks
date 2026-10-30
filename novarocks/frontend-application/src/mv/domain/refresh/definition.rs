@@ -19,34 +19,6 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::mv::domain::readiness::MvReadinessPort;
-use crate::mv::domain::refresh::target::IcebergMvTarget;
-use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
-use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
-
-/// Loads the persisted definition for one normalized Iceberg MV target.
-pub fn load_iceberg_mv_definition_by_target(
-    readiness: &MvReadinessPort,
-    target: &IcebergMvTarget,
-) -> Result<StoredKeyedMvProjection, String> {
-    #[cfg(test)]
-    record_definition_load();
-    readiness
-        .load_ready(&MvTarget {
-            catalog: Some(target.catalog.clone()),
-            database: target.namespace.clone(),
-            name: target.table.clone(),
-        })
-        .map_err(|e| format!("load iceberg mv definition failed: {e}"))?
-        .map(|loaded| loaded.projection)
-        .ok_or_else(|| {
-            format!(
-                "iceberg materialized view {}.{}.{} has no MV definition",
-                target.catalog, target.namespace, target.table
-            )
-        })
-}
-
 /// Computes the stable persisted-SQL fingerprint used by refresh artifacts.
 pub fn mv_definition_fingerprint(select_sql: &str) -> String {
     hex::encode(Sha256::digest(select_sql.as_bytes()))
@@ -60,53 +32,6 @@ pub fn parse_mv_select_query(sql: &str) -> Result<novarocks_parser::ast::Query, 
         return Err("stored MV SQL must be a SELECT query".to_string());
     };
     Ok(query.clone())
-}
-
-#[cfg(test)]
-thread_local! {
-    static DEFINITION_LOAD_COUNTER: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) struct DefinitionLoadCounterGuard;
-
-#[cfg(test)]
-impl DefinitionLoadCounterGuard {
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn install(counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        DEFINITION_LOAD_COUNTER.with(|slot| {
-            assert!(
-                slot.borrow().is_none(),
-                "definition load counter already installed"
-            );
-            *slot.borrow_mut() = Some(counter);
-        });
-        Self
-    }
-}
-
-#[cfg(test)]
-impl Drop for DefinitionLoadCounterGuard {
-    fn drop(&mut self) {
-        DEFINITION_LOAD_COUNTER.with(|slot| *slot.borrow_mut() = None);
-    }
-}
-
-#[cfg(test)]
-fn record_definition_load() {
-    DEFINITION_LOAD_COUNTER.with(|slot| {
-        if let Some(counter) = slot.borrow().as_ref() {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    });
 }
 
 #[cfg(test)]

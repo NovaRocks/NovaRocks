@@ -839,25 +839,50 @@ pub(crate) struct DialAdmission {
     lane: Option<NativeLane>,
 }
 
+/// Temporary custody during the fallible Connecting-to-Live transition. The
+/// actual IO and original admission are installed before callbacks can unwind.
+struct DialIoCustody {
+    io: Option<novarocks_transport_io::BoxedIo>,
+    admission: Option<DialAdmission>,
+}
+
+impl Drop for DialIoCustody {
+    fn drop(&mut self) {
+        let admission = self.admission.take();
+        drop(self.io.take());
+        drop(admission);
+    }
+}
+
 impl DialAdmission {
-    /// The attempt produced a live IO: publish its key as Live and return the
-    /// handshake position. A full live quota refuses the connection.
-    pub(crate) fn established(self) -> io::Result<NativeConnectionPermit> {
-        let Self {
-            mut connection,
-            handshake,
-            lane,
-        } = self;
-        if let Some(key) = &connection.key {
+    /// Publish a connected IO as Live without allowing a refusal or observer
+    /// unwind to return its physical position before the IO is destroyed.
+    pub(crate) fn established_io(
+        self,
+        io: novarocks_transport_io::BoxedIo,
+    ) -> io::Result<novarocks_transport_io::OwnedIo> {
+        let mut custody = DialIoCustody {
+            io: Some(io),
+            admission: Some(self),
+        };
+        let admission = custody.admission.as_mut().expect("original dial installed");
+        if let Some(key) = &admission.connection.key {
             key.admission.core.connection_keys.install(key.token)?;
         }
-        handshake.release();
-        if let (Some(lane), Some(observer)) = (lane, &connection._physical.admission.core.observer)
-        {
+        admission.handshake.release();
+        if let (Some(lane), Some(observer)) = (
+            admission.lane,
+            &admission.connection._physical.admission.core.observer,
+        ) {
             observer.lane_connections(lane, 1);
         }
-        connection.lane = lane;
-        Ok(connection)
+        admission.connection.lane = admission.lane;
+        // Every fallible or foreign step has completed. Transfer the same IO
+        // and physical permit directly into the established transport holder.
+        let io = custody.io.take().expect("original connected IO installed");
+        let DialAdmission { connection, .. } =
+            custody.admission.take().expect("original dial installed");
+        Ok(novarocks_transport_io::OwnedIo::with_guard(io, connection))
     }
 }
 
@@ -996,6 +1021,10 @@ impl NativeIncomingConnectionBinding {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "native_dial_io_exit_tests.rs"]
+mod dial_io_exit_tests;
 
 #[cfg(test)]
 mod tests {

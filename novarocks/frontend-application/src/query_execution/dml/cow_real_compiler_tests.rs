@@ -86,60 +86,20 @@ fn compile_signed_cow(
         &binding,
         context.clone(),
     );
-    let existing = selection
-        .byte_count()
-        .checked_add(selection.retained_container_bytes().unwrap() as u64)
-        .unwrap();
-    let (original, existing) =
-        crate::query_execution::original_cow_result_scope::from_original_binding(
-            &binding, &context, existing,
-        )
-        .unwrap();
+    let original = crate::query_execution::original_cow_result_scope::from_original_binding(
+        &binding, &context,
+    )
+    .unwrap();
     let check = || {
         original
             .check_active()
             .map_err(crate::query_execution::dml::cow_closed_ast::BuildError::Original)
     };
-    let mut recipe = crate::query_execution::dml::cow_compile_receipt::recipe::Recipe::start(Some(
-        crate::query_execution::dml::cow_compile_receipt::recipe::ExistingBackingEvidence {
-            session_simultaneous_upper: existing,
-            sorted_borrowed_target_vector_upper: 0, // this leaf has no target sorting vector
-            recipe_and_small_scalars_upper: std::mem::size_of::<
-                crate::query_execution::dml::cow_compile_receipt::recipe::Recipe,
-            >() as u64,
-        },
-    ))
-    .unwrap();
-    crate::query_execution::dml::cow_closed_route::preflight_materialized_target(
-        &selection,
-        &fixture.rows,
-        &input,
-        &route,
-        fixture.preparation.match_contract(),
-        rewrite.then_some((&fixture.rewrite_source, &fixture.identity)),
-        0,
-        0,
-        &mut recipe,
-        &check,
-    )
-    .unwrap();
     let compact_columns = crate::query_execution::dml::cow_closed_route::materialized_columns(
         &input,
         &route,
         fixture.preparation.match_contract(),
         rewrite.then_some(&fixture.rewrite_source),
-        &mut |layout| {
-            recipe
-                .add_materialized_owned(layout.size() as u64)
-                .map_err(crate::query_execution::dml::cow_closed_route::map_footprint)?;
-            original
-                .check_before_growth(
-                    recipe
-                        .peak()
-                        .map_err(crate::query_execution::dml::cow_closed_route::map_footprint)?,
-                )
-                .map_err(crate::query_execution::dml::cow_closed_ast::BuildError::Original)
-        },
         &check,
     )
     .unwrap();
@@ -156,13 +116,11 @@ fn compile_signed_cow(
                 .effect_field()
                 .target_ordinal(),
         ),
-        &mut recipe,
         &original,
         crate::application::test_constant_policy(),
         &control,
     )
     .unwrap();
-    let _receipt = recipe.finish_all(1).unwrap();
     let query = if rewrite {
         crate::query_execution::dml::cow_closed_route::build_cow_rewrite_query_materialized(
             &selection,

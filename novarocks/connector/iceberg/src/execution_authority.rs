@@ -260,6 +260,50 @@ impl ConnectorVendedS3CredentialLeaseRefresher for ExecutionNodeCredentialsEndpo
                 }
             },
         )?;
+        self.project_refresh(observed_uuid, delegation)
+    }
+
+    fn refresh_vended_s3_credentials_async<'a>(
+        &'a self,
+        policy: VendedS3CredentialRefreshCallPolicy,
+        request: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> futures::future::BoxFuture<'a, Result<VendedS3CredentialLeaseRefresh, ConnectorError>>
+    {
+        Box::pin(async move {
+            let owner = self.owner()?;
+            let routing = self.path.routing().clone();
+            let load_table = matches!(
+                self.path,
+                ExecutionNodeAcquisitionPath::LoadTableDelegation { .. }
+            );
+            let context = crate::rest_protocol::http::RequestContext::from_connector(&request);
+            let (uuid, delegation) = crate::loaded_table::run_vended_renewal_with_policy_async(
+                policy,
+                "Iceberg execution-node credential acquisition",
+                move || {
+                    let owner = Arc::clone(&owner);
+                    let routing = routing.clone();
+                    let context = context.clone();
+                    async move {
+                        crate::rest_protocol::endpoints::acquire_routed_in(
+                            &owner, &routing, load_table, &context,
+                        )
+                        .await
+                    }
+                },
+            )
+            .await?;
+            self.project_refresh(uuid, delegation)
+        })
+    }
+}
+
+impl ExecutionNodeCredentialsEndpointRefresher {
+    fn project_refresh(
+        &self,
+        observed_uuid: Option<String>,
+        delegation: crate::rest_protocol::deferred::RestDelegation,
+    ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
         // D11b: only the table identity is read from the response, and only to
         // compare it; no metadata reaches any plan, cache or table state here.
         if let ExecutionNodeAcquisitionPath::LoadTableDelegation {

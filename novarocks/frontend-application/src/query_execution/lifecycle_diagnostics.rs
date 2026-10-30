@@ -21,20 +21,12 @@ use std::sync::Mutex;
 use crate::query_execution::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
 use novarocks_types::QueryExecutionId;
 
-/// Typed origin of a query failure retained by a terminal diagnostic record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum QueryLifecycleConvergenceErrorSource {
-    BackendAttestation,
-    FrontendLiveness,
-}
-
 /// Immutable, query-scoped terminal convergence evidence. It is intentionally
 /// produced by the attempt that owns the execution id, never reconstructed
 /// from process metrics or logs.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct QueryLifecycleConvergenceSnapshot {
     pub(crate) execution_id: QueryExecutionId,
-    pub(crate) error_source: Option<QueryLifecycleConvergenceErrorSource>,
     pub(crate) primary_error: Option<String>,
     /// Original attempt terminal input, not a second logical failure acceptor.
     pub(crate) failure: Option<novarocks_query_application::execution_error::ExecutionFailureInput>,
@@ -179,7 +171,6 @@ mod tests {
         for execution_id in [first, second] {
             diagnostics.publish(QueryLifecycleConvergenceSnapshot {
                 execution_id,
-                error_source: None,
                 primary_error: None,
                 failure: None,
                 worker_contexts_converged: false,

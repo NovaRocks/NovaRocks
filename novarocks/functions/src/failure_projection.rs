@@ -320,7 +320,10 @@ impl FailureProjection for crate::FunctionSpecializationFailure {
             Self::Effects(cause) => cause.failure_fact(),
             Self::Control(cause) => cause.failure_fact(),
             Self::Kernel(cause) => cause.failure_fact(),
-            Self::MissingPureImplementation(_) => fact(FailureClass::Unsupported, 600),
+            Self::MissingPureImplementation(_) => FailureFact::new(
+                FailureClass::Unsupported,
+                novarocks_function_contract::kernel_failure::MISSING_PURE_IMPLEMENTATION,
+            ),
             Self::InvalidInput(_) => fact(FailureClass::Invariant, 601),
         }
     }
@@ -431,7 +434,10 @@ impl FailureProjection for crate::ComparisonPrepareError {
         match self {
             Self::Control(source) => source.failure_fact(),
             Self::Kernel(source) => source.failure_fact(),
-            Self::Unsupported => fact(FailureClass::Unsupported, 602),
+            Self::Unsupported => FailureFact::new(
+                FailureClass::Unsupported,
+                novarocks_function_contract::kernel_failure::UNSUPPORTED_COMPARISON,
+            ),
             Self::TypeMismatch => fact(FailureClass::Invariant, 603),
         }
     }
@@ -442,7 +448,10 @@ impl FailureProjection for crate::ArithmeticPrepareError {
         match self {
             Self::Control(source) => source.failure_fact(),
             Self::Kernel(source) => source.failure_fact(),
-            Self::Unsupported => fact(FailureClass::Unsupported, 604),
+            Self::Unsupported => FailureFact::new(
+                FailureClass::Unsupported,
+                novarocks_function_contract::kernel_failure::UNSUPPORTED_ARITHMETIC,
+            ),
             Self::TypeMismatch => fact(FailureClass::Invariant, 605),
         }
     }
@@ -453,7 +462,10 @@ impl FailureProjection for crate::CastPrepareError {
         match self {
             Self::Control(source) => source.failure_fact(),
             Self::Kernel(source) => source.failure_fact(),
-            Self::Unsupported => fact(FailureClass::Unsupported, 606),
+            Self::Unsupported => FailureFact::new(
+                FailureClass::Unsupported,
+                novarocks_function_contract::kernel_failure::UNSUPPORTED_CAST,
+            ),
             Self::TypeMismatch => fact(FailureClass::Invariant, 607),
         }
     }

@@ -456,7 +456,7 @@ mod tests {
                     "unknown-provider-attribute".into(),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
             ),
         ));
         assert_eq!(layout_identity(plain), layout_identity(annotated));

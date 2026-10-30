@@ -94,86 +94,7 @@ impl novarocks_failure_contract::FailureProjection for AggregateRequestExtent {
 }
 impl novarocks_failure_contract::OuterFailureProjection for AggregateRequestExtent {}
 
-#[derive(Debug)]
-struct AggregateBlockLayoutRefusal {
-    bytes: usize,
-    align: usize,
-    source: std::alloc::LayoutError,
-}
-impl std::fmt::Display for AggregateBlockLayoutRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "aggregate block layout rejected: bytes={} align={}: {}",
-            self.bytes, self.align, self.source
-        )
-    }
-}
-impl std::error::Error for AggregateBlockLayoutRefusal {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-impl novarocks_failure_contract::FailureProjection for AggregateBlockLayoutRefusal {
-    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
-        use novarocks_failure_contract::{
-            FailureClass, FailureFact, ResourceDimension, ResourceFacts,
-        };
-        if !self.align.is_power_of_two() {
-            FailureFact::new(
-                FailureClass::Invariant,
-                ExecutionReason::AggregateBlockAlignment.reason(),
-            )
-        } else {
-            FailureFact::new(
-                FailureClass::Resource,
-                ExecutionReason::AggregateBlockLayout.reason(),
-            )
-            .with_resource(ResourceFacts {
-                request_scope: None,
-                constraint_scope: None,
-                dimension: ResourceDimension::Bytes,
-                requested: u64::try_from(self.bytes).ok(),
-                required_growth: None,
-                limit: None,
-                live: None,
-                committed: None,
-            })
-        }
-    }
-}
-impl novarocks_failure_contract::OuterFailureProjection for AggregateBlockLayoutRefusal {}
-
 impl AggregateAllocator {
-    pub(crate) fn block_layout(
-        bytes: usize,
-        align: usize,
-    ) -> Result<Layout, novarocks_functions::KernelFailure> {
-        Layout::from_size_align(bytes, align).map_err(|source| {
-            novarocks_functions::KernelFailure::from_domain(AggregateBlockLayoutRefusal {
-                bytes,
-                align,
-                source,
-            })
-        })
-    }
-    pub(crate) fn allocate_zeroed_block(
-        &self,
-        bytes: usize,
-        align: usize,
-    ) -> Result<(NonNull<[u8]>, Layout), novarocks_functions::KernelFailure> {
-        let layout = Self::block_layout(bytes, align)?;
-        let pointer = self.allocate_zeroed(layout).map_err(|source| {
-            self.allocation_error(
-                "allocate aggregate-owned block",
-                novarocks_functions::allocation_failure::AllocatorRequestRefusal::new(
-                    layout, source,
-                ),
-            )
-        })?;
-        Ok((pointer, layout))
-    }
     pub(crate) fn new(tracker: Arc<MemTracker>) -> Self {
         Self { tracker }
     }
@@ -315,17 +236,6 @@ impl Drop for AggregateRetainedCharge {
 }
 
 pub(crate) type AggregateVec<T> = AllocVec<T, AggregateAllocator>;
-pub(crate) fn aggregate_bytes(
-    allocator: AggregateAllocator,
-    bytes: &[u8],
-) -> Result<AggregateVec<u8>, novarocks_functions::KernelFailure> {
-    let mut value = AggregateVec::new_in(allocator.clone());
-    value
-        .try_reserve_exact(bytes.len())
-        .map_err(|source| allocator.allocation_error("reserve aggregate byte value", source))?;
-    value.extend_from_slice(bytes);
-    Ok(value)
-}
 
 unsafe impl Allocator for AggregateAllocator {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
@@ -557,51 +467,5 @@ mod tests {
             assert_eq!(tracker.current(), 16);
         }
         assert_eq!(tracker.current(), 0);
-    }
-}
-
-#[cfg(test)]
-mod block_geometry_tests {
-    use super::*;
-    use novarocks_failure_contract::{FailureClass, FailureProjection};
-    #[test]
-    fn actual_block_layout_sources_separate_invalid_alignment_and_large_legal_request() {
-        for (bytes, align, class, reason) in [
-            (
-                16,
-                3,
-                FailureClass::Invariant,
-                crate::runtime::fragment::ExecutionReason::AggregateBlockAlignment,
-            ),
-            (
-                usize::MAX,
-                8,
-                FailureClass::Resource,
-                crate::runtime::fragment::ExecutionReason::AggregateBlockLayout,
-            ),
-        ] {
-            let error = AggregateAllocator::block_layout(bytes, align).unwrap_err();
-            let fact = error.failure_fact();
-            assert_eq!(fact.class(), class);
-            assert_eq!(fact.reason(), reason.reason());
-            let novarocks_functions::KernelFailure::Source(source) = &error else {
-                panic!("original layout cause lost")
-            };
-            let cause = std::error::Error::source(source)
-                .unwrap()
-                .downcast_ref::<AggregateBlockLayoutRefusal>()
-                .unwrap();
-            assert_eq!((cause.bytes, cause.align), (bytes, align));
-            if class == FailureClass::Resource {
-                assert_eq!(
-                    fact.resource().unwrap().requested,
-                    u64::try_from(bytes).ok()
-                );
-            }
-        }
-        assert_eq!(
-            AggregateAllocator::block_layout(16, 8).unwrap(),
-            Layout::from_size_align(16, 8).unwrap()
-        );
     }
 }

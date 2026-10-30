@@ -985,6 +985,487 @@ fn require_rest_snapshot_count(
     Ok(())
 }
 
+// Finite subcases belong to the existing Current recheck scenario. Its original
+// orders/D-drift test below remains unchanged and uses a separate source table.
+fn source_window_interleavings(
+    context: &mut ScenarioContext,
+    conn: &mut Conn,
+    catalog: &str,
+    rest: &str,
+) -> Result<()> {
+    for (label, mode, phase) in [
+        ("first", "first", "source-pinned"),
+        ("full", "full", "source-prepared"),
+        ("delta", "delta", "source-prepared"),
+    ] {
+        let source = format!("window_{label}_source");
+        let mv = format!("window_{label}_mv");
+        create_window_fixture(context, conn, &source, &mv)?;
+        let expected = if mode == "first" {
+            vec![(1, 10), (2, 20)]
+        } else {
+            refresh(context, conn, &mv)?;
+            execute(
+                context,
+                conn,
+                "advance source before the held window",
+                &format!("INSERT INTO {source} VALUES (3,30)"),
+            )?;
+            vec![(1, 10), (2, 20), (3, 30)]
+        };
+        let before = window_metadata(context, rest, &source, &format!("{label}-source-before"))?;
+        let old_to = window_snapshot(&before)?;
+        let next = if mode == "first" { 3 } else { 4 };
+        let (trigger, held) = hold_source_refresh(context, catalog, &mv, phase, mode == "full")?;
+        let phase_result = (|| {
+            wait_for_fe_marker(
+                context,
+                &held,
+                &format!("NOVAROCKS_MV_RECOVERY_PHASE phase={phase} token=source-window-{mv}"),
+                "wait for exact original source window boundary",
+            )?;
+            execute(
+                context,
+                conn,
+                "append after the original source boundary",
+                &format!("INSERT INTO {source} VALUES ({next},{})", next * 10),
+            )?;
+            Ok(())
+        })();
+        finish_source_hold(context, trigger, held, phase_result)??;
+        let after = window_metadata(context, rest, &source, &format!("{label}-source-after"))?;
+        ensure!(
+            before["table-uuid"] == after["table-uuid"] && old_to != window_snapshot(&after)?,
+            "append did not advance the same original source object"
+        );
+        assert_rows(
+            context,
+            conn,
+            &format!("SELECT k1,v2 FROM {mv} ORDER BY k1"),
+            &expected,
+            "held refresh must read exactly its original To rows",
+        )?;
+        require_window_watermark(
+            context,
+            rest,
+            &mv,
+            old_to,
+            &format!("{label}-published-old-to"),
+        )?;
+        refresh(context, conn, &mv)?;
+        let mut all = expected;
+        all.push((next, next as i64 * 10));
+        assert_rows(
+            context,
+            conn,
+            &format!("SELECT k1,v2 FROM {mv} ORDER BY k1"),
+            &all,
+            "only the next refresh includes the late append",
+        )?;
+        require_window_watermark(
+            context,
+            rest,
+            &mv,
+            window_snapshot(&after)?,
+            &format!("{label}-published-next-to"),
+        )?;
+    }
+    for label in ["uuid", "endpoint"] {
+        let source = format!("window_{label}_source");
+        let mv = format!("window_{label}_mv");
+        create_window_fixture(context, conn, &source, &mv)?;
+        refresh(context, conn, &mv)?;
+        let target_before = window_metadata(context, rest, &mv, &format!("{label}-target-before"))?;
+        execute(
+            context,
+            conn,
+            "advance source before negative prepared window",
+            &format!("INSERT INTO {source} VALUES (3,30)"),
+        )?;
+        let selected =
+            window_metadata(context, rest, &source, &format!("{label}-selected-source"))?;
+        let selected_to = window_snapshot(&selected)?;
+        let replacement_location = if label == "uuid" {
+            execute(
+                context,
+                conn,
+                "create independently owned replacement source",
+                "CREATE TABLE window_uuid_replacement (k1 INT,v2 BIGINT) TBLPROPERTIES ('format-version'='3','write.row-lineage'='true')",
+            )?;
+            execute(
+                context,
+                conn,
+                "seed replacement source",
+                "INSERT INTO window_uuid_replacement VALUES (9,90)",
+            )?;
+            Some(window_metadata_location(
+                context,
+                rest,
+                "window_uuid_replacement",
+            )?)
+        } else {
+            None
+        };
+        let (trigger, held) = hold_source_refresh(context, catalog, &mv, "source-prepared", false)?;
+        let phase_result = (|| {
+            wait_for_fe_marker(
+                context,
+                &held,
+                &format!(
+                    "NOVAROCKS_MV_RECOVERY_PHASE phase=source-prepared token=source-window-{mv}"
+                ),
+                "wait for negative exact prepared-source boundary",
+            )?;
+            if let Some(location) = &replacement_location {
+                externally_drop_rest_table(context, rest, "ns", &source)?;
+                // The original fixture's formal REST register author avoids a
+                // same-name FE CREATE/cache/protection dependency entirely.
+                register_window_source(context, rest, &source, location)?;
+                let replacement = window_metadata(context, rest, &source, "uuid-replaced-source")?;
+                ensure!(
+                    replacement["table-uuid"] != selected["table-uuid"],
+                    "external replacement did not change the actual UUID"
+                );
+            } else {
+                execute(
+                    context,
+                    conn,
+                    "move main off the selected endpoint before expiry",
+                    &format!("INSERT INTO {source} VALUES (4,40)"),
+                )?;
+                let head = window_metadata(context, rest, &source, "endpoint-new-head")?;
+                ensure!(
+                    window_snapshot(&head)? != selected_to,
+                    "expiry target is still main"
+                );
+                let expired = super::mv_uea7_documents::commit_updates(
+                    context,
+                    rest,
+                    "ns",
+                    &source,
+                    &head,
+                    vec![
+                        serde_json::json!({"action":"remove-snapshots","snapshot-ids":[selected_to]}),
+                    ],
+                    "expire-held-source-endpoint",
+                )?;
+                ensure!(
+                    expired["table-uuid"] == selected["table-uuid"]
+                        && !expired["snapshots"]
+                            .as_array()
+                            .context("expired source has no snapshots")?
+                            .iter()
+                            .any(|v| v["snapshot-id"].as_i64() == Some(selected_to)),
+                    "selected To was not actually removed from the same object"
+                );
+            }
+            Ok(())
+        })();
+        let outcome = finish_source_hold(context, trigger, held, phase_result)?;
+        require_window_failure(outcome, if label == "uuid" { 20 } else { 2 })?;
+        let target_after =
+            window_metadata(context, rest, &mv, &format!("{label}-target-after-failure"))?;
+        require_window_publication_unchanged(&target_before, &target_after)?;
+        wait_window_target_cleanup(context, rest, &mv, &target_before, label)?;
+        assert_rows(
+            context,
+            conn,
+            &format!("SELECT k1,v2 FROM {mv} ORDER BY k1"),
+            &[(1, 10), (2, 20)],
+            "failed prepared Source must preserve the complete previous publication",
+        )?;
+    }
+    Ok(())
+}
+fn create_window_fixture(
+    context: &mut ScenarioContext,
+    conn: &mut Conn,
+    source: &str,
+    mv: &str,
+) -> Result<()> {
+    execute(
+        context,
+        conn,
+        "create isolated source-window table",
+        &format!(
+            "CREATE TABLE {source} (k1 INT,v2 BIGINT) TBLPROPERTIES ('format-version'='3','write.row-lineage'='true')"
+        ),
+    )?;
+    execute(
+        context,
+        conn,
+        "seed isolated source-window table",
+        &format!("INSERT INTO {source} VALUES (1,10),(2,20)"),
+    )?;
+    execute(
+        context,
+        conn,
+        "create isolated source-window MV",
+        &format!(
+            "CREATE MATERIALIZED VIEW {mv} DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine'='iceberg') AS SELECT k1,v2 FROM {source}"
+        ),
+    )
+}
+fn hold_source_refresh(
+    context: &ScenarioContext,
+    catalog: &str,
+    mv: &str,
+    phase: &str,
+    full: bool,
+) -> Result<(FileTrigger, JoinedSqlResult)> {
+    let trigger = FileTrigger::create(
+        &context
+            .scenario_root()
+            .join("mv-recovery-faults")
+            .join(format!("mv-refresh-at-{phase}.trigger")),
+        &format!("token=source-window-{mv}\n"),
+    )?;
+    let user = context.mysql_user().to_string();
+    let port = context.mysql_port();
+    let deadline = context.deadline();
+    let catalog = catalog.to_string();
+    let sql = format!(
+        "REFRESH MATERIALIZED VIEW {mv}{} WITH SYNC MODE",
+        if full { " FULL" } else { "" }
+    );
+    let held = spawn_sql_actor(move || {
+        mysql_actor::connect_until(&user, port, deadline)?.run(|conn| {
+            conn.query_drop(format!("SET CATALOG {catalog}"))?;
+            conn.query_drop("USE ns")?;
+            conn.query_drop(sql)?;
+            Ok(())
+        })
+    });
+    Ok((trigger, held))
+}
+fn finish_source_hold(
+    context: &ScenarioContext,
+    trigger: FileTrigger,
+    held: JoinedSqlResult,
+    phase: Result<()>,
+) -> Result<Result<()>> {
+    // Release before join even when marker/mutation/receive already failed.
+    // The same original actor retains its work deadline; joining is not a
+    // fresh producer allowance and the post-join drain never waits.
+    let released = trigger.remove();
+    let (mut sql, mut received) = match context.remaining("receive original held source refresh") {
+        Ok(remaining) => match held.result.recv_timeout(remaining) {
+            Ok(outcome) => (Some(outcome), Ok(())),
+            Err(error) => (None, Err(error).context("receive original MV SQL result")),
+        },
+        Err(error) => (None, Err(error)),
+    };
+    let joined = held.join();
+    if sql.is_none() {
+        match held.result.try_recv() {
+            Ok(outcome) => sql = Some(outcome),
+            Err(error) => {
+                received = Err(match received {
+                    Ok(()) => {
+                        anyhow::anyhow!(error).context("original MV SQL result absent after join")
+                    }
+                    Err(primary) => primary.context(format!("post-join SQL result: {error}")),
+                });
+            }
+        }
+    }
+    source_hold_outcomes(sql, phase, received, joined, released)
+}
+
+/// A SQL refusal is an expected nested outcome only when every original
+/// marker/receive/join/release obligation succeeded. Keep its typed cause as
+/// primary when infrastructure also failed, without declaring an expected pass.
+fn source_hold_outcomes(
+    sql: Option<Result<()>>,
+    phase: Result<()>,
+    received: Result<()>,
+    joined: Result<()>,
+    released: Result<()>,
+) -> Result<Result<()>> {
+    let infrastructure = [
+        ("source-window phase", phase),
+        ("original SQL receive/deadline", received),
+        ("original SQL join", joined),
+        ("original source-hold release", released),
+    ];
+    if infrastructure.iter().all(|(_, value)| value.is_ok()) {
+        return sql.context("original MV SQL result missing after join");
+    }
+    // Flatten before combining cleanup: Some(Err(sql)) is not an outer success.
+    let mut primary = sql.and_then(Result::err);
+    for (label, outcome) in infrastructure {
+        if let Err(error) = outcome {
+            primary = Some(match primary {
+                Some(original) => original.context(format!("{label}: {error:#}")),
+                None => error.context(label),
+            });
+        }
+    }
+    Err(primary.expect("one failed original infrastructure obligation"))
+}
+
+fn window_metadata(
+    context: &ScenarioContext,
+    rest: &str,
+    table: &str,
+    label: &str,
+) -> Result<serde_json::Value> {
+    let value = super::mv_uea7_documents::load_metadata(context, rest, "ns", table)?;
+    let dir = context.scenario_root().join("source-window-evidence");
+    fs::create_dir_all(&dir)?;
+    fs::write(
+        dir.join(format!("{label}.json")),
+        serde_json::to_vec_pretty(&value)?,
+    )?;
+    Ok(value)
+}
+fn window_snapshot(metadata: &serde_json::Value) -> Result<i64> {
+    metadata["current-snapshot-id"]
+        .as_i64()
+        .filter(|id| *id >= 0)
+        .context("source window has no actual snapshot")
+}
+fn window_record(metadata: &serde_json::Value) -> Result<super::mv_uea7_documents::wire::Record> {
+    let current = window_snapshot(metadata)?;
+    let snapshot = metadata["snapshots"]
+        .as_array()
+        .context("window target has no snapshots")?
+        .iter()
+        .find(|v| v["snapshot-id"].as_i64() == Some(current))
+        .context("window target main is absent")?;
+    let frame = snapshot["summary"][super::mv_uea7_documents::wire::RECORD]
+        .as_str()
+        .context("window target main has no publication")?;
+    super::mv_uea7_documents::wire::record(frame)
+}
+fn require_window_watermark(
+    context: &ScenarioContext,
+    rest: &str,
+    mv: &str,
+    expected: i64,
+    label: &str,
+) -> Result<()> {
+    let metadata = window_metadata(context, rest, mv, label)?;
+    let graph = super::mv_uea7_documents::wire::Graph::from_metadata(&metadata)?;
+    let record = window_record(&metadata)?;
+    ensure!(
+        graph.record_snapshot_watermarks(&record)? == [Some(expected)],
+        "MV publication did not retain its exact original Source To watermark"
+    );
+    Ok(())
+}
+fn require_window_publication_unchanged(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Result<()> {
+    ensure!(
+        before["current-snapshot-id"] == after["current-snapshot-id"]
+            && window_record(before)? == window_record(after)?,
+        "failed source refresh changed target main or exact P"
+    );
+    let before_graph = super::mv_uea7_documents::wire::Graph::from_metadata(before)?;
+    let after_graph = super::mv_uea7_documents::wire::Graph::from_metadata(after)?;
+    ensure!(
+        before_graph.roots == after_graph.roots,
+        "failed source refresh changed original target document roots"
+    );
+    Ok(())
+}
+fn wait_window_target_cleanup(
+    context: &ScenarioContext,
+    rest: &str,
+    mv: &str,
+    before: &serde_json::Value,
+    label: &str,
+) -> Result<()> {
+    let expected = before["refs"]
+        .as_object()
+        .context("target has no original ref inventory")?;
+    let mut observation = 0usize;
+    loop {
+        context.remaining("observe actual failed-write target ref cleanup")?;
+        let after = window_metadata(context, rest, mv, &format!("{label}-cleanup-{observation}"))?;
+        require_window_publication_unchanged(before, &after)?;
+        let actual = after["refs"]
+            .as_object()
+            .context("target has no cleanup ref inventory")?;
+        if actual.keys().all(|name| expected.contains_key(name)) {
+            // Prior housekeeping refs may disappear independently. Only refs
+            // introduced by this failed refresh must settle here; main/P are
+            // checked separately and never inferred from this inventory.
+            return Ok(());
+        }
+        observation = observation
+            .checked_add(1)
+            .context("target cleanup observation ordinal overflow")?;
+        // Poll an actual catalog fact under the original deadline; this does
+        // not declare Native/Source exit, which the original teardown owns.
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn require_window_failure(outcome: Result<()>, reason: u16) -> Result<()> {
+    let Err(failure) = outcome else {
+        bail!("source identity/endpoint drift succeeded");
+    };
+    let original = failure
+        .chain()
+        .find_map(|value| value.downcast_ref::<mysql::Error>())
+        .context("source drift did not retain an original MySQL server error")?;
+    let mysql::Error::MySqlError(server) = original else {
+        bail!("source drift returned transport/client failure: {failure:#}");
+    };
+    ensure!(
+        server.code == 1105
+            && server.state == "HY000"
+            && server.message.starts_with("[query.execution.dependency]")
+            && server.message.contains(&format!("(reason 4:{reason})")),
+        "wrong original public Source failure: {server:?}; {failure:#}"
+    );
+    Ok(())
+}
+fn window_metadata_location(context: &ScenarioContext, rest: &str, table: &str) -> Result<String> {
+    let loaded: serde_json::Value = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("read original replacement metadata pointer")?)
+        .build()?
+        .get(format!(
+            "{}/v1/namespaces/ns/tables/{table}",
+            rest.trim_end_matches('/')
+        ))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    loaded["metadata-location"]
+        .as_str()
+        .map(str::to_owned)
+        .context("replacement source has no actual metadata-location")
+}
+fn register_window_source(
+    context: &ScenarioContext,
+    rest: &str,
+    table: &str,
+    metadata_location: &str,
+) -> Result<()> {
+    // Same formal register request used by catalog_publication::register_source.
+    let response = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("register exact replacement source")?)
+        .build()?
+        .post(format!(
+            "{}/v1/namespaces/ns/register",
+            rest.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({"name":table,"metadata-location":metadata_location}))
+        .send()?;
+    ensure!(
+        response.status().is_success(),
+        "external source registration failed: {}",
+        response.status()
+    );
+    Ok(())
+}
+
 fn rest_configuration_revision(
     context: &ScenarioContext,
     rest_uri: &str,
@@ -1045,19 +1526,37 @@ impl Scenario for MvCurrentDependencyRecheck {
         binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
+        let mut grants = vec![control_plan::recovery(
+            "dependency-data-prepared",
+            "system_mv_dependency_recheck",
+            "ns",
+            "orders_mv",
+            "data-prepared",
+            "before-current-dependency-recheck",
+            &scenario_root.join("mv-recovery-faults"),
+        )?];
+        for (mv, phase) in [
+            ("window_first_mv", "source-pinned"),
+            ("window_full_mv", "source-prepared"),
+            ("window_delta_mv", "source-prepared"),
+            ("window_uuid_mv", "source-prepared"),
+            ("window_endpoint_mv", "source-prepared"),
+        ] {
+            grants.push(control_plan::recovery(
+                &format!("source-window-{mv}"),
+                "system_mv_dependency_recheck",
+                "ns",
+                mv,
+                phase,
+                &format!("source-window-{mv}"),
+                &scenario_root.join("mv-recovery-faults"),
+            )?);
+        }
         control_plan::plan(
             cluster_size,
             binary,
             original_deadline,
-            vec![FeLaunchIntent::MvActions(vec![control_plan::recovery(
-                "dependency-data-prepared",
-                "system_mv_dependency_recheck",
-                "ns",
-                "orders_mv",
-                "data-prepared",
-                "before-current-dependency-recheck",
-                &scenario_root.join("mv-recovery-faults"),
-            )?])],
+            vec![FeLaunchIntent::MvActions(grants)],
         )
         .map(Some)
     }
@@ -1080,6 +1579,7 @@ impl Scenario for MvCurrentDependencyRecheck {
         };
         let mut conn = connect(context)?;
         setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
+        source_window_interleavings(context, &mut conn, catalog, &rest_uri)?;
         execute(
             context,
             &mut conn,
@@ -3502,6 +4002,55 @@ mod refresh_marker_tests {
         assert_eq!(actual.message, "original refresh SQL failed");
     }
 
+    #[test]
+    fn source_hold_expected_refusal_keeps_the_original_typed_sql_cause() {
+        let outcome =
+            source_hold_outcomes(Some(Err(query_failure())), Ok(()), Ok(()), Ok(()), Ok(()))
+                .unwrap();
+        assert_original_mysql_error(&outcome.unwrap_err());
+    }
+
+    #[test]
+    fn source_hold_release_failure_cannot_replace_an_original_sql_failure() {
+        let error = source_hold_outcomes(
+            Some(Err(query_failure())),
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            Err(anyhow::anyhow!("original trigger release failed")),
+        )
+        .unwrap_err();
+        assert_original_mysql_error(&error);
+        assert!(format!("{error:#}").contains("original trigger release failed"));
+    }
+
+    #[test]
+    fn source_hold_deadline_and_join_failure_remain_contexts_of_observed_sql_failure() {
+        let error = source_hold_outcomes(
+            Some(Err(query_failure())),
+            Ok(()),
+            Err(anyhow::anyhow!("original remaining deadline expired")),
+            Err(anyhow::anyhow!("original actor join failed")),
+            Ok(()),
+        )
+        .unwrap_err();
+        assert_original_mysql_error(&error);
+        let detail = format!("{error:#}");
+        assert!(detail.contains("original remaining deadline expired"));
+        assert!(detail.contains("original actor join failed"));
+        // Successful SQL plus an infrastructure failure is never returned as
+        // either an expected SQL refusal or a successful held refresh.
+        assert!(
+            source_hold_outcomes(
+                Some(Ok(())),
+                Ok(()),
+                Err(anyhow::anyhow!("original receive failed")),
+                Ok(()),
+                Ok(()),
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn pre_marker_failure_preserves_original_mysql_code_and_state() {
         let producer = spawn_sql_actor(|| Err(query_failure()));

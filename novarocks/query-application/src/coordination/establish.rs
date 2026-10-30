@@ -26,8 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use novarocks_execution_contract::{
@@ -39,7 +38,8 @@ use novarocks_execution_contract::{
 use novarocks_types::NativeCompatibilityId;
 use tokio::sync::mpsc;
 
-use super::{AttemptActivationIdentity, EstablishStandDownFact, MonotonicInstant};
+use super::EstablishStandDownFact;
+use novarocks_coordination_contract::{AttemptActivationIdentity, MonotonicInstant};
 
 /// Unforgeable actor receipt for the first issue of one exact admission request.
 ///
@@ -621,6 +621,7 @@ struct AdmissionIssueRecord {
 #[derive(Debug)]
 pub(crate) struct EstablishIssueLedger {
     required_contexts: BTreeSet<QueryContextRef>,
+    result_withdrawn: BTreeSet<QueryContextRef>,
     max_admission_issues_per_context: NonZeroUsize,
     max_authorizations_per_context: NonZeroUsize,
     admission_issues: BTreeMap<QueryContextRef, AdmissionIssueRecord>,
@@ -681,6 +682,7 @@ impl EstablishIssueLedger {
         let (events, event_rx) = mpsc::unbounded_channel();
         Self {
             required_contexts,
+            result_withdrawn: BTreeSet::new(),
             max_admission_issues_per_context,
             max_authorizations_per_context,
             admission_issues: BTreeMap::new(),
@@ -1103,11 +1105,39 @@ impl EstablishIssueLedger {
         })
     }
 
+    /// Accept a result-only withdrawal after the actor validates its exact
+    /// activation/root. Keep required_contexts and every issue for stand-down.
+    pub(crate) fn record_result_withdrawals(
+        &mut self,
+        contexts: &BTreeSet<QueryContextRef>,
+    ) -> Result<(), EstablishIssueError> {
+        if !contexts.is_subset(&self.required_contexts) {
+            return Err(EstablishIssueError::UnknownContext);
+        }
+        self.result_withdrawn.extend(contexts.iter().copied());
+        Ok(())
+    }
+
     pub(crate) fn ensure_success_ready(&mut self) -> Result<(), EstablishIssueError> {
         self.drain_events()?;
+        let mut pending = false;
         for context in &self.required_contexts {
+            if self.result_withdrawn.contains(context) {
+                continue;
+            }
+            // Admission can fail before any Establish record exists. Keep
+            // that known refusal distinct from a still-pending requirement.
+            if self.admission_issues.get(context).is_some_and(|record| {
+                matches!(
+                    record.state,
+                    AdmissionIssueState::Rejected(_)
+                        | AdmissionIssueState::PreWorkerRejected
+                        | AdmissionIssueState::PreWorkerRejectedAfterUnknown
+                )
+            }) {
+                return Err(EstablishIssueError::AdmissionRejected);
+            }
             match self.records.get(context).map(|record| record.state) {
-                None => return Err(EstablishIssueError::EstablishNotSettled),
                 Some(EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Applied)) => {}
                 Some(EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Rejected(
                     _,
@@ -1115,10 +1145,14 @@ impl EstablishIssueLedger {
                 | Some(EstablishIssueState::PreWorkerRejected) => {
                     return Err(EstablishIssueError::EstablishRejected);
                 }
-                Some(_) => return Err(EstablishIssueError::EstablishNotSettled),
+                _ => pending = true,
             }
         }
-        Ok(())
+        if pending {
+            Err(EstablishIssueError::EstablishNotSettled)
+        } else {
+            Ok(())
+        }
     }
 
     fn apply_event(&mut self, event: EstablishIssueEvent) -> Result<bool, EstablishIssueError> {
@@ -1146,9 +1180,9 @@ impl EstablishIssueLedger {
 
         if let EstablishIssueEventKind::WorkerSettled(outcome) = event.kind {
             return match record.state {
-                EstablishIssueState::TransportOwned | EstablishIssueState::WorkerSettled(_) => {
-                    settle_worker(record, outcome)
-                }
+                EstablishIssueState::TransportOwned
+                | EstablishIssueState::TransportUnknown
+                | EstablishIssueState::WorkerSettled(_) => settle_worker(record, outcome),
                 _ => Err(EstablishIssueError::WrongState),
             };
         }
@@ -1473,7 +1507,7 @@ impl Drop for EstablishTransportSubmission {
 }
 
 /// Bounded carrier that lets reconciliation publish a Worker receipt after
-/// the original transport attempt became unknown and a replay was issued.
+/// the original transport attempt became unknown, including without a replay.
 #[derive(Debug)]
 pub struct LateEstablishWorkerSettlement {
     identity: EstablishIssueIdentity,
@@ -1529,9 +1563,9 @@ mod tests {
 
     use super::*;
     use crate::coordination::{
-        ExecutionEffect, LogicalExecutionActorConfig, LogicalExecutionActorError,
-        LogicalExecutionClock, spawn_logical_execution_actor,
+        LogicalExecutionActorConfig, LogicalExecutionActorError, spawn_logical_execution_actor,
     };
+    use novarocks_coordination_contract::{ExecutionEffect, MonotonicClock};
 
     #[derive(Debug)]
     struct FakeContent(ContentFingerprint);
@@ -1611,7 +1645,7 @@ mod tests {
         }
     }
 
-    impl LogicalExecutionClock for ManualActorClock {
+    impl MonotonicClock for ManualActorClock {
         fn now(&self) -> MonotonicInstant {
             *self.now.lock().expect("manual actor clock")
         }
@@ -1867,6 +1901,225 @@ mod tests {
                 now,
             ),
             Err(EstablishIssueError::AdmissionRejected)
+        );
+        assert_eq!(
+            ledger.stand_down_facts().unwrap(),
+            vec![(context, EstablishStandDownFact::AbortRequired)]
+        );
+    }
+
+    #[tokio::test]
+    async fn original_worker_receipt_settles_unknown_without_reauthorization() {
+        for outcome in [
+            OperationOutcome::Accepted,
+            OperationOutcome::ContextConflict,
+        ] {
+            let execution = execution(40);
+            let activation = activation(execution);
+            let context = context(execution);
+            let now = times().0;
+            let mut ledger = issue_ledger(context, 2);
+            let held = ticket(context, 40);
+            hold_ticket(&mut ledger, activation, held, 40, now, now);
+            let late = submit(
+                ledger
+                    .authorize_issue(
+                        activation,
+                        establish_request(context, held, 40),
+                        NativeCompatibilityId::new([40; 32]),
+                        now,
+                    )
+                    .unwrap(),
+            )
+            .transport_unknown()
+            .unwrap();
+            ledger.drain_events().unwrap();
+            let identity = late.identity();
+            assert_eq!(ledger.snapshot(context).unwrap().identity(), Some(identity));
+            assert_eq!(
+                ledger.snapshot(context).unwrap().state(),
+                EstablishIssueState::TransportUnknown
+            );
+            ledger.revoke_issue_authority();
+            late.worker_settled(outcome).unwrap();
+            ledger.drain_events().unwrap();
+            assert_eq!(ledger.snapshot(context).unwrap().identity(), Some(identity));
+            assert_eq!(
+                ledger.snapshot(context).unwrap().state(),
+                EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::from_outcome(
+                    outcome
+                ))
+            );
+            assert_eq!(
+                ledger.ensure_success_ready(),
+                if outcome == OperationOutcome::Accepted {
+                    Ok(())
+                } else {
+                    Err(EstablishIssueError::EstablishRejected)
+                }
+            );
+            assert_eq!(
+                ledger.stand_down_facts().unwrap(),
+                vec![(context, EstablishStandDownFact::AbortRequired)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_rejection_without_establish_is_required_until_exact_result_withdrawal() {
+        for mode in 0..3 {
+            let execution = execution(34 + mode);
+            let activation = activation(execution);
+            let context = context(execution);
+            let now = times().0;
+            let mut ledger = issue_ledger(context, 2);
+            let issue = ledger
+                .begin_admission_issue(activation, admission_request(context, 34), now)
+                .unwrap();
+            let settlement = if mode == 0 {
+                AdmissionIssueSettlement::rejected(
+                    issue.operation_id(),
+                    OperationOutcome::ContextConflict,
+                )
+                .unwrap()
+            } else {
+                AdmissionIssueSettlement::pre_worker_rejected_with_prior_unknown(
+                    issue.operation_id(),
+                    mode == 2,
+                )
+            };
+            assert_eq!(
+                ledger.settle_admission_issue(activation, issue, settlement, now),
+                Err(EstablishIssueError::AdmissionRejected)
+            );
+            assert!(ledger.snapshot(context).is_none());
+            assert_eq!(
+                ledger.ensure_success_ready(),
+                Err(EstablishIssueError::AdmissionRejected)
+            );
+            let original_responsibility = ledger.stand_down_facts().unwrap();
+            assert_eq!(
+                original_responsibility,
+                vec![(
+                    context,
+                    if mode == 2 {
+                        EstablishStandDownFact::AbortRequired
+                    } else {
+                        EstablishStandDownFact::NoGrant
+                    }
+                )]
+            );
+            ledger
+                .record_result_withdrawals(&BTreeSet::from([context]))
+                .unwrap();
+            assert_eq!(ledger.ensure_success_ready(), Ok(()));
+            assert_eq!(ledger.stand_down_facts().unwrap(), original_responsibility);
+            assert_eq!(
+                ledger.settle_admission_issue(activation, issue, settlement, now),
+                Err(EstablishIssueError::AdmissionRejected)
+            );
+            assert_eq!(ledger.stand_down_facts().unwrap(), original_responsibility);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_context_cannot_hide_a_later_required_admission_or_establish_refusal() {
+        for admission_only in [true, false] {
+            let execution = execution(38);
+            let activation = activation(execution);
+            let contexts = BTreeSet::from([context(execution), context(execution)]);
+            let rejected = *contexts.last().unwrap();
+            let now = times().0;
+            let mut ledger = EstablishIssueLedger::new(
+                contexts.clone(),
+                NonZeroUsize::new(3).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+            );
+            if admission_only {
+                let issue = ledger
+                    .begin_admission_issue(activation, admission_request(rejected, 38), now)
+                    .unwrap();
+                assert_eq!(
+                    ledger.settle_admission_issue(
+                        activation,
+                        issue,
+                        AdmissionIssueSettlement::pre_worker_rejected(issue.operation_id()),
+                        now
+                    ),
+                    Err(EstablishIssueError::AdmissionRejected)
+                );
+            } else {
+                let held = ticket(rejected, 38);
+                hold_ticket(&mut ledger, activation, held, 38, now, now);
+                submit(
+                    ledger
+                        .authorize_issue(
+                            activation,
+                            establish_request(rejected, held, 38),
+                            NativeCompatibilityId::new([38; 32]),
+                            now,
+                        )
+                        .unwrap(),
+                )
+                .pre_worker_rejected()
+                .unwrap();
+            }
+            let expected = if admission_only {
+                EstablishIssueError::AdmissionRejected
+            } else {
+                EstablishIssueError::EstablishRejected
+            };
+            assert_eq!(ledger.ensure_success_ready(), Err(expected));
+            ledger
+                .record_result_withdrawals(&BTreeSet::from([rejected]))
+                .unwrap();
+            assert_eq!(
+                ledger.ensure_success_ready(),
+                Err(EstablishIssueError::EstablishNotSettled),
+                "the earlier still-pending context remains required"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn withdrawn_result_context_still_validates_its_original_worker_receipts() {
+        let execution = execution(39);
+        let activation = activation(execution);
+        let context = context(execution);
+        let now = times().0;
+        let mut ledger = issue_ledger(context, 2);
+        let held = ticket(context, 39);
+        hold_ticket(&mut ledger, activation, held, 39, now, now);
+        let late = submit(
+            ledger
+                .authorize_issue(
+                    activation,
+                    establish_request(context, held, 39),
+                    NativeCompatibilityId::new([39; 32]),
+                    now,
+                )
+                .unwrap(),
+        )
+        .transport_unknown()
+        .unwrap();
+        ledger.drain_events().unwrap();
+        submit(ledger.reauthorize_issue(activation, context, now).unwrap())
+            .worker_settled(OperationOutcome::Accepted)
+            .unwrap();
+        ledger.drain_events().unwrap();
+        ledger
+            .record_result_withdrawals(&BTreeSet::from([context]))
+            .unwrap();
+        late.worker_settled(OperationOutcome::ContextConflict)
+            .unwrap();
+        assert_eq!(
+            ledger.ensure_success_ready(),
+            Err(EstablishIssueError::ConflictingWorkerSettlement)
+        );
+        assert_eq!(
+            ledger.snapshot(context).unwrap().state(),
+            EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Applied),
+            "a refused contradictory event cannot overwrite the original verdict"
         );
         assert_eq!(
             ledger.stand_down_facts().unwrap(),
@@ -2505,7 +2758,7 @@ mod tests {
         );
         assert_eq!(
             input.attempt_class(),
-            super::super::AttemptFailureClass::ExecutionFailure
+            novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure
         );
     }
 
@@ -2668,6 +2921,55 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("revoked Establish permit did not settle definitely unsent");
+    }
+
+    #[tokio::test]
+    async fn completion_without_result_withdrawal_cannot_skip_admission_refusal() {
+        for mode in 0..3 {
+            let execution = execution(35 + mode);
+            let context = context(execution);
+            let config = actor_config(execution, vec![context]);
+            let (owner, initial, _output) =
+                spawn_logical_execution_actor(&Handle::current(), config)
+                    .unwrap()
+                    .into_parts();
+            let actor = owner.actor();
+            let running = actor.activate(initial.ready()).await.unwrap();
+            let issue = running
+                .begin_admission_issue(admission_request(context, 35))
+                .await
+                .unwrap();
+            let settlement = if mode == 0 {
+                AdmissionIssueSettlement::rejected(
+                    issue.operation_id(),
+                    OperationOutcome::ContextConflict,
+                )
+                .unwrap()
+            } else {
+                AdmissionIssueSettlement::pre_worker_rejected_with_prior_unknown(
+                    issue.operation_id(),
+                    mode == 2,
+                )
+            };
+            assert_eq!(
+                running.settle_admission_issue(issue, settlement).await,
+                Err(LogicalExecutionActorError::Establish(
+                    EstablishIssueError::AdmissionRejected
+                ))
+            );
+            assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
+            assert!(actor.establish_snapshot(context).await.unwrap().is_none());
+            assert_eq!(
+                actor.complete_attempt(running).await,
+                Err(LogicalExecutionActorError::Establish(
+                    EstablishIssueError::AdmissionRejected
+                ))
+            );
+            assert_eq!(
+                actor.snapshot().await.unwrap().conclusion,
+                Some(crate::coordination::LogicalConclusion::Failed)
+            );
+        }
     }
 
     #[tokio::test]

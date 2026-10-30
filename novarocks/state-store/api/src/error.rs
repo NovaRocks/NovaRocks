@@ -81,3 +81,46 @@ impl fmt::Display for StateStoreError {
 }
 
 impl std::error::Error for StateStoreError {}
+
+impl novarocks_failure_contract::FailureProjection for StateStoreError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        let (class, code) = match self.kind {
+            StateStoreErrorKind::InvalidRequest => (FailureClass::Data, 1),
+            StateStoreErrorKind::InvalidConfiguration => (FailureClass::Invariant, 2),
+            StateStoreErrorKind::UnsupportedFormat => (FailureClass::Unsupported, 3),
+            StateStoreErrorKind::LimitExceeded => (FailureClass::Resource, 4),
+            StateStoreErrorKind::Saturated => (FailureClass::Resource, 5),
+            StateStoreErrorKind::DeadlineExceeded => (FailureClass::Control, 6),
+            StateStoreErrorKind::PreconditionFailed => (FailureClass::Dependency, 7),
+            StateStoreErrorKind::Conflict => (FailureClass::Dependency, 8),
+            StateStoreErrorKind::Transient => (FailureClass::Dependency, 9),
+            StateStoreErrorKind::Corruption => (FailureClass::Data, 10),
+            StateStoreErrorKind::ProviderUnavailable => (FailureClass::Dependency, 11),
+            StateStoreErrorKind::Cancelled => (FailureClass::Control, 12),
+            StateStoreErrorKind::Internal => (FailureClass::Invariant, 13),
+        };
+        let reason = FailureReason::new(
+            domain::STATE_STORE,
+            std::num::NonZeroU16::new(code).unwrap(),
+        );
+        if matches!(
+            self.kind,
+            StateStoreErrorKind::Cancelled | StateStoreErrorKind::DeadlineExceeded
+        ) {
+            // A provider observes its captured stop; it does not accept a new
+            // client cancellation or replace a preceding originating failure.
+            FailureFact::stop_observation(reason)
+        } else {
+            FailureFact::new(class, reason)
+        }
+    }
+}
+impl StateStoreError {
+    /// The provider-authored fact and original error enter one immutable cause.
+    /// Its fixed diagnostic never evaluates a foreign formatter.
+    pub fn into_original_failure(self) -> crate::StateStoreExecutionFailure {
+        let detail = self.message;
+        novarocks_failure_contract::SharedFailureCause::from_static_detail(self, detail)
+    }
+}

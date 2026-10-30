@@ -93,7 +93,7 @@ pub fn cast_observed<E>(
     } else if list.values().null_count() == list.values().len() {
         null_source_observed(list.values().len(), target_field.data_type(), observe)?
     } else {
-        // NullArray has physical null_count()==0 in Arrow 58.2.0. Its nonempty
+        // NullArray still has physical null_count()==0 in Arrow 60.1.0. Its nonempty
         // values therefore reach the caller's original Null-source branch.
         cast_child(list.values(), target_field.data_type())?
     };

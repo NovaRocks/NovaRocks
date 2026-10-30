@@ -113,20 +113,18 @@ pub trait SpecializedStatementRoute: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
-    /// Executes the deliberately specialized, complete MV parser input.
-    /// MV must not acquire a second semantic command mirror.
-    fn execute_materialized_view(
+    /// Build an MV action under the already admitted statement.
+    fn prepare_materialized_view_statement_action(
         &self,
-        _statement: &novarocks_parser::ast::MaterializedViewStatement,
-        _context: &RequestContext,
-        _command_context: &CommandContext,
-    ) -> CommandFuture {
-        Box::pin(async {
-            Err(crate::api::CommandError::new(
-                crate::api::CommandErrorKind::Unsupported,
-                "materialized view command route is unavailable",
-            ))
-        })
+        _statement: novarocks_parser::ast::MaterializedViewStatement,
+        _context: RequestContext,
+        _command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, crate::api::CommandError>
+    {
+        Err(crate::api::CommandError::new(
+            crate::api::CommandErrorKind::Unsupported,
+            "materialized view action route is unavailable",
+        ))
     }
 
     /// Executes the query-owned View family, which is outside the product
@@ -169,6 +167,41 @@ impl ProductCommandRouter {
             statistics,
             maintenance,
         }
+    }
+
+    /// The closed product dispatcher selects the statistics author under the
+    /// admitted caller's original statement source.
+    pub fn prepare_statistics_statement_action(
+        &self,
+        command: StatisticsSqlCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, crate::api::CommandError>
+    {
+        self.statistics
+            .prepare_statement_action(command, request_context, command_context)
+    }
+
+    pub fn prepare_catalog_statement_action(
+        &self,
+        command: CatalogSqlCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, crate::api::CommandError>
+    {
+        self.catalog
+            .prepare_statement_action(command, request_context, command_context)
+    }
+
+    pub fn prepare_maintenance_statement_action(
+        &self,
+        command: MaintenanceSqlCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, crate::api::CommandError>
+    {
+        self.maintenance
+            .prepare_statement_action(command, request_context, command_context)
     }
 
     pub fn execute(

@@ -24,14 +24,11 @@ use std::{error::Error, num::NonZeroU16};
 
 #[repr(u16)]
 enum Reason {
-    UnsupportedFragment = 1,
-    InvalidFragment = 2,
-    UnsupportedExpression = 10,
-    UnsupportedCall = 11,
-    InvalidExpression = 12,
-    InvalidChannels = 20,
-    InvalidRepeat = 21,
-    InvalidUnpivot = 22,
+    Fragment = 2,
+    Expression = 12,
+    Channels = 20,
+    Repeat = 21,
+    Unpivot = 22,
 }
 fn fact(class: FailureClass, reason: Reason) -> FailureFact {
     FailureFact::new(
@@ -49,10 +46,11 @@ impl FailureProjection for FragmentCompileError {
             Self::ProjectMetadataRequest(source) => source.failure_fact(),
             Self::ProjectMetadataHost { error } | Self::Owner { error, .. } => error.failure_fact(),
             Self::Control(source) => source.failure_fact(),
-            Self::Unsupported { .. } => {
-                fact(FailureClass::Unsupported, Reason::UnsupportedFragment)
-            }
-            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::InvalidFragment),
+            Self::Unsupported { .. } => FailureFact::new(
+                FailureClass::Unsupported,
+                novarocks_failure_contract::local_compiler_reason::UNSUPPORTED_FRAGMENT,
+            ),
+            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::Fragment),
         }
     }
 }
@@ -78,6 +76,7 @@ impl FailureProjection for crate::expressions::ExpressionLoweringError {
     fn failure_fact(&self) -> FailureFact {
         match self {
             Self::Construction(source) => source.failure_fact(),
+            Self::BTree(source) => source.failure_fact(),
             Self::Publication(source) => source.failure_fact(),
             Self::Control(source) => source.failure_fact(),
             Self::Constant(source) => source.failure_fact(),
@@ -90,11 +89,15 @@ impl FailureProjection for crate::expressions::ExpressionLoweringError {
             Self::Arithmetic(source) => source.failure_fact(),
             Self::Cast(source) => source.failure_fact(),
             Self::Comparison(source) => source.failure_fact(),
-            Self::UnsupportedExpression(_) => {
-                fact(FailureClass::Unsupported, Reason::UnsupportedExpression)
-            }
-            Self::UnsupportedCall(_) => fact(FailureClass::Unsupported, Reason::UnsupportedCall),
-            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::InvalidExpression),
+            Self::UnsupportedExpression(_) => FailureFact::new(
+                FailureClass::Unsupported,
+                novarocks_failure_contract::local_compiler_reason::UNSUPPORTED_EXPRESSION,
+            ),
+            Self::UnsupportedCall(_) => FailureFact::new(
+                FailureClass::Unsupported,
+                novarocks_failure_contract::local_compiler_reason::UNSUPPORTED_CALL,
+            ),
+            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::Expression),
         }
     }
 }
@@ -106,7 +109,7 @@ impl FailureProjection for crate::channels::ChannelLoweringError {
             Self::Repeat(source) => source.failure_fact(),
             Self::Unpivot(source) => source.failure_fact(),
             Self::Join(source) => source.failure_fact(),
-            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::InvalidChannels),
+            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::Channels),
         }
     }
 }
@@ -116,7 +119,7 @@ impl FailureProjection for crate::repeat::RepeatLoweringError {
             Self::Control(source) => source.failure_fact(),
             Self::ValueType(source) => source.failure_fact(),
             Self::Layout(source) => source.failure_fact(),
-            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::InvalidRepeat),
+            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::Repeat),
         }
     }
 }
@@ -127,7 +130,7 @@ impl FailureProjection for crate::unpivot::UnpivotLoweringError {
             Self::ValueType(source) => source.failure_fact(),
             Self::Layout(source) => source.failure_fact(),
             Self::Constant(source) => source.failure_fact(),
-            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::InvalidUnpivot),
+            Self::Invalid(_) => fact(FailureClass::Invariant, Reason::Unpivot),
         }
     }
 }

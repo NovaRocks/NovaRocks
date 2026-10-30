@@ -165,41 +165,6 @@ pub(crate) struct BaselinePredecessors {
     pub(crate) table_object_ids: BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
 }
 
-/// Resolve what the published baseline pinned each source at.
-///
-/// The provider validates each opaque revision against a retained exact table
-/// handle before this application records the typed snapshot it names.
-pub(crate) fn baseline_predecessors(
-    previous_sources: &[RefreshStateBaselineSource],
-    connector_control: &dyn ConnectorControlResolver,
-    connector_context: &ConnectorRequestContext,
-) -> Result<BaselinePredecessors, String> {
-    let mut predecessors = BaselinePredecessors::default();
-    for source in previous_sources {
-        let named = occurrence_display(source.occurrence_id, &source.table);
-        if predecessors.snapshots.contains_key(&source.occurrence_id) {
-            return Err(format!(
-                "MV refresh baseline names {named} more than once; one occurrence is pinned at \
-                 one source"
-            ));
-        }
-        let snapshot_id = crate::mv::domain::refresh_io::snapshot_from_exact_revision_with_ports(
-            connector_control,
-            &source.table,
-            &source.semantic_revision,
-            connector_context,
-        )
-        .map_err(|error| format!("MV refresh baseline pinned {named}: {error}"))?;
-        predecessors
-            .snapshots
-            .insert(source.occurrence_id, snapshot_id);
-        predecessors
-            .table_object_ids
-            .insert(source.occurrence_id, source.table_object_id()?);
-    }
-    Ok(predecessors)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefreshStateBaseline {
     SnapshotBacked {
@@ -237,6 +202,43 @@ impl RefreshPlanContract {
     pub(crate) fn mode(&self) -> RefreshMode {
         self.decision.mode()
     }
+}
+
+pub(crate) async fn baseline_predecessors_original(
+    io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
+    previous_sources: &[RefreshStateBaselineSource],
+    connector_control: &dyn ConnectorControlResolver,
+    connector_context: &ConnectorRequestContext,
+) -> Result<
+    BaselinePredecessors,
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
+> {
+    let mut predecessors = BaselinePredecessors::default();
+    for source in previous_sources {
+        let named = occurrence_display(source.occurrence_id, &source.table);
+        if predecessors.snapshots.contains_key(&source.occurrence_id) {
+            return Err(format!(
+                "MV refresh baseline names {named} more than once; one occurrence is pinned at \
+                 one source"
+            )
+            .into());
+        }
+        let snapshot_id = io
+            .snapshot_from_revision(
+                connector_control,
+                &source.table,
+                &source.semantic_revision,
+                connector_context,
+            )
+            .await?;
+        predecessors
+            .snapshots
+            .insert(source.occurrence_id, snapshot_id);
+        predecessors
+            .table_object_ids
+            .insert(source.occurrence_id, source.table_object_id()?);
+    }
+    Ok(predecessors)
 }
 
 #[cfg(test)]

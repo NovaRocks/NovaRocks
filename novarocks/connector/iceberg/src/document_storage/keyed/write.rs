@@ -252,16 +252,34 @@ pub(crate) fn refusal_with_retained_bytes(
     context: &novarocks_spi::connector::ConnectorRequestContext,
     error: ConnectorError,
 ) -> ConnectorError {
+    let fallback = error.clone();
+    runtime
+        .resources()
+        .catalog_runtime()
+        .block_on(refusal_with_retained_bytes_async(
+            runtime, namespace, table, context, error,
+        ))
+        .unwrap_or(fallback)
+}
+
+pub(crate) async fn refusal_with_retained_bytes_async(
+    runtime: &crate::metadata_context::IcebergMetadataContext,
+    namespace: &str,
+    table: &str,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    error: ConnectorError,
+) -> ConnectorError {
     if error.kind() != ConnectorErrorKind::InvalidRequest {
         return error;
     }
     let diagnostic = runtime
-        .observe_table_classified_for_request_with_snapshots(
+        .observe_table_classified_for_request_with_snapshots_async(
             namespace,
             table,
             context,
             crate::catalog::SnapshotLoading::All,
         )
+        .await
         .map_err(|(kind, message)| ConnectorError::new(kind, message))
         .and_then(|physical| {
             super::retention::snapshot_referenced_bytes(physical.table.metadata())

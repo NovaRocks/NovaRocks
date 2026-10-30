@@ -168,12 +168,12 @@ fn matrix_arrays() -> [ArrayRef; 4] {
 }
 fn pool(array: &ArrayRef, source: FunctionValueType) -> ConstantPool {
     ConstantPool::try_new(
-        Arc::new(
-            source
-                .try_to_field("original")
-                .unwrap()
-                .with_metadata([("source-note".into(), "selected calendar".into())].into()),
-        ),
+        Arc::new(source.try_to_field("original").unwrap().with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "source-note".into(),
+                "selected calendar".into(),
+            )]),
+        )),
         source,
         array.to_data(),
         ConstantPolicy {

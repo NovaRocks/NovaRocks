@@ -17,21 +17,12 @@
 
 //! Frontend-owned INSERT command conversion and source shaping.
 
-mod command;
-mod iceberg;
+pub(crate) mod command;
 mod shaping;
 
-use crate::query_execution::dml::insert::{
-    InsertEngine, InsertOverwriteMode, InsertTargetName, PrepareIcebergInsert,
-    PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
-};
-use novarocks_proto_codec::lifecycle::QueryOptions;
-use novarocks_query_application::admitted_query_context::RequestContext;
-use novarocks_spi::connector::{LakePublicationFamily, LakePublicationId};
-
 use crate::dml::error::DmlError;
-use crate::dml::runner::StatementWriteTransactionRunner;
 use crate::dml::service::DmlService;
+use crate::query_execution::dml::insert::InsertTargetName;
 use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 
 pub use command::convert_insert_command;
@@ -39,114 +30,29 @@ pub(crate) use shaping::{
     omitted_insert_expr, shape_insert_source, shape_insert_source_with_constants,
 };
 
-use self::iceberg::{IcebergInsertWriteExecutor, write_transaction_spec};
-
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum InsertTargetRef {
+pub(crate) enum InsertTargetRef {
     Main,
     Branch(String),
     Tag(String),
 }
 
-/// A prepared INSERT whose native execution and provider publication have not begun.
-///
-/// The retained provider handle is exact to the admitted statement. Dropping
-/// it before the dispatch edge cannot create an external write.
-pub(crate) struct PreparedInsertAttempt {
-    prepared: PreparedIcebergInsert,
-}
-
 impl DmlService {
-    /// Prepare one SQLP-5 typed INSERT without beginning native execution.
-    ///
-    /// Statement-family routing is complete before this boundary. `source`
-    /// exists solely for diagnostic locations derived from AST spans; it must
-    /// not be reparsed or sliced to classify an INSERT form. Its query source
-    /// is already the parser-owned typed AST.
-    pub(crate) fn prepare_insert(
+    /// Pure command/target validation for the original statement action. No
+    /// provider request, execution identity or statement authority is created.
+    pub(crate) fn prepare_insert_shape(
         &self,
-        engine: &dyn InsertEngine,
         statement: &novarocks_parser::ast::Insert,
         source: &str,
-        context: &RequestContext,
-        query_options: Option<&QueryOptions>,
-    ) -> Result<PreparedInsertAttempt, DmlError> {
+    ) -> Result<(command::InsertCommand, InsertTargetRef), DmlError> {
         let mut command = convert_insert_command(statement)
             .map_err(|error| insert_admit_error(source, statement.span, error))?;
-        let (target, target_ref) = split_target_ref(&command.target)
+        let (target, reference) = split_target_ref(&command.target)
             .map_err(|error| insert_admit_error(source, statement.target.span, error))?;
-        command.target = target.clone();
-
-        let session = context.session();
-        let resolved = engine
-            .resolve_target(ResolveInsertTarget {
-                current_catalog: session.current_catalog().map(ToOwned::to_owned),
-                current_database: session.current_database().to_string(),
-                target,
-                query_options: query_options.cloned(),
-                execution: context.execution().clone(),
-            })
-            .map_err(DmlError::executor)?;
-        validate_target(&target_ref)
+        validate_target(&reference)
             .map_err(|error| insert_admit_error(source, statement.target.span, error))?;
-        self.prepare_iceberg_source(
-            engine,
-            resolved,
-            &command.columns,
-            &command.source,
-            source,
-            command.overwrite_mode,
-            &target_ref,
-            context,
-            query_options,
-        )
-    }
-
-    fn prepare_iceberg_source(
-        &self,
-        engine: &dyn InsertEngine,
-        target: ResolvedInsertTarget,
-        insert_columns: &[String],
-        source: &novarocks_parser::ast::Query,
-        sql_source: &str,
-        overwrite_mode: InsertOverwriteMode,
-        target_ref: &InsertTargetRef,
-        context: &RequestContext,
-        query_options: Option<&QueryOptions>,
-    ) -> Result<PreparedInsertAttempt, DmlError> {
-        let publication_id = LakePublicationId::new_v7();
-        let prepared = engine
-            .prepare_iceberg_write(PrepareIcebergInsert {
-                publication_id,
-                target,
-                insert_columns: insert_columns.to_vec(),
-                sql_source: sql_source.to_string(),
-                source: Box::new(source.clone()),
-                overwrite_mode,
-                target_ref: match target_ref {
-                    InsertTargetRef::Main => "main".to_string(),
-                    InsertTargetRef::Branch(name) => name.clone(),
-                    InsertTargetRef::Tag(_) => unreachable!("tag rejected before execution"),
-                },
-                query_options: query_options.cloned(),
-                execution: context.execution().clone(),
-            })
-            .map_err(DmlError::executor)?;
-        Ok(PreparedInsertAttempt { prepared })
-    }
-
-    /// Crosses the statement's one-shot native execution and publication edge.
-    pub(crate) fn execute_prepared_insert(
-        &self,
-        engine: &dyn InsertEngine,
-        prepared: PreparedInsertAttempt,
-    ) -> Result<(), DmlError> {
-        let _ = self;
-        let spec = write_transaction_spec(&prepared.prepared);
-        let executor = IcebergInsertWriteExecutor::new(engine, &prepared.prepared);
-        StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
-            .run(spec)
-            .map(|_| ())
+        command.target = target;
+        Ok((command, reference))
     }
 }
 
@@ -154,7 +60,7 @@ fn insert_admit_error(source: &str, span: novarocks_parser::Span, message: Strin
     DmlError::admit(DmlAdmissionError::InsertUnsupportedForm.to_user_error(source, span, message))
 }
 
-fn split_target_ref(
+pub(crate) fn split_target_ref(
     target: &InsertTargetName,
 ) -> Result<(InsertTargetName, InsertTargetRef), String> {
     let Some(last) = target.parts.last() else {
@@ -181,7 +87,7 @@ fn split_target_ref(
     Ok((InsertTargetName { parts }, target_ref))
 }
 
-fn validate_target(target_ref: &InsertTargetRef) -> Result<(), String> {
+pub(crate) fn validate_target(target_ref: &InsertTargetRef) -> Result<(), String> {
     if let InsertTargetRef::Tag(name) = target_ref {
         return Err(format!(
             "iceberg ref: tag '{name}' is read-only; use a branch as DML target"

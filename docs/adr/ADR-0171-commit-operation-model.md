@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0198
+    scope: "Synchronous control waiting, the undifferentiated finalize/cleanup completion boundary and unconditional age-gated GC continuation; immutable intent, dependencies, field inheritance, the physical artifact ledger, actual-exit observation and protection of Unknown objects remain active"
+    link: "ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md"
   - id: ADR-0180
     scope: "Request-shape table for document storage: marker-only MetadataOnly, zero-file SnapshotProducing slot changes and all-observed-ref expiry; immutable operations, dependency validation and artifact ownership remain unchanged"
   - id: ADR-0179
@@ -29,6 +32,7 @@ code-anchors:
   - "novarocks/connector/iceberg/src/commit/staging/manifests.rs (ArtifactWriter)"
   - "novarocks/connector/iceberg/src/commit/attempt.rs (run, RetryPolicy)"
   - "novarocks/connector/iceberg/src/commit/operation.rs (IcebergCommitOperation, IcebergCommitAttempt)"
+  - "novarocks/connector/iceberg/src/commit/write_stack/execution/cleanup.rs (UnsealedWriterCleanup)"
   - "novarocks/connector/iceberg/src/commit/attempt/observation.rs (PublicationJournal)"
   - "novarocks/connector/iceberg/src/commit/recovery.rs (FrozenPublicationFacts)"
   - "novarocks/connector/iceberg/src/catalog_control/staged_create/publication.rs (publish)"
@@ -37,6 +41,20 @@ code-anchors:
 ## 问题
 
 > **当前适用范围：** [ADR-0179](ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 已删除 late SDK `TableCommit` 转换与独立 transaction 结果，发布统一由冻结请求和 journal 拥有。rewrite-manifests 的可复用 manifest 现在归 Operation，依赖当前基线的 manifest-list 仍归 Attempt；旧文“当前不复用 manifest”不再适用于该路径。不可变意图、依赖验证、显式/继承字段和对象生命周期规则继续有效。
+
+> **控制与回收边界：** [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md)
+> 部分替代本条的同步控制等待、未区分必要 finalize/安全 GC 的完成边界，以及无条件年龄窗 GC 延续。
+> 原不可变意图、依赖验证、字段继承、先登记后创建的 ledger、实际退出与 Unknown 对象保护继续有效；
+> 下文相关旧句记录历史选择，不能作为恢复同步桥或授予缺证扫描的依据。
+>
+> 网络控制等待沿原 Provider async Source，真正阻塞工作沿原执行器、背压与退出观察；不另建执行池。
+> Provider 原 journal 决定准确可能派发前沿，派发后有限结算只观察同一 publication，不授予新的业务提交。
+> 业务必要 finalize、可延后安全 GC 和 Source 实际退出分别取证：已知提交不被后续清理或 receipt CPU
+> 失败改成 Unknown，必要步骤失败仍须保留已提交效果并报告业务未完成。原 NeededReady 的 effect、receipt
+> 与 finalization 由同一事实交接；GC Pending 不冒充 Complete，原 Call/残留继续持有 journal、访问能力和原始原因。
+> Unknown 不因年龄或本地 timeout 取得删除许可；REST/Hadoop 扫描安全证明仍为 UNPROVEN，精确
+> operation-owned cleanup 使用自己的 ledger 安全事实。实际 Source/对象尚未退出时，业务终态也不授权清账。
+> ADR-0198 保持 implementation pending，异步接线和最终调用图仍需实际验证。
 
 一次 Iceberg 写操作遇到并发、取消或不确定提交时，由谁证明重新准备仍然正确，并决定准备产物的生命周期？
 

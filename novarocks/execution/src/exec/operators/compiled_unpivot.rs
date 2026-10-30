@@ -827,7 +827,7 @@ fn primitive_adoption(
 }
 
 /// The fixed literal protocol remains Int32List/Utf8Map. This observes the
-/// actual original Arrow 58.4 constructors, without deriving a value domain.
+/// actual Arrow 60.1.0 constructors, without deriving a value domain.
 fn observe_literal(
     source: &LiteralSource,
     rows: usize,

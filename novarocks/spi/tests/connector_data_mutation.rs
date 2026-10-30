@@ -212,6 +212,7 @@ impl ConnectorDataMutation for FakeDataMutation {
         );
         Ok(match *self.mode.lock().expect("mode") {
             ExecuteMode::Committed => ExternalMutationOutcome::KnownCommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 effect: ExternalMutationEffect::Applied,
                 receipt: self.receipt(&request.plan, self.descriptor.clone()),
                 finalization: ExternalMutationFinalization::Complete,
@@ -225,6 +226,7 @@ impl ConnectorDataMutation for FakeDataMutation {
                 evidence: self.evidence(&request.plan),
             },
             ExecuteMode::ForeignReceipt => ExternalMutationOutcome::KnownCommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 effect: ExternalMutationEffect::Applied,
                 receipt: self.receipt(
                     &request.plan,
@@ -251,6 +253,7 @@ impl ConnectorDataMutation for FakeDataMutation {
             .1
             .clone();
         Ok(ExternalMutationOutcome::KnownCommitted {
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             effect: ExternalMutationEffect::Applied,
             receipt: self.receipt(&plan, self.descriptor.clone()),
             finalization: ExternalMutationFinalization::Complete,

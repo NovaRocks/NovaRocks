@@ -11,6 +11,8 @@ mod original_retirement;
 pub(crate) mod report_server;
 mod root_result_codec;
 mod subscription_owner;
+#[cfg(test)]
+pub(crate) use subscription_owner::NativeSubscriptionOwner;
 pub(crate) mod task_transport;
 pub(crate) mod transport;
 pub(crate) mod transport_supervisor;

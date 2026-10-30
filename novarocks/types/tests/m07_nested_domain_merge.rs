@@ -129,10 +129,12 @@ fn all_opaque_identities_survive_same_domain_rebuild() {
 
 #[test]
 fn physical_null_is_neutral_in_either_operand_order() {
-    let null = list(
-        Field::new("item", DataType::Null, true)
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), "unknown".to_owned())].into()),
-    );
+    let null = list(Field::new("item", DataType::Null, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            NR_LOGICAL_TYPE_KEY.to_owned(),
+            "unknown".to_owned(),
+        )]),
+    ));
     for (storage, domain) in [
         (DataType::Utf8, LogicalType::Json),
         (DataType::Binary, LogicalType::Bitmap),
@@ -316,11 +318,10 @@ fn recursive_list_struct_map_keeps_only_the_surviving_leaf_domain() {
 #[test]
 fn rebuilt_fields_drop_provider_decoration_but_equal_type_fast_path_is_unchanged() {
     let decorated = logical("item", DataType::Utf8, false, LogicalType::Json).with_metadata(
-        [
+        std::collections::HashMap::<String, String>::from([
             (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
             ("PARQUET:field_id".to_owned(), "71".to_owned()),
-        ]
-        .into(),
+        ]),
     );
     let left = list(decorated);
     assert_eq!(wider_type(&left, &left), left);
@@ -334,10 +335,12 @@ fn rebuilt_fields_drop_provider_decoration_but_equal_type_fast_path_is_unchanged
         item(&undecorated_nested_type(&left)),
         Some(LogicalType::Json),
     );
-    let plain = list(
-        Field::new("item", DataType::Int32, false)
-            .with_metadata([("PARQUET:field_id".to_owned(), "72".to_owned())].into()),
-    );
+    let plain = list(Field::new("item", DataType::Int32, false).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "PARQUET:field_id".to_owned(),
+            "72".to_owned(),
+        )]),
+    ));
     let widened = wider_type(&plain, &list(Field::new("item", DataType::Int64, true)));
     assert_eq!(item(&widened).data_type(), &DataType::Int64);
     assert_domain(item(&widened), None);
@@ -346,19 +349,23 @@ fn rebuilt_fields_drop_provider_decoration_but_equal_type_fast_path_is_unchanged
 #[test]
 fn recognized_markers_use_existing_normalization_but_invalid_storage_is_not_propagated() {
     let canonical = list(logical("item", DataType::Utf8, false, LogicalType::Json));
-    let normalized = list(
-        Field::new("item", DataType::Utf8, true)
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), " JSON ".to_owned())].into()),
-    );
+    let normalized = list(Field::new("item", DataType::Utf8, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            NR_LOGICAL_TYPE_KEY.to_owned(),
+            " JSON ".to_owned(),
+        )]),
+    ));
     assert_domain(
         item(&wider_type(&canonical, &normalized)),
         Some(LogicalType::Json),
     );
     for marker in ["unknown", "hll"] {
-        let invalid = list(
-            Field::new("item", DataType::Utf8, true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), marker.to_owned())].into()),
-        );
+        let invalid = list(Field::new("item", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                NR_LOGICAL_TYPE_KEY.to_owned(),
+                marker.to_owned(),
+            )]),
+        ));
         let widened = wider_type(&canonical, &invalid);
         assert_eq!(item(&widened).metadata()[NR_LOGICAL_TYPE_KEY], "invalid");
     }

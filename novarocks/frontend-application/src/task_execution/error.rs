@@ -24,17 +24,14 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::task_execution::operation::OperationDispatchResult;
+use crate::task_execution::status_validation::FinalInfoDisagreement;
+use novarocks_coordination_contract::StatusObservation;
 use novarocks_execution::task_execution::{
     DescriptorError, DomainConflict, ExchangeEdgeId, IdentityMismatch, OperationKind,
     OperationOutcome, QueryContextRef, RequestError, TaskOperationId, TaskState,
 };
-use novarocks_query_application::coordination::{
-    DispatchLane, FinalInfoDisagreement, OperationDispatchResult, ResultPacketVerdict,
-    StatusObservation,
-};
-use novarocks_types::identity::{BackendProcessId, TaskId};
-
-use crate::query_execution::schedule::FragmentInstancePlacement;
+use novarocks_types::identity::BackendProcessId;
 
 /// Why a task-status subscription can no longer represent its frozen
 /// participant. Identity violations are not transport uncertainty and must
@@ -59,8 +56,10 @@ impl ParticipantObservationFailure {
 /// Why the frontend task-protocol owners refuse to continue.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskExecutionError {
+    Workload(novarocks_workload_control::WorkError),
     /// A local owner has already projected its own fact and safe detail.
     Execution(novarocks_query_application::execution_error::ExecutionFailureInput),
+    SplitAssignment(crate::query_execution::split_assignment::SplitAssignmentDriverError),
     /// The original logical owner refused this operation; preserve its reason
     /// and normal stop observation instead of reconstructing it from text.
     Actor(novarocks_query_application::coordination::LogicalExecutionActorError),
@@ -72,16 +71,6 @@ pub enum TaskExecutionError {
     Descriptor(DescriptorError),
     /// A request built from the static schedule is not a legal value.
     Request(RequestError),
-    /// A frozen backend process identity is missing for a scheduled backend.
-    UnknownBackend {
-        backend_idx: usize,
-    },
-    /// Two tasks of one query execution derive the same kernel key, so a
-    /// destination address would be ambiguous.
-    KernelKeyCollision {
-        first: TaskId,
-        second: TaskId,
-    },
     /// A capacity bound of the operation transport was reached.
     Capacity(CapacityBound),
     /// A locally queued operation reached its residence deadline before any
@@ -155,9 +144,6 @@ pub enum TaskExecutionError {
         kind: OperationKind,
         result: OperationDispatchResult,
     },
-    /// The root result stream lost, repeated, or overran a packet, so the
-    /// result this frontend holds is not provably the whole result.
-    ResultStream(ResultPacketVerdict),
     /// A fetched final task info contradicts the terminal status this attempt
     /// already observed.
     FinalInfo(FinalInfoDisagreement),
@@ -200,8 +186,6 @@ pub enum CapacityBound {
     DescriptorBytes { limit: usize, actual: usize },
     /// One operation's queue-side carrier.
     OperationBytes { limit: usize, actual: usize },
-    /// The process-wide Native transport could not retain this queued carrier.
-    ProcessTransportQueue { lane: DispatchLane, bytes: usize },
     /// Edge-open versions one producer task can mint.
     ///
     /// A task mints one per edge-open decision and never reuses one, so this
@@ -283,14 +267,6 @@ impl novarocks_execution_contract::failure::FailureProjection for CapacityBound 
                 u64::try_from(actual).ok(),
                 u64::try_from(limit).ok(),
             ),
-            Self::ProcessTransportQueue { bytes, .. } => (
-                48,
-                Some(S::Request),
-                Some(S::Process),
-                D::Bytes,
-                u64::try_from(bytes).ok(),
-                None,
-            ),
             Self::EdgeOpenVersions { limit } => (
                 49,
                 Some(S::Task),
@@ -347,10 +323,6 @@ impl fmt::Display for CapacityBound {
                 formatter,
                 "operation queue carrier is {actual} bytes, limit is {limit}"
             ),
-            Self::ProcessTransportQueue { lane, bytes } => write!(
-                formatter,
-                "process Native transport cannot retain a {bytes}-byte {lane:?} operation"
-            ),
             Self::EdgeOpenVersions { limit } => {
                 write!(formatter, "edge-open versions for one task reached {limit}")
             }
@@ -362,6 +334,8 @@ impl fmt::Display for TaskExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Execution(input) => formatter.write_str(input.detail().as_str()),
+            Self::SplitAssignment(error) => write!(formatter, "split assignment failed: {error}"),
+            Self::Workload(error) => std::fmt::Display::fmt(error, formatter),
             Self::NativeTransport(error) => write!(
                 formatter,
                 "native Task transport construction failed: {error}"
@@ -384,14 +358,6 @@ impl fmt::Display for TaskExecutionError {
             Self::Request(error) => write!(
                 formatter,
                 "task protocol request is not a legal value: {error}"
-            ),
-            Self::UnknownBackend { backend_idx } => write!(
-                formatter,
-                "scheduled backend {backend_idx} has no frozen backend process identity"
-            ),
-            Self::KernelKeyCollision { first, second } => write!(
-                formatter,
-                "tasks {first} and {second} derive the same fragment instance id"
             ),
             Self::Capacity(bound) => write!(formatter, "task protocol capacity bound: {bound}"),
             Self::QueueResidenceExpired {
@@ -463,9 +429,6 @@ impl fmt::Display for TaskExecutionError {
                     "{kind} failed before a Worker receipt: {result:?}"
                 )
             }
-            Self::ResultStream(verdict) => {
-                write!(formatter, "root result stream is not intact: {verdict}")
-            }
             Self::FinalInfo(disagreement) => write!(formatter, "{disagreement}"),
             Self::ParticipantUnobservable { backend, state } => write!(
                 formatter,
@@ -479,6 +442,7 @@ impl fmt::Display for TaskExecutionError {
 impl std::error::Error for TaskExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Workload(error) => Some(error),
             Self::NativeTransport(error) => Some(error),
             Self::Actor(error) => Some(error),
             Self::Establish(error) => Some(error),
@@ -509,17 +473,6 @@ impl From<CapacityBound> for TaskExecutionError {
     fn from(bound: CapacityBound) -> Self {
         Self::Capacity(bound)
     }
-}
-
-/// A schedule fact that names the placement it came from.
-pub(crate) fn schedule_error(
-    placement: &FragmentInstancePlacement,
-    detail: impl fmt::Display,
-) -> TaskExecutionError {
-    TaskExecutionError::Schedule(format!(
-        "fragment {} instance {}: {detail}",
-        placement.fragment_id, placement.instance_index
-    ))
 }
 
 /// FE-authored facts for ordinary Worker protocol verdicts. An originating
@@ -576,7 +529,10 @@ impl novarocks_execution_contract::failure::FailureProjection for TaskProtocolFa
         };
         let (class, code) = match self {
             Self::OperationTimedOut => (FailureClass::Dependency, 14),
-            Self::IdentityMismatch => (FailureClass::Invariant, 15),
+            Self::IdentityMismatch => return FailureFact::new(
+                FailureClass::Invariant,
+                novarocks_query_application::execution_error::TASK_PROTOCOL_IDENTITY_MISMATCH_REASON,
+            ),
             Self::CompatibilityMismatch => (FailureClass::Invariant, 16),
             Self::ContextNotEstablished => (FailureClass::Invariant, 17),
             Self::ContextConflict => (FailureClass::Invariant, 18),
@@ -596,6 +552,43 @@ impl novarocks_execution_contract::failure::FailureProjection for TaskProtocolFa
     }
 }
 
+/// The same protocol reason author preserves a locally refused operation's
+/// fact without claiming that a Worker sent a receipt.
+pub(crate) fn local_protocol_refusal(
+    kind: OperationKind,
+    outcome: OperationOutcome,
+) -> novarocks_query_application::execution_error::ExecutionFailureInput {
+    use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+    use novarocks_query_application::execution_error::{
+        ExecutionFailureInput, ExecutionFailureSite,
+    };
+    ExecutionFailureInput::new(
+        TaskProtocolFailureReason::terminal_verdict(outcome).failure_fact(),
+        SafeDetail::truncating(&format!("{kind} returned {outcome:?}")),
+        ExecutionFailureSite::Coordinator,
+    )
+}
+
+/// Project only a settled local dispatch refusal; identity, Worker and
+/// cleanup failures keep their original owners and typed branches.
+pub(crate) fn dispatch_rejection(
+    acknowledgement: &crate::task_execution::intent::OperationAcknowledgement,
+    kind: OperationKind,
+) -> TaskExecutionError {
+    if let Some(input) = acknowledgement.local_failure() {
+        return TaskExecutionError::Execution(input.clone());
+    }
+    if acknowledgement.dispatch_result() == OperationDispatchResult::NonWorkerRejected
+        && let Some(cause) = acknowledgement.governance_failure()
+    {
+        return TaskExecutionError::Workload(cause.clone());
+    }
+    TaskExecutionError::DispatchRejected {
+        kind,
+        result: acknowledgement.dispatch_result(),
+    }
+}
+
 impl TaskExecutionError {
     /// Boundary projection, not a second Task conclusion or a recovery gate.
     pub(crate) fn preparation_input(
@@ -607,7 +600,29 @@ impl TaskExecutionError {
             ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
         };
         match self {
+            Self::Workload(error) => {
+                return ExecutionFailureInput::new(
+                    error.failure_fact(),
+                    // WorkError contains only producer-defined scalar facts,
+                    // not Native payloads or arbitrary exception messages.
+                    SafeDetail::truncating_display(format_args!(
+                        "Native workload admission failed: {error}"
+                    )),
+                    ExecutionFailureSite::Coordinator,
+                );
+            }
             Self::Execution(input) => return input.clone(),
+            Self::SplitAssignment(error) => {
+                return error.execution_failure().unwrap_or_else(|| {
+                    ExecutionFailureInput::new(
+                        QueryFailureReason::SplitAssignmentFailed.failure_fact(),
+                        SafeDetail::truncating(
+                            "split assignment could not deliver the frozen input",
+                        ),
+                        ExecutionFailureSite::Coordinator,
+                    )
+                });
+            }
             Self::NativeTransport(error) => {
                 return ExecutionFailureInput::new(
                     error.failure_fact(),
@@ -743,10 +758,6 @@ impl TaskExecutionError {
                     ExecutionFailureSite::Coordinator,
                 );
             }
-            Self::ResultStream(_) => (
-                QueryFailureReason::ResultProtocol,
-                ExecutionFailureSite::Coordinator,
-            ),
             _ => (
                 QueryFailureReason::PreparationProtocol,
                 ExecutionFailureSite::Coordinator,
@@ -781,6 +792,126 @@ mod canonical_input_tests {
             BackendProcessId::new_v7(),
         )
     }
+
+    #[test]
+    fn split_source_failures_preserve_the_original_neutral_input_including_resource_facts() {
+        use crate::query_execution::split_assignment::{ScanNodeKey, SplitAssignmentDriverError};
+        use novarocks_query_application::api::NativeAttemptPreparationFailure;
+        use novarocks_query_application::execution_error::ExecutionFailureInput;
+
+        let fact = FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(30).unwrap()),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Request),
+            constraint_scope: Some(ResourceScope::Process),
+            dimension: ResourceDimension::Positions,
+            requested: Some(2),
+            required_growth: None,
+            limit: Some(1),
+            live: Some(1),
+            committed: None,
+        });
+        let detail = SafeDetail::truncating("original split source failure fact");
+        let original =
+            ExecutionFailureInput::new(fact, detail.clone(), ExecutionFailureSite::Coordinator);
+        for split_error in [
+            SplitAssignmentDriverError::SourceClose {
+                scan: ScanNodeKey::new(1, 7),
+                fact,
+                detail: detail.clone(),
+            },
+            SplitAssignmentDriverError::SourceEnumeration {
+                scan: ScanNodeKey::new(1, 7),
+                fact,
+                detail: detail.clone(),
+            },
+        ] {
+            let projected = TaskExecutionError::SplitAssignment(split_error).preparation_input();
+            assert_eq!(projected, original);
+            assert_ne!(
+                projected.fact(),
+                QueryFailureReason::SplitAssignmentFailed.failure_fact()
+            );
+            let failure = NativeAttemptPreparationFailure::from_input(projected);
+            assert_eq!(failure.input(), &original);
+            assert_eq!(failure.error().execution_failure(), Some(&original));
+            assert_eq!(
+                failure.class(),
+                novarocks_coordination_contract::AttemptFailureClass::ResourceGovernance
+            );
+            assert_eq!(
+                failure.topology_requirement(),
+                novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+            );
+        }
+    }
+
+    #[test]
+    fn plain_split_failures_are_distinct_nonrecoverable_facts_with_fixed_safe_detail() {
+        use crate::query_execution::connector_domain::SplitAssignmentError;
+        use crate::query_execution::split_assignment::{
+            AssignmentTarget, ScanNodeKey, SplitAssignmentDriverError,
+        };
+        use novarocks_query_application::api::NativeAttemptPreparationFailure;
+
+        let scan = ScanNodeKey::new(1, 7);
+        let target = AssignmentTarget {
+            backend_idx: 0,
+            fragment_instance_id: novarocks_types::UniqueId::new(11, 12),
+        };
+        let raw = "BackendLost: private provider token must never be a recovery signal";
+        for error in [
+            SplitAssignmentDriverError::Closed,
+            SplitAssignmentDriverError::DeliveryInProgress,
+            SplitAssignmentDriverError::NoAdmittedTask { scan },
+            SplitAssignmentDriverError::Assignment(SplitAssignmentError::AlreadyTerminal {
+                plan_node_id: 7,
+            }),
+            SplitAssignmentDriverError::Transport {
+                target: target.clone(),
+                detail: raw.to_owned(),
+            },
+            SplitAssignmentDriverError::Rejected {
+                target,
+                reason: raw.to_owned(),
+                detail: raw.to_owned(),
+            },
+            SplitAssignmentDriverError::SplitSource {
+                scan: Some(scan),
+                detail: raw.to_owned(),
+            },
+        ] {
+            let input = TaskExecutionError::SplitAssignment(error).preparation_input();
+            assert_eq!(
+                input.fact(),
+                QueryFailureReason::SplitAssignmentFailed.failure_fact()
+            );
+            assert_eq!(input.fact().reason().code(), 176);
+            assert_ne!(
+                input.fact().reason(),
+                QueryFailureReason::BackendLost.failure_fact().reason()
+            );
+            assert_eq!(
+                input.detail().as_str(),
+                "split assignment could not deliver the frozen input"
+            );
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            let failure = NativeAttemptPreparationFailure::from_input(input.clone());
+            assert_eq!(
+                failure.class(),
+                novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure
+            );
+            assert_eq!(
+                failure.topology_requirement(),
+                novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+            );
+            assert_eq!(failure.error().execution_failure(), Some(&input));
+            assert!(!failure.error().message().contains(raw));
+        }
+    }
+
     #[test]
     fn domain_operation_keeps_original_fact_detail_and_exact_operation_identity() {
         let context = context();
@@ -892,8 +1023,8 @@ mod canonical_input_tests {
     }
     #[test]
     fn only_original_covered_connection_loss_requests_exact_process_recovery() {
+        use novarocks_coordination_contract::AttemptFailureClass;
         use novarocks_query_application::api::NativeAttemptTopologyRequirement;
-        use novarocks_query_application::coordination::AttemptFailureClass;
         let backend = BackendProcessId::new_v7();
         let actual = TaskExecutionError::ParticipantUnobservable {
             backend,
@@ -1047,22 +1178,7 @@ mod capacity_projection_tests {
         assert_eq!(queue.requested, None);
         assert_eq!(queue.limit, Some(7));
     }
-    #[test]
-    fn process_queue_preserves_carrier_bytes_without_fabricating_a_limit() {
-        let input = TaskExecutionError::Capacity(CapacityBound::ProcessTransportQueue {
-            lane: DispatchLane::Create,
-            bytes: 19,
-        })
-        .preparation_input();
-        let facts = input.fact().resource().unwrap();
-        assert_eq!(input.fact().reason().code(), 48);
-        assert_eq!(facts.requested, Some(19));
-        assert_eq!(facts.limit, None);
-        assert_eq!(facts.constraint_scope, Some(ResourceScope::Process));
-        assert_eq!(facts.required_growth, None);
-        assert_eq!(facts.live, None);
-        assert_eq!(facts.committed, None);
-    }
+
     #[test]
     fn descriptor_and_request_boundaries_delegate_the_original_owner_fact() {
         use novarocks_execution_contract::failure::FailureProjection;
@@ -1101,7 +1217,7 @@ mod actor_gate_failure_carry_tests {
         assert_eq!(input.fact().evidence(), FailureEvidence::StopObservation);
         assert_eq!(
             input.attempt_class(),
-            novarocks_query_application::coordination::AttemptFailureClass::ExecutionFailure
+            novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure
         );
     }
 }

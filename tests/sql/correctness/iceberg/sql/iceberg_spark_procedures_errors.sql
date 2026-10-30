@@ -29,14 +29,14 @@ PROPERTIES (
   "iceberg.catalog.warehouse" = "${iceberg_test_warehouse}/proc_err_${uuid0}",
   "aws.s3.endpoint" = "${oss_endpoint}",
   "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "static",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
+  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
   "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
   "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "static",
-  "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
+  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
   "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.enable_path_style_access" = "true"
+  "aws.s3.enable_path_style_access" = "${oss_path_style}"
 );
 CREATE DATABASE proc_err_${uuid0}.ns_${uuid0};
 CREATE TABLE proc_err_${uuid0}.ns_${uuid0}.orders (
@@ -74,7 +74,12 @@ CALL proc_err_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0
 CALL proc_err_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.orders', options => map('target-file-size-bytes', '134217728'));
 
 -- query 7
--- @expect_error=V2 Parquet position delete rewrite is not supported
+-- The original V2 refusal retains its typed Data fact through safe projection.
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 CALL proc_err_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.v2_orders', options => map('rewrite-all', 'true'));
 
 -- query 8

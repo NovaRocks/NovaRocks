@@ -19,6 +19,7 @@ explicit_only = false
 
 [impact]
 paths = [
+    "novarocks/execution/src/exec/hash_table/**",
     "novarocks/execution/src/exec/operators/aggregate/**",
     "novarocks/execution/src/exec/operators/compiled_aggregate*.rs",
     "novarocks/functions/src/builtin/aggregate*.rs",

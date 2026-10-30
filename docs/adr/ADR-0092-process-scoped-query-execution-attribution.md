@@ -10,7 +10,7 @@ provenance:
   - "discussion: 2026-08-20 query execution process attribution"
 code-anchors:
   - "novarocks/types/src/identity.rs (QueryIdAttribution)"
-  - "novarocks/frontend/src/coordinator/execution.rs (UniqueQueryIdSource)"
+  - "novarocks/query-application/src/coordination/supervisor.rs (ProcessQueryIdAllocator)"
 ---
 
 ## 问题

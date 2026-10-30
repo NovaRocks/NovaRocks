@@ -1977,6 +1977,16 @@ mod statistics {
     }
 
     fn compiled(target: u32, rows: &[(i64, Option<&str>)], writer_dop: usize) -> Compiled {
+        compiled_with_finish_package(target, rows, writer_dop, 1, |package| package)
+    }
+
+    fn compiled_with_finish_package(
+        target: u32,
+        rows: &[(i64, Option<&str>)],
+        writer_dop: usize,
+        finish_dop: usize,
+        finish_package: impl FnOnce(FragmentPackage) -> FragmentPackage,
+    ) -> Compiled {
         let catalog = theta_catalog();
         let ordinal = WriteTargetOrdinal::try_new(target).unwrap();
         let (plan, receiver) = plan(target, rows);
@@ -2005,6 +2015,8 @@ mod statistics {
             &FixtureControl,
         )
         .unwrap();
+        let finish = packages.remove(&FragmentId::new(2)).unwrap();
+        packages.insert(FragmentId::new(2), finish_package(finish));
         let provider = adapter().binding().descriptor().provider_id.clone();
         let providers = PureProviderProgramCatalog::try_new(
             &[PureProviderManifestEntry::new(
@@ -2048,7 +2060,7 @@ mod statistics {
         };
         Compiled {
             writer: compile(FragmentId::new(1), writer_dop, false),
-            finish: compile(FragmentId::new(2), 1, true),
+            finish: compile(FragmentId::new(2), finish_dop, true),
             receiver,
         }
     }
@@ -3217,4 +3229,5 @@ mod statistics {
     // Reuse the actual checked Physical writer/finish fixture, immutable pools,
     // canonical call requests, LocalCompiler and original writer/finish bodies.
     include!("compiled_writer_root_positive_statistics_tests.rs");
+    include!("compiled_writer_logical_finish_graph_tests.rs");
 }

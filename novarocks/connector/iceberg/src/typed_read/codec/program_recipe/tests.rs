@@ -808,7 +808,7 @@ fn complete_public_field_name_null_carrier_field_id_and_nominal_mutations_refuse
     assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
     wrong = fixture.clone();
     let mut metadata = wrong.fields[1].metadata().clone();
-    metadata.insert(PARQUET_FIELD_ID_META_KEY.into(), "999".into());
+    metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "999".to_string());
     wrong.fields[1] = Arc::new(wrong.fields[1].as_ref().clone().with_metadata(metadata));
     assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
     wrong = fixture.clone();
@@ -823,8 +823,8 @@ fn complete_read_preserves_public_unknown_metadata_without_reauthoring_it() {
     let mut fixture = Fixture::table();
     let mut metadata = fixture.fields[0].metadata().clone();
     metadata.insert(
-        "provider.uninterpreted".into(),
-        "retain exact source annotation".into(),
+        "provider.uninterpreted".to_string(),
+        "retain exact source annotation".to_string(),
     );
     fixture.fields[0] = Arc::new(fixture.fields[0].as_ref().clone().with_metadata(metadata));
     let frozen = fixture.build();

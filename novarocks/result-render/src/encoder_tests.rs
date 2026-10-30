@@ -17,7 +17,7 @@
 use super::*;
 use arrow::datatypes::{Field, Schema};
 use novarocks_result_contract::RenderColumn;
-fn make(value: String, with_float: bool) -> ArrowMysqlTextEncoder {
+fn make(value: String, with_float: bool) -> ArrowClientRowEncoder {
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![value.as_str()]))];
     let mut fields = vec![RenderField {
         native_type: N::String,
@@ -52,8 +52,15 @@ fn make(value: String, with_float: bool) -> ArrowMysqlTextEncoder {
             field,
         })
         .collect();
-    ArrowMysqlTextEncoder::try_new(
-        Arc::new(ClientRenderSchema::try_new(cols, batch.num_columns()).unwrap()),
+    ArrowClientRowEncoder::try_new(
+        Arc::new(
+            ClientRenderSchema::try_new(
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                cols,
+                batch.num_columns(),
+            )
+            .unwrap(),
+        ),
         batch,
     )
     .unwrap()
@@ -114,11 +121,11 @@ fn actual_scratch_capacity_layout() {
         e.cursor.stack.capacity(),
         size_of::<Task>(),
         e.cursor.stack.capacity() * size_of::<Task>(),
-        size_of::<ArrowMysqlTextEncoder>()
+        size_of::<ArrowClientRowEncoder>()
     );
     assert_eq!(
         capacity,
-        size_of::<ArrowMysqlTextEncoder>() + 65536 + 16384 + 196 * size_of::<Task>()
+        size_of::<ArrowClientRowEncoder>() + 65536 + 16384 + 196 * size_of::<Task>()
     );
     assert!(capacity < 2 * 1024 * 1024);
 }
@@ -134,6 +141,7 @@ fn single_cell_body(array: ArrayRef, native_type: N, name: &str) -> Vec<u8> {
     )
     .unwrap();
     let schema = ClientRenderSchema::try_new(
+        novarocks_result_contract::ClientPresentationFamily::MysqlText,
         vec![RenderColumn {
             source_ordinal: 0,
             source_slot: None,
@@ -147,7 +155,7 @@ fn single_cell_body(array: ArrayRef, native_type: N, name: &str) -> Vec<u8> {
         1,
     )
     .unwrap();
-    let mut encoder = ArrowMysqlTextEncoder::try_new(Arc::new(schema), batch).unwrap();
+    let mut encoder = ArrowClientRowEncoder::try_new(Arc::new(schema), batch).unwrap();
     let mut body = Vec::new();
     for _ in 0..1024 {
         let mut segment = [0; 4096];
@@ -240,6 +248,7 @@ fn typed_root_cursor_keeps_the_actual_input_type_owner_and_rejects_another_schem
         novarocks_result_contract::RootProfileId::V1,
         FrozenRootOutput::ClientRows(
             ClientRenderSchema::try_new(
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
                 vec![RenderColumn {
                     source_ordinal: 0,
                     source_slot: Some(7),
@@ -259,17 +268,17 @@ fn typed_root_cursor_keeps_the_actual_input_type_owner_and_rejects_another_schem
         schema: schema.clone(),
         binding,
     });
-    let proof = ValidatedMysqlInput::try_new(
+    let proof = ValidatedClientInput::try_new(
         ValidatedClientInputTypes::try_new(contract, owner.clone()).unwrap(),
     )
     .unwrap();
     let other_batch =
         RecordBatch::try_new(Arc::new(schema.as_ref().clone()), batch.columns().to_vec()).unwrap();
     assert!(
-        ArrowMysqlTextEncoder::try_new_typed_root(proof.clone(), other_batch).is_err(),
+        ArrowClientRowEncoder::try_new_typed_root(proof.clone(), other_batch).is_err(),
         "a different physical schema cannot borrow a previously established proof"
     );
-    let mut encoder = ArrowMysqlTextEncoder::try_new_typed_root(proof.clone(), batch).unwrap();
+    let mut encoder = ArrowClientRowEncoder::try_new_typed_root(proof.clone(), batch).unwrap();
     drop(storage);
     drop(owner);
     drop(proof);

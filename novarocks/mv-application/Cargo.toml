@@ -10,6 +10,7 @@ workspace = true
 [features]
 
 [dependencies]
+novarocks-failure-contract.workspace = true
 novarocks-type-contract.workspace = true
 apache-avro.workspace = true
 async-trait.workspace = true

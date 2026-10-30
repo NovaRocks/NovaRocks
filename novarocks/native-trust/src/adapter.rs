@@ -3,7 +3,6 @@
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
 use std::{
-    any::Any,
     fmt,
     future::Future,
     io,
@@ -16,115 +15,16 @@ use std::{
 use hyper_util::rt::TokioIo;
 use novarocks_types::{NativeEndpoint, NativeReferenceHost};
 use rustls::{ClientConfig, ServerConfig, pki_types::ServerName};
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::TcpStream,
-    sync::Semaphore,
-};
+use tokio::{net::TcpStream, sync::Semaphore};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tower::Service;
 
+use novarocks_resource_contract::{
+    DependencyFactError, NetworkServiceScheme, SelectedNetworkOrigin,
+};
+use novarocks_transport_io::BoxedIo;
+
 use crate::{AutomaticTlsMaterial, NativeTlsMaterial, NativeTransportMode, NativeTrustFailureKind};
-
-/// Object-safe Native IO for Tonic's `connect_with_connector` bridge. The
-/// connector preserves the `NativeEndpoint` reference host for TLS name
-/// verification; DNS resolution never becomes its identity key.
-pub trait NativeIo: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> NativeIo for T {}
-pub type BoxedNativeIo = Box<dyn NativeIo>;
-
-/// Native IO that keeps a caller-supplied guard alive until the transport
-/// itself has been destroyed.
-///
-/// The guard drops after the boxed transport, even when the transport
-/// destructor unwinds, so an admission position carried by the guard is never
-/// returned while its connection's socket is still open. There is deliberately
-/// no IO or guard extraction API.
-pub struct OwnedNativeIo {
-    io: Option<BoxedNativeIo>,
-    guard: Option<Box<dyn Any + Send + Sync>>,
-}
-
-impl OwnedNativeIo {
-    pub fn new(io: BoxedNativeIo) -> Self {
-        Self {
-            io: Some(io),
-            guard: None,
-        }
-    }
-
-    pub fn with_guard<G: Send + Sync + 'static>(io: BoxedNativeIo, guard: G) -> Self {
-        Self {
-            io: Some(io),
-            guard: Some(Box::new(guard)),
-        }
-    }
-
-    fn io_mut(&mut self) -> &mut (dyn NativeIo + 'static) {
-        self.io.as_deref_mut().expect("owned Native IO is live")
-    }
-}
-
-impl fmt::Debug for OwnedNativeIo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OwnedNativeIo")
-            .field("guarded", &self.guard.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for OwnedNativeIo {
-    fn drop(&mut self) {
-        // The local guard unwinds after drop(io), even if the boxed
-        // destructor panics.
-        let guard = self.guard.take();
-        drop(self.io.take());
-        drop(guard);
-    }
-}
-
-impl AsyncRead for OwnedNativeIo {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(self.get_mut().io_mut()).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for OwnedNativeIo {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(self.get_mut().io_mut()).poll_write(cx, bytes)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buffers: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(self.get_mut().io_mut()).poll_write_vectored(cx, buffers)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.io
-            .as_deref()
-            .expect("owned Native IO is live")
-            .is_write_vectored()
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self.get_mut().io_mut()).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self.get_mut().io_mut()).poll_shutdown(cx)
-    }
-}
 
 /// How many Native DNS resolutions may run at once in one process.
 ///
@@ -262,7 +162,45 @@ impl NativeEndpointConnector {
         &self.endpoint
     }
 
-    pub async fn connect(&self) -> Result<BoxedNativeIo, NativeConnectFailure> {
+    /// Pure selected reference-host facts from this connector's real TLS state.
+    /// No URL allocation, DNS, credential acquisition or dial occurs here.
+    pub fn selected_network_origin(
+        &self,
+    ) -> Result<SelectedNetworkOrigin<'_>, DependencyFactError> {
+        Self::selected_origin_for(
+            &self.endpoint,
+            if self.client_tls.is_some() {
+                NativeTransportMode::Pem
+            } else {
+                NativeTransportMode::Disabled
+            },
+        )
+    }
+
+    /// Project the original endpoint under the route owner's already frozen
+    /// transport mode without constructing a connector or TLS configuration.
+    /// This is a fact only; it neither validates TLS material nor grants I/O.
+    pub fn selected_origin_for(
+        endpoint: &NativeEndpoint,
+        mode: NativeTransportMode,
+    ) -> Result<SelectedNetworkOrigin<'_>, DependencyFactError> {
+        let scheme = match mode {
+            NativeTransportMode::Disabled => NetworkServiceScheme::Http,
+            NativeTransportMode::Automatic | NativeTransportMode::Pem => {
+                NetworkServiceScheme::Https
+            }
+        };
+        // NativeEndpoint already normalized this exact reference identity.
+        // Never replace it with a DNS result or reparse its display as a URL.
+        let host = match endpoint.reference_host() {
+            NativeReferenceHost::Ip(std::net::IpAddr::V4(ip)) => url::Host::Ipv4(*ip),
+            NativeReferenceHost::Ip(std::net::IpAddr::V6(ip)) => url::Host::Ipv6(*ip),
+            NativeReferenceHost::Dns(name) => url::Host::Domain(name.as_str()),
+        };
+        SelectedNetworkOrigin::from_selected_host(scheme, host, endpoint.port())
+    }
+
+    pub async fn connect(&self) -> Result<BoxedIo, NativeConnectFailure> {
         self.connect_with(NativeDnsResolver::process()).await
     }
 
@@ -271,7 +209,7 @@ impl NativeEndpointConnector {
     pub async fn connect_with(
         &self,
         resolver: &NativeDnsResolver,
-    ) -> Result<BoxedNativeIo, NativeConnectFailure> {
+    ) -> Result<BoxedIo, NativeConnectFailure> {
         let addresses = resolver
             .resolve(&self.endpoint)
             .await
@@ -358,7 +296,7 @@ impl std::error::Error for NativeConnectFailure {
 }
 
 impl Service<http::Uri> for NativeEndpointConnector {
-    type Response = TokioIo<BoxedNativeIo>;
+    type Response = TokioIo<BoxedIo>;
     type Error = io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -407,13 +345,13 @@ impl NativeIncomingAdapter {
         self.mode
     }
 
-    pub async fn accept(&self, stream: TcpStream) -> Result<BoxedNativeIo, NativeTrustFailureKind> {
+    pub async fn accept(&self, stream: TcpStream) -> Result<BoxedIo, NativeTrustFailureKind> {
         match &self.server_tls {
             None => Ok(Box::new(stream)),
             Some(config) => TlsAcceptor::from(config.clone())
                 .accept(stream)
                 .await
-                .map(|stream| Box::new(stream) as BoxedNativeIo)
+                .map(|stream| Box::new(stream) as BoxedIo)
                 .map_err(|_| NativeTrustFailureKind::TransportConfiguration),
         }
     }
@@ -569,5 +507,117 @@ mod dns_tests {
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         available_becomes(&resolver, 1).await;
+    }
+}
+
+#[cfg(test)]
+mod selected_origin_tests {
+    use super::NativeEndpointConnector;
+    use crate::{
+        AutomaticTlsMaterial, DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust,
+        PemTransportMaterial, ValidatedSharedSecret,
+    };
+    use novarocks_secret::SecretValue;
+    use novarocks_types::NativeEndpoint;
+
+    #[test]
+    fn original_native_endpoint_projection_matches_url_origin_without_io() {
+        for (host, port) in [
+            ("127.0.0.1", 80),
+            ("EXAMPLE.org", 8443),
+            ("2001:0DB8:0:0::1", 443),
+            ("::ffff:192.0.2.1", 8443),
+        ] {
+            let endpoint = NativeEndpoint::from_host_port(host, port).unwrap();
+            for mode in [
+                NativeTransportMode::Disabled,
+                NativeTransportMode::Automatic,
+                NativeTransportMode::Pem,
+            ] {
+                let scheme = if mode == NativeTransportMode::Disabled {
+                    "http"
+                } else {
+                    "https"
+                };
+                let selected =
+                    NativeEndpointConnector::selected_origin_for(&endpoint, mode).unwrap();
+                let oracle = url::Url::parse(&format!(
+                    "{scheme}://{endpoint}/path?token=not-retained#private"
+                ))
+                .unwrap();
+                assert_eq!(
+                    selected.into_owned().as_str(),
+                    oracle.origin().ascii_serialization()
+                );
+            }
+            let connector = NativeEndpointConnector::plaintext(endpoint.clone());
+            assert_eq!(
+                connector.selected_network_origin().unwrap().into_owned(),
+                NativeEndpointConnector::selected_origin_for(
+                    &endpoint,
+                    NativeTransportMode::Disabled
+                )
+                .unwrap()
+                .into_owned()
+            );
+        }
+        let first = NativeEndpoint::from_host_port("same.example", 19060).unwrap();
+        let alias = NativeEndpoint::from_host_port("alias.example", 19060).unwrap();
+        assert_ne!(
+            NativeEndpointConnector::selected_origin_for(&first, NativeTransportMode::Disabled)
+                .unwrap()
+                .into_owned(),
+            NativeEndpointConnector::selected_origin_for(&alias, NativeTransportMode::Disabled)
+                .unwrap()
+                .into_owned()
+        );
+        assert!(NativeEndpoint::from_host_port("user@host/path", 19060).is_err());
+    }
+
+    #[test]
+    fn actual_plaintext_automatic_and_pem_connector_state_owns_the_scheme_without_io() {
+        let endpoint = NativeEndpoint::from_host_port("LOCALHOST", 443).unwrap();
+        let trust = NativeTrust::new(
+            DeploymentId::parse("selected-origin-pure").unwrap(),
+            ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))
+                .unwrap(),
+            NativeCallerSubject::parse("fe@localhost:19040").unwrap(),
+            NativeTransportMode::Automatic,
+        );
+        let material = AutomaticTlsMaterial::for_endpoint(trust, endpoint.clone()).unwrap();
+        let automatic = NativeEndpointConnector::automatic(endpoint.clone(), &material).unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let certificate = certified.cert.pem();
+        let pem = PemTransportMaterial::new(
+            certificate.clone().into_bytes(),
+            certified.key_pair.serialize_pem().into_bytes(),
+            certificate.into_bytes(),
+        )
+        .unwrap()
+        .tls_material()
+        .unwrap();
+        let pem = NativeEndpointConnector::pem(endpoint.clone(), &pem);
+        let plaintext = NativeEndpointConnector::plaintext(endpoint);
+        assert_eq!(
+            automatic
+                .selected_network_origin()
+                .unwrap()
+                .into_owned()
+                .as_str(),
+            "https://localhost"
+        );
+        assert_eq!(
+            pem.selected_network_origin().unwrap().into_owned().as_str(),
+            "https://localhost"
+        );
+        assert_eq!(
+            plaintext
+                .selected_network_origin()
+                .unwrap()
+                .into_owned()
+                .as_str(),
+            "http://localhost:443"
+        );
+        // No connect(), DNS resolver, listener, runtime, service or socket exists.
     }
 }

@@ -52,3 +52,16 @@ pub(crate) fn shared_owner<T, E>(
         .map_err(|_| crate::ValueError::Invariant(crate::ValueViolation::Bounds))?;
     observe(ValueStructure::SharedOwner(layout.pad_to_align())).map_err(crate::ValueFailure::Caller)
 }
+
+// This is the actual Arc slice allocated by publication, independent of the
+// temporary Vec table observed through Growth. Empty Arc slices allocate too.
+pub(crate) fn shared_slice_owner<T, E>(
+    count: usize,
+    observe: &mut StructureObserver<'_, E>,
+) -> Result<(), crate::ValueFailure<E>> {
+    use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
+    let payload = std::alloc::Layout::array::<T>(count)
+        .map_err(|_| crate::ValueError::Layout(LayoutResourceError::Arithmetic))?;
+    let layout = arc_layout(payload).map_err(crate::ValueError::Layout)?;
+    observe(ValueStructure::SharedOwner(layout)).map_err(crate::ValueFailure::Caller)
+}

@@ -3,10 +3,14 @@ Explain String
 TABLE STATS ref=0 table=iceberg_opt.${case_db}.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:GATHER stats={rows=990}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 0
@@ -22,10 +26,14 @@ Explain String
 TABLE STATS ref=0 table=iceberg_opt.${case_db}.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:GATHER stats={rows=100}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 0
@@ -39,6 +47,8 @@ PLAN FRAGMENT 1
     4:BROADCAST EXCHANGE stats={rows=100}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 4
@@ -50,11 +60,15 @@ Explain String
 TABLE STATS ref=0 table=iceberg_opt.${case_db}.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:TOP-N (limit=10, offset=0) [v DESC NULLS LAST] stats={rows=10}
   1:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 1

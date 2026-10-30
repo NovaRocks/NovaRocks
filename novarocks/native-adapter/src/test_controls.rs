@@ -20,7 +20,7 @@
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_failpoint::scope::{ActionClaim, ControlCancellation, GrantHandle, ProcessBinding};
 use novarocks_failpoint::target_binding::{
-    RoleProcessReceipt, StatementExecutionBinding, StatementInputNomination,
+    RoleProcessReceipt, StatementExecutionBinding, StatementInputNomination, StatementTaskBinding,
     StatementWorkNomination,
 };
 use novarocks_failpoint::{QueryLifecycleFaultKind, QueryLifecycleFaultScope};
@@ -36,6 +36,7 @@ struct FaultGrant {
     kind: QueryLifecycleFaultKind,
     bind: bool,
     replay_barrier: bool,
+    remote_writer_sender: bool,
     target_session_id: String,
     target_process_receipt: Option<PathBuf>,
     root: PathBuf,
@@ -50,6 +51,7 @@ struct Claimed {
     kind: QueryLifecycleFaultKind,
     grant_id: String,
     binding: StatementExecutionBinding,
+    selected_task: Option<(u32, u32)>,
     ended: Arc<AtomicBool>,
     root: PathBuf,
     permission: Mutex<ActionClaim>,
@@ -235,6 +237,7 @@ impl Drop for NativeReplayTargetReservation {
 struct NominationPin {
     input: Option<StatementInputNomination>,
     statement: Option<StatementWorkNomination>,
+    selected_writer_task: Option<TaskIdentity>,
 }
 
 /// Composition constructs this once and injects the same role-local handle
@@ -465,7 +468,30 @@ impl NativeTestControls {
                 Some(serde_json::Value::Bool(true)) if matches!(action, "task-update-terminal-ack-drop" | "bind-task-update-terminal-ack-drop") => true,
                 Some(_) => return Err("split consumption refinement requires the terminal ACK-drop fault and literal true".into()),
             };
-            if parameters.len() != (if bind { 6 } else { 5 }) + usize::from(replay_barrier) {
+            let remote_writer_sender = match parameters.get("task_selector") {
+                None => false,
+                Some(serde_json::Value::String(value))
+                    if value == "remote-writer-sender"
+                        && matches!(
+                            action,
+                            "task-execution-failure"
+                                | "bind-task-execution-failure"
+                                | "create-task-before-worker-hold"
+                                | "bind-create-task-before-worker-hold"
+                        ) =>
+                {
+                    true
+                }
+                Some(_) => return Err(
+                    "remote writer selection requires its exact Task failure or Create hold action"
+                        .into(),
+                ),
+            };
+            if parameters.len()
+                != (if bind { 6 } else { 5 })
+                    + usize::from(replay_barrier)
+                    + usize::from(remote_writer_sender)
+            {
                 return Err("Native fault grant target parameters are invalid".into());
             }
             let target_process_receipt = if bind {
@@ -542,6 +568,7 @@ impl NativeTestControls {
                 kind,
                 bind,
                 replay_barrier,
+                remote_writer_sender,
                 target_session_id,
                 target_process_receipt,
                 root,
@@ -709,6 +736,48 @@ impl NativeTestControls {
         process: BackendProcessId,
         execution: QueryExecutionId,
     ) -> Result<usize, String> {
+        self.publish_binding(nomination, process, execution, None)
+    }
+
+    pub fn needs_remote_writer_selection(
+        &self,
+        nomination: &StatementWorkNomination,
+    ) -> Result<bool, String> {
+        self.validate_frozen_nomination(nomination)?;
+        let pins = self
+            .nominations
+            .lock()
+            .map_err(|_| "Native first nomination lock failed")?;
+        Ok(self.faults.iter().enumerate().any(|(index, grant)| {
+            grant.bind
+                && grant.remote_writer_sender
+                && grant.statement_run_token == nomination.statement_run_token
+                && grant.handle.cancellation().is_active()
+                && pins[index].selected_writer_task.is_none()
+        }))
+    }
+
+    pub fn publish_nominated_writer_task(
+        &self,
+        nomination: &StatementWorkNomination,
+        task: TaskIdentity,
+        remote_destination: BackendProcessId,
+    ) -> Result<usize, String> {
+        self.publish_binding(
+            nomination,
+            task.backend_process_id(),
+            task.query_execution_id(),
+            Some((task, remote_destination)),
+        )
+    }
+
+    fn publish_binding(
+        &self,
+        nomination: &StatementWorkNomination,
+        process: BackendProcessId,
+        execution: QueryExecutionId,
+        selected: Option<(TaskIdentity, BackendProcessId)>,
+    ) -> Result<usize, String> {
         self.validate_frozen_nomination(nomination)?;
         let mut published = 0;
         let mut published_once = self
@@ -717,6 +786,7 @@ impl NativeTestControls {
             .map_err(|_| "Native nomination state lock failed")?;
         for (index, grant) in self.faults.iter().enumerate().filter(|(_, grant)| {
             grant.bind
+                && grant.remote_writer_sender == selected.is_some()
                 && grant.statement_run_token == nomination.statement_run_token
                 && grant.handle.cancellation().is_active()
         }) {
@@ -753,25 +823,74 @@ impl NativeTestControls {
             )? {
                 continue;
             }
+            if let Some((task, _)) = selected {
+                // Refine the existing finite nomination pins once for this
+                // statement, without spending unselected candidate grants.
+                let mut pins = self
+                    .nominations
+                    .lock()
+                    .map_err(|_| "Native first nomination lock failed")?;
+                let same_selection = |candidate: &FaultGrant| {
+                    candidate.bind
+                        && candidate.remote_writer_sender
+                        && candidate.statement_run_token == nomination.statement_run_token
+                };
+                if self
+                    .faults
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| same_selection(candidate))
+                    .any(|(index, _)| {
+                        pins[index]
+                            .selected_writer_task
+                            .is_some_and(|old| old != task)
+                    })
+                {
+                    return Ok(published);
+                }
+                for (index, _) in self
+                    .faults
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| same_selection(candidate))
+                {
+                    pins[index].selected_writer_task = Some(task);
+                }
+            }
             let mut permission = grant
                 .handle
                 .claim_once(grant.handle.cancellation().process())
                 .map_err(|error| error.to_string())?;
-            StatementExecutionBinding::new(
+            let binding = StatementExecutionBinding::new(
                 grant.target_session_id.clone(),
                 grant.statement_run_token.clone(),
                 grant.backend_index,
                 process,
                 execution,
             )
-            .map_err(|error| error.to_string())?
-            .write_private(&fault_binding_path(
+            .map_err(|error| error.to_string())?;
+            let path = fault_binding_path(
                 &grant.root,
                 grant.kind,
                 grant.backend_index,
                 &grant.statement_run_token,
-            ))
-            .map_err(|error| format!("publish nominated Native fault: {error}"))?;
+            );
+            if let Some((task, destination)) = selected {
+                StatementTaskBinding::new(
+                    binding.clone(),
+                    task.stage_id(),
+                    task.task_id(),
+                    destination,
+                )
+                .map_err(|error| error.to_string())?
+                .write_private(&path.with_extension("task.json"))
+                .map_err(|error| format!("publish exact Native Task selection: {error}"))?;
+            }
+            // The existing execution binding becomes visible only after its
+            // complete narrowing record, so BE cannot consume a wider grant.
+            binding
+                .write_private(&path)
+                .map_err(|error| format!("publish nominated Native fault: {error}"))?;
             permission.record_hit().map_err(|error| error.to_string())?;
             published_once.insert(index);
             published += 1;
@@ -883,7 +1002,7 @@ impl NativeTestControls {
         process: BackendProcessId,
         persistent: bool,
     ) -> Result<Option<NativeFaultClaim>, String> {
-        self.claim_inner(kind, execution, process, persistent, false)
+        self.claim_inner(kind, execution, process, persistent, false, None)
     }
 
     /// Reserve the real once grant before the second Root read can offer Data.
@@ -900,6 +1019,7 @@ impl NativeTestControls {
             process,
             true,
             true,
+            None,
         )
     }
 
@@ -929,6 +1049,22 @@ impl NativeTestControls {
         visible_prefix_activation(&claim.inner.root, &claim.inner.binding)
     }
 
+    pub(crate) fn claim_task(
+        &self,
+        kind: QueryLifecycleFaultKind,
+        identity: TaskIdentity,
+        persistent: bool,
+    ) -> Result<Option<NativeFaultClaim>, String> {
+        self.claim_inner(
+            kind,
+            identity.query_execution_id(),
+            identity.backend_process_id(),
+            persistent,
+            false,
+            Some(identity),
+        )
+    }
+
     fn claim_inner(
         &self,
         kind: QueryLifecycleFaultKind,
@@ -936,6 +1072,7 @@ impl NativeTestControls {
         process: BackendProcessId,
         persistent: bool,
         allow_dormant_visible_prefix: bool,
+        task: Option<TaskIdentity>,
     ) -> Result<Option<NativeFaultClaim>, String> {
         if allow_dormant_visible_prefix
             && kind != QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix
@@ -948,6 +1085,9 @@ impl NativeTestControls {
             .map_err(|_| "Native fault claim lock failed")?;
         if let Some(scope) = claimed.get(&(kind, execution)) {
             if !persistent
+                || scope.inner.selected_task.is_some_and(|selected| {
+                    task.map(|task| (task.stage_id().get(), task.task_id().get())) != Some(selected)
+                })
                 || scope.process_id != process
                 || !scope.cancellation().is_active()
                 || scope.action_ended()?
@@ -1012,6 +1152,33 @@ impl NativeTestControls {
             {
                 continue;
             }
+            let selected_task = if grant.remote_writer_sender {
+                let Some(task) = task else {
+                    continue;
+                };
+                let selected = match StatementTaskBinding::read_private(
+                    &fault_binding_path(
+                        &grant.root,
+                        kind,
+                        grant.backend_index,
+                        &grant.statement_run_token,
+                    )
+                    .with_extension("task.json"),
+                ) {
+                    Ok(selected) => selected,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(format!("read exact Native Task selection: {error}")),
+                };
+                if selected.statement != binding
+                    || selected.stage_id != task.stage_id().get()
+                    || selected.task_id != task.task_id().get()
+                {
+                    continue;
+                }
+                Some((selected.stage_id, selected.task_id))
+            } else {
+                None
+            };
             let scope = QueryLifecycleFaultScope {
                 token: binding.statement_run_token.clone(),
                 execution_id: execution,
@@ -1031,6 +1198,7 @@ impl NativeTestControls {
                     kind,
                     grant_id: grant.handle.grant_id().to_owned(),
                     binding,
+                    selected_task,
                     ended: Arc::clone(&grant.ended),
                     root: grant.root.clone(),
                     permission: Mutex::new(permission),
@@ -1339,7 +1507,7 @@ pub(crate) mod tests {
             statement_run_token: nomination.statement_run_token.clone(),
             frontend_process_id: nomination.frontend_process_id.clone(),
             connection_id: nomination.connection_id,
-            session_epoch: nomination.session_epoch,
+            session_key: nomination.session_key,
             sql_sha256: Sha256::digest(sql.as_bytes()).into(),
         }
     }
@@ -1358,7 +1526,7 @@ pub(crate) mod tests {
         controlled_with_follow_up(action, false)
     }
     fn controlled_with_follow_up(action: &str, follow_up: bool) -> Controlled {
-        controlled_options(action, follow_up, false, 10_000)
+        controlled_options(action, follow_up, false, 10_000, false)
     }
     pub(crate) fn controlled_replay(lifetime_millis: u64) -> Controlled {
         controlled_options(
@@ -1366,6 +1534,7 @@ pub(crate) mod tests {
             false,
             true,
             lifetime_millis,
+            false,
         )
     }
     fn controlled_options(
@@ -1373,6 +1542,7 @@ pub(crate) mod tests {
         follow_up: bool,
         replay: bool,
         lifetime_millis: u64,
+        remote_writer_sender: bool,
     ) -> Controlled {
         let directory = tempfile::Builder::new()
             .prefix("g2-native-")
@@ -1390,6 +1560,9 @@ pub(crate) mod tests {
         } else {
             serde_json::json!({"action":action,"root":directory.path(),"backend_index":0,"statement_run_token":token,"target_session_id":"native-tests"})
         };
+        if remote_writer_sender {
+            parameters["task_selector"] = serde_json::json!("remote-writer-sender");
+        }
         if replay {
             parameters["hold_split_consumption_until_replay"] = serde_json::json!(true);
         }
@@ -1398,6 +1571,15 @@ pub(crate) mod tests {
             grant_id: "one-action".into(),
             parameters: parameters.clone(),
         }];
+        if remote_writer_sender {
+            let mut hold = parameters.clone();
+            hold["action"] = serde_json::json!("create-task-before-worker-hold");
+            domain_grants.push(DomainGrant {
+                domain: "native".into(),
+                grant_id: "same-writer-hold".into(),
+                parameters: hold,
+            });
+        }
         if follow_up {
             assert!(!matches!(
                 action,
@@ -1695,7 +1877,7 @@ pub(crate) mod tests {
             statement_run_token: fixture.token.clone(),
             frontend_process_id: fixture.frontend.to_string(),
             connection_id: 7,
-            session_epoch: 1,
+            session_key: 1,
             statement_generation: 1,
         };
         let input = statement_input(&nomination, role.scope().launch_id(), "SELECT 1");
@@ -2182,6 +2364,285 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    fn frozen_remote_writer_selection_narrows_both_actual_claims_and_keeps_root_unspent() {
+        let fixture = controlled_options("task-execution-failure", false, false, 10_000, true);
+        let kinds = [
+            QueryLifecycleFaultKind::TaskExecutionFailure,
+            QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold,
+        ];
+        let grants = kinds.iter().enumerate().map(|(i, kind)| DomainGrant {
+            domain: "native".into(), grant_id: format!("bind-{i}"),
+            parameters: serde_json::json!({"action":format!("bind-{}",kind.as_str()),
+                "root":fixture.directory.path(),"backend_index":0,"statement_run_token":fixture.token,
+                "target_session_id":"native-tests","target_process_receipt":fixture.runner.process_receipt_path(),
+                "task_selector":"remote-writer-sender"}),
+        }).collect();
+        let declaration = SessionDeclaration {
+            schema_version: 1,
+            session_id: "frontend-selected-writer".into(),
+            launch_id: fixture.frontend.to_string(),
+            role: SessionRole::Fe,
+            lifetime_millis: 10_000,
+            liveness_socket: fixture.directory.path().join("selected-frontend.sock"),
+            handshake_secret: "01234567890123456789012345678901".into(),
+            domain_grants: grants,
+        };
+        let path = fixture.directory.path().join("selected-frontend.json");
+        declaration.write_private(&path).unwrap();
+        let mut runner = RunnerSession::start(declaration).unwrap();
+        let mut role = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe)
+            .unwrap()
+            .bind(ProcessBinding::Frontend(fixture.frontend))
+            .unwrap();
+        let controls = NativeTestControls::from_grants(role.scope().grants_for("native")).unwrap();
+        let nomination = StatementWorkNomination {
+            target_session_id: "frontend-selected-writer".into(),
+            statement_run_token: fixture.token.clone(),
+            frontend_process_id: fixture.frontend.to_string(),
+            connection_id: 7,
+            session_key: 1,
+            statement_generation: 1,
+        };
+        let input = statement_input(
+            &nomination,
+            role.scope().launch_id(),
+            "INSERT INTO t SELECT * FROM s",
+        );
+        controls.pin_statement_input(&input).unwrap();
+        controls.nominate_statement(&input, &nomination).unwrap();
+        let selected = task(&fixture, 2);
+        let root_on_same_backend = task(&fixture, 1);
+        assert!(controls.needs_remote_writer_selection(&nomination).unwrap());
+        assert_eq!(
+            controls
+                .publish_nominated_binding(&nomination, fixture.process, fixture.execution)
+                .unwrap(),
+            0
+        );
+        for kind in kinds {
+            assert!(
+                fixture
+                    .controls
+                    .claim_task(kind, selected, false)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            controls
+                .publish_nominated_writer_task(
+                    &nomination,
+                    TaskIdentity::new(
+                        fixture.execution,
+                        selected.stage_id(),
+                        selected.task_id(),
+                        BackendProcessId::new_v7()
+                    ),
+                    BackendProcessId::new_v7()
+                )
+                .unwrap(),
+            0,
+            "an unselected candidate process consumes no bind grant"
+        );
+        assert!(role.scope().observations().is_empty());
+        let destination = BackendProcessId::new_v7();
+        assert_eq!(
+            controls
+                .publish_nominated_writer_task(&nomination, selected, destination)
+                .unwrap(),
+            2
+        );
+        assert!(!controls.needs_remote_writer_selection(&nomination).unwrap());
+        // A later attempt cannot redirect the same finite statement selection.
+        let pins = || {
+            controls
+                .nominations
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|pin| {
+                    (
+                        pin.input.clone(),
+                        pin.statement.clone(),
+                        pin.selected_writer_task,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let bindings = || {
+            kinds
+                .iter()
+                .flat_map(|kind| {
+                    let path =
+                        fault_binding_path(fixture.directory.path(), *kind, 0, &fixture.token);
+                    [path.clone(), path.with_extension("task.json")]
+                })
+                .map(|path| std::fs::read(path).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let hits = || {
+            [
+                role.scope()
+                    .observations()
+                    .iter()
+                    .filter(|event| event.event == "hit")
+                    .count(),
+                fixture
+                    .role
+                    .scope()
+                    .observations()
+                    .iter()
+                    .filter(|event| event.event == "hit")
+                    .count(),
+            ]
+        };
+        let original_pins = pins();
+        let original_bindings = bindings();
+        let original_hits = hits();
+        let later_task = TaskIdentity::new(
+            QueryExecutionId::new(fixture.execution.query_id(), AttemptId::new(2).unwrap())
+                .unwrap(),
+            selected.stage_id(),
+            novarocks_types::TaskId::new(31).unwrap(),
+            fixture.process,
+        );
+        assert_eq!(
+            controls
+                .publish_nominated_writer_task(&nomination, later_task, destination)
+                .unwrap(),
+            0
+        );
+        assert_eq!(pins(), original_pins);
+        assert_eq!(bindings(), original_bindings);
+        assert_eq!(hits(), original_hits);
+        assert!(
+            controls
+                .nominations
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|pin| pin.selected_writer_task == Some(selected))
+        );
+
+        for kind in kinds {
+            let path = fault_binding_path(fixture.directory.path(), kind, 0, &fixture.token);
+            let narrowing =
+                StatementTaskBinding::read_private(&path.with_extension("task.json")).unwrap();
+            assert_eq!(narrowing.stage_id, selected.stage_id().get());
+            assert_eq!(narrowing.task_id, selected.task_id().get());
+            assert_eq!(
+                narrowing.statement,
+                StatementExecutionBinding::read_private(&path).unwrap()
+            );
+            assert!(
+                fixture
+                    .controls
+                    .claim(kind, fixture.execution, fixture.process, true)
+                    .unwrap()
+                    .is_none(),
+                "an execution-only probe cannot bypass Task narrowing"
+            );
+            for foreign in [
+                root_on_same_backend,
+                task(&fixture, 3),
+                TaskIdentity::new(
+                    fixture.execution,
+                    novarocks_types::StageId::new(2).unwrap(),
+                    selected.task_id(),
+                    fixture.process,
+                ),
+                TaskIdentity::new(
+                    QueryExecutionId::new(fixture.execution.query_id(), AttemptId::new(2).unwrap())
+                        .unwrap(),
+                    selected.stage_id(),
+                    selected.task_id(),
+                    fixture.process,
+                ),
+                TaskIdentity::new(
+                    fixture.execution,
+                    selected.stage_id(),
+                    selected.task_id(),
+                    BackendProcessId::new_v7(),
+                ),
+            ] {
+                assert!(
+                    fixture
+                        .controls
+                        .claim_task(kind, foreign, true)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert!(fixture.role.scope().observations().is_empty());
+        }
+        for kind in kinds {
+            let persistent = kind == QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold;
+            let claim = fixture
+                .controls
+                .claim_task(kind, selected, persistent)
+                .unwrap()
+                .unwrap();
+            claim.record_hit().unwrap();
+            assert!(
+                fixture
+                    .controls
+                    .claim_task(kind, root_on_same_backend, true)
+                    .unwrap()
+                    .is_none(),
+                "a cached persistent claim remains exact to the selected Task"
+            );
+            assert_eq!(
+                fixture
+                    .controls
+                    .claim_task(kind, selected, persistent)
+                    .unwrap()
+                    .is_some(),
+                persistent
+            );
+            let binding = StatementExecutionBinding::read_private(&fault_binding_path(
+                fixture.directory.path(),
+                kind,
+                0,
+                &fixture.token,
+            ))
+            .unwrap();
+            end_fixture(&fixture, kind, &binding);
+            assert!(
+                fixture
+                    .controls
+                    .claim_task(kind, selected, true)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|e| e.event == "hit")
+                .count(),
+            2
+        );
+        assert_eq!(
+            controls
+                .publish_nominated_writer_task(&nomination, selected, destination)
+                .unwrap(),
+            0
+        );
+        let mut foreign = nomination.clone();
+        foreign.statement_generation += 1;
+        assert!(
+            controls
+                .publish_nominated_writer_task(&foreign, selected, destination)
+                .is_err()
+        );
+        role.close_and_join().unwrap();
+        runner.end_and_join().unwrap();
+    }
+
+    #[test]
     fn nomination_uses_authenticated_receipt_and_own_label_and_never_redirects_a_spent_grant() {
         let fixture = controlled("create-task-ack-drop");
         let parameters = serde_json::json!({"action":"bind-create-task-ack-drop","root":fixture.directory.path(),"backend_index":23,"statement_run_token":fixture.token,"target_session_id":"native-tests","target_process_receipt":fixture.runner.process_receipt_path()});
@@ -2220,7 +2681,7 @@ pub(crate) mod tests {
             statement_run_token: fixture.token.clone(),
             frontend_process_id: fixture.frontend.to_string(),
             connection_id: 7,
-            session_epoch: 1,
+            session_key: 1,
             statement_generation: 1,
         };
         let input = statement_input(&nomination, role.scope().launch_id(), "SELECT 1");
@@ -2311,7 +2772,7 @@ pub(crate) mod tests {
             statement_run_token: token.into(),
             frontend_process_id: frontend.to_string(),
             connection_id: 19,
-            session_epoch: 2,
+            session_key: 2,
             statement_generation: 3,
         };
         let backend = BackendProcessId::new_v7();
@@ -2354,7 +2815,7 @@ pub(crate) mod tests {
             let mut changed = a.clone();
             match field {
                 0 => changed.connection_id += 1,
-                1 => changed.session_epoch += 1,
+                1 => changed.session_key += 1,
                 2 => changed.frontend_process_id = FrontendProcessId::new_v7().to_string(),
                 _ => changed.target_session_id = "another-fe-session".into(),
             }
@@ -2421,7 +2882,7 @@ pub(crate) mod tests {
             statement_run_token: fixture.token.clone(),
             frontend_process_id: fixture.frontend.to_string(),
             connection_id: 7,
-            session_epoch: 1,
+            session_key: 1,
             statement_generation: 1,
         };
         let input = statement_input(&nomination, role.scope().launch_id(), "SELECT 1");
@@ -2817,7 +3278,7 @@ pub(crate) mod tests {
             statement_run_token: "selected-work".into(),
             frontend_process_id: frontend.to_string(),
             connection_id: 19,
-            session_epoch: 2,
+            session_key: 2,
             statement_generation: 3,
         };
         let first =
@@ -2918,7 +3379,7 @@ pub(crate) mod tests {
             statement_run_token: "original-input".into(),
             frontend_process_id: frontend.to_string(),
             connection_id: 7,
-            session_epoch: 1,
+            session_key: 1,
             statement_generation: 1,
         };
         let input = statement_input(&nomination, role.scope().launch_id(), "SELECT 1");
@@ -2954,7 +3415,7 @@ pub(crate) mod tests {
                 .all(|pin| pin.statement.is_none())
         );
         let replacement = StatementWorkNomination {
-            session_epoch: 2,
+            session_key: 2,
             ..nomination.clone()
         };
         let replacement_input = statement_input(&replacement, role.scope().launch_id(), "SELECT 1");

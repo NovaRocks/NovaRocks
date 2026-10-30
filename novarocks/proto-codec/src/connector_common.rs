@@ -64,7 +64,9 @@ pub fn decode_connector_payload(
     scan_message(encoded, &[(1, 2), (2, 2)], &root)?;
     let raw = dto::ConnectorEncodedPayload::decode(encoded)
         .map_err(|error| invalid(root.clone(), format!("malformed protobuf: {error}")))?;
-    let raw_header = raw.header.ok_or_else(|| missing(root.field("header")))?;
+    raw.header
+        .as_ref()
+        .ok_or_else(|| missing(root.field("header")))?;
     let encoded_header = extract_length_delimited(encoded, 1, &root)?;
     let header_path = root.field("header");
     scan_message(
@@ -75,7 +77,25 @@ pub fn decode_connector_payload(
     let encoded_catalog = extract_length_delimited(encoded_header, 2, &header_path)?;
     let catalog_path = header_path.field("catalog");
     scan_message(encoded_catalog, &[(1, 2), (2, 2)], &catalog_path)?;
+    finish_owned_connector_payload(raw, &mut ledger)
+}
 
+// The raw-wire entry above remains the strict unknown/duplicate-field author.
+// A decoded DTO has only its canonical known fields; consume those original
+// allocations instead of serializing and decoding them a second time.
+fn finish_owned_connector_payload(
+    raw: dto::ConnectorEncodedPayload,
+    ledger: &mut ConnectorDecodeLedger,
+) -> Result<ConnectorEncodedPayload, ConnectorCodecError> {
+    let root = ConnectorFieldPath::root("connector_payload");
+    let raw_header = raw.header.ok_or_else(|| missing(root.field("header")))?;
+    let header_path = root.field("header");
+    // The previous canonical wire scan reports the absent field number before
+    // any semantic header work. Preserve that public error path/precedence.
+    let raw_catalog = raw_header
+        .catalog
+        .ok_or_else(|| missing(header_path.field("field_2")))?;
+    let catalog_path = header_path.field("catalog");
     ledger.charge_items(8)?;
     ledger.check_depth(3)?;
     ledger.charge_scalar(raw_header.provider_id.len())?;
@@ -85,9 +105,6 @@ pub fn decode_connector_payload(
             "invalid provider identity",
         )
     })?;
-    let raw_catalog = raw_header
-        .catalog
-        .ok_or_else(|| missing(header_path.field("catalog")))?;
     ledger.charge_scalar(raw_catalog.catalog_name.len())?;
     ledger.charge_scalar(raw_catalog.version.len())?;
     let catalog_name =
@@ -129,8 +146,9 @@ pub fn decode_connector_payload_message(
     raw: dto::ConnectorEncodedPayload,
     limits: ConnectorDecodeLimits,
 ) -> Result<ConnectorEncodedPayload, ConnectorCodecError> {
-    let encoded = raw.encode_to_vec();
-    decode_connector_payload(&encoded, limits)
+    let mut ledger = ConnectorDecodeLedger::new(limits);
+    ledger.charge_raw(raw.encoded_len())?;
+    finish_owned_connector_payload(raw, &mut ledger)
 }
 
 /// Decode one envelope embedded in a purpose-specific carrier and prove that
@@ -142,27 +160,34 @@ pub fn decode_embedded_connector_payload(
     max_encoded_bytes: usize,
     path: FieldPath,
 ) -> Result<ConnectorEncodedPayload, ProtocolError> {
-    let raw = raw.ok_or_else(|| {
-        ProtocolError::new(
-            path.clone(),
-            ProtocolErrorKind::MissingField,
-            "provider payload must be present",
-        )
-    })?;
-    let encoded_len = raw.encoded_len();
-    if encoded_len > max_encoded_bytes {
-        return Err(ProtocolError::new(
-            path.clone(),
-            ProtocolErrorKind::OutOfRange,
-            format!("provider payload exceeds {max_encoded_bytes} encoded bytes"),
-        ));
-    }
+    // Keep the original borrowed API's rejection before its unavoidable DTO
+    // clone. Owning carriers use the move entry below and need no such clone.
+    check_embedded_envelope_size(raw, max_encoded_bytes, &path)?;
+    decode_embedded_owned_connector_payload(
+        raw.cloned(),
+        expected_category,
+        max_encoded_bytes,
+        path,
+    )
+}
+
+/// Consume an already-owned public envelope, retaining its original payload
+/// allocation. The same neutral limits/header/category checks still apply.
+/// Raw bytes must first use their carrier's existing wire decoder.
+pub fn decode_embedded_owned_connector_payload(
+    raw: Option<dto::ConnectorEncodedPayload>,
+    expected_category: ConnectorCodecCategory,
+    max_encoded_bytes: usize,
+    path: FieldPath,
+) -> Result<ConnectorEncodedPayload, ProtocolError> {
+    check_embedded_envelope_size(raw.as_ref(), max_encoded_bytes, &path)?;
+    let raw = raw.expect("the original embedded envelope size check requires presence");
     let envelope_slack = 4096usize;
     let limit = max_encoded_bytes.max(1);
     let limits =
         ConnectorDecodeLimits::try_new(limit, limit.saturating_add(envelope_slack), limit, 16, 8)
             .expect("finite embedded connector limits are valid");
-    let decoded = decode_connector_payload_message(raw.clone(), limits)
+    let decoded = decode_connector_payload_message(raw, limits)
         .map_err(|error| connector_error(path.clone(), error))?;
     if decoded.header().category() != expected_category {
         return Err(ProtocolError::new(
@@ -172,6 +197,29 @@ pub fn decode_embedded_connector_payload(
         ));
     }
     Ok(decoded)
+}
+
+fn check_embedded_envelope_size(
+    raw: Option<&dto::ConnectorEncodedPayload>,
+    max_encoded_bytes: usize,
+    path: &FieldPath,
+) -> Result<(), ProtocolError> {
+    let raw = raw.ok_or_else(|| {
+        ProtocolError::new(
+            (*path).clone(),
+            ProtocolErrorKind::MissingField,
+            "provider payload must be present",
+        )
+    })?;
+    let encoded_len = raw.encoded_len();
+    if encoded_len > max_encoded_bytes {
+        return Err(ProtocolError::new(
+            (*path).clone(),
+            ProtocolErrorKind::OutOfRange,
+            format!("provider payload exceeds {max_encoded_bytes} encoded bytes"),
+        ));
+    }
+    Ok(())
 }
 
 fn connector_error(path: FieldPath, error: ConnectorCodecError) -> ProtocolError {
@@ -535,6 +583,121 @@ mod compile_control_adapter_tests {
             assert_eq!(error.detail(), expected_detail);
             assert!(error.source().is_none());
         }
+    }
+
+    fn commit_envelope() -> dto::ConnectorEncodedPayload {
+        dto::ConnectorEncodedPayload {
+            header: Some(dto::ConnectorEnvelopeHeader {
+                provider_id: "test".into(),
+                catalog: Some(catalog_dto::CatalogHandle {
+                    catalog_name: "lake".into(),
+                    version: vec![9; 32],
+                }),
+                category: encode_connector_category(ConnectorCodecCategory::CommitFragment),
+                codec_revision: 1,
+            }),
+            payload: vec![7; 64],
+        }
+    }
+
+    #[test]
+    fn owned_message_validation_preserves_wire_header_limits_and_error_precedence() {
+        let valid = commit_envelope();
+        let mut cases = vec![valid.clone()];
+        let mut missing_header = valid.clone();
+        missing_header.header = None;
+        cases.push(missing_header);
+        let mut missing_catalog = valid.clone();
+        let header = missing_catalog.header.as_mut().unwrap();
+        header.catalog = None;
+        header.provider_id.clear();
+        cases.push(missing_catalog);
+        let mut bad_version = valid.clone();
+        bad_version
+            .header
+            .as_mut()
+            .unwrap()
+            .catalog
+            .as_mut()
+            .unwrap()
+            .version
+            .pop();
+        cases.push(bad_version);
+        let mut bad_category = valid.clone();
+        bad_category.header.as_mut().unwrap().category = i32::MAX;
+        cases.push(bad_category);
+        let mut bad_revision = valid.clone();
+        bad_revision.header.as_mut().unwrap().codec_revision = 0;
+        cases.push(bad_revision);
+        let limits = ConnectorDecodeLimits::try_new(8192, 8192, 8192, 16, 8).unwrap();
+        for raw in cases {
+            let encoded = raw.encode_to_vec();
+            let wire = decode_connector_payload(&encoded, limits);
+            let owned = decode_connector_payload_message(raw, limits);
+            match (wire, owned) {
+                (Ok(wire), Ok(owned)) => assert_eq!(wire, owned),
+                (Err(wire), Err(owned)) => {
+                    assert_eq!(wire.kind(), owned.kind());
+                    assert_eq!(wire.path(), owned.path());
+                    assert_eq!(wire.to_string(), owned.to_string());
+                }
+                pair => panic!("wire and owned validation disagree: {pair:?}"),
+            }
+        }
+        let encoded = valid.encode_to_vec();
+        let limits = ConnectorDecodeLimits::try_new(encoded.len() - 1, 8192, 8192, 16, 8).unwrap();
+        let wire = decode_connector_payload(&encoded, limits).unwrap_err();
+        let owned = decode_connector_payload_message(valid, limits).unwrap_err();
+        assert_eq!(wire.kind(), &ConnectorCodecErrorKind::Capacity);
+        assert_eq!(wire.kind(), owned.kind());
+        assert_eq!(wire.path(), owned.path());
+    }
+
+    #[test]
+    fn both_embedded_entries_keep_size_refusal_before_decoding() {
+        let raw = commit_envelope();
+        let bound = raw.encoded_len() - 1;
+        let path = FieldPath::root("fragment").field("provider_payload");
+        let borrowed = decode_embedded_connector_payload(
+            Some(&raw),
+            ConnectorCodecCategory::CommitFragment,
+            bound,
+            path.clone(),
+        )
+        .unwrap_err();
+        let owned = decode_embedded_owned_connector_payload(
+            Some(raw),
+            ConnectorCodecCategory::CommitFragment,
+            bound,
+            path.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(borrowed.kind(), &ProtocolErrorKind::OutOfRange);
+        assert_eq!(borrowed.kind(), owned.kind());
+        assert_eq!(borrowed.path(), &path);
+        assert_eq!(borrowed.to_string(), owned.to_string());
+    }
+
+    #[test]
+    fn raw_wire_unknown_and_duplicate_fields_still_use_the_original_strict_scanner() {
+        let limits = ConnectorDecodeLimits::try_new(8192, 8192, 8192, 16, 8).unwrap();
+        let encoded = commit_envelope().encode_to_vec();
+        let mut unknown = encoded.clone();
+        unknown.extend_from_slice(&[0x1a, 0]);
+        assert_eq!(
+            decode_connector_payload(&unknown, limits)
+                .unwrap_err()
+                .kind(),
+            &ConnectorCodecErrorKind::UnknownField
+        );
+        let mut duplicate = encoded;
+        duplicate.extend_from_slice(&[0x12, 0]);
+        assert_eq!(
+            decode_connector_payload(&duplicate, limits)
+                .unwrap_err()
+                .kind(),
+            &ConnectorCodecErrorKind::DuplicateField
+        );
     }
 
     #[test]

@@ -981,8 +981,17 @@ impl Scenario for Nid2CreateReceiptForeignTask {
                 fault: "create-task-receipt-foreign-task",
                 marker: "NOVAROCKS_TASK_CREATE_RECEIPT_FOREIGN_TASK",
                 subject: "a CreateTask acknowledgement naming a task the request never addressed",
-                expected_failure_fact: None,
-                error_fragments: &["[query.execution.invariant]", "InvalidStateOrRequest"],
+                // A foreign Accepted receipt is refused by the frontend
+                // decoder, not a Worker InvalidStateOrRequest verdict. Keep
+                // the exact original protocol invariant on attempt 1.
+                expected_failure_fact: Some(FailureFact::new(
+                    FailureClass::Invariant,
+                    FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(9).unwrap()),
+                )),
+                error_fragments: &[
+                    "[query.execution.invariant]",
+                    "frontend task protocol could not continue",
+                ],
             },
         )
     }

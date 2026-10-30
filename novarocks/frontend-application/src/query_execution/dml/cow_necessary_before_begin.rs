@@ -17,8 +17,8 @@
 
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
-    ConnectorRowMutationPreparation, ConnectorRowMutationSelection,
+    ConnectorError, ConnectorOperationControl, ConnectorRequestContext,
+    ConnectorRowMutationSelection,
 };
 
 #[derive(Debug)]
@@ -27,7 +27,6 @@ pub(super) enum Error {
     Scope(novarocks_workload_control::WorkError),
     ExistingCoverage(String),
     MissingAdmission,
-    ResourceExhausted(ConnectorError),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -38,32 +37,21 @@ impl std::fmt::Display for Error {
             Self::MissingAdmission => {
                 f.write_str("COW construction requires the original Internal result binding")
             }
-            Self::ResourceExhausted(error) => error.fmt(f),
         }
     }
 }
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Control(e) | Self::ResourceExhausted(e) => Some(e),
+            Self::Control(e) => Some(e),
             Self::Scope(e) => Some(e),
             _ => None,
         }
     }
 }
-fn exhausted() -> Error {
-    Error::ResourceExhausted(ConnectorError::new(
-        ConnectorErrorKind::ResourceExhausted,
-        "COW generated query minimum exceeds the original Internal construction profile",
-    ))
-}
-
-// Valid only for this FE's two signed-intent stock Iceberg COW callers: the
-// stock signer maps each distinct after-field into every routed row's VALUES.
-// Success here grants no capacity and establishes no full coexistence upper.
+// Original control and positive Internal binding checks only. No object
+// layout prediction qualifies the Root or authorizes a request allocation.
 fn preflight(
-    preparation: &ConnectorRowMutationPreparation,
-    selection: &ConnectorRowMutationSelection,
     binding: Option<&QueryResultCapacityBinding>,
     context: &ConnectorRequestContext,
 ) -> Result<(), Error> {
@@ -76,19 +64,6 @@ fn preflight(
         &binding.window_alias(),
     )
     .map_err(Error::ExistingCoverage)?;
-    let width = u64::try_from(preparation.match_contract().after_fields().len())
-        .map_err(|_| exhausted())?;
-    let minimum = selection
-        .row_count()
-        .checked_mul(width)
-        .and_then(|cells| cells.checked_mul(2))
-        .and_then(|nodes| {
-            nodes.checked_mul(std::mem::size_of::<novarocks_parser::ast::Expr>() as u64)
-        })
-        .ok_or_else(exhausted)?;
-    if minimum > crate::query_execution::internal_result_cpu::INTERNAL_PEAK_BYTES {
-        return Err(exhausted());
-    }
     // Neither check renews the same absolute clock; no sleep, task, or permit.
     context.check_active().map_err(Error::Control)?;
     binding.scope().check().map_err(Error::Scope)?;
@@ -98,23 +73,20 @@ fn preflight(
 // Move the original selection only after checks have returned: no borrow/move
 // conflict and no selection clone added solely for the preflight call.
 pub(super) fn before_request_owned<R>(
-    preparation: &ConnectorRowMutationPreparation,
     selection: ConnectorRowMutationSelection,
     binding: Option<&QueryResultCapacityBinding>,
     context: &ConnectorRequestContext,
     construct_request_and_begin: impl FnOnce(ConnectorRowMutationSelection) -> R,
 ) -> Result<R, Error> {
-    preflight(preparation, &selection, binding, context)?;
+    preflight(binding, context)?;
     Ok(construct_request_and_begin(selection))
 }
 #[cfg(test)]
 pub(super) fn before_request<R>(
-    preparation: &ConnectorRowMutationPreparation,
-    selection: &ConnectorRowMutationSelection,
     binding: Option<&QueryResultCapacityBinding>,
     context: &ConnectorRequestContext,
     next: impl FnOnce() -> R,
 ) -> Result<R, Error> {
-    preflight(preparation, selection, binding, context)?;
+    preflight(binding, context)?;
     Ok(next())
 }

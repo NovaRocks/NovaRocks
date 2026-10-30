@@ -25,6 +25,9 @@
 
 use std::sync::Arc;
 
+use crate::task_execution::operation::{OperationDispatchResult, WorkerReceiptOutcome};
+use crate::task_protocol_config::{DispatchBudget, DispatchLane};
+use novarocks_coordination_contract::MonotonicInstant;
 #[cfg(test)]
 use novarocks_execution::task_execution::FetchTaskDynamicFilters;
 use novarocks_execution::task_execution::{
@@ -36,9 +39,6 @@ use novarocks_execution::task_execution::{
     status::SafeDetail,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
-use novarocks_query_application::coordination::{
-    DispatchBudget, DispatchLane, MonotonicInstant, OperationDispatchResult, WorkerReceiptOutcome,
-};
 use novarocks_types::identity::BackendProcessId;
 
 /// What one queued operation costs in queue bytes on top of its payload.
@@ -58,7 +58,7 @@ pub enum OperationIntent {
     EstablishQueryContext(Arc<EstablishQueryContext>),
     /// One task's create, holding its frozen parts. Every send of the create
     /// holds the same parts.
-    CreateTask(Arc<super::creation::CreateTaskIntent>),
+    CreateTask(super::creation::CreateTaskIntent),
     UpdateTask(Arc<UpdateTask>),
     UpdateQueryContext(Arc<UpdateQueryContext>),
     CancelTask(CancelTask),
@@ -140,6 +140,31 @@ impl OperationIntent {
         };
         novarocks_proto_codec::native_rpc::operation_method(self.shape(), only_close)
     }
+    /// Original immutable grouping fact before dispatcher dequeue. This
+    /// neither encodes a DTO nor reserves any local or Joint capacity.
+    pub(crate) fn native_run_key(
+        &self,
+    ) -> (
+        novarocks_proto_codec::native_rpc::NativeRpcMethod,
+        std::time::Duration,
+    ) {
+        let wait = match self {
+            Self::AcquireQueryContextAdmissionTicket(request) => {
+                request.envelope().max_wait().get()
+            }
+            Self::EstablishQueryContext(request) => request.envelope().max_wait().get(),
+            Self::CreateTask(request) => request.envelope().max_wait().get(),
+            Self::UpdateTask(request) => request.envelope().max_wait().get(),
+            Self::UpdateQueryContext(request) => request.envelope().max_wait().get(),
+            Self::CancelTask(request) => request.envelope().max_wait().get(),
+            Self::QuiesceQueryContext(request) => request.envelope().max_wait().get(),
+            Self::AbortQueryContext(request) => request.envelope().max_wait().get(),
+            Self::ReleaseQueryContext(request) => request.envelope().max_wait().get(),
+            #[cfg(test)]
+            Self::FetchTaskDynamicFilters(_) => std::time::Duration::ZERO,
+        };
+        (self.native_method(), wait)
+    }
     pub(crate) fn requires_control_progress(&self) -> bool {
         use novarocks_proto_codec::native_rpc::{FrontendNativeLane, NativeTrafficClass};
         self.native_method().contract().traffic
@@ -210,6 +235,7 @@ impl OperationIntent {
             lane: self.lane(),
             control_progress: self.requires_control_progress(),
             queued_bytes: self.queued_bytes(),
+            native_input: crate::native::task_transport::queued_intent_quote(self).ok(),
         }
     }
 }
@@ -249,6 +275,8 @@ pub struct TaskOperationQueueRequest {
     lane: DispatchLane,
     control_progress: bool,
     queued_bytes: usize,
+    pub(crate) native_input:
+        Option<novarocks_workload_control::joint_admission::NativeQueuedInputQuote>,
 }
 
 impl TaskOperationQueueRequest {
@@ -260,6 +288,7 @@ impl TaskOperationQueueRequest {
             lane: DispatchLane::Create,
             control_progress: false,
             queued_bytes,
+            native_input: None,
         }
     }
 
@@ -271,9 +300,19 @@ impl TaskOperationQueueRequest {
             lane: DispatchLane::Update,
             control_progress: task_domain_requires_control(update),
             queued_bytes: task_domain_bytes(update).saturating_add(OPERATION_FIXED_BYTES),
+            native_input: crate::native::task_transport::queued_update_quote(update).ok(),
         }
     }
 
+    pub(crate) fn with_native_input(
+        mut self,
+        quote: novarocks_workload_control::joint_admission::NativeQueuedInputQuote,
+    ) -> Self {
+        self.native_input = Some(quote);
+        self
+    }
+
+    #[cfg(test)]
     pub const fn lane(self) -> DispatchLane {
         self.lane
     }
@@ -289,6 +328,82 @@ impl TaskOperationQueueRequest {
     pub const fn queued_bytes(self) -> usize {
         self.queued_bytes
     }
+}
+
+/// Inline preparation state in the original request producer. It owns only
+/// the original paid ticket/receipt; it is not a second queue or capacity.
+#[derive(Default)]
+pub struct TaskOperationQueuePreparation {
+    pub(crate) request: Option<TaskOperationQueueRequest>,
+    pub(crate) admission:
+        Option<novarocks_workload_control::joint_admission::NativeQueuedInputAdmission>,
+    pub(crate) ready: Option<novarocks_workload_control::joint_admission::NativeQueuedInputReady>,
+    pub(crate) grant: Option<novarocks_workload_control::joint_admission::NativeQueuedInputGrant>,
+    pub(crate) failure: Option<novarocks_workload_control::WorkError>,
+}
+impl std::fmt::Debug for TaskOperationQueuePreparation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OriginalNativeQueuePreparation")
+            .field("request", &self.request)
+            .field("waiting", &self.admission.is_some())
+            .field("granted", &self.grant.is_some())
+            .field("failure", &self.failure)
+            .finish()
+    }
+}
+impl TaskOperationQueuePreparation {
+    pub const fn new() -> Self {
+        Self {
+            request: None,
+            admission: None,
+            ready: None,
+            grant: None,
+            failure: None,
+        }
+    }
+
+    /// Withdraws this producer's never-published queue responsibility. A
+    /// successful process reservation takes `grant` out of this cell, so this
+    /// cannot retire a dispatched row or an independent payload alias.
+    /// The caller must first finish dropping its original unpublished input.
+    pub(crate) fn withdraw_unpublished(&mut self) {
+        let grant = self.grant.take();
+        let admission = self.admission.take();
+        let ready = self.ready.take();
+        self.request = None;
+        self.failure = None;
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(ready);
+            drop(admission);
+        }));
+        if let Err(cause) = dropped {
+            std::panic::resume_unwind(Box::new(UnpublishedQueueCleanupFailure {
+                _cause: cause,
+                _grant: grant,
+            }));
+        }
+        let Some(grant) = grant else {
+            return;
+        };
+        match grant.queue_exited_in() {
+            Ok(notification) => {
+                drop(grant);
+                notification.notify();
+            }
+            Err(error) => {
+                std::panic::resume_unwind(Box::new(UnpublishedQueueCleanupFailure {
+                    _cause: Box::new(error),
+                    _grant: Some(grant),
+                }));
+            }
+        }
+    }
+}
+
+struct UnpublishedQueueCleanupFailure {
+    // Same original grant remains queued if cleanup did not prove exit.
+    _cause: Box<dyn std::any::Any + Send>,
+    _grant: Option<novarocks_workload_control::joint_admission::NativeQueuedInputGrant>,
 }
 
 /// The receipt an acknowledgement carries.
@@ -319,23 +434,122 @@ pub enum AckPayload {
 }
 
 /// One settled operation. A domain failure never fabricates a positive ACK.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct OperationAcknowledgement {
     operation_id: TaskOperationId,
     kind: OperationKind,
     result: OperationAcknowledgementResult,
+    canonical: Option<crate::native::apply_send_owner::CanonicalAcknowledgement>,
 }
 #[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Canonical replies use the original boxed cell array and intake messages box the whole acknowledgement; keeping the complete result inline preserves by-value construction and clone paths without an additional result allocation."
+)]
 enum OperationAcknowledgementResult {
     Worker(novarocks_execution_contract::operation::OperationResult<AckPayload>),
     NonWorker {
         dispatch: OperationDispatchResult,
         payload: AckPayload,
         detail: Option<SafeDetail>,
+        local_failure: Option<novarocks_query_application::execution_error::ExecutionFailureInput>,
     },
 }
 static NO_ACK_PAYLOAD: AckPayload = AckPayload::None;
+impl Clone for OperationAcknowledgement {
+    fn clone(&self) -> Self {
+        if let Some(canonical) = &self.canonical {
+            return Self {
+                operation_id: self.operation_id,
+                kind: self.kind,
+                result: OperationAcknowledgementResult::NonWorker {
+                    dispatch: OperationDispatchResult::TransportUnknown,
+                    payload: AckPayload::None,
+                    detail: None,
+                    local_failure: None,
+                },
+                canonical: Some(canonical.clone()),
+            };
+        }
+        Self {
+            operation_id: self.operation_id,
+            kind: self.kind,
+            result: self.result.clone(),
+            canonical: None,
+        }
+    }
+}
+impl PartialEq for OperationAcknowledgement {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation_id == other.operation_id
+            && self.kind == other.kind
+            && self.original_result() == other.original_result()
+    }
+}
 impl OperationAcknowledgement {
+    /// Borrow the original batch's local dispatch refusal. A canonical cell
+    /// retains this same cause through its actual backing's final exit.
+    pub fn governance_failure(&self) -> Option<&novarocks_workload_control::WorkError> {
+        self.canonical.as_ref()?.governance_failure()
+    }
+    #[cfg(test)]
+    pub(crate) fn shares_original_canonical_with(&self, other: &Self) -> bool {
+        self.canonical
+            .as_ref()
+            .zip(other.canonical.as_ref())
+            .is_some_and(|(a, b)| std::ptr::eq(a.original(), b.original()))
+    }
+    fn original_result(&self) -> &OperationAcknowledgementResult {
+        self.canonical
+            .as_ref()
+            .map_or(&self.result, |canonical| &canonical.original().result)
+    }
+    pub(crate) fn bind_canonical_telemetry(
+        &mut self,
+        owner: std::sync::Weak<
+            dyn novarocks_proto_codec::lifecycle::terminal::CanonicalTerminalTelemetry,
+        >,
+        ordinal: usize,
+    ) {
+        assert!(
+            self.canonical.is_none(),
+            "the canonical cell receives an original acknowledgement"
+        );
+        let payload = match &mut self.result {
+            OperationAcknowledgementResult::Worker(
+                novarocks_execution_contract::operation::OperationResult::Verdict {
+                    acknowledgement: Some(payload),
+                    ..
+                },
+            )
+            | OperationAcknowledgementResult::NonWorker { payload, .. } => Some(payload),
+            _ => None,
+        };
+        if let Some(AckPayload::Release {
+            runtime_filter: Some(telemetry),
+            ..
+        }) = payload
+        {
+            telemetry.bind_canonical_owner(owner, ordinal);
+        }
+    }
+    pub(crate) fn from_canonical(
+        original: &Self,
+        canonical: crate::native::apply_send_owner::CanonicalAcknowledgement,
+    ) -> Self {
+        Self {
+            operation_id: original.operation_id,
+            kind: original.kind,
+            result: OperationAcknowledgementResult::NonWorker {
+                dispatch: OperationDispatchResult::TransportUnknown,
+                payload: AckPayload::None,
+                detail: None,
+                local_failure: None,
+            },
+            canonical: Some(canonical),
+        }
+    }
+    #[cfg(test)]
     pub fn new(
         operation_id: TaskOperationId,
         kind: OperationKind,
@@ -344,6 +558,37 @@ impl OperationAcknowledgement {
     ) -> Self {
         Self::worker_receipt(operation_id, kind, outcome, payload)
     }
+    /// A local refusal is not a Worker receipt. Its original typed failure
+    /// travels with the existing non-Worker dispatch result.
+    pub(crate) fn local_refusal(
+        operation_id: TaskOperationId,
+        kind: OperationKind,
+        failure: novarocks_query_application::execution_error::ExecutionFailureInput,
+    ) -> Self {
+        Self {
+            operation_id,
+            kind,
+            canonical: None,
+            result: OperationAcknowledgementResult::NonWorker {
+                dispatch: OperationDispatchResult::NonWorkerRejected,
+                payload: AckPayload::None,
+                detail: None,
+                local_failure: Some(failure),
+            },
+        }
+    }
+
+    pub(crate) fn local_failure(
+        &self,
+    ) -> Option<&novarocks_query_application::execution_error::ExecutionFailureInput> {
+        match self.original_result() {
+            OperationAcknowledgementResult::NonWorker { local_failure, .. } => {
+                local_failure.as_ref()
+            }
+            _ => None,
+        }
+    }
+
     pub fn worker_receipt(
         operation_id: TaskOperationId,
         kind: OperationKind,
@@ -366,6 +611,7 @@ impl OperationAcknowledgement {
         Self {
             operation_id,
             kind,
+            canonical: None,
             result: OperationAcknowledgementResult::Worker(
                 novarocks_execution_contract::operation::OperationResult::DomainFailure {
                     outcome,
@@ -404,16 +650,22 @@ impl OperationAcknowledgement {
                 dispatch,
                 payload,
                 detail: None,
+                local_failure: None,
             },
         };
         Self {
             operation_id,
             kind,
             result,
+            canonical: None,
         }
     }
     /// Protocol diagnostics cannot replace a producer's domain failure.
     pub fn with_detail(mut self, detail: Option<SafeDetail>) -> Self {
+        assert!(
+            self.canonical.is_none(),
+            "diagnostics freeze before canonical publication"
+        );
         match &mut self.result {
             OperationAcknowledgementResult::Worker(
                 novarocks_execution_contract::operation::OperationResult::Verdict {
@@ -434,14 +686,14 @@ impl OperationAcknowledgement {
     pub const fn kind(&self) -> OperationKind {
         self.kind
     }
-    pub const fn worker_outcome(&self) -> Option<OperationOutcome> {
-        match &self.result {
+    pub fn worker_outcome(&self) -> Option<OperationOutcome> {
+        match self.original_result() {
             OperationAcknowledgementResult::Worker(result) => Some(result.outcome()),
             OperationAcknowledgementResult::NonWorker { .. } => None,
         }
     }
-    pub const fn dispatch_result(&self) -> OperationDispatchResult {
-        match &self.result {
+    pub fn dispatch_result(&self) -> OperationDispatchResult {
+        match self.original_result() {
             OperationAcknowledgementResult::Worker(result) => {
                 OperationDispatchResult::WorkerReceipt(WorkerReceiptOutcome::from_contract(
                     result.outcome(),
@@ -451,7 +703,7 @@ impl OperationAcknowledgement {
         }
     }
     pub fn payload(&self) -> &AckPayload {
-        match &self.result {
+        match self.original_result() {
             OperationAcknowledgementResult::Worker(
                 novarocks_execution_contract::operation::OperationResult::Verdict {
                     acknowledgement: Some(payload),
@@ -462,8 +714,8 @@ impl OperationAcknowledgement {
             _ => &NO_ACK_PAYLOAD,
         }
     }
-    pub const fn detail(&self) -> Option<&SafeDetail> {
-        match &self.result {
+    pub fn detail(&self) -> Option<&SafeDetail> {
+        match self.original_result() {
             OperationAcknowledgementResult::Worker(result) => result.detail(),
             OperationAcknowledgementResult::NonWorker { detail, .. } => detail.as_ref(),
         }
@@ -474,7 +726,7 @@ impl OperationAcknowledgement {
     ) -> Option<novarocks_execution_contract::operation::OperationResult<std::convert::Infallible>>
     {
         use novarocks_execution_contract::operation::OperationResult;
-        match &self.result {
+        match self.original_result() {
             OperationAcknowledgementResult::Worker(OperationResult::Verdict {
                 outcome,
                 detail,
@@ -494,7 +746,7 @@ impl OperationAcknowledgement {
             OperationAcknowledgementResult::NonWorker { .. } => None,
         }
     }
-    pub const fn is_applied(&self) -> bool {
+    pub fn is_applied(&self) -> bool {
         matches!(
             self.worker_outcome(),
             Some(OperationOutcome::Accepted | OperationOutcome::Idempotent)
@@ -505,6 +757,7 @@ impl OperationAcknowledgement {
 /// One batch of intents the dispatcher released for one backend and lane.
 #[derive(Debug)]
 pub struct DispatchBatch {
+    pub(crate) native_pending: Option<crate::native::task_transport::NativeBatchAdmission>,
     backend: BackendProcessId,
     lane: DispatchLane,
     operations: Vec<OperationIntent>,
@@ -556,6 +809,7 @@ impl DispatchBatch {
         Self {
             backend,
             lane,
+            native_pending: None,
             operations,
             queue_permits,
             queued_bytes,
@@ -642,6 +896,10 @@ pub(crate) struct DispatchAcceptance {
 /// The result of one non-blocking transport admission attempt.
 #[derive(Debug)]
 pub enum TaskOperationSubmit {
+    AdmissionFailed {
+        batch: DispatchBatch,
+        error: novarocks_workload_control::WorkError,
+    },
     /// The transport owns the batch and will settle every operation.
     Accepted,
     /// No transport capacity was consumed; the caller still owns the exact
@@ -663,6 +921,22 @@ pub enum TaskOperationSubmit {
 /// in-flight reservation and remains held until that send settles or drops.
 pub trait TaskOperationQueuePermit: std::fmt::Debug + Send {
     fn mark_in_flight(&mut self);
+    /// Borrow the original Native queue capability for the same batch's
+    /// actual dispatch cut. Absence is not permission to omit governance.
+    /// Call outside WC State while the original queue holder stays stable.
+    fn native_dispatch_input(
+        &self,
+    ) -> Option<&novarocks_workload_control::joint_admission::NativeQueuedInputGrant> {
+        None
+    }
+    fn native_input_retention(
+        &self,
+    ) -> Result<
+        Option<novarocks_resource_contract::ExistingOwnerRetentionLease>,
+        novarocks_workload_control::WorkError,
+    > {
+        Ok(None)
+    }
 }
 
 /// Result of reserving process capacity before an operation enters an attempt
@@ -680,6 +954,8 @@ pub enum TaskOperationQueueAdmission {
     /// A process-wide window is full; no target can admit until capacity is
     /// released.
     ProcessFull,
+    /// The original paid source failed before any physical queue publication.
+    Rejected(novarocks_workload_control::WorkError),
 }
 
 #[cfg(test)]
@@ -701,7 +977,11 @@ pub(super) fn test_queue_permit() -> Box<dyn TaskOperationQueuePermit> {
 /// A submission must not block on a wire round trip: acknowledgements come
 /// back separately, which is what lets the frontend keep one serial runner.
 pub trait TaskOperationSink: std::fmt::Debug + Send + Sync {
-    fn try_reserve_queue(&self, request: TaskOperationQueueRequest) -> TaskOperationQueueAdmission;
+    fn try_reserve_queue(
+        &self,
+        request: TaskOperationQueueRequest,
+        preparation: &mut TaskOperationQueuePreparation,
+    ) -> TaskOperationQueueAdmission;
 
     fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit;
 }

@@ -26,6 +26,7 @@ mod extension_manifest;
 mod failure_artifacts;
 mod fault_injection;
 mod fixture_context;
+mod fixture_object_store;
 mod iceberg_orphan_fixture;
 mod mv_rest_document_graph;
 mod namespace_guard;
@@ -1396,19 +1397,14 @@ impl Drop for LifecycleStatementObservationGuard {
 }
 
 fn await_lifecycle_statement_observation(
-    meta: &QueryMeta,
     guard: &LifecycleStatementObservationGuard,
     deadline: Instant,
 ) -> Result<novarocks_cluster_harness::QueryLifecycleStructuredSnapshot> {
-    let require_success = meta
-        .query_lifecycle_structured_assertion
-        .as_ref()
-        .is_none_or(|assertion| assertion.error_source.is_none());
     guard
         .server_handle
         .lock()
         .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
-        .await_query_lifecycle_statement_observation(&guard.observation, require_success, deadline)
+        .await_query_lifecycle_statement_observation(&guard.observation, true, deadline)
 }
 
 fn runtime_filter_details(
@@ -1564,27 +1560,6 @@ fn verify_lifecycle_structured_assertion(
     let Some(assertion) = meta.query_lifecycle_structured_assertion.as_ref() else {
         return Ok(());
     };
-    if let Some(expected) = assertion.error_source.as_ref() {
-        let expected = match expected {
-            QueryLifecycleErrorSource::BackendAttestation => {
-                novarocks_cluster_harness::QueryLifecycleErrorSource::BackendAttestation
-            }
-            QueryLifecycleErrorSource::FrontendLiveness => {
-                novarocks_cluster_harness::QueryLifecycleErrorSource::FrontendLiveness
-            }
-            QueryLifecycleErrorSource::NoOutcome => {
-                novarocks_cluster_harness::QueryLifecycleErrorSource::NoOutcome
-            }
-        };
-        if after.error_source != Some(expected) {
-            bail!(
-                "structured lifecycle error source mismatch: expected {}, actual {:?}, execution_id={:?}",
-                assertion.error_source.as_ref().expect("checked").as_str(),
-                after.error_source,
-                after.execution_id
-            );
-        }
-    }
     verify_runtime_filter_structured_assertion(assertion, after)?;
     Ok(())
 }
@@ -1790,6 +1765,7 @@ struct InflightPublicationServiceShell<'a> {
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
     original_deadline: Option<Instant>,
+    complete_deadline: Instant,
     query_timeout: u64,
     sql: String,
     db: Option<String>,
@@ -1809,6 +1785,7 @@ fn execute_target_query_with_inflight_publication_service_shell(
         server_handle,
         session_config,
         original_deadline,
+        complete_deadline: _,
         query_timeout,
         sql,
         db,
@@ -1928,6 +1905,7 @@ fn execute_target_query_while_publication_service_holds_shell(
         server_handle,
         session_config,
         original_deadline,
+        complete_deadline,
         query_timeout,
         sql,
         db,
@@ -1941,16 +1919,16 @@ fn execute_target_query_while_publication_service_holds_shell(
     let shell = format!("shell: {shell}");
     let shell_thread = std::thread::spawn(move || {
         let storage = std::env::var(novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV).ok();
-        shell::execute_shell_step_observed(
+        shell::execute_shell_step_with_group_observation(
             &shell,
-            Some(deadline),
+            deadline,
+            complete_deadline,
             Some(&run_context),
             storage.as_deref(),
-            false,
-            Some(&writer_exit),
         )
     });
     if let Err(error) = hold.wait_until_held(deadline) {
+        writer_exit.store(false, Ordering::Release);
         let _ = hold.release();
         let _ = shell_thread.join();
         return (
@@ -1983,6 +1961,7 @@ fn execute_target_query_while_publication_service_holds_shell(
         ),
     };
     if let Err(error) = hold.release() {
+        writer_exit.store(false, Ordering::Release);
         let retry = hold.release();
         let actual_exit = shell_thread.join().is_ok();
         return (
@@ -1993,9 +1972,14 @@ fn execute_target_query_while_publication_service_holds_shell(
             ),
         );
     }
-    let (shell_ok, _, shell_error) = match shell_thread.join() {
+    let shell_result = shell_thread.join();
+    // This exact Hold owns the companion request. Always observe its delegate
+    // outcome and actual method exit, even if the shell's 409 assertion failed.
+    let remote_exit = hold.wait_for_original_exit(deadline);
+    let ((shell_ok, _, shell_error), local_group_exit) = match shell_result {
         Ok(result) => result,
         Err(_) => {
+            writer_exit.store(false, Ordering::Release);
             return (
                 false,
                 None,
@@ -2003,6 +1987,13 @@ fn execute_target_query_while_publication_service_holds_shell(
             );
         }
     };
+    if !local_group_exit || remote_exit.is_err() {
+        writer_exit.store(false, Ordering::Release);
+    }
+    let _ = writeln!(
+        log,
+        "    @publication_service_hold original local_group_exit={local_group_exit} remote_exit={remote_exit:?}"
+    );
     if !shell_ok {
         return (
             false,
@@ -2010,6 +2001,15 @@ fn execute_target_query_while_publication_service_holds_shell(
             format!(
                 "FAIL (runner service hold companion): {shell_error}; primary query: {}",
                 query_result.2
+            ),
+        );
+    }
+    if !local_group_exit || remote_exit.is_err() {
+        return (
+            false,
+            None,
+            format!(
+                "FAIL (runner service hold actual exit): local_group_exit={local_group_exit}; remote_exit={remote_exit:?}"
             ),
         );
     }
@@ -2441,9 +2441,132 @@ fn preserve_suite_failure_snapshot(ctx: &SuiteRunContext, phase: &str, stdout_lo
     }
 }
 
+fn arm_publication_catalog_fault(
+    step: &SqlStep,
+    ctx: &SuiteRunContext,
+) -> Result<publication_catalog::FixtureFaultGuard> {
+    let directive = step
+        .meta
+        .publication_catalog_fault
+        .context("publication fault arm requires its original directive")?;
+    let control = ctx
+        .publication_catalog_control
+        .as_ref()
+        .context("publication fault arm requires its original fixture")?;
+    match &step.meta.publication_catalog_fault_target {
+        Some(target) => control.arm_next_for_table(
+            directive.action.as_str(),
+            directive.fault.as_str(),
+            &target.namespace,
+            &target.table,
+        ),
+        None => control.arm_next(directive.action.as_str(), directive.fault.as_str()),
+    }
+}
+
+fn finish_publication_catalog_fault(
+    guard: &mut Option<publication_catalog::FixtureFaultGuard>,
+    query: usize,
+    evidence: &mut results_record::CaseEvidence,
+    log: &mut String,
+) -> bool {
+    let Some(guard) = guard.take() else {
+        return true;
+    };
+    let trace_before_finish = guard.trace();
+    match guard.finish() {
+        Ok(evidence) => {
+            let _ = writeln!(
+                log,
+                "    @publication_catalog_fault consumed and cleared trace={} details={}",
+                evidence.summary(),
+                evidence.trace()
+            );
+            true
+        }
+        Err(error) => {
+            evidence.record_case_cleanup_failure(
+                Some(query),
+                format!("publication catalog fault cleanup: {error:#}"),
+            );
+            let _ = writeln!(
+                log,
+                "    ❌ publication catalog fault cleanup: {error:#}; trace_before_finish={trace_before_finish}"
+            );
+            false
+        }
+    }
+}
+
+/// Retire only this step's original frozen launch slots that this case did not issue.
+/// This neither stops a role nor transfers an unused grant to another launch.
+fn retire_unissued_case_role_launches(
+    ctx: &SuiteRunContext,
+    case: &SqlCase,
+    query: Option<usize>,
+    log: &mut String,
+) -> Result<()> {
+    let Some(controls) = &ctx.controls else {
+        return Ok(());
+    };
+    for ((suite, case_id, step), launches) in &controls.step_role_launches {
+        if suite != &ctx.suite_name
+            || case_id != &case.case_id
+            || query.is_some_and(|query| query != *step)
+        {
+            continue;
+        }
+        for (role, reference) in launches {
+            let mut server = ctx
+                .server_handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+            if server.retire_unissued_role_launch_if_reserved(*role, reference)? {
+                let _ = writeln!(
+                    log,
+                    "    retired unissued step {role:?} launch for step {step}: {}",
+                    reference.session_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Complete one step's unused exact launches before another step can restart a role.
+fn retire_unissued_step_role_launches(
+    ctx: &SuiteRunContext,
+    case: &SqlCase,
+    query: usize,
+    abort: &AtomicBool,
+    evidence: &mut results_record::CaseEvidence,
+    log: &mut String,
+) -> bool {
+    if let Err(error) = retire_unissued_case_role_launches(ctx, case, Some(query), log) {
+        abort.store(true, Ordering::Relaxed);
+        evidence.record_independent_failure(
+            Some(query),
+            format!("retire unissued role launch: {error:#}"),
+        );
+        let _ = writeln!(log, "    ❌ retire unissued role launch: {error:#}");
+        return false;
+    }
+    true
+}
+
 fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOutcome {
     let mut evidence = results_record::CaseEvidence::default();
-    let outcome = run_case_observed(ctx, case, abort, &mut evidence);
+    let mut outcome = run_case_observed(ctx, case, abort, &mut evidence);
+    // Covers setup failures and early breaks, as well as the ordinary cleanup
+    // path. Issued and already retired originals are observed, never retired again.
+    if let Err(error) = retire_unissued_case_role_launches(ctx, case, None, &mut outcome.log) {
+        outcome.status = CaseStatus::Fail;
+        abort.store(true, Ordering::Relaxed);
+        evidence
+            .record_independent_failure(None, format!("retire unissued role launch: {error:#}"));
+        let _ = writeln!(outcome.log, "    ❌ retire unissued role launch: {error:#}");
+        preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut outcome.log);
+    }
     evidence.finish_case(outcome.status == CaseStatus::Fail);
     if let Some(recorder) = &ctx.results {
         recorder.case(case, &outcome, &evidence);
@@ -2844,6 +2967,18 @@ fn run_case_observed(
     let mut cleanup_transport = false;
     for step in &case.steps {
         if cleanup_only && !step.meta.cleanup {
+            if let Err(error) =
+                retire_unissued_case_role_launches(ctx, case, Some(step.query_number), &mut log)
+            {
+                case_failed = true;
+                abort.store(true, Ordering::Relaxed);
+                evidence.record_independent_failure(
+                    Some(step.query_number),
+                    format!("retire skipped role launch: {error:#}"),
+                );
+                let _ = writeln!(log, "    ❌ retire skipped role launch: {error:#}");
+                break;
+            }
             continue;
         }
         let step_deadline = if step.meta.cleanup {
@@ -2879,6 +3014,17 @@ fn run_case_observed(
                 "    original fixture work deadline expired before step {}",
                 step.query_number
             );
+            if let Err(error) =
+                retire_unissued_case_role_launches(ctx, case, Some(step.query_number), &mut log)
+            {
+                abort.store(true, Ordering::Relaxed);
+                evidence.record_independent_failure(
+                    Some(step.query_number),
+                    format!("retire skipped role launch: {error:#}"),
+                );
+                let _ = writeln!(log, "    ❌ retire skipped role launch: {error:#}");
+                break;
+            }
             continue;
         }
         evidence.begin_step(step.query_number, case_failed);
@@ -2894,10 +3040,8 @@ fn run_case_observed(
             step.query_number, order_sensitive, epsilon
         );
 
-        let be_log_deadline = Some(
-            be_log_directive::step_evidence_deadline(&step.meta)
-                .map_or(step_deadline, |end| end.min(step_deadline)),
-        );
+        let be_log_deadline =
+            be_log_directive::step_evidence_deadline(&step.meta).map(|end| end.min(step_deadline));
         let resource_baseline = if fault_injection::has_fault(&step.meta) {
             match ctx.server_handle.lock() {
                 Ok(mut server_handle)
@@ -3028,46 +3172,32 @@ fn run_case_observed(
             }
             None => None,
         };
-        let mut publication_catalog_fault_guard = match step.meta.publication_catalog_fault {
-            Some(directive) => match ctx.publication_catalog_control.as_ref() {
-                Some(control) => {
-                    match control.arm_next(directive.action.as_str(), directive.fault.as_str()) {
-                        Ok(guard) => {
-                            let _ = writeln!(
-                                log,
-                                "    @publication_catalog_fault armed action={} fault={}",
-                                directive.action.as_str(),
-                                directive.fault.as_str()
-                            );
-                            Some(guard)
-                        }
-                        Err(error) => {
-                            case_failed = true;
-                            evidence.record_independent_failure(
-                                Some(step.query_number),
-                                format!("arm publication catalog fault: {error:#}"),
-                            );
-                            let _ =
-                                writeln!(log, "    ❌ arm publication catalog fault: {error:#}");
-                            break;
-                        }
-                    }
+        let mut publication_catalog_fault_guard = None;
+        if let Some(directive) = step.meta.publication_catalog_fault
+            && step.meta.publication_catalog_fault_timing
+                != Some(PublicationCatalogFaultTiming::AfterFrontendExit)
+        {
+            match arm_publication_catalog_fault(step, ctx) {
+                Ok(guard) => {
+                    let _ = writeln!(
+                        log,
+                        "    @publication_catalog_fault armed action={} fault={}",
+                        directive.action.as_str(),
+                        directive.fault.as_str()
+                    );
+                    publication_catalog_fault_guard = Some(guard);
                 }
-                None => {
+                Err(error) => {
                     case_failed = true;
                     evidence.record_independent_failure(
                         Some(step.query_number),
-                        "@publication_catalog_fault requires the runner-owned publication catalog fixture".into(),
+                        format!("arm publication catalog fault: {error:#}"),
                     );
-                    let _ = writeln!(
-                        log,
-                        "    ❌ @publication_catalog_fault requires the runner-owned publication catalog fixture"
-                    );
+                    let _ = writeln!(log, "    ❌ arm publication catalog fault: {error:#}");
                     break;
                 }
-            },
-            None => None,
-        };
+            }
+        }
         let mut publication_service_hold = match step.meta.publication_service_hold.as_ref() {
             Some(directive) => match ctx.publication_service_control.as_ref() {
                 Some(control) => match control.arm(&directive.table) {
@@ -3079,6 +3209,12 @@ fn run_case_observed(
                             format!("arm REST service hold: {error:#}"),
                         );
                         let _ = writeln!(log, "    ❌ arm REST service hold: {error:#}");
+                        finish_publication_catalog_fault(
+                            &mut publication_catalog_fault_guard,
+                            step.query_number,
+                            evidence,
+                            &mut log,
+                        );
                         break;
                     }
                 },
@@ -3089,6 +3225,12 @@ fn run_case_observed(
                         "REST service hold requires the V11 fixture".into(),
                     );
                     let _ = writeln!(log, "    ❌ REST service hold requires the V11 fixture");
+                    finish_publication_catalog_fault(
+                        &mut publication_catalog_fault_guard,
+                        step.query_number,
+                        evidence,
+                        &mut log,
+                    );
                     break;
                 }
             },
@@ -3100,6 +3242,7 @@ fn run_case_observed(
                 &step.meta,
                 server_handle.as_ref(),
                 be_log_deadline,
+                Some(step_deadline),
             ),
             Err(_) => Err(anyhow::anyhow!("server handle mutex is poisoned")),
         };
@@ -3118,6 +3261,12 @@ fn run_case_observed(
                     log,
                     "    ❌ failed to snapshot BE log evidence before step {}: {error:#}",
                     step.query_number
+                );
+                finish_publication_catalog_fault(
+                    &mut publication_catalog_fault_guard,
+                    step.query_number,
+                    evidence,
+                    &mut log,
                 );
                 break;
             }
@@ -3154,6 +3303,7 @@ fn run_case_observed(
                             server_handle: &ctx.server_handle,
                             session_config: case_target_conn.clone(),
                             original_deadline: Some(step_deadline),
+                            complete_deadline: ctx.cleanup_deadline(),
                             query_timeout: ctx.query_timeout,
                             sql: step.sql.clone(),
                             db: step.meta.db.clone(),
@@ -3421,8 +3571,9 @@ fn run_case_observed(
                         // returning the expected client error.
                         if let Err(error) = run_post_step_server_actions(
                             step,
-                            &ctx.server_handle,
+                            ctx,
                             &mut target_session,
+                            &mut publication_catalog_fault_guard,
                             &mut log,
                         ) {
                             case_failed = true;
@@ -3431,6 +3582,23 @@ fn run_case_observed(
                                 format!("post-step server action failed: {error:#}"),
                             );
                             let _ = writeln!(log, "    ❌ {error:#}");
+                            finish_publication_catalog_fault(
+                                &mut publication_catalog_fault_guard,
+                                step.query_number,
+                                evidence,
+                                &mut log,
+                            );
+                            if !retire_unissued_step_role_launches(
+                                ctx,
+                                case,
+                                step.query_number,
+                                abort,
+                                evidence,
+                                &mut log,
+                            ) {
+                                break;
+                            }
+                            cleanup_only = true;
                             continue;
                         }
                         if step.meta.iceberg_orphan_fixture_absent {
@@ -3442,6 +3610,23 @@ fn run_case_observed(
                                         .into(),
                                 );
                                 let _ = writeln!(log, "    ❌ orphan fixture was not installed");
+                                finish_publication_catalog_fault(
+                                    &mut publication_catalog_fault_guard,
+                                    step.query_number,
+                                    evidence,
+                                    &mut log,
+                                );
+                                if !retire_unissued_step_role_launches(
+                                    ctx,
+                                    case,
+                                    step.query_number,
+                                    abort,
+                                    evidence,
+                                    &mut log,
+                                ) {
+                                    break;
+                                }
+                                cleanup_only = true;
                                 continue;
                             };
                             let absent_result = fixture.assert_absent();
@@ -3454,6 +3639,23 @@ fn run_case_observed(
                             if let Err(error) = absent_result {
                                 case_failed = true;
                                 let _ = writeln!(log, "    ❌ {error:#}");
+                                finish_publication_catalog_fault(
+                                    &mut publication_catalog_fault_guard,
+                                    step.query_number,
+                                    evidence,
+                                    &mut log,
+                                );
+                                if !retire_unissued_step_role_launches(
+                                    ctx,
+                                    case,
+                                    step.query_number,
+                                    abort,
+                                    evidence,
+                                    &mut log,
+                                ) {
+                                    break;
+                                }
+                                cleanup_only = true;
                                 continue;
                             }
                             let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
@@ -3473,8 +3675,9 @@ fn run_case_observed(
                 } else if let Some(execution) = passed_execution {
                     if let Err(error) = run_post_step_server_actions(
                         step,
-                        &ctx.server_handle,
+                        ctx,
                         &mut target_session,
+                        &mut publication_catalog_fault_guard,
                         &mut log,
                     ) {
                         case_failed = true;
@@ -3483,6 +3686,23 @@ fn run_case_observed(
                             format!("post-step server action failed: {error:#}"),
                         );
                         let _ = writeln!(log, "    ❌ {error:#}");
+                        finish_publication_catalog_fault(
+                            &mut publication_catalog_fault_guard,
+                            step.query_number,
+                            evidence,
+                            &mut log,
+                        );
+                        if !retire_unissued_step_role_launches(
+                            ctx,
+                            case,
+                            step.query_number,
+                            abort,
+                            evidence,
+                            &mut log,
+                        ) {
+                            break;
+                        }
+                        cleanup_only = true;
                         continue;
                     }
                     if step.meta.iceberg_orphan_fixture_absent {
@@ -3493,6 +3713,23 @@ fn run_case_observed(
                                 "orphan fixture was not installed before the absence check".into(),
                             );
                             let _ = writeln!(log, "    ❌ orphan fixture was not installed");
+                            finish_publication_catalog_fault(
+                                &mut publication_catalog_fault_guard,
+                                step.query_number,
+                                evidence,
+                                &mut log,
+                            );
+                            if !retire_unissued_step_role_launches(
+                                ctx,
+                                case,
+                                step.query_number,
+                                abort,
+                                evidence,
+                                &mut log,
+                            ) {
+                                break;
+                            }
+                            cleanup_only = true;
                             continue;
                         };
                         let absent_result = fixture.assert_absent();
@@ -3505,6 +3742,23 @@ fn run_case_observed(
                         if let Err(error) = absent_result {
                             case_failed = true;
                             let _ = writeln!(log, "    ❌ {error:#}");
+                            finish_publication_catalog_fault(
+                                &mut publication_catalog_fault_guard,
+                                step.query_number,
+                                evidence,
+                                &mut log,
+                            );
+                            if !retire_unissued_step_role_launches(
+                                ctx,
+                                case,
+                                step.query_number,
+                                abort,
+                                evidence,
+                                &mut log,
+                            ) {
+                                break;
+                            }
+                            cleanup_only = true;
                             continue;
                         }
                         let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
@@ -3748,6 +4002,35 @@ fn run_case_observed(
                         let preview = execution.text_output.chars().take(500).collect::<String>();
                         let _ = writeln!(log, "    last result preview: {preview:?}");
                     }
+                    if last_failure.starts_with("VERIFY FAILED: ")
+                        && expected_results
+                            .as_ref()
+                            .and_then(|results| results.get(&step.query_number))
+                            .is_none()
+                        && let Some(execution) = last_execution.as_ref()
+                    {
+                        match ctx.failure_artifacts.persist_case_actual_result(
+                            &ctx.suite_name,
+                            &case.case_id,
+                            step.query_number,
+                            execution,
+                        ) {
+                            Ok(path) => {
+                                let _ = writeln!(
+                                    log,
+                                    "    complete actual result retained at {}",
+                                    path.display()
+                                );
+                                evidence.artifacts.push(path);
+                            }
+                            Err(error) => {
+                                let _ = writeln!(
+                                    log,
+                                    "    ⚠️ failed to retain complete actual result: {error:#}"
+                                );
+                            }
+                        }
+                    }
                     if let (Some(expected), Some(execution)) = (
                         expected_results
                             .as_ref()
@@ -3923,8 +4206,9 @@ fn run_case_observed(
                     if ctx.record_from == RecordFrom::Target
                         && let Err(error) = run_post_step_server_actions(
                             step,
-                            &ctx.server_handle,
+                            ctx,
                             &mut target_session,
+                            &mut publication_catalog_fault_guard,
                             &mut log,
                         )
                     {
@@ -3934,6 +4218,23 @@ fn run_case_observed(
                             format!("post-step server action failed: {error:#}"),
                         );
                         let _ = writeln!(log, "    ❌ {error:#}");
+                        finish_publication_catalog_fault(
+                            &mut publication_catalog_fault_guard,
+                            step.query_number,
+                            evidence,
+                            &mut log,
+                        );
+                        if !retire_unissued_step_role_launches(
+                            ctx,
+                            case,
+                            step.query_number,
+                            abort,
+                            evidence,
+                            &mut log,
+                        ) {
+                            break;
+                        }
+                        cleanup_only = true;
                         continue;
                     }
                     if step.meta.iceberg_orphan_fixture_absent {
@@ -3944,6 +4245,23 @@ fn run_case_observed(
                                 "orphan fixture was not installed before the absence check".into(),
                             );
                             let _ = writeln!(log, "    ❌ orphan fixture was not installed");
+                            finish_publication_catalog_fault(
+                                &mut publication_catalog_fault_guard,
+                                step.query_number,
+                                evidence,
+                                &mut log,
+                            );
+                            if !retire_unissued_step_role_launches(
+                                ctx,
+                                case,
+                                step.query_number,
+                                abort,
+                                evidence,
+                                &mut log,
+                            ) {
+                                break;
+                            }
+                            cleanup_only = true;
                             continue;
                         };
                         let absent_result = fixture.assert_absent();
@@ -3956,6 +4274,23 @@ fn run_case_observed(
                         if let Err(error) = absent_result {
                             case_failed = true;
                             let _ = writeln!(log, "    ❌ {error:#}");
+                            finish_publication_catalog_fault(
+                                &mut publication_catalog_fault_guard,
+                                step.query_number,
+                                evidence,
+                                &mut log,
+                            );
+                            if !retire_unissued_step_role_launches(
+                                ctx,
+                                case,
+                                step.query_number,
+                                abort,
+                                evidence,
+                                &mut log,
+                            ) {
+                                break;
+                            }
+                            cleanup_only = true;
                             continue;
                         }
                         let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
@@ -4326,24 +4661,13 @@ fn run_case_observed(
             preserve_case_failure_snapshot(ctx, &case.case_id, Some(step.query_number), &mut log);
         }
 
-        if let Some(guard) = publication_catalog_fault_guard {
-            match guard.finish() {
-                Ok(evidence) => {
-                    let _ = writeln!(
-                        log,
-                        "    @publication_catalog_fault consumed and cleared trace={}",
-                        evidence.summary()
-                    );
-                }
-                Err(error) => {
-                    case_failed = true;
-                    evidence.record_case_cleanup_failure(
-                        Some(step.query_number),
-                        format!("publication catalog fault cleanup: {error:#}"),
-                    );
-                    let _ = writeln!(log, "    ❌ publication catalog fault cleanup: {error:#}");
-                }
-            }
+        if !finish_publication_catalog_fault(
+            &mut publication_catalog_fault_guard,
+            step.query_number,
+            evidence,
+            &mut log,
+        ) {
+            case_failed = true;
         }
 
         for (action, result) in [
@@ -4410,9 +4734,7 @@ fn run_case_observed(
             let assertion_result = structured_lifecycle_observation
                 .as_ref()
                 .context("exact statement lifecycle observation disappeared after the step")
-                .and_then(|guard| {
-                    await_lifecycle_statement_observation(&step.meta, guard, assertion_deadline)
-                })
+                .and_then(|guard| await_lifecycle_statement_observation(guard, assertion_deadline))
                 .and_then(|after| {
                     verify_lifecycle_structured_assertion(&step.meta, &after)?;
                     Ok(after.execution_id)
@@ -4457,6 +4779,19 @@ fn run_case_observed(
             case_failed = true;
             evidence.record_failure(serde_json::json!({"class":"error", "error":"original SQL invocation work deadline expired", "statement_index":step.query_number}));
             let _ = writeln!(log, "    ❌ original SQL invocation work deadline expired");
+        }
+        // This step is over even if its selected mode never ran a restart.
+        // Any remaining original slot belongs to this step, never its successor.
+        if !retire_unissued_step_role_launches(
+            ctx,
+            case,
+            step.query_number,
+            abort,
+            evidence,
+            &mut log,
+        ) {
+            case_failed = true;
+            break;
         }
         if case_failed && !cleanup_only {
             cleanup_only = true;
@@ -4671,7 +5006,7 @@ fn run_suite_with_hooks(
             recorder.load_failure(failure);
         }
     }
-    let result =
+    let mut result =
         run_suite_with_hooks_observed(ps, abort, stdout_lock, |conn, timeout, hook, role| {
             let result = execute_hook(conn, timeout, hook, role);
             if ps
@@ -4687,6 +5022,30 @@ fn run_suite_with_hooks(
             }
             result
         });
+    if !init_errors.is_empty() {
+        // Init failure bypasses run_case entirely; none of these step
+        // launches ran. Retire their exact originals before a later suite.
+        for case in &ps.cases {
+            let mut log = String::new();
+            if let Err(error) = retire_unissued_case_role_launches(&ps.ctx, case, None, &mut log) {
+                abort.store(true, Ordering::Relaxed);
+                result.cleanup_errors.push(format!(
+                    "retire unissued role launch after suite init failure: {error:#}"
+                ));
+                let _ = writeln!(
+                    log,
+                    "    ❌ retire unissued role launch after suite init failure: {error:#}"
+                );
+            }
+            if let Some(outcome) = result
+                .outcomes
+                .iter_mut()
+                .find(|outcome| outcome.case_id == case.case_id)
+            {
+                outcome.log.push_str(&log);
+            }
+        }
+    }
     if let Some(recorder) = &ps.ctx.results {
         recorder.finish(ps, &result, abort.load(Ordering::Relaxed), &init_errors);
     }
@@ -5040,11 +5399,55 @@ fn validate_dml_cluster_jobs(cases: &[SqlCase], jobs: usize, mode: ClusterMode) 
 /// declaration that retires a restart barrier.
 fn run_post_step_server_actions(
     step: &SqlStep,
-    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    ctx: &SuiteRunContext,
     session: &mut MysqlSession,
+    publication_fault: &mut Option<publication_catalog::FixtureFaultGuard>,
     log: &mut String,
 ) -> Result<()> {
-    restart_frontend_after_step(step, server_handle, session, log)?;
+    if step.meta.publication_catalog_fault_timing
+        == Some(PublicationCatalogFaultTiming::AfterFrontendExit)
+    {
+        ensure!(
+            step.meta.restart_fe_after_step && step.meta.imv_accelerator_wipe_restart.is_none(),
+            "after-frontend-exit timing requires the original explicit frontend restart"
+        );
+        let mut called = false;
+        let result = {
+            let mut after_exit = || {
+                ensure!(
+                    !called,
+                    "after-frontend-exit hook was invoked more than once"
+                );
+                called = true;
+                ensure!(
+                    publication_fault.is_none(),
+                    "publication fault is already armed"
+                );
+                *publication_fault = Some(arm_publication_catalog_fault(step, ctx)?);
+                Ok(())
+            };
+            restart_frontend_after_step(
+                step,
+                &ctx.server_handle,
+                session,
+                Some(&mut after_exit),
+                log,
+            )
+        };
+        if publication_fault.is_some() {
+            let _ = writeln!(
+                log,
+                "    @publication_catalog_fault armed after original frontend exit"
+            );
+        }
+        result?;
+        ensure!(
+            called,
+            "frontend restart did not invoke its required after-exit hook"
+        );
+    } else {
+        restart_frontend_after_step(step, &ctx.server_handle, session, None, log)?;
+    }
     resume_mv_management_after_step(step, session, log)
 }
 
@@ -5124,6 +5527,7 @@ fn restart_frontend_after_step(
     step: &SqlStep,
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
     session: &mut MysqlSession,
+    after_exit: Option<&mut dyn FnMut() -> Result<()>>,
     log: &mut String,
 ) -> Result<()> {
     let Some(wipe) = step.meta.imv_accelerator_wipe_restart.as_ref() else {
@@ -5136,9 +5540,11 @@ fn restart_frontend_after_step(
         if server.be_count() == 0 {
             bail!("@restart_fe_after_step requires a runner-owned cross-process frontend");
         }
-        server
-            .restart_fe()
-            .context("restart frontend after successful SQL step")?;
+        match after_exit {
+            Some(after_exit) => server.restart_fe_with_after_exit_hook(after_exit),
+            None => server.restart_fe(),
+        }
+        .context("restart frontend after successful SQL step")?;
         drop(server);
         session
             .reconnect()
@@ -5169,9 +5575,11 @@ fn restart_frontend_after_step(
     if server.be_count() == 0 {
         bail!("@imv_accelerator_wipe_restart requires a runner-owned cross-process frontend");
     }
-    server
-        .restart_fe()
-        .context("restart frontend after Accelerator wipe")?;
+    match after_exit {
+        Some(after_exit) => server.restart_fe_with_after_exit_hook(after_exit),
+        None => server.restart_fe(),
+    }
+    .context("restart frontend after Accelerator wipe")?;
     drop(server);
     session
         .reconnect()
@@ -5190,7 +5598,6 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "kill_be_after_be_log_contains",
         "terminal_snapshot_conflict_be_index",
         "query_lifecycle_fault",
-        "expect_lifecycle_error_source",
         // Structured runtime-filter assertions read the same debug projection
         // as the lifecycle fault assertions, even when the query itself has no
         // injected fault.
@@ -5319,10 +5726,46 @@ fn validate_publication_catalog_directives(
     for case in cases {
         for step in &case.steps {
             if step.meta.publication_catalog_fault.is_none()
+                && step.meta.publication_catalog_fault_timing.is_none()
+                && step.meta.publication_catalog_fault_target.is_none()
                 && step.meta.publication_service_hold.is_none()
                 && step.meta.publication_catalog_concurrent_shell.is_none()
             {
                 continue;
+            }
+            if step.meta.publication_catalog_fault_timing.is_some()
+                && step.meta.publication_catalog_fault.is_none()
+            {
+                bail!("publication_catalog_fault_timing requires its original fault directive");
+            }
+            if step.meta.publication_catalog_fault_timing
+                == Some(PublicationCatalogFaultTiming::AfterFrontendExit)
+                && (!matches!(
+                    step.meta.publication_catalog_fault,
+                    Some(PublicationCatalogFaultDirective {
+                        action: PublicationCatalogAction::TableLoad,
+                        fault: PublicationCatalogFault::CorruptPackage,
+                    })
+                ) || step.meta.publication_catalog_fault_target.is_none()
+                    || !step.meta.restart_fe_after_step
+                    || step.meta.imv_accelerator_wipe_restart.is_some()
+                    || mode != Mode::Verify
+                    || cluster_mode != ClusterMode::CrossProcess)
+            {
+                bail!(
+                    "after-frontend-exit timing requires an exact table-load,corrupt-package fault and explicit cross-process frontend restart in verify mode"
+                );
+            }
+            if step.meta.publication_catalog_fault_target.is_some()
+                && !matches!(
+                    step.meta.publication_catalog_fault,
+                    Some(PublicationCatalogFaultDirective {
+                        action: PublicationCatalogAction::TableLoad,
+                        fault: PublicationCatalogFault::CorruptPackage,
+                    })
+                )
+            {
+                bail!("publication_catalog_fault_target requires table-load,corrupt-package");
             }
             if !publication_catalog_fixture_suite(suite_name) {
                 bail!(
@@ -5726,6 +6169,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         println!("❌ ERROR: {error}");
         return Ok(1);
     }
+    FixtureEndpoints::preflight_cloud(&runner_config, &suite_names)?;
     let owns_fixture_run =
         std::env::var_os(novarocks_cluster_harness::fixture_run::RUN_CONTEXT_ENV).is_none();
     let original_fixture_env = runner_config
@@ -5737,8 +6181,25 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
     let fixture_budget =
         fixture_context::admit(&runner_config, &base_dir, cli.fixture_budget_secs)?;
     let fixture_storage = fixture_context::storage_scope(&runner_config, &fixture_budget)?;
+    let mut original_fixture_material = match (&original_fixture_env, &fixture_storage) {
+        (Some(env_file), Some(storage)) => {
+            let material = failure_artifacts.persist_original_fixture_run(
+                &fixture_budget.to_json()?,
+                &storage.to_json()?,
+                env_file,
+                owns_fixture_run,
+            )?;
+            eprintln!(
+                "Original fixture run recovery material: {}",
+                material.path().display()
+            );
+            Some(material)
+        }
+        _ => None,
+    };
     let naming_sources =
         fixture_context::selected_sources(&cli, &base_dir, &suite_names, &suite_configs)?;
+    FixtureEndpoints::reject_unsupported_sources(&runner_config, &naming_sources)?;
     let mut fixture_names = fixture_context::RunNames::prepare(&fixture_budget, &naming_sources)?;
     fixture_names.seal_catalogs(&runner_config, &naming_sources, &suite_configs)?;
     runner_config.fixture_names = Some(Arc::new(fixture_names));
@@ -5816,6 +6277,19 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         // SAFETY: no runner-owned server, proxy or case worker exists yet.
         // Publish the physical fixture projection once before starting those threads.
         unsafe {
+            if fixture_endpoints.is_node_local() {
+                for key in [
+                    "AWS_S3_ACCESS_KEY_ID",
+                    "AWS_S3_SECRET_ACCESS_KEY",
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "MINIO_ROOT_USER",
+                    "MINIO_ROOT_PASSWORD",
+                ] {
+                    std::env::remove_var(key);
+                }
+            }
             for (key, value) in &subprocess_environment {
                 std::env::set_var(key, value);
             }
@@ -6826,8 +7300,24 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 && fixture_failures.is_empty()
             {
                 match fixture_context::cleanup_run(&base_dir, env_file, &fixture_budget, storage) {
-                    Ok(report) => failure_artifacts
-                        .record_provenance("fixture-scratch-cleanup".into(), report),
+                    Ok(report) => {
+                        failure_artifacts
+                            .record_provenance("fixture-scratch-cleanup".into(), report);
+                        if let Some(material) = original_fixture_material.take() {
+                            let path = material.path().to_path_buf();
+                            let removed = material.release_after_cleanup();
+                            failure_artifacts.record_provenance(
+                                "original-fixture-run-material-retirement".into(),
+                                serde_json::json!({"directory": path, "removed": removed}),
+                            );
+                            if !removed {
+                                eprintln!(
+                                    "Original run cleanup succeeded; private recovery material remains at {}",
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
                     Err(error) => fixture_failures.push(format!("run scratch cleanup: {error:#}")),
                 }
             } else if server_recorded.load(Ordering::Acquire) {
@@ -6893,6 +7383,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
 /// those foreign MV references and refuses cleanup. Such a suite gets its own
 /// REST Catalog so its outcome does not depend on other worktrees.
 const ISOLATED_REST_CATALOG_SUITES: &[&str] = &[
+    "materialized-view",
     "iceberg-ivm",
     "iceberg-mv-apply",
     "iceberg-mv-scheduler",
@@ -7019,9 +7510,10 @@ mod tests {
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::sql_error_codes::SqlErrorPhase;
     use crate::types::{
-        ConnectionConfig, QueryExecution, QueryLifecycleStructuredAssertion, QueryMeta, ResultSet,
-        RuntimeFilterDetailExpectation, SqlCase, SqlErrorLocation, SqlErrorTier, SqlStep,
-        SuiteHook,
+        ConnectionConfig, PublicationCatalogAction, PublicationCatalogFault,
+        PublicationCatalogFaultDirective, PublicationCatalogFaultTarget, QueryExecution,
+        QueryLifecycleStructuredAssertion, QueryMeta, ResultSet, RuntimeFilterDetailExpectation,
+        SqlCase, SqlErrorLocation, SqlErrorTier, SqlStep, SuiteHook,
     };
     use crate::{
         AlterJobPollState, CaseStatus, Cli, Mode, RecordFrom,
@@ -7032,7 +7524,8 @@ mod tests {
         finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
         statement_starts_dml_operation, validate_dml_cluster_jobs, validate_fault_injection_jobs,
         validate_lake_publication_preflight, validate_lnp_3d_mv_accelerator_preflight,
-        validate_selected_suite_cluster, verify_runtime_filter_structured_assertion,
+        validate_publication_catalog_directives, validate_selected_suite_cluster,
+        verify_runtime_filter_structured_assertion,
     };
     use clap::Parser;
     use regex::Regex;
@@ -7042,6 +7535,105 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn publication_fault_after_exit_timing_rejects_orphan_and_wrong_restart_shapes() {
+        use crate::types::PublicationCatalogFaultTiming;
+        let mut case = test_case_with_meta(QueryMeta {
+            publication_catalog_fault_timing: Some(
+                PublicationCatalogFaultTiming::AfterFrontendExit,
+            ),
+            ..Default::default()
+        });
+        case.sequential = true;
+        let valid = |case: &SqlCase, cluster_mode, mode| {
+            validate_publication_catalog_directives(
+                "lnp-3d-mv-accelerator",
+                std::slice::from_ref(case),
+                true,
+                cluster_mode,
+                mode,
+            )
+        };
+        assert!(valid(&case, ClusterMode::CrossProcess, Mode::Verify).is_err());
+        case.steps[0].meta.publication_catalog_fault = Some(PublicationCatalogFaultDirective {
+            action: PublicationCatalogAction::TableLoad,
+            fault: PublicationCatalogFault::CorruptPackage,
+        });
+        case.steps[0].meta.publication_catalog_fault_target = Some(PublicationCatalogFaultTarget {
+            namespace: "owned_ns".into(),
+            table: "a_mv".into(),
+        });
+        assert!(valid(&case, ClusterMode::CrossProcess, Mode::Verify).is_err());
+        case.steps[0].meta.restart_fe_after_step = true;
+        assert!(valid(&case, ClusterMode::CrossProcess, Mode::Verify).is_ok());
+        assert!(valid(&case, ClusterMode::AllInOne, Mode::Verify).is_err());
+        assert!(valid(&case, ClusterMode::CrossProcess, Mode::Record).is_err());
+        let mut no_target = case.clone();
+        no_target.steps[0].meta.publication_catalog_fault_target = None;
+        assert!(valid(&no_target, ClusterMode::CrossProcess, Mode::Verify).is_err());
+        let mut wrong_fault = case.clone();
+        wrong_fault.steps[0].meta.publication_catalog_fault =
+            Some(PublicationCatalogFaultDirective {
+                action: PublicationCatalogAction::TableCommit,
+                fault: PublicationCatalogFault::AfterCommitBeforeResponse,
+            });
+        assert!(valid(&wrong_fault, ClusterMode::CrossProcess, Mode::Verify).is_err());
+        case.steps[0].meta.publication_catalog_fault_timing = None;
+        case.steps[0].meta.restart_fe_after_step = false;
+        assert!(valid(&case, ClusterMode::CrossProcess, Mode::Verify).is_ok());
+    }
+
+    #[test]
+    fn unsupported_restart_owner_never_arms_an_after_exit_fault() {
+        let mut server = ArtifactCapableServer;
+        let mut called = false;
+        let mut after_exit = || {
+            called = true;
+            Ok(())
+        };
+        assert!(
+            crate::cluster::ServerHandle::restart_fe_with_after_exit_hook(
+                &mut server,
+                &mut after_exit,
+            )
+            .is_err()
+        );
+        assert!(!called);
+    }
+
+    #[test]
+    fn actual_unconsumed_fault_finish_retains_restart_failure_and_releases_the_arm() {
+        let mut fixture =
+            super::publication_catalog::FixtureHandle::start("http://127.0.0.1:9".into()).unwrap();
+        let control = fixture.control().unwrap();
+        let mut guard = Some(
+            control
+                .arm_next_for_table("table-load", "corrupt-package", "owned_ns", "a_mv")
+                .unwrap(),
+        );
+        let mut evidence = crate::results_record::CaseEvidence::default();
+        evidence.record_independent_failure(Some(2), "original restart failure".into());
+        let mut log = String::new();
+        assert!(!super::finish_publication_catalog_fault(
+            &mut guard,
+            2,
+            &mut evidence,
+            &mut log,
+        ));
+        assert!(guard.is_none());
+        let failure = evidence.failure.as_ref().unwrap();
+        assert_eq!(
+            failure["primary_failure"]["error"],
+            "original restart failure"
+        );
+        assert_eq!(failure["additional_failures"][0]["cleanup"], true);
+        assert!(log.contains("publication catalog fault cleanup"));
+        // A failed match oracle still completed the original control release.
+        let unused = control.arm_next("table-load", "corrupt-package").unwrap();
+        assert!(unused.finish().is_err());
+        fixture.shutdown().unwrap();
+    }
 
     #[test]
     fn compiled_execution_identity_manifest_is_exact_and_rejects_bad_entries() {
@@ -7163,6 +7755,66 @@ mod tests {
             case_dbs: vec![],
             sequential: false,
         }
+    }
+
+    #[test]
+    fn exact_publication_target_requires_the_original_table_load_fault() {
+        let mut case = test_case_with_meta(QueryMeta {
+            publication_catalog_fault_target: Some(PublicationCatalogFaultTarget {
+                namespace: "owned_ns".into(),
+                table: "a_mv".into(),
+            }),
+            ..QueryMeta::default()
+        });
+        case.sequential = true;
+        assert!(
+            validate_publication_catalog_directives(
+                "lnp-3d-mv-accelerator",
+                std::slice::from_ref(&case),
+                true,
+                ClusterMode::CrossProcess,
+                Mode::Verify
+            )
+            .is_err()
+        );
+        case.steps[0].meta.publication_catalog_fault = Some(PublicationCatalogFaultDirective {
+            action: PublicationCatalogAction::TableCommit,
+            fault: PublicationCatalogFault::AfterCommitBeforeResponse,
+        });
+        assert!(
+            validate_publication_catalog_directives(
+                "lnp-3d-mv-accelerator",
+                std::slice::from_ref(&case),
+                true,
+                ClusterMode::CrossProcess,
+                Mode::Verify
+            )
+            .is_err()
+        );
+        case.steps[0].meta.publication_catalog_fault = Some(PublicationCatalogFaultDirective {
+            action: PublicationCatalogAction::TableLoad,
+            fault: PublicationCatalogFault::CorruptPackage,
+        });
+        assert!(
+            validate_publication_catalog_directives(
+                "lnp-3d-mv-accelerator",
+                std::slice::from_ref(&case),
+                true,
+                ClusterMode::CrossProcess,
+                Mode::Verify
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_publication_catalog_directives(
+                "lnp-3d-mv-accelerator",
+                std::slice::from_ref(&case),
+                false,
+                ClusterMode::CrossProcess,
+                Mode::Verify
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7308,7 +7960,6 @@ mod tests {
             process_namespace: 1,
             local_sequence: 2,
             attempt_id: 3,
-            error_source: None,
             failure_fact: None,
             failure_detail: None,
             failure_site: None,
@@ -7347,7 +7998,6 @@ mod tests {
             },
         };
         let delivered = QueryLifecycleStructuredAssertion {
-            error_source: None,
             runtime_filter_availability: None,
             runtime_filter_details: vec![RuntimeFilterDetailExpectation::DeliveredConsumer],
             runtime_filter_totals_at_least: Vec::new(),
@@ -8774,10 +9424,12 @@ mod tests {
             fe_http_port: 28080,
             fe_grpc_port: 29070,
             fe_mysql_port: 29030,
+            fe_trino_port: 28081,
         };
         let base = r#"
 [standalone_server]
 mysql_port = 9030
+trino_port = 8080
 
 [[connector.credentials]]
 purpose = "object-store-data"
@@ -8824,6 +9476,16 @@ access_key_secret = "admin123"
         assert_eq!(
             fe_value["standalone_server"]["mysql_port"].as_integer(),
             Some(29030)
+        );
+        assert_eq!(
+            fe_value["standalone_server"]["trino_port"].as_integer(),
+            Some(i64::from(runtime.fe_trino_port))
+        );
+        assert!(
+            be_value
+                .get("standalone_server")
+                .and_then(|table| table.get("trino_port"))
+                .is_none()
         );
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
         assert!(fe_value["cluster"].get("backends").is_none());
@@ -9458,21 +10120,23 @@ oss_sk = "private-secret"
 
     #[test]
     fn an_ordinary_suite_never_silently_gets_the_isolated_catalog() {
-        let result = super::start_isolated_rest_catalog(
-            &[
-                "mv-storage-contract".to_string(),
-                "iceberg-compatibility".to_string(),
-            ],
-            &test_fixture_budget(),
-        );
-        let error = match result {
-            Ok(_) => panic!("a shared-environment suite must not be redirected silently"),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().contains("cannot share this run"),
-            "{error}"
-        );
+        for isolated_suite in ["mv-storage-contract", "materialized-view"] {
+            let result = super::start_isolated_rest_catalog(
+                &[
+                    isolated_suite.to_string(),
+                    "iceberg-compatibility".to_string(),
+                ],
+                &test_fixture_budget(),
+            );
+            let error = match result {
+                Ok(_) => panic!("a shared-environment suite must not be redirected silently"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("cannot share this run"),
+                "{isolated_suite}: {error}"
+            );
+        }
     }
 
     #[test]

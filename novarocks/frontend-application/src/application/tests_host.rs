@@ -68,7 +68,9 @@ async fn open_host(
     input: Option<StateStoreHostInput>,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
     let registry = state_store_fixture::persistent_registry();
+    let mut host_receiving_16 = None;
     FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+        &mut host_receiving_16,
         input,
         &registry,
         execution_config(),
@@ -114,6 +116,16 @@ impl ViewEngine for SessionViewEngine {
         unreachable!("session view must not resolve external views")
     }
 
+    fn resolve_external_view_async<'a>(
+        &'a self,
+        target: &'a ViewTarget,
+        context: &'a novarocks_spi::connector::ConnectorRequestContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ExternalViewResolution, String>> + Send + 'a>,
+    > {
+        Box::pin(async move { self.resolve_external_view(target, context) })
+    }
+
     fn create_external_view(
         &self,
         _request: CreateExternalViewRequest,
@@ -137,15 +149,6 @@ impl ViewEngine for SessionViewEngine {
         _context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Option<ResolvedExternalView>, String> {
         Ok(None)
-    }
-
-    fn list_external_views(
-        &self,
-        _catalog: &str,
-        _database: &str,
-        _context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<Vec<String>, String> {
-        unreachable!("session view must not list external views")
     }
 
     fn analyze_external_view(
@@ -177,6 +180,20 @@ fn execute_view_statement(
     let [novarocks_parser::ast::Statement::View(statement)] = statements.as_slice() else {
         return Err("expected typed View statement".to_string());
     };
+    if let novarocks_parser::ast::ViewStatement::Show(show) = statement {
+        let prepared = service.prepare_show_views(show, context)?;
+        let novarocks_query_application::view::ShowViewsSource::Local(_) = &prepared.source else {
+            return Err("test host has no external SHOW provider".to_string());
+        };
+        let mut prepared = prepared;
+        let novarocks_query_application::view::ShowViewsSource::Local(names) = std::mem::replace(
+            &mut prepared.source,
+            novarocks_query_application::view::ShowViewsSource::Local(Vec::new()),
+        ) else {
+            unreachable!()
+        };
+        return prepared.finish(names).map(ViewStatementResult::Query);
+    }
     service.execute_statement(engine, statement, context)
 }
 
@@ -198,7 +215,9 @@ fn sqlite_config(_temp: &TempDir) -> StateStoreHostInput {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fe_without_state_store_fails_before_durable_services_open() {
+    let mut host_receiving_15 = None;
     let error = match FrontendApplicationHost::open(
+        &mut host_receiving_15,
         None,
         execution_config(),
         fe_backend_config(),
@@ -220,9 +239,48 @@ async fn fe_without_state_store_fails_before_durable_services_open() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_process_health_blocks_ready_and_triggers_running_host_observation() {
+    #[derive(Debug)]
+    struct OriginalCause;
+    impl std::fmt::Display for OriginalCause {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original process source failed")
+        }
+    }
+    impl std::error::Error for OriginalCause {}
+    let mut host = open_host(Some(state_store_input())).await.unwrap();
+    host.install_statement_control_for_test();
+    host.mark_ready().unwrap();
+    let healthy = !host.workload_progress_has_failed();
+    let cause = Arc::new(OriginalCause);
+    let original = Arc::downgrade(&cause);
+    host.execution_runtime_owner
+        .logical_execution_client
+        .report_process_failure(
+            novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                "original MV background source failed",
+                cause,
+            ),
+        );
+    let still_running = !host.execution_runtime_owner.supervisor.service_has_exited();
+    // These are the real readiness and running Server-loop predicates.
+    let failed = host.workload_progress_has_failed();
+    let refused = host.execution_runtime_owner.mark_ready().is_err();
+    let retained = original.upgrade().is_some();
+    let result = host
+        .shutdown_until(std::time::Instant::now() + Duration::from_secs(5))
+        .await;
+    host.abandon_for_process_exit();
+    drop(host);
+    assert!(healthy && still_running && failed && refused && retained);
+    assert!(result.is_err(), "health cannot become a healthy shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_original_subscription_reaper_cannot_strand_the_host_workload_drain() {
     use novarocks_workload_control::{WorkClass, WorkRequest};
     let mut host = open_host(Some(state_store_input())).await.unwrap();
+    host.install_statement_control_for_test();
     host.mark_ready().unwrap();
     let root = host
         .execution_runtime_owner
@@ -379,7 +437,9 @@ async fn catalog_activity_observer_tracks_the_original_service_without_retaining
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unregistered_provider_fails_before_store_open() {
     let input = state_store_input();
+    let mut host_receiving_14 = None;
     let error = match FrontendApplicationHost::open(
+        &mut host_receiving_14,
         Some(input),
         execution_config(),
         backend_config(),
@@ -540,4 +600,160 @@ async fn legacy_maintenance_and_gc_observation_records_do_not_block_host_open() 
             .expect("legacy maintenance and corrupt GC observation data must not block host open");
         reopened.shutdown().await.expect("reopened host shutdown");
     }
+}
+
+// Explicit pure receiver fixture. No SQLite algorithm or physical worker is
+// copied here; real ordinary queue/exit is tested at StateStoreOriginalOwner.
+struct HeldOpeningProbe {
+    prepared: std::sync::atomic::AtomicUsize,
+    dropped: std::sync::atomic::AtomicUsize,
+}
+struct HeldPureFactory {
+    descriptor: novarocks_state_store_api::StateStoreProviderDescriptor,
+    probe: Arc<HeldOpeningProbe>,
+}
+struct HeldPureOpen {
+    inner: Box<dyn novarocks_state_store_api::StateStoreOriginalOpen>,
+    probe: Arc<HeldOpeningProbe>,
+}
+impl Drop for HeldPureOpen {
+    fn drop(&mut self) {
+        self.probe
+            .dropped
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl novarocks_state_store_api::StateStoreOriginalOpen for HeldPureOpen {
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), novarocks_state_store_api::StateStoreExecutionFailure>> {
+        std::task::Poll::Pending
+    }
+    fn take_instance_in(
+        &mut self,
+        target: &mut Option<Box<dyn novarocks_state_store_api::StateStoreProviderInstance>>,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        self.inner.take_instance_in(target)
+    }
+}
+#[async_trait::async_trait]
+impl novarocks_state_store_api::StateStoreProviderFactory for HeldPureFactory {
+    fn blocking_dependency_facts(
+        &self,
+    ) -> Option<Vec<novarocks_state_store_api::SharedDependency>> {
+        Some(Vec::new())
+    }
+    fn descriptor(&self) -> &novarocks_state_store_api::StateStoreProviderDescriptor {
+        &self.descriptor
+    }
+    fn blocking_source_vocabulary(
+        &self,
+    ) -> Option<novarocks_state_store_api::StateStoreBlockingSourceVocabulary> {
+        Some(
+            novarocks_state_store_testkit::testing::pure_memory_original_vocabulary(
+                self.descriptor.id,
+            ),
+        )
+    }
+    fn prepare_open_in(
+        self: Box<Self>,
+        request: novarocks_state_store_api::StateStoreOpenRequest,
+        context: &novarocks_state_store_api::StateStoreExecutionContext,
+        target: &mut Option<Box<dyn novarocks_state_store_api::StateStoreOriginalOpen>>,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        assert!(target.is_none());
+        let mut inner = None;
+        Box::new(
+            novarocks_state_store_testkit::testing::InMemoryStateStoreProviderFactory::new(
+                self.descriptor,
+            ),
+        )
+        .prepare_open_in(request, context, &mut inner)?;
+        *target = Some(Box::new(HeldPureOpen {
+            inner: inner.unwrap(),
+            probe: self.probe.clone(),
+        }));
+        self.probe
+            .prepared
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn open(
+        self: Box<Self>,
+        _: novarocks_state_store_api::StateStoreOpenRequest,
+    ) -> Result<
+        Box<dyn novarocks_state_store_api::StateStoreProviderInstance>,
+        novarocks_state_store_api::StateStoreError,
+    > {
+        panic!("prepared Host must not use legacy opening")
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_bootstrap_borrow_retains_the_original_opening_until_host_close() {
+    use novarocks_state_store_api::{StateStoreProviderDescriptor, StateStoreProviderId};
+    use novarocks_state_store_runtime::{
+        StateStoreProviderRegistration, StateStoreProviderRegistry,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let descriptor = StateStoreProviderDescriptor::new(
+        StateStoreProviderId::new("held-pure-opening"),
+        novarocks_state_store_api::MAX_KEY_BYTES,
+    );
+    let probe = Arc::new(HeldOpeningProbe {
+        prepared: AtomicUsize::new(0),
+        dropped: AtomicUsize::new(0),
+    });
+    let mut registry = StateStoreProviderRegistry::new();
+    let observed = probe.clone();
+    registry
+        .register(StateStoreProviderRegistration::new(descriptor, move |_| {
+            Ok(Box::new(HeldPureFactory {
+                descriptor,
+                probe: observed.clone(),
+            }))
+        }))
+        .unwrap();
+    let mut input = state_store_fixture::input("cancelled-prepared-opening");
+    input.provider_id = descriptor.id;
+    let mut host = FrontendApplicationHost::prepare_with_role_factories_and_state_store_registry(
+        Some(input),
+        &registry,
+        execution_config(),
+        backend_config(),
+        Vec::new(),
+        tokio::runtime::Handle::current(),
+        test_native_trust(),
+        FrontendNativeTransport::plaintext(),
+    )
+    .unwrap();
+    assert!(host.state_store_host.is_none());
+    assert!(host.state_store_opening.is_some());
+    let admission = host.workload_root_admission();
+    assert!(matches!(
+        admission.try_begin_root(novarocks_workload_control::WorkRequest::new(
+            novarocks_workload_control::WorkClass::Query
+        )),
+        Err(novarocks_workload_control::WorkError::NotReady)
+    ));
+    let mut borrower = Box::pin(host.open_prepared());
+    let pending = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(borrower.as_mut(), cx).is_pending())
+    })
+    .await;
+    drop(borrower);
+    // These originals stay in Host after the borrowed F has actually dropped.
+    let retained = probe.dropped.load(Ordering::SeqCst);
+    let prepared = probe.prepared.load(Ordering::SeqCst);
+    let opening_still_installed = host.state_store_opening.is_some();
+    let closed = host.shutdown().await;
+    // Observe original local exits before assertions can unwind this fixture.
+    assert!(closed.is_ok(), "{closed:?}");
+    assert!(pending);
+    assert_eq!(prepared, 1);
+    assert_eq!(retained, 0);
+    assert!(opening_still_installed);
+    assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
+    assert!(host.state_store_opening.is_none());
+    assert!(host.state_store_host.is_none());
 }

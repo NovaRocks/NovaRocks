@@ -913,7 +913,7 @@ pub(crate) fn metadata_target_field(
                 metadata.field_id().to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
         ),
     );
     Ok(field)

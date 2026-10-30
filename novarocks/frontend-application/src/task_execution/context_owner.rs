@@ -28,17 +28,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks_execution::task_execution::{
-    AbortCause, AbortQueryContext, AcquireQueryContextAdmissionTicket, AdmissionEpochCapability,
-    CodecOwnedContent, CredentialUpdate, EstablishQueryContext, LeaseSequence, LeaseValidFor,
-    OperationKind, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextRef,
-    QueryContextState, QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome,
-    ReleaseQueryContext, RenewQueryExecutionLease, TaskOperationId, UpdateQueryContext,
+use crate::task_execution::context_state::{
+    ContextTransition, QueryContextEvent, classify_context_transition, context_state_is_closed,
 };
-use novarocks_query_application::coordination::{
-    ContextTransition, FrontendAction, MonotonicInstant, OperationDispatchResult,
-    QueryContextEvent, RenewSchedule, RequestedLeaseDurations, classify_context_transition,
-    context_state_is_closed, frontend_action,
+use crate::task_execution::lease::{RenewSchedule, RequestedLeaseDurations};
+use crate::task_execution::operation::{FrontendAction, OperationDispatchResult, frontend_action};
+use novarocks_coordination_contract::MonotonicInstant;
+use novarocks_execution::task_execution::{
+    AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, CodecOwnedContent,
+    CredentialUpdate, EstablishQueryContext, LeaseSequence, LeaseValidFor, OperationKind,
+    OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextRef, QueryContextState,
+    QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
+    RenewQueryExecutionLease, TaskOperationId, UpdateQueryContext,
 };
 
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
@@ -62,6 +63,30 @@ const RELEASE_RETRY_MAX: Duration = Duration::from_secs(1);
 /// This is a query-side policy. Worker retention limits remain Worker-owned
 /// and are not imported into the frontend.
 pub(crate) const ADMISSION_TICKET_VALID_FOR: Duration = Duration::from_secs(10);
+
+/// The original finite horizon that may outlive a rejected Create.
+///
+/// Neither source grants Worker ownership or a new observation interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateRefusalObservationHorizon {
+    AppliedLease(MonotonicInstant),
+    IssuedEstablish(MonotonicInstant),
+}
+
+impl CreateRefusalObservationHorizon {
+    pub(crate) const fn expiry(self) -> MonotonicInstant {
+        match self {
+            Self::AppliedLease(expiry) | Self::IssuedEstablish(expiry) => expiry,
+        }
+    }
+
+    pub(crate) const fn matches_parent_acknowledgement(self, acknowledged: bool) -> bool {
+        matches!(
+            (self, acknowledged),
+            (Self::AppliedLease(_), true) | (Self::IssuedEstablish(_), false)
+        )
+    }
+}
 
 /// The shared facts an establish installs atomically.
 ///
@@ -173,6 +198,11 @@ pub enum ReleaseSettlement {
 /// The frontend's owner of one query context.
 #[derive(Debug)]
 pub struct QueryContextOwner {
+    admission_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    establish_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    renewal_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    quiesce_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    release_queue_preparation: super::intent::TaskOperationQueuePreparation,
     context: QueryContextRef,
     native_compatibility_id: NativeCompatibilityId,
     admission_epoch_capability: AdmissionEpochCapability,
@@ -190,6 +220,9 @@ pub struct QueryContextOwner {
     lease_sequence: LeaseSequence,
     renew_schedule: Option<RenewSchedule>,
     establish: Option<ReleasedEstablish>,
+    /// The original rejected Establish may only observe replacement until its
+    /// already accepted ticket horizon. It grants no replay or Worker lease.
+    rejected_establish_observation: Option<(TaskOperationId, MonotonicInstant)>,
     establish_send_started: bool,
     establish_acknowledged: bool,
     renewal: Option<ReleasedLease>,
@@ -208,7 +241,6 @@ pub struct QueryContextOwner {
     release_retry_at: Option<MonotonicInstant>,
     release_retry_delay: Duration,
     released: bool,
-    abort: Option<AbortQueryContext>,
     progress: u64,
     /// The sealed runtime-filter observation this backend reported on the
     /// release that took its shared facts down.
@@ -221,6 +253,22 @@ pub struct QueryContextOwner {
 }
 
 impl QueryContextOwner {
+    pub(super) fn queue_preparation(
+        &mut self,
+        intent: &OperationIntent,
+    ) -> &mut super::intent::TaskOperationQueuePreparation {
+        match intent {
+            OperationIntent::AcquireQueryContextAdmissionTicket(_) => {
+                &mut self.admission_queue_preparation
+            }
+            OperationIntent::EstablishQueryContext(_) => &mut self.establish_queue_preparation,
+            OperationIntent::UpdateQueryContext(_) => &mut self.renewal_queue_preparation,
+            OperationIntent::QuiesceQueryContext(_) => &mut self.quiesce_queue_preparation,
+            OperationIntent::ReleaseQueryContext(_) => &mut self.release_queue_preparation,
+            _ => panic!("Task input cannot borrow a Context preparation"),
+        }
+    }
+
     /// Creates the owner of one context, over the frozen task set this
     /// attempt places on that backend.
     pub const fn new(
@@ -230,6 +278,11 @@ impl QueryContextOwner {
         admission_epoch_capability: AdmissionEpochCapability,
     ) -> Self {
         Self {
+            admission_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            establish_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            renewal_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            quiesce_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            release_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
             context,
             native_compatibility_id,
             admission_epoch_capability,
@@ -243,6 +296,7 @@ impl QueryContextOwner {
             lease_sequence: LeaseSequence::INITIAL,
             renew_schedule: None,
             establish: None,
+            rejected_establish_observation: None,
             establish_send_started: false,
             establish_acknowledged: false,
             renewal: None,
@@ -261,7 +315,6 @@ impl QueryContextOwner {
             release_retry_at: None,
             release_retry_delay: RELEASE_RETRY_INITIAL,
             released: false,
-            abort: None,
             progress: 0,
             runtime_filter_contribution: None,
         }
@@ -516,6 +569,39 @@ impl QueryContextOwner {
             .map(|expiry| expiry.saturating_duration_since(now))
     }
 
+    pub(crate) fn rejected_establish_observation_remaining(
+        &self,
+        operation_id: TaskOperationId,
+        now: MonotonicInstant,
+    ) -> Option<Duration> {
+        let (original_operation, expiry) = self.rejected_establish_observation?;
+        (original_operation == operation_id && !self.establish_acknowledged)
+            .then(|| expiry.saturating_duration_since(now))
+    }
+
+    /// Original Establish ticket or effective Worker lease at a Create refusal.
+    /// A pipelined Create does not imply that the Establish ACK arrived. Keep
+    /// those sources distinct, and snapshot once before any later ACK/renewal.
+    pub(crate) fn create_refusal_observation_horizon(
+        &self,
+    ) -> Option<CreateRefusalObservationHorizon> {
+        if self.terminal_cleanup_started || self.released || self.quiesce_receipt.is_some() {
+            return None;
+        }
+        if self.establish_acknowledged {
+            return self.renew_schedule.map(|schedule| {
+                CreateRefusalObservationHorizon::AppliedLease(schedule.conservative_expiry())
+            });
+        }
+        if !self.establish_send_started {
+            return None;
+        }
+        self.establish
+            .as_ref()?
+            .observation_expiry
+            .map(CreateRefusalObservationHorizon::IssuedEstablish)
+    }
+
     /// The next renewal, if one is due.
     ///
     /// This deliberately consults nothing but the lease schedule. It never
@@ -633,10 +719,10 @@ impl QueryContextOwner {
                     .expect("a checked Worker verdict has its original branch"),
             });
         }
-        Err(TaskExecutionError::DispatchRejected {
-            kind: OperationKind::QuiesceQueryContext,
-            result: ack.dispatch_result(),
-        })
+        Err(crate::task_execution::error::dispatch_rejection(
+            ack,
+            OperationKind::QuiesceQueryContext,
+        ))
     }
 
     #[cfg(test)]
@@ -700,18 +786,6 @@ impl QueryContextOwner {
         Some(OperationIntent::ReleaseQueryContext(request))
     }
 
-    /// The forced stand-down of this context, once.
-    pub fn abort_intent(&mut self, cause: AbortCause) -> Option<OperationIntent> {
-        if self.released || self.abort.is_some() {
-            return None;
-        }
-        self.begin_terminal_cleanup();
-        let request = *self.abort.get_or_insert_with(|| {
-            AbortQueryContext::new(TaskOperationId::new_v7(), self.context, cause)
-        });
-        Some(OperationIntent::AbortQueryContext(request))
-    }
-
     /// Closes future normal lifecycle issuance while retaining any immutable
     /// request that already crossed transport. A late Worker settlement may
     /// still apply that request once, but the FE never uses the settlement to
@@ -726,9 +800,7 @@ impl QueryContextOwner {
     /// admission.
     ///
     /// Replayable requests keep their immutable payload and first-send time;
-    /// only the in-flight marker is released. An unsent abort is cleared
-    /// because no remote effect can exist and a later cleanup turn may mint it
-    /// again.
+    /// only the in-flight marker is released.
     pub(crate) fn rollback_unsent(&mut self, operation_id: TaskOperationId) {
         if let Some(released) = &mut self.admission
             && released.request.envelope().operation_id() == operation_id
@@ -760,13 +832,6 @@ impl QueryContextOwner {
             .is_some_and(|request| request.envelope().operation_id() == operation_id)
         {
             self.release_in_flight = false;
-            return;
-        }
-        if self
-            .abort
-            .is_some_and(|request| request.envelope().operation_id() == operation_id)
-        {
-            self.abort = None;
         }
     }
 
@@ -777,9 +842,9 @@ impl QueryContextOwner {
 
     /// Whether every local task and output responsibility has drained.
     ///
-    /// This is per-context on purpose. The attempt-level drain, which also
-    /// waits for every context to be released, is derived separately from the
-    /// neutral `AttemptDrainFacts`.
+    /// This is per-context on purpose. The original Release author uses these
+    /// Task/output observations; physical convergence still needs the Worker's
+    /// actual-exit receipt or exact process replacement.
     pub const fn locally_drained(&self) -> bool {
         self.drained_tasks >= self.expected_tasks && self.released_outputs >= self.expected_tasks
     }
@@ -843,10 +908,10 @@ impl QueryContextOwner {
         if !ack.is_applied() {
             self.fail_admission();
             let Some(_outcome) = ack.worker_outcome() else {
-                return Err(TaskExecutionError::DispatchRejected {
-                    kind: OperationKind::AcquireQueryContextAdmissionTicket,
-                    result: ack.dispatch_result(),
-                });
+                return Err(crate::task_execution::error::dispatch_rejection(
+                    ack,
+                    OperationKind::AcquireQueryContextAdmissionTicket,
+                ));
             };
             return Err(TaskExecutionError::OperationFailed {
                 context: self.context,
@@ -1007,6 +1072,26 @@ impl QueryContextOwner {
             return Ok(());
         }
         if is_establish {
+            // Preserve this exact request's observation horizon before retiring
+            // the dispatched request. A local refusal or a foreign ACK cannot
+            // create this candidate; neither can another Worker verdict.
+            if self.quiesce_receipt.is_none()
+                && matches!(
+                    ack.worker_header(),
+                    Some(
+                        novarocks_execution_contract::operation::OperationResult::Verdict {
+                            outcome: OperationOutcome::IdentityMismatch,
+                            ..
+                        }
+                    )
+                )
+            {
+                self.rejected_establish_observation = self
+                    .establish
+                    .as_ref()
+                    .and_then(|released| released.observation_expiry)
+                    .map(|expiry| (ack.operation_id(), expiry));
+            }
             self.establish = None;
             if self.quiesce_receipt.is_some() {
                 // The normal fence has already settled whether this Context
@@ -1019,10 +1104,10 @@ impl QueryContextOwner {
         let Some(_outcome) = ack.worker_outcome() else {
             // The admission grant may still occupy Worker capacity. Keep the
             // context open so failure cleanup issues its exact Abort.
-            return Err(TaskExecutionError::DispatchRejected {
-                kind: OperationKind::UpdateQueryContext,
-                result: ack.dispatch_result(),
-            });
+            return Err(crate::task_execution::error::dispatch_rejection(
+                ack,
+                OperationKind::UpdateQueryContext,
+            ));
         };
         self.state = QueryContextState::TerminalRetained;
         self.released = true;
@@ -1102,10 +1187,10 @@ impl QueryContextOwner {
             return if ack.dispatch_result() == OperationDispatchResult::TransportUnknown {
                 Ok(ReleaseSettlement::RetryExactRequest)
             } else {
-                Err(TaskExecutionError::DispatchRejected {
-                    kind: OperationKind::ReleaseQueryContext,
-                    result: ack.dispatch_result(),
-                })
+                Err(crate::task_execution::error::dispatch_rejection(
+                    ack,
+                    OperationKind::ReleaseQueryContext,
+                ))
             };
         };
         match outcome {
@@ -1124,37 +1209,6 @@ impl QueryContextOwner {
                 Ok(ReleaseSettlement::FailedClosed(outcome))
             }
         }
-    }
-
-    /// Settles one abort acknowledgement.
-    pub fn on_abort_ack(
-        &mut self,
-        ack: &OperationAcknowledgement,
-    ) -> Result<(), TaskExecutionError> {
-        if self
-            .abort
-            .is_none_or(|request| request.envelope().operation_id() != ack.operation_id())
-        {
-            return Err(TaskExecutionError::UnknownOperation);
-        }
-        if ack.worker_outcome().is_none()
-            && ack.dispatch_result() != OperationDispatchResult::TransportUnknown
-        {
-            return Err(TaskExecutionError::DispatchRejected {
-                kind: OperationKind::AbortQueryContext,
-                result: ack.dispatch_result(),
-            });
-        }
-        if ack.is_applied()
-            || matches!(
-                ack.worker_outcome(),
-                Some(OperationOutcome::ContextTerminalReceipt | OperationOutcome::Gone)
-            )
-        {
-            self.state = QueryContextState::TerminalRetained;
-            self.released = true;
-        }
-        Ok(())
     }
 
     /// Records the definitive closure receipt for an actor-owned Abort.

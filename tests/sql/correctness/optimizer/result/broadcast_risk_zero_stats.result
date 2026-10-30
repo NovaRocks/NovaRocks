@@ -1,6 +1,8 @@
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:PROJECT [count(*)] stats={rows=1}
   1:HASH AGGREGATE (GLOBAL) stats={rows=1}
@@ -8,6 +10,8 @@ PLAN FRAGMENT 0
     2:GATHER stats={rows=1}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: follow-sources([2,3])
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 2
@@ -19,6 +23,8 @@ PLAN FRAGMENT 1
     6:HASH EXCHANGE
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 5
@@ -28,6 +34,8 @@ PLAN FRAGMENT 2
     9:GENERATE_SERIES(1, 1000000, 1) stats={rows=1000000}
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 6

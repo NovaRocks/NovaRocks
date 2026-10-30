@@ -96,7 +96,7 @@ pub fn connector_query_binding_from_materialization(
         write_target_admission: None,
         frozen_snapshot_materializations,
         frozen_cohort_read: None,
-        admitted_change_scans: BTreeMap::new(),
+        prepared_source_reads: BTreeMap::new(),
     })
 }
 
@@ -123,6 +123,87 @@ pub trait QueryTableBindingLoader: Send + Sync {
         metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
         binding: SqlTableBindingId,
     ) -> CatalogResolutionResult<QueryTableBinding>;
+
+    fn prepare_strict_base_table<'a>(
+        &'a self,
+        catalog: &'a str,
+        namespace: &'a str,
+        table: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = CatalogResolutionResult<PreparedQueryTableBinding>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let _ = (catalog, namespace, table);
+            Err(CatalogResolutionError::failed(
+                "asynchronous table binding loader is not injected",
+            ))
+        })
+    }
+
+    fn prepare_metadata_table<'a>(
+        &'a self,
+        catalog: &'a str,
+        namespace: &'a str,
+        table: &'a str,
+        kind: novarocks_sql::planning::catalog::MetadataTableKind,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = CatalogResolutionResult<PreparedQueryTableBinding>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let _ = (catalog, namespace, table, kind);
+            Err(CatalogResolutionError::failed(
+                "asynchronous metadata binding loader is not injected",
+            ))
+        })
+    }
+}
+
+/// Completed provider observation consumed by the original SQL binding author.
+/// It carries the same planning lease and opaque handle, never a new lookup.
+pub struct PreparedQueryTableBinding {
+    materialization: ConnectorQueryTableMaterialization,
+    catalog: String,
+    namespace: String,
+    table: String,
+    metadata_kind: Option<novarocks_sql::planning::catalog::MetadataTableKind>,
+}
+
+impl PreparedQueryTableBinding {
+    fn create(self, binding_id: SqlTableBindingId) -> CatalogResolutionResult<QueryTableBinding> {
+        let Self {
+            materialization,
+            catalog,
+            namespace,
+            table,
+            metadata_kind,
+        } = self;
+        match metadata_kind {
+            None => connector_query_binding_from_materialization(
+                materialization,
+                &catalog,
+                &namespace,
+                &table,
+                binding_id,
+            )
+            .map_err(CatalogResolutionError::failed),
+            Some(kind) => metadata_query_binding_from_materialization(
+                materialization,
+                &catalog,
+                &namespace,
+                &table,
+                kind,
+                binding_id,
+            ),
+        }
+    }
 }
 
 /// Application-owned catalog facade.  Its binding store is request-local and
@@ -138,6 +219,10 @@ pub struct CatalogServiceMaterializer<'a> {
     /// retains only whether its string-compatible failure was absence or a
     /// hard catalog failure.
     resolution_errors: Mutex<HashMap<QueryTableBindingKey, CatalogResolutionError>>,
+    // Original capture uses the same binding cache. This sidecar preserves
+    // the producer cause paired with its memoized failure, without reloading.
+    original_resolution_errors:
+        Mutex<HashMap<QueryTableBindingKey, crate::mv::domain::application::MvApplicationError>>,
     /// Frontend-owned attachment admission. The loader still owns the exact
     /// connector lease; this gate preserves Absent versus Unavailable before
     /// Core can materialize an external table.
@@ -146,7 +231,7 @@ pub struct CatalogServiceMaterializer<'a> {
     /// They are intentionally kept next to the binding store instead of the
     /// shared memory catalog: SQL can only observe their projected tokenized
     /// scan after this materializer has admitted the exact connector lease.
-    query_local_overlays: HashMap<(String, String), QueryLocalTableOverlay>,
+    query_local_overlays: HashMap<(String, String, String), QueryLocalTableOverlay>,
 }
 
 /// One application-owned relation overlay for a generated query.
@@ -157,6 +242,7 @@ pub struct CatalogServiceMaterializer<'a> {
 /// prevents a synthetic relation from leaking into the shared catalog.
 #[derive(Clone)]
 pub struct QueryLocalTableOverlay {
+    catalog: String,
     namespace: String,
     table: String,
     key: QueryTableBindingKey,
@@ -174,17 +260,34 @@ impl QueryLocalTableOverlay {
         + Sync
         + 'static,
     ) -> Self {
-        let namespace = namespace.into();
+        Self::for_catalog("default_catalog", namespace, table, key, materialize)
+    }
+
+    /// A frozen definition relation retains its canonical catalog identity.
+    /// Generated local relations use `new` instead; the two lookup domains do
+    /// not alias, even when their namespace and table names are identical.
+    pub(crate) fn for_catalog(
+        catalog: impl Into<String>,
+        namespace: impl Into<String>,
+        table: impl Into<String>,
+        key: QueryTableBindingKey,
+        materialize: impl Fn(SqlTableBindingId) -> Result<QueryTableBinding, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
         Self {
+            catalog: catalog.into(),
+            namespace: namespace.into(),
             table: table.into(),
-            namespace,
             key,
             materialize: Arc::new(materialize),
         }
     }
 
-    fn key(&self) -> (String, String) {
+    fn key(&self) -> (String, String, String) {
         (
+            self.catalog.to_ascii_lowercase(),
             self.namespace.to_ascii_lowercase(),
             self.table.to_ascii_lowercase(),
         )
@@ -192,6 +295,7 @@ impl QueryLocalTableOverlay {
 }
 
 impl<'a> CatalogServiceMaterializer<'a> {
+    #[cfg(test)]
     pub fn new(
         current_catalog: Option<&'a str>,
         service: &'a crate::catalog_application::query_catalog::QueryCatalogService,
@@ -214,16 +318,13 @@ impl<'a> CatalogServiceMaterializer<'a> {
             bindings,
             loader,
             resolution_errors: Mutex::new(HashMap::new()),
+            original_resolution_errors: Mutex::new(HashMap::new()),
             catalog_application: None,
             query_local_overlays: overlays
                 .into_iter()
                 .map(|overlay| (overlay.key(), overlay))
                 .collect(),
         }
-    }
-
-    pub fn query_table_bindings(&self) -> Arc<QueryTableBindingStore> {
-        Arc::clone(&self.bindings)
     }
 
     pub fn with_catalog_application(
@@ -329,6 +430,23 @@ impl<'a> CatalogServiceMaterializer<'a> {
         override_catalog.or(self.current_catalog)
     }
 
+    fn query_overlay(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Option<QueryLocalTableOverlay> {
+        self.query_local_overlays
+            .get(&(
+                self.effective_catalog(catalog)
+                    .unwrap_or("default_catalog")
+                    .to_ascii_lowercase(),
+                database.to_ascii_lowercase(),
+                table.to_ascii_lowercase(),
+            ))
+            .cloned()
+    }
+
     fn resolve_table_for_analysis_once(
         &self,
         catalog: Option<&str>,
@@ -337,12 +455,8 @@ impl<'a> CatalogServiceMaterializer<'a> {
     ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => {
-                if let Some(overlay) = self
-                    .query_local_overlays
-                    .get(&(database.to_ascii_lowercase(), table.to_ascii_lowercase()))
-                    .cloned()
-                {
-                    return self.resolve_query_local_overlay(overlay);
+                if let Some(overlay) = self.query_overlay(catalog, database, table) {
+                    return self.resolve_query_local_overlay(overlay, database, table);
                 }
                 let local = self
                     .service
@@ -363,6 +477,11 @@ impl<'a> CatalogServiceMaterializer<'a> {
             }
             Some(catalog) => {
                 let observation = self.require_catalog_admission(catalog)?;
+                if let Some(overlay) = self.query_overlay(Some(catalog), database, table) {
+                    let resolved = self.resolve_query_local_overlay(overlay, database, table)?;
+                    self.verify_catalog_admission(catalog, observation.as_ref())?;
+                    return Ok(resolved);
+                }
                 let key = QueryTableBindingKey::analysis_lookup(catalog, database, table);
                 let token = self.bind_for_sql(key, |binding_id| {
                     self.loader
@@ -386,16 +505,39 @@ impl<'a> CatalogServiceMaterializer<'a> {
     fn resolve_query_local_overlay(
         &self,
         overlay: QueryLocalTableOverlay,
+        database: &str,
+        table: &str,
     ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
+        let catalog = overlay.catalog.clone();
         let token = self.bind_for_sql(overlay.key, |binding_id| {
             (overlay.materialize)(binding_id).map_err(CatalogResolutionError::failed)
         })?;
-        Ok(self
+        let resolved = self
             .bindings
             .binding(token)
             .map_err(CatalogResolutionError::failed)?
             .resolved
-            .clone())
+            .clone();
+        if catalog != "default_catalog" {
+            let identity =
+                novarocks_sql::planning::catalog::materialization_identity_facts(&resolved);
+            if !identity.catalog().eq_ignore_ascii_case(&catalog)
+                || !identity.namespace().eq_ignore_ascii_case(database)
+                || !identity.table().eq_ignore_ascii_case(table)
+            {
+                return Err(CatalogResolutionError::failed(format!(
+                    "frozen relation `{}` does not match `{catalog}.{database}.{table}`",
+                    identity.fqn()
+                )));
+            }
+            return Ok(resolved);
+        }
+        // Only the SQL lookup is local. Its token still names the original
+        // Provider binding, including the exact frozen snapshot and lease.
+        novarocks_sql::planning::catalog::project_query_local_overlay_name(
+            resolved, database, table,
+        )
+        .map_err(CatalogResolutionError::failed)
     }
 
     fn metadata_table_def(
@@ -465,6 +607,345 @@ impl<'a> CatalogServiceMaterializer<'a> {
         metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
     ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
         self.metadata_table_def(catalog, database, table, metadata_table_type)
+    }
+
+    pub(crate) async fn resolve_table_for_analysis_async(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
+        if self.query_overlay(catalog, database, table).is_some() {
+            return self.resolve_table_for_analysis_once(catalog, database, table);
+        }
+        match self.effective_catalog(catalog) {
+            Some("default_catalog") | None => {
+                self.resolve_table_for_analysis_once(catalog, database, table)
+            }
+            Some(catalog) => {
+                let observation = self.require_catalog_admission(catalog)?;
+                let key = QueryTableBindingKey::analysis_lookup(catalog, database, table);
+                let token = if self.bindings.resolved_lookup(&key).is_some() {
+                    self.bind_for_sql(key, |_| unreachable!("completed binding must not reload"))?
+                } else {
+                    let observed = self
+                        .loader
+                        .prepare_strict_base_table(catalog, database, table)
+                        .await;
+                    self.bind_for_sql(key, |binding| {
+                        observed.and_then(|facts| facts.create(binding))
+                    })?
+                };
+                self.verify_catalog_admission(catalog, observation.as_ref())?;
+                Ok(self
+                    .bindings
+                    .binding(token)
+                    .map_err(CatalogResolutionError::failed)?
+                    .resolved
+                    .clone())
+            }
+        }
+    }
+
+    pub(crate) async fn resolve_metadata_table_async(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        kind: novarocks_sql::planning::catalog::MetadataTableKind,
+    ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
+        if kind == novarocks_sql::planning::catalog::MetadataTableKind::Partitions {
+            return Err(CatalogResolutionError::failed(
+                "invariant: $partitions is a SQL view over $files",
+            ));
+        }
+        match self.effective_catalog(catalog) {
+            Some("default_catalog") | None => {
+                self.metadata_table_def(catalog, database, table, kind)
+            }
+            Some(catalog) => {
+                let observation = self.require_catalog_admission(catalog)?;
+                let key = QueryTableBindingKey::metadata(catalog, database, table, kind);
+                let token = if self.bindings.resolved_lookup(&key).is_some() {
+                    self.bind_for_sql(key, |_| unreachable!("completed binding must not reload"))?
+                } else {
+                    let observed = self
+                        .loader
+                        .prepare_metadata_table(catalog, database, table, kind)
+                        .await;
+                    self.bind_for_sql(key, |binding| {
+                        observed.and_then(|facts| facts.create(binding))
+                    })?
+                };
+                self.verify_catalog_admission(catalog, observation.as_ref())?;
+                Ok(self
+                    .bindings
+                    .binding(token)
+                    .map_err(CatalogResolutionError::failed)?
+                    .resolved
+                    .clone())
+            }
+        }
+    }
+}
+
+/// A CPU-created lookup suspension. No Provider future is polled while this
+/// value is built or completed; its exact lease is used by the named I/O gate.
+pub(crate) enum OriginalCatalogLookup {
+    Fact(novarocks_sql::compiler::CatalogRelationFact),
+    Metadata(Box<OriginalCatalogMetadataLookup>),
+}
+pub(crate) struct OriginalCatalogMetadataLookup {
+    need: novarocks_sql::compiler::CatalogRelationNeed,
+    key: QueryTableBindingKey,
+    observation: Option<novarocks_catalog_application::CatalogRuntimeObservation>,
+    pub(crate) lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    pub(crate) namespace: String,
+    pub(crate) physical_table: String,
+    pub(crate) resolution: novarocks_spi::connector::ConnectorTableResolution,
+    snapshot: Option<i64>,
+    metadata_kind: Option<novarocks_sql::planning::catalog::MetadataTableKind>,
+}
+impl CatalogServiceMaterializer<'_> {
+    fn original_catalog_admission(
+        &self,
+        catalog: &str,
+    ) -> Result<
+        Option<novarocks_catalog_application::CatalogRuntimeObservation>,
+        crate::mv::domain::application::MvApplicationError,
+    > {
+        use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
+        let Some(application) = self.catalog_application else {
+            return Ok(None);
+        };
+        let id =
+            novarocks_spi::connector::ConnectorInstanceId::parse(catalog).map_err(|error| {
+                MvApplicationError::new(MvApplicationErrorKind::InvalidRequest, error.to_string())
+            })?;
+        application
+            .admit_catalog(&id)
+            .require_ready(&id)
+            .map(Some)
+            .map_err(|error| {
+                let cause = error.source_failure().cloned().unwrap_or_else(|| {
+                    novarocks_failure_contract::SharedFailureCause::new(error.clone())
+                });
+                MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
+                    .with_original_failure(cause)
+            })
+    }
+
+    /// Original SQL need, original binding store, exact catalog admission.
+    /// Call only in the pure CPU turn; the returned Metadata value is a named
+    /// request rather than a callback that may enter a live catalog.
+    pub(crate) fn begin_original_catalog_lookup(
+        &self,
+        need: &novarocks_sql::compiler::CatalogRelationNeed,
+        controls: &dyn ConnectorControlResolver,
+    ) -> Result<OriginalCatalogLookup, crate::mv::domain::application::MvApplicationError> {
+        use crate::query_execution::mv_assembly::refresh_preparation::io_gate::{
+            contract_error, provider_error,
+        };
+        use novarocks_sql::compiler::CatalogLookupTarget;
+        let relation = need.relation();
+        let catalog = relation.catalog.as_str();
+        let metadata_kind = match need.target() {
+            CatalogLookupTarget::Table { .. } => None,
+            CatalogLookupTarget::IcebergMetadata { kind } => Some(kind),
+        };
+        if catalog == "default_catalog" {
+            let resolved = match metadata_kind {
+                None => self.resolve_table_for_analysis_once(
+                    Some(catalog),
+                    &relation.namespace,
+                    &relation.table,
+                ),
+                Some(kind) => self.metadata_table_def(
+                    Some(catalog),
+                    &relation.namespace,
+                    &relation.table,
+                    kind,
+                ),
+            };
+            return original_catalog_fact(need, resolved).map(OriginalCatalogLookup::Fact);
+        }
+        let observation = self.original_catalog_admission(catalog)?;
+        if metadata_kind.is_none()
+            && let Some(overlay) =
+                self.query_overlay(Some(catalog), &relation.namespace, &relation.table)
+        {
+            let resolved =
+                self.resolve_query_local_overlay(overlay, &relation.namespace, &relation.table);
+            if self.original_catalog_admission(catalog)? != observation {
+                return Err(contract_error(
+                    "catalog attachment generation changed while acquiring its planning lease",
+                ));
+            }
+            return original_catalog_fact(need, resolved).map(OriginalCatalogLookup::Fact);
+        }
+        let key = match metadata_kind {
+            None => {
+                QueryTableBindingKey::analysis_lookup(catalog, &relation.namespace, &relation.table)
+            }
+            Some(kind) => {
+                QueryTableBindingKey::metadata(catalog, &relation.namespace, &relation.table, kind)
+            }
+        };
+        if let Some(error) = self
+            .original_resolution_errors
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+        {
+            return Err(error);
+        }
+        if self.bindings.resolved_lookup(&key).is_some() {
+            let token = self.bind_for_sql(key, |_| {
+                unreachable!("memoized original lookup must not reload")
+            });
+            let resolved = token.and_then(|token| {
+                self.bindings
+                    .binding(token)
+                    .map(|binding| binding.resolved.clone())
+                    .map_err(CatalogResolutionError::failed)
+            });
+            if self.original_catalog_admission(catalog)? != observation {
+                return Err(contract_error(
+                    "catalog attachment generation changed while acquiring its planning lease",
+                ));
+            }
+            return original_catalog_fact(need, resolved).map(OriginalCatalogLookup::Fact);
+        }
+        let lease =
+            crate::connector::metadata_binding_typed(controls, catalog).map_err(provider_error)?;
+        let (physical_table, resolution, snapshot) = match metadata_kind {
+            None => {
+                let (table, snapshot) =
+                    crate::catalog_application::query_bindings::parse_time_travel_overlay_identity(
+                        &relation.table,
+                    )
+                    .map(|(table, snapshot)| (table, Some(snapshot)))
+                    .unwrap_or((&relation.table, None));
+                (
+                    table.to_string(),
+                    novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                    snapshot,
+                )
+            }
+            Some(kind) => (
+                format!(
+                    "{}${}",
+                    relation.table,
+                    metadata_table_alias_suffix(kind)
+                        .map_err(|e| contract_error(e.into_message()))?
+                ),
+                novarocks_spi::connector::ConnectorTableResolution::ProviderReadAlias,
+                None,
+            ),
+        };
+        Ok(OriginalCatalogLookup::Metadata(Box::new(
+            OriginalCatalogMetadataLookup {
+                need: need.clone(),
+                key,
+                observation,
+                lease,
+                namespace: relation.namespace.clone(),
+                physical_table,
+                resolution,
+                snapshot,
+                metadata_kind,
+            },
+        )))
+    }
+
+    /// Consume that exact observation on the CPU. The original projection and
+    /// memoization authors install the binding once; Provider failures retain
+    /// their real cause alongside the same memoized failure.
+    pub(crate) fn finish_original_catalog_lookup(
+        &self,
+        lookup: Box<OriginalCatalogMetadataLookup>,
+        observed: Result<
+            novarocks_spi::connector::ConnectorTableMetadata,
+            novarocks_spi::connector::ConnectorError,
+        >,
+    ) -> Result<
+        novarocks_sql::compiler::CatalogRelationFact,
+        crate::mv::domain::application::MvApplicationError,
+    > {
+        use crate::query_execution::mv_assembly::refresh_preparation::io_gate::contract_error;
+        let lookup = *lookup;
+        let relation = lookup.need.relation();
+        let materialization = match observed {
+            Ok(metadata) => crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
+                metadata, lookup.lease,
+            ).map_err(CatalogResolutionError::failed),
+            Err(error) if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound => {
+                let missing = CatalogResolutionError::missing(format!("unknown table: {}.{}", relation.namespace, relation.table));
+                let cached = self.bind_for_sql(lookup.key, |_| Err(missing)).and_then(|_| unreachable!());
+                return original_catalog_fact(&lookup.need, cached);
+            }
+            Err(error) => {
+                let error = crate::query_execution::mv_assembly::refresh_preparation::io_gate::provider_error(error);
+                // Keep the original typed Provider failure. The reader stops;
+                // a repeated need observes this same cause rather than I/O.
+                let retired = self.original_resolution_errors.lock().unwrap()
+                    .insert(lookup.key.clone(), error.clone());
+                drop(retired);
+                let _ = self.bind_for_sql(lookup.key, |_| Err(CatalogResolutionError::failed(error.message())));
+                return Err(error);
+            }
+        };
+        let token = self
+            .bind_for_sql(lookup.key, |binding| {
+                let mut materialization = materialization?;
+                if let Some(snapshot) = lookup.snapshot {
+                    materialization.read_selector =
+                        novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot);
+                }
+                PreparedQueryTableBinding {
+                    materialization,
+                    catalog: relation.catalog.clone(),
+                    namespace: relation.namespace.clone(),
+                    table: relation.table.clone(),
+                    metadata_kind: lookup.metadata_kind,
+                }
+                .create(binding)
+            })
+            .map_err(|error| contract_error(error.into_message()))?;
+        if self.original_catalog_admission(&relation.catalog)? != lookup.observation {
+            return Err(contract_error(
+                "catalog attachment generation changed while acquiring its planning lease",
+            ));
+        }
+        let resolved = self
+            .bindings
+            .binding(token)
+            .map_err(contract_error)?
+            .resolved
+            .clone();
+        novarocks_sql::compiler::CatalogRelationFact::resolved(&lookup.need, resolved)
+            .map_err(|error| contract_error(error.to_string()))
+    }
+}
+
+fn original_catalog_fact(
+    need: &novarocks_sql::compiler::CatalogRelationNeed,
+    resolved: CatalogResolutionResult<ResolvedAnalyzerTable>,
+) -> Result<
+    novarocks_sql::compiler::CatalogRelationFact,
+    crate::mv::domain::application::MvApplicationError,
+> {
+    use crate::query_execution::mv_assembly::refresh_preparation::io_gate::contract_error;
+    use novarocks_sql::compiler::CatalogRelationFact;
+    match resolved {
+        Ok(table) => CatalogRelationFact::resolved(need, table)
+            .map_err(|error| contract_error(error.to_string())),
+        Err(CatalogResolutionError::Missing { reason }) => {
+            CatalogRelationFact::missing(need, reason)
+                .map_err(|error| contract_error(error.to_string()))
+        }
+        Err(error) => Err(contract_error(error.into_message())),
     }
 }
 
@@ -682,41 +1163,124 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             namespace,
             &alias,
         )?;
-        // The columns SQL analyzes must be the ones the typed reader produces.
-        // The connector's own alias materialization still reports the retired
-        // schema — `committed_at` as a bare `Int64`, `summary` as `Utf8` —
-        // while both the frozen contract and the typed reader say
-        // `TIMESTAMP WITH TIME ZONE` and `MAP`. Analyzing the retired shape
-        // renders a raw epoch integer, and ordering by it fails at the
-        // exchange with a schema mismatch.
-        let columns =
-            frozen_metadata_columns(metadata_table_type)?.unwrap_or(materialization.columns);
-        Ok(QueryTableBinding {
-            resolved: novarocks_sql::planning::catalog::resolved_metadata_table(
-                catalog,
-                namespace,
-                table,
-                metadata_table_type,
-                columns,
-                materialization.row_lineage_metadata_columns,
-                binding_id,
-            ),
-            statistics_pin: materialization.statistics_pin.clone(),
-            admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
-            source_metadata: None,
-            scan_materialization: Some(QueryScanMaterialization {
-                table: materialization.read_table,
-                selector: materialization.read_selector,
-                mv_partition_selection: None,
-                planning_lease: materialization.planning_lease,
-            }),
-            mv_target_read: None,
-            write_target_admission: None,
-            frozen_cohort_read: None,
-            frozen_snapshot_materializations: BTreeMap::new(),
-            admitted_change_scans: BTreeMap::new(),
+        metadata_query_binding_from_materialization(
+            materialization,
+            catalog,
+            namespace,
+            table,
+            metadata_table_type,
+            binding_id,
+        )
+    }
+
+    fn prepare_strict_base_table<'a>(
+        &'a self,
+        catalog: &'a str,
+        namespace: &'a str,
+        table: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = CatalogResolutionResult<PreparedQueryTableBinding>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let (base_table, snapshot_id) =
+                crate::catalog_application::query_bindings::parse_time_travel_overlay_identity(
+                    table,
+                )
+                .map(|(base, snapshot)| (base, Some(snapshot)))
+                .unwrap_or((table, None));
+            let mut materialization = crate::catalog_application::query_catalog::load_connector_table_materialization_with_resolution_async(
+                self.controls, self.connector_context.clone(), catalog, namespace, base_table,
+                novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            ).await?;
+            if let Some(snapshot) = snapshot_id {
+                materialization.read_selector =
+                    novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot);
+            }
+            Ok(PreparedQueryTableBinding {
+                materialization,
+                catalog: catalog.to_string(),
+                namespace: namespace.to_string(),
+                table: table.to_string(),
+                metadata_kind: None,
+            })
         })
     }
+
+    fn prepare_metadata_table<'a>(
+        &'a self,
+        catalog: &'a str,
+        namespace: &'a str,
+        table: &'a str,
+        kind: novarocks_sql::planning::catalog::MetadataTableKind,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = CatalogResolutionResult<PreparedQueryTableBinding>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let alias = format!("{table}${}", metadata_table_alias_suffix(kind)?);
+            let materialization = crate::catalog_application::query_catalog::load_connector_table_materialization_with_resolution_async(
+                self.controls, self.connector_context.clone(), catalog, namespace, &alias,
+                novarocks_spi::connector::ConnectorTableResolution::ProviderReadAlias,
+            ).await?;
+            Ok(PreparedQueryTableBinding {
+                materialization,
+                catalog: catalog.to_string(),
+                namespace: namespace.to_string(),
+                table: table.to_string(),
+                metadata_kind: Some(kind),
+            })
+        })
+    }
+}
+
+fn metadata_query_binding_from_materialization(
+    materialization: ConnectorQueryTableMaterialization,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
+    binding_id: SqlTableBindingId,
+) -> CatalogResolutionResult<QueryTableBinding> {
+    // The columns SQL analyzes must be the ones the typed reader produces.
+    // The connector's own alias materialization still reports the retired
+    // schema — `committed_at` as a bare `Int64`, `summary` as `Utf8` —
+    // while both the frozen contract and the typed reader say
+    // `TIMESTAMP WITH TIME ZONE` and `MAP`. Analyzing the retired shape
+    // renders a raw epoch integer, and ordering by it fails at the
+    // exchange with a schema mismatch.
+    let columns = frozen_metadata_columns(metadata_table_type)?.unwrap_or(materialization.columns);
+    Ok(QueryTableBinding {
+        resolved: novarocks_sql::planning::catalog::resolved_metadata_table(
+            catalog,
+            namespace,
+            table,
+            metadata_table_type,
+            columns,
+            materialization.row_lineage_metadata_columns,
+            binding_id,
+        ),
+        statistics_pin: materialization.statistics_pin.clone(),
+        admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
+        source_metadata: None,
+        scan_materialization: Some(QueryScanMaterialization {
+            table: materialization.read_table,
+            selector: materialization.read_selector,
+            mv_partition_selection: None,
+            planning_lease: materialization.planning_lease,
+        }),
+        mv_target_read: None,
+        write_target_admission: None,
+        frozen_cohort_read: None,
+        frozen_snapshot_materializations: BTreeMap::new(),
+        prepared_source_reads: BTreeMap::new(),
+    })
 }
 
 /// The frozen column contract for one metadata relation, when it is fully
@@ -1047,7 +1611,7 @@ mod tests {
             mv_target_read: None,
             frozen_cohort_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
-            admitted_change_scans: BTreeMap::new(),
+            prepared_source_reads: BTreeMap::new(),
         }
     }
 
@@ -1443,5 +2007,370 @@ mod tests {
             novarocks_sql::planning::catalog::local_catalog_table(&local, "db", "__nr_cow_orders")
                 .is_err()
         );
+    }
+    fn original_schema_need(sql: &str) -> novarocks_sql::compiler::SqlCapturedCatalogPreparation {
+        let statements = novarocks_parser::parse(sql).unwrap();
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("actual SQL query fixture");
+        };
+        novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
+            query.clone(),
+            Some("ice"),
+            "db",
+            novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn original_mv_catalog_fact_preserves_actual_provider_cause_and_one_lookup() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        let registry = crate::connector::FixtureConnectorRegistry::new();
+        crate::connector::scan_model::register_planned_files_fixture(
+            &registry,
+            "ice",
+            Vec::new(),
+            None,
+        );
+        let controls = crate::connector::FixtureControlResolver::new(registry);
+        let service = crate::catalog_application::query_catalog::new_query_catalog_service();
+        let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+        let materializer = CatalogServiceMaterializer::new(
+            Some("ice"),
+            &service,
+            Arc::clone(&bindings),
+            Box::new(OverlayLoader),
+        );
+        let preparation = original_schema_need("SELECT * FROM ice.db.orders");
+        let [need] = preparation.needs() else {
+            panic!("one actual relation need");
+        };
+        let OriginalCatalogLookup::Metadata(lookup) = materializer
+            .begin_original_catalog_lookup(need, &controls)
+            .unwrap()
+        else {
+            panic!("the original lookup must request metadata exactly once");
+        };
+        let original = ConnectorError::from_domain(
+            ConnectorErrorKind::ResourceExhausted,
+            novarocks_workload_control::WorkError::Capacity("original catalog observation"),
+        );
+        let fact = original.failure_fact();
+        let cause = std::error::Error::source(&original)
+            .unwrap()
+            .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            .unwrap()
+            .clone();
+        let failed = materializer
+            .finish_original_catalog_lookup(lookup, Err(original))
+            .unwrap_err();
+        assert_eq!(failed.original_failure(), Some(&cause));
+        assert_eq!(cause.failure_fact(), fact);
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert!(matches!(
+            bindings.resolved_lookup(&QueryTableBindingKey::analysis_lookup(
+                "ice", "db", "orders"
+            )),
+            Some(Err(_))
+        ));
+        let repeated = match materializer.begin_original_catalog_lookup(need, &controls) {
+            Err(error) => error,
+            Ok(_) => panic!("failed original metadata may not be loaded again"),
+        };
+        assert_eq!(repeated.original_failure(), Some(&cause));
+    }
+
+    #[test]
+    fn original_mv_catalog_keeps_canonical_frozen_relations_separate_from_local_names() {
+        let controls = crate::connector::FixtureControlResolver::new(
+            crate::connector::FixtureConnectorRegistry::new(),
+        );
+        let service = crate::catalog_application::query_catalog::new_query_catalog_service();
+        let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+        let creations = Arc::new(AtomicUsize::new(0));
+        let overlays = ["ice", "other"]
+            .into_iter()
+            .map(|catalog| {
+                let creations = creations.clone();
+                QueryLocalTableOverlay::for_catalog(
+                    catalog,
+                    "db",
+                    "orders",
+                    QueryTableBindingKey::snapshot(catalog, "db", "orders", 7),
+                    move |binding| {
+                        creations.fetch_add(1, Ordering::Relaxed);
+                        let mut facts = frozen_overlay_binding(binding);
+                        facts.resolved = test_connector_read_materialization(
+                            catalog,
+                            "orders",
+                            binding,
+                            novarocks_spi::connector::ConnectorReadSelector::SnapshotId(7),
+                        );
+                        Ok(facts)
+                    },
+                )
+            })
+            .collect();
+        let materializer = CatalogServiceMaterializer::new_with_query_local_overlays(
+            Some("ice"),
+            &service,
+            bindings.clone(),
+            Box::new(OverlayLoader),
+            overlays,
+        );
+        // Real SQL SchemaOnly prepass -> original application lookup -> exact
+        // captured catalog; an empty resolver cannot supply a fallback lease.
+        let preparation =
+            original_schema_need("SELECT 1 FROM ice.db.orders a JOIN other.db.orders b ON 1 = 1");
+        let facts = preparation
+            .needs()
+            .iter()
+            .map(|need| {
+                let OriginalCatalogLookup::Fact(fact) = materializer
+                    .begin_original_catalog_lookup(need, &controls)
+                    .unwrap()
+                else {
+                    panic!("an exact frozen relation must not reload live metadata");
+                };
+                fact
+            })
+            .collect::<Vec<_>>();
+        let catalog = preparation.capture(&facts).unwrap();
+        let mut tokens = Vec::new();
+        for name in ["ice", "other"] {
+            let resolved = catalog
+                .provider()
+                .resolve_table_for_analysis(Some(name), "db", "orders")
+                .unwrap();
+            assert_eq!(
+                novarocks_sql::planning::catalog::materialization_identity_facts(&resolved).fqn(),
+                format!("{name}.db.orders"),
+            );
+            let token = novarocks_sql::planning::catalog::table_binding_id(&resolved);
+            assert_eq!(
+                novarocks_sql::planning::catalog::frozen_input_snapshot_id(&resolved),
+                Some(7),
+            );
+            assert_eq!(
+                novarocks_sql::planning::catalog::table_binding_id(
+                    &bindings.binding(token).unwrap().resolved
+                ),
+                token,
+            );
+            tokens.push(token);
+        }
+        assert_ne!(tokens[0], tokens[1]);
+        assert_eq!(creations.load(Ordering::Relaxed), 2);
+        let repeated = materializer
+            .resolve_table_for_analysis(None, "DB", "ORDERS")
+            .unwrap();
+        assert_eq!(
+            novarocks_sql::planning::catalog::table_binding_id(&repeated),
+            tokens[0]
+        );
+        assert_eq!(creations.load(Ordering::Relaxed), 2);
+        assert!(
+            materializer
+                .resolve_table_for_analysis(Some("default_catalog"), "db", "orders")
+                .is_err()
+        );
+        assert!(
+            catalog
+                .provider()
+                .resolve_table_for_analysis(Some("foreign"), "db", "orders")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn original_mv_captured_catalog_consumes_the_exact_local_overlay_without_a_loader() {
+        let controls = crate::connector::FixtureControlResolver::new(
+            crate::connector::FixtureConnectorRegistry::new(),
+        );
+        let service = crate::catalog_application::query_catalog::new_query_catalog_service();
+        let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+        let materializer = CatalogServiceMaterializer::new_with_query_local_overlays(
+            Some("default_catalog"),
+            &service,
+            Arc::clone(&bindings),
+            Box::new(OverlayLoader),
+            vec![QueryLocalTableOverlay::new(
+                "db",
+                "__nr_cow_orders",
+                QueryTableBindingKey::snapshot("ice", "db", "orders", 7),
+                |binding| Ok(frozen_overlay_binding(binding)),
+            )],
+        );
+        let preparation = original_schema_need("SELECT * FROM default_catalog.db.__nr_cow_orders");
+        let [need] = preparation.needs() else {
+            panic!("one actual overlay relation need");
+        };
+        let OriginalCatalogLookup::Fact(fact) = materializer
+            .begin_original_catalog_lookup(need, &controls)
+            .unwrap()
+        else {
+            panic!("a frozen local overlay must not issue a provider request");
+        };
+        let catalog = preparation.capture(&[fact]).unwrap();
+        let resolved = catalog
+            .provider()
+            .resolve_table_for_analysis(Some("default_catalog"), "db", "__nr_cow_orders")
+            .unwrap();
+        let token = novarocks_sql::planning::catalog::table_binding_id(&resolved);
+        assert!(token.belongs_to(bindings.scope()));
+        assert_eq!(
+            novarocks_sql::planning::catalog::materialization_identity_facts(&resolved).fqn(),
+            "default_catalog.db.__nr_cow_orders"
+        );
+        let physical = bindings.binding(token).unwrap();
+        assert_eq!(
+            novarocks_sql::planning::catalog::materialization_identity_facts(&physical.resolved)
+                .fqn(),
+            "ice.db.__nr_cow_orders"
+        );
+        assert_eq!(
+            novarocks_sql::planning::catalog::table_binding_id(&physical.resolved),
+            token
+        );
+        assert_eq!(
+            novarocks_sql::planning::catalog::frozen_input_snapshot_id(&resolved),
+            Some(7)
+        );
+        assert_eq!(
+            novarocks_sql::planning::catalog::frozen_input_snapshot_id(&physical.resolved),
+            Some(7)
+        );
+        let repeated = materializer
+            .resolve_table_for_analysis(Some("default_catalog"), "db", "__nr_cow_orders")
+            .unwrap();
+        assert_eq!(
+            novarocks_sql::planning::catalog::table_binding_id(&repeated),
+            token
+        );
+        assert_eq!(
+            novarocks_sql::planning::catalog::materialization_identity_facts(&repeated).fqn(),
+            "default_catalog.db.__nr_cow_orders"
+        );
+        let mixed_case = materializer
+            .resolve_table_for_analysis(Some("default_catalog"), "DB", "__NR_Cow_Orders")
+            .expect("the original case-insensitive overlay lookup remains supported");
+        assert_eq!(
+            novarocks_sql::planning::catalog::table_binding_id(&mixed_case),
+            token
+        );
+        assert_eq!(
+            novarocks_sql::planning::catalog::materialization_identity_facts(&mixed_case).fqn(),
+            "default_catalog.db.__nr_cow_orders"
+        );
+        assert_eq!(
+            novarocks_sql::planning::catalog::frozen_input_snapshot_id(&mixed_case),
+            Some(7)
+        );
+        let mixed_preparation =
+            original_schema_need("SELECT * FROM DEFAULT_CATALOG.DB.__NR_COW_ORDERS");
+        let [mixed_need] = mixed_preparation.needs() else {
+            panic!("one normalized original overlay need");
+        };
+        let OriginalCatalogLookup::Fact(mixed_fact) = materializer
+            .begin_original_catalog_lookup(mixed_need, &controls)
+            .unwrap()
+        else {
+            panic!("the normalized overlay must not issue a provider request");
+        };
+        mixed_preparation.capture(&[mixed_fact]).unwrap();
+        assert!(bindings.scan_materialization(token).unwrap().is_none());
+        let local = service.local().read().unwrap();
+        assert!(
+            novarocks_sql::planning::catalog::local_catalog_table(&local, "db", "__nr_cow_orders")
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod async_observation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MissingLoader {
+        gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl QueryTableBindingLoader for MissingLoader {
+        fn load_strict_base_table(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: SqlTableBindingId,
+        ) -> CatalogResolutionResult<QueryTableBinding> {
+            panic!("async resolution must not call the joining loader")
+        }
+        fn load_metadata_table(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: novarocks_sql::planning::catalog::MetadataTableKind,
+            _: SqlTableBindingId,
+        ) -> CatalogResolutionResult<QueryTableBinding> {
+            panic!("async resolution must not call the joining loader")
+        }
+        fn prepare_strict_base_table<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = CatalogResolutionResult<PreparedQueryTableBinding>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let gate = self.gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.await.expect("original observation released");
+                }
+                Err(CatalogResolutionError::missing("unknown table: db.orders"))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn async_materialization_waits_without_a_binding_lock_and_memoizes_original_absence() {
+        let service = crate::catalog_application::query_catalog::new_query_catalog_service();
+        let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let materializer = CatalogServiceMaterializer::new(
+            Some("ice"),
+            &service,
+            Arc::clone(&bindings),
+            Box::new(MissingLoader {
+                gate: Mutex::new(Some(gate)),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let key = QueryTableBindingKey::analysis_lookup("ice", "db", "orders");
+        let mut waiting =
+            Box::pin(materializer.resolve_table_for_analysis_async(None, "db", "orders"));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        // This real original-store observation would deadlock if its metadata
+        // mutex were retained by the suspended provider operation.
+        assert!(bindings.resolved_lookup(&key).is_none());
+        release.send(()).unwrap();
+        let error = waiting.await.unwrap_err();
+        assert!(matches!(error, CatalogResolutionError::Missing { .. }));
+        let repeated = materializer
+            .resolve_table_for_analysis_async(None, "db", "orders")
+            .await
+            .unwrap_err();
+        assert_eq!(error, repeated);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(bindings.resolved_lookup(&key), Some(Err(_))));
     }
 }

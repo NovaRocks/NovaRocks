@@ -268,6 +268,7 @@ impl PureInvocationScalarImplementation for ArrayStructSubfieldOwner {
 #[derive(Debug)]
 struct PreparedArrayStructSubfield {
     contract: Arc<ScalarCallContract>,
+    field_ordinal: Option<usize>,
 }
 impl PreparedInvocationScalarKernel for PreparedArrayStructSubfield {
     fn contract(&self) -> &Arc<ScalarCallContract> {
@@ -296,6 +297,7 @@ impl PreparedInvocationScalarKernel for PreparedArrayStructSubfield {
             crate::aggregate_host_allocator::HostAggregateAllocator::try_new(host.clone())?;
         Ok(Box::new(ArrayStructSubfieldInstance {
             contract: self.contract.clone(),
+            field_ordinal: self.field_ordinal,
             host,
             allocator,
             failed: false,
@@ -304,6 +306,7 @@ impl PreparedInvocationScalarKernel for PreparedArrayStructSubfield {
 }
 struct ArrayStructSubfieldInstance {
     contract: Arc<ScalarCallContract>,
+    field_ordinal: Option<usize>,
     host: Arc<dyn AggregateStateAllocator>,
     allocator: crate::aggregate_host_allocator::HostAggregateAllocator,
     failed: bool,
@@ -335,6 +338,7 @@ impl InvocationScalarKernelInstance for ArrayStructSubfieldInstance {
         let result = super::array_struct_subfield_selected::evaluate_scoped(
             input,
             &self.contract,
+            self.field_ordinal,
             control,
             &self.allocator,
             &self.host,
@@ -417,10 +421,23 @@ impl ArrayStructSubfieldOwner {
                 _ => invalid("__array_struct_subfield preparation has a stale selected binding"),
             })?;
             work.flush().map_err(compile_failure)?;
-            // The prepared object retains the same canonical contract. Its body is
-            // a static pure implementation and needs no live resolver or authority.
-            let prepared = Arc::new(PreparedArrayStructSubfield { contract })
-                as Arc<dyn PreparedInvocationScalarKernel>;
+            let field_ordinal = if input.request.logical_argument_count == 2 {
+                Some(
+                    super::catalogue::array_struct_subfield_ordinal(input.request, &mut work)
+                        .map_err(|source| match source {
+                            FunctionBindingError::Control(source) => compile_failure(source),
+                            source => super::struct_field_resolution::into_kernel(source),
+                        })?,
+                )
+            } else {
+                None
+            };
+            // Freeze the unique field ordinal under the original exact call.
+            // Wrong arity retains its existing NoArguments runtime diagnostic.
+            let prepared = Arc::new(PreparedArrayStructSubfield {
+                contract,
+                field_ordinal,
+            }) as Arc<dyn PreparedInvocationScalarKernel>;
             work.flush().map_err(compile_failure)?;
             Ok(prepared)
         })();

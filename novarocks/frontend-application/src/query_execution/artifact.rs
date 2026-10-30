@@ -31,7 +31,8 @@ mod task_manifest_binding;
 pub(crate) use task_manifest_binding::{
     BoundManifestBackend, BoundManifestContext, BoundManifestEdge, BoundManifestFrozenUnits,
     BoundManifestPartitionKind, BoundManifestProducer, BoundManifestScanAssignment,
-    BoundManifestScanWork, BoundManifestTask, FrozenAttemptTopology, TaskManifestBinding,
+    BoundManifestScanWork, BoundManifestTask, BoundWriterCohort, FrozenAttemptTopology,
+    TaskManifestBinding,
 };
 
 pub use native_submission::{
@@ -130,6 +131,7 @@ impl PreparedDistributedTemplateIdentity {
     }
 }
 
+#[cfg(test)]
 fn validate_prepared_template_affinity(
     native: &PreparedDistributedTemplateIdentity,
     access: &PreparedDistributedTemplateIdentity,
@@ -226,12 +228,25 @@ impl PreparedDistributedAttemptAccessOwner {
     ) -> Result<PreparedDistributedQuery, DistributedQueryError> {
         let native = manifest.request_bound_native();
         validate_bound_attempt_affinity(native, self)?;
-        Ok(PreparedDistributedQuery {
-            handoff_id: native.template.identity.handoff_id,
-            plan_facts: Arc::clone(&native.template.plan_facts),
-            native_bundle: Arc::clone(&native.template.native_template),
-            attempt_access: Arc::clone(&self.attempt_access),
-        })
+        Ok(project_static_native_attempt(
+            &native.template,
+            &self.attempt_access,
+        ))
+    }
+}
+
+/// Project the original static fragments after the caller has checked the
+/// applicable template or request-bound affinity. This pure projection creates
+/// no request ticket, execution identity, manifest or activation authority.
+fn project_static_native_attempt(
+    native: &PreparedDistributedNativeTemplate,
+    attempt_access: &Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
+) -> PreparedDistributedQuery {
+    PreparedDistributedQuery {
+        handoff_id: native.identity.handoff_id,
+        plan_facts: Arc::clone(&native.plan_facts),
+        native_bundle: Arc::clone(&native.native_template),
+        attempt_access: Arc::clone(attempt_access),
     }
 }
 
@@ -326,6 +341,14 @@ impl std::fmt::Debug for ManifestBoundNativeAttemptInputs {
 }
 
 impl ManifestBoundNativeAttemptInputs {
+    pub(crate) const fn manifest(&self) -> &TaskManifestBinding {
+        &self.manifest
+    }
+
+    pub(crate) fn eligible_backends(&self) -> &[BackendProcessId] {
+        self.manifest.eligible_backends()
+    }
+
     pub(crate) const fn execution_id(&self) -> QueryExecutionId {
         self.manifest.execution()
     }
@@ -438,19 +461,6 @@ impl PreparedDistributedAttemptAccessFactory {
             attempt_access: Arc::clone(&self.attempt_access),
         }
     }
-
-    fn instantiate(
-        &self,
-        native: &PreparedDistributedNativeTemplate,
-    ) -> Result<PreparedDistributedQuery, DistributedQueryError> {
-        validate_prepared_template_affinity(&native.identity, &self.identity)?;
-        Ok(PreparedDistributedQuery {
-            handoff_id: native.identity.handoff_id,
-            plan_facts: Arc::clone(&native.plan_facts),
-            native_bundle: Arc::clone(&native.native_template),
-            attempt_access: Arc::clone(&self.attempt_access),
-        })
-    }
 }
 
 /// Immutable logical-execution owner of both static Native facts and the
@@ -498,10 +508,14 @@ impl PreparedDistributedAttemptTemplate {
         self.native.attempt_scheduling_facts()
     }
 
-    pub(crate) fn instantiate(&self) -> PreparedDistributedQuery {
-        self.access
-            .instantiate(&self.native)
-            .expect("a prepared attempt template retains its exact sibling affinity")
+    /// Exercise only static-fragment sharing at the encoding unit boundary.
+    /// Production attempts still require the exact QA request and manifest;
+    /// this fixture does not mint or bypass either of those authorities.
+    #[cfg(test)]
+    pub(crate) fn instantiate_static_fragment_fixture(&self) -> PreparedDistributedQuery {
+        validate_prepared_template_affinity(&self.native.identity, &self.access.identity)
+            .expect("one encoded template retains its exact sibling affinity");
+        project_static_native_attempt(&self.native, &self.access.attempt_access)
     }
 
     /// Mint one fresh pair of request-bound attempt owners while retaining the
@@ -557,12 +571,6 @@ impl PreparedDistributedQuery {
         &self,
     ) -> &crate::query_execution::fragment_scheduling::FragmentSchedulingFacts {
         self.plan_facts.scheduling()
-    }
-
-    pub(crate) fn write_root_targets(
-        &self,
-    ) -> Option<&[novarocks_spi::connector::write_stack::WriteTargetOrdinal]> {
-        self.plan_facts.write_root_targets()
     }
 
     /// Every typed connector scan this round must enumerate splits for.
@@ -696,6 +704,7 @@ impl PreparedDistributedQuery {
                 instance_index: task.instance_index(),
                 finst_id: task.fragment_instance_id(),
                 backend_idx: backend.backend_idx(),
+                #[cfg(test)]
                 endpoint: backend.endpoint().clone(),
                 scan_ranges,
             });
@@ -1073,18 +1082,6 @@ impl TaskExecutionPreparedQuery {
         )
     }
 
-    /// The frozen placement result the task graph is built from.
-    pub(crate) const fn scheduling_plan(&self) -> &SchedulingPlan {
-        &self.schedule.inner
-    }
-
-    /// The exchange edges of this plan, in the planner's own order.
-    pub(crate) fn fragment_edges(
-        &self,
-    ) -> &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts] {
-        self.plan_facts.edges()
-    }
-
     /// The query-wide catalog contribution every query context establishes.
     pub(crate) fn catalog_set(&self) -> &CatalogSet {
         self.options.catalog_set()
@@ -1106,18 +1103,12 @@ impl TaskExecutionPreparedQuery {
         &self.options
     }
 
-    /// Takes this attempt's vended-storage capability, once.
-    ///
-    /// Called after the establish froze its own copy of the material: the
-    /// table moves into the capability so the attempt keeps one owner of the
-    /// secrets. A deployment that vends nothing has no capability to hand out
-    /// and gets `None`, which is a different statement from a denied one.
-    pub(crate) fn take_terminal_storage_resolver(
+    /// Retain the original frozen table, including sealed-empty identity,
+    /// after Establish has borrowed it. Internal handoff checks its author.
+    pub(crate) fn take_terminal_storage(
         &mut self,
-    ) -> Option<Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>> {
-        self.options
-            .take_credential_leases()
-            .into_attempt_storage_resolver()
+    ) -> Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage> {
+        self.options.take_credential_leases().into_storage()
     }
 
     /// Consume a matching native submission attachment.
@@ -1189,6 +1180,24 @@ fn freeze_query_catalog_lease(
     Ok(QueryCatalogLease::new(catalog_set, Vec::new()))
 }
 
+/// Add the original sealed writer's BE materialization input without resolving
+/// a current catalog or acquiring another generation. Typed reads merge through
+/// this same conflict-checking author during task preparation.
+pub(crate) fn merge_write_session_catalog(
+    existing: &CatalogSet,
+    session: &crate::query_execution::write_session::ConnectorWriteSession,
+) -> Result<CatalogSet, DistributedQueryError> {
+    let writer = session
+        .catalog_properties()
+        .backend_execution_projection()
+        .map_err(|error| {
+            contract_error(format!(
+                "project write catalog for backend execution: {error}"
+            ))
+        })?;
+    merge_catalog_properties(existing, [writer])
+}
+
 fn merge_catalog_properties(
     existing: &CatalogSet,
     additional: impl IntoIterator<Item = CatalogProperties>,
@@ -1217,109 +1226,6 @@ fn merge_catalog_properties(
         .map_err(|error| contract_error(format!("invalid query catalog set: {error}")))
 }
 
-/// A frontend decision for one instance. The native endpoint representation
-/// remains core-private.
-pub struct BackendPlacement {
-    backend_idx: usize,
-    endpoint: RuntimeEndpoint,
-}
-
-impl BackendPlacement {
-    pub fn new(backend_idx: usize, endpoint: RuntimeEndpoint) -> Self {
-        Self {
-            backend_idx,
-            endpoint,
-        }
-    }
-}
-
-/// Unvalidated frontend policy output.
-pub struct FragmentScheduleDraft {
-    by_fragment: BTreeMap<FragmentId, Vec<BackendPlacement>>,
-    frozen_live_backends: Option<BTreeMap<usize, LiveBackendTarget>>,
-}
-
-impl FragmentScheduleDraft {
-    pub fn new() -> Self {
-        Self {
-            by_fragment: BTreeMap::new(),
-            frozen_live_backends: None,
-        }
-    }
-
-    pub fn freeze_live_backends(
-        &mut self,
-        live_backends: Vec<LiveBackendTarget>,
-    ) -> Result<(), DistributedQueryError> {
-        if self.frozen_live_backends.is_some() {
-            return Err(contract_error(
-                "frontend schedule live-backend topology was frozen more than once",
-            ));
-        }
-        if live_backends.is_empty() {
-            return Err(contract_error(
-                "frontend schedule requires a nonempty live-backend topology",
-            ));
-        }
-        let mut by_backend = BTreeMap::new();
-        let mut endpoints = BTreeSet::new();
-        let mut process_ids = BTreeSet::new();
-        for target in live_backends {
-            let process_id = target.process_id().map_err(|error| {
-                contract_error(format!(
-                    "frontend schedule live backend {} has invalid process identity: {error}",
-                    target.backend_idx()
-                ))
-            })?;
-            let endpoint = target.endpoint().map_err(|error| {
-                contract_error(format!(
-                    "frontend schedule live backend {} has invalid endpoint: {error}",
-                    target.backend_idx()
-                ))
-            })?;
-            if !process_ids.insert(process_id) {
-                return Err(contract_error(format!(
-                    "frontend schedule live topology repeats backend process identity {process_id}"
-                )));
-            }
-            if !endpoints.insert(endpoint.clone()) {
-                return Err(contract_error(format!(
-                    "frontend schedule live topology repeats endpoint {}",
-                    endpoint
-                )));
-            }
-            let backend_idx = target.backend_idx();
-            if by_backend.insert(backend_idx, target).is_some() {
-                return Err(contract_error(format!(
-                    "frontend schedule live topology repeats backend {}",
-                    backend_idx
-                )));
-            }
-        }
-        self.frozen_live_backends = Some(by_backend);
-        Ok(())
-    }
-
-    pub fn assign_fragment(
-        &mut self,
-        fragment_id: FragmentId,
-        placements: Vec<BackendPlacement>,
-    ) -> Result<(), DistributedQueryError> {
-        if self.by_fragment.insert(fragment_id, placements).is_some() {
-            return Err(contract_error(format!(
-                "frontend schedule assigned fragment {fragment_id} more than once"
-            )));
-        }
-        Ok(())
-    }
-}
-
-impl Default for FragmentScheduleDraft {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Core-validated schedule. It cannot be cloned, deconstructed, or created
 /// without the immutable view from the same prepared handoff.
 pub struct ValidatedFragmentSchedule {
@@ -1343,143 +1249,6 @@ impl ValidatedFragmentSchedule {
     ) -> &BTreeMap<FragmentId, Vec<crate::query_execution::schedule::FragmentInstancePlacement>>
     {
         &self.inner.by_fragment
-    }
-
-    pub fn validate(
-        facts: &crate::query_execution::fragment_scheduling::FragmentSchedulingFacts,
-        execution_id: QueryExecutionId,
-        draft: FragmentScheduleDraft,
-    ) -> Result<Self, DistributedQueryError> {
-        let FragmentScheduleDraft {
-            by_fragment: draft_by_fragment,
-            frozen_live_backends,
-        } = draft;
-        let frozen_live_backends = frozen_live_backends.ok_or_else(|| {
-            contract_error("frontend schedule did not freeze its live-backend topology")
-        })?;
-        let expected = facts.fragments.keys().copied().collect::<BTreeSet<_>>();
-        let received = draft_by_fragment.keys().copied().collect::<BTreeSet<_>>();
-        if expected != received {
-            return Err(contract_error(format!(
-                "frontend schedule fragment set mismatch: expected={expected:?}, received={received:?}"
-            )));
-        }
-
-        let mut by_fragment = BTreeMap::new();
-        for (fragment_id, placements) in draft_by_fragment {
-            if placements.is_empty() {
-                return Err(contract_error(format!(
-                    "frontend schedule fragment {fragment_id} has no placements"
-                )));
-            }
-            if placements.len() >= 1 << 16 {
-                return Err(contract_error(format!(
-                    "frontend schedule fragment {fragment_id} has too many placements"
-                )));
-            }
-            let mut backend_ids = BTreeSet::new();
-            let mut instances = placements
-                .into_iter()
-                .enumerate()
-                .map(|(instance_index, placement)| {
-                    if !backend_ids.insert(placement.backend_idx) {
-                        return Err(contract_error(format!(
-                            "frontend schedule fragment {fragment_id} repeats backend {}",
-                            placement.backend_idx
-                        )));
-                    }
-                    let frozen = frozen_live_backends
-                        .get(&placement.backend_idx)
-                        .ok_or_else(|| {
-                            contract_error(format!(
-                                "frontend schedule placement backend {} is absent from frozen topology",
-                                placement.backend_idx
-                            ))
-                        })?;
-                    let frozen_endpoint = frozen.endpoint().map_err(|error| {
-                        contract_error(format!(
-                            "frontend schedule frozen backend {} has invalid endpoint: {error}",
-                            placement.backend_idx
-                        ))
-                    })?;
-                    if frozen_endpoint != placement.endpoint {
-                        return Err(contract_error(format!(
-                            "frontend schedule placement backend {} endpoint {} differs from frozen topology endpoint {}",
-                            placement.backend_idx, placement.endpoint, frozen_endpoint
-                        )));
-                    }
-                    Ok(FragmentInstancePlacement {
-                        fragment_id,
-                        instance_index,
-                        finst_id: derive_fragment_instance_id(
-                            execution_id,
-                            fragment_id,
-                            instance_index,
-                        )?,
-                        backend_idx: placement.backend_idx,
-                        endpoint: placement.endpoint.clone(),
-                        scan_ranges: BTreeMap::new(),
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let fragment = facts.fragment(fragment_id).ok_or_else(|| {
-                contract_error(format!("prepared fragment {fragment_id} is missing"))
-            })?;
-            let instance_count = instances.len();
-            for scan in &fragment.scans {
-                let node_id = scan.node_id;
-                for instance in &mut instances {
-                    instance.scan_ranges.entry(node_id).or_default();
-                }
-                for (index, range) in scan.ranges.iter().enumerate() {
-                    instances[index % instance_count]
-                        .scan_ranges
-                        .entry(node_id)
-                        .or_default()
-                        .push(range.clone());
-                }
-            }
-            // A connector scan legitimately starts with no work: its splits
-            // arrive at runtime, and a task that ends up with none still has to
-            // be admitted so it can be told there are none. Only frozen scan
-            // ranges can make an instance provably empty at planning time.
-            let total_ranges = instances
-                .iter()
-                .flat_map(|instance| instance.scan_ranges.values())
-                .map(Vec::len)
-                .sum::<usize>();
-            if total_ranges > 0
-                && instances
-                    .iter()
-                    .any(|instance| instance.scan_ranges.values().all(Vec::is_empty))
-            {
-                return Err(contract_error(format!(
-                    "frontend schedule fragment {fragment_id} creates an empty scan instance"
-                )));
-            }
-            by_fragment.insert(fragment_id, instances);
-        }
-
-        let root_fragment_id = facts.anchor;
-        let root = by_fragment
-            .get(&root_fragment_id)
-            .and_then(|placements| placements.first())
-            .ok_or_else(|| contract_error("frontend schedule root has no placement"))?;
-        let root_finst_id = root.finst_id;
-        let root_backend_idx = root.backend_idx;
-        let inner = SchedulingPlan {
-            root_fragment_id,
-            by_fragment,
-            root_finst_id,
-            root_backend_idx,
-        };
-        Ok(Self {
-            handoff_id: facts.handoff_id,
-            execution_id,
-            inner,
-            frozen_live_backends,
-        })
     }
 
     pub const fn execution_id(&self) -> QueryExecutionId {
@@ -1649,21 +1418,6 @@ impl ValidatedNativeSubmission {
 
     pub const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
-    }
-
-    /// Whether this instance's plan contains a connector table writer.
-    ///
-    /// A distributed write's writer set is what decides whether the write
-    /// completed, and "the query is a write" says nothing about which of its
-    /// fragments actually write. The frozen fragment read it off its own plan.
-    pub(crate) fn declares_table_writer(&self) -> bool {
-        self.fragment.facts().declares_table_writer()
-    }
-
-    /// The plan-node id of this fragment's root (output) node, which EXPLAIN
-    /// ANALYZE keys a fragment by.
-    pub(crate) fn fragment_root_plan_node_id(&self) -> Result<i32, String> {
-        Ok(self.fragment.facts().root_plan_node_id())
     }
 
     /// Hands the shared frozen fragment and this instance's own assignment to
@@ -1894,7 +1648,7 @@ mod tests {
             RenderField, RenderPresentation as P,
         };
         use novarocks_result_render::{
-            ArrowMysqlTextEncoder, BoundedMysqlTextEncoder, RenderTurnStatus,
+            BoundedClientRowEncoder, ClientRowEncoder, RenderTurnStatus,
         };
         assert_eq!(result.columns.len(), 1);
         assert_eq!(result.batches.len(), 1);
@@ -1914,6 +1668,7 @@ mod tests {
             },
         };
         let schema = ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: None,
@@ -1928,7 +1683,7 @@ mod tests {
         )
         .unwrap();
         let mut encoder =
-            ArrowMysqlTextEncoder::try_new(Arc::new(schema), result.batches[0].clone()).unwrap();
+            ClientRowEncoder::try_new(Arc::new(schema), result.batches[0].clone()).unwrap();
         let mut body = Vec::new();
         for _ in 0..1024 {
             let mut segment = [0; 4096];
@@ -2063,6 +1818,55 @@ mod tests {
             error
                 .message()
                 .contains("another request-bound Native attempt")
+        );
+    }
+
+    #[test]
+    fn original_writer_catalog_survives_without_reads_and_merges_exact_read_once() {
+        use novarocks_spi::connector::{
+            ConnectorMutationFailure, ConnectorMutationFailureKind, ExternalMutationFinalization,
+            ExternalMutationOutcome,
+        };
+        let fixture = crate::query_execution::write_session::tests::fixture_with_outcome(
+            1,
+            8,
+            ExternalMutationOutcome::KnownUncommitted {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "catalog projection fixture does not publish",
+                ),
+                cleanup: ExternalMutationFinalization::Complete,
+            },
+        );
+        let original = fixture.session.catalog_properties();
+        let expected = original.backend_execution_projection().unwrap();
+        let no_reads = CatalogSet::new([]).unwrap();
+        let writer = super::merge_write_session_catalog(&no_reads, &fixture.session).unwrap();
+        let catalogs = writer.catalogs().unwrap();
+        assert_eq!(catalogs, vec![expected.clone()]);
+        assert_eq!(catalogs[0].handle(), original.handle());
+        let round_trip = CatalogSet::parse(writer.as_proto().clone()).unwrap();
+        assert_eq!(round_trip.catalogs().unwrap(), catalogs);
+        let read_first = CatalogSet::new([expected.clone()]).unwrap();
+        let exact_writer =
+            super::merge_write_session_catalog(&read_first, &fixture.session).unwrap();
+        assert_eq!(exact_writer.catalogs().unwrap(), vec![expected.clone()]);
+        // The same merge used by freeze_query_catalog_lease adds typed reads.
+        let both = merge_catalog_properties(&writer, [expected.clone()]).unwrap();
+        assert_eq!(both.catalogs().unwrap(), vec![expected.clone()]);
+        let conflicting = CatalogProperties::new(
+            expected.handle().clone(),
+            expected.provider_id().clone(),
+            expected.config_format_version(),
+            vec![CatalogProperty::new("warehouse", "s3://conflicting-generation-input").unwrap()],
+            expected.credential_bindings().to_vec(),
+        )
+        .unwrap();
+        assert!(
+            merge_catalog_properties(&writer, [conflicting])
+                .unwrap_err()
+                .message()
+                .contains("conflicting materialization inputs")
         );
     }
 
@@ -2355,7 +2159,10 @@ mod tests {
             let child = ValueTypeRef::try_new(child, child_nullable, S::pure()).unwrap();
             let mut field = Field::new("value", DataType::Binary, child_nullable);
             if let Some(attribute) = attribute {
-                field = field.with_metadata([("nr_logical_type".into(), attribute.into())].into());
+                field = field.with_metadata(std::collections::HashMap::<String, String>::from([(
+                    "nr_logical_type".into(),
+                    attribute.into(),
+                )]));
             }
             let field = Arc::new(field);
             let values: ArrayRef =
@@ -2385,11 +2192,10 @@ mod tests {
                     );
                     let entries_field = Arc::new(
                         Field::new("entries", entries.data_type().clone(), false).with_metadata(
-                            [(
+                            std::collections::HashMap::<String, String>::from([(
                                 "nr_logical_type".into(),
                                 "uninterpreted-map-source-attribute".into(),
-                            )]
-                            .into(),
+                            )]),
                         ),
                     );
                     (

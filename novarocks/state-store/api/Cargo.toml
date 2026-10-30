@@ -11,6 +11,8 @@ workspace = true
 doctest = false
 
 [dependencies]
+novarocks-failure-contract.workspace = true
+novarocks-resource-contract.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 sha2.workspace = true

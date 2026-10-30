@@ -26,7 +26,7 @@ use novarocks_spi::connector::{
     CatalogCredentialPurpose, CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion,
     ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole, MAX_CATALOG_SET_BYTES,
     MAX_CATALOGS_PER_QUERY, MAX_PRUNE_CATALOG_SET_BYTES, MAX_REACHABLE_CATALOGS_PER_PRUNE,
-    StaticCredentialReference,
+    NodeLocalCredentialReference, StaticCredentialReference,
 };
 
 /// One exact, validated query-wide catalog contribution.
@@ -420,6 +420,14 @@ fn encode_catalog_credential_binding(
         CatalogCredentialMode::Vended => {
             wire::catalog_credential_binding::Mode::VendedCredential(wire::VendedCredential {})
         }
+        CatalogCredentialMode::NodeLocal(reference) => {
+            wire::catalog_credential_binding::Mode::NodeLocalCredential(
+                wire::NodeLocalCredentialReference {
+                    name: reference.name().to_owned(),
+                    generation: reference.generation().to_owned(),
+                },
+            )
+        }
     };
     Ok(wire::CatalogCredentialBinding {
         purpose: purpose as i32,
@@ -461,6 +469,17 @@ fn decode_catalog_credential_binding(
         wire::catalog_credential_binding::Mode::VendedCredential(_) => {
             CatalogCredentialMode::Vended
         }
+        wire::catalog_credential_binding::Mode::NodeLocalCredential(reference) => {
+            CatalogCredentialMode::NodeLocal(
+                NodeLocalCredentialReference::try_new(&reference.name, &reference.generation)
+                    .map_err(|error| {
+                        invalid(
+                            root.clone().field("node_local_credential"),
+                            error.to_string(),
+                        )
+                    })?,
+            )
+        }
     };
     CatalogCredentialBinding::try_new(purpose, CredentialConsumerRole::Backend, mode)
         .map_err(|error| invalid(root, error.to_string()))
@@ -494,6 +513,63 @@ fn validate_safe_text(value: &str, root: FieldPath) -> Result<(), ProtocolError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_local_data_reference_round_trips_without_material() {
+        let reference = NodeLocalCredentialReference::try_new("worker-source", "blue").unwrap();
+        let binding = CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::ObjectStoreData,
+            CredentialConsumerRole::Backend,
+            CatalogCredentialMode::NodeLocal(reference.clone()),
+        )
+        .unwrap();
+        let encoded = encode_catalog_credential_binding(binding.clone()).unwrap();
+        let Some(wire::catalog_credential_binding::Mode::NodeLocalCredential(wire_reference)) =
+            &encoded.mode
+        else {
+            panic!("node-local source must retain its own wire mode");
+        };
+        assert_eq!(wire_reference.name, reference.name());
+        assert_eq!(wire_reference.generation, reference.generation());
+        assert_eq!(
+            decode_catalog_credential_binding(encoded, FieldPath::root("binding")).unwrap(),
+            binding
+        );
+    }
+
+    #[test]
+    fn node_local_wire_does_not_grant_catalog_or_vending_access() {
+        let reference = NodeLocalCredentialReference::try_new("source", "blue").unwrap();
+        let metadata = CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::ObjectStoreMetadata,
+            CredentialConsumerRole::Frontend,
+            CatalogCredentialMode::NodeLocal(reference),
+        )
+        .unwrap();
+        assert!(encode_catalog_credential_binding(metadata).is_err());
+        let raw = wire::CatalogCredentialBinding {
+            purpose: wire::CatalogCredentialPurpose::DataCredentialVending as i32,
+            consumer_role: wire::CredentialConsumerRole::Backend as i32,
+            mode: Some(wire::catalog_credential_binding::Mode::NodeLocalCredential(
+                wire::NodeLocalCredentialReference {
+                    name: "source".into(),
+                    generation: "blue".into(),
+                },
+            )),
+        };
+        assert!(decode_catalog_credential_binding(raw, FieldPath::root("binding")).is_err());
+        let malformed = wire::CatalogCredentialBinding {
+            purpose: wire::CatalogCredentialPurpose::ObjectStoreData as i32,
+            consumer_role: wire::CredentialConsumerRole::Backend as i32,
+            mode: Some(wire::catalog_credential_binding::Mode::NodeLocalCredential(
+                wire::NodeLocalCredentialReference {
+                    name: "source".into(),
+                    generation: String::new(),
+                },
+            )),
+        };
+        assert!(decode_catalog_credential_binding(malformed, FieldPath::root("binding")).is_err());
+    }
 
     fn properties(name: &str, version: u8) -> CatalogProperties {
         CatalogProperties::new(

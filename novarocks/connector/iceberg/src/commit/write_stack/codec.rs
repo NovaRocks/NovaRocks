@@ -1208,14 +1208,15 @@ impl IcebergWriteValueCodec {
         Ok(references)
     }
 
-    /// Project a DTO already admitted by the private fragment wire validator.
-    /// Envelope and raw-wire admission remain the caller's responsibility.
+    /// Project the exact fragment admitted by the private wire decoder.
+    /// Envelope admission remains the caller's responsibility.
     pub(crate) fn decode_commit_fragment_value(
         &self,
-        fragment: &dto::IcebergCommitFragment,
+        fragment: &crate::wire::write::ValidatedCommitFragmentWire,
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<IcebergCommitFragment, ConnectorCodecError> {
         context.flush_compile_control()?;
+        let fragment = fragment.as_dto();
         let result = (|| {
             let path = FieldPath::root("commit_fragment").field("iceberg");
             let artifact = fragment.artifact.as_ref().ok_or_else(|| {
@@ -1922,6 +1923,16 @@ mod tests {
             .decode_private(payload, &mut context)
     }
 
+    fn admit_private_fragment_value(
+        value: &dto::IcebergCommitFragment,
+    ) -> crate::wire::write::ValidatedCommitFragmentWire {
+        let header = private_header("catalog.iceberg", 1, ConnectorCodecCategory::CommitFragment);
+        let mut ledger = ConnectorDecodeLedger::new(private_limits());
+        let mut context = ConnectorDecodeContext::new(&header, &mut ledger);
+        crate::wire::write::decode_commit_fragment(&value.encode_to_vec(), &mut context)
+            .expect("the actual private wire decoder admits the fixture")
+    }
+
     fn push_varint(bytes: &mut Vec<u8>, mut value: u64) {
         loop {
             let next = (value & 0x7f) as u8;
@@ -2295,8 +2306,9 @@ mod tests {
             deletion_vector_fragment(),
         ] {
             let private = codec.encode_commit_fragment_value(&fragment).unwrap();
+            let admitted = admit_private_fragment_value(&private);
             let recovered = codec
-                .decode_commit_fragment_value(&private, &mut context)
+                .decode_commit_fragment_value(&admitted, &mut context)
                 .unwrap();
             assert_same_fragment(&fragment, &recovered);
         }
@@ -2466,6 +2478,7 @@ mod tests {
             }
             _ => panic!("data artifact fixture"),
         }
+        let fragment = admit_private_fragment_value(&fragment);
         for cause in projection_control_causes() {
             for writer_side in [true, false] {
                 let control = ProjectionControl::new(cause.clone(), 256);
@@ -2969,6 +2982,209 @@ mod tests {
                 &ConnectorCodecErrorKind::InconsistentFields
             );
         }
+    }
+
+    #[test]
+    fn admitted_fragment_projects_exact_merged_entry_fields_for_both_delete_artifacts() {
+        let facets = generation();
+        let codec = IcebergWriteValueCodec::new("catalog.iceberg");
+        let references = vec![
+            EntryIdentity::DeleteFile {
+                path: "s3://b/wh/db/t/data/exact-delete.parquet".to_owned(),
+            },
+            EntryIdentity::DeletionVector {
+                path: "s3://b/wh/db/t/data/exact-vector.puffin".to_owned(),
+                offset: i64::MAX - 7,
+                length: 7,
+                referenced_data_file: "s3://b/wh/db/t/data/exact-source.parquet".to_owned(),
+            },
+        ];
+        for original in [position_delete_fragment(), deletion_vector_fragment()] {
+            let mut dto = codec.encode_commit_fragment_value(&original).unwrap();
+            let merged = match dto.artifact.as_mut().unwrap() {
+                dto::iceberg_commit_fragment::Artifact::PositionDeleteFile(file) => {
+                    &mut file.merged_old_references
+                }
+                dto::iceberg_commit_fragment::Artifact::DeletionVector(file) => {
+                    &mut file.merged_old_references
+                }
+                _ => panic!("delete artifact fixture"),
+            };
+            *merged = references.iter().map(encode_merged_reference).collect();
+            let bytes = dto.encode_to_vec();
+            let recovered = decode_private_fragment(&facets, &bytes)
+                .expect("the original range checks admit an exact i64::MAX endpoint");
+            assert_eq!(recovered.merged_old_references(), references.as_slice());
+            assert_eq!(
+                facets
+                    .fragment_encoder
+                    .encode_private(&recovered)
+                    .unwrap()
+                    .as_ref(),
+                bytes.as_slice(),
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_merged_entries_keep_original_wire_errors_before_domain_projection() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let facets = generation();
+        let codec = IcebergWriteValueCodec::new("catalog.iceberg");
+        for original in [position_delete_fragment(), deletion_vector_fragment()] {
+            for case in 0..8 {
+                let mut dto = codec.encode_commit_fragment_value(&original).unwrap();
+                let (artifact, merged) = match dto.artifact.as_mut().unwrap() {
+                    dto::iceberg_commit_fragment::Artifact::PositionDeleteFile(file) => {
+                        ("position_delete_file", &mut file.merged_old_references)
+                    }
+                    dto::iceberg_commit_fragment::Artifact::DeletionVector(file) => {
+                        ("deletion_vector", &mut file.merged_old_references)
+                    }
+                    _ => panic!("delete artifact fixture"),
+                };
+                let mut reference = dto::IcebergDeletionVectorReference {
+                    path: "s3://b/data/old.puffin".to_owned(),
+                    content_offset: 4,
+                    content_size_in_bytes: 64,
+                    referenced_data_file: "s3://b/data/source.parquet".to_owned(),
+                };
+                let (suffix, kind, detail) = match case {
+                    0 | 1 => (
+                        ".path",
+                        ConnectorCodecErrorKind::InvalidValue,
+                        "text value must not be empty",
+                    ),
+                    2 => (
+                        ".referenced_data_file",
+                        ConnectorCodecErrorKind::InvalidValue,
+                        "text value must not be empty",
+                    ),
+                    3 => (
+                        ".content_offset",
+                        ConnectorCodecErrorKind::InvalidValue,
+                        "value must be nonnegative",
+                    ),
+                    4..=6 => (
+                        "",
+                        ConnectorCodecErrorKind::InconsistentFields,
+                        "DV reference requires a positive, non-overflowing range",
+                    ),
+                    7 => (
+                        "",
+                        ConnectorCodecErrorKind::InconsistentFields,
+                        "merged old reference requires an exact delete entry",
+                    ),
+                    _ => unreachable!(),
+                };
+                match case {
+                    1 => reference.path.clear(),
+                    2 => reference.referenced_data_file.clear(),
+                    3 => reference.content_offset = -1,
+                    4 => reference.content_size_in_bytes = 0,
+                    5 => reference.content_size_in_bytes = -1,
+                    6 => {
+                        reference.content_offset = i64::MAX;
+                        reference.content_size_in_bytes = 1;
+                    }
+                    _ => {}
+                }
+                let entry = match case {
+                    0 => Some(dto::iceberg_merged_delete_reference::Entry::DeleteFilePath(
+                        String::new(),
+                    )),
+                    7 => None,
+                    _ => Some(dto::iceberg_merged_delete_reference::Entry::DeletionVector(
+                        reference,
+                    )),
+                };
+                *merged = vec![dto::IcebergMergedDeleteReference { entry }];
+                let error = decode_private_fragment(&facets, &dto.encode_to_vec())
+                    .expect_err("invalid identities must fail in the original wire validator");
+                assert_eq!(error.kind(), &kind);
+                assert_eq!(error.detail(), detail);
+                assert_eq!(
+                    error.path().to_string(),
+                    format!("commit_fragment.iceberg.{artifact}.merged_old_references[0]{suffix}"),
+                );
+                assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+                assert!(error.compile_control_error().is_none());
+                assert!(std::error::Error::source(&error).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn admitted_fragment_keeps_original_location_and_domain_refusal_semantics() {
+        let facets = generation();
+        let codec = IcebergWriteValueCodec::new("catalog.iceberg");
+        for (location, refusal) in [
+            (
+                "relative/data.parquet?token=accepted-after-parse-failure",
+                None,
+            ),
+            (
+                ":::://name:pw@b/data?token=accepted-after-parse-failure",
+                None,
+            ),
+            ("s3://b/data?%74+oken=value", None),
+            ("s3://b/data?%FFtoken=value", None),
+            (
+                "s3://name:pw@b/data?token=value",
+                Some("must not embed credentials"),
+            ),
+            (
+                "s3://b/data?%74oken=value",
+                Some("must not embed credentials"),
+            ),
+            ("s3://b/data\0suffix", Some("contains a NUL byte")),
+        ] {
+            let mut dto = codec
+                .encode_commit_fragment_value(&data_file_fragment())
+                .unwrap();
+            match dto.artifact.as_mut().unwrap() {
+                dto::iceberg_commit_fragment::Artifact::DataFile(file) => {
+                    file.path = location.to_owned()
+                }
+                _ => panic!("data artifact fixture"),
+            }
+            // The same scanner/Prost/wire chain mints the proof. The location
+            // policy remains in the original domain constructor afterwards.
+            match (
+                decode_private_fragment(&facets, &dto.encode_to_vec()),
+                refusal,
+            ) {
+                (Ok(value), None) => assert_eq!(value.path(), location),
+                (Err(error), Some(detail)) => {
+                    assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
+                    assert_eq!(
+                        error.path().to_string(),
+                        "commit_fragment.iceberg.data_file"
+                    );
+                    assert_eq!(error.detail(), format!("Iceberg staged data file {detail}"));
+                }
+                (result, expected) => {
+                    panic!("unexpected location verdict: {result:?}, {expected:?}")
+                }
+            }
+        }
+        let mut dto = codec
+            .encode_commit_fragment_value(&data_file_fragment())
+            .unwrap();
+        match dto.artifact.as_mut().unwrap() {
+            dto::iceberg_commit_fragment::Artifact::DataFile(file) => {
+                file.file_format = dto::IcebergWriteFileFormat::Puffin as i32;
+            }
+            _ => panic!("data artifact fixture"),
+        }
+        let error = decode_private_fragment(&facets, &dto.encode_to_vec())
+            .expect_err("named Puffin format passes wire checks but keeps its domain refusal");
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
+        assert_eq!(
+            error.path().to_string(),
+            "commit_fragment.iceberg.data_file"
+        );
+        assert_eq!(error.detail(), "Iceberg staged data file must be Parquet");
     }
 
     #[test]

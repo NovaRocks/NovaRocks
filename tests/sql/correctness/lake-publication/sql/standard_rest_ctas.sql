@@ -39,7 +39,8 @@ INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows VALUES
 -- publishes nothing visible, so the statement itself reports a definite
 -- non-commit: the target must remain absent.
 -- @publication_catalog_fault=stage-create,before-dispatch
--- @expect_error_code=CommitKnownUncommitted
+-- @expect_sql_code=query.execution.dependency
+-- @expect_error=disposition=KnownUncommitted
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch AS
   SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
@@ -48,7 +49,8 @@ CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch AS
 -- definite rejection before publication (D13): the statement reports a known
 -- non-commit outcome.
 -- @publication_catalog_fault=stage-create,before-dispatch-forbidden
--- @expect_error_code=CommitKnownUncommitted
+-- @expect_sql_code=query.execution.dependency
+-- @expect_error=disposition=KnownUncommitted
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch_forbidden AS
   SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 

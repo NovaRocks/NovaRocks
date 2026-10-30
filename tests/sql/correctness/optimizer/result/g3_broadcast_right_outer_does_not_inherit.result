@@ -5,10 +5,14 @@ RUNTIME FILTER GRAPH
     consumer binding 1, fragment = 3, node = 8, expr = (a.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:GATHER stats={rows=2}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: follow-sources([2])
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: HASH_PARTITIONED (k)
   STREAM DATA SINK
     EXCHANGE ID: 0
@@ -21,6 +25,8 @@ PLAN FRAGMENT 1
       4:HASH EXCHANGE stats={rows=2}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: follow-sources([3,4])
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: HASH_PARTITIONED (b.k)
   STREAM DATA SINK
     EXCHANGE ID: 4
@@ -30,6 +36,8 @@ PLAN FRAGMENT 2
   7:HASH EXCHANGE
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 6
@@ -40,6 +48,8 @@ PLAN FRAGMENT 3
      min-max stats
 PLAN FRAGMENT 4
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 7

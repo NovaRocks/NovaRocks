@@ -73,12 +73,27 @@ impl NovaRocksCatalogFactory {
                     .with_evidence_policy(evidence_policy),
                 ))
             }
-            IcebergCatalogKind::Hive => Ok(Arc::new(
-                super::hive::NovaRocksHiveCatalog::adopt(Arc::clone(client.generic().ok_or_else(
-                    || "Hive Iceberg configuration produced no read client".to_string(),
-                )?))
-                .with_evidence_policy(evidence_policy),
-            )),
+            IcebergCatalogKind::Hive => {
+                let selected = configuration
+                    .hms_uris
+                    .as_deref()
+                    .ok_or_else(|| "HMS generation has no selected address".to_owned())?;
+                let selected =
+                    novarocks_spi::connector::SelectedThriftServiceOrigin::from_selected_address(
+                        selected,
+                    )
+                    .map_err(|e| e.to_string())?
+                    .into_owned();
+                Ok(Arc::new(
+                    super::hive::NovaRocksHiveCatalog::adopt(
+                        client.hms().cloned().ok_or_else(|| {
+                            "Hive configuration produced no exact HMS client".to_owned()
+                        })?,
+                        selected,
+                    )
+                    .with_evidence_policy(evidence_policy),
+                ))
+            }
         }
     }
 

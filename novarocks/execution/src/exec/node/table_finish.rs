@@ -41,8 +41,16 @@ use crate::exec::node::table_write_relation::{
 /// Runtime validation authority for a single Task instance of TableFinish.
 pub struct TableFinishRuntimeBinding {
     pub(crate) fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
+    pub(crate) logical_summary: Option<LogicalSummaryRuntimeBinding>,
     #[cfg(novarocks_dev_controls)]
     pub(crate) aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+}
+
+/// Exact Native input custody, separate from the pure finish declaration.
+#[derive(Clone, Debug)]
+pub(crate) struct LogicalSummaryRuntimeBinding {
+    pub(crate) receiver_node: i32,
+    pub(crate) sources: Arc<[novarocks_execution_contract::ExchangeSource]>,
 }
 
 impl TableFinishRuntimeBinding {
@@ -50,9 +58,33 @@ impl TableFinishRuntimeBinding {
     pub fn new(fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>) -> Self {
         Self {
             fragment_validator,
+            logical_summary: None,
             #[cfg(novarocks_dev_controls)]
             aggregate_guard: Arc::new(AllowTableWriteAggregates),
         }
+    }
+
+    /// The host binds the same frozen source set that authorizes this input.
+    pub fn with_logical_summary(
+        mut self,
+        receiver_node: i32,
+        sources: Arc<[novarocks_execution_contract::ExchangeSource]>,
+    ) -> crate::runtime::fragment::ExecutionResult<Self> {
+        let unique = sources
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if receiver_node < 0 || sources.is_empty() || unique.len() != sources.len() {
+            return Err(crate::exec::fragment::error::program_binding_failure(
+                crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
+                "logical summary requires one exact nonempty source set",
+            ));
+        }
+        self.logical_summary = Some(LogicalSummaryRuntimeBinding {
+            receiver_node,
+            sources,
+        });
+        Ok(self)
     }
 
     /// Bind the application-owned, query-scoped aggregate rejection guard.

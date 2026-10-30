@@ -121,6 +121,13 @@ pub(crate) trait OwnedCopy {
     fn request(&mut self, _: Layout, _: usize) -> Result<(), Self::Error> {
         Ok(())
     }
+    /// One opaque allocation upper per original library request. Numerical
+    /// actors retain the same request count; actual creators use their opaque
+    /// channel and never publish a guessed private layout as exact.
+    fn opaque_model_request(&mut self, bytes: usize, copies: usize) -> Result<(), Self::Error> {
+        let layout = Layout::array::<u8>(bytes).map_err(|_| self.arithmetic())?;
+        self.request(layout, copies)
+    }
     fn work(&mut self, _: usize) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -207,16 +214,34 @@ pub(crate) trait OwnedCopy {
             }
         }
     }
+    fn metadata_error(
+        &self,
+        error: novarocks_type_contract::owned_resources::btree::BTreeResourceError,
+    ) -> Self::Error {
+        let kind = match error {
+            novarocks_type_contract::owned_resources::btree::BTreeResourceError::Arithmetic(_) => {
+                ConnectorErrorKind::ResourceExhausted
+            }
+            novarocks_type_contract::owned_resources::btree::BTreeResourceError::SourceModel(_) => {
+                ConnectorErrorKind::InvalidRequest
+            }
+        };
+        ConnectorError::from_domain(kind, error).into()
+    }
     fn metadata_iteration(&mut self, entries: usize, traversals: usize) -> Result<(), Self::Error> {
-        if let Some(source) = self.source_invoice() {
-            // Empty RawIter loads its first group then returns None without
-            // scanning retained deleted buckets. Nonempty iteration borrows
-            // the truthful whole source upper, never len/capacity/lowerfloor.
+        if self.source_invoice().is_some() {
+            // Arrow 60 Metadata has BTree cursor traversal, not a sparse
+            // RawTable scan. The existing locked insertion-only projection
+            // covers the strictly smaller full cursor/parent-link traversal;
+            // text processing remains each caller's separate operation.
             let units = if entries == 0 {
                 64
             } else {
-                hashmap::source_iterator_work_upper_bound(source, entries)
-                    .map_err(|error| self.hash_error(error))?
+                novarocks_type_contract::owned_resources::btree::insertion_only::<String, String>(
+                    entries,
+                )
+                .map_err(|error| self.metadata_error(error))?
+                .cumulative_work_upper_bound
             };
             self.work(self.mul(units, traversals)?)?;
         }

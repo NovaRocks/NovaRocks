@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Spec / Plan"
+  short_description: "Challenge the direction of a spec or plan against industry practice"
+  default_prompt: "Use $dev-workflow-review-spec-plan to review the direction and approach of this spec or plan."

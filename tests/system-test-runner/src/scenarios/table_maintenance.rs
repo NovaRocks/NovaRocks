@@ -400,7 +400,7 @@ where
         statement_run_token: String,
         frontend_process_id: String,
         connection_id: u32,
-        session_epoch: u64,
+        session_key: u64,
         statement_generation: u64,
     }
     let wire = WireNomination::deserialize(deserializer)?;
@@ -409,7 +409,7 @@ where
         statement_run_token: wire.statement_run_token,
         frontend_process_id: wire.frontend_process_id,
         connection_id: wire.connection_id,
-        session_epoch: wire.session_epoch,
+        session_key: wire.session_key,
         statement_generation: wire.statement_generation,
     })
 }
@@ -526,9 +526,16 @@ fn wait_for_job_state(
             .iter()
             .find(|(observed_job_id, _)| *observed_job_id == job_id)
             .map(|(_, state)| state.as_str())
-            && state == expected_state
         {
-            return Ok(());
+            if state == expected_state {
+                return Ok(());
+            }
+            if !matches!(state, "PENDING" | "RUNNING") {
+                bail!(
+                    "optimize job {job_id} reached state {state}, expected {expected_state}; {}",
+                    context.diagnostics()
+                );
+            }
         }
         context.remaining("wait for durable optimize job state")?;
         thread::sleep(POLL_INTERVAL);
@@ -550,9 +557,16 @@ fn wait_for_terminal_job(
             .iter()
             .find(|(observed_job_id, _)| *observed_job_id == job_id)
             .map(|(_, state)| state.as_str())
-            && matches!(state, "FINISHED" | "FAILED" | "TARGET_REPLACED")
         {
-            return Ok(());
+            if matches!(state, "FINISHED" | "FAILED" | "TARGET_REPLACED") {
+                return Ok(());
+            }
+            if !matches!(state, "PENDING" | "RUNNING") {
+                bail!(
+                    "resubmitted optimize job {job_id} reached unexpected state {state}; {}",
+                    context.diagnostics()
+                );
+            }
         }
         context.remaining("wait for resubmitted optimize job terminal state")?;
         thread::sleep(POLL_INTERVAL);

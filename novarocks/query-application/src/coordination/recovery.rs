@@ -21,29 +21,7 @@
 //! attempt may enter replacement, then records the required runtime facts in
 //! its own serialized state before it activates a successor.
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RecoveryMode {
-    NoRecovery,
-    RestartAttemptBeforeVisibility,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExecutionEffect {
-    None,
-    External,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AttemptFailureClass {
-    RecoverableInfrastructure,
-    ExecutionFailure,
-    Unsupported,
-    ResourceGovernance,
-    ContractViolation,
-    Cancelled,
-    DeadlineExceeded,
-    CommitUnknown,
-}
+use novarocks_coordination_contract::{AttemptFailureClass, ExecutionEffect, RecoveryMode};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryRefusal {
@@ -62,50 +40,86 @@ pub enum RecoveryDecision {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RecoveryInput {
+pub struct RecoveryInput<'a> {
     pub mode: RecoveryMode,
     pub effect: ExecutionEffect,
     pub failure: AttemptFailureClass,
+    pub pre_ready_replacement: Option<&'a crate::api::PreReadyProcessReplacementWitness>,
     pub output_visible: bool,
     pub attempts_started: u32,
     pub max_attempts: u32,
     pub deadline_reached: bool,
 }
 
-pub const fn evaluate_recovery(input: RecoveryInput) -> RecoveryDecision {
+/// The same owner-policy window is used before observing independent evidence
+/// and when accepting replacement. It does not classify or rewrite a failure.
+#[derive(Clone, Copy)]
+pub(crate) struct RecoveryWindowInput {
+    pub mode: RecoveryMode,
+    pub effect: ExecutionEffect,
+    pub output_visible: bool,
+    pub attempts_started: u32,
+    pub max_attempts: u32,
+    pub deadline_reached: bool,
+}
+
+pub(crate) const fn recovery_window_refusal(input: RecoveryWindowInput) -> Option<RecoveryRefusal> {
     if !matches!(input.mode, RecoveryMode::RestartAttemptBeforeVisibility) {
-        return RecoveryDecision::Refuse(RecoveryRefusal::Mode);
+        return Some(RecoveryRefusal::Mode);
     }
     if !matches!(input.effect, ExecutionEffect::None) {
-        return RecoveryDecision::Refuse(RecoveryRefusal::ExternalEffect);
+        return Some(RecoveryRefusal::ExternalEffect);
+    }
+    if input.output_visible {
+        return Some(RecoveryRefusal::OutputVisible);
+    }
+    if input.attempts_started >= input.max_attempts {
+        return Some(RecoveryRefusal::AttemptBudget);
+    }
+    if input.deadline_reached {
+        return Some(RecoveryRefusal::Deadline);
+    }
+    None
+}
+
+pub const fn evaluate_recovery(input: RecoveryInput<'_>) -> RecoveryDecision {
+    let window = recovery_window_refusal(RecoveryWindowInput {
+        mode: input.mode,
+        effect: input.effect,
+        output_visible: input.output_visible,
+        attempts_started: input.attempts_started,
+        max_attempts: input.max_attempts,
+        deadline_reached: input.deadline_reached,
+    });
+    // Preserve the original refusal ordering: policy, failure basis, then the
+    // runtime window. Observation uses the same window without inventing a class.
+    if let Some(reason @ (RecoveryRefusal::Mode | RecoveryRefusal::ExternalEffect)) = window {
+        return RecoveryDecision::Refuse(reason);
     }
     if !matches!(
         input.failure,
         AttemptFailureClass::RecoverableInfrastructure
-    ) {
+    ) && !(matches!(input.failure, AttemptFailureClass::ContractViolation)
+        && input.pre_ready_replacement.is_some())
+    {
         return RecoveryDecision::Refuse(RecoveryRefusal::FailureClass);
     }
-    if input.output_visible {
-        return RecoveryDecision::Refuse(RecoveryRefusal::OutputVisible);
+    match window {
+        Some(reason) => RecoveryDecision::Refuse(reason),
+        None => RecoveryDecision::BeginReplacement,
     }
-    if input.attempts_started >= input.max_attempts {
-        return RecoveryDecision::Refuse(RecoveryRefusal::AttemptBudget);
-    }
-    if input.deadline_reached {
-        return RecoveryDecision::Refuse(RecoveryRefusal::Deadline);
-    }
-    RecoveryDecision::BeginReplacement
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn recoverable() -> RecoveryInput {
+    fn recoverable<'a>() -> RecoveryInput<'a> {
         RecoveryInput {
             mode: RecoveryMode::RestartAttemptBeforeVisibility,
             effect: ExecutionEffect::None,
             failure: AttemptFailureClass::RecoverableInfrastructure,
+            pre_ready_replacement: None,
             output_visible: false,
             attempts_started: 1,
             max_attempts: 2,
@@ -158,6 +172,63 @@ mod tests {
                 ..recoverable()
             }),
             RecoveryDecision::Refuse(RecoveryRefusal::FailureClass)
+        );
+    }
+    #[test]
+    fn witnessed_identity_refusal_adds_a_basis_without_reclassifying_or_bypassing_policy() {
+        use novarocks_execution_contract::QueryContextRef;
+        use novarocks_types::{
+            AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
+        };
+        let execution =
+            QueryExecutionId::new(QueryId::new(17, 19), AttemptId::new(1).unwrap()).unwrap();
+        let context = QueryContextRef::new(
+            execution,
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let (_, witness, failure) = crate::api::pre_ready_identity_refusal_test_fixture(context);
+        let basis = RecoveryInput {
+            failure: failure.class(),
+            pre_ready_replacement: Some(&witness),
+            ..recoverable()
+        };
+        assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+        assert_eq!(evaluate_recovery(basis), RecoveryDecision::BeginReplacement);
+        assert_eq!(
+            evaluate_recovery(RecoveryInput {
+                pre_ready_replacement: None,
+                ..basis
+            }),
+            RecoveryDecision::Refuse(RecoveryRefusal::FailureClass)
+        );
+        assert_eq!(
+            evaluate_recovery(RecoveryInput {
+                mode: RecoveryMode::NoRecovery,
+                ..basis
+            }),
+            RecoveryDecision::Refuse(RecoveryRefusal::Mode)
+        );
+        assert_eq!(
+            evaluate_recovery(RecoveryInput {
+                output_visible: true,
+                ..basis
+            }),
+            RecoveryDecision::Refuse(RecoveryRefusal::OutputVisible)
+        );
+        assert_eq!(
+            evaluate_recovery(RecoveryInput {
+                deadline_reached: true,
+                ..basis
+            }),
+            RecoveryDecision::Refuse(RecoveryRefusal::Deadline)
+        );
+        assert_eq!(
+            evaluate_recovery(RecoveryInput {
+                attempts_started: basis.max_attempts,
+                ..basis
+            }),
+            RecoveryDecision::Refuse(RecoveryRefusal::AttemptBudget)
         );
     }
 }

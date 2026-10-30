@@ -22,7 +22,7 @@
 
 use novarocks_types::identity::QueryExecutionId;
 
-use super::{ResultPacketVerdict, RootResultStream};
+use novarocks_coordination_contract::{ResultPacketVerdict, RootResultStream};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeliveryPhase {
@@ -215,6 +215,7 @@ pub enum BeginSchemaDelivery {
 
 #[derive(Debug)]
 pub(crate) struct DeliveryGate {
+    internal_consumption: bool,
     current: Option<QueryExecutionId>,
     eligibility_generation: u64,
     phase: DeliveryPhase,
@@ -228,6 +229,7 @@ pub(crate) struct DeliveryGate {
 impl DeliveryGate {
     pub const fn new(current: QueryExecutionId) -> Self {
         Self {
+            internal_consumption: false,
             current: Some(current),
             eligibility_generation: 1,
             phase: DeliveryPhase::BeforeVisibility,
@@ -237,6 +239,30 @@ impl DeliveryGate {
             delivered_through: None,
             in_flight: None,
         }
+    }
+
+    pub(crate) const fn internal(current: QueryExecutionId) -> Self {
+        let mut gate = Self::new(current);
+        gate.internal_consumption = true;
+        gate.schema = SchemaDeliveryState::Emitted;
+        gate
+    }
+
+    pub(crate) fn accept_internal_ready(
+        &mut self,
+        execution: QueryExecutionId,
+    ) -> Result<(), DeliveryGateError> {
+        self.require_current(execution)?;
+        if !self.internal_consumption
+            || self.in_flight.is_some()
+            || !self.accepted_stream.end_of_stream_observed()
+            || self.delivered_through.is_none()
+        {
+            return Err(DeliveryGateError::WrongExecutionPhase);
+        }
+        self.data_visible = true;
+        self.phase = DeliveryPhase::Ended;
+        Ok(())
     }
 
     pub(crate) const fn eligibility_generation(&self) -> u64 {
@@ -371,7 +397,7 @@ impl DeliveryGate {
         let consumed = self.accepted_stream.consume(sequence, end_of_stream);
         debug_assert!(matches!(consumed, ResultPacketVerdict::Accept));
         self.in_flight = Some(packet);
-        if packet.contains_data {
+        if packet.contains_data && !self.internal_consumption {
             self.data_visible = true;
             self.phase = DeliveryPhase::Visible;
         }
@@ -403,7 +429,7 @@ impl DeliveryGate {
 
         self.in_flight = None;
         self.delivered_through = Some(permit.packet.sequence);
-        if permit.packet.end_of_stream {
+        if permit.packet.end_of_stream && !self.internal_consumption {
             debug_assert!(self.accepted_stream.end_of_stream_observed());
             self.phase = DeliveryPhase::Ended;
         }
@@ -441,7 +467,7 @@ impl DeliveryGate {
         old: QueryExecutionId,
     ) -> Result<u64, DeliveryGateError> {
         self.require_current(old)?;
-        if self.data_visible || self.in_flight.is_some() {
+        if self.data_visible || (!self.internal_consumption && self.in_flight.is_some()) {
             return Err(DeliveryGateError::StaleEligibility);
         }
         match self.schema {
@@ -452,6 +478,9 @@ impl DeliveryGate {
             SchemaDeliveryState::NotStarted | SchemaDeliveryState::Emitted => {}
         }
         self.bump_generation()?;
+        // This retires only eligibility metadata. The domain's original input,
+        // CPU job and retained capacity remain alive until their actual exit.
+        self.in_flight = None;
         self.current = None;
         self.accepted_stream = RootResultStream::new();
         self.delivered_through = None;

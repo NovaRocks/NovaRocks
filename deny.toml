@@ -26,30 +26,43 @@ unmaintained = "workspace"
 unsound = "all"
 unused-ignored-advisory = "deny"
 ignore = [
-    # CDG-1 establishes policy without changing any resolved dependency identity.
-    # Each existing advisory stays visible by exact ID and expires when its affected
-    # package leaves the graph; any new advisory still fails closed.
-    { id = "RUSTSEC-2026-0190", reason = "anyhow upgrade belongs to a dependency-owner follow-up; CDG-1 freezes the existing lock graph" },
-    { id = "RUSTSEC-2021-0145", reason = "atty is retained by the server CLI; replacement belongs to a server-owner follow-up" },
-    { id = "RUSTSEC-2024-0375", reason = "atty is retained by the server CLI; replacement belongs to a server-owner follow-up" },
-    { id = "RUSTSEC-2026-0007", reason = "bytes upgrade belongs to a workspace dependency follow-up; CDG-1 freezes the existing lock graph" },
-    { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch upgrade belongs to an upstream-owner follow-up; CDG-1 freezes the existing lock graph" },
-    { id = "RUSTSEC-2026-0221", reason = "event-listener upgrade belongs to an upstream-owner follow-up; CDG-1 freezes the existing lock graph" },
-    { id = "RUSTSEC-2026-0258", reason = "h2 upgrade belongs to a transport-owner follow-up; CDG-1 freezes the existing lock graph" },
-    { id = "RUSTSEC-2026-0002", reason = "lru 0.12 is retained by the dev-only mysql client; replacement belongs to its owner" },
-    { id = "RUSTSEC-2026-0253", reason = "both MySQL lru lines require an owner-reviewed upgrade outside CDG-1" },
-    { id = "RUSTSEC-2026-0041", reason = "lz4_flex is controlled by ORC/Paimon upstreams; upgrade belongs to connector owners" },
-    { id = "RUSTSEC-2024-0437", reason = "protobuf 2 is retained by prometheus; major upgrade belongs to observability owners" },
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml versions are controlled by Reqsign/OpenDAL; upgrade belongs to connector owners" },
-    { id = "RUSTSEC-2026-0195", reason = "quick-xml versions are controlled by Reqsign/OpenDAL; upgrade belongs to connector owners" },
-    { id = "RUSTSEC-2026-0097", reason = "rand 0.8/0.9 upgrades belong to their direct and upstream dependency owners" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile replacement belongs to native-trust and connector transport owners" },
+    # Every exception names its current inbound edge, its owner and its exit route.
+    # Entries match by exact advisory ID; a new advisory or a widened exposure still
+    # fails closed and requires a reviewed change here.
+    { id = "RUSTSEC-2026-0002", reason = "lru 0.12.5 is reached only through the dev-only mysql 25 test client; exits when TRC-2/TRC-3 remove that client" },
+    { id = "RUSTSEC-2026-0253", reason = "lru 0.12.5 is reached only through the dev-only mysql 25 test client (the mysql_async lru 0.18 line is patched); exits when TRC-2/TRC-3 remove that client" },
+    { id = "RUSTSEC-2024-0437", reason = "protobuf 2.28 is reached through prometheus 0.13; the observability owner exits through the prometheus 0.14 major upgrade as a separate task" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37.5 is reached through reqsign 0.16.5, a direct novarocks-fs dependency (OpenDAL 0.58 and reqsign 3 use patched lines); the fs owner exits by migrating off reqsign 0.16" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37.5 is reached through reqsign 0.16.5, a direct novarocks-fs dependency (OpenDAL 0.58 and reqsign 3 use patched lines); the fs owner exits by migrating off reqsign 0.16" },
 
-    # Exact yanked identities already present in the accepted baseline. A different
-    # yanked crate or version is not covered by these entries.
-    { crate = "chacha20@0.10.1", reason = "transitive through FoundationDB/mysql_async rand 0.10; replace in an owner-reviewed upgrade" },
-    { crate = "lz4_flex@0.11.5", reason = "transitive through ORC/Paimon; replace in a connector-owner upgrade" },
-    { crate = "mysql_async@0.37.0", reason = "state-store provider dependency; replace in a state-store-owner upgrade" },
+    # zstd 0.13.3 / zstd-safe 7.2.4 advisories. The remaining old Rust dependency
+    # consumers are vendored Iceberg and apache-avro (DEP-SEC-3), and the dev-only
+    # mysql 25 test client via mysql_common 0.32 (TRC-2/TRC-3). Remove this group
+    # only when the last affected consumer is gone. Rust API fixes are in zstd
+    # >= 0.14.3 and zstd-safe >= 8.2.0; this does not isolate their C decoder.
+    # Iceberg/mysql_common request zstd 0.13 defaults: arrays/legacy/zdict_builder;
+    # Avro's old edge disables defaults. Arrow/Parquet and first-party Iceberg's
+    # zstd 0.14 edges also disable defaults, but both Rust lines share one zstd-sys.
+    # The old-line legacy request enables the shared C legacy decoder, including
+    # its ordinary decode entry points; no Rust 0.14 legacy feature is needed to
+    # call that C code. Do not infer C-level exclusion from a Rust feature list.
+    # Current old-line features: zstd arrays/default/legacy/zdict_builder,
+    # zstd-safe arrays/legacy/std/zdict_builder; no experimental, seekable or zstdmt.
+    # Enabling any of those, changing the C library source or adding a low-level
+    # caller requires re-review; manual review is due 2026-11-26.
+    { id = "RUSTSEC-2026-0391", reason = "raw Encoder/Decoder::with_context exists; the dangerous reuse of a context after an abandoned operation is not yet confirmed absent; DEP-SEC-3 owns the exit" },
+    { id = "RUSTSEC-2026-0395", reason = "CCtx::set_parameter exists but the StableInBuffer variant is gated by the experimental feature, which is excluded; DEP-SEC-3 owns the exit" },
+    { id = "RUSTSEC-2026-0396", reason = "the seekable module is gated by the seekable feature, which is excluded; DEP-SEC-3 owns the exit" },
+    { id = "RUSTSEC-2026-0397", reason = "OutBuffer::around_pos exists; the dangerous initialized-Vec and position inputs are not yet confirmed absent; DEP-SEC-3 owns the exit" },
+    { id = "RUSTSEC-2026-0398", reason = "the seekable module is not compiled; adding the seekable feature requires re-review; DEP-SEC-3 owns the exit" },
+    { id = "RUSTSEC-2026-0399", reason = "init_using_cdict/ddict are gated by the experimental feature, which is excluded; DEP-SEC-3 owns the exit" },
+    { id = "RUSTSEC-2026-0400", reason = "the API exists; mixing an unfinished stream with one-shot calls is not yet confirmed absent; DEP-SEC-3 owns the exit" },
+    { id = "RUSTSEC-2026-0401", reason = "zdict_builder is enabled and train_from_buffer exists; the sample-size overflow input is not yet confirmed absent; DEP-SEC-3 owns the exit" },
+    { id = "RUSTSEC-2026-0402", reason = "CCtx::try_clone is gated by the experimental feature, which is excluded; the advisory also requires multithreading; DEP-SEC-3 owns the exit" },
+    { id = "RUSTSEC-2026-0403", reason = "legacy and low-level decompress_stream exist; stream::read::Decoder, decode_all and bulk are excluded by the advisory, but write::Decoder and low-level callers still require per-consumer confirmation; DEP-SEC-3 owns the exit" },
+    { id = "RUSTSEC-2026-0404", reason = "DCtx::try_clone is gated by the experimental feature, which is excluded; DEP-SEC-3 owns the exit" },
+    { id = "RUSTSEC-2026-0405", reason = "SeekableCStream belongs to the seekable module, which is not compiled; DEP-SEC-3 owns the exit" },
+    { id = "RUSTSEC-2026-0406", reason = "the method and the NbWorkers variant exist; zstdmt is off, but ZSTD_SYS_USE_PKG_CONFIG can change the linked C library, so Rust features alone do not exclude every binary; DEP-SEC-3 owns the exit" },
 ]
 
 [licenses]
@@ -88,14 +101,9 @@ wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "simplest-path"
 skip = [
-    # The SQL runner owns axum 0.8 while the FE/BE HTTP surfaces remain on 0.7.
-    { crate = "axum@0.8.9", reason = "novarocks-sql-test-runner retains the axum 0.8 API in CDG-1" },
-    { crate = "axum-core@0.5.6", reason = "transitive through the runner-owned axum 0.8 line" },
-    { crate = "matchit@0.8.4", reason = "transitive through the runner-owned axum 0.8 line" },
-
     # Connector and MySQL stacks currently resolve distinct encoding/crypto lines.
     { crate = "base64@0.21.7", reason = "transitive through mysql_common 0.32" },
-    { crate = "base64@0.23.1", reason = "transitive through the Paimon opendal-core line" },
+    { crate = "base64@0.23.1", reason = "transitive through Arrow/Parquet 60, OpenDAL 0.58 core/S3, and Reqsign 3" },
     { crate = "block-buffer@0.12.1", reason = "transitive through opendal-core and digest 0.11" },
     { crate = "btoi@0.4.3", reason = "transitive through mysql_common 0.32" },
     { crate = "const-oid@0.9.6", reason = "transitive through the current DER stack" },
@@ -104,6 +112,16 @@ skip = [
     { crate = "digest@0.11.3", reason = "transitive through opendal-core and md-5 0.11" },
     { crate = "md-5@0.11.0", reason = "transitive through opendal-core" },
 
+    # The public OpenDAL/HDFS migration retains disjoint upstream API lines.
+    { crate = "aes@0.9.3", reason = "hdfs-native 0.14.6 requires aes 0.9; Iceberg aes-gcm 0.10 retains aes 0.8" },
+    { crate = "cipher@0.5.2", reason = "hdfs-native 0.14.6 and its crypto family require cipher 0.5; Iceberg aes-gcm retains cipher 0.4" },
+    { crate = "ctr@0.10.1", reason = "hdfs-native 0.14.6 requires ctr 0.10; Iceberg aes-gcm retains ctr 0.9" },
+    { crate = "hmac@0.13.0", reason = "hdfs-native 0.14.6 and Reqsign 3 require hmac 0.13; native trust, cluster harness and Reqsign 0.16 retain hmac 0.12" },
+    { crate = "inout@0.2.5", reason = "cipher 0.5 requires inout 0.2; the Iceberg cipher 0.4 family retains inout 0.1" },
+    { crate = "sha1@0.11.0", reason = "Reqsign 3 requires sha1 0.11; mysql_common 0.32/0.37 and Reqsign 0.16 retain sha1 0.10" },
+    { crate = "sha2@0.11.1", reason = "Reqsign 3 requires sha2 0.11; workspace consumers and retained SDKs use sha2 0.10" },
+    { crate = "wasi@0.14.7+wasi-0.2.4", reason = "HDFS whoami 2 uses wasite 1 and WASI 0.13-0.14; mio and getrandom retain the WASI 0.11 ABI" },
+
     # Macro ecosystems are pinned by upstream provider versions.
     { crate = "darling@0.20.11", reason = "transitive through derive_builder and mysql-common-derive" },
     { crate = "darling_core@0.20.11", reason = "transitive through darling 0.20" },
@@ -111,8 +129,6 @@ skip = [
     { crate = "syn@3.0.5", reason = "transitive through the SQL runner clap derive line" },
     { crate = "thiserror@1.0.69", reason = "transitive through MySQL, Pilota, and Prometheus" },
     { crate = "thiserror-impl@1.0.69", reason = "transitive through thiserror 1" },
-    { crate = "typed-builder@0.19.1", reason = "transitive through Paimon" },
-    { crate = "typed-builder-macro@0.19.1", reason = "transitive through typed-builder 0.19" },
 
     # Allocator, collection, and randomness lines are selected by different upstreams.
     { crate = "foldhash@0.2.0", reason = "transitive through Arrow and hashbrown 0.17" },
@@ -122,9 +138,9 @@ skip = [
     { crate = "hashbrown@0.14.5", reason = "transitive through DashMap and execution collections" },
     { crate = "hashbrown@0.15.5", reason = "transitive through mysql lru 0.12" },
     { crate = "hashbrown@0.17.0", reason = "transitive through Arrow, Parquet, and lru 0.18" },
-    { crate = "hermit-abi@0.1.19", reason = "transitive through the legacy atty dependency" },
     { crate = "indexmap@1.9.3", reason = "transitive through tonic tower 0.4" },
     { crate = "lru@0.12.5", reason = "transitive through the dev-only synchronous mysql client" },
+    { crate = "num-bigint@0.4.6", reason = "apache-avro 0.21, bigdecimal 0.4 and MySQL SDKs retain num-bigint 0.4 while Arrow/Parquet 60 require 0.5; remove when the last 0.4 consumer migrates" },
     { crate = "r-efi@5.3.0", reason = "transitive through getrandom 0.3" },
     { crate = "rand@0.9.5", reason = "transitive through Iceberg, Avro, HDFS, and Volo" },
     { crate = "rand@0.10.2", reason = "transitive through FoundationDB and mysql_async" },
@@ -133,22 +149,20 @@ skip = [
     { crate = "rand_core@0.10.1", reason = "transitive through rand 0.10" },
 
     # Storage and wire providers retain their upstream protocol/version families.
-    { crate = "integer-encoding@3.0.4", reason = "transitive through the Apache Thrift stack" },
-    { crate = "libloading@0.9.0", reason = "transitive through HDFS and Paimon" },
-    { crate = "lz4_flex@0.13.0", reason = "transitive through Arrow IPC and Parquet" },
+    { crate = "libloading@0.9.0", reason = "transitive through hdfs-native 0.14.6; clang-sys retains libloading 0.8" },
     { crate = "mysql_common@0.37.3", reason = "transitive through the mysql_async state-store provider" },
-    { crate = "ordered-float@2.10.1", reason = "transitive through the Apache Thrift stack" },
     { crate = "prost@0.14.3", reason = "transitive through the HDFS provider" },
     { crate = "prost-derive@0.14.3", reason = "transitive through prost 0.14" },
     { crate = "prost-types@0.14.3", reason = "transitive through the HDFS provider" },
     { crate = "quick-xml@0.37.5", reason = "transitive through reqsign" },
-    { crate = "quick-xml@0.38.4", reason = "transitive through OpenDAL 0.55" },
-    { crate = "roaring@0.11.3", reason = "transitive through Iceberg and Paimon" },
-    { crate = "snafu@0.8.9", reason = "transitive through orc-rust" },
-    { crate = "snafu-derive@0.8.9", reason = "transitive through snafu 0.8" },
+    { crate = "quick-xml@0.42.0", reason = "Reqsign AWS 3 requires quick-xml 0.42; OpenDAL 0.58 core and S3 retain quick-xml 0.41" },
+    { crate = "roaring@0.11.3", reason = "vendored Iceberg 0.11 retains roaring 0.11; first-party Iceberg and Functions retain roaring 0.10" },
     { crate = "socket2@0.5.10", reason = "transitive through tonic, Volo, and the dev-only mysql client" },
     { crate = "tower@0.4.13", reason = "transitive through tonic 0.12" },
     { crate = "twox-hash@1.6.3", reason = "transitive through the dev-only synchronous mysql client" },
+
+    { crate = "zstd@0.13.3", reason = "vendored Iceberg 0.11, apache-avro 0.21 and the dev-only mysql 25 test client via mysql_common 0.32 retain zstd 0.13; DEP-SEC-3 and TRC-2/TRC-3 own migration; remove when the last 0.13 consumer leaves" },
+    { crate = "zstd-safe@7.2.4", reason = "zstd 0.13 retains zstd-safe 7 for vendored Iceberg, apache-avro and the dev-only mysql 25 test client; DEP-SEC-3 and TRC-2/TRC-3 own migration; remove when the last zstd-safe 7 consumer leaves" },
 
     { crate = "toml_datetime@0.7.3", reason = "transitive through toml_edit 0.23" },
     { crate = "toml_edit@0.23.9", reason = "transitive through proc-macro-crate" },

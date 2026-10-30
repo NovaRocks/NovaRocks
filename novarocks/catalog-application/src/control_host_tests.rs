@@ -35,14 +35,13 @@ use novarocks_spi::connector::{
     ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorMetadataMaintenance,
     ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenancePlan,
-    ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
-    ConnectorNamespaceRequest, ConnectorProviderBinding, ConnectorProviderBindingKey,
-    ConnectorProviderId, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorSplitPlanningRequest, ConnectorStatistics, ConnectorStatisticsResolver,
-    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ConnectorWriteControl,
-    ConnectorWriteReceipt, ExternalMutationOutcome, ProviderBindingEpoch, StatisticsDataVersion,
-    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsReadRequest, StatisticsReader,
-    StatisticsRowCoverage,
+    ConnectorMetadataMaintenancePlanningRequest, ConnectorNamespaceRequest,
+    ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderId, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorStatistics,
+    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
+    ConnectorTableRequest, ConnectorWriteControl, ConnectorWriteReceipt, ExternalMutationOutcome,
+    ProviderBindingEpoch, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
+    StatisticsReadRequest, StatisticsReader, StatisticsRowCoverage,
 };
 
 struct TestControl {
@@ -359,14 +358,18 @@ impl ConnectorMetadataMaintenance for TestMetadataMaintenance {
     fn plan_maintenance(
         &self,
         _request: ConnectorMetadataMaintenancePlanningRequest,
-    ) -> Result<ConnectorMetadataMaintenancePlan, ConnectorError> {
-        Err(unsupported())
+    ) -> novarocks_spi::connector::ConnectorMetadataMaintenanceFuture<
+        '_,
+        ConnectorMetadataMaintenancePlan,
+    > {
+        Box::pin(async { Err(unsupported()) })
     }
 
-    fn execute(
+    fn begin_execute(
         &self,
         _request: ConnectorMetadataMaintenanceExecuteRequest,
-    ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError> {
+    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceExecution, ConnectorError>
+    {
         Err(unsupported())
     }
 }

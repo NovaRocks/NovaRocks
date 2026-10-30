@@ -2,7 +2,7 @@
   "schema": 1,
   "rules": [
     {"paths": ["Cargo.toml", "Cargo.lock", ".cargo/**", "rust-toolchain*"], "action": "broad", "reason": "Global build inputs have repository-wide reach."},
-    {"paths": ["novarocks/types/**", "novarocks/spi/**", "novarocks/execution-contract/**", "novarocks/*-codec/**", "novarocks/proto-models/**"], "action": "broad", "reason": "Shared vocabulary and wire contracts have no bounded blast radius."},
+    {"paths": ["novarocks/types/**", "novarocks/spi/**", "novarocks/execution-contract/**", "novarocks/coordination-contract/**", "novarocks/*-codec/**", "novarocks/proto-models/**"], "action": "broad", "reason": "Shared vocabulary and wire contracts have no bounded blast radius."},
     {"paths": ["docs/**", "README*", "NOTICE", "LICENSE", ".agents/**", ".claude/**", "novarocks-fe.toml.example"], "action": "documentation", "reason": "Documentation, workflow text and the deployable FE example use owner review; executable stages still follow their declarations."},
     {"paths": ["tools/ci/**", "docker/**", ".github/**", "AGENTS.md", "CLAUDE.md"], "action": "declared", "reason": "Repository tooling uses declared stage, SQL and System domains."}
   ]

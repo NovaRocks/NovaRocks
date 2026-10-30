@@ -146,6 +146,20 @@ impl MetadataRequestSum {
             occurrences,
         )
     }
+    /// Sum the separate original conversion requests. The node projection is
+    /// opaque; these numerical totals never relabel it as an exact layout.
+    pub fn metadata_conversion(&mut self, entries: usize) -> Result<(), MetadataRequestError> {
+        let original =
+            |cause| MetadataRequestError::Metadata(MetadataMaterializationError::BTree(cause));
+        let requests =
+            super::arrow_metadata::hashmap_conversion_requests(entries).map_err(original)?;
+        self.add(
+            requests.request_bytes_upper_bound().map_err(original)?,
+            requests
+                .allocation_requests_upper_bound()
+                .map_err(original)?,
+        )
+    }
     pub const fn facts(&self) -> CompleteMetadataRequestFacts {
         CompleteMetadataRequestFacts {
             allocation_requests_upper_bound: self.requests,

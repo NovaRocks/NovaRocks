@@ -21,6 +21,7 @@ use super::connector::{
     await_resource_convergence, connector_reader_environment, require_three_backends,
     resource_baseline,
 };
+use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
@@ -35,7 +36,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MANIFEST_ENV: &str = "NOVAROCKS_UEA4G_NATIVE_MANIFEST";
 const ACCESS_ENV: &str = "NOVAROCKS_UEA4G_FIXTURE_ACCESS";
@@ -78,6 +79,7 @@ pub(super) struct Fixture {
 #[derive(Default)]
 pub(super) struct IcebergDeleteApplicability {
     pub(super) fixture: Mutex<Option<Fixture>>,
+    intent: SqlIntentOwner,
 }
 
 fn checked_json(path: &Path, expected: &str) -> Result<Value> {
@@ -148,15 +150,47 @@ fn row_bag(case: &Value) -> Result<Vec<ExpectedRow>> {
     )?)
 }
 
+fn scale_read_sql(case: &Value) -> Result<String> {
+    let table = table_name(case["table"].as_str().context("scale table missing")?)?;
+    let snapshot = case["snapshot"]
+        .as_i64()
+        .context("scale snapshot missing")?;
+    Ok(format!(
+        "SELECT row_id,eq_key,partition_key,payload FROM {table} FOR VERSION AS OF {snapshot} ORDER BY row_id"
+    ))
+}
+
 pub(super) async fn immutable_artifacts(
     fixture: &Fixture,
 ) -> Result<novarocks_connector_iceberg::iceberg::io::FileIO> {
-    use novarocks_connector_iceberg::opendal::{Operator, services::S3};
+    use novarocks_fs::{
+        FileCancellation, FileIdentity, FileReadRange, FsAccessResolver, ObjectStoreAccessContext,
+        ObjectStoreConfig, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions, SecretValue,
+    };
+    use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
     let access = env::var("AWS_S3_ACCESS_KEY_ID").context("missing fixture access credential")?;
     let secret =
         env::var("AWS_S3_SECRET_ACCESS_KEY").context("missing fixture secret credential")?;
     let io = novarocks_connector_iceberg::iceberg::io::FileIO::new_with_memory();
-    let mut operators = std::collections::BTreeMap::new();
+    let provider_pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default())?;
+    let config = ObjectStoreConfig {
+        endpoint: fixture.manifest.s3_endpoint.clone(),
+        access_key_id: SecretValue::new(access),
+        access_key_secret: SecretValue::new(secret),
+        session_token: None,
+        enable_path_style_access: Some(true),
+        region: Some("us-east-1".to_owned()),
+        retry_max_times: None,
+        retry_min_delay_ms: None,
+        retry_max_delay_ms: None,
+        timeout_ms: None,
+        io_timeout_ms: None,
+    };
+    let credential_reference = StaticCredentialReference::try_new("uea4g-immutable-fixture", "v1")?;
+    // Fixture access identity is independent of execution fault-domain admission.
+    let domain = StorageAccessDomainId::from_bytes(
+        Sha256::digest(fixture.manifest.s3_endpoint.as_bytes()).into(),
+    );
     let mut verified = std::collections::BTreeMap::new();
     for artifact in fixture.corpus["artifacts"]
         .as_array()
@@ -181,22 +215,25 @@ pub(super) async fn immutable_artifacts(
             );
             continue;
         }
-        let (bucket, key) = path
+        let (_bucket, _key) = path
             .strip_prefix("s3://")
             .context("artifact must be S3")?
             .split_once('/')
             .context("artifact lacks bucket/key")?;
-        if !operators.contains_key(bucket) {
-            let service = S3::default()
-                .bucket(bucket)
-                .endpoint(&fixture.manifest.s3_endpoint)
-                .region("us-east-1")
-                .access_key_id(&access)
-                .secret_access_key(&secret)
-                .disable_config_load();
-            operators.insert(bucket.to_owned(), Operator::new(service)?.finish());
-        }
-        let bytes = operators[bucket].read(key).await?.to_bytes();
+        let file = FsAccessResolver::new().resolve_location(
+            domain,
+            path,
+            Some(ObjectStoreAccessContext::for_static(
+                config.endpoint_config(),
+                credential_reference.clone(),
+                config.secret_material(),
+                &provider_pool,
+            )),
+        )?;
+        let bytes = file
+            .bind(0, FileIdentity::new(path, size, None))?
+            .read(FileReadRange::WholeFile, &FileCancellation::new())
+            .await?;
         ensure!(
             bytes.len() as u64 == size && format!("{:x}", Sha256::digest(&bytes)) == hash,
             "immutable artifact bytes changed: {path}"
@@ -371,6 +408,49 @@ impl Scenario for IcebergDeleteApplicability {
         })
     }
 
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture lock poisoned"))?;
+        let fixture = slot.as_ref().context("missing prepared fixture")?;
+        let cases = fixture.scale["cases"]
+            .as_array()
+            .context("missing scale cases")?;
+        let specs = fixture
+            .manifest
+            .scale_cases
+            .iter()
+            .map(|name| {
+                let case = cases
+                    .iter()
+                    .find(|case| case["case"] == name.as_str())
+                    .context("missing selected scale case")?;
+                Ok(StatementSpec {
+                    sql: scale_read_sql(case)?,
+                    faults: vec![],
+                    observations: (0..cluster_size)
+                        .map(|index| (index, "reader-marker", None))
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(self.intent.freeze(
+            specs,
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
@@ -432,20 +512,19 @@ impl Scenario for IcebergDeleteApplicability {
         let before_logs = (0..3)
             .map(|i| context.handle().be_current_log_contents(i))
             .collect::<Result<Vec<_>>>()?;
-        for name in &fixture.manifest.scale_cases {
+        for (index, name) in fixture.manifest.scale_cases.iter().enumerate() {
             let case = fixture.scale["cases"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|c| c["case"] == name.as_str())
                 .unwrap();
-            let table = table_name(case["table"].as_str().context("scale table missing")?)?;
             let snapshot = case["snapshot"]
                 .as_i64()
                 .context("scale snapshot missing")?;
-            let query = format!(
-                "SELECT row_id,eq_key,partition_key,payload FROM {table} FOR VERSION AS OF {snapshot} ORDER BY row_id"
-            );
+            let query = scale_read_sql(case)?;
+            let selected = self.intent.take(index)?;
+            let observation = selected.arm(context, connection.connection_id(), &query)?;
             let mut hash = Sha256::new();
             let mut count = 0_i64;
             let mut sums = [0_i64; 4];
@@ -469,6 +548,9 @@ impl Scenario for IcebergDeleteApplicability {
                 observed == case["independent_oracle"],
                 "native exact scale bag differs for {name}: {observed}"
             );
+            context
+                .handle()
+                .drain_query_lifecycle_statement_binding(&observation, selected.deadline)?;
             observations.push(json!({"case":name,"snapshot":snapshot,"metadata":case["metadata"],"exact_bag":observed}));
         }
         await_resource_convergence(context, &baseline, "native delete applicability reads")?;

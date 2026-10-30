@@ -432,7 +432,7 @@ pub(crate) fn admitted_connector(
 ) -> Result<
     impl tower::Service<
         tonic::codegen::http::Uri,
-        Response = TokioIo<novarocks_native_trust::BoxedNativeIo>,
+        Response = TokioIo<novarocks_transport_io::BoxedIo>,
         Error = io::Error,
         Future = impl Send,
     > + Clone

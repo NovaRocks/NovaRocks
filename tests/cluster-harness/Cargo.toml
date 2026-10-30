@@ -42,6 +42,7 @@ novarocks-task-codec.workspace = true
 novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-result-contract.workspace = true
+percent-encoding.workspace = true
 prost.workspace = true
 novarocks-secret.workspace = true
 novarocks-types.workspace = true

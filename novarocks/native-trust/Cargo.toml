@@ -11,6 +11,9 @@ workspace = true
 doctest = false
 
 [dependencies]
+novarocks-resource-contract.workspace = true
+url.workspace = true
+novarocks-transport-io.workspace = true
 base64.workspace = true
 bytes.workspace = true
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
@@ -22,7 +25,6 @@ novarocks-secret.workspace = true
 novarocks-types.workspace = true
 rcgen.workspace = true
 rustls = { workspace = true, features = ["ring"] }
-rustls-pemfile = "2"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true

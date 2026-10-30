@@ -87,10 +87,23 @@ pub(crate) fn decode_writer_handle(
     finish_decode(result, context)
 }
 
+/// A fragment admitted by the existing private scanner and wire validator.
+///
+/// Only this module can construct the value. Shared access preserves the exact
+/// validated fields through domain projection; this is not a capacity receipt.
+#[derive(Debug)]
+pub(crate) struct ValidatedCommitFragmentWire(dto::IcebergCommitFragment);
+
+impl ValidatedCommitFragmentWire {
+    pub(crate) fn as_dto(&self) -> &dto::IcebergCommitFragment {
+        &self.0
+    }
+}
+
 pub(crate) fn decode_commit_fragment(
     payload: &[u8],
     context: &mut ConnectorDecodeContext<'_>,
-) -> Result<dto::IcebergCommitFragment, ConnectorCodecError> {
+) -> Result<ValidatedCommitFragmentWire, ConnectorCodecError> {
     let result = (|| {
         let path = ConnectorFieldPath::root("commit_fragment").field("iceberg");
         if payload.len() > MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
@@ -114,7 +127,7 @@ pub(crate) fn decode_commit_fragment(
                 .saturating_add(size_of::<dto::IcebergCommitFragment>())
                 .saturating_add(container_bytes),
         )?;
-        Ok(value)
+        Ok(ValidatedCommitFragmentWire(value))
     })();
     context.observe_compile_step()?;
     finish_decode(result, context)
@@ -1809,7 +1822,7 @@ mod compile_control_tests {
     fn run_fragment(
         bytes: &[u8],
         control: &Control,
-    ) -> Result<dto::IcebergCommitFragment, ConnectorCodecError> {
+    ) -> Result<ValidatedCommitFragmentWire, ConnectorCodecError> {
         let expected = header(ConnectorCodecCategory::CommitFragment);
         let mut budget = ledger();
         let mut context =
@@ -1903,8 +1916,8 @@ mod compile_control_tests {
                 .unwrap(),
             )
             .unwrap();
-            assert_eq!(old, raw);
-            assert_eq!(new, raw);
+            assert_eq!(old.as_dto(), &raw);
+            assert_eq!(new.as_dto(), &raw);
             assert_ledger_same(&old_budget, &new_budget);
             let trace = control.trace.lock().unwrap();
             representative_checkpoints(&trace);

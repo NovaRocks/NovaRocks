@@ -1,6 +1,8 @@
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:PROJECT [count(*)] stats={rows=1}
   1:HASH AGGREGATE (SINGLE) stats={rows=1}
@@ -10,6 +12,8 @@ PLAN FRAGMENT 0
       4:GATHER stats={rows=100}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 3
@@ -20,6 +24,8 @@ PLAN FRAGMENT 1
      min-max stats
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 4

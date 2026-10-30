@@ -32,6 +32,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
+use crate::task_execution::operation::OperationDispatchResult;
 use novarocks_execution::task_execution::{
     AbortCause, AbortQueryContext, OperationKind, OperationOutcome, QueryContextReceipt,
     QueryContextState,
@@ -40,7 +41,7 @@ use novarocks_query_application::coordination::{
     AbortQueryContextEffectAdmission, AbortQueryContextEffectPort,
     AbortQueryContextEffectReservation, AbortQueryContextEffectSubmission,
     AbortQueryContextIssueIdentity, ContextStandDownCause, ContextStandDownError,
-    LateAbortQueryContextWorkerSettlement, OperationDispatchResult,
+    LateAbortQueryContextWorkerSettlement,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -720,14 +721,16 @@ impl fmt::Display for NativeAbortEffectSettleError {
 mod tests {
     use std::time::Duration;
 
+    use crate::task_protocol_config::DispatchLane;
+    use novarocks_coordination_contract::ExecutionEffect;
     use novarocks_execution::task_execution::{
         AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
         LeaseValidFor, QueryContextAdmissionTicketReceipt, QueryContextReceipt, QueryContextRef,
         QueryContextState, TaskOperationId,
     };
     use novarocks_query_application::coordination::{
-        AbortQueryContextEffectPort, AdmissionIssueSettlement, ContextClosureState, DispatchLane,
-        ExecutionEffect, LogicalConclusion, LogicalExecutionActorConfig,
+        AbortQueryContextEffectPort, AdmissionIssueSettlement, ContextClosureState,
+        LogicalConclusion, LogicalExecutionActorConfig,
     };
     use novarocks_query_application::test_support::LogicalExecutionTestHarness;
     use novarocks_types::NativeCompatibilityId;

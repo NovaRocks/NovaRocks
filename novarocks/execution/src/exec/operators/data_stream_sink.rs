@@ -1358,10 +1358,6 @@ impl CompiledPartitionKeys {
         }
     }
 
-    #[expect(
-        dead_code,
-        reason = "Write-route construction remains closed until Task binding is installed."
-    )]
     pub(crate) fn hierarchical(
         program: Arc<LocalProgram>,
         sites: Vec<ProgramExpressionRootSite>,
@@ -1374,13 +1370,6 @@ impl CompiledPartitionKeys {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Write-route construction remains closed until Task binding is installed."
-        )
-    )]
     pub(crate) fn conditional(
         program: Arc<LocalProgram>,
         sites: Vec<ProgramExpressionRootSite>,

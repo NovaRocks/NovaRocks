@@ -16,7 +16,7 @@
 // under the License.
 
 //! Requested-size bounds for the audited Rust 1.98.1 RawVec and fresh Prost 0.13.5
-//! decoding from &[u8], with bytes 1.11.0. These are not allocator RSS or a
+//! decoding from &[u8], with bytes 1.11.1. These are not allocator RSS or a
 //! grant. Each contribution counts all occurrences, including overwritten
 //! objects. Old blocks already occur in the cumulative allocation sum.
 
@@ -59,7 +59,7 @@ pub(super) fn replacement_bytes(length: usize) -> Result<usize, E> {
 }
 
 /// Prost bytes::merge first makes a Bytes temporary. For a concrete &[u8]
-/// source, bytes 1.11.0 uses BytesMut::with_capacity(len), whose exact-length
+/// source, bytes 1.11.1 uses BytesMut::with_capacity(len), whose exact-length
 /// Vec freezes into a boxed slice without a Shared header. The temporary
 /// backing coexists with destination growth; String merge_one_copy has none.
 pub(super) fn slice_bytes_payload(length: usize) -> Result<usize, E> {

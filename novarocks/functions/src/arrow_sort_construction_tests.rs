@@ -242,3 +242,152 @@ fn lexsort_model_coverage_failure_does_not_claim_arrow_view_is_unsupported() {
         CopyConstructionError::Resource(LayoutResourceError::SourceModel)
     ));
 }
+
+// Reuse the crate's existing System/TLS request observer. Its cumulative
+// requested bytes are separate from request count, peak and live stock.
+mod take_comparator_allocator_oracle {
+    use super::*;
+
+    fn sources() -> Vec<ArrayRef> {
+        use arrow_array::types::{Int16Type, UInt8Type};
+        use arrow_array::{
+            DictionaryArray, Int16Array, Int64Array, ListViewArray, RunArray, UInt8Array,
+        };
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![Some(7), None, Some(9)]));
+        let view: ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("a long borrowed source value"),
+            None,
+            Some("second long borrowed value"),
+        ]));
+        let list: ArrayRef = Arc::new(
+            ListViewArray::try_new(
+                Arc::new(arrow_schema::Field::new("item", DataType::Int64, true)),
+                vec![0_i32, 1, 0].into(),
+                vec![2_i32, 1, 0].into(),
+                ints.clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        let run: ArrayRef = Arc::new(
+            RunArray::<Int16Type>::try_new(&Int16Array::from(vec![1, 3, 4]), ints.as_ref())
+                .unwrap(),
+        );
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<UInt8Type>::try_new(UInt8Array::from(vec![0, 1, 0]), view.clone())
+                .unwrap(),
+        );
+        let fields = arrow_schema::UnionFields::try_new(
+            [5, 99],
+            [
+                arrow_schema::Field::new("required", DataType::Int64, false),
+                arrow_schema::Field::new("nullable", DataType::Int64, true),
+            ],
+        )
+        .unwrap();
+        let mut sources = vec![ints, view, list, run, dictionary];
+        for dense in [false, true] {
+            sources.push(Arc::new(
+                arrow_array::UnionArray::try_new(
+                    fields.clone(),
+                    vec![5_i8, 99, 5].into(),
+                    dense.then(|| vec![0_i32, 0, 1].into()),
+                    if dense {
+                        vec![
+                            Arc::new(Int64Array::from(vec![7, 9])),
+                            Arc::new(Int64Array::from(vec![None])),
+                        ]
+                    } else {
+                        vec![
+                            Arc::new(Int64Array::from(vec![7, 0, 9])),
+                            Arc::new(Int64Array::from(vec![None, None, None])),
+                        ]
+                    },
+                )
+                .unwrap(),
+            ));
+        }
+        let struct_fields = sources
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.len() == 3)
+            .map(|(i, a)| {
+                Arc::new(arrow_schema::Field::new(
+                    format!("field_{i}"),
+                    a.data_type().clone(),
+                    true,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let struct_children = sources.iter().filter(|a| a.len() == 3).cloned().collect();
+        sources.push(Arc::new(
+            arrow_array::StructArray::try_new(struct_fields.into(), struct_children, None).unwrap(),
+        ));
+        sources
+    }
+    #[test]
+    fn original_run_take_comparator_source_upper_covers_actual_factory_requests() {
+        for source in sources() {
+            let bound = original_take_comparator_upper_observed(source.as_ref(), &mut |_| {
+                Ok::<_, CopyError>(())
+            })
+            .unwrap();
+            let (comparator, (requested, _, _, _)) =
+                crate::source_custody_resources_tests::measured(|| {
+                    arrow_ord::ord::make_comparator(
+                        source.as_ref(),
+                        source.as_ref(),
+                        arrow_schema::SortOptions::default(),
+                    )
+                });
+            let comparator = comparator.unwrap();
+            assert!(
+                requested <= bound,
+                "type={:?}, actual factory requests={requested}, source upper={bound}",
+                source.data_type()
+            );
+            for row in 0..source.len() {
+                assert_eq!(comparator(row, row), std::cmp::Ordering::Equal);
+            }
+        }
+    }
+    #[derive(Debug)]
+    enum Stop {
+        Copy(CopyError),
+        Original(Arc<u32>),
+    }
+    impl From<CopyError> for Stop {
+        fn from(source: CopyError) -> Self {
+            Self::Copy(source)
+        }
+    }
+    #[test]
+    fn original_run_take_comparator_keeps_each_first_work_refusal_without_completion_tail() {
+        let source = sources().pop().unwrap();
+        let mut baseline = Vec::new();
+        original_take_comparator_upper_observed(source.as_ref(), &mut |boundary| {
+            baseline.push(boundary);
+            Ok::<_, Stop>(())
+        })
+        .unwrap();
+        let cause = Arc::new(73);
+        for at in 0..baseline.len() {
+            let mut observed = Vec::new();
+            let result =
+                original_take_comparator_upper_observed(source.as_ref(), &mut |boundary| {
+                    observed.push(boundary);
+                    if observed.len() == at + 1 {
+                        Err(Stop::Original(cause.clone()))
+                    } else {
+                        Ok(())
+                    }
+                });
+            match result {
+                Err(Stop::Original(actual)) => assert!(Arc::ptr_eq(&cause, &actual)),
+                Err(Stop::Copy(source)) => panic!("first cause replaced by source: {source:?}"),
+                Ok(value) => panic!("first cause lost to success: {value}"),
+            }
+            assert_eq!(observed, baseline[..=at]);
+        }
+    }
+}

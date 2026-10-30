@@ -30,10 +30,14 @@ use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStoragePartitionTransform,
 };
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
+use novarocks_frontend_application::task_protocol_config::{
+    CoordinationBudgets, DispatchBudget, TaskUpdateRetryPolicy,
+};
 use novarocks_frontend_application::{
     ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendExecutionConfig,
-    FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig, FrontendQueryControlTimeouts,
-    FrontendServingConfig,
+    FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig, FrontendNativeCapacityInputs,
+    FrontendQueryControlTimeouts, FrontendResultCapacityProfile, FrontendServingConfig,
+    FrontendStatementIngress, FrontendWorkloadCapacityConfig, FrontendWorkloadCapacityProfile,
 };
 use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
@@ -44,19 +48,18 @@ use novarocks_mv_application::scheduler::MvSchedulerConfig;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_native_adapter::backend_application::BackendServerConfig;
 use novarocks_query_application::coordination::{
-    CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
-    LogicalExecutionSupervisorConfig, TaskUpdateRetryPolicy,
+    LogicalExecutionRowsConfig, LogicalExecutionSupervisorConfig,
 };
 use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableMetadata, MvCreateSourceObservation, MvCreatedTargetObservation,
-    MvMaintenanceMetadataObservation, MvObservedField, MvObservedMaintenancePolicy,
-    MvObservedPartitionField, MvObservedPartitionSpec, MvObservedPartitionTransform,
-    MvObservedRefreshMarker, MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
-    MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
-    WriteCommitEvidenceLimits,
+    ConnectorTableMetadata, MvCreatedTargetObservation, MvMaintenanceMetadataObservation,
+    MvObservedField, MvObservedMaintenancePolicy, MvObservedPartitionField,
+    MvObservedPartitionSpec, MvObservedPartitionTransform, MvObservedRefreshMarker,
+    MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
+    MvRefreshTargetObservation, MvSchemaValidationObservation, MvSourceSchemaObservation,
+    MvStorageObservationPort, WriteCommitEvidenceLimits,
 };
 use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_runtime::{
@@ -67,7 +70,6 @@ use novarocks_types::{ClusterRole, NativeCompatibilityId};
 use novarocks_worker::{LeaseBounds, OperationWaitCaps};
 use novarocks_workload_control::WorkloadConfig;
 
-use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 use crate::provider_manifest::ServerProviderManifest;
 use crate::scan_io::ScanIoServices;
 use crate::static_plan::ServerStaticPlan;
@@ -146,15 +148,15 @@ fn mv_partition_observation(
 }
 
 impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
-    fn observe_create_source(
+    fn observe_source_schema(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
-    ) -> Result<MvCreateSourceObservation, ConnectorError> {
+    ) -> Result<MvSourceSchemaObservation, ConnectorError> {
         let observed =
             self.inspector
-                .observe_create_source(exact_lease, metadata, context.clone())?;
+                .observe_source_schema(exact_lease, metadata, context.clone())?;
         if metadata.version.as_ref() != Some(&observed.schema_version) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
@@ -173,10 +175,12 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        MvCreateSourceObservation::try_new(
+        MvSourceSchemaObservation::try_new(
             metadata.identity.clone(),
             observed.object_id,
             observed.schema_version,
+            observed.format_v3,
+            observed.stored_row_lineage_enabled,
             fields,
             &context,
         )
@@ -358,6 +362,7 @@ pub fn compose_backend_server_config(
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
     runtime: tokio::runtime::Handle,
+    filesystem: FsAccessResources,
     scan_io: &ScanIoServices,
     #[cfg(novarocks_dev_controls)] test_session: Option<
         novarocks_failpoint::liveness::PreparedRoleSession,
@@ -485,11 +490,12 @@ pub fn compose_backend_server_config(
         execution_role_binding_factories: provider_manifest.compose_execution_factories(
             config,
             runtime,
+            &filesystem,
             scan_io,
             #[cfg(novarocks_dev_controls)]
             &test_slots,
         )?,
-        static_plan_interpreter: static_plan.backend_interpreter()?,
+        static_plan_interpreter: static_plan.backend_interpreter(),
         process_memory: backend_process_memory_observation(memory_authority),
     })
 }
@@ -561,6 +567,7 @@ pub fn compose_frontend_role_config(
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
     runtime: tokio::runtime::Handle,
+    filesystem: FsAccessResources,
     #[cfg(novarocks_dev_controls)] test_session: Option<
         novarocks_failpoint::liveness::PreparedRoleSession,
     >,
@@ -576,10 +583,6 @@ pub fn compose_frontend_role_config(
     )?;
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
-    let query_blocking_workers = NonZeroUsize::new(runtime_config.actual_query_blocking_workers())
-        .ok_or_else(|| anyhow::anyhow!("runtime.query_blocking_worker_threads must be nonzero"))?;
-    let query_blocking_queue = NonZeroUsize::new(runtime_config.query_blocking_queue_capacity)
-        .ok_or_else(|| anyhow::anyhow!("runtime.query_blocking_queue_capacity must be nonzero"))?;
     let failure_backoff_ms = config
         .standalone_server
         .as_ref()
@@ -590,16 +593,36 @@ pub fn compose_frontend_role_config(
         .ok_or_else(|| anyhow::anyhow!("compose frontend server without catalog source preflight"))?
         .input()?;
     let task_execution_budgets = compose_task_execution_budgets(config)?;
-    let (logical_supervisor, workload, abort_capacity) =
+    let (logical_supervisor, workload, abort_capacity, result_profile, capacity_inputs) =
         compose_frontend_workload_runtime(runtime_config)?;
-    let logical_runtime =
-        FrontendLogicalExecutionRuntimeConfig::new(logical_supervisor, workload, abort_capacity);
+    // Runtime settings come from the same original ingress and Native owners.
+    let ingress = compose_frontend_statement_ingress()?;
+    let capacity_profile = FrontendWorkloadCapacityProfile::try_for_native(
+        capacity_inputs,
+        &workload,
+        result_profile,
+        task_execution_budgets.transport,
+        ingress,
+    )
+    .context("compose frontend original-source workload capacity profile")?;
+    // The fifth input and the actual pool consume one frozen configuration.
+    let query_blocking_config = capacity_profile.inputs().query_blocking_capacity();
+    let logical_runtime = FrontendLogicalExecutionRuntimeConfig::new(
+        logical_supervisor,
+        workload,
+        abort_capacity,
+        result_profile,
+        capacity_profile,
+    );
+    // The frontend freezes the one carrier its island's backends interpret,
+    // under the same structural package admission as their receiver.
     let mut execution = FrontendExecutionConfig::new(
         runtime_filter_worker_count,
         native_compatibility_id,
         function_catalog,
         logical_runtime,
         constant_policy,
+        static_plan.frontend_carrier(),
     )
     .with_catalog_desired_state_source(catalog_source)
     .try_with_catalog_prune_config(
@@ -656,13 +679,7 @@ pub fn compose_frontend_role_config(
     .with_query_cpu_executor_config(QueryCpuExecutorConfig::with_idle_keepalive(
         Duration::from_millis(runtime_config.frontend_workload.planning_idle_keepalive_ms),
     ))
-    .with_query_blocking_executor_config(QueryBlockingExecutorConfig::new(
-        query_blocking_workers,
-        query_blocking_queue,
-    ));
-    // The frontend freezes the one carrier its island's backends interpret,
-    // under the same structural package admission as their receiver.
-    execution = execution.with_static_plan_carrier(static_plan.frontend_carrier());
+    .with_query_blocking_executor_config(query_blocking_config);
     let (remote_effect_policy, management_audit, startup_isolation) =
         mv_management_continuation(config)?;
     execution =
@@ -714,6 +731,16 @@ pub fn compose_frontend_role_config(
         port_override,
     )
     .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
+    let trino_settings = config
+        .standalone_server
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+    let trino_listener = novarocks_trino_adapter::TrinoListenerSettings {
+        port: trino_settings.trino_port,
+        user: trino_settings.user,
+        client_timeout: Duration::from_millis(trino_settings.trino_client_timeout_ms),
+    };
     let state_store_provider_registry = state_store_provider_registry(config)?;
     let state_store_input = state_store_input(config)?;
     #[cfg(novarocks_dev_controls)]
@@ -734,6 +761,7 @@ pub fn compose_frontend_role_config(
             connector_control_role_factories: provider_manifest.compose_control_factories(
                 config,
                 runtime,
+                &filesystem,
                 #[cfg(novarocks_dev_controls)]
                 &test_slots,
             )?,
@@ -760,6 +788,7 @@ pub fn compose_frontend_role_config(
                 config.server.frontend_cleanup_timeout_ms,
             ),
             mysql_listener,
+            trino_listener,
             native_trust: std::sync::Arc::clone(native_trust.trust()),
             native_transport: frontend_native_transport(native_trust.transport()),
             native_ingress: runtime_config.native_ingress.to_adapter_config(),
@@ -785,21 +814,35 @@ struct ComposedTaskExecutionBudgets {
     transport: FrontendTaskTransportBudget,
 }
 
+fn compose_frontend_capacity_config(
+    runtime: &crate::app_config::RuntimeConfig,
+) -> anyhow::Result<FrontendWorkloadCapacityConfig> {
+    let input = &runtime.frontend_workload;
+    FrontendWorkloadCapacityConfig::try_new(
+        input.scope_records_limit,
+        NonZeroUsize::new(input.joint_progress_turn_budget)
+            .ok_or_else(|| anyhow!("frontend responsibility turn budget must be nonzero"))?,
+        Duration::from_millis(input.retired_backing_recheck_ms),
+    )
+    .context("construct frontend workload runtime configuration")
+}
+
 fn compose_frontend_workload_policy(
     runtime: &crate::app_config::RuntimeConfig,
 ) -> anyhow::Result<WorkloadConfig> {
     let input = &runtime.frontend_workload;
+    let scope_limit = compose_frontend_capacity_config(runtime)?.scope_limit();
     let workload = WorkloadConfig {
         // These generic bookkeeping ceilings protect finite in-process state.
         // Frontend compute roots use `query_concurrency_limit` below as their
         // single operational queue; these do not form a second FE workload
         // admission policy.
-        root_limit: input.scope_records_limit,
-        business_limit: input.scope_records_limit,
+        root_limit: scope_limit,
+        business_limit: scope_limit,
         query_concurrency_limit: input.concurrency_limit,
-        preparation_limit: input.scope_records_limit,
-        execution_limit: input.scope_records_limit,
-        executions_per_root: input.scope_records_limit,
+        preparation_limit: scope_limit,
+        execution_limit: scope_limit,
+        executions_per_root: scope_limit,
         waiting_limit: input.waiting_limit,
         // Query admission has no retained-byte declaration. Keep the generic
         // stage-accounting invariant valid without exposing a second FE query
@@ -810,7 +853,7 @@ fn compose_frontend_workload_policy(
         old_attempts_per_work: input.old_attempts_per_work,
         old_attempts_limit: input.old_attempts_limit,
         unknown_creates_limit: input.unknown_creates_limit,
-        scope_records_limit: input.scope_records_limit,
+        scope_records_limit: scope_limit,
         obligation_records_limit: input.obligation_records_limit,
         control_inflight_limit: input.control_inflight_limit,
         control_ready_limit: input.control_ready_limit,
@@ -821,12 +864,40 @@ fn compose_frontend_workload_policy(
     Ok(workload)
 }
 
-/// Pure load-time check over the same policy projection used by composition.
+fn compose_frontend_result_profile(
+    runtime: &crate::app_config::RuntimeConfig,
+) -> anyhow::Result<FrontendResultCapacityProfile> {
+    let mut capacity = novarocks_workload_control::ResultCapacityConfig::V1;
+    capacity.positions[2] = runtime.frontend_workload.internal_result_positions;
+    capacity.all_objects_bytes[2] = runtime.frontend_workload.internal_result_all_objects_bytes;
+    FrontendResultCapacityProfile::try_new(capacity).context("construct frontend result capacity")
+}
+
+/// Pure validation of the actual runtime configuration used by composition.
 pub(crate) fn validate_frontend_joint_startup(
     runtime: &crate::app_config::RuntimeConfig,
-) -> anyhow::Result<crate::joint_startup_report::JointStartupReport> {
+) -> anyhow::Result<()> {
     let workload = compose_frontend_workload_policy(runtime)?;
-    crate::joint_startup_report::validate_current(&workload)
+    let result = compose_frontend_result_profile(runtime)?;
+    if workload.query_concurrency_limit > result.declared().client_compute_positions {
+        anyhow::bail!("frontend query concurrency exceeds its actual Client result positions");
+    }
+    Ok(())
+}
+
+fn compose_frontend_statement_ingress() -> anyhow::Result<FrontendStatementIngress> {
+    let mysql = novarocks_mysql_adapter::frozen_mysql_startup_parameters()
+        .context("read original frontend MySQL ingress bounds")?;
+    Ok(FrontendStatementIngress {
+        ordinary_connections: NonZeroUsize::new(mysql.ordinary_positions)
+            .ok_or_else(|| anyhow!("ordinary MySQL positions must be nonzero"))?,
+        control_connections: NonZeroUsize::new(mysql.control_positions)
+            .ok_or_else(|| anyhow!("control MySQL positions must be nonzero"))?,
+        ordinary_command_bytes: NonZeroUsize::new(mysql.ordinary.limits.command_bytes)
+            .ok_or_else(|| anyhow!("ordinary MySQL command bound must be nonzero"))?,
+        control_command_bytes: NonZeroUsize::new(mysql.control.limits.command_bytes)
+            .ok_or_else(|| anyhow!("control MySQL command bound must be nonzero"))?,
+    })
 }
 
 fn compose_frontend_workload_runtime(
@@ -835,14 +906,13 @@ fn compose_frontend_workload_runtime(
     LogicalExecutionSupervisorConfig,
     WorkloadConfig,
     NonZeroUsize,
+    FrontendResultCapacityProfile,
+    FrontendNativeCapacityInputs,
 )> {
     let input = &runtime.frontend_workload;
     let workload = compose_frontend_workload_policy(runtime)?;
-    let report = crate::joint_startup_report::validate_current(&workload)?;
-    tracing::debug!(
-        ?report,
-        "Frontend joint startup number checks completed; owner projections remain open"
-    );
+    let result_profile = compose_frontend_result_profile(runtime)?;
+    validate_frontend_joint_startup(runtime)?;
     let nonzero = |field: &'static str, value: usize| {
         NonZeroUsize::new(value)
             .ok_or_else(|| anyhow::anyhow!("runtime.frontend_workload.{field} must be nonzero"))
@@ -900,7 +970,24 @@ fn compose_frontend_workload_runtime(
     .with_remote_cleanup_timeout(Duration::from_millis(
         input.logical_remote_cleanup_timeout_ms,
     ));
-    Ok((supervisor, workload, abort_capacity))
+    let query_blocking = QueryBlockingExecutorConfig::new(
+        NonZeroUsize::new(runtime.actual_query_blocking_workers())
+            .ok_or_else(|| anyhow!("runtime.query_blocking_worker_threads must be nonzero"))?,
+        NonZeroUsize::new(runtime.query_blocking_queue_capacity)
+            .ok_or_else(|| anyhow!("runtime.query_blocking_queue_capacity must be nonzero"))?,
+    );
+    let capacity_inputs = FrontendNativeCapacityInputs::try_new(
+        compose_frontend_capacity_config(runtime)?,
+        query_blocking,
+    )
+    .context("construct unvalidated frontend Native capacity inputs")?;
+    Ok((
+        supervisor,
+        workload,
+        abort_capacity,
+        result_profile,
+        capacity_inputs,
+    ))
 }
 
 fn compose_task_execution_budgets(
@@ -1016,9 +1103,9 @@ fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntim
 pub fn compose_iceberg_execution_resources(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
+    write_resources: FsAccessResources,
     scan_io: &ScanIoServices,
 ) -> anyhow::Result<IcebergExecutionResources> {
-    let write_resources = compose_connector_file_planning_resources(config, runtime.clone())?;
     // Read and write are I/O views of the same BE storage authority. Moving
     // reads onto scan I/O must not mint another credential registry or pool.
     let read_resources =
@@ -1038,14 +1125,14 @@ fn compose_iceberg_access_template_from_resources(
     resources: FsAccessResources,
 ) -> anyhow::Result<IcebergReadBinding> {
     let resolver: std::sync::Arc<
-        dyn novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver,
+        dyn novarocks_connector_iceberg::access_binding::IcebergCredentialResolver,
     > = std::sync::Arc::new(
         config
             .connector
             .credential_registry(ClusterRole::Be)
             .map_err(|error| anyhow::anyhow!("resolve BE catalog credentials: {error}"))?,
     );
-    Ok(IcebergReadBinding::with_static_credential_resolver(
+    Ok(IcebergReadBinding::with_credential_resolver(
         resources, resolver,
     ))
 }
@@ -1055,62 +1142,19 @@ fn compose_iceberg_access_template_from_resources(
 /// planning FileIO.
 pub(crate) fn compose_iceberg_metadata_access_template(
     config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
+    resources: FsAccessResources,
 ) -> anyhow::Result<IcebergReadBinding> {
     let resolver: std::sync::Arc<
-        dyn novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver,
+        dyn novarocks_connector_iceberg::access_binding::IcebergCredentialResolver,
     > = std::sync::Arc::new(
         config
             .connector
             .credential_registry(ClusterRole::Fe)
             .map_err(|error| anyhow::anyhow!("resolve FE metadata credentials: {error}"))?,
     );
-    let resources = compose_connector_file_planning_resources(config, runtime)?;
-    Ok(IcebergReadBinding::with_static_metadata_credential_resolver(resources, resolver))
-}
-
-/// The coordinator's Paimon file access: metadata reads on the process
-/// runtime, outside the scan I/O services.
-pub(crate) fn compose_paimon_control_access_factory(
-    config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
-) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
-    let resources = compose_connector_file_planning_resources(config, runtime)?;
-    Ok(std::sync::Arc::new(
-        compose_paimon_access_factory_with_resources(config, ClusterRole::Fe, resources)?,
+    Ok(IcebergReadBinding::with_metadata_credential_resolver(
+        resources, resolver,
     ))
-}
-
-/// A backend's Paimon file access: the same scan I/O services as every other
-/// provider's execution reads, so its HEADs and GETs share their windows.
-pub(crate) fn compose_paimon_execution_access_factory(
-    config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
-    scan_io: &ScanIoServices,
-    #[cfg(novarocks_dev_controls)] test_slots: &crate::provider_test_slots::ProviderTestSlots,
-) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
-    let resources = compose_connector_file_planning_resources(config, runtime)?
-        .with_file_io(scan_io.file_runtime(), scan_io.file_task_spawner());
-    #[cfg(novarocks_dev_controls)]
-    test_slots
-        .register_storage(resources.storage_authority_registry().clone())
-        .map_err(anyhow::Error::msg)?;
-    Ok(std::sync::Arc::new(
-        compose_paimon_access_factory_with_resources(config, ClusterRole::Be, resources)?
-            .with_range_service(scan_io.range_service()),
-    ))
-}
-
-pub(crate) fn compose_paimon_access_factory_with_resources(
-    config: &NovaRocksConfig,
-    role: ClusterRole,
-    resources: FsAccessResources,
-) -> anyhow::Result<ServerPaimonRoleFileIoFactory> {
-    let credentials = config
-        .connector
-        .credential_registry(role)
-        .map_err(|error| anyhow::anyhow!("resolve role-local catalog credentials: {error}"))?;
-    Ok(ServerPaimonRoleFileIoFactory::new(resources, credentials))
 }
 
 pub fn compose_connector_file_planning_resources(
@@ -1123,7 +1167,7 @@ pub fn compose_connector_file_planning_resources(
     );
     Ok(FsAccessResources::new(
         pool,
-        FsAccessResolver::new(),
+        FsAccessResolver::with_runtime(runtime.clone()),
         std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
         std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
     ))
@@ -1163,10 +1207,14 @@ pub fn state_store_provider_registry(
 
 #[cfg(test)]
 mod tests {
-    use super::{compose_frontend_workload_runtime, compose_task_execution_budgets};
+    use super::{
+        FrontendWorkloadCapacityProfile, compose_frontend_statement_ingress,
+        compose_frontend_workload_runtime, compose_task_execution_budgets,
+    };
+
     use novarocks_execution_contract::{MaxWait, OperationKind};
+    use novarocks_frontend_application::task_protocol_config::DispatchBudget;
     use novarocks_native_adapter::FrontendTaskTransportBudget;
-    use novarocks_query_application::coordination::DispatchBudget;
     use novarocks_worker::LeaseBounds;
     use std::time::Duration;
 
@@ -1284,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    fn task_execution_budgets_default_to_the_frozen_contract_values() {
+    fn task_execution_budgets_use_frozen_wire_and_server_queue_policy() {
         let config = crate::app_config::NovaRocksConfig::default();
         let budgets = compose_task_execution_budgets(&config).expect("default budgets");
 
@@ -1317,7 +1365,7 @@ mod tests {
         );
         assert_eq!(
             budgets.transport.max_backend_queued_bytes(),
-            frozen.max_backend_queued_bytes()
+            config.runtime.task_backend_max_queued_bytes
         );
         assert_eq!(
             budgets.transport.max_tasks_per_context(),
@@ -1351,14 +1399,53 @@ mod tests {
     }
 
     #[test]
+    fn frontend_configuration_with_one_worker_does_not_derive_a_topology_limit() {
+        let mut config = crate::app_config::NovaRocksConfig::default();
+        config.runtime.query_blocking_worker_threads = 1;
+        config.runtime.query_blocking_queue_capacity = 1;
+        let (_, workload, _, result, inputs) =
+            compose_frontend_workload_runtime(&config.runtime).unwrap();
+        let transport = compose_task_execution_budgets(&config).unwrap().transport;
+        let profile = FrontendWorkloadCapacityProfile::try_for_native(
+            inputs,
+            &workload,
+            result,
+            transport,
+            compose_frontend_statement_ingress().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            profile
+                .inputs()
+                .query_blocking_capacity()
+                .worker_threads()
+                .get(),
+            1
+        );
+        assert_eq!(profile.policy().scope_limit(), 8192);
+        assert_eq!(transport.max_backend_queued_bytes(), 512 * 1024 * 1024);
+        assert_eq!(
+            profile.statement_ingress(),
+            Some(compose_frontend_statement_ingress().unwrap())
+        );
+    }
+
+    #[test]
     fn frontend_workload_runtime_is_built_from_validated_server_fields() {
         let mut config = crate::app_config::NovaRocksConfig::default();
         config.runtime.mem_limit = "1G".to_string();
-        let (_, workload, abort_capacity) = compose_frontend_workload_runtime(&config.runtime)
-            .expect("explicit frontend workload fields compose");
+        let (_, workload, abort_capacity, _, inputs) =
+            compose_frontend_workload_runtime(&config.runtime)
+                .expect("explicit frontend workload fields compose");
         assert_eq!(workload.query_concurrency_limit, 256);
         assert_eq!(workload.execution_limit, workload.scope_records_limit);
         assert_eq!(abort_capacity.get(), 16);
+        assert_eq!(inputs.policy().scope_limit(), 8192);
+        assert_eq!(inputs.policy().scope_limit(), workload.scope_records_limit);
+        assert_eq!(
+            inputs.query_blocking_capacity().worker_threads().get(),
+            config.runtime.actual_query_blocking_workers()
+        );
 
         config
             .runtime
@@ -1503,43 +1590,51 @@ fn remote_effect_guarantee(
 }
 
 #[cfg(test)]
-mod joint_startup_policy_tests {
+mod frontend_runtime_policy_tests {
     use super::*;
-
     #[test]
-    fn load_check_and_composition_use_the_same_original_workload_projection() {
+    fn configured_internal_capacity_reaches_the_actual_runtime_projection() {
         let mut runtime = crate::app_config::RuntimeConfig::default();
-        runtime.frontend_workload.concurrency_limit = 16;
-        let projected = compose_frontend_workload_policy(&runtime).expect("original workload");
-        let report = validate_frontend_joint_startup(&runtime).expect("joint number check");
-        let (_, composed, _) =
-            compose_frontend_workload_runtime(&runtime).expect("pure composition");
-        assert_eq!(projected.query_concurrency_limit, 16);
+        runtime.frontend_workload.internal_result_positions = 1;
+        runtime.frontend_workload.internal_result_all_objects_bytes = 2 * 1024 * 1024 * 1024;
+        validate_frontend_joint_startup(&runtime).unwrap();
+        let (_, _, _, installed, _) = compose_frontend_workload_runtime(&runtime).unwrap();
+        assert_eq!(installed.declared().positions[2], 1);
         assert_eq!(
-            composed.query_concurrency_limit,
-            projected.query_concurrency_limit
+            installed.declared().all_objects_bytes[2],
+            2 * 1024 * 1024 * 1024
         );
-        assert_eq!(report.computation_positions, 16);
-        assert_eq!(report.result_plus_native_declared_bytes, None);
+        runtime.frontend_workload.internal_result_positions = 0;
+        assert!(validate_frontend_joint_startup(&runtime).is_err());
+        assert!(compose_frontend_workload_runtime(&runtime).is_err());
     }
-
     #[test]
-    fn original_policy_projection_failure_preserves_the_owner_error() {
+    fn original_invalid_workload_configuration_preserves_the_owner_error() {
         let mut runtime = crate::app_config::RuntimeConfig::default();
         runtime.frontend_workload.waiting_limit = 0;
-        let error = validate_frontend_joint_startup(&runtime).expect_err("invalid actual policy");
+        let error = validate_frontend_joint_startup(&runtime).unwrap_err();
         assert!(
             error
                 .downcast_ref::<novarocks_workload_control::WorkError>()
                 .is_some()
         );
     }
-
     #[test]
-    fn beyond_supported_compute_is_rejected_by_both_pure_callers() {
+    fn actual_client_result_positions_still_bound_query_concurrency() {
         let mut runtime = crate::app_config::RuntimeConfig::default();
         runtime.frontend_workload.concurrency_limit = 257;
         assert!(validate_frontend_joint_startup(&runtime).is_err());
+        assert!(compose_frontend_workload_runtime(&runtime).is_err());
+    }
+    #[test]
+    fn global_scope_inventory_reaches_the_original_workload() {
+        let mut runtime = crate::app_config::RuntimeConfig::default();
+        runtime.frontend_workload.scope_records_limit = 5000;
+        let (_, workload, _, _, inputs) = compose_frontend_workload_runtime(&runtime).unwrap();
+        assert_eq!(workload.scope_records_limit, 5000);
+        assert_eq!(workload.root_limit, 5000);
+        assert_eq!(inputs.policy().scope_limit(), 5000);
+        runtime.frontend_workload.scope_records_limit = 0;
         assert!(compose_frontend_workload_runtime(&runtime).is_err());
     }
 }

@@ -66,7 +66,7 @@ impl Directory {
         }
     }
     fn file(&self) -> std::path::PathBuf {
-        self.0.join("actual-7-11-13.cap")
+        self.0.join(format!("actual-{}-13.cap", (7u64 << 32) | 11))
     }
 }
 impl Drop for Directory {
@@ -190,7 +190,15 @@ fn sql_dependency_original_binding_record_real_grant_charge_prost_and_drop() {
                 .unwrap();
         let artifact = factory
             .begin(
-                StatementToken::new(SessionToken::new(7, 11), 13),
+                StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (7_u64 << 32) | 11_u64,
+                        )
+                        .expect("nonzero fixture session"),
+                    ),
+                    13,
+                ),
                 &[42; 32],
                 &task.owner.scope(),
             )
@@ -223,7 +231,7 @@ fn sql_dependency_original_binding_record_real_grant_charge_prost_and_drop() {
         assert_eq!(resources.snapshot().held_bytes(), 0);
         writer.finish_storage().unwrap();
         let raw = std::fs::read(dir.file()).unwrap();
-        assert_eq!(&raw[..8], b"NRDEPS01");
+        assert_eq!(&raw[..8], b"NRDEPS02");
         assert_eq!(raw[64], 2);
         assert_eq!(u64::from_le_bytes(raw[65..73].try_into().unwrap()), 91);
         assert_eq!(
@@ -249,7 +257,15 @@ fn sql_dependency_original_binding_record_missing_grant_is_not_late_permission_a
                 .unwrap();
         let artifact = factory
             .begin(
-                StatementToken::new(SessionToken::new(7, 11), 13),
+                StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (7_u64 << 32) | 11_u64,
+                        )
+                        .expect("nonzero fixture session"),
+                    ),
+                    13,
+                ),
                 &[42; 32],
                 &task.owner.scope(),
             )
@@ -304,7 +320,15 @@ fn sql_dependency_original_binding_record_output_failure_releases_dto_before_sto
             SqlDependencyArtifactFactory::try_new(dir.descriptor(64), resources.clone()).unwrap();
         let artifact = factory
             .begin(
-                StatementToken::new(SessionToken::new(7, 11), 13),
+                StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (7_u64 << 32) | 11_u64,
+                        )
+                        .expect("nonzero fixture session"),
+                    ),
+                    13,
+                ),
                 &[42; 32],
                 &task.owner.scope(),
             )
@@ -359,7 +383,15 @@ fn sql_dependency_original_binding_record_foreign_stock_keeps_actual_authority_c
         let fb = SqlDependencyArtifactFactory::try_new(other_descriptor, br.clone()).unwrap();
         let mut writer = OriginalBindingRecordWriter::new(
             fa.begin(
-                StatementToken::new(SessionToken::new(7, 11), 13),
+                StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (7_u64 << 32) | 11_u64,
+                        )
+                        .expect("nonzero fixture session"),
+                    ),
+                    13,
+                ),
                 &[42; 32],
                 &ta.owner.scope(),
             )
@@ -367,7 +399,15 @@ fn sql_dependency_original_binding_record_foreign_stock_keeps_actual_authority_c
         );
         let other = OriginalBindingRecordWriter::new(
             fb.begin(
-                StatementToken::new(SessionToken::new(7, 11), 13),
+                StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (7_u64 << 32) | 11_u64,
+                        )
+                        .expect("nonzero fixture session"),
+                    ),
+                    13,
+                ),
                 &[42; 32],
                 &tb.owner.scope(),
             )
@@ -426,7 +466,7 @@ fn sql_dependency_original_binding_record_every_control_refusal_has_no_footer_or
                 .unwrap();
                 let artifact = factory
                     .begin(
-                        StatementToken::new(SessionToken::new(7, 11), 13),
+                        StatementToken::new(SessionToken::new(novarocks_query_application::session_control::ClientSessionKey::new((7_u64 << 32) | 11_u64).expect("nonzero fixture session")), 13),
                         &[42; 32],
                         &task.owner.scope(),
                     )

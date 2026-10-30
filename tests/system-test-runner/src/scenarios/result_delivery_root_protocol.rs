@@ -748,10 +748,12 @@ mod tests {
                 class,
                 FailureReason::new(namespace, std::num::NonZeroU16::new(code).unwrap()),
             );
-            let result = discovery_reply(RootReadResponse::Refused(RootReadRefusal::for_request(
-                &read,
-                fact,
-                SafeDetail::truncating("arbitrary safe text is not a discriminator"),
+            let result = discovery_reply(RootReadResponse::Refused(Box::new(
+                RootReadRefusal::for_request(
+                    &read,
+                    fact,
+                    SafeDetail::truncating("arbitrary safe text is not a discriminator"),
+                ),
             )));
             if accepted {
                 assert!(result.unwrap().is_none());

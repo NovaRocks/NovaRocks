@@ -45,5 +45,5 @@ fn main() {
     // algorithm. Dependency features and target geometry are not checked; the
     // grant is an admission estimate for the reviewed configuration.
     // Design: ADR-0190 (docs/adr/ADR-0190-dependency-direction-by-structure-and-review.md)
-    println!("cargo:rustc-env=NOVAROCKS_SCALAR_ARROW_SOURCE=58.4.0");
+    println!("cargo:rustc-env=NOVAROCKS_SCALAR_ARROW_SOURCE=60.1.0");
 }

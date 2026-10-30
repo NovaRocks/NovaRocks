@@ -24,11 +24,27 @@
 //! how the compiler stays pure while its answers come from a catalog, a
 //! statistics resolver and a materialized-view inventory that are anything but.
 //!
-//! All three owners answer synchronously and may reach a remote catalog to do
-//! it. They therefore run on the frontend's bounded connector lane rather than
-//! on the async runtime: a slow REST catalog must not be able to stall the
-//! scheduler, and an unbounded number of statements must not be able to queue
-//! against it.
+//! Physical observations await their original async owners directly. Schema,
+//! revision and selection interpretation then consume those completed facts;
+//! the shared connector worker remains only for explicitly authored leaf work.
+
+mod planning_cpu;
+mod provider_source;
+pub(crate) use planning_cpu::{
+    CompletedReadCpuInput, FrontendPlanningCpuSource, LogicalFinishInput, ReadEncodingInput,
+    ReadEncodingPurpose,
+};
+#[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(novarocks_dev_controls)]
+pub(crate) use planning_cpu::ReadRewriteInput;
+pub(crate) use provider_source::FrontendCompletionCustody;
+
+/// Borrow the original Provider and pure CPU sources for one completion.
+pub(crate) struct FrontendCompletionPorts<'a> {
+    pub(crate) provider: &'a FrontendCompletionCustody,
+    pub(crate) cpu: &'a FrontendPlanningCpuSource,
+}
 
 use std::sync::Arc;
 
@@ -56,9 +72,11 @@ use crate::catalog_application::query_materializer::{
 };
 use crate::connector::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvCandidateReader;
-use crate::mv::domain::rewrite_prep::freeze_materialized_view_fact_with_ports;
-use crate::query_execution::planning::statistics::resolve_statistics_need;
-use crate::query_execution::provider_read_facts::{FrontendProviderReadFacts, FrozenProviderRead};
+use crate::mv::domain::rewrite_prep::freeze_materialized_view_fact_with_ports_async;
+use crate::query_execution::planning::statistics::resolve_statistics_need_async;
+use crate::query_execution::provider_read_facts::{
+    FrontendProviderReadFacts, FrozenProviderRead, ProviderCreatorMode,
+};
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 
 /// The owners in this process that can answer a compilation question, and the
@@ -105,14 +123,23 @@ impl CompletionFactOwners {
 /// against whatever the catalog holds at the moment the question is asked.
 #[derive(Clone)]
 pub(crate) struct StatementFactScope {
+    state_store: StatementStateStore,
+    creator_mode: ProviderCreatorMode,
     bindings: Arc<QueryTableBindingStore>,
     connector_context: ConnectorRequestContext,
     current_catalog: Option<Arc<str>>,
     capacity: QueryResultCapacityBinding,
+    query_local_overlays:
+        Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
 }
 
+#[derive(Clone)]
+enum StatementStateStore {
+    Legacy,
+    Governed(Option<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>>),
+}
 impl StatementFactScope {
-    pub(crate) fn new(
+    pub(crate) fn binding_only(
         bindings: Arc<QueryTableBindingStore>,
         connector_context: ConnectorRequestContext,
         current_catalog: Option<&str>,
@@ -123,11 +150,69 @@ impl StatementFactScope {
             return Err(novarocks_workload_control::WorkError::Conflict);
         }
         Ok(Self {
+            creator_mode: ProviderCreatorMode::BindingOnly,
+            state_store: StatementStateStore::Legacy,
             bindings,
             connector_context,
             current_catalog: current_catalog.map(Arc::from),
             capacity,
+            query_local_overlays: Vec::new(),
         })
+    }
+    /// Retained pre-Original callers select their legacy MV adapter explicitly.
+    /// Their Provider I/O is governed, but their StateStore migration is separate.
+    pub(crate) fn governed_read_io(
+        bindings: Arc<QueryTableBindingStore>,
+        connector_context: ConnectorRequestContext,
+        current_catalog: Option<&str>,
+        work_scope: &novarocks_workload_control::WorkScope,
+        capacity: QueryResultCapacityBinding,
+    ) -> Result<Self, novarocks_workload_control::WorkError> {
+        let mut scope = Self::governed_read_io_in(
+            bindings,
+            connector_context,
+            current_catalog,
+            work_scope,
+            capacity,
+            None,
+        )?;
+        scope.state_store = StatementStateStore::Legacy;
+        Ok(scope)
+    }
+    /// Migrated Read explicitly supplies its request view. Missing Original
+    /// execution makes optional MV rewrite unavailable, never a legacy fallback.
+    pub(crate) fn governed_read_io_in(
+        bindings: Arc<QueryTableBindingStore>,
+        connector_context: ConnectorRequestContext,
+        current_catalog: Option<&str>,
+        work_scope: &novarocks_workload_control::WorkScope,
+        capacity: QueryResultCapacityBinding,
+        state_store: Option<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>>,
+    ) -> Result<Self, novarocks_workload_control::WorkError> {
+        if connector_context
+            .io_admission()
+            .and_then(|p| p.upgrade())
+            .is_none()
+        {
+            return Err(novarocks_workload_control::WorkError::NotReady);
+        }
+        let mut scope = Self::binding_only(
+            bindings,
+            connector_context,
+            current_catalog,
+            work_scope,
+            capacity,
+        )?;
+        scope.creator_mode = ProviderCreatorMode::GovernedReadIo;
+        scope.state_store = StatementStateStore::Governed(state_store);
+        Ok(scope)
+    }
+    pub(crate) fn with_query_local_overlays(
+        mut self,
+        overlays: Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
+    ) -> Self {
+        self.query_local_overlays = overlays;
+        self
     }
 }
 
@@ -135,11 +220,18 @@ impl StatementFactScope {
 pub(crate) struct FrontendCatalogFacts {
     owners: CompletionFactOwners,
     scope: StatementFactScope,
+    // One original fact source serializes its own observation rounds. This
+    // does not allocate another binding identity or provider cache.
+    resolving: tokio::sync::Mutex<()>,
 }
 
 impl FrontendCatalogFacts {
     pub(crate) const fn new(owners: CompletionFactOwners, scope: StatementFactScope) -> Self {
-        Self { owners, scope }
+        Self {
+            owners,
+            scope,
+            resolving: tokio::sync::Mutex::const_new(()),
+        }
     }
 }
 
@@ -149,27 +241,46 @@ impl CatalogFactPort for FrontendCatalogFacts {
         &self,
         needs: &[CatalogRelationNeed],
     ) -> Result<Vec<CatalogRelationFact>, String> {
-        let needs = needs.to_vec();
-        let owners = self.owners.clone();
-        let scope = self.scope.clone();
-        admitted(&self.owners, &self.scope.capacity, move || {
-            let loader = iceberg_table_binding_loader(
-                owners.connector_control.as_ref(),
-                scope.connector_context.clone(),
-            );
-            let materializer = CatalogServiceMaterializer::new(
-                scope.current_catalog.as_deref(),
-                owners.catalog_service.as_ref(),
-                Arc::clone(&scope.bindings),
-                loader,
-            )
-            .with_catalog_application(owners.catalog_application.as_deref());
-            needs
-                .iter()
-                .map(|need| catalog_fact(&materializer, need))
-                .collect()
-        })
-        .await
+        let _round = self.resolving.lock().await;
+        let loader = iceberg_table_binding_loader(
+            self.owners.connector_control.as_ref(),
+            self.scope.connector_context.clone(),
+        );
+        let materializer = CatalogServiceMaterializer::new_with_query_local_overlays(
+            self.scope.current_catalog.as_deref(),
+            self.owners.catalog_service.as_ref(),
+            Arc::clone(&self.scope.bindings),
+            loader,
+            self.scope.query_local_overlays.clone(),
+        )
+        .with_catalog_application(self.owners.catalog_application.as_deref());
+        let mut facts = Vec::with_capacity(needs.len());
+        for need in needs {
+            let relation = need.relation();
+            let resolved = match need.target() {
+                CatalogLookupTarget::Table { .. } => {
+                    materializer
+                        .resolve_table_for_analysis_async(
+                            Some(&relation.catalog),
+                            &relation.namespace,
+                            &relation.table,
+                        )
+                        .await
+                }
+                CatalogLookupTarget::IcebergMetadata { kind } => {
+                    materializer
+                        .resolve_metadata_table_async(
+                            Some(&relation.catalog),
+                            &relation.namespace,
+                            &relation.table,
+                            kind,
+                        )
+                        .await
+                }
+            };
+            facts.push(catalog_fact_from(need, resolved)?);
+        }
+        Ok(facts)
     }
 }
 
@@ -180,28 +291,7 @@ impl CatalogFactPort for FrontendCatalogFacts {
 /// query, while a catalog that could not say is a fact about this process. The
 /// second must not be flattened into the first, or a query over a healthy table
 /// would report that the table does not exist whenever the catalog is down.
-pub(crate) fn catalog_fact(
-    materializer: &CatalogServiceMaterializer<'_>,
-    need: &CatalogRelationNeed,
-) -> Result<CatalogRelationFact, String> {
-    let relation = need.relation();
-    let resolved = match need.target() {
-        CatalogLookupTarget::Table { .. } => materializer.resolve_table_for_analysis_typed(
-            Some(&relation.catalog),
-            &relation.namespace,
-            &relation.table,
-        ),
-        CatalogLookupTarget::IcebergMetadata { kind } => materializer.resolve_metadata_table_typed(
-            Some(&relation.catalog),
-            &relation.namespace,
-            &relation.table,
-            kind,
-        ),
-    };
-    catalog_fact_from(need, resolved)
-}
-
-fn catalog_fact_from(
+pub(super) fn catalog_fact_from(
     need: &CatalogRelationNeed,
     resolved: CatalogResolutionResult<novarocks_sql::planning::catalog::ResolvedAnalyzerTable>,
 ) -> Result<CatalogRelationFact, String> {
@@ -235,23 +325,19 @@ impl StatisticsFactPort for FrontendStatisticsFacts {
         &self,
         needs: &[StatisticsNeed],
     ) -> Result<Vec<StatisticsFact>, String> {
-        let needs = needs.to_vec();
-        let owners = self.owners.clone();
-        let scope = self.scope.clone();
-        admitted(&self.owners, &self.scope.capacity, move || {
-            needs
-                .iter()
-                .map(|need| {
-                    resolve_statistics_need(
-                        owners.statistics.as_ref(),
-                        scope.bindings.as_ref(),
-                        need,
-                        &scope.connector_context,
-                    )
-                })
-                .collect()
-        })
-        .await
+        let mut facts = Vec::with_capacity(needs.len());
+        for need in needs {
+            facts.push(
+                resolve_statistics_need_async(
+                    self.owners.statistics.as_ref(),
+                    self.scope.bindings.as_ref(),
+                    need,
+                    &self.scope.connector_context,
+                )
+                .await?,
+            );
+        }
+        Ok(facts)
     }
 }
 
@@ -277,68 +363,69 @@ impl MaterializedViewFactPort for FrontendMaterializedViewFacts {
         &self,
         needs: &[MaterializedViewNeed],
     ) -> Result<Vec<MaterializedViewFact>, String> {
-        let needs = needs.to_vec();
-        let owners = self.owners.clone();
-        admitted(&self.owners, &self.scope.capacity, move || {
-            Ok(needs
-                .iter()
-                .map(|need| {
-                    freeze_materialized_view_fact_with_ports(
-                        need,
-                        &owners.materialized_views,
-                        owners.connector_control.as_ref(),
-                        owners.mv_storage_observation.as_ref(),
-                    )
-                })
-                .collect())
-        })
-        .await
+        let candidate = match &self.scope.state_store {
+            StatementStateStore::Legacy => self.owners.materialized_views.clone(),
+            StatementStateStore::Governed(Some(requests)) => self
+                .owners
+                .materialized_views
+                .in_requests(Arc::clone(requests)),
+            StatementStateStore::Governed(None) => {
+                return Ok(needs
+                    .iter()
+                    .map(|need| {
+                        MaterializedViewFact::missing(
+                            need,
+                            "materialized-view original execution is unavailable",
+                        )
+                        .expect("a static MV capability diagnostic is non-empty")
+                    })
+                    .collect());
+            }
+        };
+        let mut facts = Vec::with_capacity(needs.len());
+        for need in needs {
+            facts.push(
+                freeze_materialized_view_fact_with_ports_async(
+                    need,
+                    &candidate,
+                    self.owners.connector_control.as_ref(),
+                    self.owners.mv_storage_observation.as_ref(),
+                    &self.scope.connector_context,
+                )
+                .await,
+            );
+        }
+        Ok(facts)
     }
 }
 
-/// Run one owner's synchronous answer on the bounded connector lane.
-///
-/// Losing the lane is not the owner's answer and must not be reported as one:
-/// a query that was refused admission never asked its question.
-async fn admitted<T, F>(
-    owners: &CompletionFactOwners,
-    capacity: &QueryResultCapacityBinding,
-    call: F,
-) -> Result<T, String>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-{
-    owners
-        .blocking
-        .spawn_admitted(capacity.scope(), &capacity.window_alias(), call)
-        .map_err(|error| format!("frontend completion fact admission: {error}"))?
-        .finish()
-        .await
-        .map_err(|error| {
-            format!(
-                "frontend completion fact lane: {}",
-                owners.blocking.present_and_retire_failure(error)
-            )
-        })?
-}
-
-/// The fact source one statement's completion is driven with, with all four
-/// kinds of question answered by this process.
-pub(crate) fn frontend_fact_source(
+/// Install the same concrete Provider and fact ports in the original action's
+/// fixed source before constructing the driver future. Refusal never replaces
+/// an older, potentially unfinished source.
+pub(crate) fn install_frontend_fact_source(
+    custody: &FrontendCompletionCustody,
     owners: CompletionFactOwners,
     scope: StatementFactScope,
     session: ConnectorSession,
-) -> QueryCompletionFactSource<FrozenProviderRead> {
-    let provider_reads = Arc::new(FrontendProviderReadFacts::new(
-        Arc::clone(&owners.connector_control),
-        Arc::clone(&scope.bindings),
-        session,
-        scope.connector_context.clone(),
-        owners.blocking.clone(),
-        scope.capacity.clone(),
-    ));
-    statement_fact_source(owners, scope, provider_reads)
+) -> Result<(), String> {
+    let provider = Arc::new(
+        FrontendProviderReadFacts::binding_only(
+            Arc::clone(&owners.connector_control),
+            Arc::clone(&scope.bindings),
+            session,
+            scope.connector_context.clone(),
+            owners.blocking.clone(),
+            scope.capacity.clone(),
+        )
+        .with_creator_mode(scope.creator_mode),
+    );
+    let facts = Arc::new(statement_fact_source(owners, scope, provider.clone()));
+    custody.install(facts, provider).map_err(|original| {
+        // No work can have been issued by this rejected new port. Destruction
+        // is outside the fixed custody lock; the old source remains unchanged.
+        drop(original);
+        "completion Provider source is already installed".to_owned()
+    })
 }
 
 /// The one fact source one statement's completion is driven with.

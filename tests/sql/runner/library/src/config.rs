@@ -90,6 +90,7 @@ pub fn load_runner_config(path: Option<&Path>) -> Result<RunnerConfig> {
     Ok(config)
 }
 
+#[cfg(test)]
 const FIXTURE_ENDPOINT_KEYS: [&str; 7] = [
     "iceberg_rest_uri",
     "iceberg_rest_warehouse",
@@ -98,6 +99,13 @@ const FIXTURE_ENDPOINT_KEYS: [&str; 7] = [
     "oss_endpoint",
     "oss_ak",
     "oss_sk",
+];
+const FIXTURE_COMMON_KEYS: [&str; 5] = [
+    "iceberg_rest_uri",
+    "iceberg_rest_warehouse",
+    "iceberg_rest_mv_uri",
+    "iceberg_rest_mv_warehouse",
+    "oss_endpoint",
 ];
 
 pub(crate) fn project_fixture_value(config: &mut RunnerConfig, key: &str, value: &str) {
@@ -110,10 +118,47 @@ pub(crate) fn project_fixture_value(config: &mut RunnerConfig, key: &str, value:
     }
 }
 
+fn fixture_config_value(config: &RunnerConfig, key: &str) -> Result<Option<String>> {
+    let mut selected: Option<&String> = None;
+    for alias in [
+        key.to_string(),
+        format!("env.{key}"),
+        format!("env.oss.{key}"),
+    ] {
+        if let Some(value) = config.values.get(&alias) {
+            anyhow::ensure!(
+                !value.trim().is_empty(),
+                "fixture runtime configuration required: {key} is empty; use the generated sql-test.toml after docker/iceberg-rest/up.sh"
+            );
+            anyhow::ensure!(
+                selected.is_none_or(|prior| prior == value),
+                "fixture runtime configuration has conflicting aliases for {key}"
+            );
+            selected = Some(value);
+        }
+    }
+    Ok(selected.cloned())
+}
+
+/// Temporary material cannot inhabit the node-local fixture branch.
+enum FixtureObjectStore {
+    Static {
+        access_key: String,
+        secret_key: String,
+    },
+    NodeLocal,
+}
+
 /// One endpoint projection for generated configurations and private fixtures.
 /// Secrets deliberately have no Debug implementation.
 pub(crate) struct FixtureEndpoints {
-    values: [String; 7],
+    values: [String; 5],
+    object_store: FixtureObjectStore,
+    region: String,
+    path_style: String,
+    metadata_name: String,
+    data_name: String,
+    generation: String,
     env_file: PathBuf,
 }
 
@@ -127,29 +172,9 @@ impl FixtureEndpoints {
         environment: impl Fn(&str) -> Option<String>,
     ) -> Result<Self> {
         let required = |key: &str| -> Result<String> {
-            let aliases = [
-                key.to_string(),
-                format!("env.{key}"),
-                format!("env.oss.{key}"),
-            ];
-            let candidates = aliases.iter().filter_map(|alias| config.values.get(alias));
-            let mut value = None;
-            for candidate in candidates {
-                if candidate.trim().is_empty() {
-                    bail!(
-                        "fixture runtime configuration required: {key} is empty; use the generated sql-test.toml after docker/iceberg-rest/up.sh"
-                    );
-                }
-                if value.is_some_and(|existing| existing != candidate) {
-                    bail!("fixture runtime configuration has conflicting aliases for {key}");
-                }
-                value = Some(candidate);
-            }
-            let value = value.with_context(|| format!(
+            let value = fixture_config_value(config, key)?.with_context(|| format!(
                 "fixture runtime configuration required: missing {key}; use --config with the generated sql-test.toml after docker/iceberg-rest/up.sh"
             ))?;
-            // Paimon artifacts retain explicit credential references instead of
-            // secrets. Resolve only declared references, never an ambient fallback.
             if let Some(reference) = value
                 .strip_prefix("${ENV:")
                 .and_then(|v| v.strip_suffix('}'))
@@ -161,22 +186,108 @@ impl FixtureEndpoints {
                             .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
                     "invalid fixture environment reference for {key}"
                 );
-                return environment(reference).filter(|v| !v.trim().is_empty()).with_context(|| {
-                    format!("fixture runtime configuration requires environment variable {reference} declared by {key}")
-                });
+                return environment(reference).filter(|v| !v.trim().is_empty()).with_context(|| format!("fixture runtime configuration requires environment variable {reference} declared by {key}"));
             }
             anyhow::ensure!(
                 !value.contains("${ENV"),
                 "fixture {key} must use a complete environment reference"
             );
-            Ok(value.clone())
+            Ok(value)
         };
-        let values = FIXTURE_ENDPOINT_KEYS
+        let values = FIXTURE_COMMON_KEYS
             .map(required)
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
-        let env_file = PathBuf::from(required("fixture_env_file")?);
-        Self::new(values.try_into().expect("seven endpoint keys"), env_file)
+        let kind = fixture_config_value(config, "fixture_object_store_kind")?
+            .unwrap_or_else(|| "minio".into());
+        let node_local = match kind.as_str() {
+            "minio" => false,
+            "aliyun-oss" => true,
+            _ => bail!("unsupported fixture_object_store_kind {kind}"),
+        };
+        let optional = |key: &str, default: &str| -> Result<String> {
+            Ok(fixture_config_value(config, key)?.unwrap_or_else(|| default.into()))
+        };
+        let mode = optional("iceberg_object_store_credential_mode", "static")?;
+        anyhow::ensure!(
+            mode == if node_local { "node-local" } else { "static" },
+            "fixture object-store kind and credential mode disagree"
+        );
+        let object_store = if node_local {
+            for key in ["oss_ak", "oss_sk", "oss_token", "oss_session_token"] {
+                anyhow::ensure!(
+                    fixture_config_value(config, key)?.is_none(),
+                    "node-local fixture configuration must omit {key}"
+                );
+            }
+            FixtureObjectStore::NodeLocal
+        } else {
+            FixtureObjectStore::Static {
+                access_key: required("oss_ak")?,
+                secret_key: required("oss_sk")?,
+            }
+        };
+        let legacy_name = optional("iceberg_object_store_credential_name", "iceberg-test-data")?;
+        let metadata_name = if node_local {
+            required("iceberg_object_store_metadata_credential_name")?
+        } else {
+            optional(
+                "iceberg_object_store_metadata_credential_name",
+                &legacy_name,
+            )?
+        };
+        let data_name = if node_local {
+            required("iceberg_object_store_data_credential_name")?
+        } else {
+            optional("iceberg_object_store_data_credential_name", &legacy_name)?
+        };
+        let generation = if node_local {
+            required("iceberg_object_store_credential_generation")?
+        } else {
+            optional("iceberg_object_store_credential_generation", "v1")?
+        };
+        let region = if node_local {
+            required("oss_region")?
+        } else {
+            optional("oss_region", "us-east-1")?
+        };
+        let path_style = if node_local {
+            required("oss_path_style")?
+        } else {
+            optional("oss_path_style", "true")?
+        };
+        anyhow::ensure!(
+            matches!(path_style.as_str(), "true" | "false"),
+            "oss_path_style must be true or false"
+        );
+        if node_local {
+            anyhow::ensure!(
+                !region.is_empty()
+                    && region
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "invalid OSS fixture region"
+            );
+            for name in [&metadata_name, &data_name] {
+                novarocks_spi::connector::NodeLocalCredentialReference::try_new(name, &generation)
+                    .map_err(|_| anyhow::anyhow!("invalid OSS fixture source reference"))?;
+            }
+            anyhow::ensure!(
+                path_style == "false"
+                    && values[4] == format!("https://s3.oss-{region}-internal.aliyuncs.com"),
+                "OSS fixture requires its exact regional internal S3 endpoint and virtual-host addressing"
+            );
+        }
+        Self::new(
+            values.try_into().expect("five endpoint keys"),
+            object_store,
+            region,
+            path_style,
+            metadata_name,
+            data_name,
+            generation,
+            PathBuf::from(required("fixture_env_file")?),
+        )
     }
 
     pub(crate) fn from_isolated(
@@ -191,15 +302,32 @@ impl FixtureEndpoints {
                 endpoints.rest_mv_uri.clone(),
                 endpoints.rest_mv_warehouse.clone(),
                 endpoints.minio_endpoint.clone(),
-                identity.access_key_id.clone(),
-                identity.secret_access_key.clone(),
             ],
+            FixtureObjectStore::Static {
+                access_key: identity.access_key_id.clone(),
+                secret_key: identity.secret_access_key.clone(),
+            },
+            "us-east-1".into(),
+            "true".into(),
+            "iceberg-test-data".into(),
+            "iceberg-test-data".into(),
+            "v1".into(),
             env_file,
         )
     }
 
-    fn new(values: [String; 7], env_file: PathBuf) -> Result<Self> {
-        for (key, value) in FIXTURE_ENDPOINT_KEYS.iter().zip(&values) {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        values: [String; 5],
+        object_store: FixtureObjectStore,
+        region: String,
+        path_style: String,
+        metadata_name: String,
+        data_name: String,
+        generation: String,
+        env_file: PathBuf,
+    ) -> Result<Self> {
+        for (key, value) in FIXTURE_COMMON_KEYS.iter().zip(&values) {
             anyhow::ensure!(
                 !value.trim().is_empty(),
                 "fixture runtime configuration required: missing {key}; use the generated sql-test.toml after docker/iceberg-rest/up.sh"
@@ -212,30 +340,104 @@ impl FixtureEndpoints {
         let env_file = env_file
             .canonicalize()
             .context("resolve fixture publication environment")?;
-        Ok(Self { values, env_file })
+        Ok(Self {
+            values,
+            object_store,
+            region,
+            path_style,
+            metadata_name,
+            data_name,
+            generation,
+            env_file,
+        })
+    }
+
+    pub(crate) fn is_node_local(&self) -> bool {
+        matches!(self.object_store, FixtureObjectStore::NodeLocal)
+    }
+
+    pub(crate) fn preflight_cloud(config: &RunnerConfig, suites: &[String]) -> Result<()> {
+        match fixture_config_value(config, "fixture_object_store_kind")?.as_deref() {
+            Some("aliyun-oss") => {
+                Self::from_runner_config(config)?.reject_unsupported_suites(suites)
+            }
+            None | Some("minio") => Ok(()),
+            Some(kind) => bail!("unsupported fixture_object_store_kind {kind}"),
+        }
+    }
+
+    pub(crate) fn reject_unsupported_sources(
+        config: &RunnerConfig,
+        sources: &BTreeMap<String, Vec<PathBuf>>,
+    ) -> Result<()> {
+        if fixture_config_value(config, "fixture_object_store_kind")?.as_deref()
+            != Some("aliyun-oss")
+        {
+            return Ok(());
+        }
+        let vended = Regex::new(
+            r#"(?i)["']credential\.(?:object-store-data|data-credential-vending)\.mode["']\s*=\s*["']vended["']"#,
+        )?;
+        for source in sources.values().flatten() {
+            let text = fs::read_to_string(source)?;
+            anyhow::ensure!(
+                !vended.is_match(&text),
+                "OSS node-local fixtures cannot run vended-credential scenario {}",
+                source.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reject_unsupported_suites(&self, suites: &[String]) -> Result<()> {
+        if self.is_node_local() {
+            for suite in suites {
+                anyhow::ensure!(
+                    !crate::isolated_rest_catalog_suite(suite) && suite != "paimon",
+                    "OSS node-local fixtures do not support private MinIO, IAM or vended-credential suite {suite}"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Replaces every supported spelling, including aliases left by TOML flattening.
     pub(crate) fn project(&self, config: &mut RunnerConfig) -> BTreeMap<String, String> {
-        for (key, value) in FIXTURE_ENDPOINT_KEYS.iter().zip(&self.values) {
+        for (key, value) in FIXTURE_COMMON_KEYS.iter().zip(&self.values) {
+            project_fixture_value(config, key, value);
+        }
+        let kind = if self.is_node_local() {
+            "aliyun-oss"
+        } else {
+            "minio"
+        };
+        let mode = if self.is_node_local() {
+            "node-local"
+        } else {
+            "static"
+        };
+        for (key, value) in [
+            ("fixture_object_store_kind", kind),
+            ("iceberg_object_store_credential_mode", mode),
+            ("oss_region", &self.region),
+            ("oss_path_style", &self.path_style),
+            (
+                "iceberg_object_store_metadata_credential_name",
+                &self.metadata_name,
+            ),
+            ("iceberg_object_store_data_credential_name", &self.data_name),
+            (
+                "iceberg_object_store_credential_generation",
+                &self.generation,
+            ),
+        ] {
             project_fixture_value(config, key, value);
         }
         project_fixture_value(config, "fixture_env_file", &self.env_file.to_string_lossy());
-        let [
-            rest,
-            warehouse,
-            rest_mv,
-            rest_mv_warehouse,
-            endpoint,
-            access_key,
-            secret_key,
-        ] = &self.values;
-        [
+        let [rest, warehouse, rest_mv, rest_mv_warehouse, endpoint] = &self.values;
+        let mut child: BTreeMap<String, String> = [
             ("AWS_S3_ENDPOINT", endpoint.clone()),
-            ("AWS_S3_ACCESS_KEY_ID", access_key.clone()),
-            ("AWS_S3_SECRET_ACCESS_KEY", secret_key.clone()),
-            ("MINIO_ROOT_USER", access_key.clone()),
-            ("MINIO_ROOT_PASSWORD", secret_key.clone()),
+            ("AWS_S3_REGION", self.region.clone()),
             ("NOVAROCKS_ICEBERG_REST_URI", rest.clone()),
             ("NOVAROCKS_ICEBERG_REST_WAREHOUSE", warehouse.clone()),
             ("NOVAROCKS_ICEBERG_REST_MV_URI", rest_mv.clone()),
@@ -250,8 +452,25 @@ impl FixtureEndpoints {
             ),
         ]
         .into_iter()
-        .map(|(key, value)| (key.to_string(), value))
-        .collect()
+        .map(|(key, value)| (key.into(), value))
+        .collect();
+        if let FixtureObjectStore::Static {
+            access_key,
+            secret_key,
+        } = &self.object_store
+        {
+            project_fixture_value(config, "oss_ak", access_key);
+            project_fixture_value(config, "oss_sk", secret_key);
+            for (key, value) in [
+                ("AWS_S3_ACCESS_KEY_ID", access_key),
+                ("AWS_S3_SECRET_ACCESS_KEY", secret_key),
+                ("MINIO_ROOT_USER", access_key),
+                ("MINIO_ROOT_PASSWORD", secret_key),
+            ] {
+                child.insert(key.into(), value.clone());
+            }
+        }
+        child
     }
 }
 
@@ -295,6 +514,30 @@ pub(crate) fn insert_placeholder_default(
 }
 
 pub fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>, suite_name: &str) {
+    // These are the original local fixture constants. Cloud publications must
+    // explicitly declare their source facts and never inherit local defaults.
+    if variables
+        .get("fixture_object_store_kind")
+        .map(String::as_str)
+        != Some("aliyun-oss")
+    {
+        let name = variables
+            .get("iceberg_object_store_credential_name")
+            .cloned()
+            .unwrap_or_else(|| "iceberg-test-data".into());
+        for (key, value) in [
+            ("iceberg_object_store_credential_mode", "static"),
+            (
+                "iceberg_object_store_metadata_credential_name",
+                name.as_str(),
+            ),
+            ("iceberg_object_store_data_credential_name", name.as_str()),
+            ("oss_region", "us-east-1"),
+            ("oss_path_style", "true"),
+        ] {
+            insert_placeholder_default(variables, key, value);
+        }
+    }
     match suite_name {
         "iceberg"
         | "iceberg-ddl"
@@ -943,7 +1186,7 @@ oss_sk = "fixture-secret"
         let projection =
             FixtureEndpoints::from_isolated(&endpoints, &identity, env_file.clone()).unwrap();
         let child = projection.project(&mut config);
-        for (key, expected) in FIXTURE_ENDPOINT_KEYS.iter().zip(&projection.values) {
+        for (key, expected) in FIXTURE_COMMON_KEYS.iter().zip(&projection.values) {
             for alias in [
                 key.to_string(),
                 format!("env.{key}"),
@@ -1137,5 +1380,138 @@ paimon_object_store_credential_generation = "v1"
                 .is_err()
             );
         }
+    }
+    fn node_local_config() -> (tempfile::TempDir, RunnerConfig) {
+        let (directory, path) = configured_fixture();
+        let mut config = load_runner_config(Some(&path)).unwrap();
+        for key in ["oss_ak", "oss_sk"] {
+            for alias in [
+                key.to_string(),
+                format!("env.{key}"),
+                format!("env.oss.{key}"),
+            ] {
+                config.values.remove(&alias);
+            }
+        }
+        for (key, value) in [
+            ("fixture_object_store_kind", "aliyun-oss"),
+            (
+                "oss_endpoint",
+                "https://s3.oss-cn-beijing-internal.aliyuncs.com",
+            ),
+            ("oss_region", "cn-beijing"),
+            ("oss_path_style", "false"),
+            ("iceberg_object_store_credential_mode", "node-local"),
+            (
+                "iceberg_object_store_metadata_credential_name",
+                "iceberg-oss-metadata",
+            ),
+            (
+                "iceberg_object_store_data_credential_name",
+                "iceberg-oss-data",
+            ),
+            ("iceberg_object_store_credential_generation", "v1-fixture"),
+        ] {
+            project_fixture_value(&mut config, key, value);
+        }
+        (directory, config)
+    }
+
+    #[test]
+    fn node_local_fixture_projection_has_no_material_or_ambient_lookup() {
+        let (_directory, mut config) = node_local_config();
+        let endpoints = FixtureEndpoints::from_runner_config_with_environment(&config, |_| {
+            panic!("node-local fixture must not read ambient material")
+        })
+        .unwrap();
+        assert!(endpoints.is_node_local());
+        let child = endpoints.project(&mut config);
+        assert_eq!(
+            config.values["iceberg_object_store_credential_mode"],
+            "node-local"
+        );
+        assert_eq!(
+            config.values["iceberg_object_store_metadata_credential_name"],
+            "iceberg-oss-metadata"
+        );
+        assert_eq!(
+            config.values["iceberg_object_store_data_credential_name"],
+            "iceberg-oss-data"
+        );
+        assert_eq!(config.values["oss_region"], "cn-beijing");
+        assert_eq!(config.values["oss_path_style"], "false");
+        for key in [
+            "AWS_S3_ACCESS_KEY_ID",
+            "AWS_S3_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "MINIO_ROOT_USER",
+            "MINIO_ROOT_PASSWORD",
+        ] {
+            assert!(!child.contains_key(key));
+        }
+        for key in ["oss_ak", "oss_sk"] {
+            assert!(fixture_config_value(&config, key).unwrap().is_none());
+        }
+        assert!(FixtureEndpoints::from_runner_config(&config).is_ok());
+    }
+
+    #[test]
+    fn node_local_fixture_refuses_incomplete_mixed_or_wrong_route_inputs() {
+        let (_directory, config) = node_local_config();
+        for (key, value) in [
+            ("oss_ak", "snapshot"),
+            ("oss_sk", "snapshot"),
+            ("oss_session_token", "snapshot"),
+            ("oss_region", "other/region"),
+            ("oss_endpoint", "http://minio:9000"),
+            ("oss_path_style", "true"),
+            ("iceberg_object_store_credential_mode", "static"),
+            ("iceberg_object_store_data_credential_name", "invalid/name"),
+        ] {
+            let mut changed = config.clone();
+            project_fixture_value(&mut changed, key, value);
+            assert!(
+                FixtureEndpoints::from_runner_config(&changed).is_err(),
+                "{key}"
+            );
+        }
+        for key in [
+            "oss_region",
+            "oss_path_style",
+            "iceberg_object_store_metadata_credential_name",
+            "iceberg_object_store_data_credential_name",
+            "iceberg_object_store_credential_generation",
+        ] {
+            let mut changed = config.clone();
+            for alias in [
+                key.to_string(),
+                format!("env.{key}"),
+                format!("env.oss.{key}"),
+            ] {
+                changed.values.remove(&alias);
+            }
+            assert!(
+                FixtureEndpoints::from_runner_config(&changed).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_fixture_rejects_minio_and_vended_scenarios_before_launch() {
+        let (directory, config) = node_local_config();
+        assert!(FixtureEndpoints::preflight_cloud(&config, &["iceberg-rest".into()]).is_ok());
+        for suite in ["iceberg-ivm", "mv-publication-v11", "paimon"] {
+            assert!(FixtureEndpoints::preflight_cloud(&config, &[suite.into()]).is_err());
+        }
+        let source = directory.path().join("vended.sql");
+        fs::write(&source, r#"CREATE EXTERNAL CATALOG c PROPERTIES ("credential.object-store-data.mode" = "vended");"#).unwrap();
+        assert!(
+            FixtureEndpoints::reject_unsupported_sources(
+                &config,
+                &BTreeMap::from([("custom".into(), vec![source])])
+            )
+            .is_err()
+        );
     }
 }

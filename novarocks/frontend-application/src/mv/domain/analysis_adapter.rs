@@ -23,7 +23,6 @@ use crate::mv::domain::analysis::{MvAnalysis, prepare_mv_select_for_catalog_prov
 use crate::mv::domain::application::MvShowStatement;
 use crate::mv::domain::lifecycle::MvListRow;
 use crate::mv::domain::model::MvStorageEngine;
-use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::readiness::MvListedManageability;
@@ -121,27 +120,32 @@ fn is_hashable_pk_type(sql_type: &str) -> bool {
     )
 }
 
-/// List materialized views from the readiness-filtered Accelerator projection.
-pub(crate) fn list_mv_result_with_ports(
-    readiness: &MvReadinessPort,
-    entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
-    current_catalog: Option<&str>,
-    stmt: &MvShowStatement,
-    storage_filter: Option<MvStorageEngine>,
-) -> Result<QueryResult, String> {
-    let mut inventory = readiness
-        .local_projection_inventory()
-        .map_err(|e| format!("load materialized view Accelerator inventory failed: {e}"))?;
-    inventory.order_by_namespace_and_name();
-    let mut table = mv_table_builder()?;
-    while let Some(listed) = inventory
-        .next_listable()
-        .map_err(|e| format!("load materialized view Accelerator projection failed: {e}"))?
-    {
-        let loaded = &listed.loaded;
-        let projection = &loaded.projection;
+/// The pure row author used by the closed SHOW CPU turn.
+pub(crate) struct MvShowResultRows {
+    table: novarocks_query_application::api::LocalTableBuilder,
+}
+pub(crate) struct MvShowRowSelection {
+    pub(crate) read_dependencies: bool,
+    dependency_budget: usize,
+    display: String,
+}
+impl MvShowResultRows {
+    pub(crate) fn new() -> Result<Self, String> {
+        Ok(Self {
+            table: mv_table_builder()?,
+        })
+    }
+    pub(crate) fn begin_row(
+        &self,
+        listed: &novarocks_mv_application::readiness::ListedKeyedMvProjection,
+        entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
+        current_catalog: Option<&str>,
+        stmt: &MvShowStatement,
+        storage_filter: Option<MvStorageEngine>,
+    ) -> Result<Option<MvShowRowSelection>, String> {
+        let projection = &listed.loaded.projection;
         if !matches_show_filter(projection, current_catalog, stmt, storage_filter) {
-            continue;
+            return Ok(None);
         }
         let manageability = manageability_parts(&listed.manageability, entrance, projection);
         let row_prefix = mv_row_bytes(
@@ -152,52 +156,59 @@ pub(crate) fn list_mv_result_with_ports(
         let bound = novarocks_query_application::api::LocalResultBound::V1;
         bound
             .admit(
-                table.rows().saturating_add(1),
-                table.bytes().saturating_add(row_prefix),
+                self.table.rows().saturating_add(1),
+                self.table.bytes().saturating_add(row_prefix),
             )
             .map_err(|e| format!("SHOW MATERIALIZED VIEWS: {e}"))?;
         admit_mv_row(
             projection,
             0,
             manageability.0.len().saturating_add(manageability.1.len()),
-            table.rows(),
-            table.bytes(),
+            self.table.rows(),
+            self.table.bytes(),
             bound,
             bound.bytes,
         )?;
         let row_workspace_overhead = std::mem::size_of::<MvListRow>() + 16 * 64;
-        let dependency_budget = (bound.bytes - table.bytes() - row_prefix).min(
+        let dependency_budget = (bound.bytes - self.table.bytes() - row_prefix).min(
             bound
                 .bytes
                 .saturating_sub(row_prefix.saturating_add(row_workspace_overhead)),
         );
-        let dependencies = match &listed.manageability {
-            MvListedManageability::Manageable => {
-                dependency_display_for_mv_with_readiness(readiness, loaded, dependency_budget)?
-            }
-            MvListedManageability::ReadOnly(_) | MvListedManageability::Unavailable(_) => {
-                String::new()
-            }
-        };
-        // Refuse all variable-size copies before SQL/name/join construction.
-        admit_mv_row(
-            projection,
-            dependencies.len(),
-            manageability.0.len().saturating_add(manageability.1.len()),
-            table.rows(),
-            table.bytes(),
-            bound,
-            bound.bytes,
-        )?;
         let mut display = String::with_capacity(manageability.0.len() + manageability.1.len());
         display.push_str(manageability.0);
         display.push_str(manageability.1);
-        let row = list_row_from_projection(projection, dependencies, display);
-        append_mv_row(&mut table, &row)?;
+        Ok(Some(MvShowRowSelection {
+            read_dependencies: matches!(&listed.manageability, MvListedManageability::Manageable),
+            dependency_budget,
+            display,
+        }))
     }
-    table
-        .finish()
-        .map_err(|e| format!("build SHOW MATERIALIZED VIEWS batch failed: {e}"))
+    pub(crate) fn append(
+        &mut self,
+        projection: &StoredKeyedMvProjection,
+        selection: MvShowRowSelection,
+        dependencies: &[novarocks_mv_application::persistence::dependency::StoredMvDependency],
+    ) -> Result<(), String> {
+        let dependencies = render_dependency_display(dependencies, selection.dependency_budget)?;
+        let bound = novarocks_query_application::api::LocalResultBound::V1;
+        admit_mv_row(
+            projection,
+            dependencies.len(),
+            selection.display.len(),
+            self.table.rows(),
+            self.table.bytes(),
+            bound,
+            bound.bytes,
+        )?;
+        let row = list_row_from_projection(projection, dependencies, selection.display);
+        append_mv_row(&mut self.table, &row)
+    }
+    pub(crate) fn finish(self) -> Result<QueryResult, String> {
+        self.table
+            .finish()
+            .map_err(|e| format!("build SHOW MATERIALIZED VIEWS batch failed: {e}"))
+    }
 }
 
 /// What SHOW prints for one target's manageability.
@@ -439,19 +450,6 @@ fn refresh_status_for_configuration(configuration: &ConfigurationDocument) -> St
     }
 }
 
-/// Render the dependency-column text for a single MV row through the typed
-/// repository boundary.
-fn dependency_display_for_mv_with_readiness(
-    readiness: &MvReadinessPort,
-    projection: &novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection,
-    maximum: usize,
-) -> Result<String, String> {
-    let dependencies = readiness
-        .list_local_dependencies_by_downstream(projection)
-        .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
-    render_dependency_display(&dependencies, maximum)
-}
-
 fn render_dependency_display(
     dependencies: &[novarocks_mv_application::persistence::dependency::StoredMvDependency],
     maximum: usize,
@@ -519,14 +517,36 @@ pub fn analyze_mv_select_with_provider(
     constant_policy: novarocks_functions::ConstantPolicy,
     control: novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<MvAnalysis, novarocks_sql::compiler::SqlCompileError> {
+    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(provider);
+    analyze_mv_select_with_captured_catalog(
+        current_catalog,
+        &catalog,
+        current_database,
+        query,
+        functions,
+        constant_policy,
+        control,
+    )
+}
+
+/// Pure analysis against the caller's already captured catalog. No lookup can
+/// obtain live Provider metadata while this author runs on the closed CPU.
+pub(crate) fn analyze_mv_select_with_captured_catalog(
+    current_catalog: Option<&str>,
+    catalog: &dyn novarocks_sql::compiler::SqlCatalogSnapshot,
+    current_database: &str,
+    query: &novarocks_parser::ast::Query,
+    functions: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: novarocks_sql::compiler::SqlCompileControl,
+) -> Result<MvAnalysis, novarocks_sql::compiler::SqlCompileError> {
     let prepared =
         prepare_mv_select_for_catalog_provider(query, current_catalog, current_database)?;
-    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(provider);
     let refresh_input = novarocks_sql::compiler::analyze_mv_refresh_input(
         novarocks_sql::compiler::SqlMvRefreshAnalysisContext {
             query: Box::new(prepared.query_for_analysis().clone()),
             current_database: current_database.to_string(),
-            catalog: &catalog,
+            catalog,
             functions,
             constant_policy,
             control,
@@ -1045,5 +1065,94 @@ mod bounded_dependency_display_tests {
                 .contains("row byte bound")
         );
         assert_eq!(render_dependency_display(&[], 0).unwrap(), "");
+    }
+}
+
+#[cfg(test)]
+mod captured_create_analysis_tests {
+    use super::*;
+    #[test]
+    fn create_aggregate_analysis_consumes_exact_captured_facts_without_live_lookup() {
+        use novarocks_sql::compiler::{
+            CatalogRelationFact, SqlCapturedCatalogPreparation, SqlCompileControl,
+        };
+        use novarocks_sql::planning::catalog::{
+            ConnectorReadTableFacts, materialize_connector_read_table,
+        };
+        let query = crate::mv::domain::refresh::definition::parse_mv_select_query(
+            "SELECT count(*) AS n FROM ice.sales.orders",
+        )
+        .unwrap();
+        let preparation = SqlCapturedCatalogPreparation::try_new(
+            query.clone(),
+            Some("ice"),
+            "sales",
+            SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let [need] = preparation.needs() else {
+            panic!("one exact original relation");
+        };
+        let mut bindings = novarocks_sql::binding::SqlTableBindingAllocator::new_unique().unwrap();
+        let table = materialize_connector_read_table(ConnectorReadTableFacts {
+            catalog: "ice".into(),
+            namespace: "sales".into(),
+            table: "orders".into(),
+            columns: vec![
+                novarocks_types::schema::ColumnDef::from_value_type(
+                    "id".into(),
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    ),
+                    None,
+                )
+                .unwrap(),
+            ],
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            schema: std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, true),
+            ])),
+            binding: bindings.allocate().unwrap(),
+            selector: novarocks_spi::connector::ConnectorReadSelector::Current,
+            planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+        })
+        .unwrap();
+        let fact = CatalogRelationFact::resolved(need, table.into_resolved_table()).unwrap();
+        let captured = preparation.capture(&[fact]).unwrap();
+        let analysis = analyze_mv_select_with_captured_catalog(
+            Some("ice"),
+            &captured,
+            "sales",
+            &query,
+            novarocks_sql::compiler::builtin_sql_function_catalog(),
+            crate::application::test_constant_policy(),
+            SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        assert_eq!(analysis.output_columns[0].name, "n");
+        assert_eq!(
+            analysis.resolved_refs,
+            vec![crate::mv::domain::analysis::ResolvedTableRef::Iceberg {
+                catalog: "ice".into(),
+                namespace: "sales".into(),
+                table: "orders".into(),
+            }]
+        );
+        assert_eq!(
+            analysis
+                .refresh_input
+                .create_persistence_facts()
+                .unwrap()
+                .relation_occurrences()
+                .len(),
+            1
+        );
+        assert!(
+            captured
+                .provider()
+                .resolve_table_for_analysis(Some("ice"), "other", "orders")
+                .is_err()
+        );
     }
 }

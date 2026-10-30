@@ -43,16 +43,38 @@ use std::sync::Arc;
 
 pub use novarocks_connector_contract::ConnectorWriteBinding;
 
+// Both fields occupy the same Arc pointee. Field order destroys the actual
+// Provider value before returning its original caller-owned retention.
+struct WritePayloadOwner<T> {
+    value: T,
+    _retention: Option<crate::connector::ConnectorPayloadRetentionGuard>,
+}
+
 #[derive(Clone)]
 pub(super) struct OpaqueWritePayload(Arc<dyn Any + Send + Sync>);
 
 impl OpaqueWritePayload {
     pub(super) fn new<T: Send + Sync + 'static>(value: T) -> Self {
-        Self(Arc::new(value))
+        Self(Arc::new(WritePayloadOwner {
+            value,
+            _retention: None,
+        }))
+    }
+
+    pub(super) fn retained<T: Send + Sync + 'static>(
+        value: T,
+        retention: crate::connector::ConnectorPayloadRetentionGuard,
+    ) -> Self {
+        Self(Arc::new(WritePayloadOwner {
+            value,
+            _retention: Some(retention),
+        }))
     }
 
     pub(super) fn downcast_ref<T: 'static>(&self) -> Option<&T> {
-        self.0.downcast_ref()
+        self.0
+            .downcast_ref::<WritePayloadOwner<T>>()
+            .map(|owner| &owner.value)
     }
 }
 

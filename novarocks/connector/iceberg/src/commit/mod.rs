@@ -66,7 +66,6 @@ mod write_preparation;
 mod write_shared;
 pub mod write_stack;
 
-pub(crate) use equality_delete_writer::write_equality_delete_file;
 pub use mv_provenance::{
     MV_PUBLICATION_PROVENANCE_PROP, MV_PUBLICATION_PROVENANCE_VERSION, MvPublicationProvenanceV2,
     ProvenanceBase, RefreshTechnique,
@@ -85,6 +84,7 @@ pub use ref_action::{RefAction, RefActionPlan, lower_ref_action};
 pub use rewrite_data_files::{
     LiveDataFileCompactionStats, current_live_data_file_compaction_stats,
 };
+pub(crate) use rewrite_data_files::{LiveFiles, append_live_manifest, compactable_file_groups};
 pub use snapshot_lifecycle_helpers::{
     FileSet, build_dv_index, compute_live_snapshot_set, enumerate_files_for_snapshots,
     is_puffin_path, puffin_half_reference_protection,

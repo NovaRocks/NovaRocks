@@ -389,7 +389,7 @@ impl PlannerTableProvider for Tables {
         database: &str,
         table: &str,
     ) -> Result<ResolvedAnalyzerTable, String> {
-        if catalog.is_some() || database != "db" {
+        if catalog != Some("ice") || database != "db" {
             return Err("fixture relation identity differs".into());
         }
         let index = match table {

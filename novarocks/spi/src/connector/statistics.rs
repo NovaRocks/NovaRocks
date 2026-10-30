@@ -19,6 +19,9 @@
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 //! Design: ADR-0080 (docs/adr/ADR-0080-statistics-evidence-four-dimension-model.md)
 
+mod scoped_cpu;
+pub use scoped_cpu::*;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -29,8 +32,10 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorMutationOperationId, ConnectorPayloadRetentionGuard, ConnectorRequestContext,
-    ConnectorTableHandle, ExternalMutationOutcome, ProviderBindingEpoch,
+    ConnectorMetadataMaintenanceIoProfile, ConnectorMutationOperationId,
+    ConnectorOriginalResultScope, ConnectorPayloadRetentionGuard, ConnectorRequestContext,
+    ConnectorTableHandle, ConnectorTableRequest, ExternalMutationEffect,
+    ExternalMutationFinalization, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
 /// Maximum size of one provider-owned data-version, evidence-revision, plan,
@@ -518,12 +523,12 @@ pub struct StatisticsCollectionStartRequest {
 
 /// Provider planning facts separated from the FE-local publication authority.
 /// The type is intentionally not cloneable or serializable.
-pub struct StatisticsCollectionStart {
+pub struct StatisticsCollectionStart<S: ?Sized = dyn StatisticsCollectionSession> {
     table: ConnectorTableHandle,
     data_version: StatisticsDataVersion,
     read_version_ordinal: Option<i64>,
     required_aggregations: Vec<StatisticsRequiredAggregation>,
-    session: Box<dyn StatisticsCollectionSession>,
+    session: Box<S>,
 }
 
 impl StatisticsCollectionStart {
@@ -534,39 +539,11 @@ impl StatisticsCollectionStart {
         required_aggregations: Vec<StatisticsRequiredAggregation>,
         session: Box<dyn StatisticsCollectionSession>,
     ) -> Result<Self, ConnectorError> {
-        if required_aggregations.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "statistics aggregation requirement count exceeds the metric limit",
-            ));
-        }
-        let identities = required_aggregations
-            .iter()
-            .map(|requirement| requirement.artifact().clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        if identities.len() != required_aggregations.len() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "statistics aggregation requirements contain duplicate artifact identities",
-            ));
-        }
-        if !required_aggregations.is_empty() && read_version_ordinal.is_none() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "statistics aggregation requirements need an exact read version ordinal",
-            ));
-        }
-        let planned = required_aggregations
-            .iter()
-            .map(|requirement| requirement.artifact())
-            .collect::<Vec<_>>();
-        let expected = session.expectations().iter().collect::<Vec<_>>();
-        if planned != expected {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "statistics aggregation requirements do not exactly match the session expectations",
-            ));
-        }
+        validate_collection_start(
+            &required_aggregations,
+            read_version_ordinal,
+            session.expectations(),
+        )?;
         Ok(Self {
             table,
             data_version,
@@ -575,7 +552,32 @@ impl StatisticsCollectionStart {
             session,
         })
     }
+}
 
+impl StatisticsCollectionStart<dyn AsyncStatisticsCollectionSession> {
+    pub fn try_new_async(
+        table: ConnectorTableHandle,
+        data_version: StatisticsDataVersion,
+        read_version_ordinal: Option<i64>,
+        required_aggregations: Vec<StatisticsRequiredAggregation>,
+        session: Box<dyn AsyncStatisticsCollectionSession>,
+    ) -> Result<Self, ConnectorError> {
+        validate_collection_start(
+            &required_aggregations,
+            read_version_ordinal,
+            session.expectations(),
+        )?;
+        Ok(Self {
+            table,
+            data_version,
+            read_version_ordinal,
+            required_aggregations,
+            session,
+        })
+    }
+}
+
+impl<S: ?Sized> StatisticsCollectionStart<S> {
     pub fn table(&self) -> &ConnectorTableHandle {
         &self.table
     }
@@ -599,7 +601,7 @@ impl StatisticsCollectionStart {
         StatisticsDataVersion,
         Option<i64>,
         Vec<StatisticsRequiredAggregation>,
-        Box<dyn StatisticsCollectionSession>,
+        Box<S>,
     ) {
         (
             self.table,
@@ -611,6 +613,83 @@ impl StatisticsCollectionStart {
     }
 }
 
+fn validate_collection_start(
+    required_aggregations: &[StatisticsRequiredAggregation],
+    read_version_ordinal: Option<i64>,
+    expectations: &[StatisticsArtifactIdentity],
+) -> Result<(), ConnectorError> {
+    if required_aggregations.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "statistics aggregation requirement count exceeds the metric limit",
+        ));
+    }
+    let identities = required_aggregations
+        .iter()
+        .map(|requirement| requirement.artifact().clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if identities.len() != required_aggregations.len() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "statistics aggregation requirements contain duplicate artifact identities",
+        ));
+    }
+    if !required_aggregations.is_empty() && read_version_ordinal.is_none() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "statistics aggregation requirements need an exact read version ordinal",
+        ));
+    }
+    let planned = required_aggregations
+        .iter()
+        .map(|requirement| requirement.artifact())
+        .collect::<Vec<_>>();
+    let expected = expectations.iter().collect::<Vec<_>>();
+    if planned != expected {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "statistics aggregation requirements do not exactly match the session expectations",
+        ));
+    }
+    Ok(())
+}
+
+/// Needed publication facts, authored before optional owned-object GC.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatisticsPublicationReady {
+    Committed {
+        effect: ExternalMutationEffect,
+        receipt: StatisticsReceipt,
+        finalization: ExternalMutationFinalization,
+    },
+    Settled(ExternalMutationOutcome<StatisticsReceipt>),
+}
+
+/// Closing observes the SAME operation. Unknown publication retains its
+/// original evidence and never authorizes deletion or another dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatisticsPublicationClose {
+    Observed {
+        outcome: ExternalMutationOutcome<StatisticsReceipt>,
+        /// Actual disposal evidence is separate from cumulative diagnostics.
+        owned_objects_disposed: bool,
+    },
+    RetainedUnknown {
+        failure: super::ConnectorMutationFailure,
+        evidence: super::ExternalMutationEvidence,
+    },
+}
+
+pub type StatisticsSessionFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ConnectorError>> + Send + 'a>>;
+
+fn async_collection_unsupported() -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        "connector statistics capability does not support supervised async collection",
+    )
+}
+
 /// FE-local, single-use publication authority. It has no serialization or
 /// cloning surface. Both `finish` and `abort` consume the authority, so a
 /// caller must explicitly converge every session it starts rather than
@@ -620,6 +699,7 @@ pub trait StatisticsCollectionSession: Send {
     fn incarnation(&self) -> ProviderBindingEpoch;
     fn operation_id(&self) -> ConnectorMutationOperationId;
     fn expectations(&self) -> &[StatisticsArtifactIdentity];
+
     fn finish(
         self: Box<Self>,
         artifacts: Vec<StatisticsArtifactDraft>,
@@ -629,6 +709,43 @@ pub trait StatisticsCollectionSession: Send {
     /// state such as an uncommitted transaction frontier.
     fn abort(self: Box<Self>) -> Result<(), ConnectorError>;
 }
+
+/// The supervised session exposes only borrowing operations. It cannot call
+/// the legacy consuming finish/abort API after installing a publication source.
+pub trait AsyncStatisticsCollectionSession: Send {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor;
+    fn incarnation(&self) -> ProviderBindingEpoch;
+    fn operation_id(&self) -> ConnectorMutationOperationId;
+    fn expectations(&self) -> &[StatisticsArtifactIdentity];
+    fn io_profile(&self) -> Result<ConnectorMetadataMaintenanceIoProfile, ConnectorError> {
+        Err(async_collection_unsupported())
+    }
+    /// The caller retains both original slots through this borrowed future.
+    /// Validation/refusal leaves the artifact slot unchanged. No publication
+    /// is dispatched until finish_publication_async is polled.
+    fn prepare_publication_async<'a>(
+        &'a mut self,
+        _artifacts: &'a mut Option<Vec<StatisticsArtifactDraft>>,
+    ) -> StatisticsSessionFuture<'a, ()> {
+        Box::pin(async { Err(async_collection_unsupported()) })
+    }
+    fn finish_publication_async(
+        &mut self,
+    ) -> StatisticsSessionFuture<'_, StatisticsPublicationReady> {
+        Box::pin(async { Err(async_collection_unsupported()) })
+    }
+    /// Current is the same original action's existing-obligation context.
+    /// A returned observation is not an assertion that retained cleanup exited.
+    fn close_publication_async<'a>(
+        &'a mut self,
+        _current: &'a ConnectorRequestContext,
+    ) -> StatisticsSessionFuture<'a, StatisticsPublicationClose> {
+        Box::pin(async { Err(async_collection_unsupported()) })
+    }
+}
+
+pub type AsyncStatisticsCollectionStart =
+    StatisticsCollectionStart<dyn AsyncStatisticsCollectionSession>;
 
 /// Collection-level fact: whether this measurement observed every visible row
 /// of its basis. It is deliberately independent of how accurate the resulting
@@ -1057,11 +1174,61 @@ pub trait StatisticsReader: Send + Sync {
         &self,
         request: StatisticsReadRequest,
     ) -> Result<StatisticsEvidence, ConnectorError>;
+
+    /// Observe the original pinned evidence without a synchronous runtime bridge.
+    /// A scoped SQL read is constructed only by this exact lease's Provider.
+    /// This does not delegate to the legacy synchronous or ungoverned reader.
+    fn prepare_scoped_read(
+        &self,
+        _request: ConnectorTableRequest,
+        _original: ConnectorOriginalResultScope,
+    ) -> Result<Arc<dyn StatisticsReadOriginal>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector has no scoped statistics read source",
+        ))
+    }
+
+    fn read_statistics_async(
+        &self,
+        request: StatisticsReadRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<StatisticsEvidence, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let _ = request;
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector statistics does not support asynchronous observation",
+            ))
+        })
+    }
 }
 
 /// Optional collection and publication half of a connector statistics
 /// capability. Providers without this trait remain valid readers.
 pub trait StatisticsCollection: Send + Sync {
+    /// The sealed production Provider manifest's concrete original phase
+    /// Source. None supports no scoped phase; descriptor equality is not a
+    /// factory qualification. This never registers a new executor or runner.
+    fn scoped_cpu_source_type_id(&self) -> Option<std::any::TypeId> {
+        None
+    }
+
+    fn io_profile(&self) -> Result<ConnectorMetadataMaintenanceIoProfile, ConnectorError> {
+        Err(async_collection_unsupported())
+    }
+    fn begin_collection_async(
+        &self,
+        _request: StatisticsCollectionStartRequest,
+        _cpu: Arc<dyn StatisticsCpuPort>,
+    ) -> StatisticsSessionFuture<'_, AsyncStatisticsCollectionStart> {
+        Box::pin(async { Err(async_collection_unsupported()) })
+    }
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn incarnation(&self) -> ProviderBindingEpoch;
     fn begin_collection(
@@ -1126,6 +1293,23 @@ impl ConnectorStatisticsLease {
     pub fn supports_collection(&self) -> bool {
         self.statistics.collection().is_some()
     }
+    pub fn scoped_cpu_source_type_id(&self) -> Result<std::any::TypeId, ConnectorError> {
+        let collection = self
+            .statistics
+            .collection()
+            .ok_or_else(async_collection_unsupported)?;
+        if collection.descriptor() != &self.descriptor
+            || collection.incarnation() != self.incarnation
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Statistics CPU factory has a foreign lease generation",
+            ));
+        }
+        collection
+            .scoped_cpu_source_type_id()
+            .ok_or_else(async_collection_unsupported)
+    }
     pub fn read(
         &self,
         request: StatisticsReadRequest,
@@ -1142,6 +1326,88 @@ impl ConnectorStatisticsLease {
         }
         Ok(evidence)
     }
+    pub fn prepare_scoped_read(
+        &self,
+        request: ConnectorTableRequest,
+        original: ConnectorOriginalResultScope,
+    ) -> Result<Arc<dyn StatisticsReadOriginal>, ConnectorError> {
+        if request.table.instance_id != self.descriptor.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics read table has a foreign lease",
+            ));
+        }
+        let source = self.statistics.prepare_scoped_read(request, original)?;
+        if source.descriptor() != &self.descriptor
+            || source.incarnation() != self.incarnation
+            || std::any::Any::type_id(source.as_ref()) != self.scoped_cpu_source_type_id()?
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics read source has a foreign exact generation",
+            ));
+        }
+        Ok(source)
+    }
+    pub fn collection_io_profile(
+        &self,
+    ) -> Result<ConnectorMetadataMaintenanceIoProfile, ConnectorError> {
+        self.collection()?.io_profile()
+    }
+    /// This future borrows the caller's original lease. The returned session
+    /// retains that same generation before the future returns.
+    pub async fn begin_collection_async(
+        &self,
+        request: StatisticsCollectionStartRequest,
+        cpu: Arc<dyn StatisticsCpuPort>,
+    ) -> Result<AsyncStatisticsCollectionStart, ConnectorError> {
+        self.validate_table(&request.table)?;
+        let expected_table = request.table.clone();
+        let expected_version = request.data_version.clone();
+        let expected_operation = request.operation_id;
+        let start = self
+            .collection()?
+            .begin_collection_async(request, cpu)
+            .await?;
+        if start.table() != &expected_table || start.data_version() != &expected_version {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector statistics session did not preserve its resolved table pin",
+            ));
+        }
+        if start.session.descriptor() != &self.descriptor
+            || start.session.incarnation() != self.incarnation
+            || start.session.operation_id() != expected_operation
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector statistics session does not match its lease generation or operation",
+            ));
+        }
+        let StatisticsCollectionStart {
+            table,
+            data_version,
+            read_version_ordinal,
+            required_aggregations,
+            session,
+        } = start;
+        // The actual Provider's scoped schema CPU source already validated
+        // requirements/expectations. Only this private wrapper moves that same
+        // validated collection; it never copies or rebuilds its facts.
+        Ok(StatisticsCollectionStart {
+            table,
+            data_version,
+            read_version_ordinal,
+            required_aggregations,
+            session: Box::new(LeaseBoundStatisticsSession {
+                inner: session,
+                _lease: self.clone(),
+            }),
+        })
+    }
+    pub fn session_backing_bytes() -> usize {
+        std::mem::size_of::<LeaseBoundStatisticsSession<dyn AsyncStatisticsCollectionSession>>()
+    }
     pub fn begin_collection(
         self,
         request: StatisticsCollectionStartRequest,
@@ -1152,6 +1418,20 @@ impl ConnectorStatisticsLease {
         let expected_operation_id = request.operation_id;
         let collection = self.collection()?;
         let start = collection.begin_collection(request)?;
+        self.bind_collection_start(
+            start,
+            expected_table,
+            expected_data_version,
+            expected_operation_id,
+        )
+    }
+    fn bind_collection_start(
+        self,
+        start: StatisticsCollectionStart,
+        expected_table: ConnectorTableHandle,
+        expected_data_version: StatisticsDataVersion,
+        expected_operation_id: ConnectorMutationOperationId,
+    ) -> Result<StatisticsCollectionStart, ConnectorError> {
         if start.table() != &expected_table || start.data_version() != &expected_data_version {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
@@ -1206,12 +1486,49 @@ impl ConnectorStatisticsLease {
     }
 }
 
-struct LeaseBoundStatisticsSession {
-    inner: Box<dyn StatisticsCollectionSession>,
+struct LeaseBoundStatisticsSession<S: ?Sized> {
+    inner: Box<S>,
     _lease: ConnectorStatisticsLease,
 }
 
-impl StatisticsCollectionSession for LeaseBoundStatisticsSession {
+impl AsyncStatisticsCollectionSession
+    for LeaseBoundStatisticsSession<dyn AsyncStatisticsCollectionSession>
+{
+    fn io_profile(&self) -> Result<ConnectorMetadataMaintenanceIoProfile, ConnectorError> {
+        self.inner.io_profile()
+    }
+    fn prepare_publication_async<'a>(
+        &'a mut self,
+        artifacts: &'a mut Option<Vec<StatisticsArtifactDraft>>,
+    ) -> StatisticsSessionFuture<'a, ()> {
+        self.inner.prepare_publication_async(artifacts)
+    }
+    fn finish_publication_async(
+        &mut self,
+    ) -> StatisticsSessionFuture<'_, StatisticsPublicationReady> {
+        self.inner.finish_publication_async()
+    }
+    fn close_publication_async<'a>(
+        &'a mut self,
+        current: &'a ConnectorRequestContext,
+    ) -> StatisticsSessionFuture<'a, StatisticsPublicationClose> {
+        self.inner.close_publication_async(current)
+    }
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        self.inner.descriptor()
+    }
+    fn incarnation(&self) -> ProviderBindingEpoch {
+        self.inner.incarnation()
+    }
+    fn operation_id(&self) -> ConnectorMutationOperationId {
+        self.inner.operation_id()
+    }
+    fn expectations(&self) -> &[StatisticsArtifactIdentity] {
+        self.inner.expectations()
+    }
+}
+
+impl StatisticsCollectionSession for LeaseBoundStatisticsSession<dyn StatisticsCollectionSession> {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         self.inner.descriptor()
     }
@@ -1437,14 +1754,13 @@ mod tests {
         let source = DataType::Struct(
             vec![
                 Field::new("payload", DataType::Utf8, false).with_metadata(
-                    [
+                    std::collections::HashMap::<String, String>::from([
                         (
                             NR_LOGICAL_TYPE_KEY.into(),
                             "unknown-source-attribute".into(),
                         ),
                         ("provider.field-id".into(), "71".into()),
-                    ]
-                    .into(),
+                    ]),
                 ),
                 Field::new_dict(
                     "codes",
@@ -1543,8 +1859,13 @@ mod tests {
         );
 
         let source = DataType::List(Arc::new(
-            Field::new("child", DataType::Int64, true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "json".into())].into()),
+            Field::new("child", DataType::Int64, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                NR_LOGICAL_TYPE_KEY.into(),
+                "json".into(),
+            )])),
         ));
         let physical = FunctionValueType::new(source, true);
         let column = StatisticsScanColumn::try_new(0, "nested", physical).unwrap();

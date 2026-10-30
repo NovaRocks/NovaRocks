@@ -28,7 +28,7 @@ use novarocks_execution_contract::{
 use novarocks_types::identity::QueryExecutionId;
 use tokio::sync::{mpsc, watch};
 
-use super::{LogicalExecutionActorId, MonotonicInstant};
+use novarocks_coordination_contract::{LogicalExecutionActorId, MonotonicInstant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplacementQualificationIdentity {
@@ -76,6 +76,7 @@ pub struct ReplacementQualificationRequest {
     issued_at: MonotonicInstant,
     conservative_expiry: MonotonicInstant,
     absolute_expiry: std::time::Instant,
+    native_actions: Option<novarocks_workload_control::joint_admission::NativeAsyncActionAuthority>,
 }
 
 impl ReplacementQualificationRequest {
@@ -85,6 +86,9 @@ impl ReplacementQualificationRequest {
         replacement_contexts: Arc<[QueryContextRef]>,
         issued_at: MonotonicInstant,
         conservative_expiry: MonotonicInstant,
+        native_actions: Option<
+            novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
+        >,
     ) -> Self {
         let absolute_expiry = std::time::Instant::now()
             .checked_add(conservative_expiry.saturating_duration_since(issued_at))
@@ -97,7 +101,19 @@ impl ReplacementQualificationRequest {
             issued_at,
             conservative_expiry,
             absolute_expiry,
+            native_actions,
         }
+    }
+
+    pub fn native_action_authority(
+        &self,
+    ) -> Result<
+        &novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
+        novarocks_workload_control::WorkError,
+    > {
+        self.native_actions
+            .as_ref()
+            .ok_or(novarocks_workload_control::WorkError::NotReady)
     }
 
     pub const fn operation_id(&self) -> TaskOperationId {
@@ -682,11 +698,10 @@ mod failure_projection_tests {
     #[test]
     fn qualification_outcome_cannot_claim_backend_loss_or_accepted_cancellation() {
         use super::ReplacementQualificationFailure;
-        use crate::{
-            api::NativeAttemptTopologyRequirement,
-            coordination::{AttemptFailureClass, LogicalExecutionActorError},
-            execution_error::{ExecutionFailureInput, ExecutionFailureSite},
-        };
+        use crate::api::NativeAttemptTopologyRequirement;
+        use crate::coordination::LogicalExecutionActorError;
+        use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
+        use novarocks_coordination_contract::AttemptFailureClass;
         use novarocks_execution_contract::failure::{
             FailureClass, FailureEvidence, FailureProjection,
         };

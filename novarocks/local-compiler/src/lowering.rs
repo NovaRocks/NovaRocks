@@ -90,6 +90,12 @@ pub enum FragmentCompileError {
     },
 }
 impl FragmentCompileError {
+    pub(crate) fn is_primary_construction(&self) -> bool {
+        matches!(self, Self::Owner { error, .. }
+            if error.downcast_ref::<ExpressionLoweringError>()
+                .is_some_and(ExpressionLoweringError::is_primary_construction))
+    }
+
     /// Capability admission is a typed fact, independent of diagnostic text.
     pub fn is_unsupported(&self) -> bool {
         match self {

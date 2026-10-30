@@ -66,15 +66,44 @@ pub(super) fn build_table_writer(
                 ),
             )
         })?;
-        if !receiver.hash_partition_slots.is_empty() {
-            let partitions = build.pipeline.dop.max(1) as usize;
-            build = shuffle_compiled_group_input_slots(
-                build,
-                ctx,
-                node_id,
-                receiver.hash_partition_slots.to_vec(),
-                partitions,
-            );
+        use novarocks_local_program::CompiledExchangeRouting;
+        use novarocks_type_contract::PartitionHashAlgorithm;
+        let partitions = build.pipeline.dop as usize;
+        match receiver.routing {
+            CompiledExchangeRouting::ConditionalKey { applies, .. } => {
+                let keys = frozen_routing_keys(
+                    program.graph().nodes()[input.index()].output_layout(),
+                    &receiver.hash_partition_slots,
+                )?;
+                build = shuffle_compiled_typed_keys(
+                    build,
+                    ctx,
+                    node_id,
+                    keys,
+                    Some(applies),
+                    partitions,
+                );
+            }
+            CompiledExchangeRouting::Hash {
+                algorithm: PartitionHashAlgorithm::NativeHierarchicalV1,
+            } => {
+                let keys = frozen_routing_keys(
+                    program.graph().nodes()[input.index()].output_layout(),
+                    &receiver.hash_partition_slots,
+                )?;
+                build = shuffle_compiled_typed_keys(build, ctx, node_id, keys, None, partitions);
+            }
+            CompiledExchangeRouting::Hash { .. }
+            | CompiledExchangeRouting::BucketShuffle { .. } => {
+                build = shuffle_compiled_group_input_slots(
+                    build,
+                    ctx,
+                    node_id,
+                    receiver.hash_partition_slots.to_vec(),
+                    partitions,
+                );
+            }
+            CompiledExchangeRouting::Unpartitioned | CompiledExchangeRouting::RoundRobin => {}
         }
     }
     build.pipeline.factories.push(Box::new(factory));
@@ -91,6 +120,25 @@ pub(super) fn build_table_finish(
     error: &Arc<RuntimeErrorState>,
     ordered: Option<&CompiledOrderedFilterContext>,
 ) -> ExecutionResult<PipelineBuildResult> {
+    if let ProgramNodeKind::TableFinish {
+        count_mode: novarocks_local_program::FinishCountMode::LogicalChanges,
+        input_roles,
+        logical_summary_layout: Some(layout),
+        ..
+    } = program.graph().nodes()[id.index()].kind()
+    {
+        return build_logical_finish(
+            program,
+            id,
+            node_id,
+            inputs,
+            *input_roles,
+            layout,
+            ctx,
+            error,
+            ordered,
+        );
+    }
     let binding = ctx.compiled_writers.finisher(id).ok_or_else(|| {
         program_failure(
             FragmentBindingErrorKind::MissingAssignment,
@@ -115,4 +163,88 @@ pub(super) fn build_table_finish(
     build.pipeline.factories.push(Box::new(factory));
     build.stream = StreamDesc::single();
     Ok(build)
+}
+
+fn build_logical_finish(
+    program: &Arc<LocalProgram>,
+    id: ProgramNodeId,
+    node_id: i32,
+    inputs: &[ProgramNodeId],
+    roles: novarocks_result_contract::FinishInputs,
+    layout: &novarocks_local_program::StaticLayout,
+    ctx: &mut PipelineBuildContext,
+    error: &Arc<RuntimeErrorState>,
+    ordered: Option<&CompiledOrderedFilterContext>,
+) -> ExecutionResult<PipelineBuildResult> {
+    let invalid = || {
+        program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            "logical finish has no exact Task summary input",
+        )
+    };
+    let writer = *inputs
+        .get(roles.writer_results as usize)
+        .ok_or_else(invalid)?;
+    let summary = *inputs
+        .get(roles.logical_summary.ok_or_else(invalid)? as usize)
+        .ok_or_else(invalid)?;
+    let binding = ctx
+        .compiled_writers
+        .finisher(id)
+        .and_then(|finish| finish.logical_summary.clone())
+        .ok_or_else(invalid)?;
+    let receiver = ctx
+        .exchange_bindings
+        .get(binding.receiver_node)
+        .ok_or_else(invalid)?;
+    if receiver.expected_senders != binding.sources.len() {
+        return Err(invalid());
+    }
+    let ProgramNodeKind::ExchangeSource { timeout, .. } =
+        program.graph().nodes()[summary.index()].kind()
+    else {
+        return Err(invalid());
+    };
+    let handle = receiver
+        .receiver_port
+        .receiver_handle(
+            crate::runtime::fragment::io::ExchangeReceiverKey {
+                fragment_instance_id: novarocks_types::identity::UniqueId::new(
+                    receiver.key.finst_id_hi,
+                    receiver.key.finst_id_lo,
+                ),
+                node_id: receiver.key.node_id,
+            },
+            receiver.expected_senders,
+        )
+        .map_err(|cause| cause.into_execution())?;
+    let summary = crate::exec::operators::logical_change_summary::SourceBoundSummaryInput::new(
+        handle,
+        binding.sources,
+        layout.clone(),
+        *timeout,
+    )?;
+    let mut child = build_node(program, writer, ctx, error, ordered)?;
+    let producers = usize::try_from(child.pipeline.dop)
+        .ok()
+        .filter(|dop| *dop > 0)
+        .ok_or_else(invalid)?;
+    let state = UnionAllSharedState::new(producers, node_id);
+    child
+        .pipeline
+        .factories
+        .push(Box::new(UnionAllSinkFactory::new(state.clone(), node_id)));
+    child.pipeline.needs_sink = false;
+    let binding = ctx.compiled_writers.finisher(id).ok_or_else(invalid)?;
+    let factory = crate::exec::operators::compiled_writer::compiled_logical_table_finish_factory(
+        program, id, node_id, binding, error, state, summary,
+    )?;
+    let pipeline = new_source_pipeline_with_dop(ctx, Box::new(factory), 1);
+    let mut extra_pipelines = child.extra_pipelines;
+    extra_pipelines.push(child.pipeline);
+    Ok(PipelineBuildResult {
+        pipeline,
+        extra_pipelines,
+        stream: StreamDesc::single(),
+    })
 }

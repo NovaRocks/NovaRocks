@@ -101,32 +101,6 @@ impl EncodedScalar {
 }
 
 impl TypedPartition {
-    /// Requested-layout upper of the existing owned envelope and JSON String.
-    /// Borrowed scalars are inspected before either representation is built.
-    pub(crate) fn json_owned_upper(&self) -> Option<u64> {
-        let mut owned = (self.values().len() as u64)
-            .checked_mul(std::mem::size_of::<Option<EncodedScalar>>() as u64)?;
-        let mut json = 32u64;
-        for value in self.values().iter().flatten() {
-            json = json.checked_add(96)?;
-            match value {
-                CanonicalScalar::String(value) => {
-                    owned = owned.checked_add(value.len() as u64)?;
-                    json = json.checked_add((value.len() as u64).checked_mul(6)?)?;
-                }
-                CanonicalScalar::Binary(value) => {
-                    owned = owned.checked_add(value.len() as u64)?;
-                    json = json.checked_add((value.len() as u64).checked_mul(4)?)?;
-                }
-                CanonicalScalar::Decimal(_) | CanonicalScalar::Uuid(_) => {
-                    owned = owned.checked_add(80)?;
-                }
-                _ => (),
-            }
-        }
-        owned.checked_add(json.checked_mul(2)?.max(8))
-    }
-
     /// All represented numbers are bounded integers; decimal and UUID values
     /// are strings. No non-finite JSON number or custom serializer can fail.
     pub fn to_json_string(&self) -> String {

@@ -33,8 +33,11 @@ use crate::commit::snapshot_lifecycle_helpers::reclamation::ReclamationReport;
 use crate::commit::snapshot_lifecycle_helpers::retention::RetentionPlan;
 use crate::commit::staging::PreparedChange;
 use novarocks_spi::connector::{ConnectorOperationControl, ConnectorRequestContext};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -45,7 +48,9 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorMaxCompactableDataFiles, ConnectorMaxCompactableDataFilesRequest,
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceExecuteRequest,
-    ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlan,
+    ConnectorMetadataMaintenanceExecution, ConnectorMetadataMaintenanceExecutionSource,
+    ConnectorMetadataMaintenanceFuture, ConnectorMetadataMaintenanceOperation,
+    ConnectorMetadataMaintenanceOutcome, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
     ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReceiptSummary,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
@@ -58,6 +63,9 @@ use crate::catalog::{CatalogTableName, SnapshotLoading};
 use crate::commit::snapshot_lifecycle_helpers::rewrite_manifests::RewriteManifestsPreparer;
 use crate::metadata::IcebergTablePayload;
 use crate::metadata_context::IcebergMetadataContext;
+
+#[path = "metadata_maintenance/observation.rs"]
+pub(crate) mod observation;
 
 const PAYLOAD_VERSION: u16 = 2;
 const MARKER_VERSION: u16 = 2;
@@ -126,11 +134,22 @@ struct TerminalRecord {
 /// FE-only Iceberg adapter.  The registry contains process-local catalog
 /// clients and credentials; none cross the SPI payload boundary.
 pub(crate) struct IcebergMetadataMaintenanceAdapter {
+    engine: Arc<MaintenanceEngine>,
+    terminal: Arc<Mutex<HashMap<ConnectorMutationOperationId, TerminalRecord>>>,
+    active: Arc<Mutex<HashMap<ConnectorMutationOperationId, Arc<MaintenanceExecution>>>>,
+}
+
+pub(crate) struct MaintenanceEngine {
     key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
     runtime: Arc<IcebergMetadataContext>,
-    terminal: Mutex<HashMap<ConnectorMutationOperationId, TerminalRecord>>,
-    active: Mutex<HashSet<ConnectorMutationOperationId>>,
+}
+
+impl std::ops::Deref for IcebergMetadataMaintenanceAdapter {
+    type Target = MaintenanceEngine;
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
 }
 
 impl IcebergMetadataMaintenanceAdapter {
@@ -143,14 +162,27 @@ impl IcebergMetadataMaintenanceAdapter {
             instance_id: key.instance_id.clone(),
         };
         Ok(Self {
-            key,
-            descriptor,
-            runtime,
-            terminal: Mutex::new(HashMap::new()),
-            active: Mutex::new(HashSet::new()),
+            engine: Arc::new(MaintenanceEngine {
+                key,
+                descriptor,
+                runtime,
+            }),
+            terminal: Arc::new(Mutex::new(HashMap::new())),
+            active: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
+    #[cfg(test)]
+    async fn execute(
+        &self,
+        request: ConnectorMetadataMaintenanceExecuteRequest,
+    ) -> Result<ConnectorMetadataMaintenanceOutcome, ConnectorError> {
+        let mut execution = self.begin_execute(request)?;
+        execution.wait().await
+    }
+}
+
+impl MaintenanceEngine {
     fn ensure_owner(&self, owner: &ConnectorProviderBindingKey) -> Result<(), ConnectorError> {
         if owner != &self.key {
             return Err(invalid(
@@ -160,7 +192,7 @@ impl IcebergMetadataMaintenanceAdapter {
         Ok(())
     }
 
-    fn plan_payload(
+    async fn plan_payload(
         &self,
         request: &ConnectorMetadataMaintenancePlanningRequest,
     ) -> Result<
@@ -177,12 +209,13 @@ impl IcebergMetadataMaintenanceAdapter {
             .invalidate_table_cache(&namespace, &table_name);
         let loaded = self
             .runtime
-            .observe_table_classified_for_request_with_snapshots(
+            .observe_table_classified_for_request_with_snapshots_async(
                 &namespace,
                 &table_name,
                 &request.context,
                 maintenance_snapshot_loading(request.operation().kind()),
             )
+            .await
             .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
         let table = loaded.into_table();
         let metadata = table.metadata();
@@ -264,11 +297,12 @@ impl IcebergMetadataMaintenanceAdapter {
         )
     }
 
-    fn replay_terminal(
+    async fn replay_terminal(
         &self,
         plan: &ConnectorMetadataMaintenancePlan,
         original: ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>,
         context: &ConnectorRequestContext,
+        execution: &Weak<MaintenanceExecution>,
     ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError> {
         let ExternalMutationOutcome::CommitUnknown { evidence, .. } = &original else {
             return Ok(original);
@@ -278,6 +312,9 @@ impl IcebergMetadataMaintenanceAdapter {
         else {
             return Ok(original);
         };
+        if let Some(execution) = execution.upgrade() {
+            execution.retain_journal(journal.clone());
+        }
         if evidence.operation_id() != plan.operation_id()
             || evidence.incarnation() != self.key.incarnation
             || evidence.descriptor() != &self.descriptor
@@ -305,16 +342,11 @@ impl IcebergMetadataMaintenanceAdapter {
             .for_request(context.clone());
         let catalog = Arc::clone(self.runtime.novarocks_catalog());
         let read_target = target.clone();
-        let observed = match self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                catalog
-                    .load_complete_metadata_for_read(read_target, binding, None)
-                    .await
-            }) {
-            Ok(Ok(crate::catalog::CatalogMetadataLoad::Complete { base, .. })) => *base,
+        let observed = match catalog
+            .load_complete_metadata_for_read(read_target, binding, None)
+            .await
+        {
+            Ok(crate::catalog::CatalogMetadataLoad::Complete { base, .. }) => *base,
             _ => return Ok(original),
         };
         let Some(observation) = descriptor
@@ -344,21 +376,8 @@ impl IcebergMetadataMaintenanceAdapter {
             if let Some((operation, roots)) = receipt.artifact_cleanup {
                 // IRU-5 owned-output cleanup is separate from snapshot GC. It
                 // retains the original operation and exact frozen roots.
-                let cleanup = self
-                    .runtime
-                    .resources()
-                    .catalog_runtime()
-                    .block_on(async move { operation.cleanup_after_commit(&roots).await });
-                let finalization = match cleanup {
-                    Ok(report) => report.finalization(),
-                    Err(message) => {
-                        ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
-                            ConnectorMutationFailureKind::Unavailable,
-                            message,
-                        ))
-                    }
-                };
-                journal.record_entry_finalization(entry, finalization);
+                let report = operation.cleanup_after_commit_in(&roots, context).await;
+                journal.record_entry_cleanup_report(entry, report);
             }
             if let Some(retired) = receipt.retired {
                 let mut proof = match journal.commit_outcome(entry) {
@@ -376,22 +395,16 @@ impl IcebergMetadataMaintenanceAdapter {
                 .map_err(|e| internal(e.to_string()))?;
                 let owner = Arc::clone(&self.runtime);
                 let gc_context = context.clone();
-                let result = self
-                    .runtime
-                    .resources()
-                    .catalog_runtime()
-                    .block_on(async move {
-                        crate::commit::snapshot_lifecycle_helpers::reclamation::reclaim(
-                            owner.as_ref(),
-                            target,
-                            &retired,
-                            &marker,
-                            &proof,
-                            &gc_context,
-                        )
-                        .await
-                    });
-                record_reclamation_result(&journal, entry, &receipt.reclamation, result);
+                let result = crate::commit::snapshot_lifecycle_helpers::reclamation::reclaim(
+                    owner.as_ref(),
+                    target,
+                    &retired,
+                    &marker,
+                    &proof,
+                    &gc_context,
+                )
+                .await;
+                record_reclamation_result(&journal, entry, &receipt.reclamation, Ok(result));
             }
         }
         self.runtime
@@ -400,28 +413,32 @@ impl IcebergMetadataMaintenanceAdapter {
         Ok(public_outcome(journal.catalog_entry_outcome(entry)))
     }
 
-    fn execute_once(
+    async fn execute_once(
         &self,
         plan: &ConnectorMetadataMaintenancePlan,
         payload: &IcebergMetadataMaintenancePlanPayloadV1,
         context: &ConnectorRequestContext,
+        execution: &Weak<MaintenanceExecution>,
     ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError> {
         context.check_active()?;
         let token = OperationToken::from_mutation(plan.operation_id());
         let runtime = self.runtime.resources().catalog_runtime();
-        let initial = runtime.observe_preparation(
-            || {
-                self.runtime
-                    .observe_table_classified_for_request_with_snapshots(
-                        &payload.namespace,
-                        &payload.table,
-                        context,
-                        maintenance_snapshot_loading(plan.operation_kind()),
-                    )
-                    .map_err(|(kind, message)| ConnectorError::new(kind, message))
-            },
-            connector_failure,
-        )?;
+        let initial = runtime
+            .observe_preparation_async(
+                async {
+                    self.runtime
+                        .observe_table_classified_for_request_with_snapshots_async(
+                            &payload.namespace,
+                            &payload.table,
+                            context,
+                            maintenance_snapshot_loading(plan.operation_kind()),
+                        )
+                        .await
+                        .map_err(|(kind, message)| ConnectorError::new(kind, message))
+                },
+                connector_failure,
+            )
+            .await?;
         if initial.table.metadata().uuid().to_string() != payload.table_uuid {
             return Ok(rejected(invalid(
                 "Iceberg maintenance table UUID was replaced",
@@ -454,10 +471,15 @@ impl IcebergMetadataMaintenanceAdapter {
         )
         .map_err(iceberg_error)?;
         let journal = PublicationJournal::for_runtime(token, runtime);
+        if let Some(execution) = execution.upgrade() {
+            execution.retain_operation(operation.clone(), journal.clone());
+        }
         if plan.operation_kind() == novarocks_spi::connector::EXPIRE_TABLE_VERSIONS_KIND {
-            return self.execute_expire(
-                plan, payload, context, &operation, &journal, policy, ident, marker,
-            );
+            return self
+                .execute_expire(
+                    plan, payload, context, &operation, &journal, policy, ident, marker,
+                )
+                .await;
         }
         let intent = OperationIntent::new(OperationIntentParts {
             target: TableTarget {
@@ -513,42 +535,24 @@ impl IcebergMetadataMaintenanceAdapter {
                 )
             }),
         }));
-        let preparer = RewriteManifestsPreparer::new();
-        let run_operation = operation.clone();
-        let result = runtime.block_on(async move {
-            attempt::run(
-                &run_operation,
-                &intent,
-                &PreparedChange::default(),
-                &[&preparer],
-                &publisher,
-                policy,
-            )
-            .await
-        });
-        let outcome = match result {
-            Ok(report) => public_outcome(journal.project(report)),
-            Err(message) => {
-                let recovery_journal = journal.clone();
-                let recovery_operation = operation.clone();
-                public_outcome(
-                    runtime
-                        .block_on(async move {
-                            recovery_journal
-                                .recover_bridge(&recovery_operation, message)
-                                .await
-                        })
-                        .map_err(unavailable)?,
-                )
-            }
-        };
+        let preparer = RewriteManifestsPreparer::for_request(context.clone());
+        let report = attempt::run(
+            &operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&preparer],
+            &publisher,
+            policy,
+        )
+        .await;
+        let outcome = public_outcome(journal.project(report));
         self.runtime
             .control_state()
             .invalidate_table_cache(&payload.namespace, &payload.table);
         Ok(outcome)
     }
 
-    fn execute_expire(
+    async fn execute_expire(
         &self,
         plan: &ConnectorMetadataMaintenancePlan,
         payload: &IcebergMetadataMaintenancePlanPayloadV1,
@@ -562,56 +566,69 @@ impl IcebergMetadataMaintenanceAdapter {
         let started = Instant::now();
         let runtime = self.runtime.resources().catalog_runtime();
         let mut ordinal = 0;
+        let mut retained_decisions = 0u64;
         loop {
             if started.elapsed() >= policy.total_timeout() {
                 return Ok(rejected(deadline("Maintenance retry budget expired")));
             }
-            let prepared = runtime.observe_preparation(
-                || {
-                    context.check_active()?;
-                    let (guard, loaded) = self.runtime.coordinate_table_for_request(
-                        &payload.namespace,
-                        &payload.table,
-                        context,
-                    )?;
-                    let metadata = loaded.table.metadata();
-                    if metadata.uuid().to_string() != payload.table_uuid {
-                        return Err(invalid("Iceberg expiration table UUID was replaced"));
-                    }
-                    let retention = RetentionPlan::compute(
-                        metadata,
-                        payload.evaluation_time_ms,
-                        payload.older_than_ms,
-                        payload.retain_last,
-                    )
-                    .map_err(iceberg_error)?;
-                    let mut updates = retention.updates();
-                    if !retention.is_empty() {
-                        updates.push(crate::iceberg::TableUpdate::SetProperties {
-                            updates: HashMap::from([(MARKER_PROPERTY.into(), marker.clone())]),
-                        });
-                    }
-                    let location = loaded.table.metadata_location().ok_or_else(|| {
-                        invalid("Expiration requires an authoritative metadata location")
-                    })?;
-                    let request = crate::commit::staging::freeze_existing_change(
-                        ident.clone(),
-                        "main",
-                        metadata,
-                        location,
-                        RequestShape::RefRetention,
-                        AttemptToken::new(operation.token(), ordinal),
-                        PreparedChange {
-                            requirements: retention.requirements.clone(),
-                            updates,
-                        },
-                        context,
-                    )
-                    .map_err(iceberg_error)?;
-                    Ok((guard, retention, request))
-                },
-                connector_failure,
-            );
+            let prepared = runtime
+                .observe_preparation_async(
+                    async {
+                        context.check_active()?;
+                        let (guard, loaded) = self
+                            .runtime
+                            .coordinate_table_for_request_async(
+                                &payload.namespace,
+                                &payload.table,
+                                context,
+                            )
+                            .await?;
+                        let metadata = loaded.table.metadata();
+                        if metadata.uuid().to_string() != payload.table_uuid {
+                            return Err(invalid("Iceberg expiration table UUID was replaced"));
+                        }
+                        let decision = RetentionPlan::owned_decision_bytes(metadata).map_err(iceberg_error)?;
+                        retained_decisions = retained_decisions.checked_add(decision).ok_or_else(||invalid("retention journal backing overflow"))?;
+                        let initial = 2*(novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES+novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES) as u64;
+                        let required = retained_decisions.checked_add(initial).and_then(std::num::NonZeroU64::new).ok_or_else(||invalid("retention journal backing overflow"))?;
+                        // The source reserves old journal decisions plus the new
+                        // decision before any owned retention clone is formed.
+                        context.reserve_owned_metadata(required).await?;
+                        let retention = RetentionPlan::compute(
+                            metadata,
+                            payload.evaluation_time_ms,
+                            payload.older_than_ms,
+                            payload.retain_last,
+                        )
+                        .map_err(iceberg_error)?;
+                        let mut updates = retention.updates();
+                        if !retention.is_empty() {
+                            updates.push(crate::iceberg::TableUpdate::SetProperties {
+                                updates: HashMap::from([(MARKER_PROPERTY.into(), marker.clone())]),
+                            });
+                        }
+                        let location = loaded.table.metadata_location().ok_or_else(|| {
+                            invalid("Expiration requires an authoritative metadata location")
+                        })?;
+                        let request = crate::commit::staging::freeze_existing_change(
+                            ident.clone(),
+                            "main",
+                            metadata,
+                            location,
+                            RequestShape::RefRetention,
+                            AttemptToken::new(operation.token(), ordinal),
+                            PreparedChange {
+                                requirements: retention.requirements.clone(),
+                                updates,
+                            },
+                            context,
+                        )
+                        .map_err(iceberg_error)?;
+                        Ok((guard, retention, request))
+                    },
+                    connector_failure,
+                )
+                .await;
             let (guard, retention, request) = match prepared {
                 Ok(prepared) => prepared,
                 Err(error) => return Ok(rejected(error)),
@@ -649,7 +666,7 @@ impl IcebergMetadataMaintenanceAdapter {
             let dispatch_journal = journal.clone();
             let preparation = context.clone();
             let evidence_policy = catalog.evidence_policy();
-            let published = runtime.block_on(async move {
+            let published = async move {
                 dispatch_journal
                     .publish_once(
                         preparation,
@@ -668,14 +685,14 @@ impl IcebergMetadataMaintenanceAdapter {
                         },
                     )
                     .await
-            });
+            }
+            .await;
             // The in-process table lock covers the fresh metadata decision and
             // dispatch conclusion, never backoff, manifest scans, or deletion.
             drop(guard);
             let outcome = match published {
-                Ok(Ok(entry)) => public_outcome(journal.catalog_entry_outcome(entry)),
-                Ok(Err(error)) => public_outcome(journal.catalog_bridge_failure(error.to_string())),
-                Err(message) => public_outcome(journal.catalog_bridge_failure(message.to_string())),
+                Ok(entry) => public_outcome(journal.catalog_entry_outcome(entry)),
+                Err(error) => public_outcome(journal.catalog_bridge_failure(error.to_string())),
             };
             if let ExternalMutationOutcome::KnownUncommitted { ref failure, .. } = outcome
                 && failure.kind() == ConnectorMutationFailureKind::Conflict
@@ -685,14 +702,7 @@ impl IcebergMetadataMaintenanceAdapter {
                 if wait >= policy.total_timeout().saturating_sub(started.elapsed()) {
                     return Ok(outcome);
                 }
-                if let Err(error) = runtime
-                    .block_on({
-                        let waiting = operation.clone();
-                        async move { waiting.pause(wait).await }
-                    })
-                    .map_err(unavailable)
-                    .and_then(|r| r.map_err(iceberg_error))
-                {
+                if let Err(error) = operation.pause(wait).await.map_err(iceberg_error) {
                     return Ok(rejected(error));
                 }
                 ordinal += 1;
@@ -727,23 +737,72 @@ impl IcebergMetadataMaintenanceAdapter {
                 let target =
                     CatalogTableName::new(payload.namespace.clone(), payload.table.clone());
                 let reclamation_context = context.clone();
-                let result = runtime.block_on(async move {
-                    crate::commit::snapshot_lifecycle_helpers::reclamation::reclaim(
-                        reclamation_owner.as_ref(),
-                        target,
-                        &retention,
-                        &marker,
-                        &proof,
-                        &reclamation_context,
-                    )
-                    .await
-                });
-                record_reclamation_result(journal, entry, &report_slot, result);
+                let result = crate::commit::snapshot_lifecycle_helpers::reclamation::reclaim(
+                    reclamation_owner.as_ref(),
+                    target,
+                    &retention,
+                    &marker,
+                    &proof,
+                    &reclamation_context,
+                )
+                .await;
+                record_reclamation_result(journal, entry, &report_slot, Ok(result));
                 return Ok(public_outcome(journal.catalog_entry_outcome(entry)));
             }
             return Ok(outcome);
         }
     }
+}
+
+/// Pure first-party fixed geometry from the same metadata execution factory.
+/// No catalog instance, route, credential, lease, Work, or network is created.
+pub fn metadata_maintenance_io_geometry()
+-> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry, ConnectorError> {
+    // Exact original io_requests, not the cleanup object bound or a new
+    // semaphore. Header/F costs exclude borrowed SDK/cache/private graphs.
+    let io = std::num::NonZeroUsize::new(OperationLimits::default().io_requests as usize)
+        .ok_or_else(|| internal("metadata operation I/O inventory is empty"))?;
+    let fixed = std::mem::size_of::<MaintenanceEngine>()
+        .checked_add(std::mem::size_of::<MetadataExecutionInput>())
+        .and_then(|n| n.checked_add(metadata_execution_future_bytes(make_metadata_execution)))
+        .and_then(|n| n.checked_add(execution::fixed_backing_bytes()))
+        .and_then(|n| n.checked_add(observation::fixed_backing_bytes()?))
+        .and_then(|n| n.checked_add(IcebergCommitOperation::fixed_backing_bytes().ok()?))
+        .and_then(|n| {
+            n.checked_add(
+                crate::fs_io::governed_writer_backing_bytes()
+                    .ok()?
+                    .checked_mul(io.get())?,
+            )
+        })
+        .ok_or_else(|| internal("metadata source geometry overflow"))?;
+    // Canonical plan/evidence String+Bytes and old/new conversion coexist.
+    // Variable retention/journal plans are reserved from observed metadata
+    // at their actual formation points, not hidden in this initial bound.
+    let initial = 2usize
+        .checked_mul(
+            novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES,
+        )
+        .and_then(|n| {
+            n.checked_add(
+                2 * novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
+            )
+        })
+        .ok_or_else(|| internal("metadata initial payload geometry overflow"))?;
+    Ok(
+        novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry::new(
+            io,
+            std::num::NonZeroU64::new(
+                u64::try_from(fixed).map_err(|_| internal("metadata source geometry overflow"))?,
+            )
+            .unwrap(),
+            std::num::NonZeroU64::new(
+                u64::try_from(initial)
+                    .map_err(|_| internal("metadata initial payload overflow"))?,
+            )
+            .unwrap(),
+        ),
+    )
 }
 
 impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
@@ -758,184 +817,204 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
     fn plan_maintenance(
         &self,
         request: ConnectorMetadataMaintenancePlanningRequest,
-    ) -> Result<ConnectorMetadataMaintenancePlan, ConnectorError> {
-        request.validate()?;
-        self.ensure_owner(request.owner())?;
-        let (namespace, table) = decode_base_table_target(request.operation().table())?;
-        let operation = match request.operation() {
-            ConnectorMetadataMaintenanceOperation::ExpireTableVersions { .. } => {
-                CatalogOperation::ExpireSnapshots
-            }
-            ConnectorMetadataMaintenanceOperation::RewriteMetadataLayout { .. } => {
-                CatalogOperation::RewriteManifests
-            }
-        };
-        self.runtime
-            .novarocks_catalog()
-            .admit(&CatalogAdmissionRequest::new(
-                operation,
-                CatalogTableName::new(namespace, table),
-                request.context.initiation(),
-            ))
-            .map_err(connector_unsupported)?;
-        let (payload, intent_digest, summary) = self.plan_payload(&request)?;
-        let provider_payload = canonical_json(&payload, "Iceberg metadata maintenance plan")?;
-        let plan = ConnectorMetadataMaintenancePlan::try_new(
-            &request,
-            intent_digest,
-            summary,
-            provider_payload,
-        )?;
-        Ok(plan)
+    ) -> ConnectorMetadataMaintenanceFuture<'_, ConnectorMetadataMaintenancePlan> {
+        Box::pin(async move {
+            request.validate()?;
+            self.ensure_owner(request.owner())?;
+            let (namespace, table) = decode_base_table_target(request.operation().table())?;
+            let operation = match request.operation() {
+                ConnectorMetadataMaintenanceOperation::ExpireTableVersions { .. } => {
+                    CatalogOperation::ExpireSnapshots
+                }
+                ConnectorMetadataMaintenanceOperation::RewriteMetadataLayout { .. } => {
+                    CatalogOperation::RewriteManifests
+                }
+            };
+            self.runtime
+                .novarocks_catalog()
+                .admit(&CatalogAdmissionRequest::new(
+                    operation,
+                    CatalogTableName::new(namespace, table),
+                    request.context.initiation(),
+                ))
+                .map_err(connector_unsupported)?;
+            let (payload, intent_digest, summary) = self.plan_payload(&request).await?;
+            let provider_payload = canonical_json(&payload, "Iceberg metadata maintenance plan")?;
+            let plan = ConnectorMetadataMaintenancePlan::try_new(
+                &request,
+                intent_digest,
+                summary,
+                provider_payload,
+            )?;
+            Ok(plan)
+        })
     }
 
-    fn execute(
+    fn io_profile(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile, ConnectorError>
+    {
+        let geometry = metadata_maintenance_io_geometry()?;
+        let dependencies = self.runtime.metadata_action_initial_dependencies()?;
+        novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile::from_geometry(
+            geometry,
+            dependencies,
+        )
+    }
+
+    fn begin_execute(
         &self,
         request: ConnectorMetadataMaintenanceExecuteRequest,
-    ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError> {
+    ) -> Result<ConnectorMetadataMaintenanceExecution, ConnectorError> {
         request.plan.validate()?;
         self.ensure_owner(request.plan.owner())?;
-        let terminal = self
-            .terminal
-            .lock()
-            .map_err(|_| internal("Maintenance terminal set poisoned"))?
-            .get(&request.plan.operation_id())
-            .cloned();
-        if let Some(terminal) = terminal {
-            if terminal.plan_digest != request.plan.plan_digest() {
-                return Err(invalid("Maintenance replay changes the fixed plan"));
-            }
-            if !matches!(
-                terminal.outcome,
-                ExternalMutationOutcome::CommitUnknown { .. }
-            ) {
-                return Ok(terminal.outcome);
-            }
-            let mut active = self
-                .active
-                .lock()
-                .map_err(|_| internal("Maintenance active set poisoned"))?;
-            if !active.insert(request.plan.operation_id()) {
-                return Err(invalid(
-                    "Maintenance operation already has an active execution",
-                ));
-            }
-            drop(active);
-            let _claim = ActiveExecution {
-                active: &self.active,
-                operation: request.plan.operation_id(),
-            };
-            let outcome =
-                self.replay_terminal(&request.plan, terminal.outcome, &request.context)?;
-            self.terminal
-                .lock()
-                .map_err(|_| internal("Maintenance terminal set poisoned"))?
-                .insert(
-                    request.plan.operation_id(),
-                    TerminalRecord {
-                        plan_digest: request.plan.plan_digest(),
-                        outcome: outcome.clone(),
-                    },
-                );
-            return Ok(outcome);
-        }
-        let payload = self.payload_for_plan(&request.plan)?;
         let mut active = self
             .active
             .lock()
             .map_err(|_| internal("Maintenance active set poisoned"))?;
-        if !active.insert(request.plan.operation_id()) {
+        if active.contains_key(&request.plan.operation_id()) {
             return Err(invalid(
                 "Maintenance operation already has an active execution",
             ));
         }
-        drop(active);
-        let _claim = ActiveExecution {
-            active: &self.active,
-            operation: request.plan.operation_id(),
-        };
         let terminal = self
             .terminal
             .lock()
             .map_err(|_| internal("Maintenance terminal set poisoned"))?
             .get(&request.plan.operation_id())
             .cloned();
-        if let Some(terminal) = terminal {
-            if terminal.plan_digest != request.plan.plan_digest() {
-                return Err(invalid("Maintenance replay changes the fixed plan"));
-            }
-            return self.replay_terminal(&request.plan, terminal.outcome, &request.context);
+        if let Some(terminal) = &terminal
+            && terminal.plan_digest != request.plan.plan_digest()
+        {
+            return Err(invalid("Maintenance replay changes the fixed plan"));
         }
-        let outcome = self.execute_once(&request.plan, &payload, &request.context)?;
-        self.terminal
-            .lock()
-            .map_err(|error| internal(format!("Iceberg maintenance terminal lock: {error}")))?
-            .insert(
-                request.plan.operation_id(),
-                TerminalRecord {
-                    plan_digest: request.plan.plan_digest(),
-                    outcome: outcome.clone(),
-                },
-            );
-        Ok(outcome)
+        let payload = if terminal.is_none() {
+            Some(self.payload_for_plan(&request.plan)?)
+        } else {
+            None
+        };
+        let row = Arc::new(MaintenanceExecution::new(
+            request.plan.operation_id(),
+            request.plan.plan_digest(),
+            Arc::downgrade(&self.active),
+            Arc::clone(&self.terminal),
+        ));
+        // The original active row exists before any physical future can be polled.
+        let weak = Arc::downgrade(&row);
+        let engine = Arc::clone(&self.engine);
+        let future = Box::pin(make_metadata_execution(MetadataExecutionInput {
+            engine,
+            request,
+            terminal,
+            payload,
+            weak,
+        }));
+        row.install(future);
+        active.insert(row.operation, Arc::clone(&row));
+        drop(active);
+        Ok(ConnectorMetadataMaintenanceExecution::from_source(row))
+    }
+
+    fn begin_read_max_compactable_data_files(
+        &self,
+        request: ConnectorMaxCompactableDataFilesRequest,
+        cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    ) -> Result<novarocks_spi::connector::ConnectorMaxCompactableDataFilesExecution, ConnectorError>
+    {
+        if request.table.owner() != &self.key.instance_id {
+            return Err(invalid("compaction observation has a foreign table owner"));
+        }
+        Ok(
+            novarocks_spi::connector::ConnectorMaxCompactableDataFilesExecution::from_source(
+                observation::ObservationSource::new(Arc::clone(&self.engine), request, cpu),
+            ),
+        )
     }
 
     fn read_max_compactable_data_files(
         &self,
         request: ConnectorMaxCompactableDataFilesRequest,
-    ) -> Result<ConnectorMaxCompactableDataFiles, ConnectorError> {
-        let (namespace, table_name) = decode_base_table_target(&request.table)?;
-        // The observation feeds a maintenance decision, so it must see the
-        // current table state rather than a cached generation snapshot.
-        self.runtime
-            .control_state()
-            .invalidate_table_cache(&namespace, &table_name);
-        let physical = self
-            .runtime
-            .load_table_for_request(&namespace, &table_name, &request.context)
-            .map_err(|error| unavailable(format!("load Iceberg table for observation: {error}")))?;
-        let preserve_row_lineage =
-            crate::schema_facts::row_lineage_enabled(physical.table.metadata());
-        let table = physical.into_table();
-        let stats = self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                crate::commit::current_live_data_file_compaction_stats(
-                    &table,
-                    table.file_io(),
-                    preserve_row_lineage,
-                )
+    ) -> ConnectorMetadataMaintenanceFuture<'_, ConnectorMaxCompactableDataFiles> {
+        Box::pin(async move {
+            let (namespace, table_name) = decode_base_table_target(&request.table)?;
+            // The observation feeds a maintenance decision, so it must see the
+            // current table state rather than a cached generation snapshot.
+            self.runtime
+                .control_state()
+                .invalidate_table_cache(&namespace, &table_name);
+            let physical = self
+                .runtime
+                .load_table_for_request_async(&namespace, &table_name, &request.context)
                 .await
-            })
-            .map_err(unavailable)?
+                .map_err(|error| {
+                    unavailable(format!("load Iceberg table for observation: {error}"))
+                })?;
+            let preserve_row_lineage =
+                crate::schema_facts::row_lineage_enabled(physical.table.metadata());
+            let table = physical.into_table();
+            let stats = crate::commit::current_live_data_file_compaction_stats(
+                &table,
+                table.file_io(),
+                preserve_row_lineage,
+            )
+            .await
             .map_err(|error| {
                 unavailable(format!(
                     "observe Iceberg table {namespace}.{table_name} compaction groups: {error}"
                 ))
             })?;
-        let value = u64::try_from(stats.max_compactable_data_files).map_err(|_| {
-            internal(format!(
-                "Iceberg table {namespace}.{table_name} compactable file count overflow"
-            ))
-        })?;
-        Ok(ConnectorMaxCompactableDataFiles::new(Some(value)))
+            let value = u64::try_from(stats.max_compactable_data_files).map_err(|_| {
+                internal(format!(
+                    "Iceberg table {namespace}.{table_name} compactable file count overflow"
+                ))
+            })?;
+            Ok(ConnectorMaxCompactableDataFiles::new(Some(value)))
+        })
     }
 }
 
-struct ActiveExecution<'a> {
-    active: &'a Mutex<HashSet<ConnectorMutationOperationId>>,
-    operation: ConnectorMutationOperationId,
+struct MetadataExecutionInput {
+    engine: Arc<MaintenanceEngine>,
+    request: ConnectorMetadataMaintenanceExecuteRequest,
+    terminal: Option<TerminalRecord>,
+    payload: Option<IcebergMetadataMaintenancePlanPayloadV1>,
+    weak: Weak<MaintenanceExecution>,
 }
-impl Drop for ActiveExecution<'_> {
-    fn drop(&mut self) {
-        self.active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.operation);
+async fn make_metadata_execution(
+    input: MetadataExecutionInput,
+) -> Result<ConnectorMetadataMaintenanceOutcome, ConnectorError> {
+    let MetadataExecutionInput {
+        engine,
+        request,
+        terminal,
+        payload,
+        weak,
+    } = input;
+    if let Some(terminal) = terminal {
+        engine
+            .replay_terminal(&request.plan, terminal.outcome, &request.context, &weak)
+            .await
+    } else {
+        engine
+            .execute_once(
+                &request.plan,
+                payload
+                    .as_ref()
+                    .expect("new execution has a validated payload"),
+                &request.context,
+                &weak,
+            )
+            .await
     }
 }
+fn metadata_execution_future_bytes<I, F>(_: fn(I) -> F) -> usize {
+    std::mem::size_of::<F>()
+}
+
+#[path = "metadata_maintenance/execution.rs"]
+mod execution;
+use execution::MaintenanceExecution;
+
 // The original journal retains candidate descriptors even for Unknown. This
 // state is process-local and is never reconstructed from a wire-only marker.
 #[derive(Clone)]
@@ -953,10 +1032,12 @@ fn public_outcome(
 ) -> ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt> {
     match outcome {
         ExternalMutationOutcome::KnownCommitted {
+            cleanup,
             effect,
             receipt,
-            mut finalization,
+            finalization,
         } => {
+            let mut cleanup = cleanup;
             let report = receipt
                 .reclamation
                 .lock()
@@ -980,14 +1061,15 @@ fn public_outcome(
                 ) {
                     Ok(enriched) => public = enriched,
                     Err(error) => {
-                        if matches!(finalization, ExternalMutationFinalization::Complete) {
-                            finalization =
+                        if matches!(cleanup, ExternalMutationFinalization::Complete) {
+                            cleanup =
                                 ExternalMutationFinalization::Failed(connector_failure(&error));
                         }
                     }
                 }
             }
             ExternalMutationOutcome::KnownCommitted {
+                cleanup,
                 effect,
                 receipt: public,
                 finalization,
@@ -1021,7 +1103,7 @@ fn record_reclamation_result(
         ))),
     };
     if let Some(error) = failure {
-        journal.record_entry_finalization(
+        journal.record_entry_cleanup(
             entry,
             ExternalMutationFinalization::Failed(connector_failure(&error)),
         );
@@ -1286,6 +1368,21 @@ mod tests {
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::resources::IcebergMetadataResources;
 
+    trait LeaseExecutionForTest {
+        async fn execute(
+            &self,
+            request: ConnectorMetadataMaintenanceExecuteRequest,
+        ) -> Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>;
+    }
+    impl LeaseExecutionForTest for novarocks_spi::connector::ConnectorMetadataMaintenanceLease {
+        async fn execute(
+            &self,
+            request: ConnectorMetadataMaintenanceExecuteRequest,
+        ) -> Result<ConnectorMetadataMaintenanceOutcome, ConnectorError> {
+            let mut execution = self.begin_execute(request)?;
+            execution.wait().await
+        }
+    }
     fn context() -> novarocks_spi::connector::ConnectorRequestContext {
         novarocks_spi::connector::ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
@@ -1587,18 +1684,20 @@ mod tests {
         let root = std::path::PathBuf::from(location.path());
         for expire in [false, true] {
             let before = inventory_without_private_artifacts(&root);
-            let plan = adapter
-                .plan_maintenance(local_planning_request(&key, expire))
+            let plan = executor
+                .block_on(adapter.plan_maintenance(local_planning_request(&key, expire)))
                 .expect("no-op plan");
             assert_eq!(inventory_without_private_artifacts(&root), before);
             let payload: IcebergMetadataMaintenancePlanPayloadV1 =
                 decode_canonical_json(plan.provider_payload(), "test plan").expect("plan payload");
             assert!(payload.evaluation_time_ms > 0);
             assert_eq!(payload.table_uuid, table.metadata().uuid().to_string());
-            let outcome = adapter
-                .execute(
-                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context())
-                        .expect("execute request"),
+            let outcome = executor
+                .block_on(
+                    adapter.execute(
+                        ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context())
+                            .expect("execute request"),
+                    ),
                 )
                 .expect("no-op execute");
             let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
@@ -1615,14 +1714,16 @@ mod tests {
         append_local_file(&executor, &adapter, table.identifier(), "b");
         for expire in [false, true] {
             let before = inventory_without_private_artifacts(&root);
-            let plan = adapter
-                .plan_maintenance(local_planning_request(&key, expire))
+            let plan = executor
+                .block_on(adapter.plan_maintenance(local_planning_request(&key, expire)))
                 .expect("maintenance plan");
             assert_eq!(inventory_without_private_artifacts(&root), before);
-            let outcome = adapter
-                .execute(
-                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context())
-                        .expect("execute request"),
+            let outcome = executor
+                .block_on(
+                    adapter.execute(
+                        ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context())
+                            .expect("execute request"),
+                    ),
                 )
                 .expect("maintenance execute");
             let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
@@ -1682,14 +1783,19 @@ mod tests {
             } else {
                 SnapshotLoading::Refs
             };
-            let plan = adapter
-                .plan_maintenance(local_planning_request(&key, expire))
+            let plan = executor
+                .block_on(adapter.plan_maintenance(local_planning_request(&key, expire)))
                 .expect("maintenance plan");
             assert_eq!(*loads.lock().expect("plan loads"), vec![expected]);
-            let outcome = adapter
-                .execute(
-                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, execution_context)
+            let outcome = executor
+                .block_on(
+                    adapter.execute(
+                        ConnectorMetadataMaintenanceExecuteRequest::try_new(
+                            plan,
+                            execution_context,
+                        )
                         .expect("execute request"),
+                    ),
                 )
                 .expect("maintenance execution");
             let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
@@ -1752,7 +1858,9 @@ mod tests {
         let root = std::path::PathBuf::from(location.path());
         for expire in [false, true] {
             let request = local_planning_request(&key, expire);
-            let plan = adapter.plan_maintenance(request.clone()).expect("plan");
+            let plan = executor
+                .block_on(adapter.plan_maintenance(request.clone()))
+                .expect("plan");
             let before = inventory_without_private_artifacts(&root);
             let mut payload: IcebergMetadataMaintenancePlanPayloadV1 =
                 decode_canonical_json(plan.provider_payload(), "test plan").expect("payload");
@@ -1764,10 +1872,15 @@ mod tests {
                 canonical_json(&payload, "test invalid plan").expect("encode payload"),
             )
             .expect("invalid provider plan");
-            let error = adapter
-                .execute(
-                    ConnectorMetadataMaintenanceExecuteRequest::try_new(invalid_plan, context())
+            let error = executor
+                .block_on(
+                    adapter.execute(
+                        ConnectorMetadataMaintenanceExecuteRequest::try_new(
+                            invalid_plan,
+                            context(),
+                        )
                         .expect("execute request"),
+                    ),
                 )
                 .expect_err("provider payload must be validated without a cache");
             assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
@@ -1786,10 +1899,15 @@ mod tests {
             let fixed_payload = plan.provider_payload().clone();
             let fixed_intent = plan.intent_digest();
             let execute_plan = plan.clone();
-            let outcome = adapter
-                .execute(
-                    ConnectorMetadataMaintenanceExecuteRequest::try_new(execute_plan, context())
+            let outcome = executor
+                .block_on(
+                    adapter.execute(
+                        ConnectorMetadataMaintenanceExecuteRequest::try_new(
+                            execute_plan,
+                            context(),
+                        )
                         .expect("execute request"),
+                    ),
                 )
                 .expect("fresh policy attempt outcome");
             assert!(matches!(
@@ -1823,15 +1941,16 @@ mod tests {
         );
         let lease = real_maintenance_lease(actual);
         for expire in [false, true] {
-            let plan = lease
-                .plan_maintenance(local_planning_request(&key, expire))
+            let plan = executor
+                .block_on(lease.plan_maintenance(local_planning_request(&key, expire)))
                 .unwrap();
-            let outcome = lease
-                .execute(
+            let outcome = executor
+                .block_on(lease.execute(
                     ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context()).unwrap(),
-                )
+                ))
                 .unwrap();
             let ExternalMutationOutcome::KnownCommitted {
+                cleanup: _,
                 effect: ExternalMutationEffect::NoOp,
                 receipt,
                 finalization: ExternalMutationFinalization::Complete,
@@ -1849,6 +1968,87 @@ mod tests {
             );
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn committed_expiry_keeps_cleanup_failure_and_replays_without_republishing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (executor, _warehouse, base, key) = adapter();
+        let table = create_local_table_with_version(
+            &executor,
+            &base,
+            crate::iceberg::spec::FormatVersion::V3,
+        );
+        append_local_file(&executor, &base, table.identifier(), "first");
+        append_local_file(&executor, &base, table.identifier(), "second");
+        let before = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                table.identifier(),
+            ),
+        );
+        let head = before.metadata().current_snapshot_id();
+        let retired_list = before
+            .metadata()
+            .snapshots()
+            .find(|snapshot| Some(snapshot.snapshot_id()) != head)
+            .unwrap()
+            .manifest_list()
+            .to_owned();
+        let location = novarocks_fs::FsLocation::parse(&retired_list).unwrap();
+        let blocked = std::path::Path::new(location.path()).to_owned();
+        // The retired snapshot's exact manifest list becomes an unreadable
+        // directory. REAL reclamation I/O must fail AFTER expiry publication;
+        // no cleanup status or catalog verdict is injected.
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("retain"), b"unreclaimed").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let actual = recorded_adapter(
+            &base,
+            Arc::new(move |_, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let lease = real_maintenance_lease(actual);
+        let plan = executor
+            .block_on(lease.plan_maintenance(local_planning_request(&key, true)))
+            .unwrap();
+        let execute = || {
+            ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context()).unwrap()
+        };
+        let mut execution = lease.begin_execute(execute()).unwrap();
+        let first = executor.block_on(execution.wait()).unwrap();
+        assert_eq!(
+            execution.cleanup_responsibility(),
+            novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained
+        );
+        let ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            finalization,
+            cleanup,
+            ..
+        } = &first
+        else {
+            panic!("metadata expiration publication must be proven")
+        };
+        assert_eq!(finalization, &ExternalMutationFinalization::Complete);
+        assert!(matches!(cleanup, ExternalMutationFinalization::Failed(_)));
+        let after = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                table.identifier(),
+            ),
+        );
+        assert_eq!(after.metadata().current_snapshot_id(), head);
+        assert_eq!(after.metadata().snapshots().len(), 1);
+        assert_eq!(
+            std::fs::read(blocked.join("retain")).unwrap(),
+            b"unreclaimed"
+        );
+        assert_eq!(executor.block_on(lease.execute(execute())).unwrap(), first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1893,13 +2093,16 @@ mod tests {
             }),
         );
         let lease = real_maintenance_lease(actual);
-        let plan = lease
-            .plan_maintenance(local_planning_request(&key, true))
+        let plan = executor
+            .block_on(lease.plan_maintenance(local_planning_request(&key, true)))
             .unwrap();
-        let outcome = lease
-            .execute(ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context()).unwrap())
+        let outcome = executor
+            .block_on(lease.execute(
+                ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context()).unwrap(),
+            ))
             .unwrap();
         let ExternalMutationOutcome::KnownCommitted {
+            cleanup: _,
             effect: ExternalMutationEffect::Applied,
             receipt,
             finalization: ExternalMutationFinalization::Complete,
@@ -1968,6 +2171,157 @@ mod tests {
             || {},
         )
         .expect("real metadata and maintenance adapter share the exact generation")
+    }
+
+    struct ObservationCpu {
+        descriptor: ConnectorInstanceDescriptor,
+        epoch: novarocks_spi::connector::ProviderBindingEpoch,
+        calls: std::sync::atomic::AtomicUsize,
+        first_receipt: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        footer: Mutex<tokio::sync::oneshot::Receiver<()>>,
+        closed: std::sync::atomic::AtomicBool,
+    }
+    // Component-only CPU executor: runs the real private phase. The independent
+    // footer verifies Source custody, not the FA Work/physical CPU admission.
+    impl novarocks_spi::connector::ProviderMetadataCpuPort for ObservationCpu {
+        fn submit_metadata_in(
+            &self,
+            input: &mut Option<novarocks_spi::connector::ProviderMetadataCpuInput>,
+        ) -> Result<(), ConnectorError> {
+            use std::sync::atomic::Ordering;
+            let source = input.as_ref().expect("original phase");
+            assert_eq!(source.descriptor(), &self.descriptor);
+            assert_eq!(source.incarnation(), self.epoch);
+            assert_eq!(
+                source.original_source_type_id(),
+                std::any::TypeId::of::<
+                    crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                >()
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            input.take().unwrap().run_original_phase();
+            Ok(())
+        }
+        fn poll_finished(&self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+            let mut receipt = self.first_receipt.lock().unwrap();
+            if let Some(receiving) = receipt.as_mut() {
+                std::task::ready!(Pin::new(receiving).poll(cx))
+                    .expect("original first CPU receipt released");
+                *receipt = None;
+            }
+            Poll::Ready(Ok(()))
+        }
+        fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+            use std::sync::atomic::Ordering;
+            if self.closed.load(Ordering::SeqCst) {
+                return Poll::Ready(Ok(()));
+            }
+            std::task::ready!(Pin::new(&mut *self.footer.lock().unwrap()).poll(cx))
+                .expect("original footer released");
+            self.closed.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            None
+        }
+    }
+
+    #[test]
+    fn original_compaction_scalar_retains_real_manifest_source_until_footer() {
+        use std::sync::atomic::Ordering;
+        let (executor, _warehouse, adapter, key) = adapter();
+        let table = create_local_table(&executor, &adapter);
+        for file in ["a", "b", "c"] {
+            append_local_file(&executor, &adapter, table.identifier(), file);
+        }
+        let root = std::path::PathBuf::from(
+            novarocks_fs::FsLocation::parse(table.metadata().location())
+                .unwrap()
+                .path(),
+        );
+        let before = inventory_without_private_artifacts(&root);
+        let request = ConnectorMaxCompactableDataFilesRequest::try_new(
+            local_planning_request(&key, false)
+                .operation()
+                .table()
+                .clone(),
+            context(),
+        )
+        .unwrap();
+        let (release_first, first_receipt) = tokio::sync::oneshot::channel();
+        let (release, footer) = tokio::sync::oneshot::channel();
+        let cpu = Arc::new(ObservationCpu {
+            descriptor: adapter.descriptor.clone(),
+            epoch: key.incarnation,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            first_receipt: Mutex::new(Some(first_receipt)),
+            footer: Mutex::new(footer),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let lease = real_maintenance_lease(adapter);
+        executor.block_on(async {
+            let mut original = lease
+                .begin_read_max_compactable_data_files(request, cpu.clone())
+                .unwrap();
+            // Cancelling a borrowed wait does not drop its original Source.
+            let mut borrowed = Box::pin(std::future::poll_fn(|cx| original.poll_result(cx)));
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(borrowed.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(cpu.calls.load(Ordering::SeqCst), 1);
+            drop(borrowed);
+            release_first.send(()).unwrap();
+            let scalar = std::future::poll_fn(|cx| original.poll_result(cx))
+                .await
+                .unwrap();
+            assert_eq!(scalar.value(), Some(3));
+            assert!(
+                cpu.calls.load(Ordering::SeqCst) > 2,
+                "real table/list/manifest CPU phases"
+            );
+            assert!(original.poll_closed(&mut cx).is_pending());
+            assert!(original.local_failure().is_none());
+            let calls = cpu.calls.load(Ordering::SeqCst);
+            assert_eq!(
+                std::future::poll_fn(|cx| original.poll_result(cx))
+                    .await
+                    .unwrap(),
+                scalar
+            );
+            assert_eq!(
+                cpu.calls.load(Ordering::SeqCst),
+                calls,
+                "observation is not replayed"
+            );
+            release.send(()).unwrap();
+            std::future::poll_fn(|cx| original.poll_closed(cx))
+                .await
+                .unwrap();
+            assert!(cpu.closed.load(Ordering::SeqCst));
+            let foreign = ConnectorMaxCompactableDataFilesRequest::try_new(
+                ConnectorTableHandle::try_new(
+                    ConnectorInstanceId::parse("foreign-observation").unwrap(),
+                    Bytes::from_static(b"not decoded"),
+                )
+                .unwrap(),
+                context(),
+            )
+            .unwrap();
+            assert_eq!(
+                lease
+                    .begin_read_max_compactable_data_files(foreign, cpu.clone())
+                    .err()
+                    .unwrap()
+                    .kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+            assert_eq!(cpu.calls.load(Ordering::SeqCst), calls);
+        });
+        assert_eq!(
+            inventory_without_private_artifacts(&root),
+            before,
+            "read-only observation"
+        );
     }
 
     fn competing_adapter(
@@ -2410,28 +2764,32 @@ mod tests {
         let handle = ConnectorTableHandle::try_new(key.instance_id.clone(), Bytes::from_static(
             br#"{"namespace":"maintenance_test","table":"snapshot_copy","metadata_location":null,"table_info":null,"metadata_columns":[],"metadata_table_type":null,"prepared_files":[],"explicit_files":null}"#,
         )).unwrap();
-        let plan = lease
-            .plan_maintenance(
-                ConnectorMetadataMaintenancePlanningRequest::try_new(
-                    ConnectorMutationOperationId::new(),
-                    key.clone(),
-                    ConnectorMetadataMaintenanceOperation::expire_table_versions(
-                        handle,
-                        Some(i64::MAX),
-                        Some(1),
+        let plan = executor
+            .block_on(
+                lease.plan_maintenance(
+                    ConnectorMetadataMaintenancePlanningRequest::try_new(
+                        ConnectorMutationOperationId::new(),
+                        key.clone(),
+                        ConnectorMetadataMaintenanceOperation::expire_table_versions(
+                            handle,
+                            Some(i64::MAX),
+                            Some(1),
+                        )
+                        .unwrap(),
+                        context(),
                     )
                     .unwrap(),
-                    context(),
-                )
-                .unwrap(),
+                ),
             )
             .unwrap();
         let fixed_payload = plan.provider_payload().clone();
         let fixed_intent = plan.intent_digest();
-        let outcome = lease
-            .execute(
-                ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
-                    .unwrap(),
+        let outcome = executor
+            .block_on(
+                lease.execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
+                        .unwrap(),
+                ),
             )
             .unwrap();
         let ExternalMutationOutcome::KnownUncommitted { failure, cleanup } = outcome else {
@@ -2535,13 +2893,15 @@ mod tests {
             context(),
         )
         .unwrap();
-        let plan = lease.plan_maintenance(request).unwrap();
+        let plan = executor.block_on(lease.plan_maintenance(request)).unwrap();
         let payload = plan.provider_payload().clone();
         let intent = plan.intent_digest();
-        let outcome = lease
-            .execute(
-                ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
-                    .unwrap(),
+        let outcome = executor
+            .block_on(
+                lease.execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
+                        .unwrap(),
+                ),
             )
             .unwrap();
         let ExternalMutationOutcome::KnownCommitted {
@@ -2615,17 +2975,20 @@ mod tests {
             }),
         );
         let lease = real_maintenance_lease(adapter);
-        let plan = lease
-            .plan_maintenance(local_planning_request(&key, false))
+        let plan = executor
+            .block_on(lease.plan_maintenance(local_planning_request(&key, false)))
             .unwrap();
         let operation = OperationToken::from_mutation(plan.operation_id()).path_component();
-        let outcome = lease
-            .execute(
-                ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
-                    .unwrap(),
+        let outcome = executor
+            .block_on(
+                lease.execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
+                        .unwrap(),
+                ),
             )
             .unwrap();
         let ExternalMutationOutcome::KnownCommitted {
+            cleanup: _,
             effect: ExternalMutationEffect::Applied,
             receipt,
             finalization,
@@ -2734,6 +3097,7 @@ mod tests {
                     .block_on(async move {
                         let plan = catalog
                             .plan_maintenance(local_planning_request(&catalog.key, false))
+                            .await
                             .unwrap();
                         let outcome = catalog
                             .execute(
@@ -2743,6 +3107,7 @@ mod tests {
                                 )
                                 .unwrap(),
                             )
+                            .await
                             .unwrap();
                         let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome
                         else {
@@ -2774,19 +3139,22 @@ mod tests {
             }),
         );
         let lease = real_maintenance_lease(adapter);
-        let plan = lease
-            .plan_maintenance(local_planning_request(&key, false))
+        let plan = executor
+            .block_on(lease.plan_maintenance(local_planning_request(&key, false)))
             .unwrap();
         let payload = plan.provider_payload().clone();
         let intent = plan.intent_digest();
         let operation = OperationToken::from_mutation(plan.operation_id()).path_component();
-        let outcome = lease
-            .execute(
-                ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
-                    .unwrap(),
+        let outcome = executor
+            .block_on(
+                lease.execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
+                        .unwrap(),
+                ),
             )
             .unwrap();
         let ExternalMutationOutcome::KnownCommitted {
+            cleanup: _,
             effect: ExternalMutationEffect::NoOp,
             receipt,
             finalization,
@@ -2976,8 +3344,8 @@ mod tests {
             }),
         );
         let lease = real_maintenance_lease(adapter);
-        let plan = lease
-            .plan_maintenance(local_planning_request(&key, false))
+        let plan = executor
+            .block_on(lease.plan_maintenance(local_planning_request(&key, false)))
             .unwrap();
         let payload = plan.provider_payload().clone();
         let intent = plan.intent_digest();
@@ -2985,10 +3353,12 @@ mod tests {
             decode_canonical_json(&payload, "fixed original target").unwrap();
         assert_eq!(fixed.table_uuid, original_uuid.to_string());
         let operation = OperationToken::from_mutation(plan.operation_id()).path_component();
-        let outcome = lease
-            .execute(
-                ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
-                    .unwrap(),
+        let outcome = executor
+            .block_on(
+                lease.execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
+                        .unwrap(),
+                ),
             )
             .unwrap();
         assert!(
@@ -3078,8 +3448,8 @@ mod tests {
         let actual =
             IcebergMetadataMaintenanceAdapter::new(key.clone(), Arc::new(runtime)).unwrap();
         let lease = real_maintenance_lease(actual);
-        let plan = lease
-            .plan_maintenance(local_planning_request(&key, false))
+        let plan = executor
+            .block_on(lease.plan_maintenance(local_planning_request(&key, false)))
             .unwrap();
         let fixed_payload = plan.provider_payload().clone();
         let fixed_intent = plan.intent_digest();
@@ -3088,7 +3458,7 @@ mod tests {
             ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context()).unwrap()
         };
         let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
-            lease.execute(execute()).unwrap()
+            executor.block_on(lease.execute(execute())).unwrap()
         else {
             panic!("the real Applied reply was lost before its journal observed the proof")
         };
@@ -3165,10 +3535,11 @@ mod tests {
         for replay in 0..2 {
             loads.lock().unwrap().clear();
             let ExternalMutationOutcome::KnownCommitted {
+                cleanup: _,
                 effect: ExternalMutationEffect::Applied,
                 receipt,
                 finalization: ExternalMutationFinalization::Failed(failure),
-            } = lease.execute(execute()).unwrap()
+            } = executor.block_on(lease.execute(execute())).unwrap()
             else {
                 panic!("read-only marker attribution must refine that original Unknown")
             };
@@ -3271,12 +3642,14 @@ mod tests {
                 );
             }),
         );
-        let plan = adapter
-            .plan_maintenance(local_planning_request(&key, false))
+        let plan = executor
+            .block_on(adapter.plan_maintenance(local_planning_request(&key, false)))
             .unwrap();
         let operation = OperationToken::from_mutation(plan.operation_id()).path_component();
-        let outcome = adapter
-            .execute(ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context()).unwrap())
+        let outcome = executor
+            .block_on(adapter.execute(
+                ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context()).unwrap(),
+            ))
             .unwrap();
         assert!(
             matches!(outcome,ExternalMutationOutcome::KnownUncommitted{failure,..} if failure.kind()==ConnectorMutationFailureKind::Conflict)
@@ -3295,18 +3668,19 @@ mod tests {
     }
     #[test]
     fn terminal_replay_preserves_failed_finalization() {
-        let (_executor, _warehouse, adapter, key) = adapter();
+        let (executor, _warehouse, adapter, key) = adapter();
         let plan = plan(key, ConnectorMutationOperationId::new(), b"table-a");
         let expected_receipt = receipt(&adapter, &plan);
         let expected_failure = ConnectorMutationFailure::new(
             ConnectorMutationFailureKind::Unavailable,
-            "cleanup response was lost",
+            "necessary owner cache finalization was lost",
         );
         adapter.terminal.lock().expect("terminal").insert(
             plan.operation_id(),
             TerminalRecord {
                 plan_digest: plan.plan_digest(),
                 outcome: ExternalMutationOutcome::KnownCommitted {
+                    cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                     effect: ExternalMutationEffect::Applied,
                     receipt: expected_receipt.clone(),
                     finalization: ExternalMutationFinalization::Failed(expected_failure.clone()),
@@ -3314,10 +3688,12 @@ mod tests {
             },
         );
 
-        let outcome = adapter
-            .execute(
-                ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context())
-                    .expect("execute request"),
+        let outcome = executor
+            .block_on(
+                adapter.execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context())
+                        .expect("execute request"),
+                ),
             )
             .expect("terminal replay");
         let ExternalMutationOutcome::KnownCommitted {
@@ -3348,7 +3724,9 @@ mod tests {
             context(),
         )
         .unwrap();
-        let exact_plan = adapter.plan_maintenance(request.clone()).unwrap();
+        let exact_plan = executor
+            .block_on(adapter.plan_maintenance(request.clone()))
+            .unwrap();
         let evidence = ExternalMutationEvidence::try_new(
             PAYLOAD_VERSION,
             adapter.descriptor.clone(),
@@ -3373,13 +3751,15 @@ mod tests {
         );
 
         for _ in 0..2 {
-            let outcome = adapter
-                .execute(
-                    ConnectorMetadataMaintenanceExecuteRequest::try_new(
-                        exact_plan.clone(),
-                        context(),
-                    )
-                    .expect("execute request"),
+            let outcome = executor
+                .block_on(
+                    adapter.execute(
+                        ConnectorMetadataMaintenanceExecuteRequest::try_new(
+                            exact_plan.clone(),
+                            context(),
+                        )
+                        .expect("execute request"),
+                    ),
                 )
                 .expect("unknown replay");
             let ExternalMutationOutcome::CommitUnknown {
@@ -3409,10 +3789,12 @@ mod tests {
         assert_eq!(conflicting.request_digest(), exact_plan.request_digest());
         assert_ne!(conflicting.intent_digest(), exact_plan.intent_digest());
         assert_ne!(conflicting.plan_digest(), exact_plan.plan_digest());
-        let error = adapter
-            .execute(
-                ConnectorMetadataMaintenanceExecuteRequest::try_new(conflicting, context())
-                    .expect("execute request"),
+        let error = executor
+            .block_on(
+                adapter.execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(conflicting, context())
+                        .expect("execute request"),
+                ),
             )
             .expect_err("same operation with a different plan must conflict");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
@@ -3424,10 +3806,10 @@ mod tests {
             ConnectorMutationOperationId::new(),
             b"invalid-table-handle",
         );
-        let malformed_error = adapter
-            .execute(
+        let malformed_error = executor
+            .block_on(adapter.execute(
                 ConnectorMetadataMaintenanceExecuteRequest::try_new(malformed, context()).unwrap(),
-            )
+            ))
             .expect_err("malformed payload must fail before publication");
         assert_eq!(malformed_error.kind(), ConnectorErrorKind::InvalidRequest);
         assert!(
@@ -3452,7 +3834,7 @@ mod tests {
 
     #[test]
     fn foreign_generation_is_rejected_before_catalog_access() {
-        let (_executor, _warehouse, adapter, key) = adapter();
+        let (executor, _warehouse, adapter, key) = adapter();
         let foreign_key = ConnectorProviderBindingKey {
             instance_id: key.instance_id,
             incarnation: ProviderBindingEpoch::from_bytes([8; 16]),
@@ -3462,10 +3844,12 @@ mod tests {
             ConnectorMutationOperationId::new(),
             b"foreign-table",
         );
-        let error = adapter
-            .execute(
-                ConnectorMetadataMaintenanceExecuteRequest::try_new(foreign, context())
-                    .expect("execute request"),
+        let error = executor
+            .block_on(
+                adapter.execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(foreign, context())
+                        .expect("execute request"),
+                ),
             )
             .expect_err("foreign generation must fail closed");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
@@ -3572,7 +3956,7 @@ mod tests {
     #[test]
     fn planning_refuses_hms_and_background_hadoop_before_maintenance_artifacts() {
         for catalog_type in ["hive", "hadoop"] {
-            let (_executor, warehouse, runtime, listener) = admission_runtime(catalog_type);
+            let (executor, warehouse, runtime, listener) = admission_runtime(catalog_type);
             let key = ConnectorProviderBindingKey {
                 instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
                 incarnation: ProviderBindingEpoch::from_bytes([8; 16]),
@@ -3598,8 +3982,8 @@ mod tests {
                     admission_context(catalog_type),
                 )
                 .expect("request");
-                let error = adapter
-                    .plan_maintenance(request)
+                let error = executor
+                    .block_on(adapter.plan_maintenance(request))
                     .expect_err("catalog admission must refuse planning");
                 assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
                 assert!(error.to_string().contains(if catalog_type == "hive" {

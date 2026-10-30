@@ -159,6 +159,60 @@ async fn compute_background_roots_share_the_warehouse_query_queue() {
     assert_eq!(control.snapshot().admitted_queries, 0);
 }
 
+#[test]
+fn unpolled_warehouse_roots_and_children_share_the_finite_scope_inventory() {
+    for class in [
+        WorkClass::Query,
+        WorkClass::MaterializedView,
+        WorkClass::Statistics,
+        WorkClass::TableMaintenance,
+    ] {
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            root_limit: 1,
+            business_limit: 1,
+            query_concurrency_limit: 1,
+            scope_records_limit: 2,
+            ..config()
+        })
+        .unwrap()
+        .owner;
+        control.mark_ready().unwrap();
+        // Neither request has polled the one warehouse concurrency queue.
+        let first = control
+            .begin_warehouse_root(WorkRequest::new(class))
+            .unwrap();
+        let second = control
+            .begin_warehouse_root(WorkRequest::new(class))
+            .unwrap();
+        let mut refused = None;
+        assert_eq!(
+            control
+                .root_admission()
+                .begin_warehouse_root_in(WorkRequest::new(class), &mut refused),
+            Err(WorkError::Capacity("scope records"))
+        );
+        assert!(refused.is_none());
+        let full = control.snapshot();
+        assert_eq!(full.scopes.len(), 2);
+        assert_eq!(full.admission_records, 0);
+        assert_eq!(full.admitted_queries, 0);
+        first.owner.complete();
+        let child = second.owner.scope().child_inherited().unwrap();
+        assert!(matches!(
+            control.begin_warehouse_root(WorkRequest::new(class)),
+            Err(WorkError::Capacity("scope records"))
+        ));
+        child.complete();
+        let next = control
+            .begin_warehouse_root(WorkRequest::new(class))
+            .unwrap();
+        next.owner.complete();
+        second.owner.complete();
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+    }
+}
+
 #[tokio::test]
 async fn cancelled_queued_query_never_consumes_concurrency_or_leaks_its_root() {
     let mut limits = config();
@@ -422,7 +476,7 @@ async fn progress_wait_prioritizes_ready_control_work() {
 }
 
 #[test]
-fn invalid_and_excessive_configuration_is_rejected() {
+fn configuration_rejects_invalid_bounds_without_an_extra_queue_limit() {
     let mut invalid = config();
     invalid.root_limit = 0;
     assert!(matches!(
@@ -432,9 +486,13 @@ fn invalid_and_excessive_configuration_is_rejected() {
     let mut invalid = config();
     invalid.scope_records_limit = 7;
     assert!(invalid.validate().is_err());
-    let mut invalid = config();
-    invalid.waiting_limit = usize::MAX;
-    assert!(invalid.validate().is_err());
+    // Entries are allocated as they arrive; this configured queue limit does
+    // not imply preallocation or another policy ceiling.
+    for waiting_limit in [1_000_001, usize::MAX] {
+        let mut configured = config();
+        configured.waiting_limit = waiting_limit;
+        assert_eq!(configured.validate(), Ok(()));
+    }
     let mut invalid = config();
     invalid.waiting_bytes = u64::MAX;
     assert!(invalid.validate().is_err());
@@ -735,7 +793,7 @@ async fn cloned_cancellation_requester_is_first_wins_and_downward_only() {
     assert_eq!(
         requester
             .request_with_outcome(CancellationReason::ExplicitKill {
-                requester_connection_id: 41,
+                requester_session: 41,
             })
             .unwrap(),
         WorkCancellationRequestOutcome::Requested
@@ -746,12 +804,12 @@ async fn cloned_cancellation_requester_is_first_wins_and_downward_only() {
             .request_with_outcome(CancellationReason::ServerShutdown)
             .unwrap(),
         WorkCancellationRequestOutcome::AlreadyRequested(CancellationReason::ExplicitKill {
-            requester_connection_id: 41,
+            requester_session: 41,
         })
     );
 
     let expected = CancellationReason::ExplicitKill {
-        requester_connection_id: 41,
+        requester_session: 41,
     };
     assert_eq!(
         target.scope().cancellation().unwrap().reason(),
@@ -792,7 +850,7 @@ fn success_seal_and_cancellation_share_one_first_wins_authority() {
             .owner
             .cancellation_requester()
             .request_with_outcome(CancellationReason::ExplicitKill {
-                requester_connection_id: 9,
+                requester_session: 9,
             })
             .unwrap(),
         WorkCancellationRequestOutcome::Requested
@@ -800,7 +858,7 @@ fn success_seal_and_cancellation_share_one_first_wins_authority() {
     assert_eq!(
         sealer.seal().unwrap(),
         WorkSuccessSealOutcome::Cancelled(CancellationReason::ExplicitKill {
-            requester_connection_id: 9,
+            requester_session: 9,
         })
     );
 }

@@ -216,6 +216,7 @@ impl MysqlWriteGateHub {
     pub(crate) fn bind_statement(
         self: &Arc<Self>,
         actual_connection: ClientConnectionToken,
+        expected_session: novarocks_query_application::session_control::SessionToken,
         actual_statement: StatementToken,
         actual_sql_sha256: [u8; 32],
     ) -> io::Result<Option<MysqlWriteRelayHook>> {
@@ -253,8 +254,7 @@ impl MysqlWriteGateHub {
                 return Ok(None);
             }
             if arm.sql_sha256 != actual_sql_sha256
-                || actual_statement.session().connection_id() != actual_connection.connection_id()
-                || actual_statement.session().session_epoch() == 0
+                || actual_statement.session() != expected_session
                 || actual_statement.generation() == 0
             {
                 return Err(hub_fail(state, GateFailure::Identity));
@@ -262,7 +262,12 @@ impl MysqlWriteGateHub {
             // The statement epoch is never equated with connection generation.
             let scope = Arc::new(MysqlWriteTestScope::new(actual_connection, self.deadline));
             state.scope = Some(Arc::clone(&scope));
-            if let Err(original_error) = scope.arm(actual_statement, actual_sql_sha256, arm.cut) {
+            if let Err(original_error) = scope.arm(
+                actual_statement,
+                expected_session,
+                actual_sql_sha256,
+                arm.cut,
+            ) {
                 state
                     .failure
                     .get_or_insert(scope.snapshot().failure.unwrap_or(GateFailure::Transition));
@@ -592,7 +597,6 @@ impl MysqlWriteRelayHook {
         let facts = self.scope.snapshot();
         let hub = self.hub.snapshot();
         if facts.statement != Some(self.statement)
-            || facts.connection.connection_id() != self.statement.session().connection_id()
             || facts.cancel_receipt != Some(actual_receipt)
             || facts.phase != GatePhase::Resumed
             || facts.failure.is_some()
@@ -825,10 +829,18 @@ mod tests {
         hub.install_action_observation(Arc::clone(&observation));
         assert!(!role.scope().observations().iter().any(|o| o.event == "hit"));
         let connection = ClientConnectionToken::new(71, 19).unwrap();
-        let statement = StatementToken::new(SessionToken::new(71, 23), 30);
+        let statement = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (71_u64 << 32) | 23_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            30,
+        );
         controller.arm(frontend, nonce, 71, SQL, 2).unwrap();
         let hook = hub
-            .bind_statement(connection, statement, SQL)
+            .bind_statement(connection, statement.session(), statement, SQL)
             .unwrap()
             .unwrap();
         let raw = InitiallyRawMysqlWriter::new(Vec::new(), connection, Arc::clone(&hub));
@@ -1004,11 +1016,51 @@ mod tests {
         fn invalid_followup(self) -> Option<StatementToken> {
             match self {
                 Self::StaleStatement => Some(identities().1),
-                Self::OlderStatement => Some(StatementToken::new(SessionToken::new(71, 23), 28)),
-                Self::WrongSession => Some(StatementToken::new(SessionToken::new(72, 23), 30)),
-                Self::WrongSessionEpoch => Some(StatementToken::new(SessionToken::new(71, 24), 30)),
-                Self::ZeroStatement => Some(StatementToken::new(SessionToken::new(71, 23), 0)),
-                Self::ZeroEpoch => Some(StatementToken::new(SessionToken::new(71, 0), 30)),
+                Self::OlderStatement => Some(StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (71_u64 << 32) | 23_u64,
+                        )
+                        .expect("nonzero fixture session"),
+                    ),
+                    28,
+                )),
+                Self::WrongSession => Some(StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (72_u64 << 32) | 23_u64,
+                        )
+                        .expect("nonzero fixture session"),
+                    ),
+                    30,
+                )),
+                Self::WrongSessionEpoch => Some(StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (71_u64 << 32) | 24_u64,
+                        )
+                        .expect("nonzero fixture session"),
+                    ),
+                    30,
+                )),
+                Self::ZeroStatement => Some(StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (71_u64 << 32) | 23_u64,
+                        )
+                        .expect("nonzero fixture session"),
+                    ),
+                    0,
+                )),
+                Self::ZeroEpoch => Some(StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            71_u64 << 32,
+                        )
+                        .expect("nonzero fixture session"),
+                    ),
+                    30,
+                )),
                 _ => None,
             }
         }
@@ -1018,7 +1070,15 @@ mod tests {
     async fn prescribed_eof_mint_refuses_wrong_receipt_statement_phase_and_prior_failure() {
         for case in 0..4 {
             let connection = ClientConnectionToken::new(71, 19).unwrap();
-            let original_statement = StatementToken::new(SessionToken::new(71, 23), 30);
+            let original_statement = StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (71_u64 << 32) | 23_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                30,
+            );
             let (hub, mut controller) = MysqlWriteGateHub::new(
                 FrontendProcessId::new_v7(),
                 NONCE,
@@ -1029,7 +1089,12 @@ mod tests {
                 .arm(controller.snapshot().frontend, NONCE, 71, SQL, 2)
                 .unwrap();
             let mut hook = hub
-                .bind_statement(connection, original_statement, SQL)
+                .bind_statement(
+                    connection,
+                    original_statement.session(),
+                    original_statement,
+                    SQL,
+                )
                 .unwrap()
                 .unwrap();
             let original = InitiallyRawMysqlWriter::new(Vec::new(), connection, hub.clone());
@@ -1089,7 +1154,15 @@ mod tests {
     async fn original_freeze_observation_refuses_duplicate_wrong_receipt_phase_and_prior_failure() {
         for case in 0..4 {
             let connection = ClientConnectionToken::new(71, 19).unwrap();
-            let statement = StatementToken::new(SessionToken::new(71, 23), 30);
+            let statement = StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (71_u64 << 32) | 23_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                30,
+            );
             let (hub, mut controller) = MysqlWriteGateHub::new(
                 FrontendProcessId::new_v7(),
                 NONCE,
@@ -1100,7 +1173,7 @@ mod tests {
                 .arm(controller.snapshot().frontend, NONCE, 71, SQL, 2)
                 .unwrap();
             let hook = hub
-                .bind_statement(connection, statement, SQL)
+                .bind_statement(connection, statement.session(), statement, SQL)
                 .unwrap()
                 .unwrap();
             let original = InitiallyRawMysqlWriter::new(Vec::new(), connection, hub.clone());
@@ -1219,11 +1292,27 @@ mod tests {
     fn identities() -> (ClientConnectionToken, StatementToken) {
         (
             ClientConnectionToken::new(71, 19).unwrap(),
-            StatementToken::new(SessionToken::new(71, 23), 29),
+            StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (71_u64 << 32) | 23_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                29,
+            ),
         )
     }
     fn followup_statement() -> StatementToken {
-        StatementToken::new(SessionToken::new(71, 23), 30)
+        StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (71_u64 << 32) | 23_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            30,
+        )
     }
     async fn pair() -> io::Result<(TcpStream, tokio::net::tcp::OwnedWriteHalf)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1268,7 +1357,7 @@ mod tests {
                 raw.write_all(&greeting()).await?;
                 assert!(raw.bound.is_none());
                 arm_rx.await.map_err(io::Error::other)?;
-                let hook = writer_hub.bind_statement(connection, statement, SQL)?.expect("one real fixture owner");
+                let hook = writer_hub.bind_statement(connection, statement.session(), statement, SQL)?.expect("one real fixture owner");
                 assert!(!hook.scope.snapshot().writer_attached);
                 let mut writer = OwnedStreamingMysqlWriter::new(raw, ProtocolLimits::default(), 1)?;
                 writer.start_metadata(metadata()?)?;
@@ -1282,10 +1371,8 @@ mod tests {
                 assert_eq!(hook.scope.snapshot().accepted_prefix_bytes, 0);
                 if !case.has_rows() {
                     let failure = match case {
-                        Case::WrongGeneration => writer_hub.bind_statement(
-                            ClientConnectionToken::new(71, 20).unwrap(), followup_statement(), HEALTHY_SQL,
-                        ).err().expect("same id, different original generation is refused"),
-                        Case::EarlyStreaming => writer_hub.bind_statement(connection, followup_statement(), HEALTHY_SQL)
+                        Case::WrongGeneration => writer_hub.bind_statement(ClientConnectionToken::new(71, 20).unwrap(), followup_statement().session(), followup_statement(), HEALTHY_SQL).err().expect("same id, different original generation is refused"),
+                        Case::EarlyStreaming => writer_hub.bind_statement(connection, followup_statement().session(), followup_statement(), HEALTHY_SQL)
                             .err().expect("early streaming query is refused"),
                         Case::EarlyLocal => writer_hub.reject_non_streaming_target(connection, HEALTHY_SQL)
                             .expect_err("early local query is refused"),
@@ -1334,7 +1421,7 @@ mod tests {
                 writer.flush_socket().await?;
                 assert_eq!(writer.receipt().rows_completed, 1);
                 if let Some(invalid_statement) = case.invalid_followup() {
-                    assert_eq!(writer_hub.bind_statement(connection, invalid_statement, HEALTHY_SQL)
+                    assert_eq!(writer_hub.bind_statement(connection, invalid_statement.session(), invalid_statement, HEALTHY_SQL)
                         .err().expect("a different SQL digest cannot validate a stale or foreign statement").kind(), io::ErrorKind::InvalidData);
                     assert_eq!(writer_hub.snapshot().failure, Some(GateFailure::Identity));
                     facts_tx.send(ServerFacts { baseline, cancel: Some(cancel), hub: writer_hub.snapshot() })
@@ -1344,7 +1431,7 @@ mod tests {
                     return Ok(());
                 }
                 // A legitimate newer generation need not be the immediately adjacent one.
-                assert!(writer_hub.bind_statement(connection, StatementToken::new(statement.session(), 31), HEALTHY_SQL)?.is_none());
+                assert!(writer_hub.bind_statement(connection, StatementToken::new(statement.session(), 31).session(), StatementToken::new(statement.session(), 31), HEALTHY_SQL)?.is_none());
                 writer_hub.reject_non_streaming_target(connection, HEALTHY_SQL)?;
                 // Same original TCP half and same scope; reset only the new statement's framing cursor.
                 let same_io = writer.into_inner();
@@ -1536,7 +1623,7 @@ mod tests {
         tcp_case(Case::WrongSession).await
     }
     #[tokio::test]
-    async fn actual_tcp_new_session_epoch_followup_is_refused() -> io::Result<()> {
+    async fn actual_tcp_new_session_key_followup_is_refused() -> io::Result<()> {
         tcp_case(Case::WrongSessionEpoch).await
     }
     #[tokio::test]
@@ -1641,7 +1728,9 @@ mod tests {
         let (hub, mut controller) =
             MysqlWriteGateHub::new(frontend, NONCE, Instant::now() + Duration::from_secs(5))?;
         controller.arm(frontend, NONCE, connection.connection_id(), SQL, 2)?;
-        let hook = hub.bind_statement(connection, statement, SQL)?.unwrap();
+        let hook = hub
+            .bind_statement(connection, statement.session(), statement, SQL)?
+            .unwrap();
         let raw = InitiallyRawMysqlWriter::new(
             ScriptedInner { over_length: None },
             connection,
@@ -1676,8 +1765,13 @@ mod tests {
             // The original inner-poll cause has already reached the actual Hub state.
             assert_eq!(hub.state.lock().unwrap().failure, Some(GateFailure::Length));
             assert!(
-                hub.bind_statement(connection, followup_statement(), HEALTHY_SQL)
-                    .is_err()
+                hub.bind_statement(
+                    connection,
+                    followup_statement().session(),
+                    followup_statement(),
+                    HEALTHY_SQL
+                )
+                .is_err()
             );
             controller.fail(GateFailure::Identity);
             assert_eq!(controller.snapshot().failure, Some(GateFailure::Length));

@@ -199,6 +199,16 @@ fn resolve_dataset(
     if let Some(shared_root) = fixture_shared_root(runner_config) {
         command.arg("--shared-root").arg(shared_root);
     }
+    let kind = runner_config
+        .values
+        .get("fixture_object_store_kind")
+        .map(String::as_str)
+        .unwrap_or("minio");
+    anyhow::ensure!(
+        matches!(kind, "minio" | "aliyun-oss"),
+        "unsupported prepared dataset object-store kind"
+    );
+    command.arg("--object-store-kind").arg(kind);
     let preview = command_preview(&command);
     let output = bounded_output(command, budget)
         .with_context(|| format!("failed to run dataset fixture resolver: {preview}"))?;
@@ -277,6 +287,16 @@ fn validate_typed_check_output(
     if let Some(shared_root) = fixture_shared_root(runner_config) {
         command.arg("--shared-root").arg(shared_root);
     }
+    let kind = runner_config
+        .values
+        .get("fixture_object_store_kind")
+        .map(String::as_str)
+        .unwrap_or("minio");
+    anyhow::ensure!(
+        matches!(kind, "minio" | "aliyun-oss"),
+        "unsupported prepared dataset object-store kind"
+    );
+    command.arg("--object-store-kind").arg(kind);
     let preview = command_preview(&command);
     let validation = bounded_output(command, budget)
         .with_context(|| format!("failed to validate dataset fixture result: {preview}"))?;
@@ -363,12 +383,7 @@ fn validate_checked_result(
 }
 
 fn validate_fixture_error(error: FixtureError, resolved: &ResolvedDataset) -> Result<()> {
-    const KNOWN_ERRORS: &[&str] = &[
-        "ready_invalid",
-        "writer_failed",
-        "publication_conflict",
-        "publication_failed",
-    ];
+    const KNOWN_ERRORS: &[&str] = &["ready_invalid", "writer_failed", "publication_failed"];
     if error.schema_version != 1
         || error.dataset_key != resolved.dataset_key
         || !KNOWN_ERRORS.contains(&error.error.as_str())
@@ -519,6 +534,44 @@ END
                 .lines()
                 .count(),
             3
+        );
+    }
+
+    #[test]
+    fn oss_dataset_check_preserves_its_explicit_producer_selection() {
+        let (temp, mut config) = fixture();
+        config
+            .values
+            .insert("fixture_object_store_kind".into(), "aliyun-oss".into());
+        let resolver = PathBuf::from(&config.values["benchmark_fixture_resolver"]);
+        let source = std::fs::read_to_string(&resolver).unwrap();
+        let log = temp.path().join("producer-selection");
+        let assertion = format!(
+            "args=sys.argv[1:]\nassert args[args.index('--object-store-kind')+1]=='aliyun-oss'\nwith open({:?}, 'a') as selected: selected.write('checked\\n')",
+            log.to_string_lossy()
+        );
+        std::fs::write(&resolver, source.replace("args=sys.argv[1:]", &assertion)).unwrap();
+        bind_prepared_dataset(
+            &PreparedDatasetRequirement {
+                dataset: DatasetName::Ssb,
+                scale: "1".into(),
+            },
+            &config,
+            temp.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap().lines().count(),
+            2,
+            "resolution and typed result validation must use the same provider"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "cloud consumption remains one check-only call"
         );
     }
 

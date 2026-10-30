@@ -117,8 +117,12 @@ fn instance(a: &ArrayRef) -> ScalarEvaluationInstance {
 fn list(values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bool>>) -> ArrayRef {
     let raw: ArrayRef = Arc::new(ListArray::new(
         Arc::new(
-            Field::new("source-child", values.data_type().clone(), true)
-                .with_metadata([("nested-proof".into(), "retained".into())].into()),
+            Field::new("source-child", values.data_type().clone(), true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "nested-proof".into(),
+                    "retained".into(),
+                )]),
+            ),
         ),
         OffsetBuffer::new(offsets.into()),
         values,
@@ -542,4 +546,41 @@ fn array_difference_required_decimal_overflow_and_shape_have_distinct_facts() {
             .class(),
         FailureClass::Invariant
     );
+}
+
+#[test]
+fn array_difference_decimal_child_retains_original_float_bits_on_slices_and_nulls() {
+    let values: ArrayRef = Arc::new(
+        Decimal128Array::new(
+            vec![
+                0,
+                12_345_678_901_234_567_890_i128,
+                77,
+                0,
+                12_345_678_901_234_567_890,
+            ]
+            .into(),
+            Some(NullBuffer::from(vec![true, true, false, true, true])),
+        )
+        .with_precision_and_scale(38, 2)
+        .unwrap(),
+    );
+    let full = list(values, vec![0, 2, 3, 5], Some(vec![true, false, true]));
+    for source in [full.clone(), full.slice(1, 2)] {
+        let args = [EvaluatedArgument::Column(&source)];
+        let actual = instance(&source)
+            .evaluate(Selection::all(source.len()), &args, &Control::default())
+            .unwrap();
+        let output = actual
+            .values()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(output.len(), source.len());
+        let final_row = output.value(output.len() - 1);
+        let values = final_row.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(values.value(0).to_bits(), 0);
+        assert_eq!(values.value(1).to_bits(), 0x437b_69b4_ba63_0f34);
+        assert!(output.is_null(output.len() - 2));
+    }
 }

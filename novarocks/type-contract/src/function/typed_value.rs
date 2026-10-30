@@ -210,18 +210,15 @@ pub(super) fn legacy_field(
     };
     let field = Field::new(name, data_type, value.nullable());
     Ok(match value.kind() {
-        ValueKind::Nominal(logical) => field.with_metadata(
-            [(
-                crate::NR_LOGICAL_TYPE_KEY.into(),
-                logical
-                    .metadata_value()
-                    .ok_or(ValueTypeError::InvalidType(
-                        "nominal type has no legacy projection tag",
-                    ))?
-                    .into(),
-            )]
-            .into(),
-        ),
+        ValueKind::Nominal(logical) => field.with_metadata(std::collections::HashMap::from([(
+            crate::NR_LOGICAL_TYPE_KEY.into(),
+            logical
+                .metadata_value()
+                .ok_or(ValueTypeError::InvalidType(
+                    "nominal type has no legacy projection tag",
+                ))?
+                .into(),
+        )])),
         _ => field,
     })
 }

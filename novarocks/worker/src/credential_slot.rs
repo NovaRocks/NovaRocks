@@ -134,6 +134,7 @@ impl QueryContextCredentialSlot {
             lease.epoch(),
             matched_prefix.clone(),
             lease.renewal_path().cloned(),
+            None,
             // An execution node is never seeded: it acquires for itself.
             None,
         ))

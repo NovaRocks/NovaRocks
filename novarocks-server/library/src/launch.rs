@@ -435,6 +435,23 @@ fn role_bind_endpoints(
             path,
         )?);
     }
+    if role == ClusterRole::Fe {
+        let port = config
+            .standalone_server
+            .as_ref()
+            .map(|server| server.trino_port)
+            .unwrap_or_else(|| crate::app_config::StandaloneServerConfig::default().trino_port);
+        // An OS-assigned port has no fixed endpoint to compare before bind.
+        if port != 0 {
+            endpoints.push(resolve_endpoint(
+                role,
+                "Trino HTTP",
+                "127.0.0.1",
+                port,
+                path,
+            )?);
+        }
+    }
     Ok(endpoints)
 }
 
@@ -753,6 +770,29 @@ mod tests {
             resolve_server_launch(parsed).expect("resolve"),
             ResolvedServerLaunch::AllInOne { .. }
         ));
+    }
+
+    #[test]
+    fn trino_loopback_bind_participates_in_same_role_and_cross_role_preflight() {
+        use super::*;
+        let fixture = tempfile::tempdir().unwrap();
+        let fe = fixture.path().join("fe.toml");
+        write_config(&fe, "fe", "127.0.0.1", 19080, 18040, Some(19030), "");
+        let mut config: crate::app_config::NovaRocksConfig =
+            toml::from_str(&std::fs::read_to_string(&fe).unwrap()).unwrap();
+        for port in [19080, 18040, 19030] {
+            config.standalone_server.as_mut().unwrap().trino_port = port;
+            let endpoints = role_bind_endpoints(ClusterRole::Fe, &config, &fe).unwrap();
+            assert!(ensure_no_endpoint_overlap(&endpoints, &[]).is_err());
+        }
+        config.standalone_server.as_mut().unwrap().trino_port = 8080;
+        let endpoints = role_bind_endpoints(ClusterRole::Fe, &config, &fe).unwrap();
+        let wildcard_be =
+            resolve_endpoint(ClusterRole::Be, "native data gRPC", "0.0.0.0", 8080, &fe).unwrap();
+        assert!(ensure_no_endpoint_overlap(&endpoints, &[wildcard_be]).is_err());
+        let other_address =
+            resolve_endpoint(ClusterRole::Be, "native data gRPC", "127.0.0.2", 8080, &fe).unwrap();
+        ensure_no_endpoint_overlap(&endpoints, &[other_address]).unwrap();
     }
 
     #[test]

@@ -292,11 +292,10 @@ pub fn task_execution_failure_injected(
     identity: TaskIdentity,
     root_result: bool,
 ) -> Result<Option<NativeFaultClaim>, String> {
-    let ordinary = claim_by_detail(
-        controls,
+    let ordinary = controls.claim_task(
         QueryLifecycleFaultKind::TaskExecutionFailure,
-        identity.query_execution_id(),
-        identity.backend_process_id(),
+        identity,
+        false,
     )?;
     if ordinary.is_some() || !root_result {
         return Ok(ordinary);
@@ -728,12 +727,13 @@ pub fn create_task_before_worker_hold(
 ) -> Result<(), tonic::Status> {
     {
         let execution = identity.query_execution_id();
-        let Some(scope) = match_persistent(
-            controls,
-            QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold,
-            execution,
-            identity.backend_process_id(),
-        )?
+        let Some(scope) = controls
+            .claim_task(
+                QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold,
+                identity,
+                true,
+            )
+            .map_err(tonic::Status::failed_precondition)?
         else {
             return Ok(());
         };

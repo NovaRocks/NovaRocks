@@ -414,7 +414,7 @@ fn freeze_leaf(
         CastTarget::Int64 => DataType::Int64,
     };
     work.step()?;
-    if !arrow_cast::can_cast_types(ty, &target_ty) {
+    if !super::rounding_binding::primitive_cast_capability(ty, &target_ty) {
         return Err(unsupported());
     }
     let factor = match (leaf, target) {
@@ -480,11 +480,11 @@ fn read_leaf(
         }};
     }
     macro_rules! decimal {
-        ($t:ty,$scale:expr,$factor:ident,$wide:expr) => {{
+        ($t:ty,$scale:expr,$factor:ident,$wide:expr,$to_f64:expr) => {{
             let raw = value!($t);
             match (target, factor) {
                 (CastTarget::Float64, Factor::Float(divisor)) => Ok(CastValue::Float(
-                    raw.to_f64()
+                    ($to_f64)(raw)
                         .ok_or_else(|| internal("round decimal cannot convert to f64"))?
                         / divisor,
                 )),
@@ -537,10 +537,12 @@ fn read_leaf(
                 },
             })
         }
-        Leaf::Decimal32(s) => decimal!(Decimal32Array, s, D32, false),
-        Leaf::Decimal64(s) => decimal!(Decimal64Array, s, D64, false),
-        Leaf::Decimal128(s) => decimal!(Decimal128Array, s, D128, true),
-        Leaf::Decimal256(s) => decimal!(Decimal256Array, s, D256, true),
+        Leaf::Decimal32(s) => decimal!(Decimal32Array, s, D32, false, |v: i32| v.to_f64()),
+        Leaf::Decimal64(s) => decimal!(Decimal64Array, s, D64, false, |v: i64| v.to_f64()),
+        Leaf::Decimal128(s) => decimal!(Decimal128Array, s, D128, true, |v: i128| v.to_f64()),
+        Leaf::Decimal256(s) => decimal!(Decimal256Array, s, D256, true, |v| Some(
+            crate::decimal_float_cast::decimal256_unscaled_to_f64(v)
+        )),
         Leaf::Timestamp(unit) => match unit {
             TimeUnit::Second => integer!(value!(TimestampSecondArray)),
             TimeUnit::Millisecond => integer!(value!(TimestampMillisecondArray)),

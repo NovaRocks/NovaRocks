@@ -1,0 +1,417 @@
+{
+  "ROSTemplateFormatVersion": "2015-09-01",
+  "Description": "NovaRocks one-shot spot CI foundation. Existing OSS bucket; no unconditional expiry policy.",
+  "Parameters": {
+    "DeploymentId": {
+      "Type": "String"
+    },
+    "Repository": {
+      "Type": "String"
+    },
+    "SecretPrefix": {
+      "Type": "String"
+    },
+    "ObjectPrefix": {
+      "Type": "String"
+    },
+    "BucketName": {
+      "Type": "String"
+    },
+    "VpcId": {
+      "Type": "String"
+    },
+    "ExistingVSwitchId": {
+      "Type": "String",
+      "Default": ""
+    },
+    "CreateVSwitch": {
+      "Type": "String",
+      "Default": "false",
+      "AllowedValues": [
+        "true",
+        "false"
+      ]
+    },
+    "ZoneId": {
+      "Type": "String"
+    },
+    "VSwitchCidrBlock": {
+      "Type": "String",
+      "Default": "192.168.100.0/24"
+    },
+    "InstanceRoleName": {
+      "Type": "String"
+    },
+    "GitHubOidcFingerprint": {
+      "Type": "String",
+      "AllowedPattern": "[a-fA-F0-9]{40}"
+    }
+  },
+  "Conditions": {
+    "MakeVSwitch": {
+      "Fn::Equals": [
+        {
+          "Ref": "CreateVSwitch"
+        },
+        "true"
+      ]
+    }
+  },
+  "Resources": {
+    "OutboundSecurityGroup": {
+      "Type": "ALIYUN::ECS::SecurityGroup",
+      "Properties": {
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupName": {
+          "Fn::Sub": "${DeploymentId}-ci"
+        },
+        "SecurityGroupIngress": [],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "all",
+            "PortRange": "-1/-1",
+            "DestCidrIp": "0.0.0.0/0",
+            "Policy": "accept",
+            "Priority": 1
+          }
+        ]
+      }
+    },
+    "OptionalVSwitch": {
+      "Type": "ALIYUN::ECS::VSwitch",
+      "Condition": "MakeVSwitch",
+      "Properties": {
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "ZoneId": {
+          "Ref": "ZoneId"
+        },
+        "CidrBlock": {
+          "Ref": "VSwitchCidrBlock"
+        },
+        "VSwitchName": {
+          "Fn::Sub": "${DeploymentId}-ci"
+        }
+      }
+    },
+    "GitHubOidc": {
+      "Type": "ALIYUN::RAM::OIDCProvider",
+      "Properties": {
+        "OIDCProviderName": {
+          "Fn::Sub": "${DeploymentId}-github"
+        },
+        "IssuerUrl": "https://token.actions.githubusercontent.com",
+        "ClientIds": [
+          "sts.aliyuncs.com"
+        ],
+        "Fingerprints": [
+          {
+            "Ref": "GitHubOidcFingerprint"
+          }
+        ]
+      }
+    },
+    "InstanceRole": {
+      "Type": "ALIYUN::RAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Ref": "InstanceRoleName"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "1",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": "sts:AssumeRole",
+              "Principal": {
+                "Service": [
+                  "ecs.aliyuncs.com"
+                ]
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": {
+              "Fn::Sub": "${DeploymentId}-bootstrap"
+            },
+            "PolicyDocument": {
+              "Version": "1",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "oos:GetSecretParameter",
+                    "oos:DeleteSecretParameter"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "acs:oos:${ALIYUN::Region}:${ALIYUN::AccountId}:secretparameter/${SecretPrefix}*"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "kms:GetSecretValue",
+                    "kms:DeleteSecret"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "acs:kms:${ALIYUN::Region}:${ALIYUN::AccountId}:secret/oos/${SecretPrefix}*"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ControlRole": {
+      "Type": "ALIYUN::RAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${DeploymentId}-control"
+        },
+        "MaxSessionDuration": 43200,
+        "AssumeRolePolicyDocument": {
+          "Version": "1",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": "sts:AssumeRoleWithOIDC",
+              "Principal": {
+                "Federated": [
+                  {
+                    "Fn::Sub": "acs:ram::${ALIYUN::AccountId}:oidc-provider/${DeploymentId}-github"
+                  }
+                ]
+              },
+              "Condition": {
+                "StringEquals": {
+                  "oidc:aud": "sts.aliyuncs.com",
+                  "oidc:iss": "https://token.actions.githubusercontent.com",
+                  "oidc:sub": {
+                    "Fn::Sub": "repo:${Repository}:environment:aliyun-ci"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": {
+              "Fn::Sub": "${DeploymentId}-control"
+            },
+            "PolicyDocument": {
+              "Version": "1",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sts:GetCallerIdentity",
+                    "ecs:DescribeInstances",
+                    "ecs:DescribeImages",
+                    "ecs:DescribeInvocationResults"
+                  ],
+                  "Resource": [
+                    "*"
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecs:RunInstances"
+                  ],
+                  "Resource": [
+                    "*"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "acs:RequestTag/deployment": {
+                        "Ref": "DeploymentId"
+                      },
+                      "acs:RequestTag/repository": {
+                        "Ref": "Repository"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecs:DeleteInstance",
+                    "ecs:ModifyInstanceAutoReleaseTime",
+                    "ecs:StopInstance",
+                    "ecs:CreateImage",
+                    "ecs:RunCommand"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "acs:ecs:${ALIYUN::Region}:${ALIYUN::AccountId}:instance/*"
+                    }
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "acs:ResourceTag/deployment": {
+                        "Ref": "DeploymentId"
+                      },
+                      "acs:ResourceTag/repository": {
+                        "Ref": "Repository"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecs:CreateImage"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "acs:ecs:${ALIYUN::Region}:${ALIYUN::AccountId}:image/*"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ram:PassRole"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "acs:ram::${ALIYUN::AccountId}:role/${InstanceRoleName}"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "oos:CreateSecretParameter",
+                    "oos:GetSecretParameter",
+                    "oos:DeleteSecretParameter"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "acs:oos:${ALIYUN::Region}:${ALIYUN::AccountId}:secretparameter/${SecretPrefix}*"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "oos:ListSecretParameters"
+                  ],
+                  "Resource": [
+                    "*"
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "kms:CreateSecret",
+                    "kms:GetSecretValue",
+                    "kms:DeleteSecret"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "acs:kms:${ALIYUN::Region}:${ALIYUN::AccountId}:secret/oos/${SecretPrefix}*"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "oss:PutObject",
+                    "oss:GetObject"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "acs:oss:*:${ALIYUN::AccountId}:${BucketName}/${ObjectPrefix}/*"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "oss:ListObjects"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "acs:oss:*:${ALIYUN::AccountId}:${BucketName}"
+                    }
+                  ],
+                  "Condition": {
+                    "StringLike": {
+                      "oss:Prefix": [
+                        {
+                          "Fn::Sub": "${ObjectPrefix}/*"
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "DependsOn": "GitHubOidc"
+    }
+  },
+  "Outputs": {
+    "BucketName": {
+      "Value": {
+        "Ref": "BucketName"
+      }
+    },
+    "ObjectPrefix": {
+      "Value": {
+        "Ref": "ObjectPrefix"
+      }
+    },
+    "InstanceRoleName": {
+      "Value": {
+        "Ref": "InstanceRoleName"
+      }
+    },
+    "SecurityGroupId": {
+      "Value": {
+        "Fn::GetAtt": [
+          "OutboundSecurityGroup",
+          "SecurityGroupId"
+        ]
+      }
+    },
+    "ControlRoleArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "ControlRole",
+          "Arn"
+        ]
+      }
+    },
+    "VSwitchId": {
+      "Value": {
+        "Fn::If": [
+          "MakeVSwitch",
+          {
+            "Fn::GetAtt": [
+              "OptionalVSwitch",
+              "VSwitchId"
+            ]
+          },
+          {
+            "Ref": "ExistingVSwitchId"
+          }
+        ]
+      }
+    }
+  }
+}

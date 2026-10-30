@@ -21,7 +21,7 @@
 //! compiler receives the resulting immutable definition index and owns all
 //! candidate parse/analyze/statistics/selection work.
 
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use crate::mv::domain::readiness::MvCandidateReader;
 use crate::mv::domain::refresh::definition::parse_mv_select_query;
@@ -31,10 +31,10 @@ use novarocks_mv_application::persistence::{
 };
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::compiler::{
-    MaterializedViewFact, MaterializedViewNeed, MvRewriteDefinitionIndex,
-    SqlMvDefinitionResolutionContext, SqlMvRelationOccurrenceId, SqlMvRewriteBaseTableFacts,
-    SqlMvRewriteDefinitionFacts, SqlMvRewritePublicationInput, SqlMvRewritePublicationRelation,
-    SqlMvRewriteSelectionFacts, SqlMvRewriteSourceOccurrenceFacts,
+    MaterializedViewFact, MaterializedViewNeed, SqlMvDefinitionResolutionContext,
+    SqlMvRelationOccurrenceId, SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts,
+    SqlMvRewritePublicationInput, SqlMvRewritePublicationRelation, SqlMvRewriteSelectionFacts,
+    SqlMvRewriteSourceOccurrenceFacts,
 };
 use novarocks_types::naming::TableIdentity;
 
@@ -48,13 +48,14 @@ use novarocks_types::naming::TableIdentity;
 ///
 /// MV discovery and each candidate are optional accelerators. Their failures
 /// therefore produce a missing or empty observed fact, never a query failure.
-pub(crate) fn freeze_materialized_view_fact_with_ports(
+pub(crate) async fn freeze_materialized_view_fact_with_ports_async(
     need: &MaterializedViewNeed,
     candidate_reader: &MvCandidateReader,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     _storage_observation: &dyn MvStorageObservationPort,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> MaterializedViewFact {
-    let definitions = match candidate_reader.list_candidate_definitions() {
+    let definitions = match candidate_reader.list_candidate_definitions_async().await {
         Ok(definitions) => definitions,
         Err(error) => {
             tracing::debug!(error = %error, "skip MV rewrite discovery because the inventory is unavailable");
@@ -76,19 +77,30 @@ pub(crate) fn freeze_materialized_view_fact_with_ports(
             &requested_relations,
         )
     });
-    let report = novarocks_mv_application::candidate::inspect_candidates(
-        relevant,
-        |definition| definition.mv_id.to_string(),
-        |definition| freeze_mv_rewrite_definition(candidate_reader, connector_control, definition),
-    );
-    for diagnostic in report.diagnostics() {
-        tracing::debug!(
-            candidate = diagnostic.identity(),
-            error = diagnostic.message(),
-            "skip unavailable MV rewrite candidate"
-        );
+    let mut accepted = Vec::new();
+    for definition in relevant {
+        let identity = definition.mv_id.to_string();
+        match freeze_mv_rewrite_definition_async(
+            candidate_reader,
+            connector_control,
+            definition,
+            context,
+        )
+        .await
+        {
+            Ok(facts) => accepted.push(facts),
+            Err(error) => {
+                let diagnostic =
+                    novarocks_mv_application::candidate::CandidateDiagnostic::new(identity, error);
+                tracing::debug!(
+                    candidate = diagnostic.identity(),
+                    error = diagnostic.message(),
+                    "skip unavailable MV rewrite candidate"
+                );
+            }
+        }
     }
-    MaterializedViewFact::observed(need, report.into_accepted())
+    MaterializedViewFact::observed(need, accepted)
 }
 
 fn candidate_base_tables_are_requested(
@@ -99,45 +111,6 @@ fn candidate_base_tables_are_requested(
         && base_table_refs
             .iter()
             .all(|base_table| requested_relations.contains(base_table))
-}
-
-/// Freeze rewrite candidates from the caller's leaf ports.  The frozen index
-/// remains request-local.
-pub(crate) fn freeze_mv_rewrite_definition_index_with_ports(
-    candidate_reader: &MvCandidateReader,
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    _storage_observation: &dyn MvStorageObservationPort,
-) -> Result<MvRewriteDefinitionIndex, String> {
-    let definitions = optional_candidate_inventory(candidate_reader.list_candidate_definitions());
-    let report = novarocks_mv_application::candidate::inspect_candidates(
-        definitions,
-        |definition| definition.mv_id.to_string(),
-        |definition| freeze_mv_rewrite_definition(candidate_reader, connector_control, definition),
-    );
-    for diagnostic in report.diagnostics() {
-        tracing::debug!(
-            candidate = diagnostic.identity(),
-            error = diagnostic.message(),
-            "skip unavailable MV rewrite candidate"
-        );
-    }
-    MvRewriteDefinitionIndex::try_new(report.into_accepted())
-}
-
-/// An MV inventory is an optional rewrite input.  Losing it must only remove
-/// rewrite candidates; it cannot prevent the required base-table query from
-/// being planned.
-fn optional_candidate_inventory<T, E>(inventory: Result<Vec<T>, E>) -> Vec<T>
-where
-    E: fmt::Display,
-{
-    match inventory {
-        Ok(candidates) => candidates,
-        Err(error) => {
-            tracing::debug!(error = %error, "skip MV rewrite discovery because the inventory is unavailable");
-            Vec::new()
-        }
-    }
 }
 
 fn definition_base_names(projection: &StoredKeyedMvProjection) -> Vec<String> {
@@ -161,10 +134,11 @@ fn occurrence_table(
     }
 }
 
-fn freeze_mv_rewrite_definition(
+async fn freeze_mv_rewrite_definition_async(
     candidate_reader: &MvCandidateReader,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     projection: StoredKeyedMvProjection,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<SqlMvRewriteDefinitionFacts, String> {
     use novarocks_spi::connector::{
         ConnectorReadSelector, ConnectorTableIdentity, ConnectorTableObjectRebindRequest,
@@ -172,12 +146,9 @@ fn freeze_mv_rewrite_definition(
     };
     let target = projection.facts.target();
     let target_catalog = target.catalog().ok_or("MV rewrite target has no catalog")?;
-    let context = crate::connector::connector_request_context(
-        None,
-        novarocks_spi::connector::ConnectorStopOwner::new().view(),
-    )?;
     let planning =
         crate::connector::acquire_metadata_planning_lease(connector_control, target_catalog)?;
+    let context = crate::connector::context_for_planning_lease(&planning, context.clone())?;
     let documents = planning
         .derive_document_storage_lease()
         .map_err(|error| error.to_string())?;
@@ -191,7 +162,9 @@ fn freeze_mv_rewrite_definition(
         projection.facts.source_revision().target_object_id.clone(),
         context.clone(),
     );
-    let frozen = candidate_reader.observe_current(&documents, request)?;
+    let frozen = candidate_reader
+        .observe_current_async(&documents, request)
+        .await?;
     let publication = frozen
         .publication
         .as_ref()
@@ -206,13 +179,14 @@ fn freeze_mv_rewrite_definition(
     let target_binding = planning
         .binding()
         .metadata()
-        .rebind_table_object_binding(ConnectorTableObjectRebindRequest {
+        .rebind_table_object_binding_async(ConnectorTableObjectRebindRequest {
             table: frozen.view.table.clone(),
             expected_object_id: frozen.view.object_id.clone(),
             resolution: ConnectorTableResolution::StrictBaseTable,
             selector: ConnectorTableObjectSelector::Current,
-            context,
+            context: context.clone(),
         })
+        .await
         .map_err(|error| format!("bind frozen MV rewrite output object: {error}"))?;
     let snapshot = frozen
         .publication_snapshot
@@ -228,31 +202,30 @@ fn freeze_mv_rewrite_definition(
         )
         .map_err(|error| format!("resolve exact MV rewrite output revision: {error}"))?;
     let definition = &frozen.definition;
-    let sources = definition
+    let mut sources = Vec::with_capacity(definition.relation_occurrences.len());
+    for (occurrence, input) in definition
         .relation_occurrences
         .iter()
         .zip(&publication.inputs)
-        .map(|(occurrence, input)| {
-            if occurrence.occurrence_id != input.relation_occurrence_id {
-                return Err("MV rewrite D/P occurrence order differs".into());
-            }
-            let table = occurrence_table(occurrence);
-            let state = freeze_base_table_state(connector_control, &table)
-                .unwrap_or_else(SqlMvRewriteBaseTableFacts::unavailable);
-            SqlMvRewriteSourceOccurrenceFacts::try_new(
-                SqlMvRelationOccurrenceId::new(occurrence.occurrence_id),
-                table,
-                occurrence.qualifier_at_binding.clone(),
-                Some(
-                    restore_exact_query_revision(&input.object_id, &input.native_data_version)
-                        .map_err(|error| {
-                            format!("restore MV rewrite publication input: {error}")
-                        })?,
-                ),
-                state,
-            )
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    {
+        if occurrence.occurrence_id != input.relation_occurrence_id {
+            return Err("MV rewrite D/P occurrence order differs".into());
+        }
+        let table = occurrence_table(occurrence);
+        let state = freeze_base_table_state_async(connector_control, &table, &context)
+            .await
+            .unwrap_or_else(SqlMvRewriteBaseTableFacts::unavailable);
+        sources.push(SqlMvRewriteSourceOccurrenceFacts::try_new(
+            SqlMvRelationOccurrenceId::new(occurrence.occurrence_id),
+            table,
+            occurrence.qualifier_at_binding.clone(),
+            Some(
+                restore_exact_query_revision(&input.object_id, &input.native_data_version)
+                    .map_err(|error| format!("restore MV rewrite publication input: {error}"))?,
+            ),
+            state,
+        )?);
+    }
     let selection = freeze_mv_rewrite_selection(&frozen, target_revision)?;
     SqlMvRewriteDefinitionFacts::try_new(
         projection.mv_id,
@@ -340,23 +313,28 @@ fn freeze_mv_rewrite_selection(
     )
 }
 
-fn freeze_base_table_state(
+async fn freeze_base_table_state_async(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     table: &TableIdentity,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<SqlMvRewriteBaseTableFacts, String> {
-    let context = crate::connector::connector_request_context(
-        None,
-        novarocks_spi::connector::ConnectorStopOwner::new().view(),
-    )?;
     let lease =
         crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &lease,
-        context,
-        &table.namespace,
-        &table.table,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-    )?;
+    let context = crate::connector::context_for_planning_lease(&lease, context.clone())?;
+    let metadata = crate::connector::schema_creation::load_frontend_table_async(
+        lease.binding().metadata().as_ref(),
+        novarocks_spi::connector::ConnectorTableRequest {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: lease.binding().descriptor().instance_id.clone(),
+                namespace: Arc::from(table.namespace.as_str()),
+                table: Arc::from(table.table.as_str()),
+            },
+            resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            context,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     lease
         .binding()
         .metadata()
@@ -372,14 +350,7 @@ fn freeze_base_table_state(
 mod tests {
     use std::collections::HashSet;
 
-    use super::{candidate_base_tables_are_requested, optional_candidate_inventory};
-
-    #[test]
-    fn unavailable_inventory_becomes_an_empty_optional_candidate_set() {
-        let candidates = optional_candidate_inventory::<u8, _>(Err("StateStore unavailable"));
-
-        assert!(candidates.is_empty());
-    }
+    use super::candidate_base_tables_are_requested;
 
     #[test]
     fn completion_need_filters_out_partial_mv_base_matches() {

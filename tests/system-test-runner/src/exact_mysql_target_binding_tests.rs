@@ -21,7 +21,7 @@ use std::io::{self, Cursor};
 use std::time::Duration;
 
 const FE: &[u8] = b"NOVAROCKS_MEM_1_M07_EXACT_MYSQL_FE frontend_process_id=01890f6e-7a00-7123-8123-456789abcdef\n";
-const BOUND: &[u8] = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id=71 connection_generation=19 session_connection_id=71 session_epoch=23 statement_generation=29 sql_sha256=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n";
+const BOUND: &[u8] = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id=71 connection_generation=19 session_connection_id=71 session_key=23 statement_generation=29 sql_sha256=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n";
 
 fn frontend() -> FrontendProcessId {
     parse_frontend(&FE[..FE.len() - 1]).expect("valid independently fixed FE UUID")
@@ -58,7 +58,7 @@ fn full_original_binding_preserves_distinct_domains_and_hash() {
             connection_id: 71,
             connection_generation: 19,
             session_connection_id: 71,
-            session_epoch: 23,
+            session_key: 23,
             statement_generation: 29,
             sql_sha256: digest(),
         }
@@ -71,7 +71,7 @@ fn full_original_binding_preserves_distinct_domains_and_hash() {
         "source owner checks do not infer byte chronology"
     );
     let equal = replace(
-        &replace(&log(), "session_epoch=23", "session_epoch=19"),
+        &replace(&log(), "session_key=23", "session_key=19"),
         "statement_generation=29",
         "statement_generation=19",
     );
@@ -79,7 +79,7 @@ fn full_original_binding_preserves_distinct_domains_and_hash() {
     assert_eq!(
         (
             value.connection_generation,
-            value.session_epoch,
+            value.session_key,
             value.statement_generation
         ),
         (19, 19, 19),
@@ -89,7 +89,7 @@ fn full_original_binding_preserves_distinct_domains_and_hash() {
 
 #[test]
 fn maximum_numeric_widths_accept_without_narrowing_domains() {
-    let max = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id=4294967295 connection_generation=18446744073709551615 session_connection_id=4294967295 session_epoch=18446744073709551615 statement_generation=18446744073709551615 sql_sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n";
+    let max = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id=4294967295 connection_generation=18446744073709551615 session_connection_id=4294967295 session_key=18446744073709551615 statement_generation=18446744073709551615 sql_sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n";
     let bytes = [FE, max.as_slice()].concat();
     let value = scan(
         &mut Cursor::new(&bytes),
@@ -103,7 +103,7 @@ fn maximum_numeric_widths_accept_without_narrowing_domains() {
     assert_eq!(value.connection_id, u32::MAX);
     assert_eq!(value.session_connection_id, u32::MAX);
     assert_eq!(value.connection_generation, u64::MAX);
-    assert_eq!(value.session_epoch, u64::MAX);
+    assert_eq!(value.session_key, u64::MAX);
     assert_eq!(value.statement_generation, u64::MAX);
 }
 
@@ -133,7 +133,7 @@ fn unknown_missing_duplicate_reordered_fields_and_extra_spaces_refuse() {
     for (from, to) in [
         ("connection_id=", "cid="),
         ("connection_generation=19 ", ""),
-        ("session_epoch=23", "session_epoch=23 session_epoch=23"),
+        ("session_key=23", "session_key=23 session_key=23"),
         (
             "connection_id=71 connection_generation=19",
             "connection_generation=19 connection_id=71",
@@ -171,7 +171,7 @@ fn zero_signed_leading_zero_nondecimal_and_overflow_refuse() {
         ("connection_id", "71"),
         ("connection_generation", "19"),
         ("session_connection_id", "71"),
-        ("session_epoch", "23"),
+        ("session_key", "23"),
         ("statement_generation", "29"),
     ] {
         let from = format!("{field}={original}");

@@ -2,6 +2,8 @@
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:PROJECT [l.id, l.score, payload] stats={rows=5}
   1:TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
@@ -11,6 +13,8 @@ PLAN FRAGMENT 0
       5:BROADCAST EXCHANGE stats={rows=1000}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 4
@@ -22,6 +26,8 @@ PLAN FRAGMENT 1
        min-max stats
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 5
@@ -39,11 +45,15 @@ RUNTIME FILTER GRAPH
     consumer binding 1, fragment = 2, node = 7, expr = (l.id), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:TOP-N (limit=5, offset=0) [r.payload DESC NULLS LAST] stats={rows=5}
   1:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: follow-sources([2,3])
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 1
@@ -55,6 +65,8 @@ PLAN FRAGMENT 1
       6:HASH EXCHANGE
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 5
@@ -65,6 +77,8 @@ PLAN FRAGMENT 2
      min-max stats
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 6
@@ -78,11 +92,15 @@ PLAN FRAGMENT 3
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
   1:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 1
@@ -97,6 +115,8 @@ PLAN FRAGMENT 1
       6:BROADCAST EXCHANGE stats={rows=1000}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 6
@@ -110,11 +130,15 @@ PLAN FRAGMENT 2
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:TOP-N (limit=5, offset=0) [payload DESC NULLS LAST] stats={rows=5}
   1:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 1
@@ -129,6 +153,8 @@ PLAN FRAGMENT 1
       6:BROADCAST EXCHANGE stats={rows=1000}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 6
@@ -146,11 +172,15 @@ RUNTIME FILTER GRAPH
     consumer binding 1, fragment = 1, node = 5, expr = (l.id), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
   1:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 1
@@ -166,6 +196,8 @@ PLAN FRAGMENT 1
       6:BROADCAST EXCHANGE stats={rows=900}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 6

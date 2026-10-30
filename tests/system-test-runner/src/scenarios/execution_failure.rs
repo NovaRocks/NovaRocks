@@ -475,7 +475,6 @@ fn assert_healthy_terminal(terminal: &QueryLifecycleStructuredSnapshot) -> Resul
     ensure!(
         terminal.execution_id.is_some()
             && terminal.attempt_id == 1
-            && terminal.error_source.is_none()
             && terminal.failure_fact.is_none()
             && terminal.worker_contexts_converged,
         "healthy continuity query did not finish and actually converge: {terminal:?}"

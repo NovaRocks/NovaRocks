@@ -22,15 +22,23 @@
 //! ownership together from admission through synchronous execution.
 
 use std::{
+    any::TypeId,
     collections::VecDeque,
     fmt,
+    mem::ManuallyDrop,
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Condvar, Mutex, OnceLock, mpsc},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock, Weak,
+        atomic::{AtomicU8, Ordering},
+        mpsc,
+    },
+    task::{Context, Poll, Waker},
     thread::{self, JoinHandle},
     time::Instant,
 };
 
+use novarocks_workload_control::joint_admission::JointLocalGrant;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 
 type WorkerCall<R> = Box<dyn FnOnce() -> R + Send + 'static>;
@@ -38,12 +46,16 @@ type WorkerCall<R> = Box<dyn FnOnce() -> R + Send + 'static>;
 /// One move-only synchronous application operation.
 pub(crate) struct BoundedWorkerJob<R> {
     call: Option<WorkerCall<R>>,
+    call_layout: std::alloc::Layout,
+    call_type: TypeId,
 }
 
 impl<R> BoundedWorkerJob<R> {
-    pub(crate) fn new(call: impl FnOnce() -> R + Send + 'static) -> Self {
+    pub(crate) fn new<F: FnOnce() -> R + Send + 'static>(call: F) -> Self {
         Self {
             call: Some(Box::new(call)),
+            call_layout: std::alloc::Layout::new::<F>(),
+            call_type: TypeId::of::<F>(),
         }
     }
 
@@ -98,48 +110,20 @@ impl fmt::Display for BoundedWorkerOpenError {
 
 impl std::error::Error for BoundedWorkerOpenError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BoundedWorkerError {
-    Panicked,
-    ExecutorClosed,
-}
+// The same receipt carries the original opaque panic to preserving callers.
+pub(crate) use super::QueryBlockingFailure as BoundedWorkerError;
 
-impl fmt::Display for BoundedWorkerError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Panicked => "bounded worker worker panicked",
-            Self::ExecutorClosed => "bounded worker executor closed before completing the job",
-        })
-    }
-}
-
-impl std::error::Error for BoundedWorkerError {}
-
-/// A refused submission is reported to the caller; tests can recover the job
-/// to verify retryability before production closes the executor.
+/// A refused submission retains the same move-only job for its original caller.
+/// The queue lock never runs the rejected input's destructor.
 pub(crate) struct BoundedWorkerSubmitError<R> {
-    #[cfg(test)]
     job: BoundedWorkerJob<R>,
-    #[cfg(not(test))]
-    _result: std::marker::PhantomData<fn() -> R>,
 }
 
 impl<R> BoundedWorkerSubmitError<R> {
     fn rejected(job: BoundedWorkerJob<R>) -> Self {
-        #[cfg(test)]
-        {
-            Self { job }
-        }
-        #[cfg(not(test))]
-        {
-            drop(job);
-            Self {
-                _result: std::marker::PhantomData,
-            }
-        }
+        Self { job }
     }
 
-    #[cfg(test)]
     pub(crate) fn into_job(self) -> BoundedWorkerJob<R> {
         self.job
     }
@@ -156,7 +140,7 @@ impl<R> fmt::Debug for BoundedWorkerSubmitError<R> {
 /// Completion ownership is independent of job execution. Dropping this value
 /// never cancels a queued or running job.
 pub(crate) struct BoundedWorkerReceipt<R> {
-    receiver: oneshot::Receiver<Result<R, BoundedWorkerError>>,
+    pub(super) receiver: oneshot::Receiver<Result<R, BoundedWorkerError>>,
 }
 
 impl<R> BoundedWorkerReceipt<R> {
@@ -183,13 +167,258 @@ pub(crate) struct BoundedWorkerSnapshot {
     pub(crate) queue_capacity: usize,
 }
 
-struct QueuedJob<R> {
+/// This source identity is non-owning: a queued row must not point strongly
+/// back to Shared through its reservation. The semaphore is the original one.
+pub(crate) struct BoundedWorkerReservation {
+    source: Weak<dyn Send + Sync>,
+    queue_slot: Option<OwnedSemaphorePermit>,
+}
+impl fmt::Debug for BoundedWorkerReservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoundedWorkerReservation")
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueReserveRefusal {
+    Full,
+    Closed,
+    FactoryMismatch,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueuePublishRefusal {
+    Empty,
+    ForeignPool,
+    Closed,
+    ReceiptClosed,
+    FactoryMismatch,
+}
+
+/// One fixed observer header for a received job, not another completion queue.
+/// The platform Mutex's external backing and Waker pointees are not quoted here.
+pub(crate) struct BoundedWorkerActualExit {
+    phase: AtomicU8,
+    observer: Mutex<ActualExitObserver>,
+}
+struct ActualExitObserver {
+    reader: Option<Waker>,
+    failure: Option<BoundedWorkerError>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerActualExitFailure {
+    FailedUnproven,
+}
+impl BoundedWorkerActualExit {
+    pub(super) fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(0),
+            observer: Mutex::new(ActualExitObserver {
+                reader: None,
+                failure: None,
+            }),
+        }
+    }
+    pub(crate) fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<(), WorkerActualExitFailure>> {
+        let mut incoming = Some(cx.waker().clone());
+        let mut outgoing = None;
+        {
+            let mut observer = self.observer.lock().unwrap_or_else(|e| e.into_inner());
+            if self.phase.load(Ordering::Acquire) == 0
+                && observer
+                    .reader
+                    .as_ref()
+                    .is_none_or(|old| !old.will_wake(incoming.as_ref().unwrap()))
+            {
+                outgoing = observer.reader.replace(incoming.take().unwrap());
+            }
+        }
+        drop(outgoing);
+        drop(incoming);
+        match self.phase.load(Ordering::Acquire) {
+            0 => Poll::Pending,
+            1 => Poll::Ready(Ok(())),
+            _ => Poll::Ready(Err(WorkerActualExitFailure::FailedUnproven)),
+        }
+    }
+    // Returns the actual raw notification panic to the original worker entry.
+    // No clone, destructor or wake executes under the observer/queue mutex.
+    pub(crate) fn failure(&self) -> Option<BoundedWorkerError> {
+        self.observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .failure
+            .clone()
+    }
+    pub(super) fn publish(
+        &self,
+        phase: u8,
+        failure: Option<&BoundedWorkerError>,
+    ) -> Option<Box<dyn std::any::Any + Send>> {
+        let mut incoming = failure.cloned();
+        let reader = {
+            let mut observer = self.observer.lock().unwrap_or_else(|e| e.into_inner());
+            if observer.failure.is_none() {
+                observer.failure = incoming.take();
+            }
+            let _ = self
+                .phase
+                .compare_exchange(0, phase, Ordering::AcqRel, Ordering::Acquire);
+            observer.reader.take()
+        };
+        drop(incoming);
+        catch_unwind(AssertUnwindSafe(|| {
+            if let Some(reader) = reader {
+                reader.wake();
+            }
+        }))
+        .err()
+    }
+}
+
+/// Prepared under the caller's original reservation/source. Receipt custody
+/// precedes publication; constructing this value does not enqueue or execute F.
+pub(crate) struct BoundedWorkerPrepared<R> {
+    source: Weak<dyn Send + Sync>,
+    job: BoundedWorkerJob<R>,
+    completion: oneshot::Sender<Result<R, BoundedWorkerError>>,
+    exit: Arc<BoundedWorkerActualExit>,
+}
+impl<R> BoundedWorkerPrepared<R> {
+    pub(crate) fn call_layout(&self) -> std::alloc::Layout {
+        self.job.call_layout
+    }
+}
+impl<R> fmt::Debug for BoundedWorkerPrepared<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoundedWorkerPrepared")
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct BoundedWorkerPublication<R> {
+    shared: Arc<Shared<R>>,
+}
+impl<R> BoundedWorkerPublication<R> {
+    pub(crate) fn notify(self) {}
+}
+impl<R> Drop for BoundedWorkerPublication<R> {
+    fn drop(&mut self) {
+        self.shared.ready.notify_one();
+    }
+}
+
+struct LegacyQueuedJob<R> {
     job: BoundedWorkerJob<R>,
     completion: oneshot::Sender<Result<R, BoundedWorkerError>>,
     queue_slot: OwnedSemaphorePermit,
 }
+struct JointQueuedJob<R> {
+    prepared: ManuallyDrop<BoundedWorkerPrepared<R>>,
+    physical: ManuallyDrop<JointLocalGrant<super::QueryBlockingReservation>>,
+}
+impl<R> Drop for JointQueuedJob<R> {
+    fn drop(&mut self) {
+        // Unexpected destruction cannot let ordinary field cleanup refund the
+        // physical guard if destruction of its original call unwinds.
+        // SAFETY: these fields are initialized once and never independently
+        // moved on this destructor path. A prepared-field unwind deliberately
+        // leaves the physical field undropped and charged.
+        unsafe {
+            ManuallyDrop::drop(&mut self.prepared);
+            ManuallyDrop::drop(&mut self.physical);
+        }
+    }
+}
+/// An ordinary queue reservation does not carry a workload grant. The stable
+/// original receiver outside this row remains responsible for source custody.
+struct OrdinaryQueuedJob<R> {
+    prepared: BoundedWorkerPrepared<R>,
+    reservation: BoundedWorkerReservation,
+}
+enum QueuedJob<R> {
+    Legacy(LegacyQueuedJob<R>),
+    Ordinary(OrdinaryQueuedJob<R>),
+    Joint(JointQueuedJob<R>),
+}
+enum PendingRecord<'a, R> {
+    Legacy(&'a mut Option<LegacyQueuedJob<R>>),
+    Ordinary {
+        prepared: &'a mut Option<BoundedWorkerPrepared<R>>,
+        reservation: &'a mut Option<super::QueryBlockingReservation>,
+    },
+    Joint {
+        prepared: &'a mut Option<BoundedWorkerPrepared<R>>,
+        physical: &'a mut Option<JointLocalGrant<super::QueryBlockingReservation>>,
+    },
+}
+impl<R> PendingRecord<'_, R> {
+    fn call_type(&self) -> TypeId {
+        match self {
+            Self::Legacy(row) => row.as_ref().unwrap().job.call_type,
+            Self::Joint { prepared, .. } | Self::Ordinary { prepared, .. } => {
+                prepared.as_ref().unwrap().job.call_type
+            }
+        }
+    }
+    fn take(&mut self) -> QueuedJob<R> {
+        match self {
+            Self::Legacy(row) => QueuedJob::Legacy(row.take().unwrap()),
+            Self::Ordinary {
+                prepared,
+                reservation,
+            } => QueuedJob::Ordinary(OrdinaryQueuedJob {
+                prepared: prepared.take().unwrap(),
+                reservation: reservation.take().unwrap().inner,
+            }),
+            Self::Joint { prepared, physical } => QueuedJob::Joint(JointQueuedJob {
+                prepared: ManuallyDrop::new(prepared.take().unwrap()),
+                physical: ManuallyDrop::new(physical.take().unwrap()),
+            }),
+        }
+    }
+}
+
+/// A teardown panic carries the same guard into this worker's original join
+/// entry. This is only the existing worker failure, not a new failure registry.
+pub(crate) struct WorkerRetirementFailure {
+    cause: ManuallyDrop<BoundedWorkerError>,
+    notification: ManuallyDrop<[Option<BoundedWorkerError>; 2]>,
+    physical: ManuallyDrop<Option<JointLocalGrant<super::QueryBlockingReservation>>>,
+}
+impl WorkerRetirementFailure {
+    pub(crate) fn cause(&self) -> &BoundedWorkerError {
+        &self.cause
+    }
+    pub(crate) fn notification(&self, index: usize) -> Option<&BoundedWorkerError> {
+        self.notification.get(index).and_then(Option::as_ref)
+    }
+}
+impl Drop for WorkerRetirementFailure {
+    fn drop(&mut self) {
+        // SAFETY: the original join owns each field exactly once. If any
+        // failure payload destructor unwinds, later manual fields stay charged.
+        unsafe {
+            ManuallyDrop::drop(&mut self.cause);
+            ManuallyDrop::drop(&mut self.notification);
+            ManuallyDrop::drop(&mut self.physical);
+        }
+    }
+}
+struct WorkerEntry {
+    join: Option<JoinHandle<()>>,
+    failure: Option<super::QueryBlockingWorkerFailure>,
+}
+
+pub(crate) fn queue_record_layout<R>() -> std::alloc::Layout {
+    std::alloc::Layout::new::<QueuedJob<R>>()
+}
+pub(crate) fn worker_entry_layout() -> std::alloc::Layout {
+    std::alloc::Layout::new::<WorkerEntry>()
+}
 
 struct QueueState<R> {
+    closed_factory: Option<TypeId>,
+    closed_factory_queue_bytes: Option<std::num::NonZeroU64>,
     closed: bool,
     jobs: VecDeque<QueuedJob<R>>,
     running: usize,
@@ -212,7 +441,7 @@ struct Shared<R> {
 /// joining the process executor.
 pub(crate) struct BoundedWorkerOwner<R> {
     shared: Arc<Shared<R>>,
-    workers: Mutex<Vec<JoinHandle<()>>>,
+    workers: Mutex<Vec<WorkerEntry>>,
 }
 
 /// Cloneable submission handle for the process-owned bounded worker executor.
@@ -247,6 +476,8 @@ impl<R: Send + 'static> BoundedWorkerOwner<R> {
         let queue_capacity = config.queue_capacity().get();
         let shared = Arc::new(Shared {
             state: Mutex::new(QueueState {
+                closed_factory: None,
+                closed_factory_queue_bytes: None,
                 closed: false,
                 jobs: VecDeque::with_capacity(queue_capacity),
                 running: 0,
@@ -277,12 +508,17 @@ impl<R: Send + 'static> BoundedWorkerOwner<R> {
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                         .live_workers += 1;
-                    workers.push(worker);
+                    workers.push(WorkerEntry {
+                        join: Some(worker),
+                        failure: None,
+                    });
                 }
                 Err(error) => {
                     close_queue(&shared);
-                    for worker in workers {
-                        let _ = worker.join();
+                    for mut worker in workers {
+                        if let Some(join) = worker.join.take() {
+                            let _ = join.join();
+                        }
                     }
                     return Err(BoundedWorkerOpenError {
                         detail: format!("spawn bounded worker worker failed: {error}").into(),
@@ -352,17 +588,30 @@ impl<R> BoundedWorkerOwner<R> {
         self.join_finished_workers()
     }
 
+    pub(crate) fn take_worker_failure(&mut self) -> Option<super::QueryBlockingWorkerFailure> {
+        let workers = self.workers.get_mut().unwrap_or_else(|e| e.into_inner());
+        let failure = workers.iter_mut().find_map(|worker| worker.failure.take());
+        workers.retain(|worker| worker.join.is_some() || worker.failure.is_some());
+        failure
+    }
+
     fn join_finished_workers(&mut self) -> Result<(), BoundedWorkerShutdownError> {
         let workers = self
             .workers
             .get_mut()
             .unwrap_or_else(|error| error.into_inner());
         let mut panicked_workers = 0;
-        for worker in workers.drain(..) {
-            if worker.join().is_err() {
-                panicked_workers += 1;
+        for worker in workers.iter_mut() {
+            if let Some(join) = worker.join.take()
+                && let Err(original) = join.join()
+            {
+                worker.failure = Some(super::QueryBlockingWorkerFailure::new(original));
             }
+            panicked_workers += usize::from(worker.failure.is_some());
         }
+        // Successful joins leave no source. Failed entries retain the original
+        // opaque payload/guard until the process owner explicitly takes them.
+        workers.retain(|worker| worker.failure.is_some());
         if panicked_workers == 0 {
             Ok(())
         } else {
@@ -402,29 +651,250 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
         &self,
         job: BoundedWorkerJob<R>,
     ) -> Result<BoundedWorkerReceipt<R>, BoundedWorkerSubmitError<R>> {
+        if !self.accepts_call_type(job.call_type) {
+            return Err(BoundedWorkerSubmitError::rejected(job));
+        }
         let queue_slot = match Arc::clone(&self.shared.queue_slots).acquire_owned().await {
             Ok(slot) => slot,
             Err(_) => return Err(BoundedWorkerSubmitError::rejected(job)),
         };
-        let (completion, receiver) = oneshot::channel();
-        let queued = QueuedJob {
-            job,
-            completion,
-            queue_slot,
+        self.enqueue(job, queue_slot)
+    }
+
+    /// Attempts bounded queue admission without waiting for a queue position.
+    /// A full or closed executor returns the same unexecuted move-only job.
+    /// This is only the physical queue seam; it grants no workload capacity.
+    #[cfg(test)]
+    pub(crate) fn try_submit(
+        &self,
+        job: BoundedWorkerJob<R>,
+    ) -> Result<BoundedWorkerReceipt<R>, BoundedWorkerSubmitError<R>> {
+        if !self.accepts_call_type(job.call_type) {
+            return Err(BoundedWorkerSubmitError::rejected(job));
+        }
+        let queue_slot = match Arc::clone(&self.shared.queue_slots).try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => return Err(BoundedWorkerSubmitError { job }),
         };
-        let mut state = self
+        self.enqueue(job, queue_slot)
+    }
+
+    pub(crate) fn bind_internal_result_closed_factory_for_composition(
+        &self,
+        call: TypeId,
+        physical_queue_bytes: std::num::NonZeroU64,
+    ) -> Result<
+        novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor,
+        novarocks_workload_control::WorkError,
+    > {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed
+            || state.closed_factory.is_some()
+            || state.running != 0
+            || !state.jobs.is_empty()
+            || self.shared.queue_slots.available_permits() != self.shared.queue_capacity
+        {
+            return Err(novarocks_workload_control::WorkError::Conflict);
+        }
+        state.closed_factory = Some(call);
+        state.closed_factory_queue_bytes = Some(physical_queue_bytes);
+        Ok(novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor::for_composition(self.source(), call, physical_queue_bytes))
+    }
+    pub(crate) fn closed_factory_descriptor(
+        &self,
+    ) -> Option<novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor>
+    {
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let call = state.closed_factory?;
+        let physical_queue_bytes = state.closed_factory_queue_bytes?;
+        Some(novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor::for_composition(self.source(), call, physical_queue_bytes))
+    }
+    pub(crate) fn accepts_call_type(&self, call: TypeId) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed_factory
+            .is_none_or(|registered| registered == call)
+    }
+    fn source(&self) -> Weak<dyn Send + Sync> {
+        let source: Arc<dyn Send + Sync> = self.shared.clone();
+        Arc::downgrade(&source)
+    }
+    pub(crate) fn try_reserve(&self) -> Result<BoundedWorkerReservation, QueueReserveRefusal> {
+        let queue_slot = Arc::clone(&self.shared.queue_slots)
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::Closed => QueueReserveRefusal::Closed,
+                tokio::sync::TryAcquireError::NoPermits => QueueReserveRefusal::Full,
+            })?;
+        let closed = self
             .shared
             .state
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(|e| e.into_inner())
+            .closed;
+        if closed {
+            return Err(QueueReserveRefusal::Closed);
+        }
+        Ok(BoundedWorkerReservation {
+            source: self.source(),
+            queue_slot: Some(queue_slot),
+        })
+    }
+
+    /// Wait in the same physical queue used by ordinary submissions. Dropping
+    /// this future withdraws its semaphore waiter; it does not create a job.
+    pub(crate) async fn reserve(&self) -> Result<BoundedWorkerReservation, QueueReserveRefusal> {
+        let queue_slot = Arc::clone(&self.shared.queue_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| QueueReserveRefusal::Closed)?;
+        if self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed
+        {
+            return Err(QueueReserveRefusal::Closed);
+        }
+        Ok(BoundedWorkerReservation {
+            source: self.source(),
+            queue_slot: Some(queue_slot),
+        })
+    }
+    pub(crate) fn same_pool(&self, reservation: &BoundedWorkerReservation) -> bool {
+        Weak::ptr_eq(&reservation.source, &self.source())
+    }
+    pub(crate) fn prepare(
+        &self,
+        job: BoundedWorkerJob<R>,
+    ) -> (
+        BoundedWorkerPrepared<R>,
+        BoundedWorkerReceipt<R>,
+        Arc<BoundedWorkerActualExit>,
+    ) {
+        let (completion, receiver) = oneshot::channel();
+        let exit = Arc::new(BoundedWorkerActualExit::new());
+        (
+            BoundedWorkerPrepared {
+                source: self.source(),
+                job,
+                completion,
+                exit: Arc::clone(&exit),
+            },
+            BoundedWorkerReceipt { receiver },
+            exit,
+        )
+    }
+    pub(crate) fn publish_joint_in(
+        &self,
+        prepared: &mut Option<BoundedWorkerPrepared<R>>,
+        physical: &mut Option<JointLocalGrant<super::QueryBlockingReservation>>,
+    ) -> Result<BoundedWorkerPublication<R>, QueuePublishRefusal> {
+        let Some(job) = prepared.as_ref() else {
+            return Err(QueuePublishRefusal::Empty);
+        };
+        let Some(guard) = physical.as_mut() else {
+            return Err(QueuePublishRefusal::Empty);
+        };
+        let source = self.source();
+        if !Weak::ptr_eq(&job.source, &source)
+            || !Weak::ptr_eq(&guard.physical_mut().inner.source, &source)
+        {
+            return Err(QueuePublishRefusal::ForeignPool);
+        }
+        match self.closed_factory_descriptor() {
+            Some(descriptor) if !guard.matches_internal_result_closed_factory(&descriptor) => {
+                return Err(QueuePublishRefusal::FactoryMismatch);
+            }
+            None if guard.is_internal_result_closed_factory() => {
+                return Err(QueuePublishRefusal::FactoryMismatch);
+            }
+            _ => {}
+        }
+        if job.completion.is_closed() {
+            return Err(QueuePublishRefusal::ReceiptClosed);
+        }
+        self.publish_record(&mut PendingRecord::Joint { prepared, physical })
+    }
+    pub(crate) fn publish_ordinary_in(
+        &self,
+        prepared: &mut Option<BoundedWorkerPrepared<R>>,
+        reservation: &mut Option<super::QueryBlockingReservation>,
+        call: TypeId,
+    ) -> Result<BoundedWorkerPublication<R>, QueuePublishRefusal> {
+        let job = prepared.as_ref().ok_or(QueuePublishRefusal::Empty)?;
+        let reserved = reservation.as_ref().ok_or(QueuePublishRefusal::Empty)?;
+        let source = self.source();
+        if !Weak::ptr_eq(&job.source, &source) || !Weak::ptr_eq(&reserved.inner.source, &source) {
+            return Err(QueuePublishRefusal::ForeignPool);
+        }
+        if reserved.inner.queue_slot.is_none() {
+            return Err(QueuePublishRefusal::Empty);
+        }
+        if job.job.call_type != call {
+            return Err(QueuePublishRefusal::FactoryMismatch);
+        }
+        if job.completion.is_closed() {
+            return Err(QueuePublishRefusal::ReceiptClosed);
+        }
+        self.publish_record(&mut PendingRecord::Ordinary {
+            prepared,
+            reservation,
+        })
+    }
+    /// The only FIFO publication author. Taking these closed enum fields runs
+    /// no callback, allocation or destructor under QueueState.
+    fn publish_record(
+        &self,
+        pending: &mut PendingRecord<'_, R>,
+    ) -> Result<BoundedWorkerPublication<R>, QueuePublishRefusal> {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closed {
-            return Err(BoundedWorkerSubmitError::rejected(queued.job));
+            return Err(QueuePublishRefusal::Closed);
+        }
+        // Ordinary publication cannot borrow a finite factory's stamp, even
+        // when its erased call happens to have the same Rust type.
+        if matches!(pending, PendingRecord::Ordinary { .. }) && state.closed_factory.is_some() {
+            return Err(QueuePublishRefusal::FactoryMismatch);
+        }
+        if state
+            .closed_factory
+            .is_some_and(|call| call != pending.call_type())
+        {
+            return Err(QueuePublishRefusal::FactoryMismatch);
         }
         debug_assert!(state.jobs.len() < self.shared.queue_capacity);
-        state.jobs.push_back(queued);
+        state.jobs.push_back(pending.take());
         drop(state);
-        self.shared.ready.notify_one();
-        Ok(BoundedWorkerReceipt { receiver })
+        Ok(BoundedWorkerPublication {
+            shared: Arc::clone(&self.shared),
+        })
+    }
+    /// Legacy admission retains its original result and dequeue-release timing.
+    fn enqueue(
+        &self,
+        job: BoundedWorkerJob<R>,
+        queue_slot: OwnedSemaphorePermit,
+    ) -> Result<BoundedWorkerReceipt<R>, BoundedWorkerSubmitError<R>> {
+        let (completion, receiver) = oneshot::channel();
+        let mut row = Some(LegacyQueuedJob {
+            job,
+            completion,
+            queue_slot,
+        });
+        match self.publish_record(&mut PendingRecord::Legacy(&mut row)) {
+            Ok(publication) => {
+                publication.notify();
+                Ok(BoundedWorkerReceipt { receiver })
+            }
+            Err(_) => {
+                let LegacyQueuedJob { job, .. } = row.take().unwrap();
+                Err(BoundedWorkerSubmitError::rejected(job))
+            }
+        }
     }
 
     pub(crate) fn snapshot(&self) -> BoundedWorkerSnapshot {
@@ -460,46 +930,182 @@ fn run_worker<R: Send + 'static>(shared: Arc<Shared<R>>) {
 
     let _exit = Exit(shared.as_ref());
     loop {
-        let queued = {
-            let mut state = shared
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+        let (queued, cancelling) = {
+            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if let Some(queued) = state.jobs.pop_front() {
                     state.running += 1;
-                    break queued;
+                    break (queued, state.closed);
                 }
                 if state.closed {
                     return;
                 }
-                state = shared
-                    .ready
-                    .wait(state)
-                    .unwrap_or_else(|error| error.into_inner());
+                state = shared.ready.wait(state).unwrap_or_else(|e| e.into_inner());
             }
         };
-        let QueuedJob {
-            job,
-            completion,
-            queue_slot,
-        } = queued;
-        // Admission protects the bounded waiting queue only. Once this worker
-        // owns the job, its fixed thread is the running bound.
-        drop(queue_slot);
-        let outcome =
-            catch_unwind(AssertUnwindSafe(|| job.run())).map_err(|_| BoundedWorkerError::Panicked);
-        if let Err(undelivered) = completion.send(outcome) {
-            // The result is destroyed here, on the worker, before this job is
-            // removed from the running set.
-            drop(undelivered);
+        let (job, completion, physical, exit) = match queued {
+            QueuedJob::Legacy(LegacyQueuedJob {
+                job,
+                completion,
+                queue_slot,
+            }) => {
+                // Preserve the legacy queue-only reservation semantics.
+                drop(queue_slot);
+                (job, completion, None, None)
+            }
+            QueuedJob::Ordinary(OrdinaryQueuedJob {
+                prepared,
+                mut reservation,
+            }) => {
+                let BoundedWorkerPrepared {
+                    job,
+                    completion,
+                    exit,
+                    ..
+                } = prepared;
+                // Same queue-only lifetime as the ordinary executor. The
+                // independent exit header still covers the actual call and
+                // result/destructor path on this original worker.
+                drop(reservation.queue_slot.take());
+                (job, completion, None, Some(exit))
+            }
+            QueuedJob::Joint(row) => {
+                let mut row = ManuallyDrop::new(row);
+                // SAFETY: suppress the row destructor and move each initialized
+                // original field exactly once into this same worker's custody.
+                let (prepared, mut guard) = unsafe {
+                    (
+                        ManuallyDrop::take(&mut row.prepared),
+                        ManuallyDrop::take(&mut row.physical),
+                    )
+                };
+                let BoundedWorkerPrepared {
+                    job,
+                    completion,
+                    exit,
+                    ..
+                } = prepared;
+                // The original FIFO no longer retains this queue position.
+                // Its separate execution/source guard remains through actual
+                // call/result teardown; a running job is bounded by workers.
+                drop(guard.physical_mut().inner.queue_slot.take());
+                (job, completion, Some(guard), Some(exit))
+            }
+        };
+        let mut physical = physical;
+        let cleanup = if cancelling && exit.is_some() {
+            // The original worker disposes an unexecuted received call. Any
+            // joint guard stays outside this catch and cannot unwind away.
+            match catch_unwind(AssertUnwindSafe(|| drop(job))) {
+                Ok(()) => catch_unwind(AssertUnwindSafe(|| {
+                    if let Err(original) = completion.send(Err(BoundedWorkerError::ExecutorClosed))
+                    {
+                        drop(original);
+                    }
+                })),
+                Err(original) => {
+                    let cause = BoundedWorkerError::panicked(original);
+                    let notification = catch_unwind(AssertUnwindSafe(|| {
+                        let _ = completion.send(Err(cause.clone()));
+                    }))
+                    .err()
+                    .map(BoundedWorkerError::panicked);
+                    retire_failed_worker(
+                        &shared,
+                        physical.take(),
+                        exit.as_deref(),
+                        cause,
+                        notification,
+                    );
+                }
+            }
+        } else {
+            let outcome =
+                catch_unwind(AssertUnwindSafe(|| job.run())).map_err(BoundedWorkerError::panicked);
+            catch_unwind(AssertUnwindSafe(|| {
+                if let Err(undelivered) = completion.send(outcome) {
+                    drop(undelivered);
+                }
+            }))
+        };
+        if let Err(original) = cleanup {
+            if exit.is_some() {
+                retire_failed_worker(
+                    &shared,
+                    physical.take(),
+                    exit.as_deref(),
+                    BoundedWorkerError::panicked(original),
+                    None,
+                );
+            }
+            // Legacy teardown panic keeps its original raw thread payload.
+            std::panic::resume_unwind(original);
         }
-        let mut state = shared
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        {
+            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.running -= 1;
+        }
+        // The call, result-send and any undelivered destructor have returned,
+        // and the original running record is gone. No owner lock is held.
+        if let Err(original) = catch_unwind(AssertUnwindSafe(|| drop(physical.take()))) {
+            retire_failed_worker_after_running(
+                &shared,
+                None,
+                exit.as_deref(),
+                BoundedWorkerError::panicked(original),
+                None,
+            );
+        }
+        if let Some(exit) = exit
+            && let Some(original) = exit.publish(1, None)
+        {
+            retire_failed_worker_after_running(
+                &shared,
+                None,
+                Some(&exit),
+                BoundedWorkerError::panicked(original),
+                None,
+            );
+        }
+    }
+}
+fn retire_failed_worker<R>(
+    shared: &Shared<R>,
+    physical: Option<JointLocalGrant<super::QueryBlockingReservation>>,
+    exit: Option<&BoundedWorkerActualExit>,
+    cause: BoundedWorkerError,
+    notification: Option<BoundedWorkerError>,
+) -> ! {
+    {
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.running -= 1;
     }
+    retire_failed_worker_after_running(shared, physical, exit, cause, notification)
+}
+fn retire_failed_worker_after_running<R>(
+    shared: &Shared<R>,
+    physical: Option<JointLocalGrant<super::QueryBlockingReservation>>,
+    exit: Option<&BoundedWorkerActualExit>,
+    cause: BoundedWorkerError,
+    notification: Option<BoundedWorkerError>,
+) -> ! {
+    {
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+    }
+    shared.queue_slots.close();
+    shared.ready.notify_all();
+    let secondary = exit
+        .and_then(|exit| exit.publish(2, Some(&cause)))
+        .map(BoundedWorkerError::panicked);
+    // Three fixed opaque carriers at most: this cause, the original result
+    // notification, and the independent actual-exit observer notification.
+    let failure = WorkerRetirementFailure {
+        cause: ManuallyDrop::new(cause),
+        notification: ManuallyDrop::new([notification, secondary]),
+        physical: ManuallyDrop::new(physical),
+    };
+    std::panic::resume_unwind(Box::new(failure));
 }
 
 async fn wait_for_worker_exit<R>(shared: &Shared<R>) {
@@ -521,17 +1127,33 @@ async fn wait_for_worker_exit<R>(shared: &Shared<R>) {
 }
 
 fn close_queue<R>(shared: &Shared<R>) {
-    let queued = {
-        let mut state = shared
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+    let discarded = {
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
-        shared.queue_slots.close();
-        state.jobs.drain(..).collect::<Vec<_>>()
+        let count = state.jobs.len();
+        let legacy_count = state
+            .jobs
+            .iter()
+            .filter(|row| matches!(row, QueuedJob::Legacy(_)))
+            .count();
+        let mut legacy = Vec::with_capacity(legacy_count);
+        for _ in 0..count {
+            let row = state.jobs.pop_front().unwrap();
+            match row {
+                QueuedJob::Legacy(row) => legacy.push(row),
+                // Same original FIFO/storage: workers perform the cancelled
+                // joint call's real destruction under its physical guard.
+                QueuedJob::Joint(row) => state.jobs.push_back(QueuedJob::Joint(row)),
+                QueuedJob::Ordinary(row) => state.jobs.push_back(QueuedJob::Ordinary(row)),
+            }
+        }
+        legacy
     };
-    drop(queued);
+    // Closing the original semaphore can wake foreign producer Wakers.
+    // Both that notification and actual input destruction are lock-free.
+    shared.queue_slots.close();
     shared.ready.notify_all();
+    drop(discarded);
 }
 
 impl<R> Drop for BoundedWorkerOwner<R> {
@@ -545,7 +1167,7 @@ impl<R> Drop for BoundedWorkerOwner<R> {
     }
 }
 
-type WorkerSet = Vec<JoinHandle<()>>;
+type WorkerSet = Vec<WorkerEntry>;
 
 /// The fallback path cannot report worker panics, but it must still keep thread
 /// convergence away from arbitrary async/runtime destruction paths. A single
@@ -563,8 +1185,10 @@ fn reap_workers(workers: WorkerSet) {
             .name("bounded-worker-reaper".to_string())
             .spawn(move || {
                 while let Ok(workers) = receiver.recv() {
-                    for worker in workers {
-                        let _ = worker.join();
+                    for mut worker in workers {
+                        if let Some(join) = worker.join.take() {
+                            let _ = join.join();
+                        }
                     }
                 }
             })
@@ -1021,5 +1645,176 @@ mod tests {
         drop_returned.store(1, Ordering::Release);
         releaser.join().unwrap();
         assert_eq!(finished.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn try_submit_full_returns_the_original_job_without_running_or_dropping_it() {
+        let (mut owner, handle) = executor::<usize>(1, 1);
+        let (release, released) = mpsc::channel();
+        let (started, observed_start) = mpsc::channel();
+        let running = handle
+            .try_submit(BoundedWorkerJob::new(move || {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                1
+            }))
+            .unwrap();
+        receive(&observed_start).await;
+        // The asynchronous entry must consume the very same physical queue.
+        let queued = handle.submit(BoundedWorkerJob::new(|| 2)).await.unwrap();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let job_runs = Arc::clone(&runs);
+        let (dropped, observed_drop) = mpsc::channel();
+        let notice = DropNotice {
+            dropped: Some(dropped),
+        };
+        let payload = String::from("same move-only application input");
+        let refused = handle
+            .try_submit(BoundedWorkerJob::new(move || {
+                assert_eq!(payload, "same move-only application input");
+                job_runs.fetch_add(1, Ordering::SeqCst);
+                drop(notice);
+                3
+            }))
+            .unwrap_err();
+        // This call returned synchronously while both existing jobs remain
+        // gated. No timeout or scheduler turn creates room for the refusal.
+        assert_eq!(
+            (handle.snapshot().queued, handle.snapshot().running),
+            (1, 1)
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(observed_drop.try_recv(), Err(mpsc::TryRecvError::Empty));
+        let original = refused.into_job();
+        release.send(()).unwrap();
+        assert_eq!(running.complete().await.unwrap(), 1);
+        assert_eq!(queued.complete().await.unwrap(), 2);
+        let retried = handle.try_submit(original).unwrap();
+        assert_eq!(retried.complete().await.unwrap(), 3);
+        receive(&observed_drop).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn try_submit_closed_returns_untouched_job_and_drop_stays_with_the_caller() {
+        let (mut owner, handle) = executor::<usize>(1, 1);
+        owner.request_close();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let job_runs = Arc::clone(&runs);
+        let (dropped, observed_drop) = mpsc::channel();
+        let notice = DropNotice {
+            dropped: Some(dropped),
+        };
+        let error = handle
+            .try_submit(BoundedWorkerJob::new(move || {
+                job_runs.fetch_add(1, Ordering::SeqCst);
+                drop(notice);
+                7
+            }))
+            .unwrap_err();
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(observed_drop.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert_eq!(handle.snapshot().queued, 0);
+        drop(error.into_job());
+        assert_eq!(receive(&observed_drop).await, thread::current().id());
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_between_original_position_acquisition_and_enqueue_returns_the_job() {
+        let (mut owner, handle) = executor::<usize>(1, 1);
+        // This is the actual semaphore position used by both public entry
+        // bodies, not a second queue or an injected queue-state flag.
+        let slot = Arc::clone(&handle.shared.queue_slots)
+            .try_acquire_owned()
+            .unwrap();
+        owner.request_close();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let job_runs = Arc::clone(&runs);
+        let (dropped, observed_drop) = mpsc::channel();
+        let notice = DropNotice {
+            dropped: Some(dropped),
+        };
+        let error = handle
+            .enqueue(
+                BoundedWorkerJob::new(move || {
+                    job_runs.fetch_add(1, Ordering::SeqCst);
+                    drop(notice);
+                    7
+                }),
+                slot,
+            )
+            .unwrap_err();
+        assert_eq!(handle.snapshot().queued, 0);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(observed_drop.try_recv(), Err(mpsc::TryRecvError::Empty));
+        drop(error.into_job());
+        assert_eq!(receive(&observed_drop).await, thread::current().id());
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(owner.shared.state.lock().unwrap().live_workers, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn original_try_submit_and_close_race_have_one_job_owner_and_one_execution_verdict() {
+        for _ in 0..16 {
+            let (mut owner, handle) = executor::<usize>(1, 1);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let submit_barrier = Arc::clone(&barrier);
+            let runs = Arc::new(AtomicUsize::new(0));
+            let job_runs = Arc::clone(&runs);
+            let (dropped, observed_drop) = mpsc::channel();
+            let notice = DropNotice {
+                dropped: Some(dropped),
+            };
+            let submitter = thread::spawn(move || {
+                submit_barrier.wait();
+                handle.try_submit(BoundedWorkerJob::new(move || {
+                    job_runs.fetch_add(1, Ordering::SeqCst);
+                    drop(notice);
+                    7
+                }))
+            });
+            barrier.wait();
+            owner.request_close();
+            match submitter.join().unwrap() {
+                Ok(receipt) => match receipt.complete().await {
+                    Ok(value) => {
+                        assert_eq!(value, 7);
+                        assert_eq!(runs.load(Ordering::SeqCst), 1);
+                    }
+                    Err(BoundedWorkerError::ExecutorClosed) => {
+                        assert_eq!(runs.load(Ordering::SeqCst), 0);
+                    }
+                    Err(other) => panic!("unexpected worker verdict: {other}"),
+                },
+                Err(error) => {
+                    assert_eq!(runs.load(Ordering::SeqCst), 0);
+                    assert_eq!(observed_drop.try_recv(), Err(mpsc::TryRecvError::Empty));
+                    drop(error.into_job());
+                }
+            }
+            receive(&observed_drop).await;
+            assert_eq!(
+                observed_drop.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            );
+            owner
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert_eq!(owner.shared.state.lock().unwrap().live_workers, 0);
+            assert!(owner.workers.lock().unwrap().is_empty());
+        }
     }
 }

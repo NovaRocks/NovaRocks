@@ -49,6 +49,22 @@ const ADMIT_PERSISTED_DEFINITION_SEMANTICS_UNSUPPORTED: ErrorCodeDescriptor = Er
     status: ErrorCodeStatus::Active,
 };
 
+const ADMIT_CLIENT_TYPE_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.client_type_unsupported"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+
+/// A frozen public output has no exact SQL expression span to publish.
+pub fn client_type_unsupported_error(message: impl Into<String>) -> UserError {
+    UserError::from_descriptor(
+        ADMIT_CLIENT_TYPE_UNSUPPORTED,
+        message,
+        None,
+        RetryClass::Never,
+    )
+}
+
 /// Session capability descriptors exported for manifest and wire-mapping checks.
 pub const SESSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED,
@@ -56,6 +72,7 @@ pub const SESSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     ADMIT_KILL_CONNECTION_UNSUPPORTED,
     ADMIT_KILL_DENIED,
     ADMIT_PERSISTED_DEFINITION_SEMANTICS_UNSUPPORTED,
+    ADMIT_CLIENT_TYPE_UNSUPPORTED,
 ];
 
 /// Capability failures owned by Query Application SQL admission.
@@ -154,5 +171,20 @@ mod tests {
             assert_eq!(error.phase(), ErrorPhase::Admit);
             assert_eq!(error.location().map(|location| location.column()), Some(5));
         }
+    }
+
+    #[test]
+    fn client_type_rejection_preserves_admit_code_without_inventing_location() {
+        let error = client_type_unsupported_error("column 'wide' has unsupported type LargeInt");
+        assert_eq!(error.code().as_str(), "sql.admit.client_type_unsupported");
+        assert_eq!(error.phase(), ErrorPhase::Admit);
+        assert_eq!(error.location(), None);
+        assert_eq!(error.retry(), RetryClass::Never);
+        assert!(error.to_string().contains("wide"));
+        assert!(
+            SESSION_ERROR_CODE_DESCRIPTORS
+                .iter()
+                .any(|descriptor| descriptor.code == error.code())
+        );
     }
 }

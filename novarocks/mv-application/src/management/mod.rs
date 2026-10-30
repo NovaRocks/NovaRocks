@@ -50,9 +50,9 @@ pub use effects::{
 };
 pub use observation::{
     FreshCreateIntentObservation, FreshManagementObservation, ManagementContinuation,
-    ManagementObservationError, ManagementObservationPhase, ManagementObservationRequestId,
-    ManagementObservationState, PendingCreateIntentObservation, PendingManagementObservation,
-    RegistrationRequirement,
+    ManagementObservationError, ManagementObservationFailure, ManagementObservationPhase,
+    ManagementObservationRequestId, ManagementObservationState, PendingCreateIntentObservation,
+    PendingManagementObservation, RegistrationRequirement,
 };
 pub use ownership::{
     CreateIntent, DeploymentOwner, ManagedMvTarget, ManagementOwnershipError, ProcessIncarnation,

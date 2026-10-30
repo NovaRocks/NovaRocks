@@ -15,10 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::query_execution::contract::{DistributedQueryErrorKind, DistributedQueryIntent};
-use crate::query_execution::outcome::QueryOutcomeFactory;
-use crate::query_execution::statistics::StatisticsExecutionPolicy;
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationSource};
+use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 
 #[test]
 fn cancellation_view_observes_injected_flag() {
@@ -31,104 +29,35 @@ fn cancellation_view_observes_injected_flag() {
 }
 
 #[test]
-fn outcome_factory_rejects_intent_mismatch() {
-    let result = QueryOutcomeFactory::new(DistributedQueryIntent::Result).from_execution_result(
-        crate::query_execution::outcome::QueryExecutionResult {
-            query_result: novarocks_query_application::api::QueryResult::empty(),
-            write_session: None,
-            fragment_profiles: vec![
-                crate::query_execution::profile::FragmentProfileTree::unattributed(
-                    novarocks_execution::runtime::profile::Profiler::new("fragment-1")
-                        .to_native_tree(),
-                ),
-            ],
-        },
-    );
-
-    let Err(error) = result else {
-        panic!("Result intent must reject a profile payload");
-    };
-    assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
-    assert_eq!(
-        error.message(),
-        "Result outcome cannot contain write or profile payloads"
-    );
-}
-
-#[test]
 fn statistics_attempt_timeout_must_be_positive() {
-    let policy = StatisticsExecutionPolicy::try_new(std::time::Duration::from_secs(30 * 60))
-        .expect("positive attempt timeout");
+    let policy_for = |attempt_timeout| {
+        LakePublicationRuntimePolicy::try_new(
+            attempt_timeout,
+            std::time::Duration::from_secs(45 * 60),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(5 * 60),
+            std::time::Duration::from_secs(60),
+        )
+    };
+    let policy =
+        policy_for(std::time::Duration::from_secs(30 * 60)).expect("positive attempt timeout");
     assert_eq!(
-        policy.attempt_timeout(),
+        policy.max_attempt_duration(),
         std::time::Duration::from_secs(30 * 60)
     );
     assert!(
-        StatisticsExecutionPolicy::try_new(std::time::Duration::from_secs(30 * 60 + 1)).is_ok(),
-        "the shared LakePublicationRuntimePolicy, not this transport-neutral Core policy, owns the configured maximum"
+        policy_for(std::time::Duration::from_secs(30 * 60 + 1)).is_ok(),
+        "the shared policy accepts longer attempts when its strict GC relationship is satisfied"
     );
-    assert!(StatisticsExecutionPolicy::try_new(std::time::Duration::ZERO).is_err());
+    assert!(policy_for(std::time::Duration::ZERO).is_err());
 }
 
 #[test]
-fn profile_outcome_preserves_fragment_profiles() {
+fn fragment_profile_set_preserves_fragment_profiles() {
     let profile = crate::query_execution::profile::FragmentProfileTree::for_fragment(
         7,
         novarocks_execution::runtime::profile::Profiler::new("fragment-7").to_native_tree(),
     );
-    let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Profile)
-        .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: novarocks_query_application::api::build_string_query_result(
-                "status",
-                vec!["profiled".to_string()],
-            )
-            .expect("profile result"),
-            write_session: None,
-            fragment_profiles: vec![profile.clone()],
-        })
-        .expect("Profile intent accepts fragment profiles");
-
-    let (output_rows, profiles) = outcome
-        .into_profile()
-        .expect("profile outcome variant")
-        .into_parts();
-    assert_eq!(output_rows, 1);
+    let profiles = crate::query_execution::outcome::FragmentProfileSet::new(vec![profile.clone()]);
     assert_eq!(profiles.into_profiles(), vec![profile]);
-}
-
-#[test]
-fn profile_outcome_retains_only_exact_count_and_diagnostics() {
-    let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Profile)
-        .profile(
-            u64::MAX,
-            crate::query_execution::outcome::FragmentProfileSet::new(Vec::new()),
-        )
-        .unwrap();
-    let (rows, profiles) = outcome.into_profile().unwrap().into_parts();
-    assert_eq!(rows, u64::MAX);
-    assert!(profiles.into_profiles().is_empty());
-}
-
-#[test]
-fn result_outcome_preserves_query_result() {
-    let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Result)
-        .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: novarocks_query_application::api::build_string_query_result(
-                "value",
-                vec!["kept".to_string()],
-            )
-            .expect("result payload"),
-            write_session: None,
-            fragment_profiles: Vec::new(),
-        })
-        .expect("Result intent accepts a plain query result");
-
-    assert_eq!(
-        outcome
-            .into_result()
-            .expect("result outcome variant")
-            .into_query_result()
-            .row_count(),
-        1
-    );
 }

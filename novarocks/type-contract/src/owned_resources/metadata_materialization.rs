@@ -19,7 +19,7 @@
 //! An arbitrary HashMap capacity, Field size, or equal metadata is not an origin.
 //! This owns no allocator, MEM grant, account, observation, or execution policy.
 use super::hashmap::{FreshTableFacts, HashMapResourceError, fresh_table_layout};
-use arrow_schema::{Field, FieldRef, Fields, Schema, SchemaRef};
+use arrow_schema::{Field, FieldRef, Fields, Metadata, Schema, SchemaRef};
 use std::{
     collections::{HashMap, TryReserveError},
     sync::{Arc, Weak},
@@ -28,6 +28,7 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataMaterializationError {
     Model(HashMapResourceError),
+    BTree(super::btree::BTreeResourceError),
     ValueType(crate::ValueTypeError),
     InsertCountExceededOriginalReservation,
     MissingOriginalFieldOrigin,
@@ -59,6 +60,10 @@ fn allocation<E>(
     }
     Ok(())
 }
+fn metadata_model_error(error: super::btree::BTreeResourceError) -> MetadataMaterializationError {
+    MetadataMaterializationError::BTree(error)
+}
+
 fn text_layout<E: From<MetadataMaterializationError>>(
     bytes: usize,
 ) -> Result<std::alloc::Layout, E> {
@@ -154,18 +159,20 @@ impl MetadataTableCloneRequest {
     }
 }
 
-// Live backing is distinct from a clone request: the original immutable table
-// construction proves bucket history, while actual strings retain capacity.
+// Live backing is distinct from a clone request: immutable Metadata retains
+// its Arc/BTree and actual String capacities while clone requests remain zero.
 fn original_map_backing_observed<E: From<MetadataMaterializationError>>(
     origin: MetadataCloneOrigin,
-    values: &HashMap<String, String>,
+    values: &Metadata,
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<usize, E> {
-    let mut bytes = origin
-        .table_request()
-        .map_err(E::from)?
-        .layout
-        .map_or(0, |v| v.size());
+    // The original staging map proves this paired immutable owner, but its
+    // buckets no longer describe Arrow 60's attached Arc<BTreeMap> backing.
+    origin.table_request().map_err(E::from)?;
+    let mut bytes = super::arrow_metadata::hashmap_conversion_requests(values.len())
+        .and_then(|requests| requests.retained_backing_upper_bound())
+        .map_err(metadata_model_error)
+        .map_err(E::from)?;
     observe()?;
     for (key, value) in values {
         bytes = bytes
@@ -191,7 +198,7 @@ fn index_original_loans(mut fields: Arc<[MetadataFieldLoan]>) -> Arc<[MetadataFi
 // HashMap plus a copied numerical origin cannot mint a source pairing.
 fn original_map_clone_request<E: From<MetadataMaterializationError>>(
     metadata: MetadataCloneOrigin,
-    values: &HashMap<String, String>,
+    values: &Metadata,
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<MetadataTableCloneRequest, E> {
     original_map_clone_request_core(metadata, values, observe, &mut None)
@@ -199,36 +206,20 @@ fn original_map_clone_request<E: From<MetadataMaterializationError>>(
 
 fn original_map_clone_request_core<E: From<MetadataMaterializationError>>(
     metadata: MetadataCloneOrigin,
-    values: &HashMap<String, String>,
+    values: &Metadata,
     observe: &mut impl FnMut() -> Result<(), E>,
     loan: &mut Option<MetadataAllocationLoan<'_, E>>,
 ) -> Result<MetadataTableCloneRequest, E> {
-    let table_backing = metadata.table_request().map_err(E::from)?.layout;
-    if let Some(layout) = table_backing {
-        allocation(loan, layout, 1)?;
-    }
-    let mut text_requests = 0_usize;
-    let mut text_bytes = 0_usize;
-    for (key, value) in values {
-        // String::clone requests the original length, independently for both
-        // strings. An empty string contributes no physical allocation request.
-        for text in [key, value] {
-            if !text.is_empty() {
-                allocation(loan, text_layout::<E>(text.len())?, 1)?;
-                text_requests = text_requests
-                    .checked_add(1)
-                    .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
-                text_bytes = text_bytes
-                    .checked_add(text.len())
-                    .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
-            }
-        }
-        observe()?;
-    }
+    // Metadata::clone is Option<Arc<BTreeMap>>::clone in Arrow 60. It has
+    // no table, Arc header or String allocation request. The live shared
+    // backing remains a separate source obligation, never a fresh clone.
+    metadata.table_request().map_err(E::from)?;
+    let _ = (values, loan);
+    observe()?;
     Ok(MetadataTableCloneRequest {
-        table_backing,
-        text_requests,
-        text_bytes,
+        table_backing: None,
+        text_requests: 0,
+        text_bytes: 0,
     })
 }
 
@@ -324,8 +315,9 @@ pub struct MetadataCloneOrigin {
     facts: Result<FreshTableFacts, MetadataMaterializationError>,
 }
 impl MetadataCloneOrigin {
-    /// RawTable::clone allocates its original bucket count; this is not a
-    /// capacity-to-buckets inversion over a possibly erased foreign table.
+    /// Original temporary HashMap request, before Arrow 60 converts it to
+    /// immutable Metadata. This is a provenance fact about the staging author,
+    /// not the attached BTree backing or a Metadata::clone allocation.
     pub fn table_request(self) -> Result<FreshTableFacts, MetadataMaterializationError> {
         self.facts
     }
@@ -573,6 +565,19 @@ mod value_field_author_tests {
             assert!(original.layout.is_some());
             assert_eq!(original.allocation_requests_upper_bound, 1);
             assert!(original.request_bytes_upper_bound > 0);
+            let request = field
+                .original_metadata_clone_request(&mut || {
+                    Ok::<(), super::MetadataMaterializationError>(())
+                })
+                .unwrap();
+            assert_eq!(request.table_backing, None);
+            assert_eq!((request.text_requests, request.text_bytes), (0, 0));
+            assert_eq!(request.request_bytes().unwrap(), 0);
+            let copied = field.clone_original();
+            assert!(std::sync::Arc::ptr_eq(
+                field.field().metadata().as_arc().unwrap(),
+                copied.field().metadata().as_arc().unwrap()
+            ));
             assert_eq!(
                 field.clone_original().metadata_origin(),
                 field.metadata_origin()
@@ -901,7 +906,7 @@ impl SchemaMetadataMaterializations {
 /// accepted. The caller still owes admission before the original clone.
 #[derive(Debug)]
 pub struct OriginalMetadataClone {
-    values: HashMap<String, String>,
+    values: Metadata,
     metadata: MetadataCloneOrigin,
 }
 impl OriginalMetadataClone {
@@ -1401,9 +1406,8 @@ impl TypedSchemaMaterializations {
         };
         let mut loans = Vec::with_capacity(self.namespace.fields.len() + roots);
         loans.extend(self.namespace.fields.iter().cloned());
-        // Schema::new creates its original empty RandomState map before
-        // converting Field values into Fields. Keep that original seed order;
-        // this is not a claim that OS seed acquisition is allocator/CPU-bounded.
+        // The original empty staging map remains allocation-free; Arrow 60
+        // represents its attached empty Metadata as None, without an Arc.
         let metadata = MaterializedMetadataMap::new_for_original_reserve();
         // The two typed input containers share ONE original Field -> Arc ->
         // Schema conversion. Plain foreign fields retain no fabricated origin.
@@ -1453,6 +1457,7 @@ impl std::error::Error for MetadataMaterializationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ValueType(source) => Some(source),
+            Self::BTree(source) => Some(source),
             _ => None,
         }
     }

@@ -213,7 +213,6 @@ struct LifecycleConvergenceWireSnapshot {
     query_process_namespace: String,
     query_local_sequence: u64,
     query_attempt_id: u64,
-    error_source: Option<String>,
     #[serde(default)]
     failure_fact: Option<Vec<u8>>,
     #[serde(default)]
@@ -432,13 +431,6 @@ fn decode_query_lifecycle_structured_snapshot(
         wire.query_attempt_id > 0,
         "FE lifecycle snapshot query_attempt_id must be nonzero"
     );
-    let error_source = match wire.error_source.as_deref() {
-        None => None,
-        Some("backend-attestation") => Some(QueryLifecycleErrorSource::BackendAttestation),
-        Some("frontend-liveness") => Some(QueryLifecycleErrorSource::FrontendLiveness),
-        Some("no-outcome") => Some(QueryLifecycleErrorSource::NoOutcome),
-        Some(source) => bail!("unknown FE lifecycle snapshot error source {source:?}"),
-    };
     ensure!(
         wire.failure_fact.is_some() == wire.failure_detail.is_some()
             && wire.failure_fact.is_some() == wire.failure_site.is_some(),
@@ -453,7 +445,6 @@ fn decode_query_lifecycle_structured_snapshot(
         process_namespace,
         local_sequence: wire.query_local_sequence,
         attempt_id: wire.query_attempt_id,
-        error_source,
         failure_fact: decode_observed_failure_fact(wire.failure_fact.as_deref())?,
         failure_detail: wire.failure_detail,
         failure_site: wire
@@ -496,6 +487,7 @@ pub struct CrossProcessRuntime {
     pub fe_http_port: u16,
     pub fe_grpc_port: u16,
     pub fe_mysql_port: u16,
+    pub fe_trino_port: u16,
 }
 
 /// Sanitized response captured from the FE management listener during a
@@ -1110,16 +1102,6 @@ pub enum QueryLifecyclePhase {
     TerminalRetained,
 }
 
-/// Structured lifecycle facts exposed by a runner-owned cross-process
-/// cluster. T4 owns this test boundary; T7/T9 supply query-scoped values once
-/// their outcome and convergence contracts are implemented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueryLifecycleErrorSource {
-    BackendAttestation,
-    FrontendLiveness,
-    NoOutcome,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryLifecycleStructuredSnapshot {
     /// The immutable execution identity used to correlate all values below.
@@ -1128,7 +1110,6 @@ pub struct QueryLifecycleStructuredSnapshot {
     pub process_namespace: u64,
     pub local_sequence: u64,
     pub attempt_id: u64,
-    pub error_source: Option<QueryLifecycleErrorSource>,
     /// The original physical attempt's typed terminal; no logical acceptance authority.
     pub failure_fact: Option<novarocks_execution_contract::failure::FailureFact>,
     pub failure_detail: Option<String>,
@@ -2426,8 +2407,7 @@ where
                     == Some(expected_execution_id.as_str())
                     && candidate.process_namespace == target.process_namespace
                     && candidate.local_sequence == target.local_sequence
-                    && candidate.attempt_id == target.attempt_id
-                    && candidate.error_source.is_none();
+                    && candidate.attempt_id == target.attempt_id;
                 if matches {
                     return Ok(candidate);
                 }
@@ -2438,7 +2418,7 @@ where
         }
         if Instant::now() >= deadline {
             bail!(
-                "timed out waiting for successful exact lifecycle target={target:?} execution_id={expected_execution_id}; before={before_execution_id:?}; latest_candidate={latest_candidate:?}; latest_error={latest_error:?}"
+                "timed out waiting for exact lifecycle target={target:?} execution_id={expected_execution_id}; before={before_execution_id:?}; latest_candidate={latest_candidate:?}; latest_error={latest_error:?}"
             );
         }
         thread::sleep(
@@ -2697,6 +2677,37 @@ pub trait ServerHandle: Send {
         bail!("finite MV scheduler observation requires an authenticated role session")
     }
 
+    fn role_launch_progress(
+        &self,
+        _role: RoleSlot,
+        _reference: &test_sessions::RoleLaunchReference,
+    ) -> Result<test_sessions::RoleLaunchProgress> {
+        bail!("role launch progress requires the original cross-process test-session owner")
+    }
+    fn retire_unissued_role_launch(
+        &mut self,
+        _role: RoleSlot,
+        _reference: &test_sessions::RoleLaunchReference,
+    ) -> Result<()> {
+        bail!("role launch retirement requires the original cross-process test-session owner")
+    }
+
+    /// Settle a skipped original intent without revoking any issued credential.
+    fn retire_unissued_role_launch_if_reserved(
+        &mut self,
+        role: RoleSlot,
+        reference: &test_sessions::RoleLaunchReference,
+    ) -> Result<bool> {
+        match self.role_launch_progress(role, reference)? {
+            test_sessions::RoleLaunchProgress::Reserved => {
+                self.retire_unissued_role_launch(role, reference)?;
+                Ok(true)
+            }
+            test_sessions::RoleLaunchProgress::Issued
+            | test_sessions::RoleLaunchProgress::RetiredUnissued => Ok(false),
+        }
+    }
+
     fn target_host(&self) -> Option<&str>;
     fn target_port(&self) -> Option<u16>;
     fn process_resource_identities(
@@ -2794,6 +2805,14 @@ pub trait ServerHandle: Send {
     fn restart_fe_until(&mut self, _deadline: Instant) -> Result<()> {
         self.restart_fe()
     }
+    /// Invoke once only after the original FE and role session actually exit,
+    /// before preparing or starting their successor. Unsupported owners reject.
+    fn restart_fe_with_after_exit_hook(
+        &mut self,
+        _after_exit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        bail!("an after-exit restart hook requires the original cross-process owner")
+    }
     fn kill_query(&mut self, connection_id: u32) -> Result<()> {
         bail!("KILL QUERY is unsupported by this server mode (connection_id={connection_id})")
     }
@@ -2844,6 +2863,14 @@ pub trait ServerHandle: Send {
         _run_token: &str,
     ) -> Result<()> {
         bail!("selected Native fault is unsupported by this server mode")
+    }
+    fn end_selected_query_lifecycle_fault(
+        &mut self,
+        _index: usize,
+        _kind: &'static str,
+        _run_token: &str,
+    ) -> Result<()> {
+        bail!("selected Native fault end is unsupported by this server mode")
     }
     fn activate_selected_deferred_query_lifecycle_fault(
         &mut self,
@@ -2906,7 +2933,7 @@ pub trait ServerHandle: Send {
             self.query_lifecycle_structured_snapshot()
         })
     }
-    /// Wait for the successful projection of this exact, externally bound attempt.
+    /// Wait for the projection correlated with this exact, externally bound execution attempt.
     fn await_query_lifecycle_structured_snapshot_for_attempt(
         &mut self,
         target: QueryLifecycleAttemptTarget,
@@ -3116,6 +3143,10 @@ pub fn render_cross_process_config(
                 "mysql_port".to_string(),
                 Value::Integer(i64::from(runtime.fe_mysql_port)),
             );
+            standalone_server.insert(
+                "trino_port".to_string(),
+                Value::Integer(i64::from(runtime.fe_trino_port)),
+            );
             // An operator declaration is refused where there is nowhere to
             // record it, so a frontend that a test may issue one to needs a
             // sink. The path is relative, which the server resolves against
@@ -3132,6 +3163,7 @@ pub fn render_cross_process_config(
                 .and_then(Value::as_table_mut)
             {
                 standalone_server.remove("mysql_port");
+                standalone_server.remove("trino_port");
             }
         }
     }
@@ -4010,6 +4042,7 @@ impl CrossProcessServerHandle {
             fe_http_port: reserved.fe_http_port.port(),
             fe_grpc_port: reserved.fe_grpc_port.port(),
             fe_mysql_port: reserved.fe_mysql_port.port(),
+            fe_trino_port: reserved.fe_trino_port.port(),
         };
         let native_proxy_config = proxy_config.clone();
         let mut native_fault_proxies = BackendNativeFaultProxies::start(
@@ -4184,6 +4217,7 @@ impl CrossProcessServerHandle {
             let _ = reserved.fe_http_port.release();
             let _ = reserved.fe_grpc_port.release();
             let _ = reserved.fe_mysql_port.release();
+            let _ = reserved.fe_trino_port.release();
             let (fe_process, fe_launch_identity) = spawn_novarocks_process(ProcessLaunch {
                 binary: &fe_binary,
                 role: "fe",
@@ -5072,6 +5106,113 @@ impl CrossProcessServerHandle {
     }
 }
 
+impl CrossProcessServerHandle {
+    fn restart_frontend_until(
+        &mut self,
+        deadline: Instant,
+        after_exit: Option<&mut dyn FnMut() -> Result<()>>,
+    ) -> Result<()> {
+        let deadline = self
+            .test_sessions
+            .as_ref()
+            .map_or(deadline, |plan| deadline.min(plan.deadline()));
+        let deadline = self
+            .fixture_budget
+            .as_ref()
+            .map_or(deadline, |budget| deadline.min(budget.work_deadline()));
+        let controller_cleanup = self
+            .test_sessions
+            .as_mut()
+            .map(|plan| plan.end_role(RoleSlot::Frontend))
+            .transpose();
+        let prior_log = self
+            .fe_process
+            .log_contents()
+            .context("preserve cross-process FE log before restart");
+        let stopped = self
+            .fe_process
+            .stop()
+            .context("reap old cross-process FE before new role session");
+        let exited = combine_role_cleanup(stopped, controller_cleanup.map(|_| ()));
+        let prior_log = combine_restart_evidence(prior_log, exited)?;
+        self.fe_log_history.push_str(&prior_log);
+        self.fe_process.release_diagnostics()?;
+        if let Some(after_exit) = after_exit {
+            let _ = remaining_until(deadline, "after-exit restart hook")?;
+            after_exit()
+                .context("after the original frontend exit, before its successor launch")?;
+        }
+        let marker = "NOVAROCKS_READY mysql_port=";
+        let binary = self.test_sessions.as_ref().map_or_else(
+            || Ok(self.fe_binary.clone()),
+            |plan| plan.binary_for_next_launch(RoleSlot::Frontend, &self.fe_binary),
+        )?;
+        let mut command = build_novarocks_command_with_profile(
+            &binary,
+            "fe",
+            &self.fe_config_path,
+            self.launch_profile,
+        );
+        let evidence = self.runtime_dir.join(format!(
+            "fe-restart-{}.build-info.json",
+            next_fragment_failure_token(0)
+        ));
+        let previous_unconfirmed_launch = self.unconfirmed_role_launch;
+        self.unconfirmed_role_launch = true;
+        self.role_sessions_joined = false;
+        if let Some(plan) = &mut self.test_sessions {
+            if let Some(declaration) =
+                plan.prepare_launch(RoleSlot::Frontend, &binary, &evidence, deadline)?
+            {
+                command.arg("--test-session").arg(declaration);
+            }
+        } else {
+            test_sessions::check_binary(&binary, false, &[], deadline, &evidence)?;
+        }
+        apply_child_environment(&mut command, &self.fe_environment);
+        apply_launch_profile(&mut command, self.launch_profile);
+        if let Some((work, complete)) =
+            role_payload_lifetime(self.fixture_budget.as_ref(), self.test_sessions.as_ref())
+        {
+            command.terminate_at(work, complete);
+        }
+        self.fe_process
+            .restart(
+                command,
+                ReadyMarker::StdoutContains(marker.to_string()),
+                remaining_until(deadline, "FE readiness")?,
+                self.runtime_dir.join("fe.log"),
+            )
+            .map_err(|error| map_novarocks_process_error(&self.fe_binary, "fe", marker, error))
+            .context("restart cross-process FE")?;
+        self.unconfirmed_role_launch = previous_unconfirmed_launch;
+        self.fe_launch_identity =
+            process_resources::capture_process_launch_identity("fe", self.fe_process.pid())
+                .context("capture FE process identity after restart")?;
+        println!(
+            "restarted cross-process FE pid={} config={}",
+            self.fe_process.pid(),
+            self.fe_config_path.display()
+        );
+        self.native_fault_proxies.disconnect_all();
+        wait_for_live_backend_topology(
+            LiveBackendTopologyWait {
+                mysql_user: &self.mysql_user,
+                runtime: &self.runtime,
+                expected_ports: &self.be_grpc_ports,
+                expected_eligible_backend_count: self.expected_eligible_backend_count,
+                fe_config_path: &self.fe_config_path,
+                be_config_paths: &self.be_config_paths,
+                timeout: remaining_until(deadline, "FE topology barrier")?,
+            },
+            &mut self.fe_process,
+            &mut self.be_processes,
+        )
+        .context("cross-process backend topology barrier after FE restart")?;
+        Ok(())
+    }
+}
+
 impl ServerHandle for CrossProcessServerHandle {
     fn retain_runtime_artifacts(&mut self) {
         CrossProcessServerHandle::retain_runtime_artifacts(self);
@@ -5092,6 +5233,27 @@ impl ServerHandle for CrossProcessServerHandle {
             .as_ref()
             .context("MV scheduler observation requires the current FE role session")?
             .mv_scheduler_outcome_binding(grant_id, catalog, namespace, mv, directory)
+    }
+
+    fn role_launch_progress(
+        &self,
+        role: RoleSlot,
+        reference: &test_sessions::RoleLaunchReference,
+    ) -> Result<test_sessions::RoleLaunchProgress> {
+        self.test_sessions
+            .as_ref()
+            .context("role launch progress requires the original frozen test-session plan")?
+            .role_launch_progress(role, reference)
+    }
+    fn retire_unissued_role_launch(
+        &mut self,
+        role: RoleSlot,
+        reference: &test_sessions::RoleLaunchReference,
+    ) -> Result<()> {
+        self.test_sessions
+            .as_mut()
+            .context("role launch retirement requires the original frozen test-session plan")?
+            .retire_unissued_role_launch(role, reference)
     }
 
     fn target_host(&self) -> Option<&str> {
@@ -5261,6 +5423,26 @@ impl ServerHandle for CrossProcessServerHandle {
             .insert((index, kind), run_token.to_owned());
         Ok(())
     }
+    fn end_selected_query_lifecycle_fault(
+        &mut self,
+        index: usize,
+        kind: &'static str,
+        run_token: &str,
+    ) -> Result<()> {
+        self.ensure_be_index(index)?;
+        ensure!(
+            self.query_lifecycle_fault_tokens
+                .get(&(index, kind))
+                .is_some_and(|token| token == run_token),
+            "selected Native action end differs from its original armed token"
+        );
+        self.test_sessions
+            .as_ref()
+            .context("Native action end has no original role session")?
+            .end_selected_native_fault(index, kind, run_token)?;
+        self.query_lifecycle_fault_tokens.remove(&(index, kind));
+        Ok(())
+    }
     fn activate_selected_deferred_query_lifecycle_fault(
         &mut self,
         index: usize,
@@ -5332,9 +5514,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 observation.connection_id,
                 wire,
             )? {
-                if !require_success
-                    || (snapshot.error_source.is_none() && snapshot.failure_fact.is_none())
-                {
+                if !require_success || snapshot.failure_fact.is_none() {
                     return Ok(snapshot);
                 }
                 latest = Some(snapshot);
@@ -5755,14 +5935,17 @@ impl ServerHandle for CrossProcessServerHandle {
 
     fn kill_be(&mut self, index: usize) -> Result<()> {
         self.ensure_be_index(index)?;
+        // Keep the original fault hold live until process loss is observed.
+        // Closing its session first can return a control error before the
+        // abrupt crash this operation is meant to inject.
+        let stopped = self.be_processes[index]
+            .kill_now()
+            .with_context(|| format!("kill cross-process BE[{index}]"));
         let cleanup = self
             .test_sessions
             .as_mut()
             .map(|plan| plan.end_role(RoleSlot::Backend(index)))
             .transpose();
-        let stopped = self.be_processes[index]
-            .kill_now()
-            .with_context(|| format!("kill cross-process BE[{index}]"));
         combine_role_cleanup(stopped, cleanup.map(|_| ()))?;
         println!("killed cross-process BE[{index}]");
         Ok(())
@@ -5983,12 +6166,15 @@ impl ServerHandle for CrossProcessServerHandle {
     }
 
     fn kill_fe(&mut self) -> Result<()> {
+        // Keep the original fault hold live until process loss is observed.
+        // Closing its session first can return a control error over MySQL
+        // before the abrupt crash this operation is meant to inject.
+        let stopped = self.fe_process.kill_now().context("kill cross-process FE");
         let cleanup = self
             .test_sessions
             .as_mut()
             .map(|plan| plan.end_role(RoleSlot::Frontend))
             .transpose();
-        let stopped = self.fe_process.kill_now().context("kill cross-process FE");
         combine_role_cleanup(stopped, cleanup.map(|_| ()))?;
         println!("killed cross-process FE");
         Ok(())
@@ -5999,99 +6185,14 @@ impl ServerHandle for CrossProcessServerHandle {
     }
 
     fn restart_fe_until(&mut self, deadline: Instant) -> Result<()> {
-        let deadline = self
-            .test_sessions
-            .as_ref()
-            .map_or(deadline, |plan| deadline.min(plan.deadline()));
-        let deadline = self
-            .fixture_budget
-            .as_ref()
-            .map_or(deadline, |budget| deadline.min(budget.work_deadline()));
-        let controller_cleanup = self
-            .test_sessions
-            .as_mut()
-            .map(|plan| plan.end_role(RoleSlot::Frontend))
-            .transpose();
-        let prior_log = self
-            .fe_process
-            .log_contents()
-            .context("preserve cross-process FE log before restart");
-        let stopped = self
-            .fe_process
-            .stop()
-            .context("reap old cross-process FE before new role session");
-        let exited = combine_role_cleanup(stopped, controller_cleanup.map(|_| ()));
-        let prior_log = combine_restart_evidence(prior_log, exited)?;
-        self.fe_log_history.push_str(&prior_log);
-        self.fe_process.release_diagnostics()?;
-        let marker = "NOVAROCKS_READY mysql_port=";
-        let binary = self.test_sessions.as_ref().map_or_else(
-            || Ok(self.fe_binary.clone()),
-            |plan| plan.binary_for_next_launch(RoleSlot::Frontend, &self.fe_binary),
-        )?;
-        let mut command = build_novarocks_command_with_profile(
-            &binary,
-            "fe",
-            &self.fe_config_path,
-            self.launch_profile,
-        );
-        let evidence = self.runtime_dir.join(format!(
-            "fe-restart-{}.build-info.json",
-            next_fragment_failure_token(0)
-        ));
-        let previous_unconfirmed_launch = self.unconfirmed_role_launch;
-        self.unconfirmed_role_launch = true;
-        self.role_sessions_joined = false;
-        if let Some(plan) = &mut self.test_sessions {
-            if let Some(declaration) =
-                plan.prepare_launch(RoleSlot::Frontend, &binary, &evidence, deadline)?
-            {
-                command.arg("--test-session").arg(declaration);
-            }
-        } else {
-            test_sessions::check_binary(&binary, false, &[], deadline, &evidence)?;
-        }
-        apply_child_environment(&mut command, &self.fe_environment);
-        apply_launch_profile(&mut command, self.launch_profile);
-        if let Some((work, complete)) =
-            role_payload_lifetime(self.fixture_budget.as_ref(), self.test_sessions.as_ref())
-        {
-            command.terminate_at(work, complete);
-        }
-        self.fe_process
-            .restart(
-                command,
-                ReadyMarker::StdoutContains(marker.to_string()),
-                remaining_until(deadline, "FE readiness")?,
-                self.runtime_dir.join("fe.log"),
-            )
-            .map_err(|error| map_novarocks_process_error(&self.fe_binary, "fe", marker, error))
-            .context("restart cross-process FE")?;
-        self.unconfirmed_role_launch = previous_unconfirmed_launch;
-        self.fe_launch_identity =
-            process_resources::capture_process_launch_identity("fe", self.fe_process.pid())
-                .context("capture FE process identity after restart")?;
-        println!(
-            "restarted cross-process FE pid={} config={}",
-            self.fe_process.pid(),
-            self.fe_config_path.display()
-        );
-        self.native_fault_proxies.disconnect_all();
-        wait_for_live_backend_topology(
-            LiveBackendTopologyWait {
-                mysql_user: &self.mysql_user,
-                runtime: &self.runtime,
-                expected_ports: &self.be_grpc_ports,
-                expected_eligible_backend_count: self.expected_eligible_backend_count,
-                fe_config_path: &self.fe_config_path,
-                be_config_paths: &self.be_config_paths,
-                timeout: remaining_until(deadline, "FE topology barrier")?,
-            },
-            &mut self.fe_process,
-            &mut self.be_processes,
-        )
-        .context("cross-process backend topology barrier after FE restart")?;
-        Ok(())
+        self.restart_frontend_until(deadline, None)
+    }
+
+    fn restart_fe_with_after_exit_hook(
+        &mut self,
+        after_exit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.restart_frontend_until(Instant::now() + self.startup_timeout, Some(after_exit))
     }
 
     fn kill_query(&mut self, connection_id: u32) -> Result<()> {
@@ -6504,9 +6605,9 @@ fn merge_safe_config_overlay(
     if overlay
         .get("standalone_server")
         .and_then(Value::as_table)
-        .is_some_and(|table| table.contains_key("mysql_port"))
+        .is_some_and(|table| table.contains_key("mysql_port") || table.contains_key("trino_port"))
     {
-        bail!("cross-process config overlay cannot modify standalone_server.mysql_port");
+        bail!("cross-process config overlay cannot modify frontend listener ports");
     }
     merge_toml_table(root, overlay);
     Ok(())
@@ -6698,6 +6799,7 @@ struct ReservedRuntimePorts {
     fe_http_port: ReservedTcpPort,
     fe_grpc_port: ReservedTcpPort,
     fe_mysql_port: ReservedTcpPort,
+    fe_trino_port: ReservedTcpPort,
 }
 
 impl ReservedRuntimePorts {
@@ -6716,6 +6818,7 @@ impl ReservedRuntimePorts {
             fe_http_port: ReservedTcpPort::new()?,
             fe_grpc_port: ReservedTcpPort::new()?,
             fe_mysql_port: ReservedTcpPort::new()?,
+            fe_trino_port: ReservedTcpPort::new()?,
         })
     }
 }
@@ -7092,7 +7195,6 @@ mod tests {
     fn lifecycle_debug_json(execution_id: &str) -> serde_json::Value {
         let mut value = serde_json::json!({
             "execution_id": execution_id,
-            "error_source": null,
             "runtime_filter": {
                 "kind": "available",
                 "participants": [{
@@ -8051,6 +8153,7 @@ mod tests {
             fe_http_port: 28080,
             fe_grpc_port: 29070,
             fe_mysql_port: 29030,
+            fe_trino_port: 28081,
         }
     }
 
@@ -8071,6 +8174,7 @@ mod tests {
             fe_http_port: 28080,
             fe_grpc_port: 29070,
             fe_mysql_port: 29030,
+            fe_trino_port: 28081,
         }
     }
 
@@ -9265,6 +9369,7 @@ static_file_path = "catalogs.toml"
             Some(500)
         );
         assert!(merge_safe_config_overlay(root, "[standalone_server]\nmysql_port = 1\n").is_err());
+        assert!(merge_safe_config_overlay(root, "[standalone_server]\ntrino_port = 1\n").is_err());
     }
 
     #[test]

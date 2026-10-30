@@ -16,7 +16,7 @@
 // under the License.
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -540,7 +540,7 @@ pub fn init_with_level(level: &str, files: &LogFileSettings) {
             "failed to initialize log files under {}, fallback to stderr",
             settings.dir.display()
         );
-        let use_ansi = atty::is(atty::Stream::Stderr);
+        let use_ansi = io::stderr().is_terminal();
         let stderr_layer = tracing_fmt::layer()
             .with_ansi(use_ansi)
             .with_writer(std::io::stderr)

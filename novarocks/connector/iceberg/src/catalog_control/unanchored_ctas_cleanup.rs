@@ -146,7 +146,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
     fn validate_cleanup_capabilities(
         access: &crate::fs_io::IcebergFsAccess,
     ) -> Result<(), ConnectorError> {
-        let capability = access.operator().info().full_capability();
+        let capability = access.operator().info().capability();
         if !capability.list
             || !capability.list_with_recursive
             || !capability.stat
@@ -447,7 +447,383 @@ impl IcebergUnanchoredCtasCleanupAdapter {
     }
 }
 
+fn cleanup_future_layout<A, B, C, F: std::future::Future>(
+    _: fn(A, B, C) -> F,
+) -> std::alloc::Layout {
+    std::alloc::Layout::new::<F>()
+}
+async fn discover_unanchored_ctas_entry(
+    owner: IcebergUnanchoredCtasCleanupAdapter,
+    request: ConnectorCtasUnanchoredDiscoveryRequest,
+    context: ConnectorRequestContext,
+) -> Result<Vec<ConnectorCtasUnanchoredProvenance>, ConnectorError> {
+    owner
+        .discover_unanchored_ctas_async_original(request, context)
+        .await
+}
+async fn inspect_then_delete_unanchored_ctas_entry(
+    owner: IcebergUnanchoredCtasCleanupAdapter,
+    request: ConnectorCtasUnanchoredCleanupRequest,
+    context: ConnectorRequestContext,
+) -> Result<ConnectorCtasUnanchoredCleanupOutcome, ConnectorError> {
+    owner
+        .inspect_then_delete_unanchored_ctas_async_original(request, context)
+        .await
+}
+
+impl IcebergUnanchoredCtasCleanupAdapter {
+    async fn read_optional_async(
+        &self,
+        location: &str,
+        context: &ConnectorRequestContext,
+    ) -> Result<Option<Bytes>, ConnectorError> {
+        let file_io = self.file_io(location, context)?;
+        let input = file_io
+            .new_input(location)
+            .map_err(|error| unavailable(error.to_string()))?;
+        let exists = input
+            .exists()
+            .await
+            .map_err(|error| unavailable(error.to_string()))?;
+        if !exists {
+            return Ok(None);
+        }
+        let input = file_io
+            .new_input(location)
+            .map_err(|error| unavailable(error.to_string()))?;
+        let bytes = input
+            .read()
+            .await
+            .map_err(|error| unavailable(error.to_string()))?;
+        Ok(Some(bytes))
+    }
+
+    async fn sidecar_locations_async(
+        &self,
+        context: &ConnectorRequestContext,
+    ) -> Result<Vec<String>, ConnectorError> {
+        let warehouse = self.warehouse_root();
+        let root = format!("{warehouse}/{CTAS_STAGING_NAMESPACE}");
+        let parsed = FsLocation::parse(&root).map_err(|error| unavailable(error.to_string()))?;
+        match parsed.scheme() {
+            FsScheme::Local => {
+                let root_path = parsed.path().to_owned();
+                let control = context.clone();
+                let admission = self.runtime.novarocks_catalog().listing_admission();
+                async move {
+                    admission
+                        .run(&control, async {
+                            let mut locations = Vec::new();
+                            let mut budget =
+                                ConnectorListingBudget::new(ConnectorListingBound::V1)?;
+                            let mut retained =
+                                ConnectorListingBudget::new(ConnectorListingBound::V1)?;
+                            let root_path = std::path::Path::new(&root_path);
+                            let mut entries = match tokio::fs::read_dir(root_path).await {
+                                Ok(entries) => entries,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    return Ok(locations);
+                                }
+                                Err(error) => {
+                                    return Err(unavailable(format!(
+                                        "list unanchored CTAS roots: {error}"
+                                    )));
+                                }
+                            };
+                            while let Some(entry) = entries.next_entry().await.map_err(|error| {
+                                unavailable(format!("read unanchored CTAS root: {error}"))
+                            })? {
+                                Self::validate_context(&control)?;
+                                let entry_path = entry.path();
+                                let entry_name = entry_path.to_str().ok_or_else(|| {
+                                    invalid("unanchored CTAS root path is not UTF-8")
+                                })?;
+                                budget.admit_names(std::iter::once(entry_name))?;
+                                entry_name
+                                    .len()
+                                    .checked_add(
+                                        1 + CTAS_UNANCHORED_PROVENANCE_FILE.len() + "file://".len(),
+                                    )
+                                    .filter(|bytes| *bytes <= ConnectorListingBound::V1.name_bytes)
+                                    .ok_or_else(|| {
+                                        ConnectorError::new(
+                                            ConnectorErrorKind::ResourceExhausted,
+                                            "unanchored CTAS sidecar name bound exceeded",
+                                        )
+                                    })?;
+                                let path = entry_path.join(CTAS_UNANCHORED_PROVENANCE_FILE);
+                                let is_file = match tokio::fs::metadata(&path).await {
+                                    Ok(metadata) => metadata.is_file(),
+                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                        false
+                                    }
+                                    Err(error) => {
+                                        return Err(unavailable(format!(
+                                            "stat unanchored CTAS sidecar: {error}"
+                                        )));
+                                    }
+                                };
+                                if is_file {
+                                    let location_bytes = path
+                                        .to_str()
+                                        .ok_or_else(|| {
+                                            invalid("unanchored CTAS sidecar path is not UTF-8")
+                                        })?
+                                        .len()
+                                        + "file://".len();
+                                    if location_bytes > ConnectorListingBound::V1.name_bytes {
+                                        return Err(ConnectorError::new(
+                                            ConnectorErrorKind::ResourceExhausted,
+                                            "unanchored CTAS sidecar name bound exceeded",
+                                        ));
+                                    }
+                                    let path_name = path.to_str().ok_or_else(|| {
+                                        invalid("unanchored CTAS sidecar path is not UTF-8")
+                                    })?;
+                                    retained.admit_qualified_names(
+                                        "file://",
+                                        std::iter::once(path_name),
+                                    )?;
+                                    let location = format!("file://{}", path.display());
+                                    locations.push(location);
+                                }
+                            }
+                            locations.sort();
+                            Ok(locations)
+                        })
+                        .await
+                }
+                .await
+            }
+            FsScheme::ObjectStore | FsScheme::Hdfs => {
+                let access = self.action_access(&root, context)?;
+                let path = access
+                    .single_relative_path()
+                    .map_err(unavailable)?
+                    .trim_matches('/')
+                    .to_string();
+                let prefix = format!("{path}/");
+                let operator = access.operator();
+                let location_prefix = crate::fs_io::format_resolved_location(access.handle(), "")
+                    .map_err(unavailable)?;
+                let control = context.clone();
+                let admission = self.runtime.novarocks_catalog().listing_admission();
+                async move {
+                    admission
+                        .run(&control, async {
+                            let mut entries = until_context(
+                                &control,
+                                operator
+                                    .lister_with(&prefix)
+                                    .recursive(true)
+                                    .limit(ConnectorListingBound::V1.page_entries)
+                                    .into_future(),
+                            )
+                            .await?
+                            .map_err(|error| {
+                                ConnectorError::from(novarocks_fs::map_object_store_listing_error(
+                                    error,
+                                ))
+                            })?;
+                            let mut budget =
+                                ConnectorListingBudget::new(ConnectorListingBound::V1)?;
+                            let mut retained =
+                                ConnectorListingBudget::new(ConnectorListingBound::V1)?;
+                            let mut locations = Vec::new();
+                            while let Some(entry) = until_context(&control, entries.next()).await? {
+                                let entry = entry.map_err(|error| {
+                                    ConnectorError::from(
+                                        novarocks_fs::map_object_store_listing_error(error),
+                                    )
+                                })?;
+                                budget.admit_names(std::iter::once(entry.path()))?;
+                                if !entry.path().ends_with(CTAS_UNANCHORED_PROVENANCE_FILE) {
+                                    continue;
+                                }
+                                let relative_path = entry.path().trim_start_matches('/');
+                                location_prefix
+                                    .len()
+                                    .checked_add(relative_path.len())
+                                    .filter(|bytes| *bytes <= ConnectorListingBound::V1.name_bytes)
+                                    .ok_or_else(|| {
+                                        ConnectorError::new(
+                                            ConnectorErrorKind::ResourceExhausted,
+                                            "unanchored CTAS sidecar name bound exceeded",
+                                        )
+                                    })?;
+                                retained.admit_qualified_names(
+                                    &location_prefix,
+                                    std::iter::once(relative_path),
+                                )?;
+                                let location = crate::fs_io::format_resolved_location(
+                                    access.handle(),
+                                    entry.path(),
+                                )
+                                .map_err(unavailable)?;
+                                locations.push(location);
+                            }
+                            locations.sort_unstable();
+                            locations.dedup();
+                            Ok(locations)
+                        })
+                        .await
+                }
+                .await
+            }
+        }
+    }
+
+    async fn discover_unanchored_ctas_async_original(
+        &self,
+        request: ConnectorCtasUnanchoredDiscoveryRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<Vec<ConnectorCtasUnanchoredProvenance>, ConnectorError> {
+        Self::validate_context(&context)?;
+        if request.owner != self.owner() {
+            return Err(invalid("unanchored CTAS discovery has a foreign owner"));
+        }
+        self.validate_warehouse(&request.warehouse_root)?;
+        let mut candidates = Vec::new();
+        for sidecar in self.sidecar_locations_async(&context).await? {
+            Self::validate_context(&context)?;
+            let Some(bytes) = self.read_optional_async(&sidecar, &context).await? else {
+                continue;
+            };
+            let Ok(provenance) = decode_unanchored_ctas_provenance(&bytes) else {
+                continue;
+            };
+            if provenance.target.instance_id != self.descriptor.instance_id
+                || provenance.created_at_ms >= request.cutoff_ms
+            {
+                continue;
+            }
+            let expected_sidecar = self.sidecar_for(provenance.publication_id)?;
+            if sidecar != expected_sidecar {
+                continue;
+            }
+            candidates.push(provenance);
+        }
+        candidates.sort_by_key(|candidate| candidate.publication_id);
+        candidates.dedup_by_key(|candidate| candidate.publication_id);
+        Ok(candidates)
+    }
+
+    async fn inspect_then_delete_unanchored_ctas_async_original(
+        &self,
+        request: ConnectorCtasUnanchoredCleanupRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorCtasUnanchoredCleanupOutcome, ConnectorError> {
+        Self::validate_context(&context)?;
+        if request.owner != self.owner() {
+            return Err(invalid("unanchored CTAS cleanup has a foreign owner"));
+        }
+        self.validate_warehouse(&request.warehouse_root)?;
+        if request.provenance.created_at_ms >= request.cutoff_ms {
+            return Ok(ConnectorCtasUnanchoredCleanupOutcome::Retained);
+        }
+        let sidecar = self.sidecar_for(request.provenance.publication_id)?;
+        let Some(bytes) = self.read_optional_async(&sidecar, &context).await? else {
+            return Ok(ConnectorCtasUnanchoredCleanupOutcome::Retained);
+        };
+        let Ok(observed) = decode_unanchored_ctas_provenance(&bytes) else {
+            return Ok(ConnectorCtasUnanchoredCleanupOutcome::Retained);
+        };
+        if observed != request.provenance {
+            return Ok(ConnectorCtasUnanchoredCleanupOutcome::Retained);
+        }
+        // The current target must be a fresh exact lookup. A matching UUID is
+        // the successful publication and pins this root. A different UUID is
+        // an ambiguous drop/recreate observation: the old staging root may be
+        // shared or otherwise still operator-relevant, so it also leaks. Only
+        // a definite NotFound target permits unanchored-root deletion.
+        self.runtime
+            .control_state()
+            .invalidate_table(&observed.target.namespace, &observed.target.table);
+        match self
+            .runtime
+            .observe_table_classified_for_request_with_snapshots_async(
+                &observed.target.namespace,
+                &observed.target.table,
+                &context,
+                crate::catalog::SnapshotLoading::All,
+            )
+            .await
+        {
+            Ok(_physical) => {
+                let _expected_uuid = observed.staged_table_uuid.ok_or_else(|| {
+                    invalid("unanchored CTAS cleanup provenance lacks staged table UUID")
+                })?;
+                return Ok(ConnectorCtasUnanchoredCleanupOutcome::Retained);
+            }
+            Err((ConnectorErrorKind::NotFound, _)) => {}
+            Err((kind, message)) => return Err(ConnectorError::new(kind, message)),
+        }
+        let root = self.root_for(observed.publication_id)?;
+        let access = self.action_access(&root, &context)?;
+        let path = access
+            .single_relative_path()
+            .map_err(unavailable)?
+            .to_owned();
+        let admission = self.runtime.novarocks_catalog().listing_admission();
+        let delete_started = Arc::new(AtomicBool::new(false));
+        let started = Arc::clone(&delete_started);
+        let delete = async move {
+            admission
+                .run(&context, async {
+                    delete_prefix_bounded_tracking(
+                        access.operator(),
+                        &path,
+                        &context,
+                        ConnectorListingBound::V1,
+                        &started,
+                    )
+                    .await
+                })
+                .await
+        }
+        .await;
+        cleanup_delete_outcome(Ok(delete), delete_started.load(Ordering::Acquire))
+    }
+}
+
 impl ConnectorUnanchoredCtasCleanup for IcebergUnanchoredCtasCleanupAdapter {
+    fn discover_unanchored_ctas_async(
+        &self,
+        request: ConnectorCtasUnanchoredDiscoveryRequest,
+        context: ConnectorRequestContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Vec<ConnectorCtasUnanchoredProvenance>, ConnectorError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(discover_unanchored_ctas_entry(
+            self.clone(),
+            request,
+            context,
+        ))
+    }
+    fn inspect_then_delete_unanchored_ctas_async(
+        &self,
+        request: ConnectorCtasUnanchoredCleanupRequest,
+        context: ConnectorRequestContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ConnectorCtasUnanchoredCleanupOutcome, ConnectorError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(inspect_then_delete_unanchored_ctas_entry(
+            self.clone(),
+            request,
+            context,
+        ))
+    }
+
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
@@ -708,6 +1084,22 @@ fn unsupported(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unsupported, message.into())
 }
 
+pub(crate) fn async_source_backing_bytes() -> Result<usize, ConnectorError> {
+    let layouts = [
+        cleanup_future_layout(discover_unanchored_ctas_entry),
+        cleanup_future_layout(inspect_then_delete_unanchored_ctas_entry),
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            AtomicBool,
+        >())
+        .map_err(|error| invalid(error.to_string()))?,
+    ];
+    layouts.into_iter().try_fold(0usize, |bytes, layout| {
+        bytes
+            .checked_add(layout.size())
+            .ok_or_else(|| invalid("CTAS cleanup source quote overflow"))
+    })
+}
+
 #[cfg(test)]
 mod listing_tests {
     use super::*;
@@ -728,9 +1120,7 @@ mod listing_tests {
 
     #[tokio::test]
     async fn cleanup_deletes_multiple_finite_batches_without_collecting_the_prefix() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         for index in 0..9 {
             operator
                 .write(&format!("root/file{index}"), "data")
@@ -756,9 +1146,7 @@ mod listing_tests {
 
     #[tokio::test]
     async fn cleanup_entry_bound_refuses_the_destructive_pass_without_truncation_success() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         for index in 0..3 {
             operator
                 .write(&format!("root/file{index}"), "data")
@@ -795,8 +1183,7 @@ mod listing_tests {
         let operator = opendal::Operator::new(
             opendal::services::Fs::default().root(directory.path().to_str().unwrap()),
         )
-        .unwrap()
-        .finish();
+        .unwrap();
         operator.write("root/table/data/a", "data").await.unwrap();
         operator.write("root/table/data/b", "data").await.unwrap();
         operator
@@ -838,9 +1225,7 @@ mod listing_tests {
 
     #[tokio::test]
     async fn cleanup_listing_refusal_before_first_delete_keeps_exact_error_and_files() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         for index in 0..3 {
             operator
                 .write(&format!("root/file{index}"), "data")
@@ -876,9 +1261,7 @@ mod listing_tests {
 
     #[tokio::test]
     async fn cleanup_expired_admission_keeps_exact_deadline_without_starting_delete() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         operator.write("root/keep", "data").await.unwrap();
         let stop = ConnectorStopOwner::new();
         let expired = ConnectorRequestContext::try_new(
@@ -915,9 +1298,7 @@ mod listing_tests {
 
     #[tokio::test]
     async fn cleanup_stop_is_refused_before_first_delete() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         operator.write("root/keep", "data").await.unwrap();
         let stop = ConnectorStopOwner::new();
         let context = context(&stop);

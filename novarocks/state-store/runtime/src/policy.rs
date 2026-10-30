@@ -95,7 +95,7 @@ impl StateStoreRunPolicy {
         self.operation_timeout
     }
 
-    pub(crate) fn backoff_after(&self, attempts_spent: usize) -> Duration {
+    pub fn backoff_after(&self, attempts_spent: usize) -> Duration {
         let index = attempts_spent.saturating_sub(1);
         RETRY_BACKOFFS[index.min(RETRY_BACKOFFS.len() - 1)]
     }

@@ -125,7 +125,7 @@ fn typed_semantic_complete_recursive_binding_and_physical_only_map_wrapper_round
     }
     let decoded = decode_type_table_pure(&table, limits(), &Control).unwrap();
     for field in decoded.fields.values() {
-        assert_eq!(field.metadata().capacity(), 0);
+        assert!(field.metadata().as_arc().is_none());
         #[allow(deprecated)]
         {
             assert_eq!(field.dict_id(), None);

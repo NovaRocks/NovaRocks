@@ -64,6 +64,7 @@ struct LoadViewResult {
 
 /// One catalog generation's REST session authority and read endpoints.
 pub(crate) struct RestEndpoints {
+    acquisition_owner: novarocks_spi::connector::CredentialAcquisitionOwnerId,
     pub(crate) publication_generation: crate::catalog::publication::PublicationGeneration,
     properties: Arc<std::collections::HashMap<String, String>>,
     owner: Arc<RestAuthOwner>,
@@ -125,6 +126,12 @@ enum Answer {
 }
 
 impl RestEndpoints {
+    pub(crate) const fn acquisition_owner(
+        &self,
+    ) -> novarocks_spi::connector::CredentialAcquisitionOwnerId {
+        self.acquisition_owner
+    }
+
     pub(crate) fn new(
         properties: Arc<std::collections::HashMap<String, String>>,
         owner: Arc<RestAuthOwner>,
@@ -134,6 +141,7 @@ impl RestEndpoints {
         vending_declared: bool,
     ) -> Self {
         Self {
+            acquisition_owner: novarocks_spi::connector::CredentialAcquisitionOwnerId::new(),
             publication_generation: Default::default(),
             properties,
             owner,
@@ -203,17 +211,42 @@ impl RestEndpoints {
         ensure_session(&self.owner, &self.gate, &self.properties).await
     }
 
+    pub(crate) async fn session_in(
+        &self,
+        context: &RequestContext,
+    ) -> Result<Arc<SessionBinding>, AttemptFailure> {
+        crate::rest_protocol::attempt::ensure_session_in(
+            &self.owner,
+            &self.gate,
+            &self.properties,
+            context,
+        )
+        .await
+    }
+
     /// The generation's session binding, establishing the session when needed
     /// (L2). Concurrent callers share one establishment attempt.
     pub(crate) async fn binding(&self) -> Result<Arc<SessionBinding>, ConnectorError> {
-        self.session().await.map_err(|failure| {
-            ConnectorError::new(
-                ConnectorErrorKind::Unavailable,
-                format!(
-                    "Iceberg REST session could not be established: {:?}",
-                    failure.step
-                ),
-            )
+        self.binding_in(&RequestContext::for_read()).await
+    }
+    pub(crate) async fn binding_in(
+        &self,
+        context: &RequestContext,
+    ) -> Result<Arc<SessionBinding>, ConnectorError> {
+        crate::rest_protocol::attempt::ensure_session_in(
+            &self.owner,
+            &self.gate,
+            &self.properties,
+            context,
+        )
+        .await
+        .map_err(|failure| {
+            failure.into_connector(|step| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    format!("Iceberg REST session could not be established: {step:?}"),
+                )
+            })
         })
     }
 
@@ -287,6 +320,33 @@ impl RestEndpoints {
         }
     }
 
+    /// One governed listing page's original bytes. Parsing/collector work is
+    /// borrowed only by the same Provider's closed metadata CPU author.
+    pub(crate) async fn list_views_page_bytes_in(
+        &self,
+        namespace: &NamespaceIdent,
+        page_token: Option<&str>,
+        page_size: usize,
+        context: &RequestContext,
+    ) -> Result<Vec<u8>, ConnectorError> {
+        const OPERATION: &str = "list views";
+        let binding = self.binding_in(context).await?;
+        let url = page_url(
+            binding.views_url(namespace),
+            page_token,
+            page_size,
+            OPERATION,
+        )?;
+        match self
+            .get_in(OPERATION, &binding, url, None, &[200], context)
+            .await?
+        {
+            Answer::Success { body, .. } => read_document_bytes(OPERATION, body).await,
+            Answer::Status(404) => Err(not_found(OPERATION)),
+            Answer::Status(code) => Err(status_error(OPERATION, code)),
+        }
+    }
+
     /// Complete metadata or a conditionally validated representation. A 304
     /// never decodes a body or contributes storage credentials.
     pub(crate) async fn load_table_conditional(
@@ -322,9 +382,13 @@ impl RestEndpoints {
             headers.insert(reqwest::header::IF_NONE_MATCH, etag.clone());
         }
         self.owner
-            .authorize(&mut headers)
+            .authorize_in(&mut headers, context)
             .await
-            .map_err(|_| unavailable("Iceberg REST load table failed: no catalog token".into()))?;
+            .map_err(|failure| {
+                failure.into_connector(|_| {
+                    unavailable("Iceberg REST load table failed: no catalog token".into())
+                })
+            })?;
         let (stage, body) = self
             .owner
             .http()
@@ -333,7 +397,7 @@ impl RestEndpoints {
                 &[200, 304],
                 context,
             )
-            .await;
+            .await?;
         match (stage, body) {
             (DispatchStage::Status { code: 200, .. }, Some(body)) => {
                 let etag = body.header(reqwest::header::ETAG).cloned();
@@ -376,7 +440,8 @@ impl RestEndpoints {
                 "Metadata validator belongs to another catalog generation",
             ));
         }
-        let binding = self.binding().await?;
+        let request_context = RequestContext::from_connector(context);
+        let binding = self.binding_in(&request_context).await?;
         context.check_active()?;
         let mut url = reqwest::Url::parse(&binding.table_url(table)).map_err(|_| {
             ConnectorError::new(
@@ -399,7 +464,7 @@ impl RestEndpoints {
                 "Metadata validator belongs to another complete representation",
             ));
         }
-        let request_context = RequestContext::with_deadline(context.deadline().into());
+
         let loaded = self
             .load_table_conditional_request(
                 table,
@@ -450,7 +515,18 @@ impl RestEndpoints {
         delegated: bool,
         snapshots: crate::catalog::SnapshotLoading,
     ) -> Result<(FrozenLoadTable, RestDelegation), ConnectorError> {
-        let binding = self.binding().await?;
+        self.load_table_with_snapshots_in(table, delegated, snapshots, &RequestContext::for_read())
+            .await
+    }
+
+    pub(crate) async fn load_table_with_snapshots_in(
+        &self,
+        table: &TableIdent,
+        delegated: bool,
+        snapshots: crate::catalog::SnapshotLoading,
+        context: &RequestContext,
+    ) -> Result<(FrozenLoadTable, RestDelegation), ConnectorError> {
+        let binding = self.binding_in(context).await?;
         match self
             .load_table_conditional_request(
                 table,
@@ -458,7 +534,7 @@ impl RestEndpoints {
                 None,
                 &binding,
                 binding.load_table_url(table, snapshots),
-                &RequestContext::for_read(),
+                context,
             )
             .await?
         {
@@ -602,10 +678,26 @@ impl RestEndpoints {
         &self,
         endpoint: &str,
     ) -> Result<RestDelegation, ConnectorError> {
+        self.load_credentials_in(endpoint, &RequestContext::for_read())
+            .await
+    }
+
+    pub(crate) async fn load_credentials_in(
+        &self,
+        endpoint: &str,
+        context: &RequestContext,
+    ) -> Result<RestDelegation, ConnectorError> {
         const OPERATION: &str = "load credentials";
-        let binding = self.binding().await.map_err(retryable)?;
+        let binding = self.binding_in(context).await.map_err(retryable)?;
         match self
-            .get(OPERATION, &binding, endpoint.to_string(), None, &[200])
+            .get_in(
+                OPERATION,
+                &binding,
+                endpoint.to_string(),
+                None,
+                &[200],
+                context,
+            )
             .await
             .map_err(retryable)?
         {
@@ -626,15 +718,25 @@ impl RestEndpoints {
         &self,
         table: &TableIdent,
     ) -> Result<(Option<String>, RestDelegation), ConnectorError> {
+        self.load_table_credentials_in(table, &RequestContext::for_read())
+            .await
+    }
+
+    pub(crate) async fn load_table_credentials_in(
+        &self,
+        table: &TableIdent,
+        context: &RequestContext,
+    ) -> Result<(Option<String>, RestDelegation), ConnectorError> {
         const OPERATION: &str = "acquire table credentials";
-        let binding = self.binding().await.map_err(retryable)?;
+        let binding = self.binding_in(context).await.map_err(retryable)?;
         match self
-            .get(
+            .get_in(
                 OPERATION,
                 &binding,
                 binding.table_url(table),
                 Some(VENDED_CREDENTIALS),
                 &[200],
+                context,
             )
             .await
             .map_err(retryable)?
@@ -658,8 +760,36 @@ impl RestEndpoints {
         delegation: Option<HeaderValue>,
         success: &[u16],
     ) -> Result<Answer, ConnectorError> {
-        self.send(operation, binding, Method::GET, url, delegation, success)
-            .await
+        self.get_in(
+            operation,
+            binding,
+            url,
+            delegation,
+            success,
+            &RequestContext::for_read(),
+        )
+        .await
+    }
+
+    async fn get_in(
+        &self,
+        operation: &'static str,
+        binding: &SessionBinding,
+        url: String,
+        delegation: Option<HeaderValue>,
+        success: &[u16],
+        context: &RequestContext,
+    ) -> Result<Answer, ConnectorError> {
+        self.send_in(
+            operation,
+            binding,
+            Method::GET,
+            url,
+            delegation,
+            success,
+            context,
+        )
+        .await
     }
 
     /// Send one NovaRocks read with the session's headers and this role's
@@ -673,25 +803,44 @@ impl RestEndpoints {
         delegation: Option<HeaderValue>,
         success: &[u16],
     ) -> Result<Answer, ConnectorError> {
+        self.send_in(
+            operation,
+            binding,
+            method,
+            url,
+            delegation,
+            success,
+            &RequestContext::for_read(),
+        )
+        .await
+    }
+
+    async fn send_in(
+        &self,
+        operation: &'static str,
+        binding: &SessionBinding,
+        method: Method,
+        url: String,
+        delegation: Option<HeaderValue>,
+        success: &[u16],
+        context: &RequestContext,
+    ) -> Result<Answer, ConnectorError> {
         let mut headers = binding.request_headers(delegation);
         self.owner
-            .authorize(&mut headers)
+            .authorize_in(&mut headers, context)
             .await
             .map_err(|failure| {
-                unavailable(format!(
-                    "Iceberg REST {operation} failed: no catalog token ({:?})",
-                    failure.step
-                ))
+                failure.into_connector(|step| {
+                    unavailable(format!(
+                        "Iceberg REST {operation} failed: no catalog token ({step:?})"
+                    ))
+                })
             })?;
         let (stage, body) = self
             .owner
             .http()
-            .send_once(
-                Ok(RestRequest::new(method, url, headers)),
-                success,
-                &RequestContext::for_read(),
-            )
-            .await;
+            .send_once(Ok(RestRequest::new(method, url, headers)), success, context)
+            .await?;
         match (stage, body) {
             (DispatchStage::Status { code, .. }, Some(body)) => Ok(Answer::Success { code, body }),
             (DispatchStage::Status { code, .. }, None) => Ok(Answer::Status(code)),
@@ -717,6 +866,15 @@ pub(crate) async fn acquire_routed(
     routing: &novarocks_spi::connector::CredentialRoutingContext,
     load_table: bool,
 ) -> Result<(Option<String>, RestDelegation), ConnectorError> {
+    acquire_routed_in(owner, routing, load_table, &RequestContext::for_read()).await
+}
+
+pub(crate) async fn acquire_routed_in(
+    owner: &RestAuthOwner,
+    routing: &novarocks_spi::connector::CredentialRoutingContext,
+    load_table: bool,
+    context: &RequestContext,
+) -> Result<(Option<String>, RestDelegation), ConnectorError> {
     const OPERATION: &str = "execution-node credential acquisition";
     let mut headers = crate::rest_protocol::binding::protocol_headers();
     for header in routing.headers() {
@@ -735,12 +893,16 @@ pub(crate) async fn acquire_routed(
             VENDED_CREDENTIALS,
         );
     }
-    owner.authorize(&mut headers).await.map_err(|failure| {
-        retryable(unavailable(format!(
-            "Iceberg REST {OPERATION} failed: no catalog token ({:?})",
-            failure.step
-        )))
-    })?;
+    owner
+        .authorize_in(&mut headers, context)
+        .await
+        .map_err(|failure| {
+            failure.into_connector(|step| {
+                retryable(unavailable(format!(
+                    "Iceberg REST {OPERATION} failed: no catalog token ({step:?})"
+                )))
+            })
+        })?;
     let (stage, body) = owner
         .http()
         .send_once(
@@ -750,9 +912,9 @@ pub(crate) async fn acquire_routed(
                 headers,
             )),
             &[200],
-            &RequestContext::for_read(),
+            context,
         )
-        .await;
+        .await?;
     let body = match (stage, body) {
         (DispatchStage::Status { .. }, Some(body)) => body,
         (DispatchStage::Status { code, .. }, None) => {
@@ -817,14 +979,21 @@ async fn decode_document<T: DeserializeOwned>(
     operation: &'static str,
     body: ResponseBody,
 ) -> Result<T, ConnectorError> {
-    let bytes = body.read_to_end().await.map_err(|error| {
-        unavailable(format!(
-            "Iceberg REST {operation} failed while reading the response ({error:?})"
-        ))
-    })?;
+    let bytes = read_document_bytes(operation, body).await?;
     serde_json::from_slice(&bytes).map_err(|_| {
         unavailable(format!(
             "Iceberg REST {operation} returned a response that could not be decoded"
+        ))
+    })
+}
+
+async fn read_document_bytes(
+    operation: &'static str,
+    body: ResponseBody,
+) -> Result<Vec<u8>, ConnectorError> {
+    body.read_to_end().await.map_err(|error| {
+        unavailable(format!(
+            "Iceberg REST {operation} failed while reading the response ({error:?})"
         ))
     })
 }

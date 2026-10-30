@@ -223,7 +223,8 @@ fn normalization_preflight_observed<E: From<ArrayProjectionFailure>>(
 }
 
 /// Borrowed canonical-representation validation for already-authored schemas.
-/// Empty maps with spare backing are not a canonical execution representation.
+/// Canonical execution metadata has no Arc backing. Arrow 60 represents
+/// empty metadata as None, including after removal and conversion.
 pub fn execution_field_is_normalized(field: &Field) -> Result<bool, ArrayProjectionFailure> {
     execution_field_is_normalized_observed(field, &mut |_| Ok(()))
 }
@@ -234,7 +235,7 @@ pub fn execution_field_is_normalized_observed<E: From<ArrayProjectionFailure>>(
 ) -> Result<bool, E> {
     work(1)?;
     normalization_preflight_observed(field.data_type(), 1, &mut 0, &mut |_| work(1))?;
-    Ok(field.metadata().capacity() == 0
+    Ok(field.metadata().as_arc().is_none()
         && !needs_normalization(field.data_type(), &mut |step| match step {
             ArrayNormalizationStep::InspectField { source, name } => {
                 let units = source
@@ -259,7 +260,7 @@ where
         name,
     })?;
     let nested = needs_normalization(field.data_type(), observe)?;
-    Ok(field.metadata().capacity() != 0 || field.name() != name || nested)
+    Ok(field.metadata().as_arc().is_some() || field.name() != name || nested)
 }
 
 fn needs_normalization<E, F>(source: &DataType, observe: &mut F) -> Result<bool, E>
@@ -283,7 +284,7 @@ where
             }
         }
         DataType::Map(entries, _) => {
-            changed |= entries.metadata().capacity() != 0 || entries.name() != "entries";
+            changed |= entries.metadata().as_arc().is_some() || entries.name() != "entries";
             observe(ArrayNormalizationStep::InspectType(entries.data_type()))?;
             let DataType::Struct(fields) = entries.data_type() else {
                 return Err(E::from(ArrayProjectionFailure::Contract(
@@ -396,7 +397,7 @@ where
 {
     let target = normalize_type(source.data_type(), observe)?;
     if matches!(target, Cow::Borrowed(_))
-        && source.metadata().capacity() == 0
+        && source.metadata().as_arc().is_none()
         && source.name() == name
     {
         return Ok(Arc::clone(source));
@@ -935,23 +936,23 @@ mod tests {
 
     fn annotated(name: &str, data_type: DataType, nullable: bool) -> FieldRef {
         Arc::new(
-            Field::new(name, data_type, nullable).with_metadata(
-                [
-                    ("nr_logical_type".into(), "uninterpreted".into()),
-                    ("PARQUET:field_id".into(), "17".into()),
-                    (
-                        "ARROW:extension:name".into(),
-                        "arrow.parquet.variant".into(),
-                    ),
-                ]
-                .into(),
-            ),
+            Field::new(name, data_type, nullable).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([
+                ("nr_logical_type".into(), "uninterpreted".into()),
+                ("PARQUET:field_id".into(), "17".into()),
+                (
+                    "ARROW:extension:name".into(),
+                    "arrow.parquet.variant".into(),
+                ),
+            ])),
         )
     }
 
     fn assert_clean(data_type: &DataType) {
         let field = |field: &Field| {
-            assert_eq!(field.metadata().capacity(), 0);
+            assert!(field.metadata().as_arc().is_none());
             assert_clean(field.data_type());
         };
         match data_type {
@@ -995,13 +996,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_metadata_with_spare_backing_is_rebuilt_without_mutating_provider_field() {
+    fn cleared_hashmap_becomes_no_metadata_backing_and_reuses_canonical_source() {
         let mut metadata = std::collections::HashMap::with_capacity(32);
         metadata.insert("external".into(), "source".into());
         metadata.clear();
+        assert!(metadata.capacity() >= 32);
         let field = Arc::new(Field::new("payload", DataType::Utf8, true).with_metadata(metadata));
         assert!(field.metadata().is_empty());
-        assert!(field.metadata().capacity() > 0);
+        assert!(field.metadata().as_arc().is_none());
         let values: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None]));
         let source: ArrayRef = Arc::new(StructArray::new(
             vec![field.clone()].into(),
@@ -1009,11 +1011,12 @@ mod tests {
             None,
         ));
         let normalized = normalize_execution_array(&source).unwrap();
-        assert!(!Arc::ptr_eq(&source, &normalized));
+        assert!(Arc::ptr_eq(&source, &normalized));
         let normalized_struct = normalized.as_any().downcast_ref::<StructArray>().unwrap();
         assert!(Arc::ptr_eq(&values, normalized_struct.column(0)));
+        assert!(Arc::ptr_eq(&field, &normalized_struct.fields()[0]));
         assert_clean(normalized.data_type());
-        assert!(field.metadata().capacity() > 0);
+        assert!(field.metadata().as_arc().is_none());
         assert_buffer_sharing(&source.to_data(), &normalized.to_data());
         let clean = normalize_execution_array(&normalized).unwrap();
         assert!(Arc::ptr_eq(&normalized, &clean));
@@ -1141,8 +1144,12 @@ mod tests {
             .unwrap(),
         );
         let field = Arc::new(
-            Field::new_dict("codes", dictionary.data_type().clone(), true, 42, true)
-                .with_metadata([("source".into(), "kept externally".into())].into()),
+            Field::new_dict("codes", dictionary.data_type().clone(), true, 42, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "source".into(),
+                    "kept externally".into(),
+                )]),
+            ),
         );
         let source: ArrayRef =
             Arc::new(StructArray::try_new(vec![field].into(), vec![dictionary], None).unwrap());

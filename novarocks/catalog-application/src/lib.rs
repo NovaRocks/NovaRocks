@@ -31,8 +31,8 @@ pub mod static_file;
 
 pub use application::{
     CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind, CatalogApplicationPort,
-    CatalogCreateCommand, CatalogDropCommand, CatalogRuntimeObservation,
-    CatalogRuntimePublisherSink,
+    CatalogCreateCommand, CatalogDropCommand, CatalogMutationCommitted, CatalogMutationReceipt,
+    CatalogRuntimeObservation, CatalogRuntimePublisherSink,
 };
 pub use attachment::CatalogReferenceReader;
 pub use attachment::{

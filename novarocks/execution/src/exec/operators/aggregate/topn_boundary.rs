@@ -18,7 +18,7 @@
 //! Aggregate-owned selection state for native TopN ordered boundaries.
 //!
 //! The state keeps only the best `N` projected order tuples. Complete aggregate
-//! group identity is supplied by `KeyTable`'s monotonically allocated group id,
+//! group identity is supplied by `KeyIndex`'s monotonically allocated group id,
 //! so equal projections from different groups retain their multiplicity without
 //! retaining every full group key. Service routing, logical versions, producer
 //! sessions, and publication policy intentionally remain outside this module.
@@ -35,18 +35,18 @@ use crate::runtime_filter::contribution::{
 };
 use crate::runtime_filter::{OrderedTopNAllocationHost, OwnedOrderKey};
 use arrow::array::{
-    Array, ArrayRef, Date32Array, Decimal128Array, DictionaryArray, FixedSizeBinaryArray,
-    Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    Array, ArrayRef, Date32Array, Decimal128Array, FixedSizeBinaryArray, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
-use arrow::datatypes::{DataType, Int32Type, TimeUnit};
+use arrow::datatypes::{DataType, TimeUnit};
+#[cfg(test)]
+use arrow::{array::DictionaryArray, datatypes::Int32Type};
 use novarocks_functions::{KernelEvaluationControl, KernelFailure};
 
 #[cfg(test)]
 use crate::runtime_filter::contribution::{OrderedScalar, OrderedTuple};
-
-#[cfg(test)]
-use crate::exec::hash_table::key_table::KeyLookup;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AggregateTopNCandidate<K> {
@@ -574,10 +574,6 @@ impl AggregateTopNBoundaryBinding {
     pub(crate) const fn state(&self) -> &AggregateTopNBoundaryState {
         &self.state
     }
-
-    pub(crate) fn state_mut(&mut self) -> &mut AggregateTopNBoundaryState {
-        &mut self.state
-    }
 }
 
 fn validate_topn_boundary_contract(
@@ -612,15 +608,12 @@ fn validate_topn_boundary_contract(
 }
 
 #[cfg(test)]
-pub(crate) fn observe_key_table_group(
+pub(crate) fn observe_scalar_projection(
     bindings: &mut [AggregateTopNBoundaryBinding],
-    lookup: &KeyLookup,
+    group_id: usize,
     group_arrays: &[ArrayRef],
     row: usize,
 ) -> Result<(), AggregateTopNBoundaryError> {
-    if !lookup.is_new {
-        return Ok(());
-    }
     for binding in bindings {
         let array = group_arrays.get(binding.group_key_ordinal).ok_or(
             AggregateTopNBoundaryError::MissingGroupKey {
@@ -629,7 +622,7 @@ pub(crate) fn observe_key_table_group(
             },
         )?;
         let tuple = tuple_from_group_array(binding.state.contract(), array, row)?;
-        binding.state.observe_new_group(lookup.group_id, tuple)?;
+        binding.state.observe_new_group(group_id, tuple)?;
     }
     Ok(())
 }
@@ -645,8 +638,203 @@ fn tuple_from_group_array(
     OrderedTuple::try_new(contract, [value]).map_err(Into::into)
 }
 
-/// One extraction leaf for the legacy tuple and controlled owned-key shells.
-/// Preserve the original bounds, UTF8 dictionary, NULL and physical-error order.
+/// Visit an actual K page loan without constructing an Arrow value per key.
+/// Complete logical declarations are checked before physical page dispatch;
+/// owned UTF-8 copies and boundary canonicalization keep their original authors.
+pub(crate) fn visit_key_read_page<'a>(
+    contract: &RuntimeOrderContract,
+    values: &'a crate::exec::hash_table::key_index::KeyReadValues<'_>,
+    rows: &[crate::exec::hash_table::key_index::KeyReadRow],
+    control: &dyn KernelEvaluationControl,
+    visitor: &mut impl FnMut(
+        usize,
+        Option<OrderedScalarRef<'a>>,
+    ) -> crate::runtime::fragment::ExecutionResult<()>,
+) -> crate::runtime::fragment::ExecutionResult<()> {
+    use crate::exec::hash_table::key_index::KeyReadValues;
+    control.checkpoint(0)?;
+    if contract.keys().len() != 1 {
+        return Err(AggregateTopNBoundaryError::UnsupportedKeyArity {
+            actual: contract.keys().len(),
+        }
+        .into());
+    }
+    let binding = match values {
+        KeyReadValues::Fixed { binding, .. } | KeyReadValues::Bytes { binding, .. } => *binding,
+        KeyReadValues::NominalBytes {
+            logical_binding, ..
+        }
+        | KeyReadValues::Canonical {
+            logical_binding, ..
+        } => *logical_binding,
+    };
+    let key = contract
+        .keys()
+        .first()
+        .ok_or(AggregateTopNBoundaryError::UnsupportedKeyArity { actual: 0 })?;
+    let expected_binding = key.value_type().ok_or_else(|| {
+        AggregateTopNBoundaryError::InvalidCandidateValue(
+            "ordered page contract has no complete value binding".into(),
+        )
+    })?;
+    if !binding
+        .same_value_domain_observed::<KernelFailure>(expected_binding, || control.checkpoint(0))?
+    {
+        return Err(AggregateTopNBoundaryError::CandidateContractMismatch(
+            OrderedTupleError::TypeMismatch,
+        )
+        .into());
+    }
+    let (array, binding) = match values {
+        KeyReadValues::Fixed { array, binding } => (*array, *binding),
+        KeyReadValues::Bytes {
+            array,
+            binding,
+            page,
+        } => {
+            if !page.is_utf8() {
+                return Err(AggregateTopNBoundaryError::InvalidCandidateValue(
+                    "ordered text page is not UTF-8".into(),
+                )
+                .into());
+            }
+            for selected in rows {
+                control.checkpoint(1)?;
+                if !page.defined_rows().contains(selected.row) {
+                    return Err(AggregateTopNBoundaryError::CandidateRowOutOfBounds {
+                        row: selected.row,
+                        len: page.len(),
+                    }
+                    .into());
+                }
+            }
+            (*array, *binding)
+        }
+        KeyReadValues::NominalBytes { .. } => {
+            return Err(AggregateTopNBoundaryError::InvalidCandidateValue(
+                "ordered scalar cannot borrow private nominal byte storage".into(),
+            )
+            .into());
+        }
+        KeyReadValues::Canonical { .. } => {
+            return Err(AggregateTopNBoundaryError::InvalidCandidateValue(
+                "ordered scalar cannot borrow an encoded complex key".into(),
+            )
+            .into());
+        }
+    };
+    if binding.data_type() != array.data_type() {
+        return Err(AggregateTopNBoundaryError::CandidateContractMismatch(
+            OrderedTupleError::TypeMismatch,
+        )
+        .into());
+    }
+    let expected = key.data_type();
+    macro_rules! visit {
+        ($array:ty, $convert:expr) => {{
+            let concrete = array.as_any().downcast_ref::<$array>().ok_or_else(|| {
+                AggregateTopNBoundaryError::CandidateArrayTypeMismatch {
+                    expected: topn_type_description(expected),
+                    actual: topn_type_description(array.data_type()),
+                }
+            })?;
+            for selected in rows {
+                control.checkpoint(1)?;
+                if selected.row >= concrete.len() {
+                    return Err(AggregateTopNBoundaryError::CandidateRowOutOfBounds {
+                        row: selected.row,
+                        len: concrete.len(),
+                    }
+                    .into());
+                }
+                let value = if concrete.is_null(selected.row) {
+                    None
+                } else {
+                    Some(($convert)(concrete.value(selected.row)))
+                };
+                visitor(selected.ordinal, value)?;
+            }
+        }};
+    }
+    if expected == &DataType::Utf8 {
+        match array.data_type() {
+            DataType::Utf8 => visit!(StringArray, OrderedScalarRef::Utf8),
+            DataType::LargeUtf8 => visit!(LargeStringArray, OrderedScalarRef::Utf8),
+            DataType::Utf8View => visit!(StringViewArray, OrderedScalarRef::Utf8),
+            _ => {
+                return Err(AggregateTopNBoundaryError::CandidateArrayTypeMismatch {
+                    expected: topn_type_description(expected),
+                    actual: topn_type_description(array.data_type()),
+                }
+                .into());
+            }
+        }
+    } else {
+        require_exact_array_type(expected, array)?;
+        match expected {
+            DataType::Int8 => visit!(Int8Array, OrderedScalarRef::Int8),
+            DataType::Int16 => visit!(Int16Array, OrderedScalarRef::Int16),
+            DataType::Int32 => visit!(Int32Array, OrderedScalarRef::Int32),
+            DataType::Int64 => visit!(Int64Array, OrderedScalarRef::Int64),
+            DataType::Date32 => visit!(Date32Array, OrderedScalarRef::Date32),
+            DataType::Decimal128(_, _) => visit!(Decimal128Array, OrderedScalarRef::Decimal128),
+            DataType::Timestamp(TimeUnit::Second, _) => {
+                visit!(TimestampSecondArray, OrderedScalarRef::Timestamp)
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                visit!(TimestampMillisecondArray, OrderedScalarRef::Timestamp)
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                visit!(TimestampMicrosecondArray, OrderedScalarRef::Timestamp)
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                visit!(TimestampNanosecondArray, OrderedScalarRef::Timestamp)
+            }
+            DataType::FixedSizeBinary(width)
+                if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
+            {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .expect("exact fixed binary carrier");
+                for selected in rows {
+                    control.checkpoint(1)?;
+                    if selected.row >= array.len() {
+                        return Err(AggregateTopNBoundaryError::CandidateRowOutOfBounds {
+                            row: selected.row,
+                            len: array.len(),
+                        }
+                        .into());
+                    }
+                    let value = if array.is_null(selected.row) {
+                        None
+                    } else {
+                        Some(OrderedScalarRef::LargeInt(
+                            novarocks_types::largeint::value_at(array, selected.row).map_err(
+                                |source| {
+                                    AggregateTopNBoundaryError::CandidateCarrier(source.into())
+                                },
+                            )?,
+                        ))
+                    };
+                    visitor(selected.ordinal, value)?;
+                }
+            }
+            _ => {
+                return Err(AggregateTopNBoundaryError::UnsupportedOrderKeyType {
+                    actual: topn_type_description(expected),
+                }
+                .into());
+            }
+        }
+    }
+    control.checkpoint(0)?;
+    Ok(())
+}
+
+/// Original legacy-vector extraction used only by independent tests.
+/// Preserve its bounds, dictionary NULL and physical-error order.
+#[cfg(test)]
 pub(crate) fn borrowed_key_from_group_array<'a>(
     contract: &RuntimeOrderContract,
     array: &'a ArrayRef,
@@ -673,6 +861,7 @@ pub(crate) fn borrowed_key_from_group_array<'a>(
     Ok(value)
 }
 
+#[cfg(test)]
 fn scalar_from_group_array(
     expected: &DataType,
     array: &ArrayRef,
@@ -747,6 +936,7 @@ fn require_exact_array_type(
     }
 }
 
+#[cfg(test)]
 fn utf8_value(array: &ArrayRef, row: usize) -> Result<Option<&str>, AggregateTopNBoundaryError> {
     if array.data_type() == &DataType::Utf8 {
         let strings = array
@@ -812,10 +1002,8 @@ mod tests {
 
     use super::{
         AggregateTopNBoundaryBinding, AggregateTopNBoundaryError, AggregateTopNBoundarySnapshot,
-        AggregateTopNBoundaryState, observe_key_table_group,
+        AggregateTopNBoundaryState, observe_scalar_projection,
     };
-    use crate::exec::hash_table::key_builder::build_group_key_views;
-    use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
     use crate::runtime_filter::contribution::{
         OrderedScalar, OrderedTuple, RuntimeOrderContract, RuntimeOrderKey,
         RuntimeOrderNullOrder as NullOrder, RuntimeOrderSortDirection as SortDirection,
@@ -1177,59 +1365,6 @@ mod tests {
     }
 
     #[test]
-    fn topn_boundary_aggregate_hook_uses_real_complete_key_table_group_identity() {
-        let contract = runtime_contract(DataType::Int64, SortDirection::Ascending, NullOrder::Last);
-        let mut bindings = vec![
-            AggregateTopNBoundaryBinding::try_new(
-                0,
-                NonZeroU32::new(2).unwrap(),
-                Arc::clone(&contract),
-            )
-            .unwrap(),
-            AggregateTopNBoundaryBinding::try_new(
-                0,
-                NonZeroU32::new(3).unwrap(),
-                Arc::clone(&contract),
-            )
-            .unwrap(),
-        ];
-        let group_arrays: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from(vec![7, 7, 7])),
-            Arc::new(StringArray::from(vec!["group-a", "group-b", "group-a"])),
-        ];
-        let mut key_table = KeyTable::new(vec![DataType::Int64, DataType::Utf8], false).unwrap();
-        let key_views = build_group_key_views(&group_arrays).unwrap();
-        let rows = key_table.build_rows_fallback(&group_arrays).unwrap();
-        let hashes = key_table
-            .build_group_hashes(&key_views, group_arrays[0].len())
-            .unwrap();
-        let mut lookups = Vec::new();
-
-        for (row, hash) in hashes.into_iter().enumerate() {
-            let lookup = key_table
-                .find_or_insert_from_row(&key_views, row, rows[row].as_slice(), hash)
-                .unwrap();
-            lookups.push((lookup.group_id, lookup.is_new));
-            observe_key_table_group(&mut bindings, &lookup, &group_arrays, row).unwrap();
-        }
-
-        assert_eq!(lookups, vec![(0, true), (1, true), (0, false)]);
-        assert_eq!(
-            ready_bound(bindings[0].state().snapshot()),
-            int64_tuple(&contract, Some(7))
-        );
-        assert_eq!(
-            bindings[0].state_mut().take_pending_tightening().unwrap(),
-            Some(int64_tuple(&contract, Some(7)))
-        );
-        assert_eq!(
-            bindings[1].state().snapshot(),
-            AggregateTopNBoundarySnapshot::NotReady,
-            "the duplicate complete key must not be counted as a third group"
-        );
-    }
-
-    #[test]
     fn topn_boundary_dictionary_utf8_value_null_projects_logical_null() {
         let keys = Int32Array::from(vec![Some(0)]);
         let values: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>]));
@@ -1247,16 +1382,7 @@ mod tests {
                 .unwrap(),
             ];
 
-            observe_key_table_group(
-                &mut bindings,
-                &KeyLookup {
-                    group_id: 0,
-                    is_new: true,
-                },
-                &[Arc::clone(&dictionary)],
-                0,
-            )
-            .unwrap();
+            observe_scalar_projection(&mut bindings, 0, &[Arc::clone(&dictionary)], 0).unwrap();
 
             assert_eq!(
                 ready_bound(bindings[0].state().snapshot()),
@@ -1355,16 +1481,7 @@ mod tests {
                 )
                 .unwrap(),
             ];
-            observe_key_table_group(
-                &mut bindings,
-                &KeyLookup {
-                    group_id: 0,
-                    is_new: true,
-                },
-                &[array],
-                0,
-            )
-            .unwrap();
+            observe_scalar_projection(&mut bindings, 0, &[array], 0).unwrap();
             assert_eq!(
                 ready_bound(bindings[0].state().snapshot()),
                 tuple(&contract, Some(expected)),

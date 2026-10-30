@@ -58,6 +58,8 @@ pub(crate) fn execute_shell_step_in_context(
     execute_shell_step_observed(sql, deadline, context, storage.as_deref(), cleanup, None)
 }
 
+type ShellExecution = (bool, Option<QueryExecution>, String);
+
 pub(crate) fn execute_shell_step_observed(
     sql: &str,
     deadline: Option<Instant>,
@@ -66,129 +68,169 @@ pub(crate) fn execute_shell_step_observed(
     cleanup: bool,
     writer_exit: Option<&std::sync::atomic::AtomicBool>,
 ) -> (bool, Option<QueryExecution>, String) {
-    let Some(deadline) = deadline else {
-        return execute_shell_step(sql);
-    };
-    #[cfg(not(unix))]
-    {
-        let _ = (deadline, writer_exit);
-        return (
-            false,
-            None,
-            "bounded shell commands require Unix process ownership".into(),
-        );
-    }
-    #[cfg(unix)]
-    {
-        let started = Instant::now();
-        let directory = match tempfile::Builder::new()
-            .prefix("nr-sql-shell-")
-            .tempdir_in("/tmp")
-        {
-            Ok(directory) => directory,
-            Err(error) => return (false, None, format!("prepare shell output: {error}")),
+    execute_shell_step_core(sql, deadline, context, storage, cleanup, writer_exit, None).0
+}
+
+/// Only a concrete domain owner can combine this local observation with its
+/// own remote producer exit. It does not update the generic writer gate.
+pub(crate) fn execute_shell_step_with_group_observation(
+    sql: &str,
+    work_deadline: Instant,
+    complete_deadline: Instant,
+    context: Option<&str>,
+    storage: Option<&str>,
+) -> (ShellExecution, bool) {
+    execute_shell_step_core(
+        sql,
+        Some(work_deadline),
+        context,
+        storage,
+        false,
+        None,
+        Some((work_deadline, complete_deadline)),
+    )
+}
+
+fn execute_shell_step_core(
+    sql: &str,
+    deadline: Option<Instant>,
+    context: Option<&str>,
+    storage: Option<&str>,
+    cleanup: bool,
+    writer_exit: Option<&std::sync::atomic::AtomicBool>,
+    lifetime: Option<(Instant, Instant)>,
+) -> (ShellExecution, bool) {
+    let mut group_exit_observed = false;
+    let result = (|| -> ShellExecution {
+        let Some(deadline) = deadline else {
+            return execute_shell_step(sql);
         };
-        let mut command = novarocks_test_support::ManagedCommand::new("sh");
-        command.arg("-c").arg(
-            sql.trim_start()
-                .strip_prefix("shell:")
-                .expect("shell step")
-                .trim(),
-        );
-        if let Some(context) = context {
-            command
-                .env(
-                    novarocks_cluster_harness::fixture_run::RUN_CONTEXT_ENV,
-                    context,
-                )
-                .env(
-                    "NOVA_FIXTURE_CLEANUP_MODE",
-                    if cleanup { "true" } else { "false" },
-                );
-        }
-        if let Some(storage) = storage {
-            command.env(
-                novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV,
-                storage,
+        #[cfg(not(unix))]
+        {
+            let _ = (deadline, writer_exit);
+            return (
+                false,
+                None,
+                "bounded shell commands require Unix process ownership".into(),
             );
         }
-        let capture = (|| -> anyhow::Result<_> {
-            use std::os::unix::fs::OpenOptionsExt;
-            let stdout = std::fs::OpenOptions::new()
-                .write(true)
-                .read(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(directory.path().join("stdout"))?;
-            let stderr = std::fs::OpenOptions::new()
-                .write(true)
-                .read(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(directory.path().join("stderr"))?;
-            novarocks_test_support::capture_command_until(command, stdout, stderr, deadline)
-        })();
-        match capture {
-            Ok(outcome) => {
-                let timed_out = outcome.timed_out || Instant::now() >= deadline;
-                let failures = &outcome.failures;
-                // A failed producer may have reported an unknown remote writer
-                // outcome even after its host CLI exited. Keep files until its
-                // original owner can supply a successful completion fact.
-                if (!failures.is_empty() || !outcome.output.status.success())
-                    && let Some(observed) = writer_exit
-                {
-                    observed.store(false, std::sync::atomic::Ordering::Release);
-                }
-                let result = render_command_output(&outcome.output, started.elapsed());
-                if timed_out || Instant::now() >= deadline || !failures.is_empty() {
-                    let path = directory.keep();
-                    return (
-                        false,
-                        result.1,
-                        format!(
-                            "shell original deadline expired={timed_out}; cleanup={failures:?}; actual output retained at {}",
-                            path.display()
-                        ),
-                    );
-                }
-                if !result.0 {
-                    let path = directory.keep();
-                    return (
-                        result.0,
-                        result.1,
-                        format!(
-                            "{}\nactual shell output retained at {}",
-                            result.2,
-                            path.display()
-                        ),
-                    );
-                }
-                if let Err(error) = outcome.release_diagnostics() {
-                    return (
-                        false,
-                        result.1,
-                        format!("release successful shell diagnostics: {error:#}"),
-                    );
-                }
-                result
+        #[cfg(unix)]
+        {
+            let started = Instant::now();
+            let directory = match tempfile::Builder::new()
+                .prefix("nr-sql-shell-")
+                .tempdir_in("/tmp")
+            {
+                Ok(directory) => directory,
+                Err(error) => return (false, None, format!("prepare shell output: {error}")),
+            };
+            let mut command = novarocks_test_support::ManagedCommand::new("sh");
+            if let Some((work, complete)) = lifetime {
+                command.terminate_at(work, complete);
             }
-            Err(error) => {
-                if let Some(observed) = writer_exit {
-                    observed.store(false, std::sync::atomic::Ordering::Release);
+            command.arg("-c").arg(
+                sql.trim_start()
+                    .strip_prefix("shell:")
+                    .expect("shell step")
+                    .trim(),
+            );
+            if let Some(context) = context {
+                command
+                    .env(
+                        novarocks_cluster_harness::fixture_run::RUN_CONTEXT_ENV,
+                        context,
+                    )
+                    .env(
+                        "NOVA_FIXTURE_CLEANUP_MODE",
+                        if cleanup { "true" } else { "false" },
+                    );
+            }
+            if let Some(storage) = storage {
+                command.env(
+                    novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV,
+                    storage,
+                );
+            }
+            let capture = (|| -> anyhow::Result<_> {
+                use std::os::unix::fs::OpenOptionsExt;
+                let stdout = std::fs::OpenOptions::new()
+                    .write(true)
+                    .read(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(directory.path().join("stdout"))?;
+                let stderr = std::fs::OpenOptions::new()
+                    .write(true)
+                    .read(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(directory.path().join("stderr"))?;
+                novarocks_test_support::capture_command_until(command, stdout, stderr, deadline)
+            })();
+            match capture {
+                Ok(outcome) => {
+                    group_exit_observed = outcome.group_exit_observed();
+                    let timed_out = outcome.timed_out || Instant::now() >= deadline;
+                    let failures = &outcome.failures;
+                    // A failed producer may have reported an unknown remote writer
+                    // outcome even after its host CLI exited. Keep files until its
+                    // original owner can supply a successful completion fact.
+                    if (!failures.is_empty() || !outcome.output.status.success())
+                        && let Some(observed) = writer_exit
+                    {
+                        observed.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                    let result = render_command_output(&outcome.output, started.elapsed());
+                    if timed_out || Instant::now() >= deadline || !failures.is_empty() {
+                        let path = directory.keep();
+                        return (
+                            false,
+                            result.1,
+                            format!(
+                                "shell original deadline expired={timed_out}; cleanup={failures:?}; actual output retained at {}",
+                                path.display()
+                            ),
+                        );
+                    }
+                    if !result.0 {
+                        let path = directory.keep();
+                        return (
+                            result.0,
+                            result.1,
+                            format!(
+                                "{}\nactual shell output retained at {}",
+                                result.2,
+                                path.display()
+                            ),
+                        );
+                    }
+                    if let Err(error) = outcome.release_diagnostics() {
+                        return (
+                            false,
+                            result.1,
+                            format!("release successful shell diagnostics: {error:#}"),
+                        );
+                    }
+                    result
                 }
-                let path = directory.keep();
-                (
-                    false,
-                    None,
-                    format!(
-                        "bounded shell command failed: {error:#}; original output retained at {}",
-                        path.display()
-                    ),
-                )
+                Err(error) => {
+                    if let Some(observed) = writer_exit {
+                        observed.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                    let path = directory.keep();
+                    (
+                        false,
+                        None,
+                        format!(
+                            "bounded shell command failed: {error:#}; original output retained at {}",
+                            path.display()
+                        ),
+                    )
+                }
             }
         }
-    }
+    })();
+    (result, group_exit_observed)
 }
 
 fn render_command_output(
@@ -266,6 +308,59 @@ mod tests {
         );
         assert!(result.0, "{}", result.2);
         assert!(success.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_group_receipt_and_remote_unknown_remain_independent_of_business_status() {
+        let remote_unknown = std::sync::atomic::AtomicBool::new(true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let generic = execute_shell_step_observed(
+            "shell: exit 17",
+            Some(deadline),
+            None,
+            None,
+            false,
+            Some(&remote_unknown),
+        );
+        assert!(!generic.0);
+        assert!(!remote_unknown.load(std::sync::atomic::Ordering::Acquire));
+        let work = Instant::now() + Duration::from_secs(5);
+        let complete = work + Duration::from_secs(5);
+        let (business, local_group) = super::execute_shell_step_with_group_observation(
+            "shell: sleep 30 & exit 17",
+            work,
+            complete,
+            None,
+            None,
+        );
+        assert!(!business.0);
+        assert!(business.2.contains("status 17"), "{}", business.2);
+        assert!(
+            local_group,
+            "the original monitor must observe the background group gone"
+        );
+        assert!(
+            !remote_unknown.load(std::sync::atomic::Ordering::Acquire),
+            "a later local group receipt cannot settle an earlier remote-unknown writer"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leader_exit_without_original_group_observation_stays_unknown() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (business, group) = super::execute_shell_step_core(
+            "shell: exit 17",
+            Some(deadline),
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
+        assert!(!business.0);
+        assert!(!group);
     }
 
     #[test]

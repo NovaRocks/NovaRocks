@@ -20,11 +20,11 @@
 use std::fmt;
 
 use crate::product::{
-    MvCommand, MvCreatedTarget, MvOperationContext, MvProductError, MvProductErrorKind,
-    MvRefreshAttemptIdentity, MvStagedTarget, MvTarget,
+    MvCommand, MvCreatePublicationOutcome, MvCreatedTarget, MvOperationContext, MvProductError,
+    MvProductErrorKind, MvRefreshAttemptIdentity, MvStagedTarget, MvTarget,
 };
 use crate::publication::MvRefreshPublicationFinalizationFacts;
-use crate::readiness::{MvDropReadiness, MvKeyedProjectionDeleteGuard};
+use crate::readiness::MvDropReadiness;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvProviderFailureKind {
@@ -41,6 +41,7 @@ pub enum MvProviderFailureKind {
 pub struct MvProviderFailure {
     kind: MvProviderFailureKind,
     message: String,
+    original_failure: Option<novarocks_failure_contract::SharedFailureCause>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
     unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
 }
@@ -50,6 +51,7 @@ impl MvProviderFailure {
         Self {
             kind,
             message: message.into(),
+            original_failure: None,
             compile_control: None,
             unavailable_implementation: None,
         }
@@ -62,6 +64,18 @@ impl MvProviderFailure {
         self.compile_control = error;
         self
     }
+    pub fn with_original_failure(
+        mut self,
+        cause: novarocks_failure_contract::SharedFailureCause,
+    ) -> Self {
+        self.original_failure = Some(cause);
+        self
+    }
+
+    pub fn original_failure(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.original_failure.as_ref()
+    }
+
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         self.compile_control.clone()
     }
@@ -114,9 +128,13 @@ impl MvProviderFailure {
             MvProviderFailureKind::TargetReplaced => MvProductErrorKind::TargetReplaced,
             MvProviderFailureKind::Corruption => MvProductErrorKind::Corruption,
         };
-        MvProductError::new(kind, self.message)
+        let mut failure = MvProductError::new(kind, self.message)
             .with_compile_control(self.compile_control)
-            .with_unavailable_implementation(self.unavailable_implementation)
+            .with_unavailable_implementation(self.unavailable_implementation);
+        if let Some(cause) = self.original_failure {
+            failure = failure.with_original_failure(cause);
+        }
+        failure
     }
 }
 
@@ -126,7 +144,11 @@ impl fmt::Display for MvProviderFailure {
     }
 }
 
-impl std::error::Error for MvProviderFailure {}
+impl std::error::Error for MvProviderFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.original_failure.as_ref().map(|cause| cause as _)
+    }
+}
 
 /// Provider effects required by the product-owned CREATE transition.
 ///
@@ -180,13 +202,41 @@ pub trait MvCreateProviderPort: Send + Sync {
     ) -> Result<(), MvProviderFailure>;
 }
 
-/// Provider effect required by the product-owned DROP transition.
-pub trait MvDropProviderPort: Send + Sync {
-    fn drop_target(
-        &self,
+/// Borrowed progress of one original CREATE. Each poll may only advance its
+/// named phase. The outer Source retains the raw result before dropping a
+/// completed child Future, and retains every in-flight input through actual
+/// exit. The product owns ordering and policy; this port owns no retry policy.
+pub trait MvCreateProgressPort: Send {
+    fn poll_stage_target(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
         operation: MvOperationContext,
-        target: &MvTarget,
-    ) -> Result<(), MvProviderFailure>;
+        command: &MvCommand,
+    ) -> std::task::Poll<Result<MvStagedTarget, MvProviderFailure>>;
+    fn poll_publish_staged_target(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        staged: &MvStagedTarget,
+    ) -> std::task::Poll<Result<MvCreatePublicationOutcome, MvProviderFailure>>;
+    fn poll_abort_staged_target(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        staged: &MvStagedTarget,
+    ) -> std::task::Poll<Result<(), MvProviderFailure>>;
+    fn poll_install_created_projection(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        target: &MvCreatedTarget,
+    ) -> std::task::Poll<Result<(), MvProviderFailure>>;
+    fn poll_register_target(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        target: &MvCreatedTarget,
+    ) -> std::task::Poll<Result<(), MvProviderFailure>>;
 }
 
 /// Product admission is expressed as a one-operation capability, never as a
@@ -210,31 +260,64 @@ pub trait MvCreateCatalogRegistrationPort: Send + Sync {
     ) -> Result<(), MvProviderFailure>;
 }
 
-/// Catalog-registration effect required by DROP after exact projection deletion.
-pub trait MvDropCatalogRegistrationPort: Send + Sync {
-    fn unregister_target(
-        &self,
-        operation: MvOperationContext,
-        target: &MvTarget,
-    ) -> Result<(), MvProviderFailure>;
-}
-
-/// The product-owned durable side of DROP. An outer adapter may bridge sync
-/// execution, but cannot reinterpret missing-target policy, dependency safety,
-/// or the exact post-provider-delete CAS.
-pub trait MvDropProjectionPort<G = MvKeyedProjectionDeleteGuard>: Send + Sync {
-    fn prepare_drop(
-        &self,
+/// DROP borrows the same original provider and exact projection-delete guard.
+/// The first projection-delete poll may move `guard` into its stable Source;
+/// a Pending result never permits dropping it or acquiring another guard.
+/// As with CREATE, the Source receives raw results before child Future Drop.
+pub trait MvDropProgressPort<G>: Send {
+    fn poll_prepare_drop(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
         operation: MvOperationContext,
         target: &MvTarget,
         if_exists: bool,
-    ) -> Result<MvDropReadiness<G>, MvProviderFailure>;
-
-    fn delete_after_provider_drop(
-        &self,
+    ) -> std::task::Poll<Result<MvDropReadiness<G>, MvProviderFailure>>;
+    fn poll_drop_target(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
         operation: MvOperationContext,
-        guard: G,
-    ) -> Result<(), MvProviderFailure>;
+        target: &MvTarget,
+    ) -> std::task::Poll<Result<(), MvProviderFailure>>;
+    fn poll_delete_after_provider_drop(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        guard: &mut Option<G>,
+    ) -> std::task::Poll<Result<(), MvProviderFailure>>;
+    fn poll_unregister_target(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: MvOperationContext,
+        target: &MvTarget,
+    ) -> std::task::Poll<Result<(), MvProviderFailure>>;
+}
+
+/// One request-local refresh capability borrowed by the product transition.
+///
+/// The outer original Source retains prepared/admitted inputs, the concrete
+/// known-committed continuation, raw outcomes and actual-exit custody. A Ready
+/// poll means its corresponding outcome is stable before foreign F Drop.
+/// Polling runs outside Source locks; an unwind retains the same Source and is
+/// never permission to dispatch another execution or projection.
+pub trait MvRefreshProgressPort: Send {
+    fn poll_execute_refresh(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        target: &MvTarget,
+        attempt: &MvRefreshAttemptIdentity,
+    ) -> std::task::Poll<()>;
+
+    fn execution_outcome(
+        &self,
+    ) -> Option<Result<&MvRefreshPublicationFinalizationFacts, &MvProviderFailure>>;
+
+    fn poll_project_known_committed(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        target: &MvTarget,
+    ) -> std::task::Poll<()>;
+
+    fn projection_outcome(&self) -> Option<&Result<(), MvProviderFailure>>;
 }
 
 /// One consumed refresh execution capability. The adapter may retain only the

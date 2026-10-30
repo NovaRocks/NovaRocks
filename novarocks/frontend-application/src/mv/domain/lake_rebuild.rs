@@ -724,7 +724,96 @@ fn projection_catalogs_are_admitted(
 }
 
 fn project_connector_error(error: ConnectorError) -> MvProjectionError {
-    MvProjectionError::from(MvDocumentError::Connector(error))
+    let cause = super::readiness::connector_failure_cause(error.clone());
+    MvProjectionError::from(MvDocumentError::Connector(error)).with_original_failure(cause)
+}
+
+/// The original CPU preparation already captured this exact target identity.
+/// The actual document observation still happens after the product reserves
+/// its same read-only installation operation; it cannot readmit management.
+pub(crate) async fn rebuild_one_lake_package_if_missing_verified_original(
+    readiness: &crate::mv::domain::readiness::MvReadinessExecution<'_>,
+    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    catalog: CatalogHandle,
+    target: MvTarget,
+    table: ConnectorTableIdentity,
+    object: novarocks_spi::connector::ConnectorTableObjectId,
+    context: ConnectorRequestContext,
+) -> Result<(), MvProjectionError> {
+    let actual_catalog = planning
+        .binding()
+        .catalog_handle()
+        .map_err(project_connector_error)?;
+    if actual_catalog != &catalog
+        || table.instance_id != planning.binding().descriptor().instance_id
+        || target.catalog() != Some(table.instance_id.as_str())
+        || target.namespace() != table.namespace.as_ref()
+        || target.name() != table.table.as_ref()
+    {
+        return Err(MvProjectionError::new(
+            MvProjectionErrorKind::SourceConflict,
+            "MV catalog generation changed before read-only Current observation",
+        ));
+    }
+    let request = MvCurrentProjectionRequest::try_new(
+        catalog,
+        target,
+        context.clone(),
+        PersistenceDecodeBudget::default(),
+    )?;
+    let documents = planning
+        .derive_document_storage_lease()
+        .map_err(project_connector_error)?;
+    let observation =
+        crate::mv::domain::staged_create::keyed_request(&documents, table, object, context);
+    let source = CapturedReadOnlyCurrentSource {
+        reader: readiness.candidate_reader(),
+        documents,
+        observation,
+    };
+    readiness
+        .observe_current_read_only_and_install(Uuid::now_v7(), request, &source)
+        .await
+        .map(|_| ())
+}
+struct CapturedReadOnlyCurrentSource {
+    reader: crate::mv::domain::readiness::MvCandidateReader,
+    documents: novarocks_spi::connector::ConnectorDocumentStorageLease,
+    observation: novarocks_spi::connector::KeyedDocumentObservationRequest,
+}
+#[async_trait::async_trait]
+impl MvKeyedReadOnlyCurrentProjectionSource for CapturedReadOnlyCurrentSource {
+    async fn observe_current_keyed_read_only(
+        &self,
+        request: MvCurrentProjectionRequest,
+    ) -> Result<
+        novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+        MvProjectionError,
+    > {
+        if request.catalog() != &self.observation.catalog_handle
+            || request.target().catalog() != Some(self.observation.target.instance_id.as_str())
+            || request.target().namespace() != self.observation.target.namespace.as_ref()
+            || request.target().name() != self.observation.target.table.as_ref()
+        {
+            return Err(MvProjectionError::new(
+                MvProjectionErrorKind::SourceConflict,
+                "MV read-only observation changed its captured target",
+            ));
+        }
+        self.reader
+            .observe_current_application_async(&self.documents, self.observation.clone())
+            .await
+            .map_err(|error| {
+                let mut projected = MvProjectionError::new(
+                    MvProjectionErrorKind::SourceConflict,
+                    error.to_string(),
+                );
+                if let Some(cause) = error.failure_cause() {
+                    projected = projected.with_original_failure(cause.clone());
+                }
+                projected
+            })
+    }
 }
 
 #[cfg(test)]

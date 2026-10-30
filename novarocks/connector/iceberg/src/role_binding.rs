@@ -629,7 +629,7 @@ mod tests {
         entered: Arc<tokio::sync::Notify>,
         gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
     }
-    impl crate::access_binding::IcebergStaticCredentialResolver for BlockingControlIdentity {
+    impl crate::access_binding::IcebergCredentialResolver for BlockingControlIdentity {
         fn resolve_object_store_static(
             &self,
             _: &novarocks_spi::connector::StaticCredentialReference,
@@ -681,14 +681,13 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(handle.clone())),
             Arc::new(TokioFileTaskSpawner::new(handle.clone())),
         );
-        let access =
-            crate::access_binding::IcebergReadBinding::with_static_metadata_credential_resolver(
-                fs,
-                Arc::new(BlockingControlIdentity {
-                    entered: entered.clone(),
-                    gate,
-                }),
-            );
+        let access = crate::access_binding::IcebergReadBinding::with_metadata_credential_resolver(
+            fs,
+            Arc::new(BlockingControlIdentity {
+                entered: entered.clone(),
+                gate,
+            }),
+        );
         let factory = IcebergControlRoleBindingFactory::new(
             IcebergMetadataResources::new(access, handle),
             NonZeroUsize::new(1).unwrap(),

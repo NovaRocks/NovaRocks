@@ -74,10 +74,13 @@ impl HashJoinBuildSide {
 pub(crate) const fn exact_hash_join_build_side(join_type: JoinKind) -> Option<HashJoinBuildSide> {
     match join_type {
         JoinKind::Cross => None,
-        JoinKind::RightSemi | JoinKind::RightAnti => Some(HashJoinBuildSide::Left),
+        // Preserve outer rows on the probe side. The mirror is the same
+        // probe-preserving implementation used by a left outer join.
+        JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti => {
+            Some(HashJoinBuildSide::Left)
+        }
         JoinKind::Inner
         | JoinKind::LeftOuter
-        | JoinKind::RightOuter
         | JoinKind::FullOuter
         | JoinKind::LeftSemi
         | JoinKind::LeftAnti
@@ -764,7 +767,11 @@ mod aggregate_stage_tests {
 
     #[test]
     fn hash_join_build_side_is_a_closed_planner_decision() {
-        for kind in [JoinKind::RightSemi, JoinKind::RightAnti] {
+        for kind in [
+            JoinKind::RightOuter,
+            JoinKind::RightSemi,
+            JoinKind::RightAnti,
+        ] {
             assert_eq!(
                 exact_hash_join_build_side(kind),
                 Some(HashJoinBuildSide::Left)
@@ -773,7 +780,6 @@ mod aggregate_stage_tests {
         for kind in [
             JoinKind::Inner,
             JoinKind::LeftOuter,
-            JoinKind::RightOuter,
             JoinKind::FullOuter,
             JoinKind::LeftSemi,
             JoinKind::LeftAnti,

@@ -58,7 +58,7 @@ class AdapterTests(unittest.TestCase):
         self.args = ['--root', str(self.root), '--daemon', 'daemon-id',
                      '--expected-version', 'version-id', '--expected-generation', 'generation-id']
 
-    def invoke(self, script='private-secret-payload', extra=(), context=None, storage=None):
+    def invoke(self, script='private-secret-payload', extra=(), context=None, storage=None, owner_expected=True):
         out, err = io.StringIO(), io.StringIO()
         environment = {'NOVA_FIXTURE_RUN_CONTEXT': json.dumps(context or self.context)}
         if storage is not None:
@@ -68,7 +68,10 @@ class AdapterTests(unittest.TestCase):
              mock.patch.object(adapter.runtime, 'install_signal_handlers'), \
              mock.patch.object(sys, 'stdin', io.StringIO(script)), redirect_stdout(out), redirect_stderr(err):
             status = adapter.main(self.args + list(extra))
-        constructor.assert_called_once_with(self.root, daemon='daemon-id')
+        if owner_expected:
+            constructor.assert_called_once_with(self.root, daemon='daemon-id')
+        else:
+            constructor.assert_not_called()
         return status, out.getvalue(), err.getvalue()
 
     def test_work_uses_original_complete_deadline_and_generation(self):
@@ -151,6 +154,75 @@ class AdapterTests(unittest.TestCase):
         self.assertNotEqual(status, 0)
         self.assertEqual(out, '')
         self.assertEqual(len(self.calls), 1)
+        self.owner.backend.run_mc.assert_not_called()
+
+    def test_exact_iam_ports_keep_original_phase_deadline_and_do_not_call_full_cleanup(self):
+        pairs = [{'user': self.identity.iam_name('init'), 'policy': self.identity.resource_name('init')}]
+        request = json.dumps({'identity': self.identity.as_dict(), 'storage': self.storage.as_dict(), 'users': pairs})
+        for action, phase, method, remaining in (
+                ('--check-users-absent', [], 'check_users_absent', 370),
+                ('--cleanup-users', ['--cleanup'], 'cleanup_users', 400)):
+            with self.subTest(action=action):
+                sweeper = mock.Mock()
+                operation = getattr(sweeper, method)
+                operation.return_value = {'complete': True, 'removed': [], 'errors': []}
+                before = time.monotonic()
+                with mock.patch.object(adapter, 'ScratchSweeper', return_value=sweeper):
+                    status, out, err = self.invoke(request, [*phase, action], storage=self.storage.as_dict())
+                self.assertEqual((status, err), (0, ''))
+                self.assertTrue(json.loads(out)['complete'])
+                self.assertEqual(operation.call_args.args[0].as_dict(), self.storage.as_dict())
+                self.assertEqual(operation.call_args.args[1], pairs)
+                deadline = operation.call_args.kwargs['deadline']
+                self.assertAlmostEqual(deadline - before, remaining, delta=2)
+                self.assertEqual(deadline, self.calls[-1][1]['deadline'])
+                sweeper.cleanup_run.assert_not_called()
+        self.owner.backend.run_mc.assert_not_called()
+
+    def test_exact_iam_ports_reject_wrong_phase_before_snapshot_or_remote_effects(self):
+        for extra in (['--cleanup', '--check-users-absent'], ['--cleanup-users']):
+            with self.subTest(extra=extra), mock.patch.object(adapter, 'ScratchSweeper') as sweeper:
+                status, out, _ = self.invoke('{}', extra, owner_expected=False)
+                self.assertNotEqual(status, 0)
+                self.assertEqual(out, '')
+                sweeper.assert_not_called()
+        self.owner.ready_snapshot.assert_not_called()
+        self.owner.backend.run_mc.assert_not_called()
+
+    def test_exact_iam_ports_reject_foreign_context_or_storage_before_sweeper(self):
+        for action, phase in (('--check-users-absent', []), ('--cleanup-users', ['--cleanup'])):
+            for change in ('identity', 'generation', 'missing-storage', 'extra-field'):
+                with self.subTest(action=action, change=change):
+                    request = {'identity': self.identity.as_dict(), 'storage': self.storage.as_dict(), 'users': []}
+                    if change == 'identity':
+                        request['identity'] = ScratchIdentity.create('s3://novarocks/peer').as_dict()
+                    elif change == 'generation':
+                        request['storage']['machine']['generation'] = 'foreign-generation'
+                    elif change == 'missing-storage':
+                        del request['storage']
+                    else:
+                        request['script'] = 'unadmitted-shell'
+                    with mock.patch.object(adapter, 'ScratchSweeper') as sweeper:
+                        status, out, _ = self.invoke(json.dumps(request), [*phase, action])
+                    self.assertNotEqual(status, 0)
+                    self.assertEqual(out, '')
+                    sweeper.assert_not_called()
+        self.owner.backend.run_mc.assert_not_called()
+
+    def test_existing_iam_or_cleanup_failure_remains_failure_without_full_cleanup(self):
+        request = json.dumps({'identity': self.identity.as_dict(), 'storage': self.storage.as_dict(), 'users': []})
+        for action, phase, method, code in (
+                ('--check-users-absent', [], 'check_users_absent', 'ScratchIamAbsenceUnconfirmed'),
+                ('--cleanup-users', ['--cleanup'], 'cleanup_users', 'ScratchCleanupIncomplete')):
+            with self.subTest(action=action):
+                sweeper = mock.Mock()
+                getattr(sweeper, method).return_value = {'complete': False, 'removed': [], 'errors': [{'code': 'ScratchAccessDenied'}]}
+                with mock.patch.object(adapter, 'ScratchSweeper', return_value=sweeper):
+                    status, out, err = self.invoke(request, [*phase, action])
+                self.assertEqual((status, out), (1, ''))
+                self.assertIn(code, err)
+                self.assertIn('ScratchAccessDenied', err)
+                sweeper.cleanup_run.assert_not_called()
         self.owner.backend.run_mc.assert_not_called()
 
     def test_expected_activation_failure_is_not_silently_reattached(self):

@@ -59,7 +59,9 @@ async fn open_host(
     input: Option<StateStoreHostInput>,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
     let registry = state_store_fixture::persistent_registry();
+    let mut host_receiving_13 = None;
     FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+        &mut host_receiving_13,
         input,
         &registry,
         execution_config(),

@@ -79,15 +79,7 @@ struct LocalExchangerState {
 pub(crate) enum LocalExchangePartitionSpec {
     Single,
     InputSlotIds(Vec<SlotId>),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged P09 builder integration")
-    )]
     HierarchicalInputSlotIds(Vec<(SlotId, novarocks_type_contract::FunctionValueType)>),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged P09 builder integration")
-    )]
     ConditionalKey {
         applies: SlotId,
         keys: Vec<(SlotId, novarocks_type_contract::FunctionValueType)>,

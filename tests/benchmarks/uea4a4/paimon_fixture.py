@@ -158,11 +158,11 @@ def install_verified_mc_image(store: Path) -> None:
     )
     bom = writer.read_json(store / "bom.json")
     try:
-        alias = bom["images"]["minio-mc"]["alias"]
+        alias = bom["derived_images"]["minio-mc"]["image_id"]
     except (KeyError, TypeError) as error:
         raise writer.FixtureError("verified input BOM has no MinIO mc image") from error
     if not isinstance(alias, str) or not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]+", alias):
-        raise writer.FixtureError("verified input BOM has an invalid MinIO mc alias")
+        raise writer.FixtureError("verified input BOM has an invalid MinIO mc image ID")
     os.environ["MINIO_MC_IMAGE"] = alias
 
 

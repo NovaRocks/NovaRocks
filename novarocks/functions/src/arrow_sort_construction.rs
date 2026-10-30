@@ -14,13 +14,14 @@
 // KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Arrow 58.4 lexsort constructor structures over actual admitted keys.
+//! Arrow 60.1.0 lexsort constructor structures over actual admitted keys.
 //! Row indices/valid tuples/rank payloads keep the caller's original policy.
 use crate::selected_copy::{
     CopyConstructionError, CopyError, preflight_flat_arrow_structure_construction,
     preflight_primitive_vec_adoption_construction_observed,
 };
-use arrow_array::types::Int32Type;
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Int16Type, Int32Type, Int64Type};
 use arrow_array::{
     Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, LargeBinaryArray, LargeListArray,
     LargeStringArray, ListArray, MapArray, StringArray, StructArray,
@@ -76,6 +77,8 @@ struct Walk<'a, 'port, H, W> {
     temporary: &'a mut ValueSchemaCreation<'port, H>,
     work: &'a mut W,
     facts: LexsortStructureFacts,
+    // Only the original Run take entry bypasses the lexsort ingress profile.
+    raw_take: bool,
 }
 impl<H, W: FnMut(bool) -> Result<(), H>> Walk<'_, '_, H, W> {
     fn visit(&mut self) -> Result<(), CopyConstructionError<H>> {
@@ -92,24 +95,24 @@ impl<H, W: FnMut(bool) -> Result<(), H>> Walk<'_, '_, H, W> {
         Ok(())
     }
     fn vector(&mut self, count: usize) -> Result<(), CopyConstructionError<H>> {
+        self.fresh_vector::<DynComparator>(count)?;
+        self.facts.comparator_vectors = add(self.facts.comparator_vectors, 1)?;
+        Ok(())
+    }
+    fn fresh_vector<T>(&mut self, count: usize) -> Result<(), CopyConstructionError<H>> {
         // ord.rs344/1042/1083 Result.collect<Vec<DynComparator>> creates a
         // new unreserved Vec through GenericShunt's zero lower size hint.
         // Reuse the sole locked RawVec amortized growth operation author.
-        let bytes =
-            original_fresh_push_requests::<DynComparator, VectorFailure<H>>(count, &mut || {
-                (self.work)(false).map_err(VectorFailure::Creator)
-            })
-            .map_err(|e| match e {
-                VectorFailure::Creator(e) => CopyConstructionError::Creator(e),
-                VectorFailure::Resource(ControlResourceError::SourceModel(_)) => {
-                    LayoutResourceError::SourceModel.into()
-                }
-                VectorFailure::Resource(ControlResourceError::Control(_)) => {
-                    LayoutResourceError::Arithmetic.into()
-                }
-            })?;
+        let bytes = original_fresh_push_requests::<T, VectorFailure<H>>(count, &mut || {
+            (self.work)(false).map_err(VectorFailure::Creator)
+        })
+        .map_err(|e| match e {
+            VectorFailure::Creator(e) => CopyConstructionError::Creator(e),
+            VectorFailure::Resource(source) => {
+                CopyError::Control(crate::KernelFailure::from_domain(source)).into()
+            }
+        })?;
         self.opaque(bytes)?;
-        self.facts.comparator_vectors = add(self.facts.comparator_vectors, 1)?;
         Ok(())
     }
     fn bitmap_header(&mut self) -> Result<(), CopyConstructionError<H>> {
@@ -119,16 +122,96 @@ impl<H, W: FnMut(bool) -> Result<(), H>> Walk<'_, '_, H, W> {
         preflight_primitive_vec_adoption_construction_observed(self.temporary, self.work)?;
         Ok(())
     }
+    fn map<K, V>(&mut self, count: usize) -> Result<(), CopyConstructionError<H>> {
+        let facts =
+            novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<K, V>(count)
+                .map_err(|cause| {
+                    CopyError::Control(crate::KernelFailure::from_domain(ComparatorMapFailure(
+                        cause,
+                    )))
+                })?;
+        if let Some(layout) = facts.layout {
+            self.opaque(layout.size())?;
+        }
+        Ok(())
+    }
+    fn logical_bitmap(&mut self, rows: usize) -> Result<(), CopyConstructionError<H>> {
+        let bytes = add(rows / 8, usize::from(!rows.is_multiple_of(8)))?;
+        let rounded = add(bytes, 63)? / 64 * 64;
+        // collect_bool/BooleanBufferBuilder request round64; sparse mask's
+        // remainder push can grow to twice it while the old block coexists.
+        self.opaque(rounded.checked_mul(3).ok_or_else(arithmetic)?)?;
+        self.bitmap_header()
+    }
+    fn logical_nulls(&mut self, array: &dyn Array) -> Result<(), CopyConstructionError<H>> {
+        self.visit()?;
+        match array.data_type() {
+            DataType::Dictionary(_, _) => {
+                let values = array
+                    .as_any_dictionary_opt()
+                    .ok_or_else(arithmetic)?
+                    .values();
+                self.logical_nulls(values.as_ref())?;
+                self.logical_bitmap(array.len())?;
+            }
+            DataType::RunEndEncoded(ends, _) => {
+                let values = match ends.data_type() {
+                    DataType::Int16 => array.as_run::<Int16Type>().values(),
+                    DataType::Int32 => array.as_run::<Int32Type>().values(),
+                    DataType::Int64 => array.as_run::<Int64Type>().values(),
+                    _ => return Ok(()),
+                };
+                self.logical_nulls(values.as_ref())?;
+                self.logical_bitmap(array.len())?;
+            }
+            DataType::Union(fields, _) if !fields.is_empty() => {
+                let union = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::UnionArray>()
+                    .ok_or_else(arithmetic)?;
+                for (id, _) in fields.iter() {
+                    self.logical_nulls(union.child(id).as_ref())?;
+                }
+                // fields_logical_nulls can filter every field; collect starts
+                // unreserved. Mask variants additionally own public bit-chunk
+                // tables, two HashSets, and the remaining type-id vector.
+                // Sum branch-specific requests to cover all target strategies;
+                // this is an opaque source upper, never a private layout claim.
+                self.fresh_vector::<(i8, NullBuffer)>(fields.len())?;
+                self.fresh_vector::<(i8, arrow_buffer::bit_chunk_iterator::BitChunks<'_>)>(
+                    fields.len(),
+                )?;
+                self.fresh_vector::<(i8, arrow_buffer::bit_chunk_iterator::BitChunkIterator<'_>)>(
+                    fields.len(),
+                )?;
+                self.map::<i8, ()>(fields.len())?;
+                self.map::<i8, ()>(fields.len())?;
+                self.fresh_vector::<i8>(fields.len())?;
+                self.logical_bitmap(1)?; // gather's one-null buffer
+                self.logical_bitmap(1)?; // gather's one-valid buffer
+                self.logical_bitmap(array.len())?;
+            }
+            _ => {} // ordinary Array::logical_nulls clones its borrowed validity
+        }
+        Ok(())
+    }
     fn comparator(&mut self, array: &dyn Array) -> Result<(), CopyConstructionError<H>> {
         self.visit()?;
         self.facts.comparator_nodes = add(self.facts.comparator_nodes, 1)?;
+        if self.raw_take && *array.data_type() != DataType::Null {
+            // compare() independently materializes logical validity for each
+            // borrowed operand. The operands alias here; the two operations do
+            // not share newly constructed validity buffers.
+            self.logical_nulls(array)?;
+            self.logical_nulls(array)?;
+        }
         let nulls = [
             Layout::new::<Option<NullBuffer>>(),
             Layout::new::<Option<NullBuffer>>(),
             Layout::new::<std::cmp::Ordering>(),
             Layout::new::<std::cmp::Ordering>(),
         ];
-        let mut payload = [Layout::new::<()>(); 4];
+        let mut payload = [Layout::new::<()>(); 8];
         let payload_len = if array.data_type().is_primitive() {
             // ord.rs119: two cloned ScalarBuffers. Native T does not add
             // storage to ScalarBuffer; PhantomData is zero sized.
@@ -263,7 +346,8 @@ impl<H, W: FnMut(bool) -> Result<(), H>> Walk<'_, '_, H, W> {
                     }
                 }
                 DataType::Dictionary(key, value)
-                    if **key == DataType::Int32
+                    if !self.raw_take
+                        && **key == DataType::Int32
                         && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
                 {
                     let a = array
@@ -280,6 +364,110 @@ impl<H, W: FnMut(bool) -> Result<(), H>> Walk<'_, '_, H, W> {
                             Layout::new::<DynComparator>(),
                             Layout::new::<ScalarBuffer<i32>>(),
                             Layout::new::<ScalarBuffer<i32>>(),
+                        ];
+                        payload[..fields.len()].copy_from_slice(&fields);
+                        fields.len()
+                    }
+                }
+                DataType::Utf8View | DataType::BinaryView if self.raw_take => {
+                    // GenericByteViewArray60.1 clones its Arc region table.
+                    // Both concrete headers have the same public carriers.
+                    let fields = if *array.data_type() == DataType::Utf8View {
+                        [Layout::new::<arrow_array::StringViewArray>(); 2]
+                    } else {
+                        [Layout::new::<arrow_array::BinaryViewArray>(); 2]
+                    };
+                    payload[..2].copy_from_slice(&fields);
+                    2
+                }
+                DataType::ListView(_) | DataType::LargeListView(_) if self.raw_take => {
+                    let child = if matches!(array.data_type(), DataType::ListView(_)) {
+                        array
+                            .as_any()
+                            .downcast_ref::<arrow_array::ListViewArray>()
+                            .ok_or_else(arithmetic)?
+                            .values()
+                    } else {
+                        array
+                            .as_any()
+                            .downcast_ref::<arrow_array::LargeListViewArray>()
+                            .ok_or_else(arithmetic)?
+                            .values()
+                    };
+                    self.comparator(child.as_ref())?;
+                    let fields = [
+                        Layout::new::<DynComparator>(),
+                        Layout::new::<ScalarBuffer<i64>>(),
+                        Layout::new::<ScalarBuffer<i64>>(),
+                        Layout::new::<ScalarBuffer<i64>>(),
+                        Layout::new::<ScalarBuffer<i64>>(),
+                    ];
+                    payload[..fields.len()].copy_from_slice(&fields);
+                    fields.len()
+                }
+                DataType::RunEndEncoded(ends, _) if self.raw_take => {
+                    let values = match ends.data_type() {
+                        DataType::Int16 => array.as_run::<Int16Type>().values(),
+                        DataType::Int32 => array.as_run::<Int32Type>().values(),
+                        DataType::Int64 => array.as_run::<Int64Type>().values(),
+                        _ => return Ok(()), // original SDK owns invalid-carrier failure
+                    };
+                    self.comparator(values.as_ref())?;
+                    let fields = [
+                        Layout::new::<DynComparator>(),
+                        Layout::new::<arrow_buffer::RunEndBuffer<i64>>(),
+                        Layout::new::<arrow_buffer::RunEndBuffer<i64>>(),
+                    ];
+                    payload[..fields.len()].copy_from_slice(&fields);
+                    fields.len()
+                }
+                DataType::Union(fields, _) if self.raw_take => {
+                    let union = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::UnionArray>()
+                        .ok_or_else(arithmetic)?;
+                    self.map::<i8, DynComparator>(fields.len())?;
+                    for (id, _) in fields.iter() {
+                        self.comparator(union.child(id).as_ref())?;
+                    }
+                    let fields = [
+                        Layout::new::<std::collections::HashMap<i8, DynComparator>>(),
+                        Layout::new::<ScalarBuffer<i8>>(),
+                        Layout::new::<ScalarBuffer<i8>>(),
+                        Layout::new::<Option<ScalarBuffer<i32>>>(),
+                        Layout::new::<Option<ScalarBuffer<i32>>>(),
+                    ];
+                    payload[..fields.len()].copy_from_slice(&fields);
+                    fields.len()
+                }
+                DataType::Dictionary(_, _) if self.raw_take => {
+                    let dictionary = array.as_any_dictionary_opt().ok_or_else(arithmetic)?;
+                    let values = dictionary.values();
+                    if matches!(
+                        values.data_type(),
+                        DataType::Utf8
+                            | DataType::LargeUtf8
+                            | DataType::Binary
+                            | DataType::LargeBinary
+                            | DataType::FixedSizeBinary(_)
+                    ) {
+                        //60.1's byte specialization captures both value-array
+                        // headers and key ScalarBuffers in ONE root closure.
+                        let value_layout = Layout::for_value(values.as_ref());
+                        let fields = [
+                            value_layout,
+                            value_layout,
+                            Layout::new::<ScalarBuffer<u64>>(),
+                            Layout::new::<ScalarBuffer<u64>>(),
+                        ];
+                        payload[..fields.len()].copy_from_slice(&fields);
+                        fields.len()
+                    } else {
+                        self.comparator(values.as_ref())?;
+                        let fields = [
+                            Layout::new::<DynComparator>(),
+                            Layout::new::<ScalarBuffer<u64>>(),
+                            Layout::new::<ScalarBuffer<u64>>(),
                         ];
                         payload[..fields.len()].copy_from_slice(&fields);
                         fields.len()
@@ -303,6 +491,72 @@ impl<H, W: FnMut(bool) -> Result<(), H>> Walk<'_, '_, H, W> {
         )?)
     }
 }
+#[derive(Debug)]
+struct ComparatorMapFailure(
+    novarocks_type_contract::owned_resources::hashmap::HashMapResourceError,
+);
+impl std::fmt::Display for ComparatorMapFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for ComparatorMapFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ComparatorMapFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&self.0)
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for ComparatorMapFailure {}
+
+/// Numeric contribution of the actual make_comparator(values,values) used by
+/// take_run. Existing source/values stay borrowed; the returned number owns no
+/// capacity. All requests belong to the caller's original temporary scope.
+/// Lexsort still passes its separate unchanged source_coverage admission.
+pub(crate) fn original_take_comparator_upper_observed<E: From<CopyError>>(
+    array: &dyn Array,
+    work: &mut impl FnMut(bool) -> Result<(), E>,
+) -> Result<usize, E> {
+    let (mut exact_bytes, mut opaque_bytes) = (0usize, 0usize);
+    let mut exact = |layout: Layout| {
+        exact_bytes = exact_bytes
+            .checked_add(layout.size())
+            .ok_or_else(|| E::from(CopyError::arithmetic(None)))?;
+        Ok(())
+    };
+    let mut opaque = |bytes| {
+        opaque_bytes = opaque_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| E::from(CopyError::arithmetic(None)))?;
+        Ok(())
+    };
+    let mut temporary = ValueSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut exact,
+        &mut opaque,
+    );
+    let result = Walk {
+        temporary: &mut temporary,
+        work,
+        facts: LexsortStructureFacts::default(),
+        raw_take: true,
+    }
+    .comparator(array);
+    match result {
+        Ok(()) => exact_bytes
+            .checked_add(opaque_bytes)
+            .ok_or_else(|| E::from(CopyError::arithmetic(None))),
+        Err(CopyConstructionError::Creator(cause)) => Err(cause),
+        Err(CopyConstructionError::Copy(cause)) => Err(cause.into()),
+        Err(CopyConstructionError::Resource(cause)) => {
+            Err(CopyError::Control(crate::KernelFailure::from_domain(cause)).into())
+        }
+    }
+}
+
 fn can_rank(ty: &DataType) -> bool {
     ty.is_primitive()
         || matches!(
@@ -433,6 +687,7 @@ pub fn preflight_lexsort_structure_construction<H>(
         temporary,
         work,
         facts: LexsortStructureFacts::default(),
+        raw_take: false,
     };
     if columns.len() == 1 && nonlexical(columns[0].values.data_type()) {
         // sort.rs271 partition_validity and scalar/list/dictionary sorting.

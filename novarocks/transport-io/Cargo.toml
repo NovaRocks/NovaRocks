@@ -1,0 +1,18 @@
+[package]
+name = "novarocks-transport-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+tokio = { workspace = true, features = ["io-util"] }
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

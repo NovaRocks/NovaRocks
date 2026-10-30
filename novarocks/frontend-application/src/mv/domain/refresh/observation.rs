@@ -17,150 +17,40 @@
 
 //! Refresh schema observations from retained provider metadata and canonical D/L.
 
-use crate::mv::domain::refresh::schema_contract::{
-    MvOccurrenceFieldRebind, validate_projection_target, validate_relation_occurrence_schema,
-};
-use crate::mv::domain::refresh::target::IcebergMvTarget;
-use crate::mv::domain::storage_observation::{
-    MvRefreshBaseObservation, MvSchemaValidationObservation,
-};
-use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
-use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
-use novarocks_spi::connector::{
-    ConnectorControlResolver, ConnectorRequestContext, ConnectorTableResolution,
-    MvStorageObservationPort,
-};
+use crate::mv::domain::refresh::schema_contract::MvOccurrenceFieldRebind;
 use novarocks_types::naming::TableIdentity;
 
-/// No second Current capture is allowed: object, metadata version, schema and
-/// fields all come from the provider's same retained handle.
-pub(crate) fn observe_schema_validation_for_table(
-    connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
-    table: &TableIdentity,
-    connector_context: &ConnectorRequestContext,
-) -> Result<MvSchemaValidationObservation, String> {
-    let lease =
-        crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &lease,
-        connector_context.clone(),
-        &table.namespace,
-        &table.table,
-        ConnectorTableResolution::StrictBaseTable,
-    )?;
-    let observed = crate::mv::domain::storage_observation::observe_schema_validation(
-        storage_observation,
-        &lease,
-        &metadata,
-        connector_context.clone(),
-    )
-    .map_err(|error| format!("observe exact MV schema for {}: {error}", table.fqn()))?;
-    if observed.table() != &metadata.identity {
+pub(crate) fn validate_observed_schema_locator(
+    observed: &novarocks_spi::connector::ConnectorTableIdentity,
+    identity: &novarocks_spi::connector::ConnectorTableIdentity,
+) -> Result<(), String> {
+    if observed != identity {
         return Err(
             "MV schema observation does not match the retained metadata locator".to_string(),
         );
     }
-    Ok(observed)
+    Ok(())
 }
 
-pub(crate) fn observe_current_refresh_base(
-    connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
+pub(crate) fn validate_occurrence_locator(
+    occurrence: &novarocks_mv_application::persistence::codec::RelationOccurrence,
     table: &TableIdentity,
-    connector_context: &ConnectorRequestContext,
-) -> Result<MvRefreshBaseObservation, String> {
-    crate::mv::domain::refresh_io::observe_current_refresh_base_with_ports(
-        connector_control,
-        storage_observation,
-        table,
-        connector_context,
-    )
-}
-
-/// Collects exact target runtime bindings and every occurrence-local rename.
-/// The caller owns SQL rewriting; duplicate physical inputs are never coalesced.
-pub(crate) fn observe_refresh_schema(
-    connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
-    projection: &StoredKeyedMvProjection,
-    base_refs: &[TableIdentity],
-    target: &IcebergMvTarget,
-    retained_target_observation: Option<&MvSchemaValidationObservation>,
-    connector_context: &ConnectorRequestContext,
-) -> Result<(MvRuntimeBindings, Vec<MvOccurrenceFieldRebind>), String> {
-    let loaded_target;
-    let target_observation = match retained_target_observation {
-        Some(observation) => observation,
-        None => {
-            loaded_target = observe_schema_validation_for_table(
-                connector_control,
-                storage_observation,
-                &TableIdentity {
-                    catalog: target.catalog.clone(),
-                    namespace: target.namespace.clone(),
-                    table: target.table.clone(),
-                },
-                connector_context,
-            )?;
-            &loaded_target
-        }
-    };
-    let bindings = validate_projection_target(projection, target_observation)?;
-    let occurrences = &projection.facts.definition().relation_occurrences;
-    if occurrences.len() != base_refs.len() {
-        return Err("MV refresh source references do not retain every D occurrence".to_string());
+) -> Result<(), String> {
+    if occurrence.catalog_at_binding != table.catalog
+        || occurrence.namespace_at_binding != table.namespace
+        || occurrence.relation_at_binding != table.table
+    {
+        return Err(format!(
+            "MV refresh source locator does not match occurrence {}",
+            occurrence.occurrence_id
+        ));
     }
-    let mut renames = Vec::new();
-    for (occurrence, table) in occurrences.iter().zip(base_refs) {
-        if occurrence.catalog_at_binding != table.catalog
-            || occurrence.namespace_at_binding != table.namespace
-            || occurrence.relation_at_binding != table.table
-        {
-            return Err(format!(
-                "MV refresh source locator does not match occurrence {}",
-                occurrence.occurrence_id
-            ));
-        }
-        let observed = observe_schema_validation_for_table(
-            connector_control,
-            storage_observation,
-            table,
-            connector_context,
-        )?;
-        renames.extend(validate_relation_occurrence_schema(occurrence, &observed)?);
-    }
-    Ok((bindings, renames))
+    Ok(())
 }
 
-/// Until the SQL occurrence-aware rewriter is connected, renamed fields fail
-/// closed. The canonical document is never changed to pretend a rebind occurred.
-pub(crate) fn rebind_mv_definition_before_refresh_derivation(
-    connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
-    projection: &StoredKeyedMvProjection,
-    base_refs: &[TableIdentity],
-    target: &IcebergMvTarget,
-    retained_target_observation: Option<&MvSchemaValidationObservation>,
-    connector_context: &ConnectorRequestContext,
-) -> Result<(StoredKeyedMvProjection, String), String> {
-    let (_, renames) = observe_refresh_schema(
-        connector_control,
-        storage_observation,
-        projection,
-        base_refs,
-        target,
-        retained_target_observation,
-        connector_context,
-    )?;
-    require_occurrence_rewriter(&renames)?;
-    Ok((
-        projection.clone(),
-        projection.facts.definition().query.effective_sql.clone(),
-    ))
-}
-
-fn require_occurrence_rewriter(renames: &[MvOccurrenceFieldRebind]) -> Result<(), String> {
+pub(crate) fn require_occurrence_rewriter(
+    renames: &[MvOccurrenceFieldRebind],
+) -> Result<(), String> {
     if renames.is_empty() {
         Ok(())
     } else {

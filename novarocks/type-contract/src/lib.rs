@@ -93,8 +93,8 @@ pub use comparison_coercion::{
     value_type_for_common_layout_with_construction, wider_comparison_value_type,
 };
 pub use compile_control::{
-    CompileCheckpoints, CompileControlError, CompilePhase, MAX_UNOBSERVED_COMPILE_WORK,
-    PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompileControlProvenance, CompilePhase,
+    MAX_UNOBSERVED_COMPILE_WORK, PureCompileControl,
 };
 pub use control_flow::*;
 pub use effects::*;

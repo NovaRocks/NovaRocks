@@ -308,6 +308,14 @@ pub(crate) struct CreationLengths {
     assignment: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CreationSizing {
+    pub(crate) lengths: CreationLengths,
+    /// All newly requested descriptor/projection buffers plus the final
+    /// encoded metadata buffer; original borrowed source backing is excluded.
+    pub(crate) new_backing_bytes: usize,
+}
+
 /// The move-only inputs of one task's creation.
 ///
 /// It owns this task's initial scan ranges and its place in the shared
@@ -430,25 +438,176 @@ impl TaskCreationSeed {
         #[cfg(test)]
         tests::record_pricing();
         crate::metrics::task_creation::create_priced();
-        let assignment = assignment_message(
-            self.instance_ordinal,
-            self.initial_scan_ranges.iter().map(|(node, ranges)| {
-                (
-                    *node,
-                    ranges
-                        .iter()
-                        .map(|range| range.as_proto().clone())
-                        .collect(),
+        self.size_without_projection().map(|sizing| sizing.lengths)
+    }
+
+    /// The same frozen facts as `freeze`, visited without descriptor/assignment
+    /// DTOs or cloned ranges. This runs before a paid input or queue is taken.
+    pub(crate) fn size_without_projection(&self) -> Result<CreationSizing, TaskExecutionError> {
+        use novarocks_task_codec::creation::size as wire_size;
+        use prost::encoding::encoded_len_varint;
+        use std::alloc::Layout;
+        let failure = || TaskExecutionError::Schedule("creation sizing overflow".into());
+        let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(failure);
+        let mut topology_bytes = 0usize;
+        let mut requested = 0usize;
+        let mut add_array =
+            |size: usize, align: usize, count: usize| -> Result<(), TaskExecutionError> {
+                let element = Layout::from_size_align(size, align).map_err(|_| failure())?;
+                let bytes = element.size().checked_mul(count).ok_or_else(failure)?;
+                requested = add(requested, bytes)?;
+                Ok(())
+            };
+        macro_rules! array {
+            ($ty:ty,$count:expr) => {
+                add_array(
+                    std::mem::size_of::<$ty>(),
+                    std::mem::align_of::<$ty>(),
+                    $count,
+                )?
+            };
+        }
+        array!(ExchangeEdge, self.view.outbound.len());
+        array!(proto::TaskExchangeEdge, self.view.outbound.len());
+        array!(ExchangeInbound, self.view.inbound.len());
+        array!(proto::TaskExchangeInbound, self.view.inbound.len());
+        array!(PlanNodeId, self.split_plan_nodes.len());
+        array!(i32, self.split_plan_nodes.len());
+        // The original descriptor and generated descriptor coexist during
+        // projection. Source ranges move into the final assignment; no deep
+        // range clone is needed by pricing or freezing.
+        let mut destination_count = 0usize;
+        let mut source_count = 0usize;
+        let mut host_bytes = 0usize;
+        for edge_id in self.view.outbound.iter() {
+            let edge = self.topology.edge(*edge_id)?;
+            let ordinal = edge
+                .producers
+                .iter()
+                .find(|p| p.task == self.identity)
+                .map(|p| p.sender_ordinal)
+                .ok_or_else(|| {
+                    TaskExecutionError::Schedule("creation producer is absent".into())
+                })?;
+            let mut bytes = wire_size::edge_header(
+                edge.edge_id.get(),
+                edge.destination_node_id.get(),
+                edge.partitioning,
+                ordinal,
+                edge.sender_count.get(),
+            );
+            destination_count = add(destination_count, edge.destinations.len())?;
+            for destination in edge.destinations.iter() {
+                host_bytes = add(host_bytes, destination.endpoint.host().len())?;
+                let destination = wire_size::destination(
+                    destination.task,
+                    destination.kernel_key,
+                    destination.endpoint.host(),
+                    destination.endpoint.port() as u16,
+                    edge.destination_node_id.get(),
                 )
-            }),
-            &self.sink_edges,
+                .map_err(|_| failure())?;
+                bytes = add(
+                    bytes,
+                    wire_size::message(4, destination).map_err(|_| failure())?,
+                )?;
+            }
+            topology_bytes = add(
+                topology_bytes,
+                wire_size::message(1, bytes).map_err(|_| failure())?,
+            )?;
+        }
+        for (node, edge_ids) in self.view.inbound.iter() {
+            let mut bytes = 0usize;
+            let mut delivery = None;
+            for edge_id in edge_ids.iter() {
+                let edge = self.topology.edge(*edge_id)?;
+                if delivery.is_some_and(|d| d != edge.delivery) {
+                    return Err(TaskExecutionError::Schedule(
+                        "creation delivery requirements conflict".into(),
+                    ));
+                }
+                delivery = Some(edge.delivery);
+                source_count = add(source_count, edge.producers.len())?;
+                for source in edge.producers.iter() {
+                    let source =
+                        wire_size::source(source.task, source.kernel_key, source.sender_ordinal)
+                            .map_err(|_| failure())?;
+                    bytes = add(bytes, wire_size::message(2, source).map_err(|_| failure())?)?;
+                }
+            }
+            let delivery = delivery.ok_or_else(|| {
+                TaskExecutionError::Schedule("creation input has no producer edge".into())
+            })?;
+            bytes = add(bytes, wire_size::inbound_header(node.get(), delivery))?;
+            topology_bytes = add(
+                topology_bytes,
+                wire_size::message(2, bytes).map_err(|_| failure())?,
+            )?;
+        }
+        array!(ExchangeDestination, destination_count);
+        array!(proto::TaskExchangeDestination, destination_count);
+        array!(ExchangeSource, source_count);
+        array!(proto::TaskExchangeSource, source_count);
+        // Every projected task identity has one original 16-byte process ID.
+        // Three more belong to descriptor/context headers; only the actual
+        // generated creation constructors allocate these original Vec values.
+        array!(
+            u8,
+            add(add(destination_count, source_count)?, 3)?
+                .checked_mul(16)
+                .ok_or_else(failure)?
         );
-        let assignment_len = assignment.encoded_len();
+        let split_bytes = self
+            .split_plan_nodes
+            .iter()
+            .try_fold(0usize, |bytes, node| {
+                add(bytes, encoded_len_varint(node.get() as u64))
+            })?;
+        let descriptor = wire_size::descriptor(
+            self.identity,
+            self.kernel_key,
+            self.pipeline_dop.get(),
+            split_bytes,
+            topology_bytes,
+        )
+        .map_err(|_| failure())?;
+        let mut assignment = wire_size::uint(1, self.instance_ordinal as u64);
+        let mut range_count = 0usize;
+        for (&node, ranges) in &self.initial_scan_ranges {
+            range_count = add(range_count, ranges.len())?;
+            let mut bytes = wire_size::int(1, node as i64);
+            for range in ranges {
+                bytes = add(
+                    bytes,
+                    wire_size::message(2, range.as_proto().encoded_len()).map_err(|_| failure())?,
+                )?;
+            }
+            assignment = add(
+                assignment,
+                wire_size::message(2, bytes).map_err(|_| failure())?,
+            )?;
+        }
+        let sink_bytes = self.sink_edges.iter().try_fold(0usize, |bytes, edge| {
+            add(bytes, encoded_len_varint(edge.get() as u64))
+        })?;
+        assignment = add(
+            assignment,
+            wire_size::packed(3, sink_bytes).map_err(|_| failure())?,
+        )?;
         let metadata =
-            encode_creation_metadata(self.context, &self.descriptor()?, assignment, Vec::new());
-        Ok(CreationLengths {
-            metadata: metadata.encoded_len(),
-            assignment: assignment_len,
+            wire_size::metadata(self.context, descriptor, assignment).map_err(|_| failure())?;
+        array!(proto::TaskScanRanges, self.initial_scan_ranges.len());
+        array!(proto::ScanRangeParams, range_count);
+        array!(u32, self.sink_edges.len());
+        requested = add(requested, host_bytes.checked_mul(2).ok_or_else(failure)?)?;
+        requested = add(requested, metadata)?;
+        Ok(CreationSizing {
+            lengths: CreationLengths {
+                metadata,
+                assignment,
+            },
+            new_backing_bytes: requested,
         })
     }
 
@@ -493,7 +652,7 @@ impl TaskCreationSeed {
         let retained = crate::metrics::task_creation::create_frozen(metadata.len());
         Ok(Arc::new(FrozenCreationParts {
             fragment: self.fragment,
-            metadata: FrozenBytes::freeze(metadata.into()),
+            metadata: FrozenBytes::freeze_encoded(metadata),
             assignment_len,
             _retained: retained,
         }))
@@ -572,44 +731,111 @@ pub(crate) fn create_queued_bytes(
 /// Every send of one task's create holds the same parts. The envelope is the
 /// only thing a send could change, and it is priced separately.
 #[derive(Debug)]
-pub(crate) struct CreateTaskIntent {
+struct CreateTaskBody {
     envelope: OperationEnvelope,
     identity: TaskIdentity,
     parts: Arc<FrozenCreationParts>,
 }
-
+/// The by-value handle drops the actual shared body/header before its paid
+/// input lease. No grant is embedded in the allocation whose header it pays.
+#[derive(Debug)]
+pub(crate) struct CreateTaskIntent {
+    original: Arc<CreateTaskBody>,
+    retention: Option<novarocks_resource_contract::ExistingOwnerRetentionLease>,
+}
+impl Clone for CreateTaskIntent {
+    fn clone(&self) -> Self {
+        // Checked retain happens first; failure leaves the original unchanged.
+        let retention = self.retention.as_ref().map(|lease| {
+            lease
+                .try_clone()
+                .expect("original Native input alias count remains representable")
+        });
+        Self {
+            original: Arc::clone(&self.original),
+            retention,
+        }
+    }
+}
 impl CreateTaskIntent {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         envelope: OperationEnvelope,
         identity: TaskIdentity,
         parts: Arc<FrozenCreationParts>,
+        retention: Option<novarocks_resource_contract::ExistingOwnerRetentionLease>,
     ) -> Self {
         Self {
-            envelope,
-            identity,
-            parts,
+            original: Arc::new(CreateTaskBody {
+                envelope,
+                identity,
+                parts,
+            }),
+            retention,
         }
     }
-
-    pub(crate) const fn envelope(&self) -> OperationEnvelope {
-        self.envelope
+    pub(crate) fn envelope(&self) -> OperationEnvelope {
+        self.original.envelope
     }
-
-    pub(crate) const fn identity(&self) -> TaskIdentity {
-        self.identity
+    pub(crate) fn identity(&self) -> TaskIdentity {
+        self.original.identity
     }
-
-    pub(crate) const fn parts(&self) -> &Arc<FrozenCreationParts> {
-        &self.parts
+    pub(crate) fn parts(&self) -> &FrozenCreationParts {
+        &self.original.parts
     }
-
     pub(crate) fn queued_bytes(&self) -> usize {
-        create_queued_bytes(self.envelope, &self.parts.fragment, self.parts.lengths())
+        create_queued_bytes(
+            self.envelope(),
+            &self.original.parts.fragment,
+            self.original.parts.lengths(),
+        )
     }
-
     pub(crate) fn plan_carrier_bytes(&self) -> usize {
-        plan_carrier_bytes(&self.parts.fragment, self.parts.lengths())
+        plan_carrier_bytes(&self.original.parts.fragment, self.original.parts.lengths())
     }
+    #[cfg(test)]
+    pub(crate) fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.original, &other.original)
+    }
+    #[cfg(test)]
+    pub(crate) fn original_strong_count(&self) -> usize {
+        Arc::strong_count(&self.original)
+    }
+    #[cfg(test)]
+    pub(crate) fn weak_original_lifetimes(
+        &self,
+    ) -> (
+        std::sync::Weak<dyn std::any::Any + Send + Sync>,
+        std::sync::Weak<dyn std::any::Any + Send + Sync>,
+    ) {
+        // Coercion clones only existing Arc counters. Both temporary strong
+        // aliases leave before returning these non-owning test observers.
+        let original: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(&self.original) as _;
+        let parts: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(&self.original.parts) as _;
+        (Arc::downgrade(&original), Arc::downgrade(&parts))
+    }
+    #[cfg(test)]
+    pub(crate) fn same_parts(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.original.parts, &other.original.parts)
+    }
+}
+/// The actual two Arc requested layouts created by freeze/replay ownership.
+/// Their original borrowed source pointees are not cloned or charged here.
+pub(crate) fn creation_owner_header_bytes() -> Result<usize, TaskExecutionError> {
+    fn arc<T>() -> Result<usize, TaskExecutionError> {
+        std::alloc::Layout::new::<[usize; 2]>()
+            .extend(std::alloc::Layout::new::<T>())
+            .map(|(layout, _)| layout.pad_to_align().size())
+            .map_err(|_| {
+                TaskExecutionError::Workload(
+                    novarocks_workload_control::WorkError::ArithmeticOverflow,
+                )
+            })
+    }
+    arc::<CreateTaskBody>()?
+        .checked_add(arc::<FrozenCreationParts>()?)
+        .ok_or(TaskExecutionError::Workload(
+            novarocks_workload_control::WorkError::ArithmeticOverflow,
+        ))
 }
 
 #[cfg(test)]
@@ -691,7 +917,11 @@ pub(crate) mod tests {
                 max: 4,
                 requires_power_of_two: false,
             },
-            Some((2, 20)),
+            Some((
+                2,
+                20,
+                novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+            )),
             0,
         )
     }

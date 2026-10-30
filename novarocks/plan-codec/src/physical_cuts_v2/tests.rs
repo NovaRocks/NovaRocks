@@ -822,7 +822,7 @@ fn normalized_occurrence_copies_share_complete_binding_and_count_only_cut_contai
         panic!("normalized Struct")
     };
     assert_eq!(fields[0].name(), "雪");
-    assert_eq!(fields[0].metadata().capacity(), 0);
+    assert!(fields[0].metadata().as_arc().is_none());
     assert_eq!(field.metadata()["tag"], "exact");
 }
 

@@ -79,7 +79,7 @@ fn extent_mul(a: usize, b: usize) -> Result<usize, ScalarResourceError> {
     a.checked_mul(b).ok_or(ScalarResourceError::Arithmetic)
 }
 
-/// Conservative private Bytes Arc header upper for the pinned Arrow 58.4.0
+/// Conservative private Bytes Arc header upper for the pinned Arrow 60.1.0
 /// immutable Buffer constructor; it excludes payload and custom custodians.
 /// Its private Bytes contains pointer, length and the three-word Deallocation
 /// (Arrow's own alloc::tests::test_size_of_deallocation proves that bound).
@@ -199,7 +199,7 @@ fn custody_metadata_with_backing(
     Ok(bytes)
 }
 
-/// Include the actual indexed Union table allocated by Arrow 58.2.0's
+/// Include the actual indexed Union table allocated by Arrow 60.1.0's
 /// UnionArray::from(ArrayData), rather than counting only populated children.
 /// This is metadata construction/retention, not payload or a host grant.
 pub(crate) fn custody_typed_node_metadata_upper_bound(

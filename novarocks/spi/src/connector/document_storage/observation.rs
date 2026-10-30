@@ -453,6 +453,62 @@ pub trait ConnectorDocumentStorageObservation: Send + Sync {
         &self,
         request: super::KeyedDocumentObservationRequest,
     ) -> Result<super::FullKeyedDocumentView, super::KeyedDocumentReadError>;
+    fn observe_keyed_documents_async(
+        &self,
+        _request: super::KeyedDocumentObservationRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<super::KeyedDocumentView, super::KeyedDocumentReadError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "document observation capability has no asynchronous keyed observation",
+            )
+            .into())
+        })
+    }
+    fn observe_full_keyed_documents_async(
+        &self,
+        _request: super::KeyedDocumentObservationRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<super::FullKeyedDocumentView, super::KeyedDocumentReadError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "document observation capability has no asynchronous full keyed observation",
+            )
+            .into())
+        })
+    }
+    fn resolve_keyed_commit_async(
+        &self,
+        _request: super::KeyedDocumentObservationRequest,
+        _evidence: super::UnknownCommitEvidence,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<super::CommitConclusion, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "document observation capability has no asynchronous commit resolution",
+            ))
+        })
+    }
     fn decode_keyed_slot_change_evidence(
         &self,
         request: super::KeyedDocumentObservationRequest,

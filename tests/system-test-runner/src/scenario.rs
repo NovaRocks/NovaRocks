@@ -366,6 +366,10 @@ impl ScenarioContext {
         self.handle.effective_launch_config_evidence()
     }
 
+    pub fn trino_port(&self) -> u16 {
+        self.handle.runtime().fe_trino_port
+    }
+
     pub fn mysql_port(&self) -> u16 {
         self.handle.runtime().fe_mysql_port
     }

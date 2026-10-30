@@ -38,9 +38,10 @@ use crate::api::{
 
 use super::{
     AdmissionIssueDisposition, AdmissionIssueReceipt, AdmissionIssueSettlement,
-    AttemptActivationIdentity, EstablishIssuePermit, LogicalExecutionActorError,
-    RunningAttemptDriveAuthority, RunningAttemptPermit,
+    EstablishIssuePermit, LogicalExecutionActorError, RunningAttemptDriveAuthority,
+    RunningAttemptPermit,
 };
+use novarocks_coordination_contract::AttemptActivationIdentity;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AttemptScheduleError(Arc<str>);
@@ -325,55 +326,98 @@ pub(crate) fn build_attempt_schedule(
         ));
     }
 
-    #[derive(Clone, Copy)]
-    struct IncomingEdge {
-        source: u32,
-        gather: bool,
-        hash_partitioned: bool,
-    }
-    let mut incoming = BTreeMap::<u32, Vec<IncomingEdge>>::new();
+    // Placement and row partitioning answer different questions. Evaluate
+    // each frozen stage policy against this one retained backend snapshot.
+    let mut predecessors = BTreeMap::<u32, BTreeSet<u32>>::new();
+    let mut gathers = BTreeSet::new();
+    let positions = plan
+        .topological_fragment_order
+        .iter()
+        .enumerate()
+        .map(|(position, &fragment)| (fragment, position))
+        .collect::<BTreeMap<_, _>>();
     for edge in &plan.edges {
-        incoming
+        let source = positions.get(&edge.source_fragment_id);
+        let target = positions.get(&edge.target_fragment_id);
+        if !matches!((source, target), (Some(source), Some(target)) if source < target) {
+            return Err(AttemptScheduleError::new(
+                "scheduling edge violates the exact topological fragment order",
+            ));
+        }
+        predecessors
             .entry(edge.target_fragment_id)
             .or_default()
-            .push(IncomingEdge {
-                source: edge.source_fragment_id,
-                gather: edge.stream_kind == SchedulingStreamKind::Gather,
-                hash_partitioned: edge.hash_partitioned,
-            });
+            .insert(edge.source_fragment_id);
+        if edge.stream_kind == SchedulingStreamKind::Gather {
+            gathers.insert(edge.target_fragment_id);
+        }
     }
 
+    use novarocks_physical_plan::StagePlacementPolicy;
+    let anchor = fragments_by_id
+        .get(&plan.execution_anchor_fragment_id)
+        .ok_or_else(|| AttemptScheduleError::new("scheduling execution anchor is absent"))?;
+    if anchor.placement != StagePlacementPolicy::Singleton {
+        return Err(AttemptScheduleError::new(
+            "scheduling execution anchor must declare singleton placement",
+        ));
+    }
     let backend_count = backends.len();
     let mut counts = BTreeMap::<u32, usize>::new();
     for &fragment_id in &plan.topological_fragment_order {
-        let fragment = fragments_by_id.get(&fragment_id).ok_or_else(|| {
-            AttemptScheduleError::new(format!("scheduling fragment {fragment_id} is missing"))
-        })?;
-        let has_gather = incoming
-            .get(&fragment_id)
-            .is_some_and(|edges| edges.iter().any(|edge| edge.gather));
-        let count = if has_gather {
-            1
-        } else if !fragment.scans.is_empty() {
-            scan_fragment_parallelism(&fragment.scans, backend_count)
-        } else {
-            incoming
-                .get(&fragment_id)
-                .into_iter()
-                .flatten()
-                .filter(|edge| edge.hash_partitioned)
-                .filter_map(|edge| counts.get(&edge.source).copied())
-                .max()
-                .unwrap_or(1)
+        let fragment = fragments_by_id[&fragment_id];
+        if gathers.contains(&fragment_id) && fragment.placement != StagePlacementPolicy::Singleton {
+            return Err(AttemptScheduleError::new(
+                "gather input conflicts with the declared stage placement",
+            ));
+        }
+        let count = match &fragment.placement {
+            StagePlacementPolicy::Singleton => 1,
+            StagePlacementPolicy::ScanWork => {
+                if fragment.scans.is_empty() {
+                    return Err(AttemptScheduleError::new(
+                        "scan-work placement requires a declared scan",
+                    ));
+                }
+                scan_fragment_parallelism(&fragment.scans, backend_count)
+            }
+            StagePlacementPolicy::Spread { max_instances } => {
+                max_instances.map_or(backend_count, |cap| backend_count.min(cap.get() as usize))
+            }
+            StagePlacementPolicy::FollowSources { sources } => {
+                if sources.is_empty() || sources.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return Err(AttemptScheduleError::new(
+                        "placement sources must be nonempty and strictly ordered",
+                    ));
+                }
+                let mut width = 1;
+                for source in sources {
+                    let source = source.get();
+                    if !predecessors
+                        .get(&fragment_id)
+                        .is_some_and(|set| set.contains(&source))
+                    {
+                        return Err(AttemptScheduleError::new(
+                            "placement source is not an actual predecessor",
+                        ));
+                    }
+                    let source_width = counts.get(&source).ok_or_else(|| {
+                        AttemptScheduleError::new("placement source has not been scheduled")
+                    })?;
+                    width = width.max(*source_width);
+                }
+                width
+            }
         };
+        for scan in &fragment.scans {
+            if scan.scan.fragment_id() != fragment_id {
+                return Err(AttemptScheduleError::new(
+                    "scan work belongs to a different fragment",
+                ));
+            }
+        }
         counts.insert(fragment_id, count);
     }
-    if !counts.contains_key(&plan.execution_anchor_fragment_id) {
-        return Err(AttemptScheduleError::new(
-            "scheduling execution anchor is absent",
-        ));
-    }
-    counts.insert(plan.execution_anchor_fragment_id, 1);
 
     let preferred = (execution.query_id().low() as usize) % backend_count;
     #[cfg(novarocks_dev_controls)]
@@ -431,6 +475,78 @@ pub(crate) fn build_attempt_schedule(
     Ok(AttemptSchedule {
         execution,
         fragments: scheduled.into_boxed_slice(),
+        edges: edges.into_boxed_slice(),
+        contexts: contexts.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+        root,
+    })
+}
+
+/// Explicit finite protocol placements, without applying the production planner's
+/// parallelism policy. The real edge author still validates every exchange.
+#[cfg(novarocks_dev_controls)]
+pub(crate) fn protocol_fixture_schedule(
+    execution: QueryExecutionId,
+    frontend: FrontendProcessId,
+    plan: &ExecutionSchedulingFacts,
+    placements: &BTreeMap<u32, Vec<BackendProcessId>>,
+) -> Result<AttemptSchedule, AttemptScheduleError> {
+    let facts = plan
+        .fragments
+        .iter()
+        .map(|f| (f.fragment_id, f))
+        .collect::<BTreeMap<_, _>>();
+    if facts.keys().copied().collect::<BTreeSet<_>>() != placements.keys().copied().collect() {
+        return Err(AttemptScheduleError::new(
+            "protocol fixture placement fragments differ from its declared DAG",
+        ));
+    }
+    let mut fragments = Vec::new();
+    let mut contexts = BTreeSet::new();
+    let mut next_task = 1_u32;
+    for (stage_index, (&fragment_id, backends)) in placements.iter().enumerate() {
+        let stage =
+            StageId::new(u32::try_from(stage_index + 1).map_err(|_| {
+                AttemptScheduleError::new("protocol fixture stage space exhausted")
+            })?)
+            .map_err(|error| AttemptScheduleError::new(error.to_string()))?;
+        if backends.is_empty() {
+            return Err(AttemptScheduleError::new(
+                "protocol fixture fragment has no placement",
+            ));
+        }
+        let mut tasks = Vec::new();
+        for (instance_index, &backend) in backends.iter().enumerate() {
+            let id = TaskId::new(next_task)
+                .map_err(|error| AttemptScheduleError::new(error.to_string()))?;
+            next_task = next_task.checked_add(1).ok_or_else(|| {
+                AttemptScheduleError::new("protocol fixture task space exhausted")
+            })?;
+            let context = QueryContextRef::new(execution, frontend, backend);
+            contexts.insert(context);
+            tasks.push(ScheduledTask {
+                identity: TaskIdentity::new(execution, stage, id, backend),
+                context,
+                instance_index,
+                scan_work: Box::new([]),
+            });
+        }
+        assign_scan_work(&facts[&fragment_id].scans, &mut tasks)?;
+        fragments.push(ScheduledFragment {
+            fragment_id,
+            stage_id: stage,
+            tasks: tasks.into_boxed_slice(),
+        });
+    }
+    let root = fragments
+        .iter()
+        .find(|f| f.fragment_id == plan.execution_anchor_fragment_id)
+        .and_then(|f| f.tasks.first())
+        .map(|t| t.identity)
+        .ok_or_else(|| AttemptScheduleError::new("protocol fixture root has no placement"))?;
+    let edges = schedule_edges(plan, &fragments)?;
+    Ok(AttemptSchedule {
+        execution,
+        fragments: fragments.into_boxed_slice(),
         edges: edges.into_boxed_slice(),
         contexts: contexts.into_iter().collect::<Vec<_>>().into_boxed_slice(),
         root,
@@ -633,6 +749,20 @@ impl NativeAttemptDrive {
         self.authority.identity()
     }
 
+    /// Ask the current logical owner whether this exact refusal may wait for
+    /// independent process-replacement evidence within its ORIGINAL horizon.
+    /// A positive answer grants no retry, topology, terminal, or exit authority;
+    /// callers must ask again before continuing a pending observation. Refusal
+    /// or a stale drive leaves the original failure unchanged.
+    pub async fn may_observe_pre_ready_replacement(
+        &self,
+        refusal: &crate::execution_error::ExecutionFailureInput,
+    ) -> Result<bool, LogicalExecutionActorError> {
+        self.authority
+            .may_observe_pre_ready_replacement(refusal)
+            .await
+    }
+
     pub async fn begin_admission_issue(
         &self,
         request: AcquireQueryContextAdmissionTicket,
@@ -670,6 +800,10 @@ impl NativeAttemptDrive {
 
 #[cfg(test)]
 mod tests {
+    mod placement {
+        use super::*;
+        include!("schedule_placement_tests.rs");
+    }
     use super::*;
     use crate::api::{FragmentSchedulingFacts, PlanSeal, SchedulingEdgeFacts};
     use novarocks_types::identity::{AttemptId, QueryId};
@@ -727,6 +861,25 @@ mod tests {
             Ok(None),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn empty_eligible_backend_set_refuses_distributed_scheduling() {
+        let error = build_attempt_schedule(
+            execution(1),
+            FrontendProcessId::new_v7(),
+            &[],
+            &scan_edge_inputs(NativeScanWork::RuntimeSplits {
+                placement: RuntimeSplitPlacement::Spread,
+            }),
+            #[cfg(novarocks_dev_controls)]
+            Ok(None),
+        )
+        .expect_err("distributed scheduling requires an eligible backend");
+        assert_eq!(
+            error.to_string(),
+            "attempt scheduling requires at least one eligible backend",
+        );
     }
 
     #[test]

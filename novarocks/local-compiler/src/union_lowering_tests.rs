@@ -165,8 +165,12 @@ fn fixture(case: Case) -> Fixture {
     let union = NodeId::new(41);
     let mut builder = FragmentBuilder::new(fragment_id);
     let nested_field = Arc::new(
-        Field::new("original-nested", DataType::Utf8, true)
-            .with_metadata([("owner".to_owned(), "kept".to_owned())].into()),
+        Field::new("original-nested", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "owner".to_owned(),
+                "kept".to_owned(),
+            )]),
+        ),
     );
     let mut branch_nodes = [left, right];
     let mut branch_values: [Vec<ValueId>; 2] = [vec![], vec![]];

@@ -137,13 +137,31 @@ pub enum CommandErrorKind {
     EffectUnknown,
 }
 
+/// Knowledge of an original statement's external effect. This is independent
+/// of provider identity, domain receipts, failure cause, and actual exit.
+/// None at the observation boundary means no effect fact has been supplied;
+/// it must not be interpreted as evidence of non-commit or safe retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatementExternalEffectDisposition {
+    KnownUncommitted,
+    CommitUnknown,
+    KnownCommitted,
+}
+impl StatementExternalEffectDisposition {
+    pub const fn do_not_retry(self) -> bool {
+        matches!(self, Self::CommitUnknown | Self::KnownCommitted)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandError {
+    failure_cause: Option<novarocks_failure_contract::SharedFailureCause>,
     kind: CommandErrorKind,
     message: Arc<str>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
     execution_failure: Option<crate::execution_error::ExecutionFailureInput>,
-    publication_disposition: Option<novarocks_spi::connector::LakePublicationDisposition>,
+    user_error: Option<novarocks_user_error::UserError>,
+    external_effect_disposition: Option<StatementExternalEffectDisposition>,
 }
 
 impl CommandError {
@@ -153,30 +171,56 @@ impl CommandError {
             message: message.into(),
             compile_control: None,
             execution_failure: None,
-            publication_disposition: None,
+            user_error: None,
+            external_effect_disposition: None,
+            failure_cause: None,
         }
     }
 
-    /// An existing maintenance publication owner's verdict, independent of
-    /// the selected execution cause; it creates no publication identity.
-    pub fn with_publication_disposition(
+    /// The original action's external effect, independent of the selected
+    /// failure cause. This creates no domain identity or receipt.
+    pub fn with_external_effect_disposition(
         mut self,
-        disposition: Option<novarocks_spi::connector::LakePublicationDisposition>,
+        disposition: Option<StatementExternalEffectDisposition>,
     ) -> Self {
-        self.publication_disposition = disposition;
+        self.external_effect_disposition = disposition;
         self
     }
 
-    pub fn publication_disposition(
-        &self,
-    ) -> Option<novarocks_spi::connector::LakePublicationDisposition> {
-        self.publication_disposition
+    pub fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
+        self.external_effect_disposition
+    }
+
+    pub fn from_failure_cause(cause: novarocks_failure_contract::SharedFailureCause) -> Self {
+        let service = crate::session_error::QueryServiceError::from_failure_cause(cause.clone());
+        let mut error = Self::from_execution_failure(
+            service
+                .execution_failure()
+                .expect("same selected domain fact")
+                .clone(),
+        );
+        error.failure_cause = Some(cause);
+        error
+    }
+    pub fn failure_cause(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.failure_cause.as_ref()
     }
 
     pub fn from_execution_failure(input: crate::execution_error::ExecutionFailureInput) -> Self {
         let mut error = Self::new(CommandErrorKind::Failed, input.user_error().to_string());
         error.execution_failure = Some(input);
         error
+    }
+
+    /// Preserve a domain-authored descriptor without reducing it to Display.
+    pub fn from_user_error(error: novarocks_user_error::UserError) -> Self {
+        let mut failure = Self::new(CommandErrorKind::Failed, error.to_string());
+        failure.user_error = Some(error);
+        failure
+    }
+
+    pub fn user_error(&self) -> Option<&novarocks_user_error::UserError> {
+        self.user_error.as_ref()
     }
 
     pub fn execution_failure(&self) -> Option<&crate::execution_error::ExecutionFailureInput> {
@@ -223,13 +267,30 @@ impl fmt::Display for CommandError {
 
 impl Error for CommandError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.compile_control
+        self.failure_cause
             .as_ref()
             .map(|cause| cause as &dyn Error)
+            .or_else(|| {
+                self.compile_control
+                    .as_ref()
+                    .map(|cause| cause as &dyn Error)
+            })
     }
 }
 
 pub trait CatalogCommandConsumer: Send + Sync + 'static {
+    fn prepare_statement_action(
+        &self,
+        _command: CatalogSqlCommand,
+        _request_context: RequestContext,
+        _command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, CommandError> {
+        Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "catalog consumer does not provide a governed statement action",
+        ))
+    }
+
     fn execute(
         &self,
         command: CatalogSqlCommand,
@@ -239,6 +300,18 @@ pub trait CatalogCommandConsumer: Send + Sync + 'static {
 }
 
 pub trait StatisticsCommandConsumer: Send + Sync + 'static {
+    fn prepare_statement_action(
+        &self,
+        _command: StatisticsSqlCommand,
+        _request_context: RequestContext,
+        _command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, CommandError> {
+        Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "statistics consumer does not provide a governed statement action",
+        ))
+    }
+
     fn execute(
         &self,
         command: StatisticsSqlCommand,
@@ -248,6 +321,20 @@ pub trait StatisticsCommandConsumer: Send + Sync + 'static {
 }
 
 pub trait MaintenanceCommandConsumer: Send + Sync + 'static {
+    /// Prepare a move-only action for the original registered statement source.
+    /// Construction performs no physical dispatch and creates no Work owner.
+    fn prepare_statement_action(
+        &self,
+        _command: MaintenanceSqlCommand,
+        _request_context: RequestContext,
+        _command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, CommandError> {
+        Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "maintenance consumer does not provide a governed statement action",
+        ))
+    }
+
     fn execute(
         &self,
         command: MaintenanceSqlCommand,
@@ -276,12 +363,14 @@ impl MaterializedViewCommand {
 /// statement and immutable admission contexts; role composition supplies the
 /// adapter that owns Connector and query-execution capabilities.
 pub trait MaterializedViewCommandConsumer: Send + Sync + 'static {
-    fn execute(
+    /// Prepare the original asynchronous action for a parser-admitted MV statement.
+    /// The caller retains the existing statement admission and supervision.
+    fn prepare_statement_action(
         &self,
-        command: &MaterializedViewCommand,
-        context: &RequestContext,
-        command_context: &CommandContext,
-    ) -> Result<QuerySessionOutput, CommandError>;
+        command: MaterializedViewCommand,
+        context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, CommandError>;
 }
 
 #[cfg(test)]
@@ -320,7 +409,13 @@ mod tests {
             4_096,
         )
         .unwrap();
-        let statement_token = StatementToken::new(SessionToken::new(7, 11), 13);
+        let statement_token = StatementToken::new(
+            SessionToken::new(
+                crate::session_control::ClientSessionKey::new((7_u64 << 32) | 11_u64)
+                    .expect("nonzero fixture session"),
+            ),
+            13,
+        );
         let context = CommandContext::new(
             expected_scope.clone(),
             connector_context,
@@ -380,7 +475,13 @@ mod tests {
                     4096,
                 )
                 .unwrap(),
-                StatementToken::new(SessionToken::new(7, 11), 13),
+                StatementToken::new(
+                    SessionToken::new(
+                        crate::session_control::ClientSessionKey::new((7_u64 << 32) | 11_u64)
+                            .expect("nonzero fixture session"),
+                    ),
+                    13,
+                ),
                 "test-principal",
             )
         };

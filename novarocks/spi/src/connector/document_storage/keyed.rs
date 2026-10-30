@@ -680,6 +680,26 @@ impl std::error::Error for KeyedDocumentReadError {
     }
 }
 
+/// The keyed-document codec authors this format rejection. It is not a
+/// compiled-plan capability or a synthetic Connector operation failure.
+pub const LEGACY_KEYED_DOCUMENT_FORMAT: std::num::NonZeroU16 =
+    std::num::NonZeroU16::new(916).unwrap();
+
+impl novarocks_failure_contract::FailureProjection for KeyedDocumentReadError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        match self {
+            Self::Invalid(error) => {
+                novarocks_failure_contract::FailureProjection::failure_fact(error)
+            }
+            Self::LegacyFormat { .. } => FailureFact::new(
+                FailureClass::Unsupported,
+                FailureReason::new(domain::METADATA, LEGACY_KEYED_DOCUMENT_FORMAT),
+            ),
+        }
+    }
+}
+
 impl KeyedDocumentView {
     pub fn validate_for(
         &self,
@@ -859,5 +879,53 @@ mod tests {
             }
             .is_empty()
         );
+    }
+
+    #[test]
+    fn invalid_keyed_read_delegates_the_actual_connector_fact() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        let connector = ConnectorError::compile_interruption(
+            novarocks_type_contract::CompileControlError::Cancelled,
+        );
+        let original = std::error::Error::source(&connector)
+            .and_then(|source| source.downcast_ref::<SharedFailureCause>())
+            .unwrap()
+            .clone();
+        let expected = connector.failure_fact();
+        let keyed = KeyedDocumentReadError::Invalid(connector);
+        assert_eq!(keyed.failure_fact(), expected);
+        let actual = std::error::Error::source(&keyed)
+            .unwrap()
+            .downcast_ref::<ConnectorError>()
+            .unwrap();
+        assert_eq!(
+            std::error::Error::source(actual)
+                .and_then(|source| source.downcast_ref::<SharedFailureCause>()),
+            Some(&original),
+        );
+        assert_eq!(actual.failure_fact(), original.failure_fact());
+    }
+
+    #[test]
+    fn legacy_keyed_format_authors_its_own_unsupported_metadata_fact() {
+        use novarocks_failure_contract::{
+            FailureClass, FailureProjection, SharedFailureCause, domain,
+        };
+        let legacy = KeyedDocumentReadError::LegacyFormat {
+            key: "original-legacy-key".into(),
+        };
+        let fact = legacy.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Unsupported);
+        assert_eq!(fact.reason().domain(), domain::METADATA.get());
+        assert_eq!(fact.reason().code(), LEGACY_KEYED_DOCUMENT_FORMAT.get());
+        let cause = SharedFailureCause::new(legacy.clone());
+        assert_eq!(cause.failure_fact(), fact);
+        assert_eq!(
+            cause.downcast_ref::<KeyedDocumentReadError>(),
+            Some(&legacy)
+        );
+        assert_eq!(cause.clone(), cause);
+        assert!(cause.detail().contains("original-legacy-key"));
+        assert!(cause.downcast_ref::<ConnectorError>().is_none());
     }
 }

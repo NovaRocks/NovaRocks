@@ -22,7 +22,7 @@
 //! It carries no physical plan. The static plan travels as its own immutable
 //! carrier, which only the backend that wins a task's creation decodes; see
 //! [`crate::creation`].
-// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
+// Design: ADR-0161 (docs/adr/ADR-0161-pure-local-programs-and-supervised-task-lifecycle.md)
 
 use std::num::{NonZeroU32, NonZeroUsize};
 

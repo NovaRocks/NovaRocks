@@ -2,6 +2,8 @@
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:PROJECT [id, score] stats={rows=2}
   1:PROJECT [id, score] stats={rows=2}
@@ -9,6 +11,8 @@ PLAN FRAGMENT 0
       3:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 3
@@ -24,11 +28,15 @@ PLAN FRAGMENT 1
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:TOP-N (limit=2, offset=0) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=2}
   1:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 1

@@ -12,6 +12,8 @@ RUNTIME FILTER GRAPH
     consumer binding 3, fragment = 1, node = 4, expr = (a.v), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:PROJECT [count(*)] stats={rows=1}
   1:HASH AGGREGATE (GLOBAL) stats={rows=1}
@@ -19,6 +21,8 @@ PLAN FRAGMENT 0
     2:GATHER stats={rows=1}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 2
@@ -38,6 +42,8 @@ PLAN FRAGMENT 1
     10:BROADCAST EXCHANGE stats={rows=2}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 9
@@ -49,6 +55,8 @@ PLAN FRAGMENT 2
      predicates: a.k IS NOT NULL AND a.v IS NOT NULL
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 10
@@ -64,6 +72,8 @@ PLAN FRAGMENT 3
       16:BROADCAST EXCHANGE stats={rows=2}
 PLAN FRAGMENT 4
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 16
@@ -82,6 +92,8 @@ RUNTIME FILTER GRAPH
     consumer binding 1, fragment = 1, node = 5, expr = (p.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:PROJECT [count(*)] stats={rows=1}
   1:HASH AGGREGATE (GLOBAL) stats={rows=1}
@@ -89,6 +101,8 @@ PLAN FRAGMENT 0
     2:GATHER stats={rows=1}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 2
@@ -104,6 +118,8 @@ PLAN FRAGMENT 1
     6:BROADCAST EXCHANGE stats={rows=3}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 6

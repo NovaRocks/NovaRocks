@@ -125,23 +125,6 @@ pub(crate) struct SearchStats {
     pub(crate) lookup_miss_rows: u64,
 }
 
-impl SearchStats {
-    pub(crate) fn from_group_ids(group_ids: &[Option<usize>]) -> Self {
-        let mut stats = Self {
-            lookup_hit_rows: 0,
-            lookup_miss_rows: 0,
-        };
-        for group_id in group_ids {
-            if group_id.is_some() {
-                stats.lookup_hit_rows += 1;
-            } else {
-                stats.lookup_miss_rows += 1;
-            }
-        }
-        stats
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProbeMask {
     keep: Vec<bool>,
@@ -284,13 +267,5 @@ mod tests {
         assert!(stopped);
         assert_eq!(selection.probe, vec![1, 1, 1, 2, 2]);
         assert_eq!(selection.build, vec![10, 11, 12, 10, 11]);
-    }
-
-    #[test]
-    fn search_stats_counts_hits_and_misses() {
-        let stats = SearchStats::from_group_ids(&[Some(0), None, Some(3), None]);
-
-        assert_eq!(stats.lookup_hit_rows, 2);
-        assert_eq!(stats.lookup_miss_rows, 2);
     }
 }

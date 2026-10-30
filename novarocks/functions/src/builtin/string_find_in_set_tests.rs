@@ -106,7 +106,10 @@ fn pool(array: ArrayRef) -> ConstantPool {
         Arc::new(
             ty.try_to_field("original")
                 .unwrap()
-                .with_metadata([("source-note".into(), "kept selected backing".into())].into()),
+                .with_metadata(std::collections::HashMap::<String, String>::from([(
+                    "source-note".into(),
+                    "kept selected backing".into(),
+                )])),
         ),
         ty,
         array.to_data(),

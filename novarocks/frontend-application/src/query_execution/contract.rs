@@ -15,25 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Core-owned distributed-query request contract.
+//! Resolved Native execution options and typed Frontend execution failures.
 
 use std::fmt;
-use std::sync::Arc;
-use std::time::Instant;
 
-use crate::query_execution::artifact::{
-    PreparedDistributedAttemptTemplate, PreparedDistributedQuery,
-};
-use crate::query_execution::outcome::{DistributedQueryOutcome, QueryOutcomeFactory};
-use crate::query_execution::statistics::StatisticsCollectionProgram;
 use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
-use novarocks_query_application::cancellation::QueryCancellationView;
-use novarocks_query_application::preparation::FrozenExecutionDescription;
-use novarocks_types::BackendProcessId;
 
 /// Query options resolved by core before ownership crosses into frontend.
 ///
@@ -190,402 +180,12 @@ impl RuntimeFilterLifecycleView {
     }
 }
 
-/// The engine-visible purpose of a distributed execution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DistributedQueryIntent {
-    #[cfg(test)]
-    Result,
-    /// Signed bounded selection, validated before external COW write admission.
-    CowMatch,
-    Write,
-    Profile,
-    /// Internal collection execution. Its completion carries typed evidence,
-    /// never a `QueryResult` that could be returned as user MySQL rows.
-    Statistics,
-}
-
-/// An owned request passed from core to the injected execution coordinator.
-///
-/// Every field is private so role crates cannot assemble a request from
-/// unrelated prepared/native artifacts or replace its cancellation/completion
-/// capabilities.
-pub struct DistributedQueryRequest {
-    #[cfg(novarocks_dev_controls)]
-    test_statement_nomination:
-        Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
-    result_capacity:
-        Option<novarocks_query_application::admitted_query_context::QueryResultCapacityBinding>,
-    cow_match: Option<crate::query_execution::row_mutation::CowMatchRootConsumer>,
-    payload: DistributedQueryPayload,
-    topology: novarocks_query_application::api::BackendTopologySnapshot,
-    deadline: Option<Instant>,
-    cancellation: QueryCancellationView,
-    completion: QueryOutcomeFactory,
-    write_root_decode_contract:
-        Option<crate::query_execution::write_result::RootWriteDecodeContract>,
-    statistics_program: Option<StatisticsCollectionProgram>,
-    // Last: the original COW session outlives every request-owned payload.
-    write_stack_session: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
-}
-
-enum DistributedQueryPayload {
-    RestartableRead(Arc<RestartableReadExecution>),
-    SingleUse {
-        description: Arc<FrozenExecutionDescription>,
-        artifacts: PreparedDistributedQuery,
-        options: Arc<ResolvedQueryOptions>,
-    },
-}
-
-/// Closed, immutable source for every legacy coordinator round of one
-/// restartable read.
-///
-/// The frozen description, static native template, Connector access recipes,
-/// resolved options and result intent are created together by the sole
-/// finalizer. This carrier deliberately does not pretend to be an executable
-/// query-application request: that move-only request can be created only when
-/// the production Native adapter also supplies its exact seed.
-pub(crate) struct RestartableReadExecution {
-    description: Arc<FrozenExecutionDescription>,
-    attempt_template: PreparedDistributedAttemptTemplate,
-    options: Arc<ResolvedQueryOptions>,
-    intent: DistributedQueryIntent,
-}
-
-impl RestartableReadExecution {
-    pub(crate) fn instantiate_attempt(
-        self: &Arc<Self>,
-        execution: &QueryExecutionContext,
-    ) -> DistributedQueryRequest {
-        DistributedQueryRequest {
-            #[cfg(novarocks_dev_controls)]
-            test_statement_nomination: execution.test_statement_nomination().cloned(),
-            result_capacity: execution.result_capacity().cloned(),
-            cow_match: None,
-            payload: DistributedQueryPayload::RestartableRead(Arc::clone(self)),
-            topology: execution.topology().clone(),
-            deadline: execution.deadline(),
-            cancellation: execution.cancellation().clone(),
-            completion: QueryOutcomeFactory::new(self.intent),
-            write_stack_session: None,
-            write_root_decode_contract: None,
-            statistics_program: None,
-        }
-    }
-}
-
-impl DistributedQueryRequest {
-    pub(crate) fn with_cow_match_consumer(
-        mut self,
-        consumer: crate::query_execution::row_mutation::CowMatchRootConsumer,
-    ) -> Result<Self, DistributedQueryError> {
-        if self.intent() != DistributedQueryIntent::CowMatch || self.cow_match.is_some() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "COW match consumer requires its dedicated single-use intent",
-            ));
-        }
-        self.cow_match = Some(consumer);
-        Ok(self)
-    }
-
-    pub fn intent(&self) -> DistributedQueryIntent {
-        self.completion.intent()
-    }
-
-    pub fn options(&self) -> &ResolvedQueryOptions {
-        match &self.payload {
-            DistributedQueryPayload::RestartableRead(read) => read.options.as_ref(),
-            DistributedQueryPayload::SingleUse { options, .. } => options.as_ref(),
-        }
-    }
-
-    pub fn topology(&self) -> &novarocks_query_application::api::BackendTopologySnapshot {
-        &self.topology
-    }
-
-    pub const fn deadline(&self) -> Option<Instant> {
-        self.deadline
-    }
-
-    fn write_root_targets(
-        &self,
-    ) -> Option<&[novarocks_spi::connector::write_stack::WriteTargetOrdinal]> {
-        match &self.payload {
-            DistributedQueryPayload::RestartableRead(_) => None,
-            DistributedQueryPayload::SingleUse { artifacts, .. } => artifacts.write_root_targets(),
-        }
-    }
-
-    /// Return the closed capability for replacement attempts when this logical
-    /// execution's frozen recovery policy permits them.
-    pub(crate) fn restartable_read(&self) -> Option<Arc<RestartableReadExecution>> {
-        match &self.payload {
-            DistributedQueryPayload::RestartableRead(read) => Some(Arc::clone(read)),
-            DistributedQueryPayload::SingleUse { .. } => None,
-        }
-    }
-
-    pub fn into_parts(self) -> DistributedQueryRequestParts {
-        let (description, artifacts, options) = match self.payload {
-            DistributedQueryPayload::RestartableRead(read) => (
-                Arc::clone(&read.description),
-                read.attempt_template.instantiate(),
-                Arc::clone(&read.options),
-            ),
-            DistributedQueryPayload::SingleUse {
-                description,
-                artifacts,
-                options,
-            } => (description, artifacts, options),
-        };
-        DistributedQueryRequestParts {
-            #[cfg(novarocks_dev_controls)]
-            test_statement_nomination: self.test_statement_nomination,
-            result_capacity: self.result_capacity,
-            cow_match: self.cow_match,
-            description,
-            artifacts,
-            options,
-            topology: self.topology,
-            cancellation: self.cancellation,
-            completion: self.completion,
-            write_stack_session: self.write_stack_session,
-            write_root_decode_contract: self.write_root_decode_contract,
-            statistics_program: self.statistics_program,
-        }
-    }
-}
-
-/// Consuming frontend handoff. There is deliberately no constructor,
-/// `Clone`, or inverse recombination API.
-pub struct DistributedQueryRequestParts {
-    #[cfg(novarocks_dev_controls)]
-    pub(crate) test_statement_nomination:
-        Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
-    pub(crate) result_capacity:
-        Option<novarocks_query_application::admitted_query_context::QueryResultCapacityBinding>,
-    pub(crate) cow_match: Option<crate::query_execution::row_mutation::CowMatchRootConsumer>,
-    pub description: Arc<FrozenExecutionDescription>,
-    pub artifacts: PreparedDistributedQuery,
-    pub options: Arc<ResolvedQueryOptions>,
-    pub topology: novarocks_query_application::api::BackendTopologySnapshot,
-    pub cancellation: QueryCancellationView,
-    pub completion: QueryOutcomeFactory,
-    pub(crate) write_root_decode_contract:
-        Option<crate::query_execution::write_result::RootWriteDecodeContract>,
-    pub statistics_program: Option<StatisticsCollectionProgram>,
-    pub(crate) write_stack_session:
-        Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
-}
-
-fn validate_completed_runtime_options(
-    description: &FrozenExecutionDescription,
-    options: &ResolvedQueryOptions,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<(), DistributedQueryError> {
-    description
-        .validate_legacy_intrinsic_allow_throw_exception(
-            options.runtime_options().allow_throw_exception,
-            control,
-        )
-        .map_err(DistributedQueryError::from_compile)
-}
-
-pub(crate) fn build_request_from_finalized_execution(
-    finalized: crate::query_execution::post_compile::FinalizedDistributedExecution,
-    options: Option<QueryOptions>,
-    intent: DistributedQueryIntent,
-    execution: &QueryExecutionContext,
-    statistics_program: Option<StatisticsCollectionProgram>,
-) -> Result<DistributedQueryRequest, DistributedQueryError> {
-    if (intent == DistributedQueryIntent::Statistics) != statistics_program.is_some() {
-        return Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::ContractViolation,
-            "statistics intent and typed StatisticsCollectionProgram must be present together",
-        ));
-    }
-    let (description, attempt_template) = finalized.into_parts();
-    let description = Arc::new(description);
-    let options = Arc::new(ResolvedQueryOptions::from_upstream(options));
-    let control = crate::query_execution::planning::sql_compile_control_from_execution(execution);
-    validate_completed_runtime_options(&description, &options, &control)?;
-    let restartable_read_intent = match intent {
-        DistributedQueryIntent::Profile => true,
-        #[cfg(test)]
-        DistributedQueryIntent::Result => true,
-        _ => false,
-    };
-    let restartable_read = restartable_read_intent && description.kind()
-        == novarocks_query_application::api::QueryExecutionKind::Read
-        && description.recovery()
-            == novarocks_query_application::coordination::RecoveryMode::RestartAttemptBeforeVisibility;
-    let payload = if restartable_read {
-        DistributedQueryPayload::RestartableRead(Arc::new(RestartableReadExecution {
-            description,
-            attempt_template,
-            options,
-            intent,
-        }))
-    } else {
-        DistributedQueryPayload::SingleUse {
-            description,
-            artifacts: attempt_template.instantiate(),
-            options,
-        }
-    };
-    Ok(DistributedQueryRequest {
-        #[cfg(novarocks_dev_controls)]
-        test_statement_nomination: execution.test_statement_nomination().cloned(),
-        result_capacity: execution.result_capacity().cloned(),
-        cow_match: None,
-        payload,
-        topology: execution.topology().clone(),
-        deadline: execution.deadline(),
-        cancellation: execution.cancellation().clone(),
-        completion: QueryOutcomeFactory::new(intent),
-        write_stack_session: None,
-        write_root_decode_contract: None,
-        statistics_program,
-    })
-}
-
-/// Build a distributed request for internal statistics collection.  The
-/// program is intentionally required here rather than carried in generic
-/// query options, preventing a client-result request from acquiring a
-/// statistics completion capability.
-/// Attach the NCP-6 write session to a sealed distributed write request.
-///
-/// A query carries this or the placement-deferred writer template, never both:
-/// they describe the same write through two different data planes, and a query
-/// that claimed both would have two answers to "did this commit".
-pub(crate) fn with_connector_write_session(
-    mut request: DistributedQueryRequest,
-    session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-) -> Result<DistributedQueryRequest, DistributedQueryError> {
-    if request.intent() != DistributedQueryIntent::Write {
-        return Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::ContractViolation,
-            "a connector write session is only valid for a distributed write request",
-        ));
-    }
-    if request.write_stack_session.is_some() {
-        return Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::ContractViolation,
-            "distributed query already has a connector write session",
-        ));
-    }
-    let query_targets = request.write_root_targets().ok_or_else(|| {
-        DistributedQueryError::new(
-            DistributedQueryErrorKind::ContractViolation,
-            "distributed write plan has no query-local TableFinish target contract",
-        )
-    })?;
-    let decode_contract = crate::query_execution::write_result::RootWriteDecodeContract::try_new(
-        query_targets,
-        session.targets(),
-    )
-    .map_err(|error| {
-        DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
-    })?;
-    request.write_stack_session = Some(session);
-    request.write_root_decode_contract = Some(decode_contract);
-    Ok(request)
-}
-
 /// Stable error categories exposed by the coordinator boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DistributedQueryErrorKind {
     ContractViolation,
     Rejected,
-    /// The statement observed a pre-ControlReady topology disposition, but
-    /// its owner cannot prove the stable semantic binding and zero-effect
-    /// conditions required to construct a replacement round.
-    TopologyRetryUnsupported,
     Failed,
-}
-
-/// Closed, pre-ControlReady topology outcomes that a statement-level round
-/// controller may consider for one bounded replan.  This is carried as typed
-/// coordinator evidence rather than reconstructed from an error string.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PreReadyTopologyOutcome {
-    #[cfg(test)]
-    BackendDraining {
-        backend_idx: usize,
-        process_id: BackendProcessId,
-    },
-    #[cfg(test)]
-    BackendProcessMismatch {
-        backend_idx: usize,
-        process_id: BackendProcessId,
-    },
-    BackendNotEligible {
-        backend_idx: usize,
-        process_id: BackendProcessId,
-    },
-    /// The backend rejected the FE's exact native compatibility identity
-    /// before ControlReady. This is retryable only through the existing
-    /// effect-gated whole-round controller.
-    #[cfg(test)]
-    CompatibilityMismatch {
-        backend_idx: usize,
-        process_id: BackendProcessId,
-    },
-}
-
-impl novarocks_execution_contract::failure::FailureProjection for PreReadyTopologyOutcome {
-    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use novarocks_execution_contract::failure::{
-            FailureClass, FailureFact, FailureReason, domain,
-        };
-        let (class, code) = match self {
-            #[cfg(test)]
-            Self::BackendDraining { .. } => (FailureClass::Dependency, 35),
-            #[cfg(test)]
-            Self::BackendProcessMismatch { .. } => (FailureClass::Dependency, 36),
-            Self::BackendNotEligible { .. } => (FailureClass::Dependency, 37),
-            #[cfg(test)]
-            Self::CompatibilityMismatch { .. } => (FailureClass::Invariant, 38),
-        };
-        FailureFact::new(
-            class,
-            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap()),
-        )
-    }
-}
-impl PreReadyTopologyOutcome {
-    fn failure_site(self) -> novarocks_query_application::execution_error::ExecutionFailureSite {
-        let process = match self {
-            #[cfg(test)]
-            Self::BackendDraining { process_id, .. } => process_id,
-            #[cfg(test)]
-            Self::BackendProcessMismatch { process_id, .. } => process_id,
-            Self::BackendNotEligible { process_id, .. } => process_id,
-            #[cfg(test)]
-            Self::CompatibilityMismatch { process_id, .. } => process_id,
-        };
-        novarocks_query_application::execution_error::ExecutionFailureSite::Backend { process }
-    }
-    fn safe_detail(self) -> &'static str {
-        match self {
-            #[cfg(test)]
-            Self::BackendDraining { .. } => {
-                "the captured backend is draining before context readiness"
-            }
-            #[cfg(test)]
-            Self::BackendProcessMismatch { .. } => {
-                "the captured backend process did not match before context readiness"
-            }
-            Self::BackendNotEligible { .. } => {
-                "the captured backend is ineligible before context readiness"
-            }
-            #[cfg(test)]
-            Self::CompatibilityMismatch { .. } => {
-                "native compatibility was rejected before context readiness"
-            }
-        }
-    }
 }
 
 /// A coordinator failure that core can surface without naming a coordinator
@@ -599,11 +199,8 @@ enum DistributedQueryErrorBody {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DistributedQueryError {
     domain_source: Option<novarocks_execution_contract::failure::SharedFailureCause>,
-    root_fetch_failure: Option<novarocks_query_application::coordination::RootResultFetchFailure>,
     kind: DistributedQueryErrorKind,
     body: DistributedQueryErrorBody,
-    pre_ready_topology_outcome: Option<PreReadyTopologyOutcome>,
-    pre_ready_topology_observation: bool,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
@@ -614,11 +211,8 @@ impl DistributedQueryError {
     ) -> Self {
         Self {
             domain_source: None,
-            root_fetch_failure: None,
             kind: DistributedQueryErrorKind::Failed,
             body: DistributedQueryErrorBody::Execution(Box::new(input)),
-            pre_ready_topology_outcome: None,
-            pre_ready_topology_observation: false,
             compile_control: None,
         }
     }
@@ -635,11 +229,8 @@ impl DistributedQueryError {
     pub fn new(kind: DistributedQueryErrorKind, message: impl Into<String>) -> Self {
         Self {
             domain_source: None,
-            root_fetch_failure: None,
             kind,
             body: DistributedQueryErrorBody::Coordinator(message.into()),
-            pre_ready_topology_outcome: None,
-            pre_ready_topology_observation: false,
             compile_control: None,
         }
     }
@@ -661,59 +252,6 @@ impl DistributedQueryError {
         error.kind = kind;
         error.domain_source = Some(source);
         error
-    }
-
-    /// Constructed only by the pre-ControlReady coordinator/barrier path.
-    /// Callers must never infer this disposition from transport text or a
-    /// post-ready lifecycle failure.
-    pub(crate) fn pre_ready_topology(
-        outcome: PreReadyTopologyOutcome,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            domain_source: None,
-            root_fetch_failure: None,
-            kind: DistributedQueryErrorKind::Rejected,
-            body: DistributedQueryErrorBody::Coordinator(message.into()),
-            pre_ready_topology_outcome: Some(outcome),
-            pre_ready_topology_observation: false,
-            compile_control: None,
-        }
-    }
-
-    /// A pre-ControlReady lifecycle transport loss can wait briefly for the
-    /// membership authority to prove an exact captured-process replacement.
-    /// It is not retry evidence by itself and must never be constructed from
-    /// display text or after ControlReady.
-    pub(crate) fn pre_ready_topology_observation(message: impl Into<String>) -> Self {
-        Self {
-            domain_source: None,
-            root_fetch_failure: None,
-            kind: DistributedQueryErrorKind::Failed,
-            body: DistributedQueryErrorBody::Coordinator(message.into()),
-            pre_ready_topology_outcome: None,
-            pre_ready_topology_observation: true,
-            compile_control: None,
-        }
-    }
-
-    /// Turns typed pre-ready topology evidence into a fail-closed statement
-    /// result when the operation has no whole-round replanning owner. The
-    /// original outcome remains available to observability and callers; it is
-    /// not reduced to transport/display text.
-    pub(crate) fn topology_retry_unsupported(
-        outcome: PreReadyTopologyOutcome,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            domain_source: None,
-            root_fetch_failure: None,
-            kind: DistributedQueryErrorKind::TopologyRetryUnsupported,
-            body: DistributedQueryErrorBody::Coordinator(message.into()),
-            pre_ready_topology_outcome: Some(outcome),
-            pre_ready_topology_observation: false,
-            compile_control: None,
-        }
     }
 
     pub(crate) fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
@@ -784,34 +322,6 @@ impl DistributedQueryError {
         self.compile_control.clone()
     }
 
-    /// Preserve the transport verdict after this coordinator has failed its
-    /// installed attempt. It grants no pre-ready or transparent retry proof.
-    pub(crate) fn with_root_fetch_failure(
-        mut self,
-        failure: novarocks_query_application::coordination::RootResultFetchFailure,
-    ) -> Self {
-        use novarocks_query_application::coordination::AttemptFailureClass as C;
-        if self.execution_failure().is_some() {
-            // This is supplemental transport evidence, not another selection.
-            self.root_fetch_failure = Some(failure);
-            return self;
-        }
-        self.kind = match failure.class() {
-            C::ResourceGovernance => DistributedQueryErrorKind::Rejected,
-            C::ContractViolation => DistributedQueryErrorKind::ContractViolation,
-            _ => DistributedQueryErrorKind::Failed,
-        };
-        self.body = DistributedQueryErrorBody::Execution(Box::new(failure.input().clone()));
-        self.root_fetch_failure = Some(failure);
-        self
-    }
-    #[cfg(test)]
-    pub(crate) fn root_fetch_failure(
-        &self,
-    ) -> Option<&novarocks_query_application::coordination::RootResultFetchFailure> {
-        self.root_fetch_failure.as_ref()
-    }
-
     /// The coordinator consumes its own closed state. Foreign domain facts and
     /// already selected root-read input are forwarded without reclassification;
     /// text-only coordinator failures explicitly select this owner's reason.
@@ -826,16 +336,6 @@ impl DistributedQueryError {
             DistributedQueryErrorBody::Execution(input) => return *input,
             DistributedQueryErrorBody::Coordinator(message) => message,
         };
-        if let Some(failure) = self.root_fetch_failure {
-            return failure.input().clone();
-        }
-        if let Some(outcome) = self.pre_ready_topology_outcome {
-            return ExecutionFailureInput::new(
-                outcome.failure_fact(),
-                SafeDetail::truncating(outcome.safe_detail()),
-                outcome.failure_site(),
-            );
-        }
         let site = ExecutionFailureSite::Coordinator;
         if let Some(source) = self.domain_source {
             return ExecutionFailureInput::new(
@@ -856,22 +356,12 @@ impl DistributedQueryError {
                 site,
             );
         }
-        let reason =
-            if self.pre_ready_topology_outcome.is_some() || self.pre_ready_topology_observation {
-                QueryFailureReason::ObservationLost
-            } else {
-                match self.kind {
-                    DistributedQueryErrorKind::ContractViolation => {
-                        QueryFailureReason::PreparationProtocol
-                    }
-                    DistributedQueryErrorKind::TopologyRetryUnsupported => {
-                        QueryFailureReason::ObservationLost
-                    }
-                    DistributedQueryErrorKind::Rejected | DistributedQueryErrorKind::Failed => {
-                        QueryFailureReason::PreparationFailed
-                    }
-                }
-            };
+        let reason = match self.kind {
+            DistributedQueryErrorKind::ContractViolation => QueryFailureReason::PreparationProtocol,
+            DistributedQueryErrorKind::Rejected | DistributedQueryErrorKind::Failed => {
+                QueryFailureReason::PreparationFailed
+            }
+        };
         tracing::debug!(error = %message, kind = ?self.kind, "coordinator preparation failed");
         ExecutionFailureInput::new(
             reason.failure_fact(),
@@ -891,14 +381,6 @@ impl DistributedQueryError {
             DistributedQueryErrorBody::Execution(input) => input.detail().as_str(),
         }
     }
-
-    pub(crate) const fn pre_ready_topology_outcome(&self) -> Option<PreReadyTopologyOutcome> {
-        self.pre_ready_topology_outcome
-    }
-
-    pub(crate) const fn requires_pre_ready_topology_observation(&self) -> bool {
-        self.pre_ready_topology_observation
-    }
 }
 
 impl fmt::Display for DistributedQueryError {
@@ -915,104 +397,21 @@ impl std::error::Error for DistributedQueryError {
     }
 }
 
-/// Frontend-owned distributed query execution port.
-pub trait DistributedQueryCoordinator: Send + Sync + 'static {
-    /// Reserve the identity of one logical query without creating an
-    /// execution attempt. SELECT preparation uses it only for diagnostics;
-    /// the coordinator mints attempt identity after the frozen operation is
-    /// submitted.
-    fn reserve_logical_query(
-        &self,
-    ) -> Result<crate::query_execution::completion::LogicalQueryReservation, DistributedQueryError>
-    {
-        Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::Rejected,
-            "distributed query coordinator does not reserve logical query identities",
-        ))
-    }
-
-    /// Reserve the first attempt identity before connector metadata
-    /// materialization. Production owns the query-id source; injected test
-    /// coordinators fail closed unless they explicitly implement this port.
-    fn reserve_initial_attempt(
-        &self,
-    ) -> Result<crate::query_execution::completion::QueryAttemptReservation, DistributedQueryError>
-    {
-        let logical = self.reserve_logical_query()?;
-        crate::query_execution::completion::QueryAttemptReservation::first(logical.into_query_id())
-    }
-
-    fn execute(
-        &self,
-        request: DistributedQueryRequest,
-    ) -> Result<DistributedQueryOutcome, DistributedQueryError>;
-
-    /// Execute one non-retriable reserved attempt. Callers use this when
-    /// connector planning has already observed attempt-scoped capabilities
-    /// but statement semantics do not permit automatic whole-round replanning.
-    fn execute_reserved(
-        &self,
-        _request: DistributedQueryRequest,
-        _reservation: crate::query_execution::completion::QueryAttemptReservation,
-    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::ContractViolation,
-            "injected coordinator does not implement reserved distributed attempts",
-        ))
-    }
-
-    /// Execute a statement operation whose replacement rounds must carry a
-    /// newly derived completion formatter as well as a newly derived request.
-    /// The default retains legacy single-round behavior for narrow test
-    /// coordinators; the production coordinator overrides it with the
-    /// statement-level pre-ready controller.
-    fn execute_prepared(
-        &self,
-        operation: crate::query_execution::completion::PreparedDistributedQuery,
-    ) -> Result<
-        novarocks_query_application::protocol_delivery::QuerySessionOutput,
-        DistributedQueryError,
-    > {
-        let (request, completion, attempt_factory, _logical_reservation) = operation.into_parts();
-        if attempt_factory.is_some() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "injected coordinator does not implement statement-level pre-ready replan",
-            ));
-        }
-        let outcome = self.execute(request)?;
-        completion
-            .complete(outcome)
-            .map_err(|error| DistributedQueryError::new(DistributedQueryErrorKind::Failed, error))
-    }
-
-    /// Execute a statement operation whose caller retains its raw outcome.
-    /// This is deliberately separate from `execute_prepared`: a distributed
-    /// write must preserve connector commit/abort handles for the frontend
-    /// transaction runner and cannot be rendered as a `StatementResult`.
-    fn execute_prepared_raw(
-        &self,
-        operation: crate::query_execution::completion::PreparedRawDistributedRequest,
-    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let (request, reservation) = operation.into_parts();
-        if reservation.is_some() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "injected coordinator does not implement reserved raw distributed attempts",
-            ));
-        }
-        Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::ContractViolation,
-            format!(
-                "injected coordinator does not implement raw distributed execution for {:?}",
-                request.intent()
-            ),
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    fn validate_completed_runtime_options(
+        description: &novarocks_query_application::preparation::FrozenExecutionDescription,
+        options: &super::ResolvedQueryOptions,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), super::DistributedQueryError> {
+        description
+            .validate_legacy_intrinsic_allow_throw_exception(
+                options.runtime_options().allow_throw_exception,
+                control,
+            )
+            .map_err(super::DistributedQueryError::from_compile)
+    }
+
     use super::{completed_plan_dop_domain, reconstruct_runtime_query_options};
     use novarocks_proto_codec::lifecycle::QueryOptions;
     use novarocks_proto_models::novarocks;
@@ -1039,7 +438,7 @@ mod tests {
             novarocks_plan_codec::PhysicalEncodeError::Invalid("FULL OUTER hash join".into()),
         ] {
             let fact = original.failure_fact();
-            let selected = novarocks_query_application::coordination::SelectedTaskTermination::new(
+            let selected = novarocks_coordination_contract::SelectedTaskTermination::new(
                 identity,
                 novarocks_execution_contract::TerminationDetail::Failed(
                     novarocks_execution_contract::TaskFailure::new_in_phase(
@@ -1058,11 +457,7 @@ mod tests {
                 novarocks_query_application::coordination::RootResultFetchFailure::from_input(
                     input.clone(),
                 );
-            let error = super::DistributedQueryError::new(
-                super::DistributedQueryErrorKind::Failed,
-                "root failed",
-            )
-            .with_root_fetch_failure(observed);
+            let error = super::DistributedQueryError::from_execution(observed.input().clone());
             assert_eq!(error.into_execution_failure_input(), input);
         }
     }
@@ -1186,6 +581,7 @@ mod tests {
                 cancellation.view(),
                 novarocks_sql::compiler::SessionOptimizerSettings::default(),
                 admitted_semantics,
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
             ));
             let options = super::synthetic_statement_query_options(context.execution());
             assert_eq!(options.as_proto().allow_throw_exception, expected_allow);
@@ -1198,7 +594,7 @@ mod tests {
             let mut absent = super::ResolvedQueryOptions::from_upstream(None);
             absent.runtime.set_allow_throw_exception(expected_allow);
             assert_eq!(resolved.runtime_options(), absent.runtime_options());
-            super::validate_completed_runtime_options(
+            validate_completed_runtime_options(
                 &intrinsic_runtime_description(expected_allow),
                 &resolved,
                 &runtime_gate_control(None),
@@ -1207,7 +603,9 @@ mod tests {
         }
     }
 
-    fn intrinsic_runtime_description(allow: bool) -> super::FrozenExecutionDescription {
+    fn intrinsic_runtime_description(
+        allow: bool,
+    ) -> novarocks_query_application::preparation::FrozenExecutionDescription {
         use arrow::datatypes::DataType;
         use novarocks_physical_plan::{
             ExprKind, FragmentBuilder, FragmentId, FragmentSink, LiteralValue, PipelineDopDomain,
@@ -1285,8 +683,8 @@ mod tests {
             candidate,
             Vec::new(),
             OutputContract::CompletionOnly,
-            novarocks_query_application::coordination::ExecutionEffect::None,
-            novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+            novarocks_coordination_contract::ExecutionEffect::None,
+            novarocks_coordination_contract::RecoveryMode::NoRecovery,
             Vec::new(),
             FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
             ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
@@ -1331,13 +729,9 @@ mod tests {
                 }),
             ));
             let description = intrinsic_runtime_description(actual);
-            super::validate_completed_runtime_options(
-                &description,
-                &options,
-                &runtime_gate_control(None),
-            )
-            .unwrap();
-            let error = super::validate_completed_runtime_options(
+            validate_completed_runtime_options(&description, &options, &runtime_gate_control(None))
+                .unwrap();
+            let error = validate_completed_runtime_options(
                 &intrinsic_runtime_description(!actual),
                 &options,
                 &runtime_gate_control(None),
@@ -1351,7 +745,7 @@ mod tests {
         }
         let default_options = super::ResolvedQueryOptions::from_upstream(None);
         assert!(
-            super::validate_completed_runtime_options(
+            validate_completed_runtime_options(
                 &intrinsic_runtime_description(true),
                 &default_options,
                 &runtime_gate_control(None)
@@ -1377,7 +771,7 @@ mod tests {
                 intrinsic_runtime_description(false)
             };
             let trace = runtime_gate_control(None);
-            let result = super::validate_completed_runtime_options(&description, &options, &trace);
+            let result = validate_completed_runtime_options(&description, &options, &trace);
             assert_eq!(result.is_ok(), success);
             let callbacks = trace.calls.into_inner().unwrap();
             assert_eq!(callbacks.len(), 2);
@@ -1388,9 +782,8 @@ mod tests {
             ] {
                 for ordinal in 0..callbacks.len() {
                     let trace = runtime_gate_control(Some((ordinal, cause.clone())));
-                    let error =
-                        super::validate_completed_runtime_options(&description, &options, &trace)
-                            .unwrap_err();
+                    let error = validate_completed_runtime_options(&description, &options, &trace)
+                        .unwrap_err();
                     assert_eq!(error.compile_control_error(), Some(cause.clone()));
                     assert_eq!(*trace.calls.lock().unwrap(), callbacks[..=ordinal]);
                 }
@@ -1502,8 +895,7 @@ mod typed_compile_source_tests {
                 .unwrap();
             assert_eq!(carried, &source);
             assert_eq!(failure.compile_control_error(), None);
-            assert_eq!(failure.pre_ready_topology_outcome(), None);
-            assert!(!failure.requires_pre_ready_topology_observation());
+
             let input = failure.into_execution_failure_input();
             assert_eq!(input.fact(), original_fact);
             assert_eq!(input.fact().class(), FailureClass::Dependency);
@@ -1549,64 +941,6 @@ mod typed_compile_source_tests {
                 .is_some()
         );
         assert_eq!(failure.compile_control_error(), None);
-        assert_eq!(failure.pre_ready_topology_outcome(), None);
-        assert!(!failure.requires_pre_ready_topology_observation());
-    }
-}
-
-#[cfg(test)]
-mod pre_ready_failure_fact_tests {
-    use super::*;
-    use novarocks_query_application::coordination::AttemptFailureClass;
-    use novarocks_query_application::execution_error::ExecutionFailureSite;
-    #[test]
-    fn pre_ready_facts_keep_exact_process_without_minting_transport_loss_or_retry() {
-        let process = BackendProcessId::new_v7();
-        for (outcome, reason, class) in [
-            (
-                PreReadyTopologyOutcome::BackendDraining {
-                    backend_idx: 3,
-                    process_id: process,
-                },
-                35,
-                AttemptFailureClass::ExecutionFailure,
-            ),
-            (
-                PreReadyTopologyOutcome::BackendProcessMismatch {
-                    backend_idx: 3,
-                    process_id: process,
-                },
-                36,
-                AttemptFailureClass::ExecutionFailure,
-            ),
-            (
-                PreReadyTopologyOutcome::BackendNotEligible {
-                    backend_idx: 3,
-                    process_id: process,
-                },
-                37,
-                AttemptFailureClass::ExecutionFailure,
-            ),
-            (
-                PreReadyTopologyOutcome::CompatibilityMismatch {
-                    backend_idx: 3,
-                    process_id: process,
-                },
-                38,
-                AttemptFailureClass::ContractViolation,
-            ),
-        ] {
-            let input = DistributedQueryError::pre_ready_topology(outcome, "private diagnostic")
-                .into_execution_failure_input();
-            assert_eq!(input.fact().reason().code(), reason);
-            assert_eq!(input.site(), ExecutionFailureSite::Backend { process });
-            assert_eq!(input.attempt_class(), class);
-            assert_eq!(
-                input.topology_requirement(),
-                novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
-            );
-            assert!(!input.detail().as_str().contains("private"));
-        }
     }
 }
 
@@ -1615,11 +949,11 @@ mod selected_execution_carrier_tests {
     use super::*;
     use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
     use novarocks_query_application::execution_error::{
-        ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+        ExecutionFailureInput, ExecutionFailureSite,
     };
 
     #[test]
-    fn selected_execution_is_not_reclassified_by_later_root_fetch_evidence() {
+    fn selected_execution_carrier_preserves_its_original_input() {
         let source = novarocks_spi::connector::ConnectorError::new(
             novarocks_spi::connector::ConnectorErrorKind::Internal,
             "private provider diagnostic",
@@ -1629,22 +963,9 @@ mod selected_execution_carrier_tests {
             SafeDetail::new("original safe task failure").unwrap(),
             ExecutionFailureSite::Coordinator,
         );
-        let later = ExecutionFailureInput::new(
-            QueryFailureReason::ResultProtocol.failure_fact(),
-            SafeDetail::new("later root protocol failure").unwrap(),
-            ExecutionFailureSite::Coordinator,
-        );
-        let failure = DistributedQueryError::from_execution(original.clone())
-            .with_root_fetch_failure(
-                novarocks_query_application::coordination::RootResultFetchFailure::from_input(
-                    later,
-                ),
-            );
+        let failure = DistributedQueryError::from_execution(original.clone());
         assert_eq!(failure.execution_failure(), Some(&original));
         assert_eq!(failure.kind(), DistributedQueryErrorKind::Failed);
-        assert!(failure.root_fetch_failure().is_some());
-        assert_eq!(failure.pre_ready_topology_outcome(), None);
-        assert!(!failure.requires_pre_ready_topology_observation());
         assert_eq!(failure.into_execution_failure_input(), original);
     }
 }

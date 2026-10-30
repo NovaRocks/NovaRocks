@@ -26,3 +26,14 @@ use std::num::NonZeroU16;
 
 pub const NUMERIC_OUT_OF_RANGE: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(41).unwrap());
+
+// These reasons belong to the actual pure-function preparation authors.
+// Consumers may preserve their identity; the constants select no SQL policy.
+pub const MISSING_PURE_IMPLEMENTATION: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(600).unwrap());
+pub const UNSUPPORTED_COMPARISON: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(602).unwrap());
+pub const UNSUPPORTED_ARITHMETIC: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(604).unwrap());
+pub const UNSUPPORTED_CAST: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(606).unwrap());

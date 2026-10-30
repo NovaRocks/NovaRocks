@@ -48,7 +48,8 @@ use futures::future::BoxFuture;
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
     ConnectorControlResolver, ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
-    StaticCredentialReference, canonicalize_catalog_credential_bindings,
+    NodeLocalCredentialReference, StaticCredentialReference,
+    canonicalize_catalog_credential_bindings,
 };
 use novarocks_spi::connector::{
     ConnectorMaterializationRetryDisposition, MaterializationContext, NormalizedCatalogProperties,
@@ -338,23 +339,6 @@ impl CatalogApplicationService {
         self.source()?.sql_mutation_authority()
     }
 
-    fn block_on<T>(
-        &self,
-        future: impl Future<Output = Result<T, CatalogAttachmentError>>,
-    ) -> Result<T, CatalogApplicationError> {
-        let result = match Handle::try_current() {
-            Ok(_) if self.runtime.runtime_flavor() == RuntimeFlavor::CurrentThread => {
-                return Err(CatalogApplicationError::new(
-                    CatalogApplicationErrorKind::Unavailable,
-                    "catalog attachment StateStore access is unavailable on a current-thread Tokio runtime",
-                ));
-            }
-            Ok(_) => tokio::task::block_in_place(|| self.runtime.block_on(future)),
-            Err(_) => self.runtime.block_on(future),
-        };
-        result.map_err(repository_error)
-    }
-
     fn block_on_catalog<T>(
         &self,
         future: impl Future<Output = Result<T, CatalogApplicationError>>,
@@ -560,6 +544,28 @@ impl CatalogApplicationService {
         worker_count: usize,
     ) -> Result<(CatalogDesiredStateSnapshot, CatalogProjectionCounts), CatalogApplicationError>
     {
+        self.reconcile_snapshot_with_execution(page_size, worker_count, None)
+            .await
+    }
+
+    pub async fn reconcile_snapshot_in(
+        self: &Arc<Self>,
+        page_size: usize,
+        worker_count: usize,
+        execution: &dyn novarocks_state_store_api::StateStoreReadExecution,
+    ) -> Result<(CatalogDesiredStateSnapshot, CatalogProjectionCounts), CatalogApplicationError>
+    {
+        self.reconcile_snapshot_with_execution(page_size, worker_count, Some(execution))
+            .await
+    }
+
+    async fn reconcile_snapshot_with_execution(
+        self: &Arc<Self>,
+        page_size: usize,
+        worker_count: usize,
+        execution: Option<&dyn novarocks_state_store_api::StateStoreReadExecution>,
+    ) -> Result<(CatalogDesiredStateSnapshot, CatalogProjectionCounts), CatalogApplicationError>
+    {
         if worker_count == 0 {
             return Err(CatalogApplicationError::new(
                 CatalogApplicationErrorKind::InvalidRequest,
@@ -567,7 +573,18 @@ impl CatalogApplicationService {
             ));
         }
         let source = self.source()?;
-        let snapshot = source.enumerate(page_size).await?;
+        let snapshot = match execution {
+            Some(execution) => {
+                let transaction = execution.read_transaction_context().map_err(|cause| {
+                    CatalogApplicationError::from_domain(
+                        CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete,
+                        cause,
+                    )
+                })?;
+                source.enumerate_in(page_size, &transaction).await
+            }
+            None => source.enumerate(page_size).await,
+        }?;
         let reachable = snapshot
             .catalog_properties()?
             .into_iter()
@@ -585,7 +602,7 @@ impl CatalogApplicationService {
                 "catalog reachable snapshot lock is poisoned",
             )
         })? = Some(reachable);
-        self.retire_projections_absent_from(source, &snapshot)
+        self.retire_projections_absent_from(source, &snapshot, execution)
             .await?;
 
         // Design: ADR-0131 (docs/adr/ADR-0131-server-composes-provider-role-bindings.md)
@@ -647,6 +664,7 @@ impl CatalogApplicationService {
         &self,
         source: &CatalogDesiredStateSource,
         snapshot: &CatalogDesiredStateSnapshot,
+        execution: Option<&dyn novarocks_state_store_api::StateStoreReadExecution>,
     ) -> Result<(), CatalogApplicationError> {
         let candidates = self
             .projections
@@ -662,7 +680,24 @@ impl CatalogApplicationService {
             .map(|(instance_id, projection)| (instance_id.clone(), projection.attachment_id()))
             .collect::<Vec<_>>();
         for (instance_id, attachment_id) in candidates {
-            match source.locate(&instance_id).await {
+            // Each independent re-read starts one transaction. Its Get/Range
+            // operations keep this context; the prior enumeration cannot
+            // consume this transaction's selected-provider time budget.
+            let located = match execution {
+                Some(execution) => match execution.read_transaction_context() {
+                    Ok(transaction) => {
+                        source
+                            .locate_with_execution(&instance_id, Some(&transaction))
+                            .await
+                    }
+                    Err(cause) => Err(CatalogApplicationError::from_domain(
+                        CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete,
+                        cause,
+                    )),
+                },
+                None => source.locate_with_execution(&instance_id, None).await,
+            };
+            match located {
                 Ok(Some(entry)) if entry.identity().as_uuid() == attachment_id => {}
                 Ok(_) => self.retire_projection(&instance_id),
                 // Keep serving and retry next cycle: the read failed, so
@@ -1168,6 +1203,10 @@ impl CatalogApplicationService {
 }
 
 impl CatalogApplicationPort for CatalogApplicationService {
+    fn require_catalog_mutation_admission(&self) -> Result<(), CatalogApplicationError> {
+        self.sql_mutation_authority().map(|_| ())
+    }
+
     fn catalog_activity_sources(
         &self,
     ) -> Result<Vec<novarocks_spi::connector::CatalogActivitySource>, CatalogApplicationError> {
@@ -1204,12 +1243,58 @@ impl CatalogApplicationPort for CatalogApplicationService {
         &self,
         command: CatalogCreateCommand,
     ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
+        self.block_on_catalog(self.create_catalog_with_execution(command, None, None))
+    }
+
+    fn drop_catalog(&self, command: CatalogDropCommand) -> Result<(), CatalogApplicationError> {
+        self.block_on_catalog(self.drop_catalog_with_execution(command, None, None))
+    }
+
+    fn create_catalog_in<'a>(
+        &'a self,
+        command: CatalogCreateCommand,
+        execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+        receipt: &'a crate::CatalogMutationReceipt,
+    ) -> futures::future::BoxFuture<'a, Result<CatalogRuntimeObservation, CatalogApplicationError>>
+    {
+        Box::pin(self.create_catalog_with_execution(command, Some(execution), Some(receipt)))
+    }
+
+    fn drop_catalog_in<'a>(
+        &'a self,
+        command: CatalogDropCommand,
+        execution: &'a novarocks_state_store_api::StateStoreExecutionContext,
+        receipt: &'a crate::CatalogMutationReceipt,
+    ) -> futures::future::BoxFuture<'a, Result<(), CatalogApplicationError>> {
+        Box::pin(self.drop_catalog_with_execution(command, Some(execution), Some(receipt)))
+    }
+
+    fn admit_catalog(&self, instance_id: &ConnectorInstanceId) -> CatalogAdmission {
+        if self.source.is_none() {
+            return CatalogAdmission::Unavailable {
+                reason: "this frontend has no configured catalog desired-state source".to_string(),
+            };
+        }
+        self.observation(instance_id)
+    }
+}
+
+impl CatalogApplicationService {
+    async fn create_catalog_with_execution(
+        &self,
+        command: CatalogCreateCommand,
+        execution: Option<&novarocks_state_store_api::StateStoreExecutionContext>,
+        receipt: Option<&crate::CatalogMutationReceipt>,
+    ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
         let repository = self.sql_mutation_authority()?;
         let (credential_bindings, provider_properties) =
             extract_catalog_credential_bindings(command.properties)?;
-        if self
-            .block_on(repository.get(&command.instance_id))?
-            .is_some()
+        if match execution {
+            Some(execution) => repository.get_in(&command.instance_id, execution).await,
+            None => repository.get(&command.instance_id).await,
+        }
+        .map_err(repository_error)?
+        .is_some()
         {
             if !command.if_not_exists {
                 return Err(CatalogApplicationError::new(
@@ -1242,7 +1327,18 @@ impl CatalogApplicationPort for CatalogApplicationService {
             .map_err(connector_error)?
             .normalize_and_validate(candidate_properties)
             .map_err(|error| materialization_error(&error))?;
-        let created = self.block_on(repository.create(attachment))?;
+        let created = match execution {
+            Some(execution) => match receipt {
+                Some(receipt) => {
+                    repository
+                        .create_in_receiving(attachment, execution, receipt)
+                        .await
+                }
+                None => repository.create_in(attachment, execution).await,
+            },
+            None => repository.create(attachment).await,
+        }
+        .map_err(repository_error)?;
         // CREATE uses the exact same keyed scheduler as reconcile. The ticket
         // observes that attempt's first completion and does not create a
         // second materialization policy or provider side effect path.
@@ -1259,7 +1355,7 @@ impl CatalogApplicationPort for CatalogApplicationService {
                 "connector control role factory is unavailable for this provider",
             ));
         }
-        self.block_on_catalog(async {
+        async {
             if let Some(work) = work {
                 self.run_materialization(work).await;
             }
@@ -1269,12 +1365,23 @@ impl CatalogApplicationPort for CatalogApplicationService {
                     "catalog materialization attempt stopped before completion",
                 )
             })?
-        })
+        }
+        .await
     }
 
-    fn drop_catalog(&self, command: CatalogDropCommand) -> Result<(), CatalogApplicationError> {
+    async fn drop_catalog_with_execution(
+        &self,
+        command: CatalogDropCommand,
+        execution: Option<&novarocks_state_store_api::StateStoreExecutionContext>,
+        receipt: Option<&crate::CatalogMutationReceipt>,
+    ) -> Result<(), CatalogApplicationError> {
         let repository = self.sql_mutation_authority()?;
-        let Some(existing) = self.block_on(repository.get(&command.instance_id))? else {
+        let Some(existing) = match execution {
+            Some(execution) => repository.get_in(&command.instance_id, execution).await,
+            None => repository.get(&command.instance_id).await,
+        }
+        .map_err(repository_error)?
+        else {
             return if command.if_exists {
                 Ok(())
             } else {
@@ -1296,25 +1403,44 @@ impl CatalogApplicationPort for CatalogApplicationService {
         // catalog is gone, which the MV side already refuses through its
         // unavailable/fail-closed paths rather than publishing anything wrong
         // to the lake.
-        self.block_on(repository.observe_references_before_drop(
-            self.reference_reader.as_ref(),
-            &command.instance_id,
-            256,
-        ))?;
-        self.block_on(repository.drop_exact(existing))?;
+        match execution {
+            Some(execution) => {
+                repository
+                    .observe_references_before_drop_in(
+                        self.reference_reader.as_ref(),
+                        &command.instance_id,
+                        256,
+                        execution,
+                    )
+                    .await
+            }
+            None => {
+                repository
+                    .observe_references_before_drop(
+                        self.reference_reader.as_ref(),
+                        &command.instance_id,
+                        256,
+                    )
+                    .await
+            }
+        }
+        .map_err(repository_error)?;
+        match execution {
+            Some(execution) => match receipt {
+                Some(receipt) => {
+                    repository
+                        .drop_exact_in_receiving(existing.clone(), execution, receipt)
+                        .await
+                }
+                None => repository.drop_exact_in(existing.clone(), execution).await,
+            },
+            None => repository.drop_exact(existing.clone()).await,
+        }
+        .map_err(repository_error)?;
         self.retire_projection(&command.instance_id);
         // Durable deletion is authoritative. A local generation can be absent
         // or already retiring; either case converges through reconciliation.
         Ok(())
-    }
-
-    fn admit_catalog(&self, instance_id: &ConnectorInstanceId) -> CatalogAdmission {
-        if self.source.is_none() {
-            return CatalogAdmission::Unavailable {
-                reason: "this frontend has no configured catalog desired-state source".to_string(),
-            };
-        }
-        self.observation(instance_id)
     }
 }
 
@@ -1439,6 +1565,20 @@ fn take_credential_binding(
                     .map_err(|error| invalid_credential_property(error.to_string()))?,
             )
         }
+        Some("node-local") => {
+            let name = name.as_deref().ok_or_else(|| {
+                invalid_credential_property("node-local catalog credential binding requires name")
+            })?;
+            let generation = generation.as_deref().ok_or_else(|| {
+                invalid_credential_property(
+                    "node-local catalog credential binding requires generation",
+                )
+            })?;
+            CatalogCredentialMode::NodeLocal(
+                NodeLocalCredentialReference::try_new(name, generation)
+                    .map_err(|error| invalid_credential_property(error.to_string()))?,
+            )
+        }
         Some("vended") => {
             if name.is_some() || generation.is_some() {
                 return Err(invalid_credential_property(
@@ -1505,7 +1645,7 @@ fn repository_error(error: CatalogAttachmentError) -> CatalogApplicationError {
         }
         CatalogAttachmentErrorKind::Corruption => CatalogApplicationErrorKind::Internal,
     };
-    CatalogApplicationError::new(kind, error.to_string())
+    CatalogApplicationError::from_domain(kind, error)
 }
 
 fn connector_error(error: novarocks_spi::connector::ConnectorError) -> CatalogApplicationError {
@@ -1550,7 +1690,105 @@ fn materialization_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_catalog_extracts_node_local_sources_without_retyping_static() {
+        let properties = [
+            ("credential.object-store-data.consumer-role", "backend"),
+            ("credential.object-store-data.mode", "node-local"),
+            ("credential.object-store-data.name", "worker-source"),
+            ("credential.object-store-data.generation", "blue"),
+            ("warehouse", "s3://warehouse/"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let (bindings, provider) = extract_catalog_credential_bindings(properties).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].node_local_reference().unwrap().name(),
+            "worker-source"
+        );
+        assert!(bindings[0].static_reference().is_none());
+        assert_eq!(
+            provider,
+            vec![("warehouse".to_string(), "s3://warehouse/".to_string())]
+        );
+    }
+
     use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn reconcile_borrows_one_context_for_enumeration_and_each_independent_reread() {
+        use novarocks_state_store_api::{StateStoreExecutionContext, StateStoreReadExecution};
+        struct ReadRequests {
+            base: StateStoreExecutionContext,
+            issued: Mutex<Vec<Instant>>,
+        }
+        impl StateStoreReadExecution for ReadRequests {
+            fn read_transaction_context(
+                &self,
+            ) -> Result<
+                StateStoreExecutionContext,
+                novarocks_state_store_api::StateStoreExecutionFailure,
+            > {
+                let mut issued = self.issued.lock().unwrap();
+                let fixed = self.base.with_deadline(
+                    self.base.deadline() - Duration::from_secs(10 - issued.len() as u64),
+                );
+                issued.push(fixed.deadline());
+                Ok(fixed)
+            }
+        }
+        let (store, _port, absolute, reads, _) =
+            CatalogAttachmentRepository::original_read_fixture();
+        let repository = CatalogAttachmentRepository::open_in(
+            store,
+            novarocks_state_store_runtime::StateStoreRunPolicy::default(),
+            &absolute,
+        )
+        .await
+        .unwrap();
+        reads.lock().unwrap().clear();
+        let control = Arc::new(
+            ConnectorControlHost::with_role_factories(vec![Arc::new(FailingRoleFactory {
+                disposition: ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                calls: Arc::new(AtomicUsize::new(0)),
+            })])
+            .unwrap(),
+        );
+        let service = Arc::new(CatalogApplicationService::new(
+            CatalogDesiredStateSource::dynamic_state_store(repository),
+            control,
+            Arc::new(TestRuntimePublisher),
+            Handle::current(),
+            Arc::new(TestReferenceReader),
+        ));
+        for name in ["absent-a", "absent-b"] {
+            service.projections.lock().unwrap().insert(
+                ConnectorInstanceId::parse(name).unwrap(),
+                LocalProjection::Unavailable {
+                    attachment_id: Uuid::now_v7(),
+                    provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                    reason: "original candidate must be reread".into(),
+                },
+            );
+        }
+        let request = ReadRequests {
+            base: absolute,
+            issued: Mutex::new(Vec::new()),
+        };
+        service.reconcile_snapshot_in(1, 1, &request).await.unwrap();
+        let issued = request.issued.lock().unwrap();
+        assert_eq!(
+            issued.len(),
+            3,
+            "one enumeration and two independent read transactions"
+        );
+        assert_eq!(*reads.lock().unwrap(), *issued);
+        assert!(issued.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(service.projections.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn catalog_boundary_retains_connector_author_facts_and_occurrence() {
@@ -2182,7 +2420,7 @@ mod tests {
             self.0.release();
         }
     }
-    impl novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver
+    impl novarocks_connector_iceberg::access_binding::IcebergCredentialResolver
         for DrainingControlResolver
     {
         fn resolve_object_store_static(
@@ -2253,8 +2491,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
             Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
         );
-        let access =
-            IcebergReadBinding::with_static_metadata_credential_resolver(fs, resolver.clone());
+        let access = IcebergReadBinding::with_metadata_credential_resolver(fs, resolver.clone());
         let role = Arc::new(IcebergControlRoleBindingFactory::new(
             IcebergMetadataResources::new(access, handle.clone()),
             std::num::NonZeroUsize::new(2).unwrap(),
@@ -2579,7 +2816,7 @@ mod tests {
     mod generation_expiry_ref {
         use super::*;
         use novarocks_connector_iceberg::access_binding::{
-            IcebergReadBinding, IcebergRestAuthMaterial, IcebergStaticCredentialResolver,
+            IcebergCredentialResolver, IcebergReadBinding, IcebergRestAuthMaterial,
         };
         use novarocks_connector_iceberg::{IcebergControlRoleBindingFactory, iceberg};
         use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
@@ -2599,7 +2836,7 @@ mod tests {
         use std::sync::{Condvar, atomic::AtomicBool};
 
         struct Identity;
-        impl IcebergStaticCredentialResolver for Identity {
+        impl IcebergCredentialResolver for Identity {
             fn resolve_object_store_static(
                 &self,
                 _: &StaticCredentialReference,
@@ -2999,10 +3236,8 @@ mod tests {
                 Arc::new(TokioFileIoRuntime::new(runtime.clone())),
                 Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
             );
-            let access = IcebergReadBinding::with_static_metadata_credential_resolver(
-                fs,
-                Arc::new(Identity),
-            );
+            let access =
+                IcebergReadBinding::with_metadata_credential_resolver(fs, Arc::new(Identity));
             let factory = Arc::new(IcebergControlRoleBindingFactory::new(
                 novarocks_connector_iceberg::resources::IcebergMetadataResources::new(
                     access,
@@ -3074,13 +3309,16 @@ mod tests {
                     .unwrap(),
                     planning.clone(),
                 )
+                .await
                 .unwrap();
             let first_id = first.control_runtime_id();
-            let expiry = tokio::task::spawn_blocking(move || {
-                first.execute(
+            let mut execution = first
+                .begin_execute(
                     ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, planning).unwrap(),
                 )
-            });
+                .unwrap();
+            drop(first);
+            let expiry = tokio::spawn(async move { execution.wait().await });
             until(|| server.state.lock().unwrap().expiry_entered).await;
             assert_eq!(server.posts("t").len(), 1);
             port.unpublish_all();

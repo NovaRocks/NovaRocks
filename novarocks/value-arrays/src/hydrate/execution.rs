@@ -155,7 +155,11 @@ impl Node {
         observe: &mut HydrateObserver<'_, E>,
     ) -> Result<ArrayRef, ValueFailure<E>> {
         let layout = self.layout.ok_or_else(invalid)?;
-        let source = ByteSource::parse(&self.source, layout, self.dictionary_layout)?;
+        let source = ByteSource::parse(
+            &self.source,
+            self.source_layout.ok_or_else(invalid)?,
+            self.dictionary_layout,
+        )?;
         // View descriptors and cache choices were already acquired and frozen
         // during planning. Execution neither allocates another decoded bottom
         // nor changes the strategy after output capacity has been requested.
@@ -213,7 +217,7 @@ impl Node {
 fn field_changes(source: &Field, target: &Field) -> bool {
     source.name() != target.name()
         || source.is_nullable() != target.is_nullable()
-        || source.metadata().capacity() != 0
+        || source.metadata().as_arc().is_some()
 }
 pub(super) fn local_metadata_changes(
     source: &DataType,

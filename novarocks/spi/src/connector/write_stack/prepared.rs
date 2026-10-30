@@ -188,7 +188,17 @@ impl ConnectorPreparedWriteSet {
     /// against the highest ordinal.
     pub fn try_new(
         row_count: u64,
-        fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
+        mut fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
+        expected_targets: &[WriteTargetOrdinal],
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_in(row_count, &mut fragments, expected_targets)
+    }
+
+    /// Validate every original fragment before moving its unique inventory.
+    /// A refusal leaves the caller's receiving slot unchanged.
+    pub fn try_new_in(
+        row_count: u64,
+        fragments: &mut Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
         expected_targets: &[WriteTargetOrdinal],
     ) -> Result<Self, ConnectorError> {
         crate::connector::write_stack::target::validate_query_target_ordinals(expected_targets)?;
@@ -202,7 +212,7 @@ impl ConnectorPreparedWriteSet {
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        for (target, _) in &fragments {
+        for (target, _) in fragments.iter() {
             if !expected.contains(target) {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -212,7 +222,7 @@ impl ConnectorPreparedWriteSet {
         }
         Ok(Self {
             row_count,
-            fragments,
+            fragments: std::mem::take(fragments),
         })
     }
 

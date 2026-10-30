@@ -66,6 +66,7 @@ pub struct ConnectorError {
     message: String,
     retryable_before_progress: bool,
     cleanup_context: Option<String>,
+    public_failure_detail: Option<novarocks_failure_contract::BoundedDetail>,
 }
 
 impl ConnectorError {
@@ -75,6 +76,7 @@ impl ConnectorError {
             message: message.into(),
             retryable_before_progress: false,
             cleanup_context: None,
+            public_failure_detail: None,
         }
     }
 
@@ -94,7 +96,46 @@ impl ConnectorError {
             cause: ConnectorErrorCause::Domain { kind, source },
             retryable_before_progress: false,
             cleanup_context: None,
+            public_failure_detail: None,
         }
+    }
+
+    /// Closed producers with a fixed public diagnostic keep the exact domain
+    /// cause without invoking its Display. Geometry below describes precisely
+    /// this construction, not the arbitrary formatting path in from_domain.
+    pub fn from_domain_static<E>(kind: ConnectorErrorKind, cause: E, detail: &'static str) -> Self
+    where
+        E: std::error::Error
+            + novarocks_failure_contract::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        let source =
+            novarocks_failure_contract::SharedFailureCause::from_static_detail(cause, detail);
+        Self {
+            message: source.detail().to_owned(),
+            cause: ConnectorErrorCause::Domain { kind, source },
+            retryable_before_progress: false,
+            cleanup_context: None,
+            public_failure_detail: None,
+        }
+    }
+
+    /// First-party storage of from_domain_static: its actual CauseRecord Arc,
+    /// plus exactly two owned copies of the same bounded UTF-8 prefix. The
+    /// inline E is included once in that record. Its existing pointees and
+    /// this inline ConnectorError remain with their original source authors.
+    pub fn static_domain_backing_bytes<E>(
+        detail: &'static str,
+    ) -> Result<usize, novarocks_type_contract::owned_resources::layout::LayoutResourceError> {
+        use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
+        let record =
+            arc_layout(novarocks_failure_contract::SharedFailureCause::record_layout::<E>())?;
+        let text = novarocks_failure_contract::BoundedDetail::truncating_backing_len(detail);
+        text.checked_mul(2)
+            .and_then(|bytes| record.size().checked_add(bytes))
+            .ok_or(LayoutResourceError::Arithmetic)
     }
 
     /// Preserve the original pure compiler refusal, including a caller-owned
@@ -120,6 +161,7 @@ impl ConnectorError {
             message: message.into(),
             retryable_before_progress: false,
             cleanup_context: None,
+            public_failure_detail: None,
         }
     }
 
@@ -139,6 +181,24 @@ impl ConnectorError {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Explicitly publish this producer-owned message as a bounded diagnostic.
+    /// Only an author that knows the message is public may opt in. Kind,
+    /// length, and a foreign error's Display are never evidence of that fact.
+    pub fn with_public_failure_detail(mut self) -> Self {
+        self.public_failure_detail = Some(novarocks_failure_contract::BoundedDetail::truncating(
+            &self.message,
+        ));
+        self
+    }
+
+    /// The original producer's public projection, independent of diagnostic
+    /// context appended later. Absence never authorizes publishing message().
+    pub fn public_failure_detail(&self) -> Option<&str> {
+        self.public_failure_detail
+            .as_ref()
+            .map(novarocks_failure_contract::BoundedDetail::as_str)
     }
 
     /// Extend a diagnostic without rebuilding its classification, retry or
@@ -205,6 +265,7 @@ impl From<ConnectorIdentityError> for ConnectorError {
             cause: ConnectorErrorCause::Identity(error),
             retryable_before_progress: false,
             cleanup_context: None,
+            public_failure_detail: None,
         }
     }
 }
@@ -296,21 +357,38 @@ impl novarocks_failure_contract::FailureProjection for ConnectorError {
                 },
             )
         } else {
-            match self.kind() {
-                ConnectorErrorKind::InvalidRequest => (Class::Data, 1),
-                ConnectorErrorKind::NotFound => (Class::Dependency, 2),
-                ConnectorErrorKind::PermissionDenied => (Class::Dependency, 3),
-                ConnectorErrorKind::Unsupported => (Class::Unsupported, 4),
-                ConnectorErrorKind::Cancelled => (Class::Control, 5),
-                ConnectorErrorKind::DeadlineExceeded => (Class::Control, 6),
-                ConnectorErrorKind::ResourceExhausted => (Class::Resource, 7),
-                ConnectorErrorKind::Unavailable => (Class::Dependency, 8),
-                ConnectorErrorKind::CorruptData => (Class::Data, 9),
-                ConnectorErrorKind::Internal => (Class::Unexpected, 10),
-                // An interruption descriptor without its required typed source
-                // is an invalid construction, not evidence of caller intent.
-                ConnectorErrorKind::Interrupted => (Class::Invariant, 11),
-            }
+            return self.kind().failure_fact();
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(
+                domain::CONNECTOR,
+                std::num::NonZeroU16::new(code).expect("nonzero reason"),
+            ),
+        )
+    }
+}
+
+/// A closed kind's fact does not require allocating a diagnostic carrier.
+impl novarocks_failure_contract::FailureProjection for ConnectorErrorKind {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass as Class, FailureFact, FailureReason, domain,
+        };
+        let (class, code) = match self {
+            ConnectorErrorKind::InvalidRequest => (Class::Data, 1),
+            ConnectorErrorKind::NotFound => (Class::Dependency, 2),
+            ConnectorErrorKind::PermissionDenied => (Class::Dependency, 3),
+            ConnectorErrorKind::Unsupported => (Class::Unsupported, 4),
+            ConnectorErrorKind::Cancelled => (Class::Control, 5),
+            ConnectorErrorKind::DeadlineExceeded => (Class::Control, 6),
+            ConnectorErrorKind::ResourceExhausted => (Class::Resource, 7),
+            ConnectorErrorKind::Unavailable => (Class::Dependency, 8),
+            ConnectorErrorKind::CorruptData => (Class::Data, 9),
+            ConnectorErrorKind::Internal => (Class::Unexpected, 10),
+            // An interruption descriptor without its required typed source
+            // is an invalid construction, not evidence of caller intent.
+            ConnectorErrorKind::Interrupted => (Class::Invariant, 11),
         };
         FailureFact::new(
             class,
@@ -470,5 +548,131 @@ mod domain_source_tests {
             .downcast_ref::<LocalContractRefusal>()
             .unwrap();
         assert!(std::ptr::eq(a, b));
+    }
+    #[test]
+    fn public_detail_requires_its_original_author_and_survives_private_context() {
+        for error in [
+            ConnectorError::new(ConnectorErrorKind::Unsupported, "provider refusal"),
+            ConnectorError::from_domain(ConnectorErrorKind::Internal, LocalContractRefusal),
+            ConnectorError::from_domain_static(
+                ConnectorErrorKind::Unavailable,
+                LocalContractRefusal,
+                "fixed internal diagnostic",
+            ),
+            ConnectorError::table_object_binding(
+                ConnectorTableObjectBindingFailure::Replaced,
+                "original table binding refusal",
+            ),
+        ] {
+            assert_eq!(error.public_failure_detail(), None);
+            let fact = error.failure_fact();
+            let original_message = error.message().to_owned();
+            let public = error.with_public_failure_detail();
+            assert_eq!(
+                public.public_failure_detail(),
+                Some(original_message.as_str())
+            );
+            let contextualized = public
+                .clone()
+                .map_message(|_| "private later SDK context".into())
+                .with_cleanup_context("private cleanup context");
+            assert_eq!(contextualized.failure_fact(), fact);
+            assert_eq!(
+                contextualized.public_failure_detail(),
+                public.public_failure_detail()
+            );
+            assert_eq!(contextualized.message(), "private later SDK context");
+        }
+    }
+
+    #[test]
+    fn explicitly_public_detail_uses_the_existing_utf8_diagnostic_bound() {
+        let error = ConnectorError::new(ConnectorErrorKind::Unsupported, "中".repeat(600));
+        assert_eq!(error.public_failure_detail(), None);
+        let fact = error.failure_fact();
+        let public = error.with_public_failure_detail();
+        let expected = novarocks_failure_contract::BoundedDetail::truncating(public.message());
+        assert_eq!(public.public_failure_detail(), Some(expected.as_str()));
+        assert!(
+            public.public_failure_detail().unwrap().len()
+                <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES
+        );
+        assert_eq!(public.failure_fact(), fact);
+    }
+
+    #[test]
+    fn fixed_domain_quote_covers_actual_record_and_both_owned_diagnostics() {
+        use novarocks_failure_contract::{BoundedDetail, SharedFailureCause};
+        use novarocks_type_contract::owned_resources::layout::arc_layout;
+        const DETAIL: &str = "fixed caller-safe diagnostic";
+        let error = ConnectorError::from_domain_static(
+            ConnectorErrorKind::Unavailable,
+            LocalContractRefusal,
+            DETAIL,
+        );
+        let ConnectorErrorCause::Domain { source, .. } = &error.cause else {
+            panic!("domain source")
+        };
+        assert!(source.downcast_ref::<LocalContractRefusal>().is_some());
+        assert_eq!(error.failure_fact(), LocalContractRefusal.failure_fact());
+        assert_eq!(error.message(), DETAIL);
+        assert_eq!(source.detail(), DETAIL);
+        let actual_record = arc_layout(SharedFailureCause::record_layout::<LocalContractRefusal>())
+            .unwrap()
+            .size();
+        let actual_detail = BoundedDetail::truncating(DETAIL).into_string();
+        assert_eq!(actual_detail.capacity(), DETAIL.len());
+        assert_eq!(error.message.capacity(), DETAIL.len());
+        assert_eq!(
+            ConnectorError::static_domain_backing_bytes::<LocalContractRefusal>(DETAIL).unwrap(),
+            actual_record + actual_detail.capacity() + error.message.capacity()
+        );
+        assert!(
+            actual_record
+                > arc_layout(std::alloc::Layout::new::<LocalContractRefusal>())
+                    .unwrap()
+                    .size()
+        );
+    }
+
+    #[test]
+    fn kind_projection_retains_all_original_connector_reason_codes() {
+        for (kind, class, code) in [
+            (ConnectorErrorKind::InvalidRequest, FailureClass::Data, 1),
+            (ConnectorErrorKind::NotFound, FailureClass::Dependency, 2),
+            (
+                ConnectorErrorKind::PermissionDenied,
+                FailureClass::Dependency,
+                3,
+            ),
+            (
+                ConnectorErrorKind::Unsupported,
+                FailureClass::Unsupported,
+                4,
+            ),
+            (ConnectorErrorKind::Cancelled, FailureClass::Control, 5),
+            (
+                ConnectorErrorKind::DeadlineExceeded,
+                FailureClass::Control,
+                6,
+            ),
+            (
+                ConnectorErrorKind::ResourceExhausted,
+                FailureClass::Resource,
+                7,
+            ),
+            (ConnectorErrorKind::Unavailable, FailureClass::Dependency, 8),
+            (ConnectorErrorKind::CorruptData, FailureClass::Data, 9),
+            (ConnectorErrorKind::Internal, FailureClass::Unexpected, 10),
+            (ConnectorErrorKind::Interrupted, FailureClass::Invariant, 11),
+        ] {
+            let fact = kind.failure_fact();
+            assert_eq!(fact.class(), class);
+            assert_eq!(fact.reason().code(), code);
+            assert_eq!(
+                fact,
+                ConnectorError::new(kind, "unchanged ordinary carrier").failure_fact()
+            );
+        }
     }
 }

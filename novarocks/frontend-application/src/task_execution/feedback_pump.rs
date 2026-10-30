@@ -260,7 +260,11 @@ impl TurnPump for DynamicFilterFeedbackPump {
     }
 
     fn begin_close(&mut self) {
-        self.closing = true;
+        if !self.closing {
+            self.closing = true;
+            // Close the shared admission gate and wake split-source waiters.
+            self.feedback.close();
+        }
     }
     fn close_turn(&mut self) -> Result<usize, TaskExecutionError> {
         self.begin_close();

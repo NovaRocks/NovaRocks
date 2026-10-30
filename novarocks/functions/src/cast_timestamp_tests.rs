@@ -145,8 +145,12 @@ fn pool(input: &ArrayRef, nullable: bool) -> ConstantPool {
     let source =
         FunctionValueType::from_legacy_declared_projection(input.data_type().clone(), nullable);
     let field = Arc::new(
-        Field::new("original-timestamp", input.data_type().clone(), nullable)
-            .with_metadata([("source-note".into(), "retain-exact-pool".into())].into()),
+        Field::new("original-timestamp", input.data_type().clone(), nullable).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "source-note".into(),
+                "retain-exact-pool".into(),
+            )]),
+        ),
     );
     let pool = ConstantPool::try_new(
         field.clone(),

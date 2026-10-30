@@ -741,12 +741,39 @@ impl CatalogDesiredStateSource {
         &self,
         page_size: usize,
     ) -> Result<CatalogDesiredStateSnapshot, CatalogApplicationError> {
+        self.enumerate_with_execution(page_size, None).await
+    }
+
+    pub async fn enumerate_in(
+        &self,
+        page_size: usize,
+        execution: &novarocks_state_store_api::StateStoreExecutionContext,
+    ) -> Result<CatalogDesiredStateSnapshot, CatalogApplicationError> {
+        self.enumerate_with_execution(page_size, Some(execution))
+            .await
+    }
+
+    async fn enumerate_with_execution(
+        &self,
+        page_size: usize,
+        execution: Option<&novarocks_state_store_api::StateStoreExecutionContext>,
+    ) -> Result<CatalogDesiredStateSnapshot, CatalogApplicationError> {
         match &self.authority {
             CatalogDesiredStateAuthority::DynamicStateStore(attachments) => {
-                let located = attachments
-                    .list_with_page_size(page_size)
-                    .await
-                    .map_err(|error| untrustworthy_enumeration(self.mode, error))?;
+                let located = match execution {
+                    Some(execution) => {
+                        attachments
+                            .list_with_page_size_in(page_size, execution)
+                            .await
+                    }
+                    None => attachments.list_with_page_size(page_size).await,
+                }
+                .map_err(|error| {
+                    CatalogApplicationError::from_domain(
+                        CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete,
+                        error,
+                    )
+                })?;
                 CatalogDesiredStateSnapshot::try_new(
                     self.mode,
                     located
@@ -772,17 +799,24 @@ impl CatalogDesiredStateSource {
     /// wanted.  Only a read issued *after* the local evidence was observed can
     /// separate the two, which is why this exists as its own operation instead
     /// of being answered from the snapshot.
-    pub(crate) async fn locate(
+    pub(crate) async fn locate_with_execution(
         &self,
         instance_id: &ConnectorInstanceId,
+        execution: Option<&novarocks_state_store_api::StateStoreExecutionContext>,
     ) -> Result<Option<CatalogDesiredStateEntry>, CatalogApplicationError> {
         match &self.authority {
-            CatalogDesiredStateAuthority::DynamicStateStore(attachments) => attachments
-                .get(instance_id)
-                .await
-                .map_err(|error| untrustworthy_enumeration(self.mode, error))?
-                .map(|versioned| CatalogDesiredStateEntry::from_attachment(&versioned.attachment))
-                .transpose(),
+            CatalogDesiredStateAuthority::DynamicStateStore(attachments) => match execution {
+                Some(execution) => attachments.get_in(instance_id, execution).await,
+                None => attachments.get(instance_id).await,
+            }
+            .map_err(|error| {
+                CatalogApplicationError::from_domain(
+                    CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete,
+                    error,
+                )
+            })?
+            .map(|versioned| CatalogDesiredStateEntry::from_attachment(&versioned.attachment))
+            .transpose(),
             CatalogDesiredStateAuthority::StaticFile(snapshot) => Ok(snapshot.locate(instance_id)),
             CatalogDesiredStateAuthority::Unimplemented => {
                 Err(unsupported_mode(self.mode, "locate a catalog"))

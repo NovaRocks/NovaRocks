@@ -199,10 +199,31 @@ impl ConnectorCleanupCandidate {
         }
     }
 
+    /// Prospective size of the exact original public spelling. This is not a
+    /// plan/SDK graph invoice or permission; the local result author checks its
+    /// real output contract before the report String is constructed.
+    pub fn display_key_len(&self) -> Result<usize, ConnectorError> {
+        match self {
+            Self::Object { location } => Ok(location.len()),
+            Self::OwnedRef { name, .. } => name.len().checked_add("ref:".len()).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "cleanup display length overflow",
+                )
+            }),
+        }
+    }
+    pub fn display_key_string(&self) -> String {
+        match self {
+            Self::Object { location } => location.to_string(),
+            Self::OwnedRef { name, .. } => format!("ref:{name}"),
+        }
+    }
+
     pub fn display_key(&self) -> Arc<str> {
         match self {
             Self::Object { location } => Arc::clone(location),
-            Self::OwnedRef { name, .. } => Arc::from(format!("ref:{name}")),
+            Self::OwnedRef { .. } => Arc::from(self.display_key_string()),
         }
     }
 
@@ -1264,9 +1285,64 @@ impl ConnectorCleanupFinalizeRequest {
     }
 }
 
+/// Provider evidence for scanned-object reclamation, distinct from exact
+/// operation-owned cleanup and exact Catalog reference retirement.
+/// No current provider proves writer fencing, Unknown/unreceived protection
+/// and restart recovery together. Age/current reachability is not that proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ConnectorCleanupScanSafety {
+    Unproven,
+}
+impl ConnectorCleanupScanSafety {
+    pub fn require_scanned_object_gc(self) -> Result<(), ConnectorError> {
+        match self {
+            Self::Unproven => Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "scanned orphan cleanup is unsupported: Provider writer fencing, Unknown/unreceived output protection and restart safety are unproven",
+            )),
+        }
+    }
+}
+
 /// A cleanup provider never receives an opportunity to re-list candidates after
 /// planning. `execute_batch` is invoked once per prepared batch.
 pub trait ConnectorCleanupMaintenance: Send + Sync {
+    /// Exact concrete author of this selected provider generation; no CPU grant.
+    fn metadata_cpu_source_type_id(&self) -> Result<std::any::TypeId, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "cleanup has no governed metadata CPU author",
+        ))
+    }
+    /// Silent construction only. The original application installs this source
+    /// before polling; dropping a borrowed wait never drops its physical F.
+    fn begin_async_in(
+        &self,
+        _start: &mut Option<ConnectorCleanupAsyncStart>,
+        _metadata: Arc<dyn ConnectorMetadata>,
+        _cpu: Arc<dyn super::ProviderMetadataCpuPort>,
+        _target: &mut Option<ConnectorCleanupAsyncExecution>,
+    ) -> Result<(), ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "provider has no governed cleanup async source",
+        ))
+    }
+    /// Initial routes selected by THIS original cleanup factory. This is
+    /// neither a byte allowance nor an I/O/concurrency grant.
+    fn initial_dependencies(&self) -> Result<Vec<super::SharedDependency>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "cleanup factory has no original selected route facts",
+        ))
+    }
+
+    /// Must be checked before object discovery and before executing a frozen
+    /// object manifest. It does not gate independently safe owned operations.
+    fn scan_gc_safety(&self) -> ConnectorCleanupScanSafety {
+        ConnectorCleanupScanSafety::Unproven
+    }
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn binding_key(&self) -> &ConnectorProviderBindingKey;
     fn plan_cleanup(
@@ -1316,6 +1392,28 @@ struct CleanupRelease {
 }
 
 impl ConnectorCleanupMaintenanceLease {
+    pub fn metadata_cpu_source_type_id(&self) -> Result<std::any::TypeId, ConnectorError> {
+        let selected = self.cleanup.metadata_cpu_source_type_id()?;
+        let (key, actual) = self
+            .metadata
+            .provider_metadata_cpu_author()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "selected cleanup metadata CPU author is unsupported",
+                )
+            })?;
+        if key != self.provider_binding_key || actual != selected {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cleanup metadata CPU author belongs to another exact generation",
+            ));
+        }
+        Ok(selected)
+    }
+    pub const fn incarnation(&self) -> ProviderBindingEpoch {
+        self.provider_binding_key.incarnation
+    }
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
@@ -1348,11 +1446,55 @@ impl ConnectorCleanupMaintenanceLease {
             }),
         })
     }
+    pub fn initial_dependencies(&self) -> Result<Vec<super::SharedDependency>, ConnectorError> {
+        if self.cleanup.descriptor() != &self.descriptor
+            || self.cleanup.binding_key() != &self.provider_binding_key
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cleanup route author belongs to another exact generation",
+            ));
+        }
+        self.cleanup.initial_dependencies()
+    }
+    pub fn begin_async_in(
+        &self,
+        start: &mut Option<ConnectorCleanupAsyncStart>,
+        cpu: Arc<dyn super::ProviderMetadataCpuPort>,
+        target: &mut Option<ConnectorCleanupAsyncExecution>,
+    ) -> Result<(), ConnectorError> {
+        let input = start.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cleanup original start is absent",
+            )
+        })?;
+        if target.is_some() || input.table.instance_id != self.descriptor.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cleanup original receiving or exact owner differs",
+            ));
+        }
+        let operation = input.operation_id;
+        self.cleanup
+            .begin_async_in(start, self.metadata.clone(), cpu, target)?;
+        let execution = target.as_mut().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "cleanup provider did not install its original source",
+            )
+        })?;
+        execution.expected = Some((self.provider_binding_key.clone(), operation));
+        Ok(())
+    }
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
     pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
         self.control_runtime_id
+    }
+    pub fn scan_gc_safety(&self) -> ConnectorCleanupScanSafety {
+        self.cleanup.scan_gc_safety()
     }
     pub fn metadata(&self) -> &Arc<dyn ConnectorMetadata> {
         &self.metadata
@@ -1870,5 +2012,165 @@ mod tests {
         .unwrap();
         assert_eq!(receipt.summary().unknown(), 4);
         assert!(receipt.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod scan_safety_tests {
+    use super::*;
+    #[test]
+    fn unproven_scan_safety_is_typed_unsupported_not_age_or_reachability() {
+        let error = ConnectorCleanupScanSafety::Unproven
+            .require_scanned_object_gc()
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(error.message().contains("Unknown/unreceived"));
+        assert!(error.message().contains("restart"));
+    }
+}
+
+/// Closed initial request. No object sweep authority is implied by an age.
+pub struct ConnectorCleanupAsyncStart {
+    pub original: super::ConnectorOriginalResultScope,
+    pub table: super::ConnectorTableIdentity,
+    pub operation_id: ConnectorCleanupOperationId,
+    pub older_than_ms: i64,
+    pub selection: Option<ConnectorCleanupOwnedRefSelection>,
+    pub context: ConnectorRequestContext,
+}
+/// One original serial step; existing carrier validation remains authoritative.
+pub enum ConnectorCleanupAsyncStep {
+    Prepare(ConnectorCleanupPrepareRequest),
+    Execute(ConnectorCleanupExecuteRequest),
+    Page(ConnectorCleanupCandidatePageRequest),
+    Finalize(ConnectorCleanupFinalizeRequest),
+}
+pub enum ConnectorCleanupAsyncOutput {
+    Plan(ConnectorCleanupPlan),
+    Prepared(PreparedBatch),
+    Receipt(BatchReceipt),
+    Page(CandidatePage),
+    Finalized,
+}
+/// Provider original owns request, physical future, typed result and journal.
+/// This is an observer/borrower API, never an execution or deletion grant.
+pub trait ConnectorCleanupAsyncSource: Send + Sync {
+    fn install_step_in(
+        &self,
+        step: &mut Option<ConnectorCleanupAsyncStep>,
+    ) -> Result<(), ConnectorError>;
+    fn poll_output(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<ConnectorCleanupAsyncOutput, ConnectorError>>;
+    fn poll_closed(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ConnectorError>>;
+    fn publication_fact(&self) -> (Option<super::LakePublicationDisposition>, bool);
+    /// One originating dispatch/required-finalization failure from the original
+    /// journal. The boolean proves required finalization, never actual exit.
+    fn original_failure(&self) -> Option<(ConnectorError, bool)>;
+}
+/// Read-only facts from the SAME original source; no dispatch/wait authority.
+#[derive(Clone)]
+pub struct ConnectorCleanupAsyncObservation {
+    original: Arc<dyn ConnectorCleanupAsyncSource>,
+}
+impl ConnectorCleanupAsyncObservation {
+    pub fn publication_fact(&self) -> (Option<super::LakePublicationDisposition>, bool) {
+        self.original.publication_fact()
+    }
+    pub fn original_failure(&self) -> Option<(ConnectorError, bool)> {
+        self.original.original_failure()
+    }
+
+    pub fn publication_disposition(&self) -> Option<super::LakePublicationDisposition> {
+        self.original.publication_fact().0
+    }
+    pub fn has_applied(&self) -> bool {
+        self.original.publication_fact().1
+    }
+}
+pub struct ConnectorCleanupAsyncExecution {
+    original: Arc<dyn ConnectorCleanupAsyncSource>,
+    expected: Option<(ConnectorProviderBindingKey, ConnectorCleanupOperationId)>,
+}
+impl ConnectorCleanupAsyncExecution {
+    pub fn observation(&self) -> ConnectorCleanupAsyncObservation {
+        ConnectorCleanupAsyncObservation {
+            original: self.original.clone(),
+        }
+    }
+
+    pub fn from_original(original: Arc<dyn ConnectorCleanupAsyncSource>) -> Self {
+        Self {
+            original,
+            expected: None,
+        }
+    }
+    pub fn install_step_in(
+        &self,
+        step: &mut Option<ConnectorCleanupAsyncStep>,
+    ) -> Result<(), ConnectorError> {
+        if let Some((owner, operation)) = &self.expected {
+            let plan = match step.as_ref().ok_or_else(|| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, "cleanup step is absent")
+            })? {
+                ConnectorCleanupAsyncStep::Prepare(x) => &x.plan,
+                ConnectorCleanupAsyncStep::Execute(x) => &x.plan,
+                ConnectorCleanupAsyncStep::Page(x) => &x.plan,
+                ConnectorCleanupAsyncStep::Finalize(x) => &x.plan,
+            };
+            if plan.owner() != owner || plan.operation_id() != *operation {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "cleanup async step differs from original owner/operation",
+                ));
+            }
+        }
+        self.original.install_step_in(step)
+    }
+    pub fn poll_output(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<ConnectorCleanupAsyncOutput, ConnectorError>> {
+        let value = std::task::ready!(self.original.poll_output(cx))?;
+        if let Some((owner, operation)) = &self.expected {
+            let matches = match &value {
+                ConnectorCleanupAsyncOutput::Plan(x) => {
+                    x.owner() == owner && x.operation_id() == *operation
+                }
+                ConnectorCleanupAsyncOutput::Prepared(x) => {
+                    x.owner() == owner && x.operation_id() == *operation
+                }
+                ConnectorCleanupAsyncOutput::Receipt(x) => {
+                    x.owner() == owner && x.operation_id() == *operation
+                }
+                ConnectorCleanupAsyncOutput::Page(x) => {
+                    x.owner() == owner && x.operation_id() == *operation
+                }
+                ConnectorCleanupAsyncOutput::Finalized => true,
+            };
+            if !matches {
+                return std::task::Poll::Ready(Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "cleanup async output differs from original owner/operation",
+                )));
+            }
+        }
+        std::task::Poll::Ready(Ok(value))
+    }
+    pub fn poll_closed(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ConnectorError>> {
+        self.original.poll_closed(cx)
+    }
+    pub fn publication_disposition(&self) -> Option<super::LakePublicationDisposition> {
+        self.original.publication_fact().0
+    }
+    pub fn has_applied(&self) -> bool {
+        self.original.publication_fact().1
     }
 }

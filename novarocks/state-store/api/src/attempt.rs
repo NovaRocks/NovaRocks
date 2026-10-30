@@ -44,14 +44,19 @@
 //! [`AttemptOutcome::Unresolved`], which grants no right to run the work again.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use uuid::Uuid;
 
 use super::contract::CommitReceipt;
 use super::error::{StateStoreError, StateStoreErrorKind};
+use super::execution::{
+    StateStoreExecutionContext, StateStoreExecutionFailure, StateStoreOriginalUnsupported,
+};
 
 /// Default ceiling on attempts a single open instance keeps charged at once.
 ///
@@ -169,6 +174,97 @@ pub trait InDoubtAdjudicator: Send + Sync {
     /// a later reader can never mistake released evidence for proof that
     /// nothing committed.
     async fn release_evidence(&self, attempt: AttemptId) -> Result<(), StateStoreError>;
+
+    /// Uses the same installed original owner for evidence observation.
+    /// Unsupported providers refuse explicitly; no legacy I/O is dispatched.
+    async fn adjudicate_in(
+        &self,
+        _attempt: AttemptId,
+        _execution: &StateStoreExecutionContext,
+    ) -> Result<AttemptOutcome, StateStoreExecutionFailure> {
+        Err(StateStoreOriginalUnsupported.into_original_failure())
+    }
+
+    /// Releases evidence through that same original owner. Cancellation of this
+    /// borrower never removes the supervisor's outstanding release obligation.
+    async fn release_evidence_in(
+        &self,
+        _attempt: AttemptId,
+        _execution: &StateStoreExecutionContext,
+    ) -> Result<(), StateStoreExecutionFailure> {
+        Err(StateStoreOriginalUnsupported.into_original_failure())
+    }
+}
+
+// Closed API selection, not a second attempt algorithm or execution owner.
+// Returning the async-trait future directly adds no wrapper future allocation.
+type EvidenceFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+trait EvidenceMode: Sync {
+    type Error: Send;
+    fn from_store(error: StateStoreError) -> Self::Error;
+    fn kind(error: &Self::Error) -> Option<StateStoreErrorKind>;
+    fn adjudicate<'a>(
+        &'a self,
+        adjudicator: &'a dyn InDoubtAdjudicator,
+        attempt: AttemptId,
+    ) -> EvidenceFuture<'a, AttemptOutcome, Self::Error>;
+    fn release<'a>(
+        &'a self,
+        adjudicator: &'a dyn InDoubtAdjudicator,
+        attempt: AttemptId,
+    ) -> EvidenceFuture<'a, (), Self::Error>;
+}
+struct LegacyEvidence;
+impl EvidenceMode for LegacyEvidence {
+    type Error = StateStoreError;
+    fn from_store(error: StateStoreError) -> Self::Error {
+        error
+    }
+    fn kind(error: &Self::Error) -> Option<StateStoreErrorKind> {
+        Some(error.kind())
+    }
+    fn adjudicate<'a>(
+        &'a self,
+        adjudicator: &'a dyn InDoubtAdjudicator,
+        attempt: AttemptId,
+    ) -> EvidenceFuture<'a, AttemptOutcome, Self::Error> {
+        adjudicator.adjudicate(attempt)
+    }
+    fn release<'a>(
+        &'a self,
+        adjudicator: &'a dyn InDoubtAdjudicator,
+        attempt: AttemptId,
+    ) -> EvidenceFuture<'a, (), Self::Error> {
+        adjudicator.release_evidence(attempt)
+    }
+}
+struct OriginalEvidence<'a>(&'a StateStoreExecutionContext);
+impl EvidenceMode for OriginalEvidence<'_> {
+    type Error = StateStoreExecutionFailure;
+    fn from_store(error: StateStoreError) -> Self::Error {
+        error.into_original_failure()
+    }
+    fn kind(error: &Self::Error) -> Option<StateStoreErrorKind> {
+        // Only this API's original error owns Transient semantics. A foreign
+        // fact, diagnostic, or nested source is not a retry classification.
+        error
+            .downcast_ref::<StateStoreError>()
+            .map(StateStoreError::kind)
+    }
+    fn adjudicate<'a>(
+        &'a self,
+        adjudicator: &'a dyn InDoubtAdjudicator,
+        attempt: AttemptId,
+    ) -> EvidenceFuture<'a, AttemptOutcome, Self::Error> {
+        adjudicator.adjudicate_in(attempt, self.0)
+    }
+    fn release<'a>(
+        &'a self,
+        adjudicator: &'a dyn InDoubtAdjudicator,
+        attempt: AttemptId,
+    ) -> EvidenceFuture<'a, (), Self::Error> {
+        adjudicator.release_evidence_in(attempt, self.0)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,6 +282,9 @@ enum SlotState {
 struct Slot {
     id: AttemptId,
     state: Mutex<SlotState>,
+    // Only the supervisor-adjudicated path owns this release. Provider-owned
+    // settle paths retain their existing physical release responsibility.
+    evidence_pending: AtomicBool,
     supervisor: Arc<SupervisorInner>,
 }
 
@@ -200,6 +299,12 @@ impl Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
+        if self.evidence_pending.load(Ordering::Acquire) {
+            // The release guard transferred this original charge to debt
+            // before its last strong alias could exit. A drain whose Weak
+            // upgrade loses to this Drop is the sole remaining refund owner.
+            return;
+        }
         // The last handle for this attempt is gone. A settled or never
         // dispatched attempt owes nothing more and frees its slot. A dispatched
         // attempt nobody settled is a real debt: it may still be committing, so
@@ -215,8 +320,10 @@ impl Drop for Slot {
                 // no storage was touched, so the capacity is free.
                 self.supervisor.release_slot();
             }
-            Ok(SlotState::Dispatched) => self.supervisor.record_debt(self.id),
-            Err(_) => self.supervisor.record_debt(self.id),
+            Ok(SlotState::Dispatched) => {
+                self.supervisor.record_debt(CleanupDebt::abandoned(self.id))
+            }
+            Err(_) => self.supervisor.record_debt(CleanupDebt::abandoned(self.id)),
         }
     }
 }
@@ -228,7 +335,7 @@ struct SupervisorInner {
     outstanding: Mutex<usize>,
     /// Attempts whose evidence still has to be released, or that were dropped
     /// while dispatched. They stay charged against capacity until drained.
-    debt: Mutex<VecDeque<AttemptId>>,
+    debt: Mutex<VecDeque<CleanupDebt>>,
     adjudicator: Arc<dyn InDoubtAdjudicator>,
 }
 
@@ -239,9 +346,88 @@ impl SupervisorInner {
         }
     }
 
-    fn record_debt(&self, attempt: AttemptId) {
+    fn record_debt(&self, entry: CleanupDebt) {
         if let Ok(mut debt) = self.debt.lock() {
-            debt.push_back(attempt);
+            debt.push_back(entry);
+        }
+    }
+}
+
+// Each entry owns the original outstanding charge only after the Slot exits.
+// A Weak points back to a still-observable adjudicated terminal without making
+// a supervisor -> Slot -> supervisor ownership cycle.
+struct CleanupDebt {
+    id: AttemptId,
+    slot: Weak<Slot>,
+}
+
+impl CleanupDebt {
+    fn abandoned(id: AttemptId) -> Self {
+        Self {
+            id,
+            slot: Weak::new(),
+        }
+    }
+
+    fn released(self, supervisor: &SupervisorInner) {
+        if let Some(slot) = self.slot.upgrade() {
+            // Keep this strong alias until the flag is clear. The final Slot
+            // Drop, possibly this one, is the only refund while aliases live.
+            slot.evidence_pending.store(false, Ordering::Release);
+            drop(slot);
+        } else {
+            // Slot::drop sees evidence_pending and does not refund or requeue.
+            supervisor.release_slot();
+        }
+    }
+}
+
+// This guard borrows a strong original Slot. Its cancellation transfer always
+// happens before that alias can be dropped; an answer alone is not a release.
+struct AdjudicatedRelease<'a> {
+    slot: &'a Arc<Slot>,
+    pending: bool,
+}
+
+impl<'a> AdjudicatedRelease<'a> {
+    fn new(slot: &'a Arc<Slot>) -> Self {
+        slot.evidence_pending.store(true, Ordering::Release);
+        Self {
+            slot,
+            pending: true,
+        }
+    }
+
+    fn released(mut self) {
+        self.slot.evidence_pending.store(false, Ordering::Release);
+        self.pending = false;
+    }
+}
+
+impl Drop for AdjudicatedRelease<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            self.slot.supervisor.record_debt(CleanupDebt {
+                id: self.slot.id,
+                slot: Arc::downgrade(self.slot),
+            });
+        }
+    }
+}
+
+// One drain exclusively owns its taken batch. The front remains in this guard
+// across the provider await, so cancellation returns both current and tail.
+struct PendingDebts<'a> {
+    supervisor: &'a SupervisorInner,
+    entries: VecDeque<CleanupDebt>,
+}
+
+impl Drop for PendingDebts<'_> {
+    fn drop(&mut self) {
+        if !self.entries.is_empty()
+            && let Ok(mut debt) = self.supervisor.debt.lock()
+        {
+            debt.append(&mut self.entries);
         }
     }
 }
@@ -283,8 +469,9 @@ impl AttemptSupervisor {
         self.inner.outstanding.lock().map_or(0, |count| *count)
     }
 
-    /// Dispatched attempts abandoned before settling, whose evidence still
-    /// has to be released. See [`Self::drain_abandoned_attempts`].
+    /// Queued attempts whose evidence still has to be released, including a
+    /// cancelled or failed release after adjudication. See
+    /// [`Self::drain_abandoned_attempts`].
     pub fn abandoned(&self) -> usize {
         self.inner.debt.lock().map_or(0, |debt| debt.len())
     }
@@ -334,6 +521,7 @@ impl AttemptSupervisor {
                 sequence,
             },
             state: Mutex::new(SlotState::Reserved),
+            evidence_pending: AtomicBool::new(false),
             supervisor: Arc::clone(&self.inner),
         });
 
@@ -353,7 +541,8 @@ impl AttemptSupervisor {
     /// method would let a provider's private evidence grow without bound, which
     /// is one of the things the attempt contract exists to prevent.
     ///
-    /// What lands here is the case with nobody left to do it: every handle for a
+    /// This also owns a failed or cancelled supervisor-adjudicated release.
+    /// Otherwise it is the case with nobody left to do it: every handle for a
     /// dispatched attempt was dropped before anything settled. The slot stays
     /// charged until the release succeeds, because reclaiming it early would let
     /// new work evict evidence a possibly-committed attempt still needs.
@@ -363,33 +552,52 @@ impl AttemptSupervisor {
     /// whose release fails stay queued and stay charged. Returns how many were
     /// released.
     pub async fn drain_abandoned_attempts(&self) -> Result<usize, StateStoreError> {
-        let pending = {
-            let mut debt = self
-                .inner
-                .debt
-                .lock()
-                .map_err(|_| internal("state store cleanup debt lock is poisoned"))?;
-            std::mem::take(&mut *debt)
+        self.drain_with(&LegacyEvidence).await
+    }
+
+    /// Borrows the installed original owner for the same debt pass. The context
+    /// and its absolute deadline are unchanged; this does not spawn a worker or
+    /// authorize legacy evidence I/O if original execution is unavailable.
+    pub async fn drain_abandoned_attempts_in(
+        &self,
+        execution: &StateStoreExecutionContext,
+    ) -> Result<usize, StateStoreExecutionFailure> {
+        self.drain_with(&OriginalEvidence(execution)).await
+    }
+
+    async fn drain_with<M: EvidenceMode>(&self, mode: &M) -> Result<usize, M::Error> {
+        let mut pending = PendingDebts {
+            supervisor: &self.inner,
+            entries: {
+                let mut debt = self.inner.debt.lock().map_err(|_| {
+                    M::from_store(internal("state store cleanup debt lock is poisoned"))
+                })?;
+                std::mem::take(&mut *debt)
+            },
         };
 
         let mut released = 0_usize;
-        let mut blocked: Option<StateStoreError> = None;
-        for attempt in pending {
-            match self.inner.adjudicator.release_evidence(attempt).await {
+        let mut blocked: Option<M::Error> = None;
+        while let Some(entry) = pending.entries.front() {
+            let attempt = entry.id;
+            match mode.release(self.inner.adjudicator.as_ref(), attempt).await {
                 Ok(()) => {
-                    self.inner.release_slot();
+                    // No await separates successful release, removal, and the
+                    // original charge disposition.
+                    pending.entries.pop_front().unwrap().released(&self.inner);
                     released += 1;
                 }
                 Err(error) => {
                     // Requeue: the slot stays charged, which is the point.
                     // Reclaiming capacity here would let new work evict evidence
                     // that may still be needed.
-                    self.inner.record_debt(attempt);
+                    self.inner.record_debt(pending.entries.pop_front().unwrap());
                     // "Not releasable yet" is an ordinary state, not a fault: a
                     // provider says it while its own worker is still in flight.
                     // Stopping the pass on it would let one busy attempt hide
                     // every other release that was ready to happen.
-                    if error.kind() != StateStoreErrorKind::Transient && blocked.is_none() {
+                    if M::kind(&error) != Some(StateStoreErrorKind::Transient) && blocked.is_none()
+                    {
                         blocked = Some(error);
                     }
                 }
@@ -548,13 +756,36 @@ impl std::fmt::Debug for WriteAttempt {
 ///
 /// Cloning shares the attempt's slot rather than charging a second one, so a
 /// caller may hand a copy to whoever needs to learn the result. The slot is
-/// freed once every clone is gone and the outcome is terminal.
+/// freed once every clone is gone, the outcome is terminal, and any
+/// supervisor-adjudicated evidence release has completed.
 #[derive(Clone)]
 pub struct CommitObservation {
     slot: Arc<Slot>,
 }
 
+/// A read-only snapshot of the issued attempt's own publication state.
+/// NotDispatched is an instantaneous fact, never a terminal absence proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommitObservationState {
+    NotDispatched,
+    Dispatched,
+    Terminal(AttemptOutcome),
+}
+
 impl CommitObservation {
+    /// Reads the original slot without I/O, adjudication or settlement.
+    /// A later provider dispatch may follow NotDispatched; this grants no right
+    /// to retire the owner or declare its operation uncommitted.
+    pub fn publication_state(&self) -> Result<CommitObservationState, StateStoreError> {
+        Ok(match self.slot.read()? {
+            SlotState::Reserved => CommitObservationState::NotDispatched,
+            SlotState::Dispatched => CommitObservationState::Dispatched,
+            SlotState::CancelledBeforeDispatch => {
+                CommitObservationState::Terminal(AttemptOutcome::NotCommitted)
+            }
+            SlotState::Settled(outcome) => CommitObservationState::Terminal(outcome),
+        })
+    }
     pub fn id(&self) -> AttemptId {
         self.slot.id
     }
@@ -577,6 +808,20 @@ impl CommitObservation {
     /// re-adjudicated, so a decision cannot be revisited after the evidence it
     /// rested on has been released.
     pub async fn outcome(&self) -> Result<AttemptOutcome, StateStoreError> {
+        self.outcome_with(&LegacyEvidence).await
+    }
+
+    /// Resolves through the same installed original owner without a legacy
+    /// fallback. Cached terminal proofs still require no provider I/O. A failed
+    /// or cancelled evidence release retains the same Slot/debt responsibility.
+    pub async fn outcome_in(
+        &self,
+        execution: &StateStoreExecutionContext,
+    ) -> Result<AttemptOutcome, StateStoreExecutionFailure> {
+        self.outcome_with(&OriginalEvidence(execution)).await
+    }
+
+    async fn outcome_with<M: EvidenceMode>(&self, mode: &M) -> Result<AttemptOutcome, M::Error> {
         // Reading `Reserved` and answering from it has to be one step. A
         // provider whose commit runs on a task the caller does not own can mark
         // the attempt dispatched at any moment, so a lock taken only to read
@@ -587,11 +832,9 @@ impl CommitObservation {
         // provider already turns that failure into a definite failure rather
         // than writing.
         {
-            let mut state = self
-                .slot
-                .state
-                .lock()
-                .map_err(|_| internal("state store attempt slot lock is poisoned"))?;
+            let mut state = self.slot.state.lock().map_err(|_| {
+                M::from_store(internal("state store attempt slot lock is poisoned"))
+            })?;
             match &*state {
                 SlotState::Settled(outcome) => return Ok(outcome.clone()),
                 SlotState::CancelledBeforeDispatch => return Ok(AttemptOutcome::NotCommitted),
@@ -607,30 +850,26 @@ impl CommitObservation {
             }
         }
 
-        let decided = self
-            .slot
-            .supervisor
-            .adjudicator
-            .adjudicate(self.slot.id)
+        let decided = mode
+            .adjudicate(self.slot.supervisor.adjudicator.as_ref(), self.slot.id)
             .await?;
         if !decided.is_terminal() {
             return Ok(AttemptOutcome::Unresolved);
         }
 
         // Record the proof before anything can release the evidence behind it.
-        let published = {
-            let mut state = self
-                .slot
-                .state
-                .lock()
-                .map_err(|_| internal("state store attempt slot lock is poisoned"))?;
+        let (published, release) = {
+            let mut state = self.slot.state.lock().map_err(|_| {
+                M::from_store(internal("state store attempt slot lock is poisoned"))
+            })?;
             match &*state {
                 // Someone else already published; theirs stands and theirs owns
                 // the release.
                 SlotState::Settled(existing) => return Ok(existing.clone()),
                 _ => {
+                    let release = AdjudicatedRelease::new(&self.slot);
                     *state = SlotState::Settled(decided.clone());
-                    decided
+                    (decided, release)
                 }
             }
         };
@@ -644,15 +883,15 @@ impl CommitObservation {
         // A failed release is not a failed read. The caller asked what happened
         // and now knows; the uncollected evidence becomes accounted debt rather
         // than a lost answer or a silently leaked row.
-        if let Err(_error) = self
-            .slot
-            .supervisor
-            .adjudicator
-            .release_evidence(self.slot.id)
+        if mode
+            .release(self.slot.supervisor.adjudicator.as_ref(), self.slot.id)
             .await
+            .is_ok()
         {
-            self.slot.supervisor.record_debt(self.slot.id);
+            release.released();
         }
+        // Err and cancellation retain the same original charge as debt. Other
+        // observers keep the published answer without creating another debt.
         Ok(published)
     }
 }
@@ -738,6 +977,38 @@ mod tests {
             attempt,
             revision: StoreRevision::try_from(Bytes::from_static(b"r1")).expect("revision"),
         }
+    }
+
+    #[test]
+    fn publication_snapshot_reads_only_the_actual_issued_state() {
+        let (supervisor, _) = supervisor(2);
+        let (attempt, observation) = supervisor.reserve().unwrap();
+        assert_eq!(
+            observation.publication_state().unwrap(),
+            CommitObservationState::NotDispatched
+        );
+        assert!(observation.peek().unwrap().is_none());
+        // Reading NotDispatched did not consume the owner's dispatch right.
+        attempt.mark_dispatched().unwrap();
+        assert_eq!(
+            observation.publication_state().unwrap(),
+            CommitObservationState::Dispatched
+        );
+        assert!(observation.peek().unwrap().is_none());
+        let actual = receipt(attempt.id());
+        attempt
+            .settle(AttemptOutcome::Committed(actual.clone()))
+            .unwrap();
+        assert_eq!(
+            observation.publication_state().unwrap(),
+            CommitObservationState::Terminal(AttemptOutcome::Committed(actual))
+        );
+        let (withdrawn, observed) = supervisor.reserve().unwrap();
+        withdrawn.cancel_before_dispatch().unwrap();
+        assert_eq!(
+            observed.publication_state().unwrap(),
+            CommitObservationState::Terminal(AttemptOutcome::NotCommitted)
+        );
     }
 
     #[test]
@@ -1212,5 +1483,474 @@ mod tests {
             supervisor.drain_abandoned_attempts().await.expect("drain"),
             0
         );
+    }
+
+    // The provider retains real per-attempt evidence until its release await
+    // passes the gate. Cancelling a caller cannot itself delete this evidence.
+    struct GatedEvidence {
+        evidence: Mutex<std::collections::HashSet<AttemptId>>,
+        released: Mutex<Vec<AttemptId>>,
+        adjudicated: AtomicUsize,
+        refuse: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl GatedEvidence {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                evidence: Mutex::new(std::collections::HashSet::new()),
+                released: Mutex::new(Vec::new()),
+                adjudicated: AtomicUsize::new(0),
+                refuse: AtomicBool::new(false),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn reserve(&self, supervisor: &AttemptSupervisor) -> (WriteAttempt, CommitObservation) {
+            let (attempt, observation) = supervisor.reserve().expect("original reservation");
+            assert!(self.evidence.lock().unwrap().insert(attempt.id()));
+            attempt.mark_dispatched().expect("original dispatch");
+            (attempt, observation)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InDoubtAdjudicator for GatedEvidence {
+        async fn adjudicate(&self, attempt: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
+            assert!(self.evidence.lock().unwrap().contains(&attempt));
+            self.adjudicated.fetch_add(1, Ordering::Relaxed);
+            Ok(AttemptOutcome::NotCommitted)
+        }
+
+        async fn release_evidence(&self, attempt: AttemptId) -> Result<(), StateStoreError> {
+            self.entered.notify_one();
+            if self.refuse.load(Ordering::Acquire) {
+                return Err(StateStoreError::new(
+                    StateStoreErrorKind::Transient,
+                    "release not ready",
+                ));
+            }
+            self.release.acquire().await.expect("release gate").forget();
+            assert!(
+                self.evidence.lock().unwrap().remove(&attempt),
+                "evidence is released once"
+            );
+            self.released.lock().unwrap().push(attempt);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_concurrent_drains_return_current_and_remaining_original_debt() {
+        let evidence = GatedEvidence::new();
+        let supervisor = AttemptSupervisor::new(NonZeroUsize::new(4).unwrap(), evidence.clone());
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let (attempt, observation) = evidence.reserve(&supervisor);
+            ids.insert(attempt.id());
+            drop((attempt, observation));
+        }
+        let first = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.drain_abandoned_attempts().await }
+        });
+        evidence.entered.notified().await;
+        // The other drain gets only newly abandoned debt, never the first
+        // drain's in-flight entry or its unvisited tail.
+        let (attempt, observation) = evidence.reserve(&supervisor);
+        ids.insert(attempt.id());
+        drop((attempt, observation));
+        let second = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.drain_abandoned_attempts().await }
+        });
+        evidence.entered.notified().await;
+        first.abort();
+        second.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(second.await.unwrap_err().is_cancelled());
+        assert_eq!(supervisor.abandoned(), 4);
+        assert_eq!(supervisor.outstanding(), 4);
+        assert_eq!(*evidence.evidence.lock().unwrap(), ids);
+        assert!(evidence.released.lock().unwrap().is_empty());
+
+        evidence.release.add_permits(4);
+        assert_eq!(supervisor.drain_abandoned_attempts().await.unwrap(), 4);
+        assert_eq!(supervisor.abandoned(), 0);
+        assert_eq!(supervisor.outstanding(), 0);
+        assert!(evidence.evidence.lock().unwrap().is_empty());
+        let released = evidence.released.lock().unwrap();
+        assert_eq!(released.len(), 4);
+        assert_eq!(
+            released
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            ids
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_adjudicated_release_keeps_the_terminal_and_original_charge() {
+        let evidence = GatedEvidence::new();
+        let supervisor = AttemptSupervisor::new(NonZeroUsize::new(1).unwrap(), evidence.clone());
+        let (attempt, observation) = evidence.reserve(&supervisor);
+        let id = attempt.id();
+        let resolving = tokio::spawn({
+            let observation = observation.clone();
+            async move { observation.outcome().await }
+        });
+        evidence.entered.notified().await;
+        assert_eq!(
+            observation.peek().unwrap(),
+            Some(AttemptOutcome::NotCommitted)
+        );
+        assert_eq!(
+            observation.outcome().await.unwrap(),
+            AttemptOutcome::NotCommitted
+        );
+        assert_eq!(evidence.adjudicated.load(Ordering::Relaxed), 1);
+        resolving.abort();
+        assert!(resolving.await.unwrap_err().is_cancelled());
+        assert_eq!(supervisor.abandoned(), 1);
+        drop((attempt, observation));
+        assert_eq!(
+            supervisor.outstanding(),
+            1,
+            "unreleased evidence remains charged"
+        );
+        assert_eq!(
+            supervisor.reserve().unwrap_err().kind(),
+            StateStoreErrorKind::Saturated
+        );
+        assert!(evidence.evidence.lock().unwrap().contains(&id));
+
+        evidence.release.add_permits(1);
+        assert_eq!(supervisor.drain_abandoned_attempts().await.unwrap(), 1);
+        assert_eq!(supervisor.outstanding(), 0);
+        assert_eq!(*evidence.released.lock().unwrap(), vec![id]);
+        let live = supervisor.reserve().unwrap();
+        assert_eq!(supervisor.drain_abandoned_attempts().await.unwrap(), 0);
+        assert_eq!(
+            supervisor.outstanding(),
+            1,
+            "no second refund consumes the next attempt"
+        );
+        drop(live);
+        assert_eq!(supervisor.outstanding(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_adjudicated_release_refunds_once_on_either_side_of_last_alias_drop() {
+        for drop_aliases_first in [false, true] {
+            let evidence = GatedEvidence::new();
+            let supervisor =
+                AttemptSupervisor::new(NonZeroUsize::new(1).unwrap(), evidence.clone());
+            let (attempt, observation) = evidence.reserve(&supervisor);
+            let alias = observation.clone();
+            evidence.refuse.store(true, Ordering::Release);
+            assert_eq!(
+                observation.outcome().await.unwrap(),
+                AttemptOutcome::NotCommitted
+            );
+            assert_eq!(alias.outcome().await.unwrap(), AttemptOutcome::NotCommitted);
+            assert_eq!(
+                supervisor.abandoned(),
+                1,
+                "a cached terminal adds no second debt"
+            );
+            drop((attempt, observation));
+            let mut last = Some(alias);
+            if drop_aliases_first {
+                drop(last.take());
+            }
+            assert_eq!(supervisor.outstanding(), 1);
+            assert_eq!(
+                supervisor.reserve().unwrap_err().kind(),
+                StateStoreErrorKind::Saturated
+            );
+
+            evidence.refuse.store(false, Ordering::Release);
+            evidence.release.add_permits(1);
+            assert_eq!(supervisor.drain_abandoned_attempts().await.unwrap(), 1);
+            assert_eq!(supervisor.outstanding(), usize::from(!drop_aliases_first));
+            drop(last);
+            assert_eq!(supervisor.outstanding(), 0);
+            let live = supervisor.reserve().unwrap();
+            assert_eq!(supervisor.drain_abandoned_attempts().await.unwrap(), 0);
+            assert_eq!(supervisor.outstanding(), 1);
+            drop(live);
+            assert_eq!(supervisor.outstanding(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_settlement_retains_its_existing_release_owner() {
+        let evidence = GatedEvidence::new();
+        let supervisor = AttemptSupervisor::new(NonZeroUsize::new(1).unwrap(), evidence.clone());
+        let (attempt, observation) = evidence.reserve(&supervisor);
+        attempt.settle(AttemptOutcome::NotCommitted).unwrap();
+        assert_eq!(
+            observation.outcome().await.unwrap(),
+            AttemptOutcome::NotCommitted
+        );
+        assert_eq!(evidence.adjudicated.load(Ordering::Relaxed), 0);
+        evidence.release.add_permits(1);
+        evidence.release_evidence(attempt.id()).await.unwrap();
+        assert_eq!(supervisor.abandoned(), 0);
+        drop(attempt);
+        assert_eq!(
+            supervisor.outstanding(),
+            1,
+            "the original observation still owns its alias"
+        );
+        drop(observation);
+        assert_eq!(supervisor.outstanding(), 0);
+        assert_eq!(supervisor.drain_abandoned_attempts().await.unwrap(), 0);
+    }
+
+    // This test port never supplies a physical operation. These tests exercise
+    // only the original API borrower, shared evidence algorithm and debt owner.
+    struct NoPhysicalPort;
+    impl crate::StateStoreExecutionPort for NoPhysicalPort {
+        fn bind_original_in(
+            &self,
+            _: &Arc<dyn crate::StateStoreBlockingOriginal>,
+            _: std::time::Instant,
+            _: &mut Option<Box<dyn crate::StateStoreBlockingSlot>>,
+        ) -> Result<(), StateStoreExecutionFailure> {
+            panic!("evidence fixture must not fabricate a physical slot")
+        }
+        fn request_progress(&self) {}
+    }
+    fn original_context() -> (
+        Arc<dyn crate::StateStoreExecutionPort>,
+        StateStoreExecutionContext,
+    ) {
+        let port: Arc<dyn crate::StateStoreExecutionPort> = Arc::new(NoPhysicalPort);
+        let execution = StateStoreExecutionContext::new(
+            &port,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        (port, execution)
+    }
+
+    struct OriginalEvidenceFixture {
+        expected: StateStoreExecutionContext,
+        evidence: Arc<GatedEvidence>,
+        observe_error: Mutex<Option<StateStoreExecutionFailure>>,
+        release_error: Mutex<Option<StateStoreExecutionFailure>>,
+    }
+    impl OriginalEvidenceFixture {
+        fn new(execution: &StateStoreExecutionContext, evidence: Arc<GatedEvidence>) -> Arc<Self> {
+            Arc::new(Self {
+                expected: execution.clone(),
+                evidence,
+                observe_error: Mutex::new(None),
+                release_error: Mutex::new(None),
+            })
+        }
+        fn check(&self, execution: &StateStoreExecutionContext) {
+            assert!(self.expected.shares_owner(execution));
+            assert_eq!(self.expected.deadline(), execution.deadline());
+        }
+    }
+    #[async_trait::async_trait]
+    impl InDoubtAdjudicator for OriginalEvidenceFixture {
+        async fn adjudicate(&self, _: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
+            panic!("original observation must not dispatch the legacy API")
+        }
+        async fn release_evidence(&self, _: AttemptId) -> Result<(), StateStoreError> {
+            panic!("original release must not dispatch the legacy API")
+        }
+        async fn adjudicate_in(
+            &self,
+            attempt: AttemptId,
+            execution: &StateStoreExecutionContext,
+        ) -> Result<AttemptOutcome, StateStoreExecutionFailure> {
+            self.check(execution);
+            if let Some(error) = self.observe_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            // Both fixture APIs share the same provider evidence set/gate;
+            // this is not a production fallback or a second release record.
+            self.evidence
+                .adjudicate(attempt)
+                .await
+                .map_err(StateStoreError::into_original_failure)
+        }
+        async fn release_evidence_in(
+            &self,
+            attempt: AttemptId,
+            execution: &StateStoreExecutionContext,
+        ) -> Result<(), StateStoreExecutionFailure> {
+            self.check(execution);
+            if let Some(error) = self.release_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            self.evidence
+                .release_evidence(attempt)
+                .await
+                .map_err(StateStoreError::into_original_failure)
+        }
+    }
+
+    #[tokio::test]
+    async fn original_evidence_defaults_refuse_without_dispatching_legacy() {
+        let (_port, execution) = original_context();
+        let (supervisor, legacy) = supervisor(1);
+        let (attempt, observation) = supervisor.reserve().unwrap();
+        attempt.mark_dispatched().unwrap();
+        let refusal = observation.outcome_in(&execution).await.unwrap_err();
+        assert!(
+            refusal
+                .downcast_ref::<StateStoreOriginalUnsupported>()
+                .is_some()
+        );
+        assert_eq!(observation.peek().unwrap(), None);
+        drop((attempt, observation));
+        let refusal = supervisor
+            .drain_abandoned_attempts_in(&execution)
+            .await
+            .unwrap_err();
+        assert!(
+            refusal
+                .downcast_ref::<StateStoreOriginalUnsupported>()
+                .is_some()
+        );
+        assert_eq!(legacy.adjudicated.load(Ordering::Relaxed), 0);
+        assert_eq!(legacy.released.load(Ordering::Relaxed), 0);
+        assert_eq!(supervisor.abandoned(), 1);
+        assert_eq!(supervisor.outstanding(), 1);
+        // The explicit legacy entry still uses its existing provider contract.
+        assert_eq!(supervisor.drain_abandoned_attempts().await.unwrap(), 1);
+        assert_eq!(legacy.released.load(Ordering::Relaxed), 1);
+        let (attempt, observation) = supervisor.reserve().unwrap();
+        assert_eq!(
+            observation.outcome_in(&execution).await.unwrap(),
+            AttemptOutcome::NotCommitted
+        );
+        assert_eq!(
+            attempt.mark_dispatched().unwrap_err().kind(),
+            StateStoreErrorKind::InvalidRequest
+        );
+        assert_eq!(legacy.adjudicated.load(Ordering::Relaxed), 0);
+    }
+
+    #[derive(Debug)]
+    struct ForeignTransient;
+    impl std::fmt::Display for ForeignTransient {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Transient: release not ready")
+        }
+    }
+    impl std::error::Error for ForeignTransient {}
+    impl novarocks_failure_contract::FailureProjection for ForeignTransient {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            // Deliberately the same fact and diagnostic as the API-owned
+            // Transient. Neither permits inferring the foreign retry policy.
+            novarocks_failure_contract::FailureProjection::failure_fact(&StateStoreError::new(
+                StateStoreErrorKind::Transient,
+                "release not ready",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn original_evidence_preserves_cause_and_only_own_transient_is_deferred() {
+        use novarocks_failure_contract::FailureProjection;
+        let (_port, execution) = original_context();
+        let evidence = GatedEvidence::new();
+        let original = OriginalEvidenceFixture::new(&execution, evidence.clone());
+        let supervisor = AttemptSupervisor::new(NonZeroUsize::new(1).unwrap(), original.clone());
+        let (attempt, observation) = evidence.reserve(&supervisor);
+        let foreign = StateStoreExecutionFailure::new(ForeignTransient);
+        *original.observe_error.lock().unwrap() = Some(foreign.clone());
+        let returned = observation.outcome_in(&execution).await.unwrap_err();
+        assert_eq!(returned, foreign, "same original cause identity");
+        assert_eq!(returned.failure_fact(), foreign.failure_fact());
+        assert!(returned.downcast_ref::<ForeignTransient>().is_some());
+        assert_eq!(observation.peek().unwrap(), None);
+        *original.observe_error.lock().unwrap() = None;
+        drop((attempt, observation));
+        *original.release_error.lock().unwrap() = Some(foreign.clone());
+        assert_eq!(
+            supervisor
+                .drain_abandoned_attempts_in(&execution)
+                .await
+                .unwrap_err(),
+            foreign
+        );
+        assert_eq!((supervisor.outstanding(), supervisor.abandoned()), (1, 1));
+        *original.release_error.lock().unwrap() = Some(
+            StateStoreError::new(StateStoreErrorKind::Transient, "release not ready")
+                .into_original_failure(),
+        );
+        assert_eq!(
+            supervisor
+                .drain_abandoned_attempts_in(&execution)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!((supervisor.outstanding(), supervisor.abandoned()), (1, 1));
+        *original.release_error.lock().unwrap() = None;
+        evidence.release.add_permits(1);
+        assert_eq!(
+            supervisor
+                .drain_abandoned_attempts_in(&execution)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!((supervisor.outstanding(), supervisor.abandoned()), (0, 0));
+        assert_eq!(evidence.released.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn original_cancelled_release_returns_to_same_debt_and_context() {
+        let (_port, execution) = original_context();
+        let evidence = GatedEvidence::new();
+        let original = OriginalEvidenceFixture::new(&execution, evidence.clone());
+        let supervisor = AttemptSupervisor::new(NonZeroUsize::new(1).unwrap(), original);
+        let (attempt, observation) = evidence.reserve(&supervisor);
+        let id = attempt.id();
+        let resolving = tokio::spawn({
+            let observation = observation.clone();
+            let execution = execution.clone();
+            async move { observation.outcome_in(&execution).await }
+        });
+        evidence.entered.notified().await;
+        assert_eq!(
+            observation.outcome_in(&execution).await.unwrap(),
+            AttemptOutcome::NotCommitted
+        );
+        resolving.abort();
+        assert!(resolving.await.unwrap_err().is_cancelled());
+        drop((attempt, observation));
+        assert_eq!((supervisor.outstanding(), supervisor.abandoned()), (1, 1));
+        let draining = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let execution = execution.clone();
+            async move { supervisor.drain_abandoned_attempts_in(&execution).await }
+        });
+        evidence.entered.notified().await;
+        draining.abort();
+        assert!(draining.await.unwrap_err().is_cancelled());
+        assert_eq!((supervisor.outstanding(), supervisor.abandoned()), (1, 1));
+        assert!(evidence.evidence.lock().unwrap().contains(&id));
+        evidence.release.add_permits(1);
+        assert_eq!(
+            supervisor
+                .drain_abandoned_attempts_in(&execution)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(evidence.adjudicated.load(Ordering::Relaxed), 1);
+        assert_eq!(*evidence.released.lock().unwrap(), vec![id]);
+        assert_eq!((supervisor.outstanding(), supervisor.abandoned()), (0, 0));
     }
 }

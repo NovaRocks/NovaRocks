@@ -371,12 +371,54 @@ Dependency direction belongs to crate structure and review, following the
 [ADR-0190](../../docs/adr/ADR-0190-dependency-direction-by-structure-and-review.md). CI does not add dependency-boundary,
 source-shape or product-prerequisite checks.
 
-`Cargo dependency policy` runs cargo-deny for advisories, licenses, banned
-versions and sources under the root `deny.toml`. Versions remain owned by the
-root manifest and `Cargo.lock`. This supply-chain policy does not establish
-architectural direction, reject local path replacements or prove product
-compatibility; source requirements outside its coverage need review and
-behavioral evidence.
+`Cargo dependency policy` runs `cargo deny --locked check bans licenses sources`
+under the root `deny.toml`. It remains an admission stage in the fail-fast
+`--cargo-only` chain. It does not fetch the advisory database or check registry
+index yanked status. Versions remain owned by the root manifest and `Cargo.lock`.
+This supply-chain policy does not establish architectural direction, reject local
+path replacements or prove product compatibility; source requirements outside
+its coverage need review and behavioral evidence.
+
+`Cargo dependency advisories` is a separate `full`-tier native stage, following
+[ADR-0200](../../docs/adr/ADR-0200-advisory-discovery-is-independent-of-admission.md).
+It runs `cargo deny --format json --locked check advisories` against the latest
+online database and the same `deny.toml`, including yanked checks and unused
+exception checks. It is absent from `--cargo-only` and the admission enabled
+scope. Its three discovery entries share the same native stage:
+
+- PRs run the independent `dependency-advisories` workflow as a non-required
+  check. Findings and input errors retain a failed check; required-check settings
+  must keep it outside admission. No `continue-on-error` masks the result.
+- The same workflow supports `workflow_dispatch` with an optional ref. It has
+  read-only permissions, publishes a summary and raw artifacts, and opens no
+  issues. Scheduled discovery remains future work.
+- Locally, run the stage with a fresh output directory:
+
+  ```bash
+  tools/ci/local-full-ci.sh --run-stage "Cargo dependency advisories" \
+    /absolute/unused-artifact-receipt.json /absolute/new/advisories-attempt
+  ```
+
+The stage stores `dependency-advisories/cargo-deny.stdout`, `cargo-deny.stderr`,
+`exit`, `summary.json` and `summary.md` below that output directory. It preserves
+raw streams and the cargo-deny exit code. The summary distinguishes `pass`,
+`findings` and `input-error`; removable exceptions are listed separately from
+advisory findings, and input diagnostics remain visible even with findings.
+Database commit, commit time and fetch time describe the observed input; an
+unreadable or ambiguous local database is recorded as unknown. They do not pin
+the database or change the result. A nonempty result directory is rejected.
+
+The stage domain covers `Cargo.lock`, `deny.toml`, its script and its workflow.
+`dev-verify` selects it as a heavy author obligation when those inputs change;
+the full layer includes it. Online findings remain raw failures in composition,
+even when the CI change itself behaves correctly. The database is outside the
+stage identity, so development reuse in one verification root can retain an
+older observation: inspect the summary timestamp and database commit, or use a
+new root for fresh discovery. Local results do not prove remote trigger,
+permission or required-check configuration.
+
+`NOVA_CI_CARGO_DENY_VERSION` must stay identical in `admission.yml` and
+`dependency-advisories.yml`; update and verify both when changing cargo-deny.
 
 The next two stages, in order, are `unused dependencies` and
 `unused dependencies tests`. They run in local full CI, admission and

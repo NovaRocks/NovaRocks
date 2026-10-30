@@ -27,13 +27,13 @@ pub trait ConnectorOriginalResultScopeCheck: Send + Sync + 'static {
     fn original_deadline(&self) -> Instant;
     /// Original control and Work checks only. Never authorizes allocation.
     fn check_active(&self) -> Result<(), OriginalResultCheckError>;
-    fn check_before_growth(&self, simultaneous_upper: u64) -> Result<(), OriginalResultCheckError>;
 }
 
 /// Preserve the original cause; presentation never formats an arbitrary source.
 pub struct OriginalResultCheckError {
     class: OriginalResultCheckClass,
     source: Box<dyn Error + Send + Sync>,
+    fact: novarocks_failure_contract::FailureFact,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OriginalResultCheckClass {
@@ -45,11 +45,13 @@ pub enum OriginalResultCheckClass {
 impl OriginalResultCheckError {
     pub fn new(
         class: OriginalResultCheckClass,
-        source: impl Error + Send + Sync + 'static,
+        source: impl novarocks_failure_contract::FailureProjection + Error + Send + Sync + 'static,
     ) -> Self {
+        let fact = source.failure_fact();
         Self {
             class,
             source: Box::new(source),
+            fact,
         }
     }
     pub fn class(&self) -> OriginalResultCheckClass {
@@ -74,6 +76,13 @@ impl Error for OriginalResultCheckError {
     }
 }
 
+impl novarocks_failure_contract::FailureProjection for OriginalResultCheckError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.fact
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for OriginalResultCheckError {}
+
 #[derive(Clone)]
 pub struct ConnectorOriginalResultScope {
     checks: Arc<dyn ConnectorOriginalResultScopeCheck>,
@@ -95,12 +104,7 @@ impl ConnectorOriginalResultScope {
     pub fn check_active(&self) -> Result<(), OriginalResultCheckError> {
         self.checks.check_active()
     }
-    pub fn check_before_growth(
-        &self,
-        simultaneous_upper: u64,
-    ) -> Result<(), OriginalResultCheckError> {
-        self.checks.check_before_growth(simultaneous_upper)
-    }
+
     pub fn retention_guard(&self) -> ConnectorPayloadRetentionGuard {
         self.guard.clone()
     }
@@ -111,5 +115,60 @@ impl ConnectorOriginalResultScope {
 impl fmt::Debug for ConnectorOriginalResultScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ConnectorOriginalResultScope")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+
+    #[derive(Debug)]
+    struct StopCause;
+    impl fmt::Display for StopCause {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+            panic!("scope failure projection must not format its original source")
+        }
+    }
+    impl Error for StopCause {}
+    impl FailureProjection for StopCause {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            novarocks_failure_contract::FailureFact::stop_observation(
+                novarocks_failure_contract::FailureReason::new(
+                    novarocks_failure_contract::domain::CONNECTOR,
+                    std::num::NonZeroU16::new(432).unwrap(),
+                ),
+            )
+        }
+    }
+
+    #[test]
+    fn original_scope_and_cow_boundary_keep_the_original_fact_and_cause() {
+        let fact = StopCause.failure_fact();
+        let check = OriginalResultCheckError::new(OriginalResultCheckClass::Coverage, StopCause);
+        // The check label is a diagnostic location, not a failure classifier.
+        assert_eq!(check.failure_fact(), fact);
+        let cause = super::super::ConnectorCowBeginCause::OriginalResult(check);
+        let error = super::super::ConnectorError::from_domain(
+            super::super::ConnectorErrorKind::ResourceExhausted,
+            cause,
+        );
+        assert_eq!(error.failure_fact(), fact);
+        let shared = error
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        let original = shared
+            .downcast_ref::<super::super::ConnectorCowBeginCause>()
+            .unwrap();
+        assert!(
+            original
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<StopCause>()
+        );
     }
 }

@@ -18,7 +18,10 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/execution/src/exec/operators/setop/**"]
+paths = [
+    "novarocks/execution/src/exec/operators/setop/**",
+    "novarocks/execution/src/exec/hash_table/**",
+]
 
 [reuse]
 scope = "suite"

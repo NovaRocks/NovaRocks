@@ -26,7 +26,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use novarocks_state_store_api::{
-    Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, StateStoreError,
+    Direction, Key, KeyRange, OriginalWriteTransaction, Precondition, RangeRequest, StateRecord,
+    StateStore, StateStoreError, StateStoreExecutionContext, StateStoreExecutionFailure,
     WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
@@ -34,7 +35,7 @@ use uuid::Uuid;
 
 use novarocks_state_store_runtime::{
     DurableRecord, DurableRecordStore, EncodedRecord, PersistentStateFamily, RunFailure,
-    StateStoreRunMetrics, StateStoreRunPolicy, run_side_effect_free,
+    StateStoreRunMetrics, StateStoreRunPolicy, run_side_effect_free, run_side_effect_free_in,
 };
 
 /// Frozen StateStore identity owned by Table Maintenance.
@@ -202,6 +203,80 @@ impl fmt::Display for GcOwnedRefObservationError {
 
 impl std::error::Error for GcOwnedRefObservationError {}
 
+/// Original execution preserves the provider's raw failure and the exact
+/// unresolved observation; neither is formatted into the legacy String error.
+#[derive(Clone, Debug)]
+pub enum GcOwnedRefObservationInError {
+    Observation(GcOwnedRefObservationError),
+    Run(RunFailure<StateStoreExecutionFailure>),
+}
+impl GcOwnedRefObservationInError {
+    pub fn kind(&self) -> GcOwnedRefObservationErrorKind {
+        match self {
+            Self::Observation(error) => error.kind(),
+            Self::Run(RunFailure::CommitUnknown { .. }) => {
+                GcOwnedRefObservationErrorKind::CommitUnknown
+            }
+            Self::Run(_) => GcOwnedRefObservationErrorKind::Store,
+        }
+    }
+    pub fn run_failure(&self) -> Option<&RunFailure<StateStoreExecutionFailure>> {
+        match self {
+            Self::Run(failure) => Some(failure),
+            _ => None,
+        }
+    }
+    pub fn original_failure(&self) -> Option<&StateStoreExecutionFailure> {
+        match self {
+            Self::Run(
+                RunFailure::Begin(error)
+                | RunFailure::Operation(error)
+                | RunFailure::RetryExhausted(error)
+                | RunFailure::DefiniteFailure(error)
+                | RunFailure::CommitUnknown { error, .. },
+            ) => Some(error),
+            _ => None,
+        }
+    }
+}
+impl fmt::Display for GcOwnedRefObservationInError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observation(error) => error.fmt(f),
+            Self::Run(failure) => match failure {
+                RunFailure::Begin(error) => {
+                    write!(f, "GC original observation begin failed: {error}")
+                }
+                RunFailure::Operation(error) => {
+                    write!(f, "GC original observation operation failed: {error}")
+                }
+                RunFailure::RetryExhausted(error) => {
+                    write!(f, "GC original observation retry exhausted: {error}")
+                }
+                RunFailure::DefiniteFailure(error) => {
+                    write!(f, "GC original observation commit failed: {error}")
+                }
+                RunFailure::CommitUnknown { error, .. } => {
+                    write!(f, "GC original observation commit unknown: {error}")
+                }
+                RunFailure::DeadlineExceeded => {
+                    f.write_str("GC original observation deadline exceeded")
+                }
+            },
+        }
+    }
+}
+impl std::error::Error for GcOwnedRefObservationInError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Observation(error) => Some(error),
+            _ => self
+                .original_failure()
+                .map(|error| error as &(dyn std::error::Error + 'static)),
+        }
+    }
+}
+
 /// Product-owned retry facts for GC safety-window persistence.
 #[derive(Debug, Default)]
 struct GcObservationMetrics {
@@ -275,17 +350,7 @@ impl GcOwnedRefObservationAccelerator {
         now_ms: i64,
         safe_gc_age_ms: i64,
     ) -> Result<GcOwnedRefObservationDecision, GcOwnedRefObservationError> {
-        validate_observation(&observation)?;
-        if now_ms <= 0 {
-            return Err(GcOwnedRefObservationError::corruption(
-                "GC owned-ref observation time must be positive",
-            ));
-        }
-        if safe_gc_age_ms <= 0 {
-            return Err(GcOwnedRefObservationError::corruption(
-                "GC owned-ref safe age must be positive",
-            ));
-        }
+        validate_observation_input(&observation, now_ms, safe_gc_age_ms)?;
 
         let durable = self.durable.clone();
         let result = run_side_effect_free(
@@ -297,8 +362,15 @@ impl GcOwnedRefObservationAccelerator {
                 let observation = observation.clone();
                 let durable = durable.clone();
                 Box::pin(async move {
-                    apply_observation(transaction, &durable, observation, now_ms, safe_gc_age_ms)
-                        .await
+                    let mut transaction = LegacyObservation(transaction);
+                    apply_observation(
+                        &mut transaction,
+                        &durable,
+                        observation,
+                        now_ms,
+                        safe_gc_age_ms,
+                    )
+                    .await
                 })
             },
         )
@@ -309,6 +381,49 @@ impl GcOwnedRefObservationAccelerator {
                 "record table-maintenance GC owned-ref observation",
                 failure,
             )),
+        }
+    }
+
+    /// Same record and clock algorithm on the selected original transaction.
+    /// The execution borrower never manufactures another Root or blocking port.
+    pub async fn observe_in(
+        &self,
+        execution: &StateStoreExecutionContext,
+        observation: GcOwnedRefObservation,
+        now_ms: i64,
+        safe_gc_age_ms: i64,
+    ) -> Result<GcOwnedRefObservationDecision, GcOwnedRefObservationInError> {
+        validate_observation_input(&observation, now_ms, safe_gc_age_ms)
+            .map_err(GcOwnedRefObservationInError::Observation)?;
+        let durable = self.durable.clone();
+        let result = run_side_effect_free_in(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            self.policy,
+            "record table-maintenance GC owned-ref observation",
+            execution,
+            move |transaction| {
+                let observation = observation.clone();
+                let durable = durable.clone();
+                Box::pin(async move {
+                    let mut transaction = OriginalObservation(transaction);
+                    apply_observation(
+                        &mut transaction,
+                        &durable,
+                        observation,
+                        now_ms,
+                        safe_gc_age_ms,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        match result {
+            Ok(success) => success
+                .value
+                .map_err(GcOwnedRefObservationInError::Observation),
+            Err(failure) => Err(GcOwnedRefObservationInError::Run(failure)),
         }
     }
 
@@ -462,13 +577,69 @@ impl TryFrom<StoredGcOwnedRefObservationV7> for GcOwnedRefObservation {
     }
 }
 
-async fn apply_observation(
-    transaction: &mut dyn WriteTransaction,
+type ObservationFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+// Only the physical API differs. The record interpretation and maturity clock
+// remain in the one apply_observation/put_not_mature algorithm below.
+trait ObservationTransaction: Send {
+    type Error: Send;
+    fn get<'a>(
+        &'a mut self,
+        key: &'a Key,
+    ) -> ObservationFuture<'a, Result<Option<StateRecord>, Self::Error>>;
+    fn put<'a>(
+        &'a mut self,
+        durable: &'a DurableRecordStore,
+        key: Key,
+        record: EncodedRecord,
+        precondition: Precondition,
+    ) -> ObservationFuture<'a, Result<(), Self::Error>>;
+}
+struct LegacyObservation<'a>(&'a mut dyn WriteTransaction);
+impl ObservationTransaction for LegacyObservation<'_> {
+    type Error = StateStoreError;
+    fn get<'a>(
+        &'a mut self,
+        key: &'a Key,
+    ) -> ObservationFuture<'a, Result<Option<StateRecord>, Self::Error>> {
+        Box::pin(self.0.get(key))
+    }
+    fn put<'a>(
+        &'a mut self,
+        durable: &'a DurableRecordStore,
+        key: Key,
+        record: EncodedRecord,
+        precondition: Precondition,
+    ) -> ObservationFuture<'a, Result<(), Self::Error>> {
+        Box::pin(durable.put_record(self.0, key, record, precondition))
+    }
+}
+struct OriginalObservation<'a>(&'a mut dyn OriginalWriteTransaction);
+impl ObservationTransaction for OriginalObservation<'_> {
+    type Error = StateStoreExecutionFailure;
+    fn get<'a>(
+        &'a mut self,
+        key: &'a Key,
+    ) -> ObservationFuture<'a, Result<Option<StateRecord>, Self::Error>> {
+        Box::pin(self.0.get_in(key))
+    }
+    fn put<'a>(
+        &'a mut self,
+        durable: &'a DurableRecordStore,
+        key: Key,
+        record: EncodedRecord,
+        precondition: Precondition,
+    ) -> ObservationFuture<'a, Result<(), Self::Error>> {
+        Box::pin(durable.put_encoded_in(self.0, key, record, precondition))
+    }
+}
+
+async fn apply_observation<T: ObservationTransaction>(
+    transaction: &mut T,
     durable: &DurableRecordStore,
     observation: GcOwnedRefObservation,
     now_ms: i64,
     safe_gc_age_ms: i64,
-) -> Result<Result<GcOwnedRefObservationDecision, GcOwnedRefObservationError>, StateStoreError> {
+) -> Result<Result<GcOwnedRefObservationDecision, GcOwnedRefObservationError>, T::Error> {
     let key = match observation_key(&observation.table_uuid, &observation.ref_name) {
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
@@ -530,20 +701,18 @@ async fn apply_observation(
     }))
 }
 
-async fn put_not_mature(
-    transaction: &mut dyn WriteTransaction,
+async fn put_not_mature<T: ObservationTransaction>(
+    transaction: &mut T,
     durable: &DurableRecordStore,
     key: Key,
     observation: GcOwnedRefObservation,
     precondition: Precondition,
-) -> Result<Result<GcOwnedRefObservationDecision, GcOwnedRefObservationError>, StateStoreError> {
+) -> Result<Result<GcOwnedRefObservationDecision, GcOwnedRefObservationError>, T::Error> {
     let value = match encode_record(durable, &StoredGcOwnedRefObservationV7::from(&observation)) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
-    durable
-        .put_record(transaction, key, value, precondition)
-        .await?;
+    transaction.put(durable, key, value, precondition).await?;
     Ok(Ok(GcOwnedRefObservationDecision::NotMature {
         first_observed_at_ms: observation.first_observed_at_ms,
     }))
@@ -557,6 +726,25 @@ fn with_first_observed_at(
         first_observed_at_ms,
         ..observation
     }
+}
+
+fn validate_observation_input(
+    observation: &GcOwnedRefObservation,
+    now_ms: i64,
+    safe_gc_age_ms: i64,
+) -> Result<(), GcOwnedRefObservationError> {
+    validate_observation(observation)?;
+    if now_ms <= 0 {
+        return Err(GcOwnedRefObservationError::corruption(
+            "GC owned-ref observation time must be positive",
+        ));
+    }
+    if safe_gc_age_ms <= 0 {
+        return Err(GcOwnedRefObservationError::corruption(
+            "GC owned-ref safe age must be positive",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_observation(
@@ -682,5 +870,117 @@ mod tests {
             StoredGcOwnedRefObservationV7::SCHEMA_VERSION,
             policy.schema_version()
         );
+    }
+}
+
+#[cfg(test)]
+mod original_observation_tests {
+    use super::*;
+    use novarocks_state_store_api::{
+        StateStoreBlockingOriginal, StateStoreBlockingSlot, StateStoreExecutionPort,
+        StateStoreOriginalUnsupported,
+    };
+    use novarocks_state_store_testkit::testing::InMemoryStateStore;
+    struct NoPhysicalPort;
+    impl StateStoreExecutionPort for NoPhysicalPort {
+        fn bind_original_in(
+            &self,
+            _: &Arc<dyn StateStoreBlockingOriginal>,
+            _: std::time::Instant,
+            _: &mut Option<Box<dyn StateStoreBlockingSlot>>,
+        ) -> Result<(), StateStoreExecutionFailure> {
+            panic!("unsupported provider cannot acquire a physical Source");
+        }
+        fn request_progress(&self) {
+            panic!("no original source was installed");
+        }
+    }
+    #[tokio::test]
+    async fn observe_in_keeps_original_unsupported_and_never_writes_through_legacy() {
+        let store = Arc::new(InMemoryStateStore::new("gc-original-no-fallback"));
+        let accelerator =
+            GcOwnedRefObservationAccelerator::open(store.clone(), StateStoreRunPolicy::default())
+                .await
+                .unwrap();
+        let port: Arc<dyn StateStoreExecutionPort> = Arc::new(NoPhysicalPort);
+        let execution = StateStoreExecutionContext::new(
+            &port,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        let observation = GcOwnedRefObservation::try_new(
+            Uuid::from_u128(31),
+            "owned-ref".into(),
+            1,
+            1,
+            [4; 32],
+            1,
+        )
+        .unwrap();
+        let failure = accelerator
+            .observe_in(&execution, observation.clone(), 1000, 50)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind(), GcOwnedRefObservationErrorKind::Store);
+        assert!(
+            failure
+                .original_failure()
+                .unwrap()
+                .downcast_ref::<StateStoreOriginalUnsupported>()
+                .is_some()
+        );
+        // The first legacy call must still establish its OWN safety window.
+        // An implicit legacy fallback above would have made this mature.
+        assert_eq!(
+            accelerator.observe(observation, 2000, 50).await.unwrap(),
+            GcOwnedRefObservationDecision::NotMature {
+                first_observed_at_ms: 2000
+            }
+        );
+    }
+    #[derive(Debug)]
+    struct RawCause;
+    impl fmt::Display for RawCause {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("original raw physical cause")
+        }
+    }
+    impl std::error::Error for RawCause {}
+    impl novarocks_failure_contract::FailureProjection for RawCause {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            novarocks_failure_contract::FailureProjection::failure_fact(&StateStoreError::new(
+                novarocks_state_store_api::StateStoreErrorKind::Transient,
+                "actual test source failed",
+            ))
+        }
+    }
+    #[test]
+    fn original_gc_error_retains_raw_arc_and_exact_unresolved_observation() {
+        let store = InMemoryStateStore::new("gc-original-raw-carrier");
+        let (attempt, observation) = store.attempts().reserve().unwrap();
+        let id = observation.id();
+        let raw =
+            StateStoreExecutionFailure::from_static_detail(RawCause, "actual raw source failed");
+        let failure = GcOwnedRefObservationInError::Run(RunFailure::CommitUnknown {
+            observation,
+            error: raw.clone(),
+        });
+        assert_eq!(
+            failure.kind(),
+            GcOwnedRefObservationErrorKind::CommitUnknown
+        );
+        assert_eq!(failure.original_failure().unwrap(), &raw);
+        let captured = std::error::Error::source(&failure)
+            .unwrap()
+            .downcast_ref::<StateStoreExecutionFailure>()
+            .unwrap();
+        assert_eq!(captured, &raw);
+        assert!(captured.downcast_ref::<RawCause>().is_some());
+        let RunFailure::CommitUnknown { observation, .. } = failure.run_failure().unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(observation.id(), id);
+        assert_eq!(observation.id(), attempt.id());
+        // No commit or actual-exit proof is manufactured by the error carrier.
+        assert!(observation.peek().unwrap().is_none());
     }
 }

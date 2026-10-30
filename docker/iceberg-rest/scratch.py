@@ -40,8 +40,9 @@ IAM_RE = re.compile(r"nr([0-9a-f]{8})([0-9a-f]{10})\Z")
 PURPOSE_RE = re.compile(r"[a-z][a-z0-9]{0,11}\Z")
 MISSING_CODES = {"NoSuchKey", "NoSuchBucket", "NoSuchUser", "NoSuchPolicy",
                  "XMinioAdminNoSuchUser", "XMinioAdminNoSuchPolicy"}
+USER_MISSING_CODES = {"NoSuchUser", "XMinioAdminNoSuchUser"}
+POLICY_MISSING_CODES = {"NoSuchPolicy", "XMinioAdminNoSuchPolicy"}
 MAX_REST_BYTES = 8 * 1024 * 1024
-MAX_MC_BYTES = 16 * 1024 * 1024
 MAX_PREFIX_VISITS = 2048
 MAX_PREFIX_DEPTH = 32
 MAX_PENDING_PREFIXES = 10000
@@ -226,6 +227,22 @@ class ScratchIdentity:
                     scope_root=self.scope_root)
 
 
+def cloud_storage_owner(record):
+    """Derive a closed non-secret owner from the frozen cloud definition."""
+    config = record.get("config", {}).get("object_store")
+    if config is None:
+        return None
+    try:
+        from oss_ops import OpsError, validate_config
+        canonical = validate_config(config)
+    except (OpsError, ValueError, TypeError, AttributeError) as error:
+        raise runtime.RuntimeFailure("InvalidScratchScope", "invalid cloud storage definition") from error
+    if canonical != config:
+        raise runtime.RuntimeFailure("InvalidScratchScope", "cloud storage definition is not canonical")
+    return dict(provider="aliyun-oss", endpoint="https://s3.oss-" + config["region"] + "-internal.aliyuncs.com",
+                region=config["region"], bucket=config["bucket"], root_prefix=config["root_prefix"])
+
+
 @dataclass(frozen=True)
 class RunStorageScope:
     """A fixed storage projection, independently validated against its machine.
@@ -241,9 +258,12 @@ class RunStorageScope:
     @classmethod
     def from_record(cls, identity, record):
         warehouses = record.get("server_warehouses", {})
-        value = dict(schema=1, identity=identity.as_dict(),
+        cloud_owner = cloud_storage_owner(record)
+        if cloud_owner is not None and record.get("storage_owner") != cloud_owner:
+            raise runtime.RuntimeFailure("InvalidScratchScope", "cloud record differs from its closed storage owner")
+        value = dict(schema=2 if cloud_owner is not None else 1, identity=identity.as_dict(),
                      machine={k: record.get(k) for k in ("id", "control_root", "daemon_id", "version", "generation")},
-                     storage_owner=dict(daemon_id=record.get("daemon_id"),
+                     storage_owner=cloud_owner or dict(daemon_id=record.get("daemon_id"),
                                         minio_volume=record.get("config", {}).get("minio_volume")),
                      ranges=dict(run_root=identity.scope_root + "/", **{
                          name: dict(warehouse=canonical_s3(warehouses.get(service)) + "/",
@@ -259,18 +279,36 @@ class RunStorageScope:
 
     @classmethod
     def from_dict(cls, value):
-        if not isinstance(value, dict) or set(value) != {"schema", "identity", "machine", "storage_owner", "ranges"} or value.get("schema") != 1:
+        if not isinstance(value, dict) or set(value) != {"schema", "identity", "machine", "storage_owner", "ranges"} or type(value.get("schema")) is not int or value.get("schema") not in (1, 2):
             raise runtime.RuntimeFailure("InvalidScratchScope", "invalid run storage schema")
+        if value["schema"] == 2 and (not isinstance(value["identity"], dict)
+                or set(value["identity"]) != {"schema", "run_id", "created_unix_ms", "scope_root"}
+                or type(value["identity"].get("schema")) is not int):
+            raise runtime.RuntimeFailure("InvalidScratchScope", "cloud scratch identity is not closed")
         identity = ScratchIdentity.from_dict(value["identity"])
         machine, owner, ranges = value["machine"], value["storage_owner"], value["ranges"]
         if (not isinstance(machine, dict) or set(machine) != {"id", "control_root", "daemon_id", "version", "generation"}
                 or not all(isinstance(v, str) and v for v in machine.values())
-                or not isinstance(owner, dict) or set(owner) != {"daemon_id", "minio_volume"}
-                or not all(isinstance(v, str) and v for v in owner.values())
-                or owner["daemon_id"] != machine["daemon_id"]
+                or not isinstance(owner, dict)
                 or not isinstance(ranges, dict) or set(ranges) != {"run_root", "rest", "rest_mv"}
                 or ranges["run_root"] != identity.scope_root + "/"):
             raise runtime.RuntimeFailure("InvalidScratchScope", "invalid run storage owner or ranges")
+        if value["schema"] == 1:
+            if (set(owner) != {"daemon_id", "minio_volume"}
+                    or not all(isinstance(v, str) and v for v in owner.values())
+                    or owner["daemon_id"] != machine["daemon_id"]):
+                raise runtime.RuntimeFailure("InvalidScratchScope", "invalid MinIO storage owner")
+        else:
+            if (set(owner) != {"provider", "endpoint", "region", "bucket", "root_prefix"}
+                    or owner.get("provider") != "aliyun-oss"
+                    or not all(isinstance(v, str) and v for v in owner.values())
+                    or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", owner["region"])
+                    or owner["endpoint"] != "https://s3.oss-" + owner["region"] + "-internal.aliyuncs.com"
+                    or not owner["root_prefix"].endswith("/")):
+                raise runtime.RuntimeFailure("InvalidScratchScope", "invalid cloud storage owner")
+            root = "s3://" + owner["bucket"] + "/" + owner["root_prefix"]
+            if canonical_s3(root) + "/" != root:
+                raise runtime.RuntimeFailure("InvalidScratchScope", "invalid cloud owner root")
         roots = [identity.scope_root]
         for key in ("rest", "rest_mv"):
             entry = ranges[key]
@@ -280,13 +318,16 @@ class RunStorageScope:
                     or canonical_s3(entry["warehouse"]) + "/" != entry["warehouse"]):
                 raise runtime.RuntimeFailure("InvalidScratchScope", "invalid warehouse namespace range")
             roots.append(entry["warehouse"])
+        if value["schema"] == 2 and any(not contains(root, candidate) for candidate in roots):
+            raise runtime.RuntimeFailure("InvalidScratchScope", "run roots leave the closed cloud owner")
         if any(contains(a, b) or contains(b, a) for i, a in enumerate(roots) for b in roots[i + 1:]):
             raise runtime.RuntimeFailure("InvalidScratchScope", "independent run storage roots overlap")
         # Copy caller-owned maps: subsequent mutations cannot add authority.
         return cls(identity, dict(machine), dict(owner), json.loads(json.dumps(ranges)))
 
     def as_dict(self):
-        return dict(schema=1, identity=self.identity.as_dict(), machine=dict(self.machine),
+        return dict(schema=2 if self.storage_owner.get("provider") == "aliyun-oss" else 1,
+                    identity=self.identity.as_dict(), machine=dict(self.machine),
                     storage_owner=dict(self.storage_owner), ranges=json.loads(json.dumps(self.ranges)))
 
     def validate_against(self, identity, record):
@@ -298,9 +339,10 @@ class RunStorageScope:
         return namespace_run(name) == self.identity.run_id
 
     def belongs(self, uri):
-        # Alias only within a projection with an exact common MinIO owner. The
-        # caller must validate_against before trusting an inherited projection.
-        if isinstance(uri, str) and uri.startswith("s3a://") and self.storage_owner["daemon_id"] == self.machine["daemon_id"]:
+        # Alias only after validating the entire original storage owner and
+        # all roots. An alias never chooses another service or grant.
+        if isinstance(uri, str) and uri.startswith("s3a://") and (self.storage_owner.get("provider") == "aliyun-oss"
+                or self.storage_owner.get("daemon_id") == self.machine["daemon_id"]):
             uri = "s3://" + uri[6:]
         bucket, key = s3_parts(uri)
         if contains(self.identity.scope_root, uri):
@@ -314,6 +356,8 @@ class RunStorageScope:
         return False
 
     def iam_policy(self):
+        if self.storage_owner.get("provider") == "aliyun-oss":
+            raise runtime.RuntimeFailure("CloudIamUnsupported", "cloud runs do not create or revoke IAM users")
         prefixes = [self.ranges["run_root"]] + [self.ranges[k]["warehouse"] + self.ranges[k]["namespace_prefix"] for k in ("rest", "rest_mv")]
         by_bucket = {}
         objects = []
@@ -399,6 +443,7 @@ class RunBudget:
 class ScratchSweeper:
     def __init__(self, record, backend, *, wall_clock=time.time, monotonic=time.monotonic):
         self.record, self.backend = record, backend
+        self.cloud_owner = cloud_storage_owner(record)
         self.wall_clock, self.monotonic = wall_clock, monotonic
         self.blocked_runs = set()
         self.groups = {}
@@ -413,7 +458,9 @@ class ScratchSweeper:
         if not math.isfinite(deadline) or self.monotonic() >= deadline:
             raise runtime.RuntimeFailure("ScratchSweepTimeout", "scratch sweep deadline expired")
 
-    def _mc(self, args, deadline, *, absent_ok=False):
+    def _mc(self, args, deadline, *, absent_ok=False, missing_codes=None):
+        if self.cloud_owner is not None:
+            raise runtime.RuntimeFailure("CloudIamUnsupported", "cloud storage never executes mc commands")
         self._check(deadline)
         command = " ".join(shlex.quote(str(a)) for a in ["mc", "--json", *args])
         # Preserve mc's native exit in the protocol even though the Docker
@@ -433,8 +480,6 @@ class ScratchSweeper:
             output = getattr(error, "stdout", None)
             if output is None:
                 raise runtime.RuntimeFailure("ScratchSweepTimeout", "scratch mc deadline expired after confirmed cleanup") from error
-        if len(output.encode()) > MAX_MC_BYTES:
-            raise runtime.RuntimeFailure("InvalidMcResponse", "mc response exceeds byte limit")
         lines = output.splitlines()
         has_status = bool(lines and re.fullmatch(r"NOVA_SCRATCH_MC_EXIT=[0-9]+", lines[-1]))
         if not has_status and not timed_out:
@@ -443,10 +488,12 @@ class ScratchSweeper:
         records, missing = [], False
         body = "\n".join(lines).strip()
         decoder = json.JSONDecoder()
-        while body:
+        cursor = 0
+        while cursor < len(body):
             try:
-                value, consumed = decoder.raw_decode(body)
-                body = body[consumed:].lstrip()
+                value, cursor = decoder.raw_decode(body, cursor)
+                while cursor < len(body) and body[cursor].isspace():
+                    cursor += 1
             except (TypeError, ValueError) as error:
                 if timed_out and not has_status:
                     # A deadline may truncate the final JSON object. Complete
@@ -461,7 +508,7 @@ class ScratchSweeper:
                 native = cause.get("error") if isinstance(cause, dict) else None
                 code = native.get("Code") if isinstance(native, dict) else None
                 code = code or (detail.get("code") if isinstance(detail, dict) else None)
-                if absent_ok and code in MISSING_CODES:
+                if absent_ok and code in (MISSING_CODES if missing_codes is None else missing_codes):
                     missing = True
                     continue
                 public = "ScratchAccessDenied" if code in {"AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"} else "ScratchMcFailed"
@@ -469,6 +516,8 @@ class ScratchSweeper:
             records.append(value)
         if status and not (absent_ok and missing and not records):
             raise runtime.RuntimeFailure("ScratchMcFailed", f"mc exited with {status}")
+        if missing_codes is not None and ((missing and records) or (not records and not missing)):
+            raise runtime.RuntimeFailure("InvalidMcResponse", "exact IAM absence needs its native missing response")
         if timed_out:
             raise runtime.RuntimeFailure("ScratchSweepTimeout", "scratch mc deadline expired after confirmed cleanup")
         self._check(deadline)
@@ -521,7 +570,7 @@ class ScratchSweeper:
         # Read every controllable policy before inferring an orphan's identity;
         # a successfully read subset never proves a unique reverse mapping.
         facts, candidates, failed_policies = {}, {}, set()
-        inventory_complete, fact_bytes, names = True, 0, set()
+        inventory_complete, names = True, set()
         try:
             items = self._mc(["admin", "policy", "list", "store"], deadline)
         except runtime.RuntimeFailure as error:
@@ -548,9 +597,6 @@ class ScratchSweeper:
                 if identity is None:
                     continue
                 self._expired(created_ms(identity.run_id), False)
-                fact_bytes += len(name.encode()) + len(identity.scope_root.encode())
-                if len(facts) >= MAX_PENDING_PREFIXES or fact_bytes > MAX_MC_BYTES:
-                    raise runtime.RuntimeFailure("InvalidMcResponse", "IAM policy inventory exceeds its input bound")
                 facts[name] = identity, purpose
                 if self.collecting:
                     group = self._identity_fact(identity)
@@ -568,8 +614,6 @@ class ScratchSweeper:
                 self._error(report, "inspect-policy", name if isinstance(name, str) else "unknown", error)
                 if error.code == "ScratchSweepTimeout":
                     raise
-                if fact_bytes > MAX_MC_BYTES or len(facts) >= MAX_PENDING_PREFIXES:
-                    break
         for item in self._mc(["admin", "user", "list", "store"], deadline):
             self._check(deadline)
             name = item.get("accessKey")
@@ -652,7 +696,8 @@ class ScratchSweeper:
         match = RESOURCE_RE.fullmatch(name)
         if not match or len(name) > 63 or match[2] not in {"init", "rot"}:
             raise runtime.RuntimeFailure("ScratchIamUnmapped", "policy does not identify an admitted IAM purpose")
-        rows = self._mc(["admin", "policy", "info", "store", name], deadline, absent_ok=True)
+        rows = self._mc(["admin", "policy", "info", "store", name], deadline, absent_ok=True,
+                        missing_codes=POLICY_MISSING_CODES)
         if not rows:
             return None, None
         if len(rows) != 1 or rows[0].get("policy") != name:
@@ -734,6 +779,8 @@ class ScratchSweeper:
         return identity, match[2]
 
     def revoke_users(self):
+        if self.cloud_owner is not None:
+            raise runtime.RuntimeFailure("CloudIamUnsupported", "cloud runs do not revoke IAM users")
         deadline = self.monotonic() + getattr(self.backend, "timeout", 90)
         report = dict(complete=True, removed=[], errors=[])
         self._iam(False, deadline, report, disable=True)
@@ -767,7 +814,7 @@ class ScratchSweeper:
         if isinstance(location, str) and location.startswith("s3a://"):
             # The sweeper already runs under the exact machine/MinIO lock and
             # backend binding. Never rewrite the URI used for object I/O.
-            if not self.record.get("daemon_id") or not self.record.get("config", {}).get("minio_volume"):
+            if self.cloud_owner is None and (not self.record.get("daemon_id") or not self.record.get("config", {}).get("minio_volume")):
                 return False
             location = "s3://" + location[6:]
         bucket, key = s3_parts(location)
@@ -833,7 +880,8 @@ class ScratchSweeper:
     def _remove_pairs(self, identity, pairs, policies, deadline, report):
         verified = []
         for pair in pairs:
-            rows = self._mc(["admin", "user", "info", "store", pair["user"]], deadline, absent_ok=True)
+            rows = self._mc(["admin", "user", "info", "store", pair["user"]], deadline, absent_ok=True,
+                            missing_codes=USER_MISSING_CODES)
             if rows and (len(rows) != 1 or rows[0].get("accessKey") != pair["user"] or rows[0].get("memberOf")
                          or not isinstance(rows[0].get("policyName", ""), str)
                          or rows[0].get("policyName", "") not in {"", pair["policy"]}):
@@ -846,10 +894,12 @@ class ScratchSweeper:
         for pair, present in verified:
             if present:
                 for operation in ("disable", "rm"):
-                    self._mc(["admin", "user", operation, "store", pair["user"]], deadline, absent_ok=True)
+                    self._mc(["admin", "user", operation, "store", pair["user"]], deadline, absent_ok=True,
+                             missing_codes=USER_MISSING_CODES)
                     report["removed"].append(dict(kind="user", name=pair["user"], operation=operation))
         for policy in policies:
-            self._mc(["admin", "policy", "rm", "store", policy], deadline, absent_ok=True)
+            self._mc(["admin", "policy", "rm", "store", policy], deadline, absent_ok=True,
+                     missing_codes=POLICY_MISSING_CODES)
             report["removed"].append(dict(kind="policy", name=policy, operation="remove"))
 
     def _remove_prefixes(self, group, deadline, report):
@@ -890,26 +940,68 @@ class ScratchSweeper:
         s3_parts("s3://validation/" + component)
         return component
 
+    def _exact_iam_identity(self, scope, exact_users_and_policies):
+        if not isinstance(scope, RunStorageScope):
+            raise runtime.RuntimeFailure("InvalidScratchScope", "cleanup requires a fixed run storage projection")
+        scope.validate_against(scope.identity, self.record)
+        identity = scope.identity
+        if not isinstance(exact_users_and_policies, list):
+            raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup needs predeclared IAM pairs")
+        if self.cloud_owner is not None and exact_users_and_policies:
+            raise runtime.RuntimeFailure("CloudIamUnsupported", "cloud exact cleanup cannot carry IAM pairs")
+        seen = set()
+        for pair in exact_users_and_policies:
+            if not isinstance(pair, dict) or set(pair) != {"user", "policy"}:
+                raise runtime.RuntimeFailure("ScratchIamUnmapped", "invalid cleanup IAM pair")
+            purpose = next((p for p in ("init", "rot") if pair["policy"] == identity.resource_name(p)
+                            and pair["user"] == identity.iam_name(p)), None)
+            if purpose is None or purpose in seen:
+                raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup pair differs from the original run")
+            seen.add(purpose)
+        return identity
+
+    def check_users_absent(self, scope: RunStorageScope, exact_users_and_policies: list, deadline: float) -> dict:
+        """Check canonical IAM names without acquiring or mutating their bindings."""
+        report = dict(complete=True, removed=[], errors=[])
+        try:
+            self._check(deadline)
+            self._exact_iam_identity(scope, exact_users_and_policies)
+            for pair in exact_users_and_policies:
+                for kind, name, codes in (("user", pair["user"], USER_MISSING_CODES),
+                                          ("policy", pair["policy"], POLICY_MISSING_CODES)):
+                    rows = self._mc(["admin", kind, "info", "store", name], deadline,
+                                    absent_ok=True, missing_codes=codes)
+                    if rows:
+                        raise runtime.RuntimeFailure("ScratchIamAlreadyExists", "canonical IAM binding already exists")
+        except runtime.RuntimeFailure as error:
+            self._error(report, "check-users-absent", getattr(getattr(scope, "identity", None), "run_id", "invalid-context"), error)
+        return report
+
+    def cleanup_users(self, scope: RunStorageScope, exact_users_and_policies: list, deadline: float) -> dict:
+        """Retire only the caller's exact IAM pairs; catalogs and data stay live."""
+        report = dict(complete=True, removed=[], errors=[])
+        try:
+            self._check(deadline)
+            identity = self._exact_iam_identity(scope, exact_users_and_policies)
+            self._remove_pairs(identity, exact_users_and_policies,
+                               {pair["policy"] for pair in exact_users_and_policies}, deadline, report)
+        except runtime.RuntimeFailure as error:
+            self._error(report, "cleanup-users", getattr(getattr(scope, "identity", None), "run_id", "invalid-context"), error)
+        return report
+
     def cleanup_run(self, scope: RunStorageScope, exact_users_and_policies: list, deadline: float) -> dict:
         """The caller confirms actual writer exit and retains its original budget."""
         report = dict(complete=True, removed=[], errors=[], catalog_barrier={})
         try:
             self._check(deadline)
-            if not isinstance(scope, RunStorageScope):
-                raise runtime.RuntimeFailure("InvalidScratchScope", "cleanup requires a fixed run storage projection")
-            scope.validate_against(scope.identity, self.record)
-            identity = scope.identity
-            if not isinstance(exact_users_and_policies, list):
-                raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup needs predeclared IAM pairs")
-            seen = set()
-            for pair in exact_users_and_policies:
-                if not isinstance(pair, dict) or set(pair) != {"user", "policy"}:
-                    raise runtime.RuntimeFailure("ScratchIamUnmapped", "invalid cleanup IAM pair")
-                purpose = next((p for p in ("init", "rot") if pair["policy"] == identity.resource_name(p)
-                                and pair["user"] == identity.iam_name(p)), None)
-                if purpose is None or purpose in seen:
-                    raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup pair differs from the original run")
-                seen.add(purpose)
+            identity = self._exact_iam_identity(scope, exact_users_and_policies)
+            if self.cloud_owner is not None:
+                self.groups, self.blocked_runs = {}, set()
+                self._identity_fact(identity)
+                inventory = self._catalog_inventory(deadline, report)
+                self._catalog_run(identity.run_id, inventory, deadline, report)
+                self._cleanup_cloud_scope(scope, deadline, report)
+                return report
             self.groups, self.blocked_runs = {}, set()
             group = self._identity_fact(identity)
             inventory = self._catalog_inventory(deadline, report)
@@ -920,6 +1012,71 @@ class ScratchSweeper:
         except runtime.RuntimeFailure as error:
             self._error(report, "cleanup-run", getattr(getattr(scope, "identity", None), "run_id", "invalid-context"), error)
         return report
+
+    def _oss(self, operation, uri, deadline, *extra):
+        self._check(deadline)
+        output = self.backend.run_oss(self.record, [operation, "--uri", uri, *extra], deadline=deadline)
+        if not isinstance(output, str):
+            raise runtime.RuntimeFailure("InvalidObjectStoreResponse", "OSS response must be JSON text")
+        try:
+            value = json.loads(output)
+        except (TypeError, ValueError) as error:
+            raise runtime.RuntimeFailure("InvalidObjectStoreResponse", "OSS response is not one JSON object") from error
+        if not isinstance(value, dict) or value.get("ok") is not True:
+            raise runtime.RuntimeFailure("ScratchObjectStoreFailed", "OSS operation did not succeed")
+        self._check(deadline)
+        return value
+
+    def _cloud_rows(self, operation, prefix, deadline):
+        field = "objects" if operation == "list" else "uploads"
+        rows = self._oss(operation, prefix, deadline).get(field)
+        if not isinstance(rows, list) or len(rows) > MAX_PENDING_PREFIXES:
+            raise runtime.RuntimeFailure("InvalidObjectStoreResponse", "invalid bounded OSS listing")
+        for row in rows:
+            if (not isinstance(row, dict) or not isinstance(row.get("uri"), str)
+                    or not contains(prefix, row["uri"])):
+                raise runtime.RuntimeFailure("InvalidScratchScope", "OSS listing leaves its requested prefix")
+            if operation == "list-multipart" and (not isinstance(row.get("upload_id"), str) or not row["upload_id"]):
+                raise runtime.RuntimeFailure("InvalidObjectStoreResponse", "multipart identity is missing")
+        return rows
+
+    def _cleanup_cloud_scope(self, scope, deadline, report):
+        barrier = report.get("catalog_barrier", {}).get(scope.identity.run_id, {})
+        if barrier.get("complete") is not True:
+            raise runtime.RuntimeFailure("ScratchCatalogBarrierRequired", "exact cloud cleanup requires both catalog barriers")
+        prefixes = {scope.ranges["run_root"]}
+        # A multipart upload may be the only trace of an owned namespace. Both
+        # inventories are observations; only the exact original run is removed.
+        for service in ("rest", "rest_mv"):
+            warehouse = scope.ranges[service]["warehouse"]
+            for operation in ("list", "list-multipart"):
+                for row in self._cloud_rows(operation, warehouse, deadline):
+                    relative = canonical_s3(row["uri"])[len(canonical_s3(warehouse)) + 1:]
+                    namespace = relative.split("/", 1)[0]
+                    if scope.owns_namespace(namespace):
+                        prefixes.add(warehouse + namespace + "/")
+        objects, uploads = set(), set()
+        for prefix in sorted(prefixes):
+            if not scope.belongs(prefix) or self._protected(prefix, deletion=True):
+                raise runtime.RuntimeFailure("InvalidScratchScope", "cloud cleanup leaves its exact original run")
+            for operation in ("list", "list-multipart"):
+                for row in self._cloud_rows(operation, prefix, deadline):
+                    if not scope.belongs(row["uri"]) or self._protected(row["uri"], deletion=True):
+                        raise runtime.RuntimeFailure("InvalidScratchScope", "cloud object leaves its exact original run")
+                    if operation == "list":
+                        objects.add(row["uri"])
+                    else:
+                        uploads.add((row["uri"], row["upload_id"]))
+        # All catalog and object inventories are validated before mutating OSS.
+        for uri, upload_id in sorted(uploads):
+            self._oss("abort-multipart", uri, deadline, "--upload-id", upload_id)
+            report["removed"].append(dict(kind="s3-multipart", uri=uri))
+        for uri in sorted(objects):
+            self._oss("delete", uri, deadline)
+            report["removed"].append(dict(kind="s3-object", uri=uri))
+        for prefix in sorted(prefixes):
+            if self._cloud_rows("list", prefix, deadline) or self._cloud_rows("list-multipart", prefix, deadline):
+                raise runtime.RuntimeFailure("ScratchCleanupIncomplete", "owned cloud objects remain after cleanup")
 
     def _s3(self, expired_only, deadline, report):
         # The optional private cursor is only a continuation of enumeration.
@@ -1087,6 +1244,8 @@ class ScratchSweeper:
         return dict(expected)
 
     def sweep(self, *, expired_only: bool, deadline: float) -> dict:
+        if self.cloud_owner is not None:
+            raise runtime.RuntimeFailure("CloudSweepUnsupported", "cloud cleanup requires the original run budget and confirmed writer exit")
         kinds = ["s3-prefix", "rest-namespace", "user", "policy"]
         report = dict(complete=True, removed=[], errors=[], catalog_barrier={},
                       observed_counts={kind: 0 for kind in kinds}, oldest_created_unix_ms=None,

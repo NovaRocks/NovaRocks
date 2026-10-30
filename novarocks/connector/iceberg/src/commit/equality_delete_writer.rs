@@ -40,12 +40,53 @@ use super::types::WrittenFile;
 use super::write_adaptation::adapt_batch;
 use super::write_stack::equality_schema::EqualityDeleteFileTarget;
 
+use super::data_writer::StagedPathJournal;
+
+#[cfg(test)]
 pub(crate) async fn write_equality_delete_file(
     file_io: &FileIO,
     staging_dir: &str,
     partition_spec_id: i32,
     target: EqualityDeleteFileTarget,
     batch: RecordBatch,
+) -> Result<Option<WrittenFile>, String> {
+    write_equality_delete_file_with_journal(
+        file_io,
+        staging_dir,
+        partition_spec_id,
+        target,
+        batch,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn write_equality_delete_file_journaled(
+    file_io: &FileIO,
+    staging_dir: &str,
+    partition_spec_id: i32,
+    target: EqualityDeleteFileTarget,
+    batch: RecordBatch,
+    journal: &StagedPathJournal,
+) -> Result<Option<WrittenFile>, String> {
+    write_equality_delete_file_with_journal(
+        file_io,
+        staging_dir,
+        partition_spec_id,
+        target,
+        batch,
+        Some(journal),
+    )
+    .await
+}
+
+async fn write_equality_delete_file_with_journal(
+    file_io: &FileIO,
+    staging_dir: &str,
+    partition_spec_id: i32,
+    target: EqualityDeleteFileTarget,
+    batch: RecordBatch,
+    journal: Option<&StagedPathJournal>,
 ) -> Result<Option<WrittenFile>, String> {
     if batch.num_rows() == 0 {
         return Ok(None);
@@ -84,6 +125,9 @@ pub(crate) async fn write_equality_delete_file(
     );
     let bytes = encode_equality_delete_parquet(schema, &batch)?;
     let file_size = bytes.len() as u64;
+    if let Some(journal) = journal {
+        journal.record(&path);
+    }
     write_bytes_via_file_io(file_io, &path, bytes).await?;
 
     Ok(Some(WrittenFile {
@@ -300,10 +344,7 @@ mod tests {
             assert_eq!(column.self_type().get_basic_info().id(), id);
             assert!(!matches!(
                 column.logical_type_ref(),
-                Some(LogicalType::Integer {
-                    bit_width: 8 | 16,
-                    ..
-                })
+                Some(LogicalType::Integer(value)) if matches!(value.bit_width, 8 | 16)
             ));
             assert_eq!(builder.schema().field(index).data_type(), &DataType::Int32);
             assert!(builder.schema().field(index).is_nullable());
@@ -455,10 +496,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             reader.parquet_schema().columns()[0].logical_type_ref(),
-            Some(LogicalType::Timestamp {
-                is_adjusted_to_u_t_c: true,
-                ..
-            })
+            Some(LogicalType::Timestamp(value)) if value.is_adjusted_to_u_t_c
         ));
         assert_eq!(
             reader.parquet_schema().columns()[0]

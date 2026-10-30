@@ -141,3 +141,85 @@ pub enum Storage {
         value: &'static RustLayout,
     },
 }
+
+/// Walk only new backing requested by deriving Clone on this generated value.
+/// Inline fields are already covered by their containing source allocation.
+/// This reports original values/lengths; it creates no grant or allocation.
+pub trait GeneratedCloneBacking {
+    const HAS_BACKING: bool = true;
+    fn visit_clone_backing<V: CloneBackingVisitor>(&self, visitor: &mut V) -> Result<(), V::Error>;
+}
+pub trait CloneBackingVisitor {
+    type Error;
+    fn vector<T>(&mut self, len: usize) -> Result<(), Self::Error>;
+    fn string(&mut self, len: usize) -> Result<(), Self::Error>;
+    fn boxed<T>(&mut self) -> Result<(), Self::Error>;
+    /// A shared Bytes clone is a real alias of its original backing. This
+    /// callback must join its original source facts/pin, not infer capacity
+    /// from the visible span or mint an independent free allowance.
+    fn shared_bytes(&mut self, bytes: &bytes::Bytes) -> Result<(), Self::Error>;
+    fn btree<K, V>(&mut self, len: usize) -> Result<(), Self::Error>;
+    fn unsupported(&mut self, shape: &'static str) -> Result<(), Self::Error>;
+}
+macro_rules! inline_clone_backing {
+    ($($ty:ty),* $(,)?) => { $(impl GeneratedCloneBacking for $ty {
+        const HAS_BACKING: bool = false;
+        fn visit_clone_backing<V: CloneBackingVisitor>(&self, _: &mut V) -> Result<(), V::Error> { Ok(()) }
+    })* };
+}
+inline_clone_backing!(bool, u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
+impl GeneratedCloneBacking for String {
+    fn visit_clone_backing<V: CloneBackingVisitor>(&self, v: &mut V) -> Result<(), V::Error> {
+        v.string(self.len())
+    }
+}
+impl GeneratedCloneBacking for bytes::Bytes {
+    fn visit_clone_backing<V: CloneBackingVisitor>(&self, v: &mut V) -> Result<(), V::Error> {
+        v.shared_bytes(self)
+    }
+}
+impl<T: GeneratedCloneBacking> GeneratedCloneBacking for Option<T> {
+    const HAS_BACKING: bool = T::HAS_BACKING;
+    fn visit_clone_backing<V: CloneBackingVisitor>(&self, v: &mut V) -> Result<(), V::Error> {
+        if let Some(value) = self {
+            value.visit_clone_backing(v)?;
+        }
+        Ok(())
+    }
+}
+impl<T: GeneratedCloneBacking> GeneratedCloneBacking for Vec<T> {
+    fn visit_clone_backing<V: CloneBackingVisitor>(&self, v: &mut V) -> Result<(), V::Error> {
+        v.vector::<T>(self.len())?;
+        if T::HAS_BACKING {
+            for value in self {
+                value.visit_clone_backing(v)?;
+            }
+        }
+        Ok(())
+    }
+}
+impl<T: GeneratedCloneBacking> GeneratedCloneBacking for Box<T> {
+    fn visit_clone_backing<V: CloneBackingVisitor>(&self, v: &mut V) -> Result<(), V::Error> {
+        v.boxed::<T>()?;
+        (**self).visit_clone_backing(v)
+    }
+}
+impl<K: GeneratedCloneBacking, T: GeneratedCloneBacking> GeneratedCloneBacking
+    for std::collections::BTreeMap<K, T>
+{
+    fn visit_clone_backing<V: CloneBackingVisitor>(&self, v: &mut V) -> Result<(), V::Error> {
+        v.btree::<K, T>(self.len())?;
+        for (key, value) in self {
+            key.visit_clone_backing(v)?;
+            value.visit_clone_backing(v)?;
+        }
+        Ok(())
+    }
+}
+impl<K, T, S> GeneratedCloneBacking for std::collections::HashMap<K, T, S> {
+    fn visit_clone_backing<V: CloneBackingVisitor>(&self, v: &mut V) -> Result<(), V::Error> {
+        // Clone may retain source table capacity after deletions. A fresh
+        // len-only table model is not evidence for this actual source.
+        v.unsupported("generated HashMap clone requires its original table source")
+    }
+}

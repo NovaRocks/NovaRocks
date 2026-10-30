@@ -22,7 +22,11 @@ use async_trait::async_trait;
 use crate::cancellation::QueryCancellationReason;
 use crate::client_connection::ClientConnectionToken;
 use crate::protocol_delivery::QuerySessionOutput;
+use crate::session_control::ClientQueryId;
+use crate::session_effects::SessionEffects;
 use crate::session_error::QueryServiceError;
+use crate::session_value::{SessionValue, StatementSessionError};
+use crate::statement_kind::StatementKind;
 
 /// Role-local lifetime that remains live until a protocol adapter has reached
 /// its terminal wire outcome.
@@ -42,21 +46,49 @@ impl SessionProtocolTerminal for OutputOwnsProtocolTerminal {
 pub struct QuerySessionStatement {
     output: QuerySessionOutput,
     terminal: Box<dyn SessionProtocolTerminal>,
+    effects: SessionEffects,
+    kind: StatementKind,
 }
 
 impl QuerySessionStatement {
-    pub fn new(output: QuerySessionOutput, terminal: Box<dyn SessionProtocolTerminal>) -> Self {
-        Self { output, terminal }
+    pub fn new(
+        mut output: QuerySessionOutput,
+        terminal: Box<dyn SessionProtocolTerminal>,
+        kind: StatementKind,
+    ) -> Self {
+        let effects = match &mut output {
+            QuerySessionOutput::GovernedCompletion(completion) => completion.take_session_effects(),
+            _ => SessionEffects::default(),
+        };
+        Self {
+            output,
+            terminal,
+            effects,
+            kind,
+        }
     }
-
-    /// Use when the output itself owns every statement lifetime, such as a
-    /// governed query result whose protocol owner is embedded in the output.
-    pub fn output_owned(output: QuerySessionOutput) -> Self {
-        Self::new(output, Box::new(OutputOwnsProtocolTerminal))
+    /// The result owns the original terminal lifecycle; syntax supplies its explicit kind.
+    pub fn output_owned(output: QuerySessionOutput, kind: StatementKind) -> Self {
+        Self::new(output, Box::new(OutputOwnsProtocolTerminal), kind)
     }
-
+    pub fn session_effects(&self) -> &SessionEffects {
+        &self.effects
+    }
+    pub const fn statement_kind(&self) -> StatementKind {
+        self.kind
+    }
     pub fn into_parts(self) -> (QuerySessionOutput, Box<dyn SessionProtocolTerminal>) {
         (self.output, self.terminal)
+    }
+    pub fn into_parts_with_session(
+        self,
+    ) -> (
+        QuerySessionOutput,
+        Box<dyn SessionProtocolTerminal>,
+        SessionEffects,
+        StatementKind,
+    ) {
+        (self.output, self.terminal, self.effects, self.kind)
     }
 }
 
@@ -85,9 +117,39 @@ impl QuerySessionOpenRequest {
     }
 }
 
+/// One client statement supplies its whole session, independent of a connection.
+pub struct StatementSessionRequest {
+    client_query_id: ClientQueryId,
+    principal: Arc<str>,
+    session: SessionValue,
+}
+impl StatementSessionRequest {
+    pub fn new(
+        client_query_id: ClientQueryId,
+        principal: impl Into<Arc<str>>,
+        session: SessionValue,
+    ) -> Self {
+        Self {
+            client_query_id,
+            principal: principal.into(),
+            session,
+        }
+    }
+    pub fn into_parts(self) -> (ClientQueryId, Arc<str>, SessionValue) {
+        (self.client_query_id, self.principal, self.session)
+    }
+}
+
 /// Application-owned client session consumed by a protocol adapter.
 #[async_trait]
 pub trait QuerySession: Send + Sync + 'static {
+    /// Observe the original lease only for its exact connection incarnation.
+    #[cfg(novarocks_dev_controls)]
+    fn connection_session(
+        &self,
+        connection: ClientConnectionToken,
+    ) -> Option<crate::session_control::SessionToken>;
+
     /// Handles a COM_INIT_DB request. Like COM_QUERY, the result retains its
     /// governed statement owner until the protocol adapter has written the
     /// terminal packet.
@@ -113,6 +175,11 @@ pub trait QuerySession: Send + Sync + 'static {
 }
 
 pub trait QuerySessionFactory: Send + Sync + 'static {
+    fn open_statement_session(
+        &self,
+        request: StatementSessionRequest,
+    ) -> Result<Arc<dyn QuerySession>, StatementSessionError>;
+
     fn open_session(
         &self,
         request: QuerySessionOpenRequest,
@@ -153,6 +220,7 @@ mod tests {
         let statement = QuerySessionStatement::new(
             QuerySessionOutput::Ok,
             Box::new(ProbeTerminal(Arc::clone(&completed))),
+            StatementKind::Empty,
         );
 
         let (output, terminal) = statement.into_parts();

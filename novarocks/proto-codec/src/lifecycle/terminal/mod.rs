@@ -92,12 +92,78 @@ impl TerminalTelemetryUnavailable {
     }
 }
 
-/// A validated generated profile-contribution telemetry oneof.
-#[derive(Clone, Debug, PartialEq)]
-pub struct QueryTerminalProfileContributionTelemetry {
-    raw: novarocks::QueryTerminalProfileContributionTelemetry,
+/// The existing immutable canonical response backing. Implementations return
+/// the original validated raw value for the same ordinal; no I/O or mutation.
+/// Keeping an owner alias retains its original paid backing, not a new budget.
+pub trait CanonicalTerminalTelemetry: std::fmt::Debug + Send + Sync {
+    fn terminal_telemetry(
+        &self,
+        ordinal: usize,
+    ) -> &novarocks::QueryTerminalProfileContributionTelemetry;
+    /// Release the actual data Arc before notifying its original source.
+    fn release_alias(self: std::sync::Arc<Self>);
 }
-
+#[derive(Debug)]
+enum TelemetryBacking {
+    Owned {
+        raw: novarocks::QueryTerminalProfileContributionTelemetry,
+        canonical: Option<(std::sync::Weak<dyn CanonicalTerminalTelemetry>, usize)>,
+    },
+    Retained {
+        owner: Option<std::sync::Arc<dyn CanonicalTerminalTelemetry>>,
+        ordinal: usize,
+    },
+}
+impl Drop for TelemetryBacking {
+    fn drop(&mut self) {
+        if let Self::Retained { owner, .. } = self
+            && let Some(owner) = owner.take()
+        {
+            owner.release_alias();
+        }
+    }
+}
+/// A validated generated profile-contribution telemetry oneof.
+#[derive(Debug)]
+pub struct QueryTerminalProfileContributionTelemetry {
+    backing: TelemetryBacking,
+}
+impl PartialEq for QueryTerminalProfileContributionTelemetry {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_proto() == other.as_proto()
+    }
+}
+impl Clone for QueryTerminalProfileContributionTelemetry {
+    fn clone(&self) -> Self {
+        let backing = match &self.backing {
+            TelemetryBacking::Owned {
+                raw,
+                canonical: None,
+            } => TelemetryBacking::Owned {
+                raw: raw.clone(),
+                canonical: None,
+            },
+            TelemetryBacking::Owned {
+                canonical: Some((owner, ordinal)),
+                ..
+            } => TelemetryBacking::Retained {
+                owner: Some(
+                    owner
+                        .upgrade()
+                        .expect("canonical telemetry is borrowed from its live owner"),
+                ),
+                ordinal: *ordinal,
+            },
+            TelemetryBacking::Retained { owner, ordinal } => TelemetryBacking::Retained {
+                owner: Some(std::sync::Arc::clone(
+                    owner.as_ref().expect("live canonical telemetry"),
+                )),
+                ordinal: *ordinal,
+            },
+        };
+        Self { backing }
+    }
+}
 impl QueryTerminalProfileContributionTelemetry {
     pub fn parse(
         raw: novarocks::QueryTerminalProfileContributionTelemetry,
@@ -106,37 +172,78 @@ impl QueryTerminalProfileContributionTelemetry {
             &raw,
             FieldPath::root("query_terminal_profile_contribution_telemetry"),
         )?;
-        Ok(Self { raw })
+        Ok(Self {
+            backing: TelemetryBacking::Owned {
+                raw,
+                canonical: None,
+            },
+        })
     }
-
-    pub const fn as_proto(&self) -> &novarocks::QueryTerminalProfileContributionTelemetry {
-        &self.raw
+    pub fn as_proto(&self) -> &novarocks::QueryTerminalProfileContributionTelemetry {
+        match &self.backing {
+            TelemetryBacking::Owned { raw, .. } => raw,
+            TelemetryBacking::Retained { owner, ordinal } => owner
+                .as_ref()
+                .expect("live canonical telemetry")
+                .terminal_telemetry(*ordinal),
+        }
     }
-
+    /// Bind only while installing this original owned value in that owner's
+    /// canonical cell. A Weak in the cell prevents owner -> owner cycles.
+    pub fn bind_canonical_owner(
+        &mut self,
+        owner: std::sync::Weak<dyn CanonicalTerminalTelemetry>,
+        ordinal: usize,
+    ) {
+        match &mut self.backing {
+            TelemetryBacking::Owned { canonical, .. } if canonical.is_none() => {
+                *canonical = Some((owner, ordinal))
+            }
+            _ => panic!("canonical telemetry binds its original owned value exactly once"),
+        }
+    }
+    /// Borrow validated canonical facts without cloning the generated graph.
+    pub fn available_ref(&self) -> Option<QueryTerminalProfileContributionRef<'_>> {
+        let novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(raw) =
+            self.as_proto().telemetry.as_ref()?
+        else {
+            return None;
+        };
+        Some(QueryTerminalProfileContributionRef { raw })
+    }
     pub fn available(&self) -> Option<QueryTerminalProfileContributionV1> {
-        let novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
-            contribution,
-        ) = self.raw.telemetry.as_ref()?
-        else {
-            return None;
-        };
-        Some(
-            QueryTerminalProfileContributionV1::parse(contribution.clone())
-                .expect("validated profile telemetry always has a valid contribution"),
-        )
+        Some(QueryTerminalProfileContributionV1 {
+            raw: self.available_ref()?.raw.clone(),
+        })
     }
-
     pub fn unavailable(&self) -> Option<TerminalTelemetryUnavailable> {
-        let novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
-            reason,
-        ) = self.raw.telemetry.as_ref()?
+        let novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(raw) =
+            self.as_proto().telemetry.as_ref()?
         else {
             return None;
         };
-        Some(
-            TerminalTelemetryUnavailable::parse(reason.clone())
-                .expect("validated profile telemetry always has a valid reason"),
-        )
+        Some(TerminalTelemetryUnavailable { raw: raw.clone() })
+    }
+}
+#[derive(Clone, Copy)]
+pub struct QueryTerminalProfileContributionRef<'a> {
+    raw: &'a novarocks::QueryTerminalProfileContributionV1,
+}
+impl QueryTerminalProfileContributionRef<'_> {
+    pub fn as_proto(&self) -> &novarocks::QueryTerminalProfileContributionV1 {
+        self.raw
+    }
+    pub fn channels(&self) -> &[novarocks::QueryTerminalRuntimeFilterChannelV1] {
+        &self.raw.channels
+    }
+    pub fn producer_streams(&self) -> &[novarocks::QueryTerminalRuntimeFilterProducerStreamV1] {
+        &self.raw.producer_streams
+    }
+    pub fn transport_routes(&self) -> &[novarocks::QueryTerminalRuntimeFilterTransportRouteV1] {
+        &self.raw.transport_routes
+    }
+    pub fn consumers(&self) -> &[novarocks::QueryTerminalRuntimeFilterConsumerV1] {
+        &self.raw.consumers
     }
 }
 

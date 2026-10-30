@@ -226,7 +226,9 @@ fn provider_position_rewrite_preparation_begins_with_its_exact_identity_roles() 
         lake.control
             .abort_write(ConnectorWriteSessionAbortRequest {
                 commit: session.commit_handle(),
+                production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted,
                 context: request_context(),
+                received: None,
             })
             .unwrap(),
         ConnectorWriteAbortOutcome::KnownUncommitted { .. }
@@ -530,7 +532,9 @@ fn empty_delete_session(version: crate::iceberg::spec::FormatVersion, variant: b
         lake.control
             .abort_write(ConnectorWriteSessionAbortRequest {
                 commit: session.commit_handle(),
-                context
+                production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted,
+                context,
+                received: None,
             })
             .unwrap(),
         ConnectorWriteAbortOutcome::KnownUncommitted { .. }
@@ -630,7 +634,9 @@ fn ordinary_equality_delete_sessions_apply_the_existing_table_shape_guards() {
                 lake.control
                     .abort_write(ConnectorWriteSessionAbortRequest {
                         commit: session.commit_handle(),
+                        production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted,
                         context,
+                        received: None,
                     })
                     .unwrap();
                 assert!(

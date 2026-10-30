@@ -36,8 +36,7 @@ pub(crate) struct ResolvedCreateMvDependencies {
     pub(crate) dependencies: Vec<CreateMvDependencyRequest>,
 }
 
-pub(crate) fn resolve_create_mv_dependencies_with_readiness(
-    _readiness: &MvReadinessPort,
+pub(crate) fn resolve_create_mv_dependencies(
     resolved_refs: &[ResolvedTableRef],
     created_at_ms: i64,
 ) -> Result<ResolvedCreateMvDependencies, String> {
@@ -137,37 +136,56 @@ pub(crate) fn ensure_no_external_iceberg_dependents_with_readiness(
 /// Read-only preflight for already classified edges. The product must repeat
 /// cycle admission after binding CREATE's unclassified locator occurrences to
 /// exact D objects; this name-only input cannot prove those new edges.
-pub(crate) fn validate_no_create_cycle_with_readiness(
-    readiness: &MvReadinessPort,
+pub(crate) fn validate_no_create_cycle_from_facts(
     new_target: &MvDependencyObjectRef,
     new_dependencies: &[CreateMvDependencyRequest],
+    projections: Vec<
+        novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection,
+    >,
+    observed_dependencies: Vec<Vec<StoredMvDependency>>,
 ) -> Result<(), String> {
-    let projections = readiness
-        .list_ready_projections()
-        .map_err(|e| format!("load MV projections for dependency cycle check failed: {e}"))?;
-    let mut edges = Vec::new();
+    assert_eq!(
+        projections.len(),
+        observed_dependencies.len(),
+        "one dependency set per original projection"
+    );
     let inventory = projections
         .iter()
         .map(|loaded| &loaded.projection)
         .collect::<Vec<_>>();
-    for loaded in &projections {
-        let target = stored_keyed_definition_dependency_ref(&loaded.projection);
-        let dependencies = readiness
-            .list_ready_dependencies_by_downstream(loaded)
-            .map_err(|e| format!("load MV dependencies for cycle check failed: {e}"))?;
-        let dependencies = classify_ready_dependency_occurrences(dependencies, &inventory)?
-            .into_iter()
-            .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
-            .map(|dep| dep.upstream)
-            .collect::<Vec<_>>();
-        edges.push((target, dependencies));
-    }
+    let edges = projections
+        .iter()
+        .zip(observed_dependencies)
+        .map(|(loaded, dependencies)| create_cycle_edge(loaded, dependencies, &inventory))
+        .collect::<Result<Vec<_>, _>>()?;
+    finish_create_cycle(new_target, new_dependencies, &edges)
+}
+fn create_cycle_edge(
+    loaded: &novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection,
+    dependencies: Vec<StoredMvDependency>,
+    inventory: &[&StoredKeyedMvProjection],
+) -> Result<(MvDependencyObjectRef, Vec<MvDependencyObjectRef>), String> {
+    let dependencies = classify_ready_dependency_occurrences(dependencies, inventory)?
+        .into_iter()
+        .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
+        .map(|dep| dep.upstream)
+        .collect::<Vec<_>>();
+    Ok((
+        stored_keyed_definition_dependency_ref(&loaded.projection),
+        dependencies,
+    ))
+}
+fn finish_create_cycle(
+    new_target: &MvDependencyObjectRef,
+    new_dependencies: &[CreateMvDependencyRequest],
+    edges: &[(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)],
+) -> Result<(), String> {
     let new_upstreams = new_dependencies
         .iter()
         .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
         .map(|dep| dep.upstream.clone())
         .collect::<Vec<_>>();
-    validate_no_cycle_for_edges(new_target, &new_upstreams, &edges)
+    validate_no_cycle_for_edges(new_target, &new_upstreams, edges)
 }
 
 /// Classify each exact source occurrence against the caller's one ready
@@ -458,31 +476,15 @@ mod tests {
         assert_eq!(order, vec![upstream_target, target]);
     }
 
-    fn empty_readiness() -> MvReadinessPort {
-        let handle = tokio::runtime::Handle::current();
-        let (product, _) = tokio::task::block_in_place(|| {
-            handle.block_on(crate::mv::domain::test_admission::keyed_product())
-        });
-        MvReadinessPort::from_product(
-            product.keyed_readiness_service().unwrap(),
-            handle,
-            product.management_entrance().unwrap(),
-        )
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn create_preserves_repeated_locators_without_guessing_dependency_kind() {
+    #[test]
+    fn create_preserves_repeated_locators_without_guessing_dependency_kind() {
         let source = ResolvedTableRef::Iceberg {
             catalog: "ice".to_string(),
             namespace: "sales".to_string(),
             table: "orders".to_string(),
         };
-        let resolved = resolve_create_mv_dependencies_with_readiness(
-            &empty_readiness(),
-            &[source.clone(), source],
-            123,
-        )
-        .expect("CREATE retains source locator occurrences");
+        let resolved = resolve_create_mv_dependencies(&[source.clone(), source], 123)
+            .expect("CREATE retains source locator occurrences");
 
         assert_eq!(resolved.base_refs.len(), 2);
         assert_eq!(resolved.base_refs[0], resolved.base_refs[1]);
@@ -500,10 +502,9 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn native_internal_mv_base_table_is_rejected() {
-        let error = resolve_create_mv_dependencies_with_readiness(
-            &empty_readiness(),
+    #[test]
+    fn native_internal_mv_base_table_is_rejected() {
+        let error = resolve_create_mv_dependencies(
             &[ResolvedTableRef::UnsupportedNative {
                 display_name: "sales.orders".to_string(),
             }],

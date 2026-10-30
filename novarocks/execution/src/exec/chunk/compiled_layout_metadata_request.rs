@@ -117,7 +117,7 @@ fn original_request(
 ) -> Result<CompleteMetadataRequestFacts, CompiledSchemaRequestFailure> {
     if !source.is_typed()
         || source.schema().fields().len() != source.slots().len()
-        || source.schema().metadata().capacity() != 0
+        || source.schema().metadata().as_arc().is_some()
     {
         return Err(MetadataRequestError::SourceModel(
             "compiled schema request requires its exact typed execution layout",
@@ -283,9 +283,9 @@ mod tests {
         .unwrap();
         assert!(facts.allocation_requests_upper_bound >= host.requests.load(Ordering::SeqCst));
         assert!(facts.allocation_request_bytes_upper_bound >= host.bytes.load(Ordering::SeqCst));
-        assert_eq!(output.arrow_schema_ref().metadata().capacity(), 0);
+        assert!(output.arrow_schema_ref().metadata().as_arc().is_none());
         for (index, slot) in output.slots().iter().enumerate() {
-            assert_eq!(slot.field_ref().metadata().capacity(), 0);
+            assert!(slot.field_ref().metadata().as_arc().is_none());
             assert_eq!(
                 slot.typed_binding(),
                 source.value_binding_at(index).unwrap()

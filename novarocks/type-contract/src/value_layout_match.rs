@@ -263,8 +263,12 @@ mod tests {
             vec![Field::new(
                 "named",
                 DataType::List(Arc::new(
-                    Field::new("provider_role", dictionary(DataType::Utf8), true)
-                        .with_metadata([(String::from("format"), String::from("fact"))].into()),
+                    Field::new("provider_role", dictionary(DataType::Utf8), true).with_metadata(
+                        std::collections::HashMap::<String, String>::from([(
+                            String::from("format"),
+                            String::from("fact"),
+                        )]),
+                    ),
                 )),
                 false,
             )]

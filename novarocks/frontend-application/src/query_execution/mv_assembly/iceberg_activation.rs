@@ -22,9 +22,9 @@
 //! writer registration, provenance encoding and commit/reconcile machinery.
 
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorManagedPublicationEmptyInputDisposition,
-    ConnectorManagedPublicationTechnique, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorWriteInputRequest, ConnectorWriteLease,
+    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
+    ConnectorRequestContext, ConnectorWriteInputRequest, ConnectorWriteLease,
 };
 
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
@@ -32,17 +32,11 @@ use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvIncrementalWriteRequest, PreparedMvFirstRefreshWrite, PreparedMvMetadataOnlyWrite,
 };
-use crate::query_execution::mv_assembly::refresh_handoff::{
-    PreparedMvRefreshWrite, PreparedMvRefreshWriteArtifact,
-};
-use crate::query_execution::mv_native_write::{
-    MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
-};
+use crate::query_execution::mv_native_write::MvRefreshProviderActivation;
 use novarocks_mv_application::product::MvIncrementalWriteMode;
 use novarocks_mv_application::publication::{
     MvRefreshCommittedFacts, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
 };
-use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
 /// Core-side provider adapter installed into the frontend composition.
 ///
@@ -64,54 +58,39 @@ impl IcebergMvRefreshProviderActivation {
 }
 
 impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
-    fn activate_write(
+    fn prepare_write_source(
         &self,
-        prepared: PreparedMvRefreshWrite,
-        planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-        exact_lease: &ConnectorWriteLease,
-        execution: &QueryExecutionContext,
-        connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
-        match prepared.into_assembly_artifact() {
-            PreparedMvRefreshWriteArtifact::FirstRefresh(prepared) => {
-                super::first_refresh_staging::bind_prepared_mv_first_refresh_staging(
-                    &self.query_kernel,
-                    &self.ports,
-                    prepared,
-                    planning_lease,
-                    exact_lease,
-                    execution,
-                    connector_context,
-                )
-            }
-            PreparedMvRefreshWriteArtifact::Incremental(prepared) => {
-                super::incremental_staging::bind_prepared_mv_incremental_staging(
-                    &self.query_kernel,
-                    &self.ports,
-                    prepared,
-                    planning_lease,
-                    exact_lease,
-                    execution,
-                    connector_context,
-                )
-            }
-        }
-    }
-
-    fn activate_metadata_only_publication(
-        &self,
-        prepared: &PreparedMvMetadataOnlyWrite,
-        planning_lease: &ConnectorControlPlanningLease,
-        exact_lease: &ConnectorWriteLease,
-        connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String>
-    {
-        begin_metadata_only_connector_write_session(
+        request: super::activation_request::OriginalMvWritePreparationRequest,
+    ) -> super::activation_source::MvWritePreparationCustody {
+        let super::activation_request::OriginalMvWritePreparationRequest {
             prepared,
-            connector_context,
-            exact_lease,
-            planning_lease,
-            self.query_kernel.typed_connector_control(),
+            target,
+            planning,
+            execution,
+            context,
+            session,
+            io,
+            turn,
+            owners,
+            capacity,
+            requests,
+        } = request;
+        super::activation_source::MvWritePreparationCustody::new(
+            super::activation_preparation::MvWriteAnalysisPreparationInput {
+                kernel: self.query_kernel.clone(),
+                ports: self.ports.clone(),
+                prepared,
+                target,
+                planning,
+                execution,
+                context,
+                session,
+            },
+            io,
+            turn,
+            owners,
+            capacity,
+            requests,
         )
     }
 
@@ -121,50 +100,6 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
         receipt: &novarocks_spi::connector::ConnectorWriteReceipt,
     ) -> Result<MvRefreshCommittedFacts, String> {
         MvRefreshCommittedFacts::from_write_receipt(intent, receipt)
-    }
-
-    fn install_published_projection(
-        &self,
-        planning_lease: &ConnectorControlPlanningLease,
-        table: &ConnectorTableIdentity,
-        expected_snapshot_id: i64,
-        operation_id: uuid::Uuid,
-        connector_context: &ConnectorRequestContext,
-    ) -> Result<(), String> {
-        if planning_lease.binding().descriptor().instance_id != table.instance_id {
-            return Err(
-                "MV publication observation table belongs to a different connector generation"
-                    .to_string(),
-            );
-        }
-        let catalog = planning_lease
-            .binding()
-            .catalog_handle()
-            .map_err(|error| format!("bind MV publication catalog generation: {error}"))?
-            .clone();
-        let target = novarocks_mv_application::product::MvTarget::try_new(
-            Some(table.instance_id.as_str().to_string()),
-            table.namespace.to_string(),
-            table.table.to_string(),
-        )
-        .map_err(|error| format!("name the published MV target: {error}"))?;
-        crate::mv::domain::staged_create::install_published_current_projection(
-            self.ports
-                .management_entrance()
-                .map_err(|error| error.to_string())?
-                .as_ref(),
-            self.ports.readiness().as_ref(),
-            self.ports.connector_control(),
-            catalog,
-            target,
-            operation_id,
-            crate::mv::domain::staged_create::PublishedOutput {
-                snapshot_id: expected_snapshot_id,
-            },
-            // The publication already happened; observe under a scope that
-            // cannot be mistaken for part of the same effect.
-            connector_context.clone().after_external_effect(),
-        )
     }
 }
 
@@ -180,20 +115,43 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
 /// The publication id travels inside the managed intent and nowhere else. It
 /// reaches the snapshot the commit writes -- that is what the publication fence
 /// reads back -- but no writer recipe, commit fragment, or backend sees it.
-pub(crate) fn begin_first_refresh_connector_write_session(
+pub(crate) async fn begin_first_refresh_connector_write_session_async_in(
     prepared: &PreparedMvFirstRefreshWrite,
     connector_context: ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
     planning_lease: &ConnectorControlPlanningLease,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
+    receiving: &crate::query_execution::write_session::WriteBeginReceiving,
+) -> Result<
+    std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    ConnectorError,
+> {
+    let request =
+        prepare_first_refresh_document_write_request(prepared, connector_context, exact_lease)?;
+    begin_pending_document_write_async_in(
+        request,
+        exact_lease,
+        planning_lease,
+        typed_connector_control,
+        receiving,
+    )
+    .await
+}
+
+fn prepare_first_refresh_document_write_request(
+    prepared: &PreparedMvFirstRefreshWrite,
+    connector_context: ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
+) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, ConnectorError> {
     if !exact_lease.matches_provider_binding_key(prepared.observed_binding()) {
-        return Err("MV first-refresh write lease drifted from prepared binding".to_string());
+        return Err(invalid_activation(
+            "MV first-refresh write lease drifted from prepared binding".to_string(),
+        ));
     }
     if !exact_lease.matches_provider_instance(prepared.target_table().owner()) {
-        return Err(
+        return Err(invalid_activation(
             "MV first-refresh staging table belongs to a different connector instance".to_string(),
-        );
+        ));
     }
     let target = crate::catalog_application::resolver::TargetBackend {
         provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
@@ -212,10 +170,10 @@ pub(crate) fn begin_first_refresh_connector_write_session(
             novarocks_spi::connector::ConnectorWriteIntent::Append
         }
         MvRefreshPublicationTechnique::MetadataOnly => {
-            return Err(
+            return Err(invalid_activation(
                 "metadata-only MV refresh publishes through its own session, not a data write"
                     .to_string(),
-            );
+            ));
         }
     };
     // Every publication commits, including one that produced no rows. A full
@@ -243,17 +201,12 @@ pub(crate) fn begin_first_refresh_connector_write_session(
         connector_context.clone(),
     )?;
     let declaration =
-        document_publication_declaration(prepared.publication_intent(), base.clone(), empty_input)?;
+        document_publication_declaration(prepared.publication_intent(), base.clone(), empty_input)
+            .map_err(invalid_activation)?;
     // The publication document cannot exist yet: it describes inputs and an
     // output this write has not produced. The declaration is the authority the
     // one later bind is checked against.
-    crate::query_execution::write_session::begin_connector_application_document_write_session_pending(
-        crate::connector::write_target::derive_write_stack_lease(
-            typed_connector_control,
-            planning_lease,
-        )?,
-        exact_lease,
-        crate::query_execution::dml::iceberg_writer::connector_write_begin_request_on_base(
+    crate::query_execution::dml::iceberg_writer::connector_write_begin_request_on_base(
             &target,
             target_ref,
             intent,
@@ -265,8 +218,8 @@ pub(crate) fn begin_first_refresh_connector_write_session(
                 shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
             },
             connector_context,
-        )?,
-    )
+        )
+        .map_err(invalid_activation)
 }
 
 /// Open the write session one metadata-only MV publication commits through.
@@ -277,27 +230,52 @@ pub(crate) fn begin_first_refresh_connector_write_session(
 /// rows to replace, and the empty-input disposition is `CommitEmptyWrite`,
 /// because the empty write *is* the publication -- an output version whose one
 /// new fact is the watermark P records.
-pub(crate) fn begin_metadata_only_connector_write_session(
+pub(crate) async fn begin_metadata_only_connector_write_session_async_in(
     prepared: &PreparedMvMetadataOnlyWrite,
     connector_context: ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
     planning_lease: &ConnectorControlPlanningLease,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
+    receiving: &crate::query_execution::write_session::WriteBeginReceiving,
+) -> Result<
+    std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    ConnectorError,
+> {
+    let request =
+        prepare_metadata_only_document_write_request(prepared, connector_context, exact_lease)?;
+    begin_pending_document_write_async_in(
+        request,
+        exact_lease,
+        planning_lease,
+        typed_connector_control,
+        receiving,
+    )
+    .await
+}
+
+fn prepare_metadata_only_document_write_request(
+    prepared: &PreparedMvMetadataOnlyWrite,
+    connector_context: ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
+) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, ConnectorError> {
     let publication = prepared.publication_intent();
     if !matches!(
         publication.technique(),
         MvRefreshPublicationTechnique::MetadataOnly
     ) {
-        return Err("MV metadata-only session opened for another technique".to_string());
+        return Err(invalid_activation(
+            "MV metadata-only session opened for another technique".to_string(),
+        ));
     }
     if !exact_lease.matches_provider_binding_key(prepared.observed_binding()) {
-        return Err("MV metadata-only write lease drifted from prepared binding".to_string());
+        return Err(invalid_activation(
+            "MV metadata-only write lease drifted from prepared binding".to_string(),
+        ));
     }
     if !exact_lease.matches_provider_instance(prepared.target_table().owner()) {
-        return Err(
+        return Err(invalid_activation(
             "MV metadata-only target belongs to a different connector instance".to_string(),
-        );
+        ));
     }
     let target = crate::catalog_application::resolver::TargetBackend {
         provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
@@ -323,14 +301,9 @@ pub(crate) fn begin_metadata_only_connector_write_session(
         publication,
         base.clone(),
         ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
-    )?;
-    crate::query_execution::write_session::begin_connector_application_document_write_session_pending(
-        crate::connector::write_target::derive_write_stack_lease(
-            typed_connector_control,
-            planning_lease,
-        )?,
-        exact_lease,
-        crate::query_execution::dml::iceberg_writer::connector_write_begin_request_on_base(
+    )
+    .map_err(invalid_activation)?;
+    crate::query_execution::dml::iceberg_writer::connector_write_begin_request_on_base(
             &target,
             target_ref,
             intent,
@@ -342,8 +315,8 @@ pub(crate) fn begin_metadata_only_connector_write_session(
                 shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
             },
             connector_context,
-        )?,
-    )
+        )
+        .map_err(invalid_activation)
 }
 
 /// The write intent, signed input, and branch shape one incremental refresh mode
@@ -454,7 +427,7 @@ fn incremental_publication_write_input(
 /// The publication id travels inside the managed intent and nowhere else. It
 /// reaches the snapshot the commit writes -- that is what the publication fence
 /// reads back -- but no writer recipe, commit fragment, or backend sees it.
-pub(crate) fn begin_incremental_connector_write_session(
+pub(crate) async fn begin_incremental_connector_write_session_async_in(
     request: &MvIncrementalWriteRequest,
     target_table: &novarocks_spi::connector::ConnectorTableHandle,
     publication_intent: &MvRefreshPublicationIntent,
@@ -464,7 +437,39 @@ pub(crate) fn begin_incremental_connector_write_session(
     exact_lease: &ConnectorWriteLease,
     planning_lease: &ConnectorControlPlanningLease,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
+    receiving: &crate::query_execution::write_session::WriteBeginReceiving,
+) -> Result<
+    std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    ConnectorError,
+> {
+    let request = prepare_incremental_document_write_request(
+        request,
+        target_table,
+        publication_intent,
+        mode,
+        target_write_fields,
+        connector_context,
+        exact_lease,
+    )?;
+    begin_pending_document_write_async_in(
+        request,
+        exact_lease,
+        planning_lease,
+        typed_connector_control,
+        receiving,
+    )
+    .await
+}
+
+fn prepare_incremental_document_write_request(
+    request: &MvIncrementalWriteRequest,
+    target_table: &novarocks_spi::connector::ConnectorTableHandle,
+    publication_intent: &MvRefreshPublicationIntent,
+    mode: MvIncrementalWriteMode,
+    target_write_fields: &[novarocks_spi::connector::ConnectorWriteFieldRequest],
+    connector_context: ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
+) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, ConnectorError> {
     let target = crate::catalog_application::resolver::TargetBackend {
         provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
             .expect("static Iceberg provider ID"),
@@ -472,7 +477,8 @@ pub(crate) fn begin_incremental_connector_write_session(
         namespace: request.target_namespace.clone(),
         table: request.target_name.clone(),
     };
-    let (intent, input, shape) = incremental_publication_write_input(mode, target_write_fields)?;
+    let (intent, input, shape) = incremental_publication_write_input(mode, target_write_fields)
+        .map_err(invalid_activation)?;
     let base = publication_write_base(
         exact_lease,
         target_table,
@@ -487,14 +493,9 @@ pub(crate) fn begin_incremental_connector_write_session(
         publication_intent,
         base.clone(),
         ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
-    )?;
-    crate::query_execution::write_session::begin_connector_application_document_write_session_pending(
-        crate::connector::write_target::derive_write_stack_lease(
-            typed_connector_control,
-            planning_lease,
-        )?,
-        exact_lease,
-        crate::query_execution::dml::iceberg_writer::connector_write_begin_request_on_base(
+    )
+    .map_err(invalid_activation)?;
+    crate::query_execution::dml::iceberg_writer::connector_write_begin_request_on_base(
             &target,
             "main",
             intent,
@@ -506,29 +507,8 @@ pub(crate) fn begin_incremental_connector_write_session(
                 shape,
             },
             connector_context,
-        )?,
-    )
-}
-
-/// Release a session that will never reach its commit.
-///
-/// Nothing external has happened -- a begin performs reads only, and a session
-/// commits only through a completion this attempt never produced -- but the
-/// provider is holding a session for a write that will not run, and this
-/// refresh's one terminal decision is the only thing that releases it. So a
-/// failed refresh leaves nothing behind. The original failure is what the
-/// caller reports, so a failure to release is logged rather than substituted
-/// for it.
-pub(crate) fn release_mv_write_session_without_commit(
-    write_session: &crate::query_execution::write_session::ConnectorWriteSession,
-    connector_context: &ConnectorRequestContext,
-) {
-    if let Err(error) = write_session.abort(connector_context.clone()) {
-        tracing::warn!(
-            %error,
-            "releasing an uncommitted MV first-refresh write session failed",
-        );
-    }
+        )
+        .map_err(invalid_activation)
 }
 
 /// Freeze the declaration one MV publication commits under.
@@ -576,27 +556,44 @@ pub(crate) fn publication_write_base(
     intent: novarocks_spi::connector::ConnectorWriteIntent,
     input: ConnectorWriteInputRequest,
     connector_context: ConnectorRequestContext,
-) -> Result<novarocks_spi::connector::ConnectorWriteBaseVersion, String> {
-    let outcome = exact_lease
-        .prepare_write(novarocks_spi::connector::ConnectorWritePreparationRequest {
+) -> Result<novarocks_spi::connector::ConnectorWriteBaseVersion, ConnectorError> {
+    let outcome =
+        exact_lease.prepare_write(novarocks_spi::connector::ConnectorWritePreparationRequest {
             table: table.clone(),
-            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::parse(target_ref)
-                .map_err(|error| format!("validate MV publication target ref: {error}"))?,
+            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::parse(target_ref)?,
             intent,
             purpose:
                 novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
             input,
             context: connector_context,
-        })
-        .map_err(|error| format!("prepare the MV publication write: {error}"))?;
+        })?;
     match outcome {
         novarocks_spi::connector::ConnectorWritePreparationOutcome::Prepared(preparation) => {
             Ok(preparation.base_version().clone())
         }
-        novarocks_spi::connector::ConnectorWritePreparationOutcome::Denied(error) => {
-            Err(format!("MV publication write admission denied: {error}"))
-        }
+        novarocks_spi::connector::ConnectorWritePreparationOutcome::Denied(error) => Err(error),
     }
+}
+
+fn invalid_activation(message: String) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
+}
+
+async fn begin_pending_document_write_async_in(
+    request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+    exact_lease: &ConnectorWriteLease,
+    planning_lease: &ConnectorControlPlanningLease,
+    typed_connector_control: &novarocks_catalog_application::ConnectorControlHost,
+    receiving: &crate::query_execution::write_session::WriteBeginReceiving,
+) -> Result<
+    std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    ConnectorError,
+> {
+    let lease =
+        typed_connector_control.acquire_exact_write_stack(planning_lease.control_runtime_id())?;
+    crate::query_execution::write_session::begin_connector_application_document_write_session_pending_async_in(
+        lease, exact_lease, request, receiving,
+    ).await
 }
 
 #[cfg(test)]
@@ -718,6 +715,169 @@ mod tests {
             assert!(
                 incremental_publication_write_input(mode, &[]).is_err(),
                 "{mode:?} must not sign an empty write input"
+            );
+        }
+    }
+
+    #[test]
+    fn publication_write_base_calls_the_exact_lease_once_and_preserves_original_refusal() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_spi::connector::{
+            ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorProviderBindingKey,
+            ConnectorRequestContext, ConnectorStopOwner, ConnectorTableHandle,
+            ConnectorWriteAdmissionPurpose, ConnectorWriteControl, ConnectorWriteLease,
+            ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+            ProviderBindingEpoch,
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct AdmissionControl {
+            key: ConnectorProviderBindingKey,
+            denied: bool,
+            calls: AtomicUsize,
+            request: Mutex<Option<ConnectorWritePreparationRequest>>,
+            failure: Mutex<Option<ConnectorError>>,
+        }
+        impl ConnectorWriteControl for AdmissionControl {
+            fn binding_key(&self) -> &ConnectorProviderBindingKey {
+                &self.key
+            }
+            fn prepare_write(
+                &self,
+                request: ConnectorWritePreparationRequest,
+            ) -> Result<ConnectorWritePreparationOutcome, ConnectorError> {
+                assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+                *self.request.lock().unwrap() = Some(request);
+                let original = self
+                    .failure
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one original refusal");
+                if self.denied {
+                    Ok(ConnectorWritePreparationOutcome::Denied(original))
+                } else {
+                    Err(original)
+                }
+            }
+        }
+
+        for denied in [false, true] {
+            let error = ConnectorError::from_domain(
+                ConnectorErrorKind::ResourceExhausted,
+                novarocks_workload_control::WorkError::Capacity(
+                    "actual MV write preparation refusal",
+                ),
+            )
+            .with_cleanup_context("same original preparation cleanup");
+            let original = std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<SharedFailureCause>())
+                .expect("actual Connector domain cause")
+                .clone();
+            let fact = original.failure_fact();
+            let message = error.to_string();
+            let key = ConnectorProviderBindingKey {
+                instance_id: ConnectorInstanceId::parse("mv_activation_test").unwrap(),
+                incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
+            };
+            let control = Arc::new(AdmissionControl {
+                key: key.clone(),
+                denied,
+                calls: AtomicUsize::new(0),
+                request: Mutex::new(None),
+                failure: Mutex::new(Some(error)),
+            });
+            let lease = ConnectorWriteLease::new(key.clone(), control.clone(), || {}).unwrap();
+            let table = ConnectorTableHandle::try_new(
+                key.instance_id.clone(),
+                bytes::Bytes::from_static(b"admitted-mv-table"),
+            )
+            .unwrap();
+            let fields = target_write_fields();
+            let input = ConnectorWriteInputRequest::Data {
+                fields: fields.clone(),
+            };
+            let stop = ConnectorStopOwner::new();
+            let context = ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                stop.view(),
+                1024,
+                8192,
+            )
+            .unwrap();
+            let marker = context.request_scope_extension_or_insert_with(|| AtomicUsize::new(0));
+            let returned = super::publication_write_base(
+                &lease,
+                &table,
+                "main",
+                ConnectorWriteIntent::Append,
+                input,
+                context.clone(),
+            )
+            .unwrap_err();
+            assert_eq!(control.calls.load(Ordering::SeqCst), 1);
+            assert!(control.failure.lock().unwrap().is_none());
+            let actual = control
+                .request
+                .lock()
+                .unwrap()
+                .take()
+                .expect("actual Provider request");
+            assert_eq!(actual.table.owner(), table.owner());
+            assert_eq!(actual.table.payload(), table.payload());
+            assert_eq!(actual.target_ref.as_str(), "main");
+            assert_eq!(actual.intent, ConnectorWriteIntent::Append);
+            assert_eq!(
+                actual.purpose,
+                ConnectorWriteAdmissionPurpose::MaterializedViewRefresh
+            );
+            let ConnectorWriteInputRequest::Data {
+                fields: actual_fields,
+            } = actual.input
+            else {
+                panic!("preserve the prepared data input");
+            };
+            assert_eq!(actual_fields.len(), fields.len());
+            for (actual_field, prepared_field) in actual_fields.iter().zip(&fields) {
+                assert_eq!(actual_field.field(), prepared_field.field());
+                assert_eq!(
+                    actual_field.execution_type(),
+                    prepared_field.execution_type()
+                );
+            }
+            assert_eq!(actual.context.deadline(), context.deadline());
+            assert_eq!(
+                actual.context.max_handle_payload_bytes(),
+                context.max_handle_payload_bytes()
+            );
+            assert_eq!(
+                actual.context.max_total_payload_bytes(),
+                context.max_total_payload_bytes()
+            );
+            let actual_marker = actual
+                .context
+                .request_scope_extension_or_insert_with::<AtomicUsize>(|| {
+                    panic!("must retain the original request scope")
+                });
+            assert!(Arc::ptr_eq(&marker, &actual_marker));
+            assert!(!actual.context.is_cancelled());
+            stop.request_stop();
+            assert!(actual.context.is_cancelled());
+            assert!(context.is_cancelled());
+            assert_eq!(returned.kind(), ConnectorErrorKind::ResourceExhausted);
+            assert_eq!(returned.to_string(), message);
+            let source = std::error::Error::source(&returned)
+                .and_then(|source| source.downcast_ref::<SharedFailureCause>())
+                .expect("same original source");
+            assert_eq!(source, &original);
+            assert_eq!(source.failure_fact(), fact);
+            assert!(
+                source
+                    .downcast_ref::<novarocks_workload_control::WorkError>()
+                    .is_some()
             );
         }
     }

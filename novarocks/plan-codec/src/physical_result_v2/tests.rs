@@ -142,7 +142,10 @@ impl Fixture {
                 41,
                 true,
             )
-            .with_metadata([("source.tag".into(), "exact".into())].into()),
+            .with_metadata(std::collections::HashMap::<String, String>::from([(
+                "source.tag".into(),
+                "exact".into(),
+            )])),
         );
         let roots = vec![
             (0, FunctionValueType::new(DataType::Utf8, true)),

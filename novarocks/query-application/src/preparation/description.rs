@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use crate::api::QueryExecutionKind;
-use crate::coordination::{ExecutionEffect, RecoveryMode};
+use novarocks_coordination_contract::{ExecutionEffect, RecoveryMode};
 
 use super::CompletedPhysicalPlanCandidate;
 
@@ -32,6 +32,15 @@ use super::CompletedPhysicalPlanCandidate;
 pub enum OutputContract {
     Rows(Arc<[crate::api::ResultField]>),
     CompletionOnly,
+}
+
+/// The event that closes this logical execution's recovery and output.
+/// Public statement output and the root computation carrier remain separate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionFinishBoundary {
+    ClientEof,
+    TaskCompletion,
+    ComputationReady,
 }
 
 impl OutputContract {
@@ -294,6 +303,7 @@ pub struct FrozenExecutionDescription {
     scan_identities: Arc<[crate::api::PlanScanIdentity]>,
     output: OutputContract,
     row_carrier: Option<crate::api::ResultRowCarrier>,
+    finish_boundary: ExecutionFinishBoundary,
     effect: ExecutionEffect,
     recovery: RecoveryMode,
     residuals: Arc<[ResidualResponsibility]>,
@@ -368,6 +378,10 @@ impl FrozenExecutionDescription {
             candidate,
             kind,
             scan_identities: scan_identities.into(),
+            finish_boundary: match &output {
+                OutputContract::Rows(_) => ExecutionFinishBoundary::ClientEof,
+                OutputContract::CompletionOnly => ExecutionFinishBoundary::TaskCompletion,
+            },
             output,
             row_carrier,
             effect,
@@ -376,6 +390,21 @@ impl FrozenExecutionDescription {
             cost,
             resources,
         })
+    }
+
+    /// Freezes internal consumption without changing the statement's public
+    /// output, exact carrier, effect or recovery policy. A registered domain
+    /// consumer must prove completion before the actor can accept readiness.
+    pub fn into_internal_computation(mut self) -> Result<Self, String> {
+        if self.row_carrier.is_none() {
+            return Err("internal computation requires a frozen root result carrier".into());
+        }
+        self.finish_boundary = ExecutionFinishBoundary::ComputationReady;
+        Ok(self)
+    }
+
+    pub const fn finish_boundary(&self) -> ExecutionFinishBoundary {
+        self.finish_boundary
     }
 
     /// Check the exact intrinsic values before legacy native submission folds
@@ -645,7 +674,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(raw_error.contains("frozen root purpose"), "{raw_error}");
-        let render = novarocks_sql::compiler::client_render_schema(candidate.plan(), 0).unwrap();
+        let render = novarocks_sql::compiler::client_render_schema(
+            candidate.plan(),
+            novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
+                timezone_offset_seconds: 0,
+            },
+        )
+        .unwrap();
         let candidate = candidate
             .freeze_root_output(novarocks_result_contract::FrozenRootOutput::ClientRows(
                 render,

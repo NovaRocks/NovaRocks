@@ -46,7 +46,6 @@ use crate::query_execution::artifact::FragmentId;
 
 use crate::query_execution::artifact::{TaskManifestBinding, ValidatedNativeSubmission};
 use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
-use crate::query_execution::schedule::SchedulingPlan;
 use crate::task_execution::context_owner::{ContextEstablishFacts, ContextEstablishSource};
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::graph::{FragmentPlanFacts, FragmentPlanSource};
@@ -96,7 +95,11 @@ impl SubmissionFragmentPlans {
                     "manifest instance {finst} belongs to fragment {scheduled_fragment} but its submission names {fragment_id}"
                 )));
             }
+            let execution = submission.execution_id();
             let (fragment, assignment) = submission.into_creation_parts();
+            manifest
+                .validate_submission_fragment(execution, &fragment)
+                .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
             if plans
                 .insert(
                     (fragment_id, instance_index),
@@ -116,72 +119,6 @@ impl SubmissionFragmentPlans {
             return Err(TaskExecutionError::Schedule(format!(
                 "the Task manifest contains {} tasks but {} plans were submitted",
                 expected.len(),
-                plans.len()
-            )));
-        }
-        Ok(Self { plans })
-    }
-
-    /// Indexes every submission against the schedule that placed it.
-    ///
-    /// A submission whose instance the schedule does not contain, or a
-    /// placement with no submission, fails here rather than at the first task
-    /// that needs one: a partial index would produce a graph missing exactly
-    /// the tasks nobody asked about yet.
-    pub fn index(
-        submissions: Vec<ValidatedNativeSubmission>,
-        schedule: &SchedulingPlan,
-    ) -> Result<Self, TaskExecutionError> {
-        let mut index_of_instance = BTreeMap::new();
-        for (&fragment_id, placements) in &schedule.by_fragment {
-            for placement in placements {
-                index_of_instance
-                    .insert(placement.finst_id, (fragment_id, placement.instance_index));
-            }
-        }
-
-        let mut plans = BTreeMap::new();
-        for submission in submissions {
-            let finst = submission.fragment_instance_id();
-            let fragment_id = submission.fragment_id();
-            let &(scheduled_fragment, instance_index) =
-                index_of_instance.get(&finst).ok_or_else(|| {
-                    TaskExecutionError::Schedule(format!(
-                        "fragment {fragment_id} submission names instance {finst} which the \
-                         schedule did not place"
-                    ))
-                })?;
-            if scheduled_fragment != fragment_id {
-                return Err(TaskExecutionError::Schedule(format!(
-                    "instance {finst} is placed under fragment {scheduled_fragment} but its \
-                     submission names fragment {fragment_id}"
-                )));
-            }
-            let (fragment, assignment) = submission.into_creation_parts();
-            if plans
-                .insert(
-                    (fragment_id, instance_index),
-                    FragmentPlanFacts {
-                        fragment,
-                        assignment,
-                    },
-                )
-                .is_some()
-            {
-                return Err(TaskExecutionError::Schedule(format!(
-                    "fragment {fragment_id} instance {instance_index} was submitted twice"
-                )));
-            }
-        }
-
-        let placed: usize = schedule
-            .by_fragment
-            .values()
-            .map(|placements| placements.len())
-            .sum();
-        if plans.len() != placed {
-            return Err(TaskExecutionError::Schedule(format!(
-                "the schedule placed {placed} instances but {} were submitted",
                 plans.len()
             )));
         }
@@ -329,7 +266,7 @@ mod tests {
 
     use crate::native::fragment_encoder::frozen::FragmentArtifact;
     use crate::query_execution::artifact::NativePlacementAssignment;
-    use crate::query_execution::schedule::FragmentInstancePlacement;
+    use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 
     const ROOT: FragmentId = 1;
     const LEAF: FragmentId = 2;
@@ -343,7 +280,11 @@ mod tests {
     }
 
     fn finst(fragment_id: FragmentId, instance_index: usize) -> UniqueId {
-        UniqueId::new(i64::from(fragment_id), instance_index as i64 + 1)
+        crate::query_execution::artifact::fragment_instance_id_for_contract_test(
+            execution_id().query_id(),
+            fragment_id,
+            instance_index,
+        )
     }
 
     fn placement(fragment_id: FragmentId, instance_index: usize) -> FragmentInstancePlacement {
@@ -407,16 +348,34 @@ mod tests {
         )
     }
 
-    fn submission(fragment_id: FragmentId, instance_index: usize) -> ValidatedNativeSubmission {
-        submission_of(&artifact(fragment_id), instance_index)
-    }
-
-    fn every_submission(leaves: usize) -> Vec<ValidatedNativeSubmission> {
+    fn submission_fixture(
+        leaves: usize,
+    ) -> (
+        Vec<ValidatedNativeSubmission>,
+        TaskManifestBinding,
+        Arc<FragmentArtifact>,
+    ) {
         let root = artifact(ROOT);
         let leaf = artifact(LEAF);
+        let schedule = schedule(leaves);
+        let mut processes = BTreeMap::new();
+        for placement in schedule.by_fragment.values().flatten() {
+            processes
+                .entry(placement.backend_idx)
+                .or_insert_with(BackendProcessId::new_v7);
+        }
+        let manifest = TaskManifestBinding::protocol_fixture_for_test(
+            execution_id(),
+            novarocks_types::FrontendProcessId::new_v7(),
+            &schedule,
+            &[],
+            &processes,
+            [(ROOT, Arc::clone(&root)), (LEAF, Arc::clone(&leaf))].into(),
+        )
+        .expect("bind the original finite manifest");
         let mut all = vec![submission_of(&root, 0)];
         all.extend((0..leaves).map(|index| submission_of(&leaf, index)));
-        all
+        (all, manifest, leaf)
     }
 
     #[test]
@@ -424,9 +383,9 @@ mod tests {
         // Every instance of one fragment shares that fragment's frozen plan
         // and carries only its own assignment. Taking an instance moves its
         // facts out, so the index keeps no second copy of what a task owns.
-        let schedule = schedule(3);
+        let (submissions, manifest, _) = submission_fixture(3);
         let mut plans =
-            SubmissionFragmentPlans::index(every_submission(3), &schedule).expect("a full index");
+            SubmissionFragmentPlans::index_manifest(submissions, &manifest).expect("a full index");
 
         let first = plans.take_plan(LEAF, 0).expect("instance zero");
         let second = plans.take_plan(LEAF, 1).expect("instance one");
@@ -450,12 +409,20 @@ mod tests {
         // unplaced instance means the encoder and the scheduler disagree, and
         // a graph built from it would address a task no backend was told to
         // expect.
-        let mut submissions = every_submission(2);
-        submissions.push(submission(LEAF, 7));
-        let error = SubmissionFragmentPlans::index(submissions, &schedule(2))
-            .expect_err("an unplaced instance is refused")
-            .to_string();
-        assert!(error.contains("the schedule did not place"), "{error}");
+        let (mut submissions, manifest, leaf) = submission_fixture(2);
+        submissions.push(submission_of(&leaf, 7));
+        let error = SubmissionFragmentPlans::index_manifest(submissions, &manifest)
+            .expect_err("an unplaced instance is refused");
+        let TaskExecutionError::Schedule(error) = error else {
+            panic!("unplaced submission keeps the original schedule error category");
+        };
+        assert_eq!(
+            error,
+            format!(
+                "fragment {LEAF} submission names instance {} absent from the Task manifest",
+                finst(LEAF, 7),
+            ),
+        );
     }
 
     #[test]
@@ -463,12 +430,16 @@ mod tests {
         // The opposite direction, and the more dangerous one: a missing
         // submission would silently produce a graph short one task, and the
         // query would wait forever for output nobody was asked to produce.
-        let error = SubmissionFragmentPlans::index(every_submission(1), &schedule(3))
-            .expect_err("a missing submission is refused")
-            .to_string();
-        assert!(
-            error.contains("placed 4 instances but 2 were submitted"),
-            "{error}"
+        let (mut submissions, manifest, _) = submission_fixture(3);
+        submissions.truncate(2);
+        let error = SubmissionFragmentPlans::index_manifest(submissions, &manifest)
+            .expect_err("a missing submission is refused");
+        let TaskExecutionError::Schedule(error) = error else {
+            panic!("missing submission keeps the original schedule error category");
+        };
+        assert_eq!(
+            error,
+            "the Task manifest contains 4 tasks but 2 plans were submitted",
         );
     }
 

@@ -30,16 +30,18 @@ use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_execution::runtime::execution_runtime::ExchangeFlowLimits;
 use novarocks_execution_contract::{LeaseValidFor, MaxWait};
+use novarocks_frontend_application::task_protocol_config::{
+    DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
+};
 use novarocks_memory::{AuthorityConfig, ConfigError as MemoryConfigError};
 use novarocks_native_adapter::{
     FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
 };
 use novarocks_native_trust::NativeTransportMode;
-use novarocks_query_application::coordination::{
-    DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
-};
 use novarocks_secret::SecretValue;
-use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
+use novarocks_spi::connector::{
+    CatalogCredentialPurpose, NodeLocalCredentialReference, StaticCredentialReference,
+};
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_types::{ClusterRole, NativeEndpoint};
 use novarocks_worker::LeaseBounds;
@@ -787,7 +789,7 @@ fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
 /// should be refused where it is written, not where it is first used.
 fn validate_application_configuration(config: &NovaRocksConfig) -> Result<()> {
     if config.cluster.role == ClusterRole::Fe {
-        let _report = crate::composition::validate_frontend_joint_startup(&config.runtime)?;
+        crate::composition::validate_frontend_joint_startup(&config.runtime)?;
     } else {
         crate::sdk_listing_profile::validate_current()?;
     }
@@ -929,6 +931,13 @@ enum ConnectorCredentialEntryWire {
         access_key_secret: String,
         session_token: Option<String>,
     },
+    AliyunEcsRamRole {
+        purpose: CatalogCredentialPurposeWire,
+        name: String,
+        generation: String,
+        role_name: String,
+        scope_prefixes: Vec<String>,
+    },
     IcebergRestOauth2 {
         purpose: CatalogCredentialPurposeWire,
         name: String,
@@ -964,6 +973,24 @@ impl ConnectorCredentialEntryWire {
                     session_token.map(SecretValue::new),
                 )?),
             ),
+            Self::AliyunEcsRamRole {
+                purpose,
+                name,
+                generation,
+                role_name,
+                scope_prefixes,
+            } => {
+                let reference = NodeLocalCredentialReference::try_new(&name, &generation)
+                    .map_err(|error| error.to_string())?;
+                let config =
+                    novarocks_fs::AliyunEcsRamRoleConfig::try_new(&role_name, scope_prefixes)
+                        .map_err(|error| error.to_string())?;
+                return CatalogCredentialRegistryEntry::try_new_node_local(
+                    purpose.into(),
+                    reference,
+                    config,
+                );
+            }
             Self::IcebergRestOauth2 {
                 purpose,
                 name,
@@ -1040,6 +1067,10 @@ impl ConnectorConfig {
 pub struct StandaloneServerConfig {
     #[serde(default = "default_standalone_server_mysql_port")]
     pub mysql_port: u16,
+    #[serde(default = "default_trino_port")]
+    pub trino_port: u16,
+    #[serde(default = "default_trino_client_timeout_ms")]
+    pub trino_client_timeout_ms: u64,
     #[serde(default = "default_standalone_server_user")]
     pub user: String,
     #[serde(default)]
@@ -1072,6 +1103,13 @@ pub struct StandaloneServerConfig {
     pub iceberg_maintenance_action_cooldown_ms: i64,
     #[serde(default = "default_standalone_iceberg_maintenance_max_consecutive_failures")]
     pub iceberg_maintenance_max_consecutive_failures: u32,
+}
+
+fn default_trino_port() -> u16 {
+    8080
+}
+fn default_trino_client_timeout_ms() -> u64 {
+    300_000
 }
 
 fn default_standalone_server_mysql_port() -> u16 {
@@ -1142,6 +1180,8 @@ impl Default for StandaloneServerConfig {
     fn default() -> Self {
         Self {
             mysql_port: default_standalone_server_mysql_port(),
+            trino_port: default_trino_port(),
+            trino_client_timeout_ms: default_trino_client_timeout_ms(),
             user: default_standalone_server_user(),
             mv_refresh_scheduler_enabled: false,
             mv_refresh_scheduler_interval_ms: default_standalone_mv_refresh_scheduler_interval_ms(),
@@ -1180,13 +1220,20 @@ pub struct FrontendWorkloadRuntimeConfig {
     /// Warehouse-wide admitted compute queries. This is the Frontend's only
     /// query-load control: it covers planning through protocol terminality.
     pub concurrency_limit: usize,
+    /// FE Internal computation windows and their matching fixed CPU positions.
+    pub internal_result_positions: usize,
+    /// Complete retained backing allowance per Internal window.
+    pub internal_result_all_objects_bytes: u64,
     pub waiting_limit: usize,
     pub capacity_wait_timeout_ms: u64,
     pub restarts_per_work: usize,
     pub old_attempts_per_work: usize,
     pub old_attempts_limit: usize,
     pub unknown_creates_limit: usize,
+    /// Original global limit for live Work records, independent of Work class.
     pub scope_records_limit: usize,
+    pub joint_progress_turn_budget: usize,
+    pub retired_backing_recheck_ms: u64,
     pub obligation_records_limit: usize,
     pub control_inflight_limit: usize,
     pub control_ready_limit: usize,
@@ -1206,6 +1253,10 @@ impl Default for FrontendWorkloadRuntimeConfig {
     fn default() -> Self {
         Self {
             concurrency_limit: 256,
+            internal_result_positions: novarocks_workload_control::ResultCapacityConfig::V1
+                .positions[2],
+            internal_result_all_objects_bytes: novarocks_workload_control::ResultCapacityConfig::V1
+                .all_objects_bytes[2],
             waiting_limit: 1024,
             capacity_wait_timeout_ms: 30_000,
             restarts_per_work: 2,
@@ -1213,6 +1264,8 @@ impl Default for FrontendWorkloadRuntimeConfig {
             old_attempts_limit: 128,
             unknown_creates_limit: 4096,
             scope_records_limit: 8192,
+            joint_progress_turn_budget: 7,
+            retired_backing_recheck_ms: 25,
             obligation_records_limit: 8192,
             control_inflight_limit: 16,
             control_ready_limit: 256,
@@ -3079,6 +3132,26 @@ mod tests {
     const P: u64 = 1024 * 1024 * 1024;
 
     #[test]
+    fn internal_result_capacity_uses_explicit_runtime_values_and_original_defaults() {
+        let configured: RuntimeConfig = toml::from_str(
+            "[frontend_workload]\ninternal_result_positions = 1\ninternal_result_all_objects_bytes = 2147483648\n"
+        ).unwrap();
+        assert_eq!(configured.frontend_workload.internal_result_positions, 1);
+        assert_eq!(
+            configured
+                .frontend_workload
+                .internal_result_all_objects_bytes,
+            2147483648
+        );
+        let defaults: RuntimeConfig = toml::from_str("").unwrap();
+        assert_eq!(defaults.frontend_workload.internal_result_positions, 4);
+        assert_eq!(
+            defaults.frontend_workload.internal_result_all_objects_bytes,
+            1073741824
+        );
+    }
+
+    #[test]
     fn an_absent_memory_partition_derives_a_quarter_of_the_bound_as_headroom() {
         let config = RuntimeMemoryConfig::default()
             .authority_config(P)
@@ -3182,7 +3255,9 @@ mod tests {
     use novarocks_native_adapter::{
         FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
     };
-    use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
+    use novarocks_spi::connector::{
+        CatalogCredentialPurpose, NodeLocalCredentialReference, StaticCredentialReference,
+    };
     use novarocks_types::ClusterRole;
 
     #[test]
@@ -3425,6 +3500,85 @@ password = "${ENV:RETIRED_STARROCKS_SECRET_MUST_NOT_BE_RESOLVED}"
             !error.contains("RETIRED_STARROCKS_SECRET_MUST_NOT_BE_RESOLVED"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn connector_credentials_parse_node_local_role_sources_without_acquiring_material() {
+        for (role, purpose, cluster_role) in [
+            ("fe", "object-store-metadata", ClusterRole::Fe),
+            ("be", "object-store-data", ClusterRole::Be),
+        ] {
+            let frontend_endpoint = if role == "be" {
+                "frontend_endpoint = \"127.0.0.1:9070\""
+            } else {
+                ""
+            };
+            let config: NovaRocksConfig = toml::from_str(&format!(
+                r#"
+[cluster]
+role = "{role}"
+{frontend_endpoint}
+[[connector.credentials]]
+purpose = "{purpose}"
+name = "oss-source"
+generation = "blue"
+kind = "aliyun-ecs-ram-role"
+role_name = "novarocks-ecs"
+scope_prefixes = ["s3://novarocks-ci/development/"]
+"#
+            ))
+            .unwrap();
+            let registry = config.connector.credential_registry(cluster_role).unwrap();
+            let purpose = if role == "fe" {
+                CatalogCredentialPurpose::ObjectStoreMetadata
+            } else {
+                CatalogCredentialPurpose::ObjectStoreData
+            };
+            let reference = NodeLocalCredentialReference::try_new("oss-source", "blue").unwrap();
+            let source = registry.resolve_node_local(purpose, &reference).unwrap();
+            assert_eq!(source.role_name(), "novarocks-ecs");
+            assert_eq!(
+                source.scope_prefixes()[0].as_str(),
+                "s3://novarocks-ci/development/"
+            );
+            assert!(
+                registry
+                    .resolve(
+                        purpose,
+                        &StaticCredentialReference::try_new("oss-source", "blue").unwrap()
+                    )
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn node_local_startup_config_requires_an_explicit_closed_source_definition() {
+        let valid = r#"
+[cluster]
+role = "be"
+frontend_endpoint = "127.0.0.1:9070"
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "oss-source"
+generation = "blue"
+kind = "aliyun-ecs-ram-role"
+role_name = "novarocks-ecs"
+scope_prefixes = ["s3://novarocks-ci/development/"]
+"#;
+        for invalid in [
+            valid.replace("role_name = \"novarocks-ecs\"", ""),
+            valid.replace("[\"s3://novarocks-ci/development/\"]", "[]"),
+            valid.replace(
+                "s3://novarocks-ci/development/",
+                "s3://novarocks-ci/development",
+            ),
+            valid.replace("object-store-data", "catalog-control"),
+            valid.replace("object-store-data", "data-credential-vending"),
+            format!("{valid}\naccess_key_id = \"must-not-be-a-static-snapshot\"\n"),
+        ] {
+            assert!(toml::from_str::<NovaRocksConfig>(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -3740,7 +3894,7 @@ access_key_secret = ""
     }
 
     #[test]
-    fn task_execution_config_defaults_to_the_frozen_contract_values() {
+    fn task_execution_config_uses_frozen_wire_and_server_queue_policy() {
         let runtime = RuntimeConfig::default();
         let frozen = FrontendTaskTransportBudget::DEFAULT;
 
@@ -3784,10 +3938,7 @@ access_key_secret = ""
             runtime.task_backend_max_queued_operations,
             frozen.max_backend_queued_operations()
         );
-        assert_eq!(
-            runtime.task_backend_max_queued_bytes,
-            frozen.max_backend_queued_bytes()
-        );
+        assert_eq!(runtime.task_backend_max_queued_bytes, 512 * 1024 * 1024);
         assert_eq!(
             runtime.task_max_tasks_per_context,
             frozen.max_tasks_per_context()
@@ -4299,6 +4450,8 @@ grpc_port = 19080
             cfg.standalone_server,
             Some(StandaloneServerConfig {
                 mysql_port: 9030,
+                trino_port: 8080,
+                trino_client_timeout_ms: 300_000,
                 user: "root".to_string(),
                 mv_refresh_scheduler_enabled: false,
                 mv_refresh_scheduler_interval_ms: 30_000,
@@ -4977,5 +5130,33 @@ mod frontend_constant_policy_tests {
         assert_eq!(policy.max_metadata_bytes, 0);
         assert_eq!(policy.max_library_validation_work, 0);
         assert_eq!(policy.max_library_validation_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod frontend_workload_runtime_config_tests {
+    use super::*;
+    #[test]
+    fn actual_global_scope_and_native_queue_configuration_are_preserved() {
+        let configured: RuntimeConfig=toml::from_str("task_backend_max_queued_bytes = 268435456\n[frontend_workload]\nscope_records_limit = 5000\n").unwrap();
+        assert_eq!(configured.task_backend_max_queued_bytes, 256 * 1024 * 1024);
+        assert_eq!(configured.frontend_workload.scope_records_limit, 5000);
+        let defaults = RuntimeConfig::default();
+        assert_eq!(defaults.frontend_workload.scope_records_limit, 8192);
+        assert_eq!(defaults.task_backend_max_queued_bytes, 512 * 1024 * 1024);
+    }
+    #[test]
+    fn retired_class_and_dependency_quota_tables_are_rejected() {
+        for document in [
+            "[scope_slots]\nquery = 20\n",
+            "[dependency_custody]\npublications = 5\n",
+            "max_claims = 99",
+            "work_per_turn = 7",
+        ] {
+            assert!(
+                toml::from_str::<FrontendWorkloadRuntimeConfig>(document).is_err(),
+                "{document}"
+            );
+        }
     }
 }

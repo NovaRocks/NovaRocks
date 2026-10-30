@@ -28,8 +28,145 @@ use crate::iceberg::puffin::{Blob, PuffinWriter};
 use crate::iceberg::spec::{BlobMetadata, StatisticsFile, TableMetadata};
 use novarocks_spi::connector::StatisticsArtifactDraft;
 
+/// Formation invoice for the actual session's drafts. Original guarded body
+/// bytes are borrowed; only the largest sequential Puffin body copy coexists.
+/// Metadata accounts for normalization, identity sets, the Blob/StatisticsFile
+/// copies, frozen updates and JSON escaping. This changes no input limit.
+pub(crate) fn statistics_publication_owned_bytes(
+    drafts: &[StatisticsArtifactDraft],
+    table: &crate::iceberg::table::Table,
+    expectations: &[novarocks_spi::connector::StatisticsArtifactIdentity],
+) -> Result<std::num::NonZeroU64, novarocks_spi::connector::ConnectorError> {
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
+    };
+    use std::mem::size_of;
+    let overflow = || {
+        ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "Statistics publication formation invoice overflow",
+        )
+    };
+    if drafts.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "Statistics artifact count exceeds its original contract",
+        ));
+    }
+    let mut metadata = drafts
+        .len()
+        .checked_mul(
+            size_of::<StatisticsArtifactDraft>() + size_of::<Blob>() + size_of::<BlobMetadata>(),
+        )
+        .ok_or_else(overflow)?;
+    let mut body = 0;
+    for draft in drafts {
+        body = body.max(draft.body().len());
+        metadata = metadata
+            .checked_add(
+                draft
+                    .identity()
+                    .input_fields()
+                    .len()
+                    .checked_mul(size_of::<i32>())
+                    .ok_or_else(overflow)?,
+            )
+            .and_then(|n| n.checked_add(draft.identity().blob_type().len()))
+            .ok_or_else(overflow)?;
+        // The only normalized property is the NDV value. Include its missing
+        // value's f64 display buffer even when the actual input has no entry.
+        metadata = metadata
+            .checked_add(
+                size_of::<(String, String)>()
+                    + crate::stats_loader::NDV_PROPERTY.len()
+                    + f64::MAX_10_EXP as usize
+                    + f64::MANTISSA_DIGITS as usize
+                    + 4,
+            )
+            .ok_or_else(overflow)?;
+        for (key, value) in draft.properties() {
+            metadata = metadata
+                .checked_add(size_of::<(String, String)>())
+                .and_then(|n| n.checked_add(key.len()))
+                .and_then(|n| n.checked_add(value.len()))
+                .ok_or_else(overflow)?;
+        }
+    }
+    for expected in expectations {
+        metadata = metadata
+            .checked_add(size_of::<
+                novarocks_spi::connector::StatisticsArtifactIdentity,
+            >())
+            .and_then(|n| {
+                n.checked_add(
+                    expected
+                        .input_fields()
+                        .len()
+                        .checked_mul(size_of::<i32>())?,
+                )
+            })
+            .and_then(|n| n.checked_add(expected.blob_type().len()))
+            .ok_or_else(overflow)?;
+    }
+    metadata = metadata
+        .checked_add(table.metadata().location().len())
+        .and_then(|n| n.checked_add(table.identifier().name.len()))
+        .ok_or_else(overflow)?;
+    for part in table.identifier().namespace.iter() {
+        metadata = metadata
+            .checked_add(size_of::<String>())
+            .and_then(|n| n.checked_add(part.len()))
+            .ok_or_else(overflow)?;
+    }
+    // Eight live typed metadata views (normalization/sets, Blob/metadata,
+    // frozen request/projection) with at most six JSON bytes per input byte.
+    let peak = metadata
+        .checked_mul(8)
+        .and_then(|n| n.checked_mul(6))
+        .and_then(|n| n.checked_add(body))
+        .and_then(|n| {
+            n.checked_add(2 * novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES)
+        })
+        .ok_or_else(overflow)?;
+    std::num::NonZeroU64::new(u64::try_from(peak).map_err(|_| overflow())?).ok_or_else(overflow)
+}
+
 /// Per-table switch for collect-on-write statistics.
 pub const COLLECT_ON_WRITE_PROPERTY: &str = "novarocks.statistics.collect-on-write";
+
+// Scoped CPU failures retain their exact Connector fact and cause through
+// the shared writer. Legacy callers still receive their original String API.
+#[derive(Debug)]
+enum PuffinWriteFailure {
+    Legacy(String),
+    Scoped(novarocks_spi::connector::ConnectorError),
+}
+impl From<String> for PuffinWriteFailure {
+    fn from(message: String) -> Self {
+        Self::Legacy(message)
+    }
+}
+impl std::fmt::Display for PuffinWriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy(message) => f.write_str(message),
+            Self::Scoped(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+impl PuffinWriteFailure {
+    fn into_preparation_error(self) -> crate::iceberg::Error {
+        let error = match self {
+            Self::Legacy(message) => novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                message,
+            ),
+            Self::Scoped(error) => error,
+        };
+        crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, error.message())
+            .with_source(error)
+    }
+}
 
 /// Write already-computed long-form artifact drafts to one Puffin file.
 /// Snapshot and sequence provenance are bound here, after execution, and are
@@ -41,6 +178,32 @@ pub async fn write_puffin_artifacts(
     sequence_number: i64,
     artifacts: &[StatisticsArtifactDraft],
 ) -> Result<Option<StatisticsFile>, String> {
+    write_puffin_artifacts_original(
+        file_io,
+        puffin_path,
+        snapshot_id,
+        sequence_number,
+        artifacts,
+        None,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+type PuffinArtifactCpu<'a> = (
+    &'a std::sync::Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    &'a novarocks_spi::connector::ConnectorInstanceDescriptor,
+    novarocks_spi::connector::ProviderBindingEpoch,
+    &'a std::sync::Arc<[StatisticsArtifactDraft]>,
+);
+
+async fn write_puffin_artifacts_original(
+    file_io: &FileIO,
+    puffin_path: &str,
+    snapshot_id: i64,
+    sequence_number: i64,
+    artifacts: &[StatisticsArtifactDraft],
+    cpu: Option<PuffinArtifactCpu<'_>>,
+) -> Result<Option<StatisticsFile>, PuffinWriteFailure> {
     if artifacts.is_empty() {
         return Ok(None);
     }
@@ -51,31 +214,32 @@ pub async fn write_puffin_artifacts(
         .await
         .map_err(|error| format!("create Puffin writer: {error}"))?;
     let mut metadata = Vec::with_capacity(artifacts.len());
-    for artifact in artifacts {
+    for (ordinal, artifact) in artifacts.iter().enumerate() {
         // Keep the original carrier borrowed through every async writer exit.
         // Copies made for Puffin coexist under its admission holder.
-        let identity = artifact.identity();
-        let body = artifact.body();
-        let properties = artifact.properties();
-        let blob = Blob::builder()
-            .r#type(identity.blob_type().to_string())
-            .fields(identity.input_fields().to_vec())
-            .snapshot_id(snapshot_id)
-            .sequence_number(sequence_number)
-            .data(body.to_vec())
-            .properties(properties.clone().into_iter().collect())
-            .build();
+        let (blob, blob_metadata) = if let Some((cpu, descriptor, incarnation, drafts)) = cpu {
+            let source =
+                crate::catalog_control::statistics::scoped_cpu::StatisticsCpuOriginal::blob(
+                    descriptor.clone(),
+                    incarnation,
+                    std::sync::Arc::clone(drafts),
+                    ordinal,
+                    snapshot_id,
+                    sequence_number,
+                );
+            crate::catalog_control::statistics::scoped_cpu::run_artifacts(cpu, &source)
+                .await
+                .map_err(PuffinWriteFailure::Scoped)?;
+            source.take_blob()
+        } else {
+            // Explicit legacy caller, not a fallback from scoped refusal.
+            prepare_puffin_blob(artifact, snapshot_id, sequence_number)
+        };
         writer
             .add(blob, crate::iceberg::puffin::CompressionCodec::None)
             .await
             .map_err(|error| format!("write Puffin artifact: {error}"))?;
-        metadata.push(BlobMetadata {
-            r#type: identity.blob_type().to_string(),
-            snapshot_id,
-            sequence_number,
-            fields: identity.input_fields().to_vec(),
-            properties: properties.clone().into_iter().collect(),
-        });
+        metadata.push(blob_metadata);
     }
     writer
         .close()
@@ -166,4 +330,127 @@ pub(crate) async fn write_puffin_artifacts_allocated(
     .await?;
     writer.check_active().map_err(|error| error.to_string())?;
     Ok(statistics)
+}
+
+/// Exact closed first-party materialization, with the guarded source retained
+/// by the original Statistics CPU input until actual worker exit.
+pub(crate) fn prepare_puffin_blob(
+    artifact: &StatisticsArtifactDraft,
+    snapshot_id: i64,
+    sequence_number: i64,
+) -> (Blob, BlobMetadata) {
+    let identity = artifact.identity();
+    let body = artifact.body();
+    let properties = artifact.properties();
+    let blob = Blob::builder()
+        .r#type(identity.blob_type().to_string())
+        .fields(identity.input_fields().to_vec())
+        .snapshot_id(snapshot_id)
+        .sequence_number(sequence_number)
+        .data(body.to_vec())
+        .properties(properties.clone().into_iter().collect())
+        .build();
+    let metadata = BlobMetadata {
+        r#type: identity.blob_type().to_string(),
+        snapshot_id,
+        sequence_number,
+        fields: identity.input_fields().to_vec(),
+        properties: properties.clone().into_iter().collect(),
+    };
+    (blob, metadata)
+}
+
+pub(crate) async fn write_puffin_artifacts_allocated_scoped(
+    writer: &dyn crate::commit::model::ArtifactWriter,
+    snapshot_id: i64,
+    sequence_number: i64,
+    drafts: std::sync::Arc<[StatisticsArtifactDraft]>,
+    cpu: std::sync::Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    descriptor: &novarocks_spi::connector::ConnectorInstanceDescriptor,
+    incarnation: novarocks_spi::connector::ProviderBindingEpoch,
+) -> crate::iceberg::Result<Option<StatisticsFile>> {
+    writer.check_active()?;
+    if drafts.is_empty() {
+        return Ok(None);
+    }
+    let object = writer.allocate(
+        crate::commit::model::ArtifactClass::Attempt,
+        crate::commit::model::ArtifactKind::Statistics,
+    )?;
+    let result = write_puffin_artifacts_original(
+        writer.file_io(),
+        object.path(),
+        snapshot_id,
+        sequence_number,
+        &drafts,
+        Some((&cpu, descriptor, incarnation, &drafts)),
+    )
+    .await
+    .map_err(PuffinWriteFailure::into_preparation_error)?;
+    writer.check_active()?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod scoped_refusal_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureFact, FailureProjection};
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorMutationFailureKind,
+    };
+
+    #[derive(Debug)]
+    struct OriginalRefusal(ConnectorErrorKind);
+    impl std::fmt::Display for OriginalRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original bounded CPU marker")
+        }
+    }
+    impl std::error::Error for OriginalRefusal {}
+    impl FailureProjection for OriginalRefusal {
+        fn failure_fact(&self) -> FailureFact {
+            self.0.failure_fact()
+        }
+    }
+
+    #[test]
+    fn scoped_puffin_refusal_reaches_original_publication_fact_and_cause() {
+        for (kind, expected) in [
+            (
+                ConnectorErrorKind::ResourceExhausted,
+                ConnectorMutationFailureKind::ResourceExhausted,
+            ),
+            (
+                ConnectorErrorKind::Interrupted,
+                ConnectorMutationFailureKind::Interrupted,
+            ),
+            (
+                ConnectorErrorKind::Internal,
+                ConnectorMutationFailureKind::Internal,
+            ),
+        ] {
+            let original =
+                ConnectorError::from_domain(kind, OriginalRefusal(kind)).map_message(|_| {
+                    "internal CPU action Begin refused: original bounded detail".into()
+                });
+            let error = PuffinWriteFailure::Scoped(original.clone()).into_preparation_error();
+            let failure = crate::commit::attempt::before_dispatch_failure(&error);
+            assert_eq!(failure.kind(), expected);
+            assert_eq!(failure.failure_fact(), original.failure_fact());
+            assert_eq!(failure.connector_source(), Some(&original));
+            assert!(failure.message().contains("original bounded detail"));
+        }
+    }
+
+    #[test]
+    fn legacy_puffin_io_failure_keeps_original_unavailable_projection() {
+        let error = PuffinWriteFailure::Legacy("original Puffin storage error".into())
+            .into_preparation_error();
+        let failure = crate::commit::attempt::before_dispatch_failure(&error);
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unavailable);
+        assert_eq!(
+            failure.connector_source().unwrap().message(),
+            "original Puffin storage error"
+        );
+    }
 }

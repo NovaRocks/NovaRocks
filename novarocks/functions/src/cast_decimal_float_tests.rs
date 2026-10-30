@@ -466,3 +466,45 @@ fn decimal_float_compile_callbacks_preserve_primary_causes_on_success_and_reject
         }
     }
 }
+
+#[test]
+fn decimal256_selected_and_scalar_casts_keep_independent_midpoint_bits() {
+    let array = input(
+        true,
+        19,
+        0,
+        vec![
+            Some(9_223_372_036_854_776_833),
+            None,
+            Some(-9_223_372_036_854_776_833),
+        ],
+    );
+    let prepared = recipe(array.data_type().clone(), true);
+    for (row, expected) in [(0, 0x43e0_0000_0000_0000), (2, 0xc3e0_0000_0000_0001)] {
+        let CastRowResult::Float64(value) = prepared
+            .evaluate_row(
+                EvaluatedArgument::Column(&array),
+                17,
+                row,
+                &Control::default(),
+            )
+            .unwrap()
+        else {
+            panic!("original decimal float value");
+        };
+        assert_eq!(value.to_bits(), expected);
+        let scalar = array.slice(row, 1);
+        let CastRowResult::Float64(value) = prepared
+            .evaluate_row(
+                EvaluatedArgument::Scalar(&scalar),
+                31,
+                999,
+                &Control::default(),
+            )
+            .unwrap()
+        else {
+            panic!("original scalar decimal float value");
+        };
+        assert_eq!(value.to_bits(), expected);
+    }
+}

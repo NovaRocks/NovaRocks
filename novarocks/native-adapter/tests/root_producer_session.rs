@@ -79,7 +79,14 @@ fn client(columns: usize) -> FrozenRootOutput {
             },
         })
         .collect();
-    FrozenRootOutput::ClientRows(ClientRenderSchema::try_new(columns, 1).unwrap())
+    FrozenRootOutput::ClientRows(
+        ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            columns,
+            1,
+        )
+        .unwrap(),
+    )
 }
 
 struct Fixture {
@@ -1186,14 +1193,14 @@ fn decoded_fixture_schema(schema: &Schema, slots: &[u32]) -> Arc<ChunkSchema> {
         CompileCheckpoints, CompilePhase, FunctionValueType, ValueTypeStorageLifetime,
     };
     assert_eq!(schema.fields().len(), slots.len());
-    assert_eq!(schema.metadata().capacity(), 0);
+    assert!(schema.metadata().as_arc().is_none());
     // Both call sites author their original metadata-free physical contracts:
     // StatisticsArtifactV1 and the fixed RootWriteResultSchema, respectively.
     let declared: Vec<_> = schema
         .fields()
         .iter()
         .map(|field| {
-            assert_eq!(field.metadata().capacity(), 0);
+            assert!(field.metadata().as_arc().is_none());
             FunctionValueType::new(field.data_type().clone(), field.is_nullable())
         })
         .collect();

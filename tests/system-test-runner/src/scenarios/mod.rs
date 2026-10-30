@@ -35,6 +35,7 @@ mod mv_uea7_handover;
 mod mv_uea7_incarnation;
 mod mv_uea7_storage;
 mod native_compatibility;
+mod native_create_hold;
 mod native_creation;
 mod native_direct_controls;
 mod native_ingress;
@@ -58,6 +59,8 @@ mod runtime_filter;
 mod state_family;
 mod table_maintenance;
 mod task_evidence;
+mod trino_interop;
+mod trino_protocol;
 mod uea4_catalog_planning;
 mod uea4_range_reads;
 mod uea4_scan_readiness;
@@ -115,6 +118,8 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(execution_failure_prepared::scenarios());
     scenarios.extend(state_family::scenarios());
     scenarios.extend(table_maintenance::scenarios());
+    scenarios.extend(trino_interop::scenarios());
+    scenarios.extend(trino_protocol::scenarios());
     scenarios
 }
 
@@ -133,9 +138,9 @@ pub fn disabled_reason(name: &str) -> Option<&'static str> {
         | "uea4/catalog-planning-responsibility"
         | "catalog/provider-read-queued-progress"
         | "uea4/scan-producer-readiness"
-        | "uea4/scan-producer-cancel" => {
-            Some("Paimon tests are suspended pending detailed connector design")
-        }
+        | "uea4/scan-producer-cancel" => Some(
+            "Paimon provider is suspended until paimon-rust and its readers support Arrow 60 and zstd 0.14",
+        ),
         _ => None,
     }
 }

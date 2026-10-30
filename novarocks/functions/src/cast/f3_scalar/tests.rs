@@ -658,3 +658,71 @@ fn p05_extended_preparation_types_nullability_and_effects_follow_each_semantic_b
         }
     }
 }
+
+#[test]
+fn utf8_raw_float_retains_strict_text_and_non_finite_null_policy() {
+    let input = Arc::new(StringArray::from(vec![
+        Some("7"),
+        Some(" 7"),
+        Some("7 "),
+        Some("\u{a0}7"),
+        Some("7\u{2003}"),
+        Some("NaN"),
+        Some("1e999"),
+        None,
+    ])) as ArrayRef;
+    check(
+        input.clone(),
+        DataType::Float64,
+        &[
+            CastRowResult::Float64(7.0),
+            CastRowResult::Null,
+            CastRowResult::Null,
+            CastRowResult::Null,
+            CastRowResult::Null,
+            CastRowResult::Null,
+            CastRowResult::Null,
+            CastRowResult::Null,
+        ],
+    );
+    check(
+        input,
+        DataType::Float32,
+        &[
+            CastRowResult::Float32(7.0),
+            CastRowResult::Null,
+            CastRowResult::Null,
+            CastRowResult::Null,
+            CastRowResult::Null,
+            CastRowResult::Null,
+            CastRowResult::Null,
+            CastRowResult::Null,
+        ],
+    );
+}
+
+#[test]
+fn utf8_decimal_retains_its_existing_blank_normalization_and_unicode_trim() {
+    let input = Arc::new(StringArray::from(vec![
+        Some("\u{a0}1.25\u{2003}"),
+        Some("-1.255"),
+        Some("1.255"),
+        Some("1e2"),
+        Some(""),
+        Some("\u{3000}"),
+        None,
+    ])) as ArrayRef;
+    check(
+        input,
+        DataType::Decimal128(5, 2),
+        &[
+            CastRowResult::Decimal128(125),
+            CastRowResult::Decimal128(-126),
+            CastRowResult::Decimal128(126),
+            CastRowResult::Null,
+            CastRowResult::Null,
+            CastRowResult::Null,
+            CastRowResult::Null,
+        ],
+    );
+}

@@ -69,6 +69,8 @@ use tokio::time::Instant;
 
 use novarocks_catalog_application::CatalogApplicationService;
 use novarocks_catalog_application::CatalogAttachmentWakeupSignal;
+mod original;
+use original::CatalogOriginalRounds;
 
 #[derive(Default)]
 struct CatalogProjectionMetrics {
@@ -133,14 +135,16 @@ pub struct FrontendCatalogController {
     /// rather than a notification because it holds state — a stop published
     /// before the worker starts waiting is still seen.
     stop: watch::Sender<bool>,
-    /// The identity `bootstrap` observed, handed once to the worker.
+    /// The identity `bootstrap_in` observed, handed once to the worker.
     bootstrap_identity: Mutex<Option<StoreIdentity>>,
     /// Monotonic control generation. A freshness expiry supersedes it, which
     /// is what makes an abandoned scan's late completion inert rather than
     /// merely unlikely.
     generation: AtomicU64,
     metrics: CatalogProjectionMetrics,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    original: Option<CatalogOriginalRounds>,
+    worker_failure: Mutex<Option<Arc<tokio::task::JoinError>>>,
 }
 
 impl FrontendCatalogController {
@@ -172,37 +176,53 @@ impl FrontendCatalogController {
             bootstrap_identity: Mutex::new(None),
             generation: AtomicU64::new(0),
             metrics: CatalogProjectionMetrics::default(),
-            worker: Mutex::new(None),
+            worker: tokio::sync::Mutex::new(None),
+            original: None,
+            worker_failure: Mutex::new(None),
         }))
     }
 
-    /// Performs the first complete authoritative reread.
-    ///
-    /// There is no watermark to capture. A reconcile reads the attachment
-    /// family itself, so the only thing startup has to establish is that one
-    /// complete snapshot was applied; failing here fails frontend bootstrap,
-    /// which is the point — a frontend that never enumerated desired state
-    /// must not start serving a guess at it.
-    pub async fn bootstrap(&self) -> Result<(), String> {
-        let identity = self
-            .store
-            .identity()
-            .await
-            .map_err(|error| error.to_string())?;
-        self.reconcile().await?;
-        *self
-            .bootstrap_identity
-            .lock()
-            .map_err(|_| "catalog controller bootstrap state lock is poisoned".to_string())? =
-            Some(identity);
+    pub(crate) fn new_with_original(
+        store: Arc<dyn StateStore>,
+        projection: Arc<CatalogApplicationService>,
+        config: CatalogProjectionConfig,
+        admission: novarocks_workload_control::RootAdmissionHandle,
+        binding: crate::state_store::execution::StateStoreOriginalBinding,
+    ) -> Result<Arc<Self>, String> {
+        let mut controller = Self::new(store, projection, config)?;
+        Arc::get_mut(&mut controller)
+            .expect("unpublished controller")
+            .original = Some(CatalogOriginalRounds::new(admission, binding));
+        Ok(controller)
+    }
+
+    pub(crate) async fn bootstrap_in(
+        &self,
+        execution: &dyn novarocks_state_store_api::StateStoreReadExecution,
+    ) -> Result<(), novarocks_catalog_application::CatalogApplicationError> {
+        self.projection
+            .reconcile_snapshot_in(self.config.page_size, self.config.worker_count, execution)
+            .await?;
+        let identity = self.store.identity().await.map_err(|error| {
+            novarocks_catalog_application::CatalogApplicationError::from_domain(
+                novarocks_catalog_application::CatalogApplicationErrorKind::Unavailable,
+                error,
+            )
+        })?;
+        *self.bootstrap_identity.lock().map_err(|_| {
+            novarocks_catalog_application::CatalogApplicationError::new(
+                novarocks_catalog_application::CatalogApplicationErrorKind::Internal,
+                "catalog bootstrap identity lock is poisoned",
+            )
+        })? = Some(identity);
         Ok(())
     }
 
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
         let mut worker = self
             .worker
-            .lock()
-            .map_err(|_| "catalog controller worker lock is poisoned".to_string())?;
+            .try_lock()
+            .map_err(|_| "catalog controller worker is being joined".to_string())?;
         if worker.is_some() {
             return Err("catalog controller is already running".to_string());
         }
@@ -217,18 +237,40 @@ impl FrontendCatalogController {
 
     pub async fn shutdown(&self) -> Result<(), String> {
         self.request_stop_for_process_exit();
-        let handle = self
-            .worker
+        if let Some(cause) = self
+            .worker_failure
             .lock()
-            .map_err(|_| "catalog controller worker lock is poisoned".to_string())?
-            .take();
-        if let Some(mut handle) = handle
-            && tokio::time::timeout(self.config.shutdown_deadline, &mut handle)
-                .await
-                .is_err()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
         {
-            handle.abort();
-            let _ = handle.await;
+            return Err(format!(
+                "catalog controller retains failed original worker: {cause}"
+            ));
+        }
+        // The async guard only borrows this stable field. Cancelling either
+        // timeout drops the guard, leaving the SAME JoinHandle to be rejoined.
+        let mut worker = self.worker.lock().await;
+        if let Some(handle) = worker.as_mut() {
+            let result = tokio::time::timeout(self.config.shutdown_deadline, handle)
+                .await
+                .map_err(|_| {
+                    "catalog controller still retains its current physical round".to_string()
+                })?;
+            if let Err(cause) = result {
+                // Tokio already consumed this completed Join; retain the raw
+                // health and original round, and never repoll a panicked F.
+                worker.take();
+                let cause = Arc::new(cause);
+                *self
+                    .worker_failure
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(cause.clone());
+                return Err(format!("catalog controller worker failed: {cause}"));
+            }
+        }
+        worker.take();
+        if let Some(original) = &self.original {
+            original.close().await?;
         }
         self.projection.unpublish_all();
         self.publish_metrics();
@@ -397,14 +439,8 @@ impl FrontendCatalogController {
     async fn run_round(&self, expiry: Option<Instant>) -> ScanRound {
         let generation = self.generation.load(Ordering::Acquire);
         let mut scan = std::pin::pin!(self.scan_once());
-        let Some(expiry) = expiry else {
-            let (identity, outcome) = scan.await;
-            return ScanRound {
-                generation,
-                identity,
-                outcome,
-            };
-        };
+        let mut stop = self.stop.subscribe();
+        let mut stop_observed = false;
         let mut expired = false;
         loop {
             tokio::select! {
@@ -412,7 +448,17 @@ impl FrontendCatalogController {
                 (identity, outcome) = &mut scan => {
                     return ScanRound { generation, identity, outcome };
                 }
-                () = tokio::time::sleep_until(expiry), if !expired => {
+                _ = stop.wait_for(|stopping| *stopping), if !stop_observed => {
+                    // Re-poll the SAME scan so its stable original can observe
+                    // stop and settle its actual phase; never drop/restart it.
+                    stop_observed = true;
+                }
+                () = async {
+                    match expiry {
+                        Some(expiry) => tokio::time::sleep_until(expiry).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if !expired && expiry.is_some() => {
                     // Independent of the scan by construction: this fires on
                     // the clock the last completed reconcile set, so a scan
                     // that never returns cannot hold expired projections open.
@@ -435,7 +481,10 @@ impl FrontendCatalogController {
             .identity()
             .await
             .map_err(|error| error.to_string());
-        let outcome = self.reconcile().await;
+        let outcome = match &self.original {
+            Some(original) => original.scan(self).await,
+            None => self.reconcile().await,
+        };
         (identity, outcome)
     }
 
@@ -485,6 +534,10 @@ impl FrontendCatalogController {
 mod integration_tests;
 
 #[cfg(test)]
+#[path = "catalog_controller/original_tests.rs"]
+mod original_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::time::Instant as StdInstant;
@@ -510,6 +563,86 @@ mod tests {
     use super::*;
     use novarocks_catalog_application::ConnectorControlHost;
     use novarocks_catalog_application::{CatalogAttachment, CatalogAttachmentRepository};
+
+    /// Retains the selected Host's real startup-read owner while its borrower runs.
+    /// The physical worker is joined after the original inventory closes, even
+    /// when the caller's outer watchdog cancelled only that borrower.
+    pub(super) struct OriginalBootstrapFixture {
+        original: crate::state_store::execution::StateStoreOriginalOwner,
+        workers: novarocks_query_application::cpu::QueryBlockingExecutorOwner,
+        transaction_deadline: Duration,
+    }
+    impl OriginalBootstrapFixture {
+        pub(super) fn new(host: &novarocks_state_store_runtime::StateStoreHost) -> Self {
+            use novarocks_query_application::cpu::{
+                QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
+            };
+            let (vocabulary, instance) = host
+                .original_blocking_sources()
+                .expect("the selected pure provider supports original reads");
+            let workers = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
+                std::num::NonZeroUsize::new(1).unwrap(),
+                std::num::NonZeroUsize::new(1).unwrap(),
+            ))
+            .expect("original bootstrap worker");
+            let original = crate::state_store::execution::StateStoreOriginalOwner::bootstrap_read(
+                &workers.executor(),
+                vocabulary,
+                instance,
+                host.run_policy(),
+            )
+            .expect("the selected instance's original bootstrap owner");
+            Self {
+                original,
+                workers,
+                transaction_deadline: host.state_store().unwrap().limits().transaction_deadline,
+            }
+        }
+
+        pub(super) async fn drive(
+            &self,
+            controller: &FrontendCatalogController,
+        ) -> Result<(), CatalogApplicationError> {
+            use std::future::Future;
+            let execution = self
+                .original
+                .read_execution(self.transaction_deadline)
+                .expect("the original read execution");
+            let mut bootstrap = std::pin::pin!(controller.bootstrap_in(&execution));
+            std::future::poll_fn(|cx| {
+                self.original
+                    .poll_progress(cx)
+                    .unwrap_or_else(|cause| panic!("original bootstrap progress failed: {cause}"));
+                let result = bootstrap.as_mut().poll(cx);
+                self.original
+                    .poll_progress(cx)
+                    .unwrap_or_else(|cause| panic!("original bootstrap progress failed: {cause}"));
+                result
+            })
+            .await
+        }
+
+        pub(super) async fn close(mut self) {
+            std::future::poll_fn(|cx| self.original.poll_closed(cx))
+                .await
+                .unwrap_or_else(|cause| panic!("original bootstrap did not close: {cause}"));
+            drop(self.original);
+            self.workers
+                .shutdown_until(StdInstant::now() + Duration::from_secs(5))
+                .await
+                .expect("the same original bootstrap worker exits");
+        }
+    }
+
+    pub(super) async fn bootstrap_original(
+        controller: &FrontendCatalogController,
+        host: &novarocks_state_store_runtime::StateStoreHost,
+    ) -> Result<(), CatalogApplicationError> {
+        let fixture = OriginalBootstrapFixture::new(host);
+        let result = fixture.drive(controller).await;
+        fixture.close().await;
+        result
+    }
 
     /// Mints a distinct control generation per materialization, like a real
     /// provider role factory: reusing an incarnation would trip the retired-generation guard
@@ -586,6 +719,23 @@ mod tests {
             self.inner.begin_read().await
         }
 
+        async fn begin_original_read_in(
+            &self,
+            execution: &novarocks_state_store_api::StateStoreExecutionContext,
+        ) -> Result<
+            Box<dyn novarocks_state_store_api::OriginalReadTransaction>,
+            novarocks_state_store_api::StateStoreExecutionFailure,
+        > {
+            if !self.reads_available.load(Ordering::Acquire) {
+                return Err(StateStoreError::new(
+                    StateStoreErrorKind::ProviderUnavailable,
+                    "injected catalog admission read failure",
+                )
+                .into_original_failure());
+            }
+            self.inner.begin_original_read_in(execution).await
+        }
+
         async fn begin_write(
             &self,
             attempt: WriteAttempt,
@@ -616,6 +766,21 @@ mod tests {
                 let _permit = self.gate.acquire().await.expect("stall gate");
             }
             self.inner.begin_read().await
+        }
+
+        async fn begin_original_read_in(
+            &self,
+            execution: &novarocks_state_store_api::StateStoreExecutionContext,
+        ) -> Result<
+            Box<dyn novarocks_state_store_api::OriginalReadTransaction>,
+            novarocks_state_store_api::StateStoreExecutionFailure,
+        > {
+            if self.stalled.load(Ordering::Acquire) {
+                // Parks here for as long as the test holds the permit. The scan
+                // is not failing and not cancelled; it simply has not returned.
+                let _permit = self.gate.acquire().await.expect("stall gate");
+            }
+            self.inner.begin_original_read_in(execution).await
         }
 
         async fn begin_write(
@@ -947,7 +1112,7 @@ mod tests {
             .expect("state store shutdown");
     }
 
-    async fn open_store() -> (tempfile::TempDir, StateStoreHost, Arc<dyn StateStore>) {
+    pub(super) async fn open_store() -> (tempfile::TempDir, StateStoreHost, Arc<dyn StateStore>) {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
         let registry =
             builtin_state_store_provider_registry().expect("builtin StateStore registry");
@@ -988,7 +1153,7 @@ mod tests {
         }
     }
 
-    fn projection(
+    pub(super) fn projection(
         repository: CatalogAttachmentRepository,
     ) -> (
         Arc<ConnectorControlHost>,
@@ -1372,8 +1537,7 @@ mod tests {
         )
         .expect("controller");
 
-        controller
-            .bootstrap()
+        bootstrap_original(&controller, &host)
             .await
             .expect("one provider failure does not fail the full bootstrap");
         assert!(matches!(
@@ -1427,7 +1591,9 @@ mod tests {
             CatalogProjectionConfig::default(),
         )
         .expect("controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
         toggle_store.reads_available.store(false, Ordering::Release);
         assert!(
             repository
@@ -1489,7 +1655,9 @@ mod tests {
                 config.clone(),
             )
             .expect("controller");
-            controller.bootstrap().await.expect("bootstrap");
+            bootstrap_original(&controller, &host)
+                .await
+                .expect("bootstrap");
             wait_for_ready(&port, &created.attachment.instance_id).await;
             controller.start().expect("start controller");
             assert!(matches!(
@@ -1566,7 +1734,9 @@ mod tests {
             },
         )
         .expect("controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
         wait_for_ready(&port, &created.attachment.instance_id).await;
         assert_eq!(materializations.load(Ordering::Relaxed), 1);
 
@@ -1634,7 +1804,9 @@ mod tests {
             },
         )
         .expect("controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
         wait_for_ready(&port, &created.attachment.instance_id).await;
 
         stalling.stalled.store(true, Ordering::Release);
@@ -1725,7 +1897,9 @@ mod tests {
             },
         )
         .expect("outage controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
         wait_for_ready(&port, &created.attachment.instance_id).await;
 
         toggle_store.reads_available.store(false, Ordering::Release);
@@ -1797,7 +1971,9 @@ mod tests {
             CatalogProjectionConfig::default(),
         )
         .expect("controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
         wait_for_ready(&port, &created.attachment.instance_id).await;
 
         // The attachment goes away, and the store reports a new identity. The
@@ -1879,12 +2055,15 @@ mod tests {
             },
         )
         .expect("controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
+        let bootstrap_resyncs = controller.metrics_snapshot().resyncs;
         controller.start().expect("start controller");
         wait_for(
             Duration::from_secs(2),
             "the worker reaches its park between rounds",
-            || controller.metrics_snapshot().resyncs >= 2,
+            || controller.metrics_snapshot().resyncs > bootstrap_resyncs,
         )
         .await;
 
@@ -1926,7 +2105,10 @@ mod tests {
             },
         )
         .expect("controller");
-        controller.bootstrap().await.expect("bootstrap projection");
+        bootstrap_original(&controller, &host)
+            .await
+            .expect("bootstrap projection");
+        let bootstrap_resyncs = controller.metrics_snapshot().resyncs;
         controller.start().expect("start controller");
         // The worker always runs one round of its own before it parks, so the
         // baseline is taken after that round; otherwise this would pass on the
@@ -1934,7 +2116,7 @@ mod tests {
         wait_for(
             Duration::from_secs(2),
             "the worker performs its own first round before parking",
-            || controller.metrics_snapshot().resyncs >= 2,
+            || controller.metrics_snapshot().resyncs > bootstrap_resyncs,
         )
         .await;
         let parked = controller.metrics_snapshot().resyncs;

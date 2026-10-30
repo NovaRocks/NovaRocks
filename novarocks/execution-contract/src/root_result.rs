@@ -177,7 +177,8 @@ impl RootResultReply {
 pub enum RootReadResponse {
     Reply(RootResultReply),
     Deferred(RootReadDeferred),
-    Refused(RootReadRefusal),
+    // Keep complete rare refusal facts off the normal reply carrier.
+    Refused(Box<RootReadRefusal>),
 }
 
 /// Frozen request binding for a response that supplies no ACK receipt.

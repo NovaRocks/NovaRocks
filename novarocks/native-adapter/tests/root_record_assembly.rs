@@ -24,7 +24,9 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use novarocks_native_adapter::root_cow_selection_codec::{CowSelectionEncoder, CowSelectionTotals};
-use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
+use novarocks_native_adapter::root_record_assembly::{
+    RootRecordAssembly, RootRecordAssemblyError, RootRecordDomain,
+};
 use novarocks_result_render::RenderTurnStatus;
 
 fn cow_stream() -> Vec<u8> {
@@ -68,7 +70,7 @@ fn records(stream: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
     let mut start = 0;
     for &cut in cuts.iter().chain(std::iter::once(&stream.len())) {
         assembly
-            .push(&stream[start..cut], |record| {
+            .push::<std::convert::Infallible>(&stream[start..cut], |record| {
                 out.push(record.to_vec());
                 Ok(())
             })
@@ -98,7 +100,7 @@ fn whole_records_in_one_body_are_not_copied() {
     let range = stream.as_ptr_range();
     let mut assembly = RootRecordAssembly::new(RootRecordDomain::CowSelection, 1 << 20);
     assembly
-        .push(&stream, |record| {
+        .push::<std::convert::Infallible>(&stream, |record| {
             assert!(range.contains(&record.as_ptr()), "record was copied");
             Ok(())
         })
@@ -112,8 +114,10 @@ fn declared_length_is_bounded_before_assembly_reserves_it() {
     let first = records(&stream, &[])[0].len();
     let mut assembly = RootRecordAssembly::new(RootRecordDomain::CowSelection, first - 1);
     // The header arrives alone; the oversized declaration is refused at once.
-    let error = assembly.push(&stream[..32], |_| Ok(())).unwrap_err();
-    assert!(error.contains("assembly bound"), "{error}");
+    let error = assembly
+        .push::<std::convert::Infallible>(&stream[..32], |_| Ok(()))
+        .unwrap_err();
+    assert!(error.to_string().contains("assembly bound"), "{error}");
     assert!(assembly.retained_bytes() <= 32);
 }
 
@@ -121,16 +125,24 @@ fn declared_length_is_bounded_before_assembly_reserves_it() {
 fn end_inside_a_record_and_forged_headers_are_refused() {
     let stream = cow_stream();
     let mut assembly = RootRecordAssembly::new(RootRecordDomain::CowSelection, 1 << 20);
-    assembly.push(&stream[..40], |_| Ok(())).unwrap();
+    assembly
+        .push::<std::convert::Infallible>(&stream[..40], |_| Ok(()))
+        .unwrap();
     assert!(assembly.finish().is_err());
     let mut forged = stream.clone();
     forged[0] = b'X';
     let mut assembly = RootRecordAssembly::new(RootRecordDomain::CowSelection, 1 << 20);
-    assert!(assembly.push(&forged, |_| Ok(())).is_err());
+    assert!(
+        assembly
+            .push::<std::convert::Infallible>(&forged, |_| Ok(()))
+            .is_err()
+    );
     // A decoder refusal stops assembly with its own message.
     let mut assembly = RootRecordAssembly::new(RootRecordDomain::CowSelection, 1 << 20);
-    assert_eq!(
-        assembly.push(&stream, |_| Err("decoder refused".to_string())),
-        Err("decoder refused".to_string())
+    let error = assembly
+        .push(&stream, |_| Err("decoder refused".to_string()))
+        .unwrap_err();
+    assert!(
+        matches!(error, RootRecordAssemblyError::Sink(message) if message == "decoder refused")
     );
 }

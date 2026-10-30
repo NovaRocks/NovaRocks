@@ -23,8 +23,10 @@
 //! independent concurrency budget.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 use novarocks_query_application::cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
@@ -83,7 +85,9 @@ pub struct MvActivityGate {
 
 struct GateInner {
     state: Mutex<GateState>,
+    // Temporary legacy wait support. P06 removes this with the sync entrypoints.
     changed: Condvar,
+    changed_async: Notify,
 }
 
 impl Default for GateInner {
@@ -91,7 +95,17 @@ impl Default for GateInner {
         Self {
             state: Mutex::new(GateState::default()),
             changed: Condvar::new(),
+            changed_async: Notify::new(),
         }
+    }
+}
+
+impl GateInner {
+    // Every release/cancel/stop publishes the same level to both temporary
+    // caller forms. Foreign async wakes must run after the state lock exits.
+    fn notify_waiters(&self) {
+        self.changed.notify_all();
+        self.changed_async.notify_waiters();
     }
 }
 
@@ -148,16 +162,24 @@ impl MvActivityGate {
     /// Stops new admission and asks only worker-owned attempts to cancel.
     /// Foreground work retains its statement-owned cancellation lifecycle.
     pub fn begin_stopping(&self) {
-        let mut state = lock(&self.inner.state);
-        state.stopping = true;
-        for entry in state.entries.values_mut() {
-            if let Some(active) = &entry.active
-                && let Some(source) = &active.cancellation
-            {
-                let _ = source.request(QueryCancellationReason::ServerShutdown);
-            }
+        let cancellations = {
+            let mut state = lock(&self.inner.state);
+            state.stopping = true;
+            state
+                .entries
+                .values()
+                .filter_map(|entry| entry.active.as_ref()?.cancellation.clone())
+                .collect::<Vec<_>>()
+        };
+        // Stop and wake callbacks are foreign work. Never invoke them under
+        // the FIFO mutex, including during shutdown.
+        // Publish the gate's terminal level before invoking independent
+        // worker cancellation callbacks. Their failure cannot withhold the
+        // close notification from already queued foreground callers.
+        self.inner.notify_waiters();
+        for cancellation in cancellations {
+            let _ = cancellation.request(QueryCancellationReason::ServerShutdown);
         }
-        self.inner.changed.notify_all();
     }
 
     /// Perform the complete foreground transition into an activity lease.
@@ -173,6 +195,24 @@ impl MvActivityGate {
             .request(target, owner)
             .map_err(|_| MvActivityAdmissionError::Stopping)?;
         match ticket.acquire_waiting(cancelled) {
+            Ok(Some(lease)) => Ok(lease),
+            Ok(None) => Err(MvActivityAdmissionError::Cancelled),
+            Err(_) => Err(MvActivityAdmissionError::Stopping),
+        }
+    }
+
+    /// Async migration entry on the same FIFO. The legacy sync entry above
+    /// remains only until its actual callers migrate and P06 removes it.
+    pub async fn acquire_foreground_async(
+        &self,
+        target: CanonicalMvTarget,
+        owner: MvActivityOwner,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<MvActivityLease, MvActivityAdmissionError> {
+        let mut ticket = self
+            .request(target, owner)
+            .map_err(|_| MvActivityAdmissionError::Stopping)?;
+        match ticket.acquire_waiting_async(cancelled).await {
             Ok(Some(lease)) => Ok(lease),
             Ok(None) => Err(MvActivityAdmissionError::Cancelled),
             Err(_) => Err(MvActivityAdmissionError::Stopping),
@@ -206,7 +246,8 @@ impl MvActivityTicket {
         let mut state = lock(&inner.state);
         if state.stopping {
             remove_waiter(&mut state, &self.target, self.ticket_id);
-            inner.changed.notify_all();
+            drop(state);
+            inner.notify_waiters();
             return Err(MvActivityGateError::Stopping);
         }
         let Some(entry) = state.entries.get_mut(&self.target) else {
@@ -260,12 +301,14 @@ impl MvActivityTicket {
         loop {
             if cancelled() {
                 remove_waiter(&mut state, &self.target, self.ticket_id);
-                inner.changed.notify_all();
+                drop(state);
+                inner.notify_waiters();
                 return Ok(None);
             }
             if state.stopping {
                 remove_waiter(&mut state, &self.target, self.ticket_id);
-                inner.changed.notify_all();
+                drop(state);
+                inner.notify_waiters();
                 return Err(MvActivityGateError::Stopping);
             }
             let Some(entry) = state.entries.get_mut(&self.target) else {
@@ -305,6 +348,47 @@ impl MvActivityTicket {
             state = next;
         }
     }
+
+    /// Await the FIFO head and the original caller's cancellation/deadline.
+    /// Cancellation is a wakeable future, not a probe requiring a poll timer.
+    /// Dropping this borrow leaves the same ticket queued until its owner
+    /// retries or drops it; it never creates another waiter or grants a lease.
+    pub async fn acquire_waiting_async(
+        &mut self,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<Option<MvActivityLease>, MvActivityGateError> {
+        if self.claimed {
+            return Ok(None);
+        }
+        let Some(inner) = self.inner.upgrade() else {
+            return Err(MvActivityGateError::Stopping);
+        };
+        tokio::pin!(cancelled);
+        tokio::select! {
+            biased;
+            () = &mut cancelled => {
+                {
+                    let mut state = lock(&inner.state);
+                    remove_waiter(&mut state, &self.target, self.ticket_id);
+                }
+                inner.notify_waiters();
+                Ok(None)
+            }
+            result = async {
+                loop {
+                    let changed = inner.changed_async.notified();
+                    tokio::pin!(changed);
+                    // Register before checking the FIFO level. A release
+                    // between the check and await cannot strand this ticket.
+                    changed.as_mut().enable();
+                    if let Some(lease) = self.try_acquire()? {
+                        return Ok(Some(lease));
+                    }
+                    changed.await;
+                }
+            } => result,
+        }
+    }
 }
 
 impl Drop for MvActivityTicket {
@@ -316,7 +400,7 @@ impl Drop for MvActivityTicket {
             return;
         };
         remove_waiter(&mut lock(&inner.state), &self.target, self.ticket_id);
-        inner.changed.notify_all();
+        inner.notify_waiters();
     }
 }
 
@@ -354,7 +438,8 @@ impl Drop for MvActivityLease {
         if remove_entry {
             state.entries.remove(&self.target);
         }
-        inner.changed.notify_all();
+        drop(state);
+        inner.notify_waiters();
     }
 }
 
@@ -467,6 +552,231 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("lease release wakes FIFO waiter without host sleeping");
         waiter.join().expect("waiter does not panic");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_async_foreground_transition_returns_a_terminal_cancellation_without_a_host_wait_loop()
+     {
+        let gate = MvActivityGate::new();
+        let first = gate
+            .acquire_foreground_async(
+                target("mv"),
+                MvActivityOwner::ManualRefresh,
+                std::future::pending(),
+            )
+            .await
+            .expect("first foreground transition acquires its lease");
+        let cancelled = gate
+            .acquire_foreground_async(
+                target("mv"),
+                MvActivityOwner::ManualRefresh,
+                std::future::ready(()),
+            )
+            .await;
+        assert!(matches!(
+            cancelled,
+            Err(MvActivityAdmissionError::Cancelled)
+        ));
+        assert_eq!(gate.observe(&target("mv")).waiting, 0);
+        drop(first);
+        assert_eq!(gate.tracked_target_count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_async_foreground_waiter_is_woken_by_lease_release() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+        struct Count(AtomicUsize);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let gate = MvActivityGate::new();
+        let first = gate
+            .acquire_foreground(target("mv"), MvActivityOwner::Create, || false)
+            .expect("legacy admission owns the same target");
+        let wake = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut second = Box::pin(gate.acquire_foreground_async(
+            target("mv"),
+            MvActivityOwner::ManualRefresh,
+            std::future::pending(),
+        ));
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        let before = wake.0.load(Ordering::SeqCst);
+        drop(first);
+        assert!(wake.0.load(Ordering::SeqCst) > before);
+        let Poll::Ready(Ok(lease)) = second.as_mut().poll(&mut cx) else {
+            panic!("actual lease release must wake and admit the original FIFO waiter");
+        };
+        drop(second);
+        drop(lease);
+        assert_eq!(gate.tracked_target_count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_async_cancellation_wakes_and_removes_the_original_waiter_without_a_gate_timer()
+     {
+        let gate = MvActivityGate::new();
+        let first = gate
+            .acquire_foreground_async(
+                target("mv"),
+                MvActivityOwner::ManualRefresh,
+                std::future::pending(),
+            )
+            .await
+            .unwrap();
+        let cancellation = QueryCancellationSource::new();
+        let view = cancellation.view();
+        let mut second = Box::pin(gate.acquire_foreground_async(
+            target("mv"),
+            MvActivityOwner::ManualRefresh,
+            async {
+                let _ = view.cancelled().await;
+            },
+        ));
+        struct Count(std::sync::atomic::AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let wake = Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(wake.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(gate.observe(&target("mv")).waiting, 1);
+        cancellation.request(QueryCancellationReason::ClientDisconnected);
+        assert!(
+            wake.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "same cancellation must wake without a gate timer"
+        );
+        assert!(matches!(
+            second.await,
+            Err(MvActivityAdmissionError::Cancelled)
+        ));
+        assert_eq!(gate.observe(&target("mv")).waiting, 0);
+        drop(first);
+        assert_eq!(gate.tracked_target_count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_async_worker_cancellation_panic_does_not_withhold_gate_closure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+        struct PanicWake(MvActivityGate);
+        impl Wake for PanicWake {
+            fn wake(self: Arc<Self>) {
+                assert!(
+                    self.0.inner.state.try_lock().is_ok(),
+                    "worker cancellation runs outside FIFO lock"
+                );
+                panic!("actual worker cancellation wake failed");
+            }
+        }
+        struct Count(AtomicUsize);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let gate = MvActivityGate::new();
+        let mut worker = gate
+            .request(target("mv"), MvActivityOwner::ScheduledRefresh)
+            .unwrap();
+        let lease = worker.try_acquire().unwrap().unwrap();
+        let cancellation = lease.cancellation().unwrap();
+        let mut worker_wait = Box::pin(cancellation.cancelled());
+        let worker_waker = Waker::from(Arc::new(PanicWake(gate.clone())));
+        assert!(
+            worker_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&worker_waker))
+                .is_pending()
+        );
+        let wake = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut queued = Box::pin(gate.acquire_foreground_async(
+            target("mv"),
+            MvActivityOwner::ManualRefresh,
+            std::future::pending(),
+        ));
+        assert!(queued.as_mut().poll(&mut cx).is_pending());
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gate.begin_stopping()));
+        assert!(
+            result.is_err(),
+            "the original wake panic must remain observable"
+        );
+        assert!(
+            wake.0.load(Ordering::SeqCst) > 0,
+            "gate closure has its own actual notification"
+        );
+        assert!(matches!(
+            queued.as_mut().poll(&mut cx),
+            Poll::Ready(Err(MvActivityAdmissionError::Stopping))
+        ));
+        drop(queued);
+        drop(worker_wait);
+        drop(lease);
+        assert_eq!(gate.tracked_target_count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_async_borrow_drop_keeps_ticket_and_enqueue_does_not_wake_waiters() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Wake, Waker};
+        struct Count(AtomicUsize);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let gate = MvActivityGate::new();
+        let first = gate
+            .acquire_foreground(target("mv"), MvActivityOwner::Create, || false)
+            .unwrap();
+        let mut original = gate
+            .request(target("mv"), MvActivityOwner::Repartition)
+            .unwrap();
+        let wake = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        {
+            let mut borrow = Box::pin(original.acquire_waiting_async(std::future::pending()));
+            assert!(borrow.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(gate.observe(&target("mv")).waiting, 1);
+        let before = wake.0.load(Ordering::SeqCst);
+        let mut later = gate.request(target("mv"), MvActivityOwner::Drop).unwrap();
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            before,
+            "enqueue cannot enable an existing waiter"
+        );
+        drop(first);
+        assert!(
+            later.try_acquire().unwrap().is_none(),
+            "borrow drop cannot surrender the original FIFO position"
+        );
+        let lease = original
+            .acquire_waiting_async(std::future::pending())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(later.try_acquire().unwrap().is_none());
+        drop(lease);
+        drop(later.try_acquire().unwrap().unwrap());
+        assert_eq!(gate.tracked_target_count(), 0);
     }
 
     #[test]

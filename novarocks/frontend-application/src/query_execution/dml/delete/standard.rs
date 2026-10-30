@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Standalone-mode `DELETE FROM iceberg ... WHERE ...` entry point.
+//! Preparation and pure SQL authors for governed Iceberg DELETE.
 //!
 //! Distributed position-delete path:
 //! 1. Resolve + load the iceberg table.
@@ -26,19 +26,14 @@
 //!    Other expressions are rejected with an explicit error.
 //! 4. Rewrite DELETE into a SELECT of `_file`, `_pos`, and partition source
 //!    columns, then run it through the distributed `ICEBERG_DELETE_SINK`.
-//! 5. Route the sink output through the Iceberg write transaction runner,
-//!    which commits the generated position-delete files and drives
-//!    finalization lifecycle.
+//! 5. The supervised write action consumes the completed plan and retains the
+//!    exact session through publication, necessary finalization and actual exit.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::resolver::{TargetBackend, resolve_existing_table_target};
-use crate::query_execution::dml::delete::{
-    DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
-};
 use crate::query_execution::kernels::DmlExecutionKernel;
-use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
@@ -56,16 +51,12 @@ use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
 use novarocks_sql::semantic::ObjectName as SqlObjectName;
 use novarocks_types::schema::ColumnDef;
 
-pub(crate) fn prepare_delete_statement(
+pub(super) fn resolve_target(
     state: &DmlExecutionKernel,
     stmt: &Delete,
-    _source: &str,
     current_catalog: Option<&str>,
     current_database: &str,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    publication_id: novarocks_spi::connector::LakePublicationId,
-) -> Result<PreparedDelete, String> {
+) -> Result<(TargetBackend, String), String> {
     // Detect branch/tag suffix in the target table name.
     let target_name = sql_object_name(&stmt.target);
     let (stripped_parts, ref_suffix) = split_ref_suffix(&target_name.parts);
@@ -89,7 +80,7 @@ pub(crate) fn prepare_delete_statement(
         _ => "main".to_string(),
     };
 
-    // 1. Resolve target.
+    // Resolve only local catalog admission facts.
     let target =
         resolve_existing_table_target(state, table_name, current_catalog, current_database)?;
     if target.provider_id.as_str() != "iceberg" {
@@ -98,171 +89,99 @@ pub(crate) fn prepare_delete_statement(
             target.provider_id.as_str()
         ));
     }
-    let target_binding = crate::connector::write_target::load_write_target_binding(
-        state.connector_control().as_ref(),
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        connector_context.clone(),
-    )?;
-    let planning_lease = target_binding.lease().clone();
+    Ok((target, target_ref))
+}
 
-    // Reject a managed materialized view from neutral metadata under an exact
-    // generation, the same way INSERT, TRUNCATE and ADD FILES already do. This
-    // check cannot move into row-mutation admission: incremental MV refresh
-    // drives its own writes through that same admission, so at that level a
-    // user statement is indistinguishable from the MV machinery maintaining its
-    // own target.
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-        state.connector_control().as_ref(),
-        state.mv_storage_observation().as_ref(),
-        state.mv_readiness().as_ref(),
-        &target,
-        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Delete,
-    )?;
-
-    // 3. Reject an unsupported WHERE clause before any external side effect.
-    //    The distributed SELECT planner owns scan pruning and existing delete
-    //    visibility from this point onward. Column types come from the provider,
-    //    so this check never decodes an Iceberg schema itself.
+fn delete_where_sql(
+    stmt: &Delete,
+    target_binding: &crate::connector::write_target::ConnectorWriteTargetBinding,
+) -> Result<String, String> {
     let where_clause = stmt.selection.as_ref().ok_or_else(|| {
         "DELETE requires a WHERE clause; for full table replacement use \
          INSERT OVERWRITE t SELECT * FROM t WHERE FALSE"
             .to_string()
     })?;
     validate_where(where_clause, &target_binding.dml_target_columns()?)?;
-    let where_sql = novarocks_parser::printer::print_expr(where_clause);
+    Ok(novarocks_parser::printer::print_expr(where_clause))
+}
 
-    // 4. Ask the provider to admit the row mutation. The physical strategy, the
-    //    branch/format admission gates and the base version the frontend
-    //    journals all come back signed; nothing here re-derives them. The
-    //    provider reservation stays where DELETE has always made it, before the
-    //    frontend persists its operation intent -- unlike UPDATE and MERGE,
-    //    which defer admission until after. Aligning the two is a lifecycle
-    //    change and not part of this cutover.
-    let connector_operation_id = publication_id.into();
-    let (write_lease, row_mutation) = target_binding.prepare_row_mutation(
-        &target_ref,
-        connector_operation_id,
+pub(super) async fn prepare_delete_statement_async(
+    state: &DmlExecutionKernel,
+    stmt: &Delete,
+    target: &TargetBackend,
+    target_ref: &str,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    execution: QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    operation_id: ConnectorWriteOperationId,
+    begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
+) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
+    let target_binding =
+        super::load_delete_target_async(target, planning_lease, connector_context).await?;
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
+        state.mv_storage_observation().as_ref(),
+        target_binding.lease(),
+        state.mv_readiness().as_ref(),
+        target,
+        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Delete,
+        connector_context.clone(),
+    ).await?;
+    let where_sql = delete_where_sql(stmt, &target_binding)?;
+    // This provider author is pure over the frozen table metadata. It keeps
+    // the original operation identity and signs strategy, base and routing.
+    let (write_lease, mutation) = target_binding.prepare_row_mutation(
+        target_ref,
+        operation_id,
         novarocks_spi::connector::ConnectorRowMutationIntent::Delete,
         connector_context.clone(),
     )?;
-    let strategy = row_mutation.strategy();
-    let base_snapshot_id = row_mutation.base_version_ordinal();
-
-    prepare_delete_write(
+    let (deletion_vectors, sink_mode) = delete_write_mode(mutation.strategy())?;
+    let write_session = super::begin_delete_write_session_async(
         state,
-        &target,
-        strategy,
-        base_snapshot_id,
-        connector_operation_id,
+        target_binding.lease(),
         &write_lease,
-        &target_ref,
-        &where_sql,
-        execution.clone(),
-        connector_context,
-        planning_lease,
-        publication_id,
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
+            target,
+            target_ref,
+            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            delete_input_request(deletion_vectors)?,
+            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
+            connector_context.clone(),
+        )?,
+        begin_receiving.as_ref(),
     )
+    .await?;
+    // The original receiving already owns this session before any fallible
+    // post-begin binding or query shaping can fail.
+    let (delete_query, sql_write_input, table_bindings) = bind_delete_write(
+        target,
+        target_ref,
+        &where_sql,
+        sink_mode,
+        target_binding.lease(),
+        &write_session,
+    )?;
+    Ok(super::PreparedDeleteWrite {
+        state: state.clone(),
+        target: target.clone(),
+        delete_query,
+        sql_write_input,
+        table_bindings,
+        execution,
+        connector_context: connector_context.clone(),
+        write_session,
+        distribution: if deletion_vectors {
+            crate::query_execution::compiler::iceberg_write_shuffle_by_output_index(0)
+        } else {
+            novarocks_sql::compiler::RootDistributionRequirement::Any
+        },
+    })
 }
 
-struct DistributedDeleteWriteExecutor {
-    state: DmlExecutionKernel,
-    target: TargetBackend,
-    delete_query: Query,
-    sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<QueryTableBindingStore>,
-    execution: QueryExecutionContext,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    /// The one commit authority for this statement.
-    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    /// Deletion vectors are written one per target data file, so the sink output
-    /// is shuffled by its first column. Position deletes have no such
-    /// requirement. Both follow from the provider-signed strategy.
-    shuffle_by_first_output: bool,
-    native_assembly: Mutex<Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>>,
-}
-
-impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
-    /// Plan this DELETE's write if it has not been planned, then submit it.
-    ///
-    /// The plan is encoded when it is prepared, so submitting it takes
-    /// nothing the caller has to assemble first.
-    fn run(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
-        {
-            let mut assembly = self
-                .native_assembly
-                .lock()
-                .expect("prepared DELETE native assembly lock poisoned");
-            if assembly.is_none() {
-                let distribution = if self.shuffle_by_first_output {
-                    crate::query_execution::compiler::iceberg_write_shuffle_by_output_index(0)
-                } else {
-                    novarocks_sql::compiler::RootDistributionRequirement::Any
-                };
-                *assembly = Some(
-                    crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session(
-                        &self.state,
-                        Some(&self.target.catalog),
-                        &self.target.namespace,
-                        &self.delete_query,
-                        self.sql_write_input.clone(),
-                        Arc::clone(&self.table_bindings),
-                        None,
-                        distribution,
-                        Some(&self.execution),
-                        &self.connector_context,
-                        Arc::clone(&self.write_session),
-                    )?,
-                );
-            }
-        }
-        self.native_assembly
-            .lock()
-            .expect("prepared DELETE native assembly lock poisoned")
-            .take()
-            .ok_or_else(|| "prepared DELETE native assembly was already consumed".to_string())?
-            .finish()
-    }
-
-    fn terminal_request_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
-        self.connector_context.clone()
-    }
-
-    fn finalize(&self) -> Result<(), String> {
-        self.state.catalog_service().invalidate_table(
-            &self.target.catalog,
-            &self.target.namespace,
-            &self.target.table,
-        )
-    }
-}
-
-/// Plan the distributed write for a DELETE whose physical strategy the provider
-/// has already signed.
-///
-/// Both supported strategies share the same sink query and admission shape; only
-/// the sink mode and the root distribution differ, and both follow from the
-/// signed strategy rather than from anything this engine decides.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Delete preparation validates separate target, mutation, and execution-owner facts at this boundary; a wrapper would only restate those independently checked inputs."
-)]
-fn prepare_delete_write(
-    state: &DmlExecutionKernel,
-    target: &TargetBackend,
+fn delete_write_mode(
     strategy: ConnectorRowMutationStrategy,
-    base_snapshot_id: Option<i64>,
-    connector_operation_id: ConnectorWriteOperationId,
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
-    target_ref: &str,
-    where_sql: &str,
-    execution: QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-    publication_id: novarocks_spi::connector::LakePublicationId,
-) -> Result<PreparedDelete, String> {
+) -> Result<(bool, DmlWriteSinkMode), String> {
     let deletion_vectors = match strategy {
         ConnectorRowMutationStrategy::DeletionVector => true,
         ConnectorRowMutationStrategy::PositionDelete => false,
@@ -277,26 +196,24 @@ fn prepare_delete_write(
     } else {
         DmlWriteSinkMode::PositionDeletes
     };
+    Ok((deletion_vectors, sink_mode))
+}
 
-    // One row-mutation delete branch. The provider-signed strategy chooses
-    // between a deletion vector and position deletes; the session admits that
-    // shape and signs back the branch this statement writes.
-    let write_session = crate::query_execution::write_session::begin_connector_write_session(
-        crate::connector::write_target::derive_write_stack_lease(
-            state.typed_connector_control(),
-            &planning_lease,
-        )?,
-        write_lease,
-        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
-            target,
-            target_ref,
-            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-            delete_input_request(deletion_vectors)?,
-            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
-            connector_context.clone(),
-        )?,
-    )?;
+fn bind_delete_write(
+    target: &TargetBackend,
+    target_ref: &str,
+    where_sql: &str,
+    sink_mode: DmlWriteSinkMode,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    write_session: &crate::query_execution::write_session::ConnectorWriteSession,
+) -> Result<
+    (
+        Query,
+        novarocks_sql::planning::dml::DmlWritePlanInput,
+        Arc<QueryTableBindingStore>,
+    ),
+    String,
+> {
     // A DELETE writes exactly one branch, so the session must have sealed
     // exactly one target and that target must carry the provider's row-mutation
     // routing facts. Both are proved here rather than assumed: a session that
@@ -341,33 +258,7 @@ fn prepare_delete_write(
         &write_input_columns(write_target.input()),
         target_ref,
     )?;
-    let executor = DistributedDeleteWriteExecutor {
-        state: state.clone(),
-        target: target.clone(),
-        delete_query,
-        sql_write_input,
-        table_bindings,
-        execution,
-        connector_context: connector_context.clone(),
-        write_session,
-        // Deletion vectors are written one per target data file, so the sink
-        // output is shuffled by its first column; position deletes have no such
-        // requirement.
-        shuffle_by_first_output: deletion_vectors,
-        native_assembly: Mutex::new(None),
-    };
-    Ok(prepared_delete(
-        DeleteOperation {
-            publication_id,
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-            target_ref: target_ref.to_string(),
-            attempt_id: connector_operation_id.to_string(),
-            base_snapshot_id,
-        },
-        Arc::new(executor),
-    ))
+    Ok((delete_query, sql_write_input, table_bindings))
 }
 
 fn build_delete_position_sink_query(
@@ -929,6 +820,30 @@ mod tests {
         let error = super::validate_where(&where_clause, &columns_with_variant())
             .expect_err("a bare variant comparison is not supported");
         assert!(error.contains("LargeBinary"), "{error}");
+    }
+
+    /// DELETE takes its sink and distribution from the Provider's signed
+    /// strategy; another mutation strategy cannot silently choose a fallback.
+    #[test]
+    fn signed_delete_strategy_selects_its_sink_and_file_shuffle_requirement() {
+        use novarocks_spi::connector::ConnectorRowMutationStrategy as Strategy;
+        use novarocks_sql::planning::dml::DmlWriteSinkMode;
+        let (shuffle, sink) = super::delete_write_mode(Strategy::DeletionVector).unwrap();
+        assert!(shuffle);
+        assert!(matches!(sink, DmlWriteSinkMode::DeletionVectors));
+        let (shuffle, sink) = super::delete_write_mode(Strategy::PositionDelete).unwrap();
+        assert!(!shuffle);
+        assert!(matches!(sink, DmlWriteSinkMode::PositionDeletes));
+        for strategy in [
+            Strategy::MergeOnRead,
+            Strategy::CopyOnWrite,
+            Strategy::EqualityDelete,
+        ] {
+            assert_eq!(
+                super::delete_write_mode(strategy).unwrap_err(),
+                format!("DELETE cannot be served by row-mutation strategy {strategy:?}"),
+            );
+        }
     }
 
     #[test]

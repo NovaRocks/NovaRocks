@@ -37,7 +37,7 @@ pub use durable::{
 pub use family::{
     PersistentStateFamily, PersistentStateFamilyError, validate_persistent_state_families,
 };
-pub use host::{StateStoreHost, StateStoreHostLifecycle};
+pub use host::{PreparedStateStoreHost, StateStoreHost, StateStoreHostLifecycle};
 pub use host_error::{StateStoreHostError, StateStoreHostErrorKind};
 
 pub use policy::{
@@ -47,4 +47,7 @@ pub use policy::{
 pub use provider::{
     StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
 };
-pub use runner::{RunFailure, RunSuccess, StateStoreRunMetrics, run_side_effect_free};
+pub use runner::{
+    RunFailure, RunSuccess, StateStoreRunMetrics, StateStoreRunReceiving, run_side_effect_free,
+    run_side_effect_free_in, run_side_effect_free_in_receiving,
+};

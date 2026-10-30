@@ -34,6 +34,7 @@ pub enum FunctionBindingConstructionResource {
     Layout(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
     Vec(novarocks_type_contract::ControlResourceError),
     HashMap(novarocks_type_contract::owned_resources::hashmap::HashMapResourceError),
+    BTree(novarocks_type_contract::owned_resources::btree::BTreeResourceError),
 }
 #[derive(Debug)]
 pub enum FunctionBindingCreationFailure<H> {

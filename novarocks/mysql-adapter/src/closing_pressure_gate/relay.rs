@@ -53,11 +53,12 @@ impl PressureOwner {
     pub(crate) fn bind_relay(
         &self,
         connection: ClientConnectionToken,
+        expected_session: novarocks_query_application::session_control::SessionToken,
         statement: StatementToken,
         actual_sql_sha256: [u8; 32],
     ) -> io::Result<Option<PressureRelayHook>> {
         Ok(self
-            .bind_statement(connection, statement, actual_sql_sha256)?
+            .bind_statement(connection, expected_session, statement, actual_sql_sha256)?
             .map(|scope| PressureRelayHook { scope, statement }))
     }
     fn scope_for_original_writer(

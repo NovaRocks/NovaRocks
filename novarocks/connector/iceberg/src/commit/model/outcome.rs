@@ -47,6 +47,9 @@ pub enum IcebergCleanupReport {
 }
 
 impl IcebergCleanupReport {
+    /// Cleanup-only diagnostic projection. A KnownCommitted caller must keep
+    /// this separate from necessary business finalization; exact remaining
+    /// identities stay in this report on the original publication journal.
     pub(crate) fn finalization(&self) -> novarocks_spi::connector::ExternalMutationFinalization {
         use novarocks_spi::connector::{
             ConnectorMutationFailureKind, ExternalMutationFinalization,

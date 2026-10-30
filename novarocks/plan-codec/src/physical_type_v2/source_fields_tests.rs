@@ -716,7 +716,7 @@ fn actual_wide_empty_metadata_constructor_fits_original_work_envelope() {
             .unwrap();
     for id in 0..400 {
         let field = decoded.field_observed(id, &mut work).unwrap().unwrap();
-        assert_eq!(field.metadata().capacity(), 0);
+        assert!(field.metadata().as_arc().is_none());
         assert_eq!(field.data_type(), &DataType::Utf8);
     }
 }

@@ -390,7 +390,7 @@ fn writer_schema_large_metadata_is_legal_in_writer_owner_without_foreign_value_c
     let f = field(DataType::Int64).with_metadata(
         (0..64)
             .map(|i| (format!("k{i}"), "v".repeat(64 * 1024)))
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
     );
     let mut bytes = 0;
     validate_write_field_schema(&f, 1, &mut bytes).unwrap();
@@ -399,8 +399,11 @@ fn writer_schema_large_metadata_is_legal_in_writer_owner_without_foreign_value_c
         196 + 64 * (65536 + 2 * size_of::<String>()) + 10 * 2 + 54 * 3
     );
     parity(&f, 1, 0);
-    let f = field(DataType::Int64)
-        .with_metadata((0..65).map(|i| (format!("k{i}"), "v".into())).collect());
+    let f = field(DataType::Int64).with_metadata(
+        (0..65)
+            .map(|i| (format!("k{i}"), "v".into()))
+            .collect::<std::collections::HashMap<String, String>>(),
+    );
     parity(&f, 1, 0);
     let mut bytes = 0;
     contract(

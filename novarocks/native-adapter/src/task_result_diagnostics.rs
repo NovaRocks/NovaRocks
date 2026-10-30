@@ -1,7 +1,7 @@
 //! Backend task-result diagnostics.
 //!
-//! The task ingress emits a marker only after the Worker-owned result reader
-//! settles an exact task result. This module owns neither a result buffer nor
+//! The task and root readers emit the same marker only after their Worker-owned
+//! result reader settles an exact result. This module owns neither a result buffer nor
 //! a fragment-addressed compatibility fetch path.
 
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
@@ -38,6 +38,49 @@ pub fn emit_task_fetch_marker(
     Ok(())
 }
 
+/// Preserves first-Data and EOS observations from the settled typed root read.
+#[cfg(novarocks_dev_controls)]
+pub fn emit_root_read_marker(
+    controls: Option<&crate::test_observation_controls::NativeObservationControls>,
+    identity: TaskIdentity,
+    outcome: &novarocks_execution_contract::root_result::RootReadOutcome,
+) -> Result<(), String> {
+    use novarocks_execution_contract::root_result::RootReadOutcome;
+    use proto::novarocks::fetch_result_response::Status as FetchStatus;
+
+    let (status, sequence, eos, payload_bytes) = match outcome {
+        RootReadOutcome::Data(data) => {
+            let eos = data.end_after_data().is_some();
+            // Root data starts at one; the legacy task packets start at zero.
+            // Keep the same first-packet/EOS policy and print the real sequence.
+            if data.sequence().get() != 1 && !eos {
+                return Ok(());
+            }
+            (FetchStatus::Ready, data.sequence(), eos, data.body().len())
+        }
+        RootReadOutcome::End(end) => (FetchStatus::Eof, end.sequence, true, 0),
+        _ => return Ok(()),
+    };
+    let Some(controls) = controls else {
+        return Ok(());
+    };
+    if !controls.owns_backend(identity.backend_process_id()) {
+        return Err("root read observation names another backend process".into());
+    }
+    if let Some(observer) =
+        controls.observation_for("grpc-fragment", identity.query_execution_id())?
+    {
+        observer.observe(&typed_fetch_marker(
+            identity,
+            status,
+            sequence,
+            eos,
+            payload_bytes,
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(any(test, novarocks_dev_controls))]
 fn should_emit_typed_fetch_marker(
     status: proto::novarocks::fetch_result_response::Status,
@@ -57,7 +100,7 @@ fn should_emit_typed_fetch_marker(
 fn typed_fetch_marker(
     identity: TaskIdentity,
     status: proto::novarocks::fetch_result_response::Status,
-    packet_seq: i64,
+    packet_seq: impl std::fmt::Display,
     eos: bool,
     payload_bytes: usize,
 ) -> String {
@@ -99,6 +142,15 @@ mod tests {
         assert!(marker.contains("query_hi=7 query_lo=9 attempt=2 stage=3 task=4"));
         assert!(marker.contains(&format!("backend={}", identity.backend_process_id())));
         assert!(!marker.contains("unknown"));
+        let end = typed_fetch_marker(
+            identity,
+            FetchStatus::Eof,
+            std::num::NonZeroU64::new(u64::MAX).unwrap(),
+            true,
+            0,
+        );
+        assert!(end.contains("packet_seq=18446744073709551615 eos=true payload_bytes=0"));
+        assert!(end.contains(&format!("backend={}", identity.backend_process_id())));
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub(super) fn project_actual(
     names: &ArrayRef,
     actual_domain: Selection<'_>,
     contract: &Arc<ScalarCallContract>,
+    field_ordinal: usize,
     allocator: &HostAggregateAllocator,
     host: &Arc<dyn AggregateStateAllocator>,
     control: &dyn KernelEvaluationControl,
@@ -47,6 +48,23 @@ pub(super) fn project_actual(
         )
         .into());
     }
+    let Some(crate::FunctionArgumentType::Value(expected_source)) =
+        contract.selected().argument_types.first()
+    else {
+        return Err(
+            crate::kernel_control::invalid("ARRAY projection has no declared source type").into(),
+        );
+    };
+    if !novarocks_type_contract::arrow_data_types_exact_observed::<crate::KernelFailure>(
+        source.data_type(),
+        expected_source.data_type(),
+        || work.step(),
+    )? {
+        return Err(crate::kernel_control::invalid(
+            "ARRAY projection source differs from its prepared declaration",
+        )
+        .into());
+    }
     let result = {
         let diagnostics = HostProjectionDiagnostics::try_new(
             allocator,
@@ -56,10 +74,11 @@ pub(super) fn project_actual(
             &mut work,
         )?;
         let mut port = ArrayStructSubfieldPort { diagnostics };
-        array_struct_subfield_core::project_with_port(
+        array_struct_subfield_core::project_prepared_with_port(
             source,
             names,
-            Some(contract.result_type().data_type()),
+            contract.result_type().data_type(),
+            field_ordinal,
             &mut port,
         )?
     };

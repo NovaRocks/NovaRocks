@@ -133,8 +133,12 @@ fn workflow<H>(
             FunctionValueType::new(
                 DataType::Struct(
                     vec![Arc::new(
-                        Field::new("child", DataType::Utf8, true)
-                            .with_metadata([("original".into(), "metadata".into())].into()),
+                        Field::new("child", DataType::Utf8, true).with_metadata(
+                            std::collections::HashMap::<String, String>::from([(
+                                "original".into(),
+                                "metadata".into(),
+                            )]),
+                        ),
                     )]
                     .into(),
                 ),

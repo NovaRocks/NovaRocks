@@ -22,7 +22,7 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -30,13 +30,19 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
-use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer, RetryLayer, TimeoutLayer};
+use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::raw::{
-    Access, Layer, LayeredAccess, OpDelete, OpList, OpRead, OpStat, OpWrite, RpList, RpRead,
-    RpStat, RpWrite, oio,
+    Layer, OpCopier, OpCopy, OpCreateDir, OpDelete, OpList, OpPresign, OpRead, OpRename, OpStat,
+    OpWrite, RpCreateDir, RpPresign, RpRead, RpRename, RpStat, Service, ServiceInfo, Servicer, oio,
 };
-use opendal::{Buffer, Metadata, Operator};
+use opendal::{Buffer, HttpTransporter, Metadata, OperationContext, Operator};
 use url::{Host, Url};
+
+use crate::http_transport::Reqwest012Transport;
+
+#[path = "s3_signing.rs"]
+mod s3_signing;
+use s3_signing::{S3PresignLayer, S3RequestSigner, S3SigningTransport};
 
 use crate::list_body_limit::{
     ListBodyLimitFetch, OBJECT_STORE_LIST_BODY_LIMIT_BYTES, is_list_body_limit_exceeded,
@@ -434,6 +440,24 @@ pub struct FsAccessHandle {
 }
 
 impl FsAccessHandle {
+    /// Derive only a request view. The pooled operator, signer, client and
+    /// authority identities remain the originals; no client/cache is minted.
+    pub fn with_request_context(
+        mut self,
+        request: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Self {
+        if request.io_admission().is_some() {
+            let base = self.operator.base_context();
+            let transport = HttpTransporter::new(s3_signing::GovernedRequestTransport::new(
+                base.http_transport().clone(),
+                request,
+            ));
+            let context = base.with_http_transport(transport);
+            self.operator = self.operator.with_context(context);
+        }
+        self
+    }
+
     pub fn new(
         access_domain: StorageAccessDomainId,
         scheme: FsScheme,
@@ -833,12 +857,7 @@ impl FsAccessHandle {
         let path = self.paths.get(path_index).ok_or_else(|| {
             FileError::invalid(format!("file path index out of bounds: {path_index}"))
         })?;
-        if !self
-            .operator
-            .info()
-            .full_capability()
-            .write_with_if_not_exists
-        {
+        if !self.operator.info().capability().write_with_if_not_exists {
             return Err(FileError::unsupported(
                 "filesystem does not support native conditional create",
             ));
@@ -1217,7 +1236,7 @@ pub struct ObjectStoreConfig {
 }
 
 /// Non-secret object-store configuration that participates in provider reuse.
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ObjectStoreEndpointConfig {
     pub endpoint: String,
     pub enable_path_style_access: Option<bool>,
@@ -1384,8 +1403,12 @@ impl ObjectStoreProviderPool {
     }
 
     fn start(options: ObjectStoreProviderPoolOptions) -> FileResult<Self> {
+        // Build both transport policies once, before publishing the pool or
+        // starting its janitor. Operators clone these clients, not their pools.
+        let http_clients = ObjectStoreHttpClients::try_new()?;
         let state = Arc::new(ObjectStoreProviderPoolState {
             options,
+            http_clients,
             inner: Mutex::new(ObjectStoreProviderPoolInner::default()),
             wake: Condvar::new(),
         });
@@ -1410,6 +1433,20 @@ impl ObjectStoreProviderPool {
         self.state.options
     }
 
+    // Invoked only by the original single-flight construction owner, after
+    // claim released the pool mutex. Client selection performs no I/O.
+    fn build_operator(
+        &self,
+        endpoint: &ObjectStoreEndpointIdentity,
+        credentials: &ObjectStoreCredentialSource,
+    ) -> FileResult<Operator> {
+        build_object_store_operator(
+            endpoint,
+            credentials,
+            self.state.http_clients.select(endpoint),
+        )
+    }
+
     pub fn metrics_snapshot(&self) -> FileResult<ObjectStoreProviderPoolMetrics> {
         let inner = self.state.lock_inner()?;
         Ok(inner.metrics())
@@ -1420,7 +1457,6 @@ impl ObjectStoreProviderPool {
         access_domain: StorageAccessDomainId,
         bucket: &str,
         endpoint_config: &ObjectStoreEndpointConfig,
-        credential_identity: &ObjectStoreCredentialProviderIdentity,
         credentials: &ObjectStoreCredentialSource,
         builder: F,
     ) -> FileResult<Operator>
@@ -1430,8 +1466,7 @@ impl ObjectStoreProviderPool {
             &ObjectStoreCredentialSource,
         ) -> FileResult<Operator>,
     {
-        let (endpoint, key) =
-            provider_key(access_domain, bucket, endpoint_config, credential_identity)?;
+        let (endpoint, key) = provider_key(access_domain, bucket, endpoint_config, credentials)?;
         match self.claim(key)? {
             ProviderAcquisition::Ready(operator) => Ok(operator),
             ProviderAcquisition::Build(claim) => claim.build(&endpoint, credentials, builder),
@@ -1450,8 +1485,9 @@ impl ObjectStoreProviderPool {
     /// can never leave a construction without an owner.
     async fn acquire_async<F>(
         &self,
-        endpoint: ObjectStoreEndpointIdentity,
-        key: ObjectStoreProviderKey,
+        access_domain: StorageAccessDomainId,
+        bucket: &str,
+        endpoint_config: &ObjectStoreEndpointConfig,
         credentials: &ObjectStoreCredentialSource,
         cancellation: &FileCancellation,
         builder: F,
@@ -1462,6 +1498,7 @@ impl ObjectStoreProviderPool {
             &ObjectStoreCredentialSource,
         ) -> FileResult<Operator>,
     {
+        let (endpoint, key) = provider_key(access_domain, bucket, endpoint_config, credentials)?;
         cancellation.check()?;
         match self.claim(key)? {
             ProviderAcquisition::Ready(operator) => Ok(operator),
@@ -1599,13 +1636,13 @@ fn provider_key(
     access_domain: StorageAccessDomainId,
     bucket: &str,
     endpoint_config: &ObjectStoreEndpointConfig,
-    credential_identity: &ObjectStoreCredentialProviderIdentity,
+    credentials: &ObjectStoreCredentialSource,
 ) -> FileResult<(ObjectStoreEndpointIdentity, ObjectStoreProviderKey)> {
     let endpoint = ObjectStoreEndpointIdentity::try_new(bucket, endpoint_config)?;
     let key = ObjectStoreProviderKey {
         endpoint: endpoint.clone(),
         access_domain,
-        credential_identity: credential_identity.clone(),
+        credential_identity: credentials.identity(),
     };
     Ok((endpoint, key))
 }
@@ -1630,8 +1667,45 @@ impl Debug for ObjectStoreProviderPool {
     }
 }
 
+// HTTP policy belongs to the process FS pool, independently of the operator
+// cache key, bucket, access domain, or credential provider identity.
+struct ObjectStoreHttpClients {
+    local: reqwest::Client,
+    remote: reqwest::Client,
+}
+
+impl ObjectStoreHttpClients {
+    fn try_new() -> FileResult<Self> {
+        let build = |builder: reqwest::ClientBuilder| {
+            builder
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| {
+                    FileError::with_source(
+                        FileErrorKind::Internal,
+                        "build object-store pool HTTP client",
+                        error,
+                    )
+                })
+        };
+        Ok(Self {
+            local: build(reqwest::Client::builder().no_proxy())?,
+            remote: build(reqwest::Client::builder())?,
+        })
+    }
+
+    fn select(&self, endpoint: &ObjectStoreEndpointIdentity) -> reqwest::Client {
+        if is_local_endpoint(&endpoint.endpoint) {
+            self.local.clone()
+        } else {
+            self.remote.clone()
+        }
+    }
+}
+
 struct ObjectStoreProviderPoolState {
     options: ObjectStoreProviderPoolOptions,
+    http_clients: ObjectStoreHttpClients,
     inner: Mutex<ObjectStoreProviderPoolInner>,
     wake: Condvar,
 }
@@ -1965,14 +2039,11 @@ impl ObjectStoreBuildReservation {
 ///
 /// Secret material remains outside this type and outside all pool keys.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[non_exhaustive]
-pub enum ObjectStoreCredentialProviderIdentity {
+enum ObjectStoreCredentialProviderIdentity {
     /// Startup-composed material named by an exact static reference.
     Static(StaticCredentialReference),
-    /// Material owned by a consumer-side [`StorageAuthority`]. Mint this only
-    /// through [`ObjectStoreAccessContext::for_authority`], which takes the
-    /// identity from the authority that will actually sign the requests.
-    Vended(StorageAuthorityId),
+    /// Identity derived from the authority that will sign the request.
+    Authority(StorageAuthorityId),
 }
 
 /// What one object-store operator signs its requests with.
@@ -1984,14 +2055,37 @@ pub enum ObjectStoreCredentialProviderIdentity {
 /// operator outlive the rotation and the expiry of any single credential.
 #[derive(Clone)]
 enum ObjectStoreCredentialSource {
-    Static(ObjectStoreSecretMaterial),
+    Static {
+        reference: StaticCredentialReference,
+        material: ObjectStoreSecretMaterial,
+    },
     Authority(Arc<StorageAuthority>),
+}
+
+impl ObjectStoreCredentialSource {
+    fn identity(&self) -> ObjectStoreCredentialProviderIdentity {
+        match self {
+            Self::Static { reference, .. } => {
+                ObjectStoreCredentialProviderIdentity::Static(reference.clone())
+            }
+            Self::Authority(authority) => {
+                ObjectStoreCredentialProviderIdentity::Authority(authority.id().clone())
+            }
+        }
+    }
 }
 
 impl Debug for ObjectStoreCredentialSource {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Static(material) => f.debug_tuple("Static").field(material).finish(),
+            Self::Static {
+                reference,
+                material,
+            } => f
+                .debug_struct("Static")
+                .field("reference", reference)
+                .field("material", material)
+                .finish(),
             Self::Authority(authority) => f.debug_tuple("Authority").field(authority).finish(),
         }
     }
@@ -1999,23 +2093,24 @@ impl Debug for ObjectStoreCredentialSource {
 
 pub struct ObjectStoreAccessContext<'a> {
     endpoint_config: ObjectStoreEndpointConfig,
-    credential_identity: ObjectStoreCredentialProviderIdentity,
     credentials: ObjectStoreCredentialSource,
     provider_pool: &'a ObjectStoreProviderPool,
 }
 
 impl<'a> ObjectStoreAccessContext<'a> {
     /// Bind startup-composed static material to its exact reference.
-    pub fn new(
+    pub fn for_static(
         endpoint_config: ObjectStoreEndpointConfig,
-        credential_identity: ObjectStoreCredentialProviderIdentity,
+        credential_reference: StaticCredentialReference,
         secret_material: ObjectStoreSecretMaterial,
         provider_pool: &'a ObjectStoreProviderPool,
     ) -> Self {
         Self {
             endpoint_config,
-            credential_identity,
-            credentials: ObjectStoreCredentialSource::Static(secret_material),
+            credentials: ObjectStoreCredentialSource::Static {
+                reference: credential_reference,
+                material: secret_material,
+            },
             provider_pool,
         }
     }
@@ -2031,9 +2126,6 @@ impl<'a> ObjectStoreAccessContext<'a> {
     ) -> Self {
         Self {
             endpoint_config,
-            credential_identity: ObjectStoreCredentialProviderIdentity::Vended(
-                authority.id().clone(),
-            ),
             credentials: ObjectStoreCredentialSource::Authority(authority),
             provider_pool,
         }
@@ -2044,23 +2136,96 @@ impl Debug for ObjectStoreAccessContext<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObjectStoreAccessContext")
             .field("endpoint_config", &self.endpoint_config)
-            .field("credential_identity", &self.credential_identity)
             .field("credentials", &self.credentials)
             .field("provider_pool", &self.provider_pool)
             .finish_non_exhaustive()
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FsAccessResolver;
+/// Cloneable view of one explicitly composed filesystem runtime epoch.
+/// A configuration-only view can parse locations and resolve local/S3 access;
+/// HDFS execution requires the role runtime before any cache lookup.
+#[derive(Clone, Default)]
+pub struct FsAccessResolver {
+    hdfs: Option<Arc<HdfsRuntimeView>>,
+}
+
+// The former HDFS operator cache is owned by this original resolver view,
+// rather than a process-global key which can cross role/runtime epochs.
+// Operators retain only a clone of the supplied Handle, never this view.
+struct HdfsRuntimeView {
+    runtime: tokio::runtime::Handle,
+    operators: Mutex<HashMap<HdfsOperatorKey, Operator>>,
+}
+
+impl Debug for FsAccessResolver {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsAccessResolver")
+            .field("hdfs_runtime_installed", &self.hdfs.is_some())
+            .finish_non_exhaustive()
+    }
+}
 
 impl FsAccessResolver {
+    /// Configuration/local/S3 view. This never discovers or creates a runtime.
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// The composition root supplies its existing role runtime. Clones share
+    /// this same HDFS cache epoch; changing an I/O view does not mint another.
+    /// The caller retains the Runtime itself through all filesystem work.
+    pub fn with_runtime(runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            hdfs: Some(Arc::new(HdfsRuntimeView {
+                runtime,
+                operators: Mutex::new(HashMap::new()),
+            })),
+        }
     }
 
     pub fn parse_location(&self, raw: impl AsRef<str>) -> FileResult<FsLocation> {
         FsLocation::parse(raw)
+    }
+
+    /// Pure projection from the SAME route author used by resolve_locations.
+    /// It does not create an operator, resolve DNS, acquire secrets, or dial.
+    pub fn selected_dependency(
+        &self,
+        location: &str,
+        object_store: Option<&ObjectStoreEndpointConfig>,
+    ) -> FileResult<novarocks_spi::connector::SharedDependency> {
+        use novarocks_spi::connector::{HdfsServiceOrigin, NetworkServiceOrigin, SharedDependency};
+        let selected = self.parse_location(location)?;
+        match selected.scheme() {
+            FsScheme::Local => Ok(SharedDependency::LocalHost),
+            FsScheme::Hdfs => {
+                let original = parse_hdfs_selection(location, false)?;
+                let route = Url::parse(&original.name_node)
+                    .map_err(|_| FileError::invalid("invalid selected HDFS service"))?;
+                HdfsServiceOrigin::from_selected_url(&route)
+                    .map(SharedDependency::Hdfs)
+                    .map_err(|_| {
+                        FileError::invalid("selected HDFS service exceeds dependency profile")
+                    })
+            }
+            FsScheme::ObjectStore => {
+                let config = object_store.ok_or_else(|| {
+                    FileError::invalid("object-store route has no original endpoint configuration")
+                })?;
+                let bucket = selected
+                    .authority()
+                    .ok_or_else(|| FileError::invalid("object-store path has no bucket"))?;
+                let endpoint = ObjectStoreEndpointIdentity::try_new(bucket, config)?;
+                let route = Url::parse(&endpoint.endpoint)
+                    .map_err(|_| FileError::invalid("invalid selected object-store endpoint"))?;
+                NetworkServiceOrigin::from_selected_url(&route)
+                    .map(SharedDependency::Network)
+                    .map_err(|_| {
+                        FileError::invalid("selected storage service exceeds dependency profile")
+                    })
+            }
+        }
     }
 
     pub fn parse_locations<I, S>(&self, locations: I) -> FileResult<Vec<FsLocation>>
@@ -2103,7 +2268,9 @@ impl FsAccessResolver {
             FsScheme::ObjectStore => {
                 resolve_object_store_locations(access_domain, locations, object_store_access)
             }
-            FsScheme::Hdfs => resolve_hdfs_locations(access_domain, locations),
+            FsScheme::Hdfs => {
+                resolve_hdfs_locations(access_domain, locations, self.hdfs.as_deref())
+            }
         }
     }
 
@@ -2145,25 +2312,24 @@ impl FsAccessResolver {
             FsScheme::Local => resolve_local_locations(access_domain, locations),
             FsScheme::ObjectStore => {
                 let (access, bucket) = object_store_target(&locations, object_store_access)?;
-                let (endpoint, key) = provider_key(
-                    access_domain,
-                    &bucket,
-                    &access.endpoint_config,
-                    &access.credential_identity,
-                )?;
                 let operator = access
                     .provider_pool
                     .acquire_async(
-                        endpoint,
-                        key,
+                        access_domain,
+                        &bucket,
+                        &access.endpoint_config,
                         &access.credentials,
                         cancellation,
-                        build_object_store_operator,
+                        |endpoint, credentials| {
+                            access.provider_pool.build_operator(endpoint, credentials)
+                        },
                     )
                     .await?;
                 object_store_handle(access_domain, locations, bucket, operator)
             }
-            FsScheme::Hdfs => resolve_hdfs_locations(access_domain, locations),
+            FsScheme::Hdfs => {
+                resolve_hdfs_locations(access_domain, locations, self.hdfs.as_deref())
+            }
         }
     }
 
@@ -2194,8 +2360,7 @@ fn resolve_local_locations(
     let (root, relative_paths) = normalize_local_paths(&raw_paths)?;
     let builder = opendal::services::Fs::default().root(&root);
     let operator = Operator::new(builder)
-        .map_err(|error| map_opendal_error("initialize local file operator", error))?
-        .finish();
+        .map_err(|error| map_opendal_error("initialize local file operator", error))?;
     let paths = locations
         .into_iter()
         .zip(relative_paths)
@@ -2303,9 +2468,12 @@ fn resolve_object_store_locations(
         access_domain,
         &bucket,
         &object_store_access.endpoint_config,
-        &object_store_access.credential_identity,
         &object_store_access.credentials,
-        build_object_store_operator,
+        |endpoint, credentials| {
+            object_store_access
+                .provider_pool
+                .build_operator(endpoint, credentials)
+        },
     )?;
     object_store_handle(access_domain, locations, bucket, operator)
 }
@@ -2360,68 +2528,45 @@ fn object_store_handle(
 fn build_object_store_operator(
     endpoint: &ObjectStoreEndpointIdentity,
     credentials: &ObjectStoreCredentialSource,
+    client: reqwest::Client,
 ) -> FileResult<Operator> {
+    // Signing belongs to the Provider transport, after it sees the actual
+    // SDK-selected request URI. The SDK must not load credentials first.
     let mut builder = opendal::services::S3::default()
         .endpoint(&endpoint.endpoint)
         .bucket(&endpoint.bucket)
-        .region(&endpoint.region);
+        .region(&endpoint.region)
+        .skip_signature()
+        .disable_config_load()
+        .disable_ec2_metadata();
     if !endpoint.use_path_style {
         builder = builder.enable_virtual_host_style();
     }
-    let denial = match credentials {
-        ObjectStoreCredentialSource::Static(secrets) => {
-            builder = builder
-                .access_key_id(secrets.access_key_id.expose_secret())
-                .secret_access_key(secrets.access_key_secret.expose_secret());
-            if let Some(session_token) = secrets.session_token.as_ref() {
-                builder = builder.session_token(session_token.expose_secret());
-            }
-            None
-        }
-        ObjectStoreCredentialSource::Authority(authority) => {
-            // The material is never welded into the builder: the loader reads
-            // it back from the authority for every request that is about to be
-            // signed, which is what keeps this operator usable across a
-            // credential rotation (CAD-1 D0).
-            let denial = Arc::new(CredentialDenialLatch::default());
-            builder = builder.customized_credential_load(Box::new(AuthorityCredentialLoad {
-                authority: Arc::clone(authority),
-                denial: Arc::clone(&denial),
-                budget: Duration::from_millis(endpoint.timeout_ms),
-            }));
-            Some(denial)
-        }
-    };
+    let denial = Arc::new(CredentialDenialLatch::default());
+    let signer = Arc::new(S3RequestSigner::new(
+        endpoint,
+        credentials,
+        Arc::clone(&denial),
+    )?);
     let mut operator = Operator::new(builder)
         .map_err(|error| map_opendal_error("initialize object store operator", error))?
-        .finish();
-    if let Some(denial) = denial {
-        // Installed first, so it sits *under* the RetryLayer added below and
-        // gets to restore a confirmed denial's meaning before the retry
-        // predicate reads it.
+        .layer(S3PresignLayer::new(Arc::clone(&signer)));
+    if matches!(credentials, ObjectStoreCredentialSource::Authority(_)) {
+        // Preserve the original authority denial classifier below RetryLayer.
         operator = operator.layer(CredentialDenialLayer { denial });
     }
-    let inner_client = if is_local_endpoint(&endpoint.endpoint) {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .map_err(|error| {
-                FileError::with_source(
-                    FileErrorKind::Internal,
-                    "build local object store HTTP client",
-                    error,
-                )
-            })?;
-        opendal::raw::HttpClient::with(client)
-    } else {
-        opendal::raw::HttpClient::new()
-            .map_err(|error| map_opendal_error("initialize object store HTTP client", error))?
-    };
-    // Install for every endpoint, before the timeout/concurrency/retry layers.
-    // Credential acquisition uses the authority's independent reqwest path.
-    operator = operator.layer(HttpClientLayer::new(opendal::raw::HttpClient::with(
-        ListBodyLimitFetch::new(inner_client, OBJECT_STORE_LIST_BODY_LIMIT_BYTES),
-    )));
+    let signed_transport = HttpTransporter::new(S3SigningTransport::new(
+        Reqwest012Transport::new(client),
+        signer,
+    ));
+    // Preserve the independent list body limit outside signing/HTTP dispatch.
+    let context = operator
+        .base_context()
+        .with_http_transport(HttpTransporter::new(ListBodyLimitFetch::new(
+            signed_transport,
+            OBJECT_STORE_LIST_BODY_LIMIT_BYTES,
+        )));
+    operator = operator.with_context(context);
     let mut timeout = TimeoutLayer::new();
     timeout = timeout.with_timeout(Duration::from_millis(endpoint.timeout_ms));
     timeout = timeout.with_io_timeout(Duration::from_millis(endpoint.io_timeout_ms));
@@ -2442,12 +2587,12 @@ fn build_object_store_operator(
 
 /// Serves one operator's signing material out of its storage authority.
 ///
-/// opendal calls this at every authentication boundary, so the path that
-/// matters is the cache hit: [`StorageAuthority::material_for_request`] takes a
-/// lock, clones the material in hand, and returns without touching the network.
+/// The Provider signer reads the original authority on every signing attempt.
+/// [`StorageAuthority::material_for_request`] serves cached material without
+/// touching the network while it remains valid.
 /// A remote acquisition happens only when the authority itself decides one is
 /// due, and it runs on the authority's own executor, never on this thread.
-struct AuthorityCredentialLoad {
+struct AuthoritySigningSource {
     authority: Arc<StorageAuthority>,
     denial: Arc<CredentialDenialLatch>,
     /// How long one credential load may take. This is the operator's own
@@ -2457,16 +2602,23 @@ struct AuthorityCredentialLoad {
     budget: Duration,
 }
 
-#[async_trait::async_trait]
-impl reqsign::AwsCredentialLoad for AuthorityCredentialLoad {
-    async fn load_credential(
+impl AuthoritySigningSource {
+    async fn credential_for_request_in(
         &self,
-        _client: reqwest::Client,
-    ) -> anyhow::Result<Option<reqsign::AwsCredential>> {
+        request: Option<&novarocks_spi::connector::ConnectorRequestContext>,
+    ) -> anyhow::Result<reqsign::AwsCredential> {
         let now = Instant::now();
         let deadline = now.checked_add(self.budget).unwrap_or(now);
-        match self.authority.material_for_request(now, deadline).await {
-            Ok(material) => Ok(Some(reqsign::AwsCredential {
+        let result = match request {
+            Some(request) => {
+                self.authority
+                    .material_for_request_in(now, deadline, request.clone())
+                    .await
+            }
+            None => self.authority.material_for_request(now, deadline).await,
+        };
+        match result {
+            Ok(material) => Ok(reqsign::AwsCredential {
                 access_key_id: material.access_key_id().expose_secret().to_string(),
                 secret_access_key: material.secret_access_key().expose_secret().to_string(),
                 session_token: material
@@ -2477,7 +2629,7 @@ impl reqsign::AwsCredentialLoad for AuthorityCredentialLoad {
                 // expiry, which is a second, disagreeing opinion about the
                 // same material.
                 expires_in: None,
-            })),
+            }),
             Err(error) => {
                 if error.kind() == FileErrorKind::Permission {
                     self.denial.record(&error);
@@ -2490,13 +2642,9 @@ impl reqsign::AwsCredentialLoad for AuthorityCredentialLoad {
 
 /// One operator's record that its storage authority answered with a denial.
 ///
-/// opendal turns *every* credential-load failure into a temporary error
-/// (`opendal-0.55.0/src/services/s3/core.rs`: a loader that succeeded before
-/// and fails now becomes `PermissionDenied` + `set_temporary()`, and an error
-/// returned by the loader becomes `Unexpected` + `set_temporary()`), and its
-/// `RetryLayer` retries whatever is temporary with a fixed, non-overridable
-/// predicate. That collapses the third state of CAD-1 D4: a confirmed denial
-/// would be retried as if it were jitter and would then surface as transient.
+/// The Provider signs requests through the original authority. Its typed
+/// acquisition outcomes must survive the SDK operation and stream wrappers;
+/// a confirmed denial must not be retried as transient S3 transport failure.
 ///
 /// The loader latches a denial here and [`CredentialDenialLayer`], installed
 /// under the RetryLayer, restores its meaning before the retry predicate can
@@ -2593,29 +2741,27 @@ impl CredentialDenialLatch {
 
 /// Restores a confirmed credential denial before opendal's retry predicate
 /// sees it. Must be installed under the `RetryLayer`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct CredentialDenialLayer {
     denial: Arc<CredentialDenialLatch>,
 }
 
-impl<A: Access> Layer<A> for CredentialDenialLayer {
-    type LayeredAccess = CredentialDenialAccessor<A>;
-
-    fn layer(&self, inner: A) -> Self::LayeredAccess {
-        CredentialDenialAccessor {
+impl Layer for CredentialDenialLayer {
+    fn apply_service(&self, inner: Servicer) -> Servicer {
+        Arc::new(CredentialDenialService {
             inner,
             denial: Arc::clone(&self.denial),
-        }
+        })
     }
 }
 
 #[derive(Debug)]
-struct CredentialDenialAccessor<A: Access> {
-    inner: A,
+struct CredentialDenialService {
+    inner: Servicer,
     denial: Arc<CredentialDenialLatch>,
 }
 
-impl<A: Access> CredentialDenialAccessor<A> {
+impl CredentialDenialService {
     fn wrap<T>(&self, inner: T) -> CredentialDenialStream<T> {
         CredentialDenialStream {
             inner,
@@ -2624,99 +2770,201 @@ impl<A: Access> CredentialDenialAccessor<A> {
     }
 }
 
-impl<A: Access> LayeredAccess for CredentialDenialAccessor<A> {
-    type Inner = A;
-    type Reader = CredentialDenialStream<A::Reader>;
-    type Writer = CredentialDenialStream<A::Writer>;
-    type Lister = CredentialDenialStream<A::Lister>;
-    type Deleter = CredentialDenialStream<A::Deleter>;
+impl Service for CredentialDenialService {
+    type Reader = CredentialDenialStream<oio::Reader>;
+    type Writer = CredentialDenialStream<oio::Writer>;
+    type Lister = CredentialDenialStream<oio::Lister>;
+    type Deleter = CredentialDenialStream<oio::Deleter>;
+    type Copier = oio::Copier;
 
-    fn inner(&self) -> &Self::Inner {
-        &self.inner
+    fn info(&self) -> ServiceInfo {
+        self.inner.info()
     }
 
-    async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
-        let outcome = self.inner.read(path, args).await;
-        outcome
-            .map(|(reply, reader)| (reply, self.wrap(reader)))
+    fn capability(&self) -> opendal::Capability {
+        self.inner.capability()
+    }
+
+    async fn create_dir(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpCreateDir,
+    ) -> opendal::Result<RpCreateDir> {
+        self.inner.create_dir(ctx, path, args).await
+    }
+
+    fn read(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpRead,
+    ) -> opendal::Result<Self::Reader> {
+        self.inner
+            .read(ctx, path, args)
+            .map(|reader| self.wrap(reader))
             .map_err(|error| self.denial.classify(error))
     }
 
-    async fn write(&self, path: &str, args: OpWrite) -> opendal::Result<(RpWrite, Self::Writer)> {
-        let outcome = self.inner.write(path, args).await;
-        outcome
-            .map(|(reply, writer)| (reply, self.wrap(writer)))
+    fn write(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpWrite,
+    ) -> opendal::Result<Self::Writer> {
+        self.inner
+            .write(ctx, path, args)
+            .map(|writer| self.wrap(writer))
             .map_err(|error| self.denial.classify(error))
     }
 
-    async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<RpStat> {
-        let outcome = self.inner.stat(path, args).await;
-        outcome.map_err(|error| self.denial.classify(error))
-    }
-
-    async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
-        let outcome = self.inner.delete().await;
-        outcome
-            .map(|(reply, deleter)| (reply, self.wrap(deleter)))
+    async fn stat(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpStat,
+    ) -> opendal::Result<RpStat> {
+        self.inner
+            .stat(ctx, path, args)
+            .await
             .map_err(|error| self.denial.classify(error))
     }
 
-    async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
-        let outcome = self.inner.list(path, args).await;
-        outcome
-            .map(|(reply, lister)| (reply, self.wrap(lister)))
+    fn delete(&self, ctx: &OperationContext) -> opendal::Result<Self::Deleter> {
+        self.inner
+            .delete(ctx)
+            .map(|deleter| self.wrap(deleter))
             .map_err(|error| self.denial.classify(error))
+    }
+
+    fn list(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpList,
+    ) -> opendal::Result<Self::Lister> {
+        self.inner
+            .list(ctx, path, args)
+            .map(|lister| self.wrap(lister))
+            .map_err(|error| self.denial.classify(error))
+    }
+
+    fn copy(
+        &self,
+        ctx: &OperationContext,
+        from: &str,
+        to: &str,
+        args: OpCopy,
+        opts: OpCopier,
+    ) -> opendal::Result<Self::Copier> {
+        self.inner.copy(ctx, from, to, args, opts)
+    }
+
+    async fn rename(
+        &self,
+        ctx: &OperationContext,
+        from: &str,
+        to: &str,
+        args: OpRename,
+    ) -> opendal::Result<RpRename> {
+        self.inner.rename(ctx, from, to, args).await
+    }
+
+    async fn presign(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpPresign,
+    ) -> opendal::Result<RpPresign> {
+        self.inner.presign(ctx, path, args).await
     }
 }
 
-/// Wraps one streamed opendal handle so the per-request signing failures it
-/// raises are classified the same way the accessor's own calls are.
+/// Classify the same signing failures at lazy reader and stream boundaries.
 struct CredentialDenialStream<T> {
     inner: T,
     denial: Arc<CredentialDenialLatch>,
 }
 
 impl<R: oio::Read> oio::Read for CredentialDenialStream<R> {
+    async fn open(
+        &self,
+        range: opendal::BytesRange,
+    ) -> opendal::Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+        let (reply, inner) = self
+            .inner
+            .open(range)
+            .await
+            .map_err(|error| self.denial.classify(error))?;
+        let stream: Box<dyn oio::ReadStreamDyn> = Box::new(CredentialDenialStream {
+            inner,
+            denial: Arc::clone(&self.denial),
+        });
+        Ok((reply, stream))
+    }
+
+    async fn read(&self, range: opendal::BytesRange) -> opendal::Result<(RpRead, Buffer)> {
+        self.inner
+            .read(range)
+            .await
+            .map_err(|error| self.denial.classify(error))
+    }
+}
+
+impl<R: oio::ReadStream> oio::ReadStream for CredentialDenialStream<R> {
     async fn read(&mut self) -> opendal::Result<Buffer> {
-        let outcome = self.inner.read().await;
-        outcome.map_err(|error| self.denial.classify(error))
+        self.inner
+            .read()
+            .await
+            .map_err(|error| self.denial.classify(error))
     }
 }
 
 impl<W: oio::Write> oio::Write for CredentialDenialStream<W> {
     async fn write(&mut self, buffer: Buffer) -> opendal::Result<()> {
-        let outcome = self.inner.write(buffer).await;
-        outcome.map_err(|error| self.denial.classify(error))
+        self.inner
+            .write(buffer)
+            .await
+            .map_err(|error| self.denial.classify(error))
     }
 
     async fn close(&mut self) -> opendal::Result<Metadata> {
-        let outcome = self.inner.close().await;
-        outcome.map_err(|error| self.denial.classify(error))
+        self.inner
+            .close()
+            .await
+            .map_err(|error| self.denial.classify(error))
     }
 
     async fn abort(&mut self) -> opendal::Result<()> {
-        let outcome = self.inner.abort().await;
-        outcome.map_err(|error| self.denial.classify(error))
+        self.inner
+            .abort()
+            .await
+            .map_err(|error| self.denial.classify(error))
     }
 }
 
 impl<L: oio::List> oio::List for CredentialDenialStream<L> {
     async fn next(&mut self) -> opendal::Result<Option<oio::Entry>> {
-        let outcome = self.inner.next().await;
-        outcome.map_err(|error| self.denial.classify(error))
+        self.inner
+            .next()
+            .await
+            .map_err(|error| self.denial.classify(error))
     }
 }
 
 impl<D: oio::Delete> oio::Delete for CredentialDenialStream<D> {
-    fn delete(&mut self, path: &str, args: OpDelete) -> opendal::Result<()> {
+    async fn delete<'a>(&'a mut self, path: &'a str, args: OpDelete) -> opendal::Result<()> {
         self.inner
             .delete(path, args)
+            .await
             .map_err(|error| self.denial.classify(error))
     }
 
-    async fn flush(&mut self) -> opendal::Result<usize> {
-        let outcome = self.inner.flush().await;
-        outcome.map_err(|error| self.denial.classify(error))
+    async fn close(&mut self) -> opendal::Result<()> {
+        self.inner
+            .close()
+            .await
+            .map_err(|error| self.denial.classify(error))
     }
 }
 
@@ -2823,14 +3071,10 @@ struct HdfsOperatorKey {
     user: Option<String>,
 }
 
-fn hdfs_operator_cache() -> &'static Mutex<HashMap<HdfsOperatorKey, Operator>> {
-    static CACHE: OnceLock<Mutex<HashMap<HdfsOperatorKey, Operator>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn resolve_hdfs_locations(
     access_domain: StorageAccessDomainId,
     locations: Vec<FsLocation>,
+    runtime: Option<&HdfsRuntimeView>,
 ) -> FileResult<FsAccessHandle> {
     let mut parsed = locations
         .iter()
@@ -2850,7 +3094,15 @@ fn resolve_hdfs_locations(
             "mixed hdfs users are not allowed in one access handle",
         ));
     }
-    let operator = build_hdfs_operator(&first.name_node, first.user.as_deref())?;
+    // Parse/identity refusals stay unchanged. Missing execution custody is
+    // refused before looking at any cached operator or constructing a client.
+    let runtime = runtime.ok_or_else(|| {
+        FileError::new(
+            FileErrorKind::Internal,
+            "HDFS execution requires an explicitly composed role runtime",
+        )
+    })?;
+    let operator = build_hdfs_operator(runtime, &first.name_node, first.user.as_deref())?;
     let paths = locations
         .into_iter()
         .zip(parsed.drain(..))
@@ -2874,6 +3126,10 @@ struct HdfsPath {
 }
 
 fn parse_hdfs_path(raw: &str) -> FileResult<HdfsPath> {
+    parse_hdfs_selection(raw, true)
+}
+
+fn parse_hdfs_selection(raw: &str, require_file: bool) -> FileResult<HdfsPath> {
     let url = Url::parse(raw).map_err(|error| {
         FileError::with_source(FileErrorKind::Invalid, "parse hdfs path", error)
     })?;
@@ -2896,24 +3152,41 @@ fn parse_hdfs_path(raw: &str) -> FileResult<HdfsPath> {
         .map(|port| format!("{host}:{port}"))
         .unwrap_or_else(|| host.to_string());
     let relative_path = url.path().trim_start_matches('/').to_string();
-    if relative_path.is_empty() {
+    if require_file && relative_path.is_empty() {
         return Err(FileError::invalid(
             "hdfs path points to namenode root and cannot be used as file path",
         ));
     }
+    let user = if url.username().is_empty() {
+        None
+    } else {
+        Some(
+            percent_encoding::percent_decode_str(url.username())
+                .decode_utf8()
+                .map_err(|error| {
+                    FileError::with_source(FileErrorKind::Invalid, "decode HDFS user", error)
+                })?
+                .into_owned(),
+        )
+    };
     Ok(HdfsPath {
         name_node: format!("hdfs://{authority}"),
-        user: (!url.username().is_empty()).then(|| url.username().to_string()),
+        user,
         relative_path,
     })
 }
 
-fn build_hdfs_operator(name_node: &str, user: Option<&str>) -> FileResult<Operator> {
+fn build_hdfs_operator(
+    owner: &HdfsRuntimeView,
+    name_node: &str,
+    user: Option<&str>,
+) -> FileResult<Operator> {
     let key = HdfsOperatorKey {
         name_node: name_node.to_string(),
         user: user.map(str::to_string),
     };
-    if let Some(operator) = hdfs_operator_cache()
+    if let Some(operator) = owner
+        .operators
         .lock()
         .map_err(|_| FileError::new(FileErrorKind::Internal, "lock hdfs operator cache"))?
         .get(&key)
@@ -2921,23 +3194,26 @@ fn build_hdfs_operator(name_node: &str, user: Option<&str>) -> FileResult<Operat
     {
         return Ok(operator);
     }
-    let mut url = Url::parse(name_node)
-        .map_err(|error| FileError::with_source(FileErrorKind::Invalid, "parse namenode", error))?;
-    if let Some(user) = user {
-        url.set_username(user)
-            .map_err(|_| FileError::invalid("invalid hdfs user"))?;
-    }
-    let builder = opendal::services::HdfsNative::default()
-        .name_node(url.as_str().trim_end_matches('/'))
-        .root("/");
+    // Client construction is outside the original cache mutex. The service
+    // consumes this exact role Handle through hdfs-native's public builder.
+    let builder =
+        crate::hdfs_service::HdfsServiceBuilder::new(name_node, user, owner.runtime.clone());
     let operator = Operator::new(builder)
-        .map_err(|error| map_opendal_error("initialize hdfs operator", error))?
-        .finish();
-    hdfs_operator_cache()
-        .lock()
-        .map_err(|_| FileError::new(FileErrorKind::Internal, "lock hdfs operator cache"))?
-        .insert(key, operator.clone());
-    Ok(operator)
+        .map_err(|error| map_opendal_error("initialize hdfs operator", error))?;
+    let selected = {
+        let mut operators = owner
+            .operators
+            .lock()
+            .map_err(|_| FileError::new(FileErrorKind::Internal, "lock hdfs operator cache"))?;
+        // Concurrent misses may finish together. Keep the first published
+        // instance and destroy the redundant local instance outside the lock.
+        operators
+            .entry(key)
+            .or_insert_with(|| operator.clone())
+            .clone()
+    };
+    drop(operator);
+    Ok(selected)
 }
 
 /// Recover only an already projected FS acquisition cause through the actual
@@ -3245,19 +3521,18 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
-    impl<A: Access> Layer<A> for ConditionalCompletion {
-        type LayeredAccess = ConditionalCompletionAccess<A>;
-        fn layer(&self, inner: A) -> Self::LayeredAccess {
-            ConditionalCompletionAccess {
+    impl Layer for ConditionalCompletion {
+        fn apply_service(&self, inner: Servicer) -> Servicer {
+            Arc::new(ConditionalCompletionAccess {
                 inner,
                 completion: self.clone(),
-            }
+            })
         }
     }
 
     #[derive(Debug)]
-    struct ConditionalCompletionAccess<A> {
-        inner: A,
+    struct ConditionalCompletionAccess {
+        inner: Servicer,
         completion: ConditionalCompletion,
     }
 
@@ -3290,48 +3565,107 @@ mod tests {
         }
     }
 
-    impl<A: Access> LayeredAccess for ConditionalCompletionAccess<A> {
-        type Inner = A;
-        type Reader = A::Reader;
-        type Writer = ConditionalCompletionWriter<A::Writer>;
-        type Lister = A::Lister;
-        type Deleter = A::Deleter;
-        fn inner(&self) -> &A {
-            &self.inner
+    impl Service for ConditionalCompletionAccess {
+        type Reader = oio::Reader;
+        type Writer = ConditionalCompletionWriter<oio::Writer>;
+        type Lister = oio::Lister;
+        type Deleter = oio::Deleter;
+        type Copier = oio::Copier;
+
+        fn info(&self) -> ServiceInfo {
+            self.inner.info()
         }
-        fn info(&self) -> Arc<opendal::raw::AccessorInfo> {
-            let info = self.inner.info();
+
+        fn capability(&self) -> opendal::Capability {
             // This layer models a condition-capable store's terminal ACK/error.
-            info.update_full_capability(|mut capability| {
-                capability.write_with_if_not_exists = true;
-                capability
-            });
-            info
+            let mut capability = self.inner.capability();
+            capability.write_with_if_not_exists = true;
+            capability
         }
-        async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
-            self.inner.read(path, args).await
-        }
-        async fn write(
+
+        async fn create_dir(
             &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpCreateDir,
+        ) -> opendal::Result<RpCreateDir> {
+            self.inner.create_dir(ctx, path, args).await
+        }
+
+        async fn stat(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpStat,
+        ) -> opendal::Result<RpStat> {
+            self.inner.stat(ctx, path, args).await
+        }
+
+        fn read(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<Self::Reader> {
+            self.inner.read(ctx, path, args)
+        }
+
+        fn write(
+            &self,
+            ctx: &OperationContext,
             path: &str,
             args: OpWrite,
-        ) -> opendal::Result<(RpWrite, Self::Writer)> {
+        ) -> opendal::Result<Self::Writer> {
             assert!(args.if_not_exists());
-            self.inner.write(path, args).await.map(|(reply, inner)| {
-                (
-                    reply,
-                    ConditionalCompletionWriter {
-                        inner,
-                        completion: self.completion.clone(),
-                    },
-                )
-            })
+            self.inner
+                .write(ctx, path, args)
+                .map(|inner| ConditionalCompletionWriter {
+                    inner,
+                    completion: self.completion.clone(),
+                })
         }
-        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
-            self.inner.delete().await
+
+        fn delete(&self, ctx: &OperationContext) -> opendal::Result<Self::Deleter> {
+            self.inner.delete(ctx)
         }
-        async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
-            self.inner.list(path, args).await
+
+        fn list(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpList,
+        ) -> opendal::Result<Self::Lister> {
+            self.inner.list(ctx, path, args)
+        }
+
+        fn copy(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpCopy,
+            opts: OpCopier,
+        ) -> opendal::Result<Self::Copier> {
+            self.inner.copy(ctx, from, to, args, opts)
+        }
+
+        async fn rename(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpRename,
+        ) -> opendal::Result<RpRename> {
+            self.inner.rename(ctx, from, to, args).await
+        }
+
+        async fn presign(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpPresign,
+        ) -> opendal::Result<RpPresign> {
+            self.inner.presign(ctx, path, args).await
         }
     }
 
@@ -3417,7 +3751,6 @@ mod tests {
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, StorageCredentialScopePrefix,
     };
-    use reqsign::AwsCredentialLoad;
 
     use super::*;
     use crate::storage_authority::{
@@ -3549,14 +3882,24 @@ mod tests {
         );
     }
 
-    fn credential_identity(generation: &str) -> ObjectStoreCredentialProviderIdentity {
-        ObjectStoreCredentialProviderIdentity::Static(
-            StaticCredentialReference::try_new("warehouse-data", generation).unwrap(),
-        )
+    // Explicit fixture policy for tests that deliberately bypass the pool.
+    fn test_s3_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    fn static_reference(generation: &str) -> StaticCredentialReference {
+        StaticCredentialReference::try_new("warehouse-data", generation).unwrap()
     }
 
     fn static_source(secret_suffix: &str) -> ObjectStoreCredentialSource {
-        ObjectStoreCredentialSource::Static(secret_material(secret_suffix))
+        ObjectStoreCredentialSource::Static {
+            reference: static_reference("blue"),
+            material: secret_material(secret_suffix),
+        }
     }
 
     fn authority_id(scope: &str) -> StorageAuthorityId {
@@ -3566,7 +3909,7 @@ mod tests {
                 CatalogVersion::from_bytes([0x11; 32]),
             ),
             StorageCredentialScopePrefix::try_from_normalized(scope).unwrap(),
-            AuthorityCapabilityPath::SeededWithoutRenewal,
+            AuthorityCapabilityPath::SeededWithoutRenewal { grant: None },
         )
     }
 
@@ -3648,33 +3991,34 @@ mod tests {
 
     #[derive(Clone, Debug, Default)]
     struct ListingRecord {
-        pending_open: Arc<AtomicUsize>,
+        pending_first_poll: Arc<AtomicUsize>,
         pending_next: Arc<AtomicUsize>,
-        open_future_drops: Arc<AtomicUsize>,
+        first_poll_future_drops: Arc<AtomicUsize>,
         next_future_drops: Arc<AtomicUsize>,
         stats: Arc<AtomicUsize>,
         stat_failure: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<Option<usize>>>>,
         polls: Arc<AtomicUsize>,
+        first_polls: Arc<AtomicUsize>,
         drops: Arc<AtomicUsize>,
     }
-    impl<A: Access> Layer<A> for ListingRecord {
-        type LayeredAccess = ListingRecorder<A>;
-        fn layer(&self, inner: A) -> Self::LayeredAccess {
-            ListingRecorder {
+    impl Layer for ListingRecord {
+        fn apply_service(&self, inner: Servicer) -> Servicer {
+            Arc::new(RecordingListAccess {
                 inner,
                 record: self.clone(),
-            }
+            })
         }
     }
     #[derive(Debug)]
-    struct ListingRecorder<A: Access> {
-        inner: A,
+    struct RecordingListAccess {
+        inner: Servicer,
         record: ListingRecord,
     }
     struct RecordedLister<L> {
         inner: L,
         record: ListingRecord,
+        first_poll: bool,
     }
     struct PendingListingFutureDrop(Arc<AtomicUsize>);
     impl Drop for PendingListingFutureDrop {
@@ -3690,36 +4034,72 @@ mod tests {
     impl<L: oio::List> oio::List for RecordedLister<L> {
         async fn next(&mut self) -> opendal::Result<Option<oio::Entry>> {
             self.record.polls.fetch_add(1, Ordering::SeqCst);
-            if self.record.pending_next.load(Ordering::SeqCst) != 0 {
+            if std::mem::replace(&mut self.first_poll, false) {
+                self.record.first_polls.fetch_add(1, Ordering::SeqCst);
+                if self.record.pending_first_poll.load(Ordering::SeqCst) != 0 {
+                    let _hold =
+                        PendingListingFutureDrop(Arc::clone(&self.record.first_poll_future_drops));
+                    return std::future::pending::<opendal::Result<Option<oio::Entry>>>().await;
+                }
+            } else if self.record.pending_next.load(Ordering::SeqCst) != 0 {
                 let _hold = PendingListingFutureDrop(Arc::clone(&self.record.next_future_drops));
                 return std::future::pending::<opendal::Result<Option<oio::Entry>>>().await;
             }
             self.inner.next().await
         }
     }
-    impl<A: Access> LayeredAccess for ListingRecorder<A> {
-        type Inner = A;
-        type Reader = A::Reader;
-        type Writer = A::Writer;
-        type Lister = RecordedLister<A::Lister>;
-        type Deleter = A::Deleter;
-        fn inner(&self) -> &A {
-            &self.inner
+    impl Service for RecordingListAccess {
+        type Reader = oio::Reader;
+        type Writer = oio::Writer;
+        type Lister = RecordedLister<oio::Lister>;
+        type Deleter = oio::Deleter;
+        type Copier = oio::Copier;
+
+        fn info(&self) -> ServiceInfo {
+            self.inner.info()
         }
-        async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
-            self.inner.read(path, args).await
+
+        fn capability(&self) -> opendal::Capability {
+            self.inner.capability()
         }
-        async fn write(
+
+        async fn create_dir(
             &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpCreateDir,
+        ) -> opendal::Result<RpCreateDir> {
+            self.inner.create_dir(ctx, path, args).await
+        }
+
+        fn read(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<Self::Reader> {
+            self.inner.read(ctx, path, args)
+        }
+
+        fn write(
+            &self,
+            ctx: &OperationContext,
             path: &str,
             args: OpWrite,
-        ) -> opendal::Result<(RpWrite, Self::Writer)> {
-            self.inner.write(path, args).await
+        ) -> opendal::Result<Self::Writer> {
+            self.inner.write(ctx, path, args)
         }
-        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
-            self.inner.delete().await
+
+        fn delete(&self, ctx: &OperationContext) -> opendal::Result<Self::Deleter> {
+            self.inner.delete(ctx)
         }
-        async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<RpStat> {
+
+        async fn stat(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpStat,
+        ) -> opendal::Result<RpStat> {
             self.record.stats.fetch_add(1, Ordering::SeqCst);
             if self.record.stat_failure.load(Ordering::SeqCst) != 0 {
                 return Err(opendal::Error::new(
@@ -3729,25 +4109,56 @@ mod tests {
                 .with_context("path", "y".repeat(8192))
                 .set_source(ListingPanicDisplay));
             }
-            self.inner.stat(path, args).await
+            self.inner.stat(ctx, path, args).await
         }
-        async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
+
+        fn list(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpList,
+        ) -> opendal::Result<Self::Lister> {
             self.record.requests.lock().unwrap().push(args.limit());
-            if self.record.pending_open.load(Ordering::SeqCst) != 0 {
-                let _hold = PendingListingFutureDrop(Arc::clone(&self.record.open_future_drops));
-                return std::future::pending::<opendal::Result<(RpList, Self::Lister)>>().await;
-            }
-            self.inner.list(path, args).await.map(|(reply, inner)| {
-                (
-                    reply,
-                    RecordedLister {
-                        inner,
-                        record: self.record.clone(),
-                    },
-                )
-            })
+            self.inner
+                .list(ctx, path, args)
+                .map(|inner| RecordedLister {
+                    inner,
+                    record: self.record.clone(),
+                    first_poll: true,
+                })
+        }
+
+        fn copy(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpCopy,
+            opts: OpCopier,
+        ) -> opendal::Result<Self::Copier> {
+            self.inner.copy(ctx, from, to, args, opts)
+        }
+
+        async fn rename(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpRename,
+        ) -> opendal::Result<RpRename> {
+            self.inner.rename(ctx, from, to, args).await
+        }
+
+        async fn presign(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpPresign,
+        ) -> opendal::Result<RpPresign> {
+            self.inner.presign(ctx, path, args).await
         }
     }
+
     fn listing_access(operator: Operator) -> FsAccessHandle {
         FsAccessHandle::new(
             domain(84),
@@ -3763,10 +4174,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_listing_pending_open_stop_and_deadline_drop_future() {
+    async fn bounded_listing_pending_first_poll_stop_and_deadline_drop_state_then_eof() {
         for deadline in [false, true] {
             let record = ListingRecord::default();
-            record.pending_open.store(1, Ordering::SeqCst);
+            record.pending_first_poll.store(1, Ordering::SeqCst);
             let access = listing_access(memory_operator().unwrap().layer(record.clone()));
             let cancellation = if deadline {
                 FileCancellation::new()
@@ -3780,26 +4191,35 @@ mod tests {
                 &cancellation,
                 listing_bound(64),
             ));
+            // OpenDAL 0.58 creates the lister synchronously. The first async
+            // listing boundary is the returned lister's actual next poll.
+            let mut stream = match futures::poll!(opening.as_mut()) {
+                std::task::Poll::Ready(Ok(stream)) => stream,
+                std::task::Poll::Ready(Err(error)) => panic!("lister creation failed: {error}"),
+                std::task::Poll::Pending => panic!("synchronous SDK lister creation suspended"),
+            };
+            drop(opening);
+            assert_eq!(*record.requests.lock().unwrap(), [Some(1)]);
+            assert_eq!(record.polls.load(Ordering::SeqCst), 0);
+            assert_eq!(record.drops.load(Ordering::SeqCst), 0);
+            let mut next = Box::pin(stream.next());
             assert!(matches!(
-                futures::poll!(opening.as_mut()),
+                futures::poll!(next.as_mut()),
                 std::task::Poll::Pending
             ));
-            assert_eq!(
-                record.requests.lock().unwrap().len(),
-                1,
-                "the SDK open actually started"
-            );
-            assert_eq!(record.open_future_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(record.polls.load(Ordering::SeqCst), 1);
+            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
+            assert_eq!(record.first_poll_future_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(record.drops.load(Ordering::SeqCst), 0);
             if !deadline {
                 cancellation.cancel();
             }
-            let outcome = tokio::time::timeout(Duration::from_secs(2), opening.as_mut())
+            let error = tokio::time::timeout(Duration::from_secs(2), next.as_mut())
                 .await
-                .expect("pending SDK open must wake on stop/deadline");
-            let error = match outcome {
-                Ok(_) => panic!("pending SDK unexpectedly opened"),
-                Err(error) => error,
-            };
+                .expect("pending first SDK poll must wake on stop/deadline")
+                .expect("typed terminal error")
+                .unwrap_err();
             assert_eq!(
                 error.kind(),
                 if deadline {
@@ -3808,13 +4228,17 @@ mod tests {
                     FileErrorKind::Cancelled
                 }
             );
-            assert_eq!(record.open_future_drops.load(Ordering::SeqCst), 1);
-            assert_eq!(record.polls.load(Ordering::SeqCst), 0);
+            drop(next);
+            assert_eq!(record.first_poll_future_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 0);
             assert_eq!(
                 record.drops.load(Ordering::SeqCst),
-                0,
-                "a lister was never constructed"
+                1,
+                "the constructed lister exits with the terminal error"
             );
+            assert!(stream.next().await.is_none());
+            assert_eq!(record.polls.load(Ordering::SeqCst), 1);
+            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -3823,7 +4247,10 @@ mod tests {
         for deadline in [false, true] {
             let record = ListingRecord::default();
             record.pending_next.store(1, Ordering::SeqCst);
-            let access = listing_access(memory_operator().unwrap().layer(record.clone()));
+            let operator = memory_operator().unwrap().layer(record.clone());
+            operator.write("warehouse/a", "a").await.unwrap();
+            operator.write("warehouse/b", "b").await.unwrap();
+            let access = listing_access(operator);
             let cancellation = if deadline {
                 FileCancellation::new()
                     .with_deadline(Some(Instant::now() + Duration::from_millis(100)))
@@ -3839,6 +4266,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            assert_eq!(*record.requests.lock().unwrap(), [Some(1)]);
+            assert_eq!(record.polls.load(Ordering::SeqCst), 0);
+            let first = stream.next().await.unwrap().unwrap();
+            assert_eq!(first.location, "s3://bucket/warehouse/a");
+            assert!(!first.is_dir);
+            assert_eq!(record.polls.load(Ordering::SeqCst), 1);
+            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
+            assert_eq!(record.first_poll_future_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(record.drops.load(Ordering::SeqCst), 0);
             let mut next = Box::pin(stream.next());
             assert!(matches!(
                 futures::poll!(next.as_mut()),
@@ -3846,9 +4283,10 @@ mod tests {
             ));
             assert_eq!(
                 record.polls.load(Ordering::SeqCst),
-                1,
-                "the SDK next actually started"
+                2,
+                "the SDK continuation actually started after a real entry"
             );
+            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
             assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 0);
             if !deadline {
                 cancellation.cancel();
@@ -3867,6 +4305,7 @@ mod tests {
                 }
             );
             drop(next);
+            assert_eq!(record.first_poll_future_drops.load(Ordering::SeqCst), 0);
             assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 1);
             assert_eq!(
                 record.drops.load(Ordering::SeqCst),
@@ -3876,9 +4315,10 @@ mod tests {
             assert!(stream.next().await.is_none());
             assert_eq!(
                 record.polls.load(Ordering::SeqCst),
-                1,
+                2,
                 "EOF must not poll the dropped lister"
             );
+            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -4212,7 +4652,6 @@ mod tests {
 
     fn memory_operator() -> FileResult<Operator> {
         Operator::new(opendal::services::Memory::default())
-            .map(|builder| builder.finish())
             .map_err(|error| map_opendal_error("initialize test memory operator", error))
     }
 
@@ -4243,12 +4682,10 @@ mod tests {
     fn provider_pool_reuses_static_reference_without_secret_keys() {
         let pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default()).unwrap();
         let endpoint = endpoint_config("http://localhost:9000");
-        let identity = credential_identity("blue");
         pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
-            &identity,
             &static_source("first"),
             |_, _| memory_operator(),
         )
@@ -4257,7 +4694,6 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint,
-            &identity,
             &static_source("different-value-same-reference"),
             |_, _| -> FileResult<Operator> {
                 panic!("secret material must not participate in the provider key")
@@ -4277,26 +4713,11 @@ mod tests {
     fn provider_pool_reuses_one_authority_identity_across_credential_rotations() {
         let pool = ObjectStoreProviderPool::new_for_test(4, Duration::from_secs(60)).unwrap();
         let endpoint = endpoint_config("http://localhost:9000");
-        let orders = ObjectStoreCredentialProviderIdentity::Vended(authority_id(
-            "s3://warehouse/sales/orders/",
-        ));
-        let returns = ObjectStoreCredentialProviderIdentity::Vended(authority_id(
-            "s3://warehouse/sales/returns/",
-        ));
         let first = seeded_authority(
             "s3://warehouse/sales/orders/",
             Some(vended_material(
                 "first",
                 Instant::now() + Duration::from_secs(900),
-            )),
-        );
-        // A later resolution of the same authorized scope brings rotated
-        // material. CAD-1 D0: that must be a cache hit, not a rebuild.
-        let rotated = seeded_authority(
-            "s3://warehouse/sales/orders/",
-            Some(vended_material(
-                "rotated",
-                Instant::now() + Duration::from_secs(1800),
             )),
         );
         let other_scope = seeded_authority("s3://warehouse/sales/returns/", None);
@@ -4305,17 +4726,27 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint,
-            &orders,
-            &ObjectStoreCredentialSource::Authority(first),
-            |_, _| memory_operator(),
+            &ObjectStoreCredentialSource::Authority(Arc::clone(&first)),
+            |_, source| {
+                assert!(
+                    matches!(source, ObjectStoreCredentialSource::Authority(owner)
+                    if Arc::ptr_eq(owner, &first))
+                );
+                memory_operator()
+            },
         )
         .unwrap();
+        // Rotate the original authority, not another Arc with
+        // the same identity. The resident signer must keep this exact owner.
+        first.install_material(vended_material(
+            "rotated",
+            Instant::now() + Duration::from_secs(1800),
+        ));
         pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
-            &orders,
-            &ObjectStoreCredentialSource::Authority(rotated),
+            &ObjectStoreCredentialSource::Authority(Arc::clone(&first)),
             |_, _| -> FileResult<Operator> {
                 panic!("rotated credential material must not rebuild the operator")
             },
@@ -4325,7 +4756,6 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint,
-            &returns,
             &ObjectStoreCredentialSource::Authority(other_scope),
             |_, _| memory_operator(),
         )
@@ -4338,6 +4768,103 @@ mod tests {
     }
 
     #[test]
+    fn provider_pool_keeps_static_and_authority_sources_separate_in_both_orders() {
+        for authority_first in [false, true] {
+            let pool = ObjectStoreProviderPool::new_for_test(8, Duration::from_secs(60)).unwrap();
+            let endpoint = endpoint_config("http://localhost:9000");
+            let authority = seeded_authority("s3://warehouse/sales/orders/", None);
+            let static_context = ObjectStoreAccessContext::for_static(
+                endpoint.clone(),
+                static_reference("blue"),
+                secret_material("static"),
+                &pool,
+            );
+            let authority_context = ObjectStoreAccessContext::for_authority(
+                endpoint.clone(),
+                Arc::clone(&authority),
+                &pool,
+            );
+            let acquire = |context: &ObjectStoreAccessContext<'_>| {
+                context.provider_pool.acquire(
+                    domain(1),
+                    "warehouse",
+                    &context.endpoint_config,
+                    &context.credentials,
+                    |_, _| memory_operator(),
+                )
+            };
+            let (static_operator, authority_operator) = if authority_first {
+                let authority_operator = acquire(&authority_context).unwrap();
+                let static_operator = acquire(&static_context).unwrap();
+                (static_operator, authority_operator)
+            } else {
+                let static_operator = acquire(&static_context).unwrap();
+                let authority_operator = acquire(&authority_context).unwrap();
+                (static_operator, authority_operator)
+            };
+            assert!(
+                !Arc::ptr_eq(
+                    static_operator.base_service(),
+                    authority_operator.base_service()
+                ),
+                "a static context cannot hit an authority-backed operator or poison its key"
+            );
+
+            let repeated_static = ObjectStoreAccessContext::for_static(
+                endpoint.clone(),
+                static_reference("blue"),
+                secret_material("same-reference-ignored-material"),
+                &pool,
+            );
+            let repeated_authority = ObjectStoreAccessContext::for_authority(
+                endpoint.clone(),
+                Arc::clone(&authority),
+                &pool,
+            );
+            let static_hit = acquire(&repeated_static).unwrap();
+            let authority_hit = acquire(&repeated_authority).unwrap();
+            assert!(Arc::ptr_eq(
+                static_operator.base_service(),
+                static_hit.base_service()
+            ));
+            assert!(Arc::ptr_eq(
+                authority_operator.base_service(),
+                authority_hit.base_service()
+            ));
+
+            let next_generation = ObjectStoreAccessContext::for_static(
+                endpoint.clone(),
+                static_reference("green"),
+                secret_material("static"),
+                &pool,
+            );
+            let next_operator = acquire(&next_generation).unwrap();
+            assert!(!Arc::ptr_eq(
+                static_operator.base_service(),
+                next_operator.base_service()
+            ));
+            let other_domain = pool
+                .acquire(
+                    domain(2),
+                    "warehouse",
+                    &static_context.endpoint_config,
+                    &static_context.credentials,
+                    |_, _| memory_operator(),
+                )
+                .unwrap();
+            assert!(!Arc::ptr_eq(
+                static_operator.base_service(),
+                other_domain.base_service()
+            ));
+            let metrics = pool.metrics_snapshot().unwrap();
+            assert_eq!(metrics.operator_constructions, 4);
+            assert_eq!(metrics.cache_hits, 2);
+            assert_eq!(metrics.cache_misses, 4);
+            assert_eq!(metrics.resident_entries, 4);
+        }
+    }
+
+    #[test]
     fn provider_pool_capacity_evicts_the_oldest_access_domain() {
         let pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions {
             capacity: 1,
@@ -4345,25 +4872,14 @@ mod tests {
         })
         .unwrap();
         let endpoint = endpoint_config("http://localhost:9000");
-        let identity = credential_identity("blue");
         let secrets = static_source("one");
-        pool.acquire(
-            domain(1),
-            "warehouse",
-            &endpoint,
-            &identity,
-            &secrets,
-            |_, _| memory_operator(),
-        )
+        pool.acquire(domain(1), "warehouse", &endpoint, &secrets, |_, _| {
+            memory_operator()
+        })
         .unwrap();
-        pool.acquire(
-            domain(2),
-            "warehouse",
-            &endpoint,
-            &identity,
-            &secrets,
-            |_, _| memory_operator(),
-        )
+        pool.acquire(domain(2), "warehouse", &endpoint, &secrets, |_, _| {
+            memory_operator()
+        })
         .unwrap();
 
         let metrics = pool.metrics_snapshot().unwrap();
@@ -4380,7 +4896,6 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint_config("http://localhost:9000"),
-            &credential_identity("blue"),
             &static_source("one"),
             |_, _| memory_operator(),
         )
@@ -4414,21 +4929,13 @@ mod tests {
             let constructions = Arc::clone(&constructions);
             workers.push(std::thread::spawn(move || {
                 let endpoint = endpoint_config("http://localhost:9000");
-                let identity = credential_identity("blue");
                 let secrets = static_source("one");
                 barrier.wait();
-                pool.acquire(
-                    domain(1),
-                    "warehouse",
-                    &endpoint,
-                    &identity,
-                    &secrets,
-                    |_, _| {
-                        constructions.fetch_add(1, Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(50));
-                        memory_operator()
-                    },
-                )
+                pool.acquire(domain(1), "warehouse", &endpoint, &secrets, |_, _| {
+                    constructions.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(50));
+                    memory_operator()
+                })
                 .unwrap();
             }));
         }
@@ -4460,7 +4967,7 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint_config("http://localhost:9000"),
-            &credential_identity("blue"),
+            &static_source("one"),
         )
         .expect("provider key")
     }
@@ -4470,11 +4977,11 @@ mod tests {
         cancellation: FileCancellation,
     ) -> tokio::task::JoinHandle<FileResult<Operator>> {
         let pool = Arc::clone(pool);
-        let (endpoint, key) = waiting_key();
         tokio::spawn(async move {
             pool.acquire_async(
-                endpoint,
-                key,
+                domain(1),
+                "warehouse",
+                &endpoint_config("http://localhost:9000"),
                 &static_source("one"),
                 &cancellation,
                 |_, _| -> FileResult<Operator> { panic!("a waiter never constructs") },
@@ -4499,7 +5006,6 @@ mod tests {
                     domain(1),
                     "warehouse",
                     &endpoint_config("http://localhost:9000"),
-                    &credential_identity("blue"),
                     &static_source("one"),
                     |_, _| {
                         constructions.fetch_add(1, Ordering::SeqCst);
@@ -4576,7 +5082,6 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint_config("http://localhost:9000"),
-            &credential_identity("blue"),
             &static_source("one"),
             |_, _| memory_operator(),
         )
@@ -4628,7 +5133,6 @@ mod tests {
                     domain(1),
                     "warehouse",
                     &endpoint_config("http://localhost:9000"),
-                    &credential_identity("blue"),
                     &static_source("one"),
                     |_, _| -> FileResult<Operator> {
                         entered.send(()).expect("entered");
@@ -4661,7 +5165,6 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint_config("http://localhost:9000"),
-            &credential_identity("blue"),
             &static_source("one"),
             |_, _| memory_operator(),
         )
@@ -4680,9 +5183,9 @@ mod tests {
                     .resolve_location_async(
                         domain(1),
                         "s3://warehouse/sales/part-0.parquet",
-                        Some(ObjectStoreAccessContext::new(
+                        Some(ObjectStoreAccessContext::for_static(
                             endpoint_config("http://localhost:9000"),
-                            credential_identity("blue"),
+                            static_reference("blue"),
                             secret_material("one"),
                             &pool,
                         )),
@@ -4703,9 +5206,9 @@ mod tests {
             .resolve_location(
                 domain(1),
                 "s3://warehouse/sales/part-1.parquet",
-                Some(ObjectStoreAccessContext::new(
+                Some(ObjectStoreAccessContext::for_static(
                     endpoint_config("http://localhost:9000"),
-                    credential_identity("blue"),
+                    static_reference("blue"),
                     secret_material("one"),
                     &pool,
                 )),
@@ -4720,38 +5223,24 @@ mod tests {
     fn failed_construction_does_not_evict_a_healthy_entry() {
         let pool = ObjectStoreProviderPool::new_for_test(1, Duration::from_secs(1)).unwrap();
         let endpoint = endpoint_config("http://localhost:9000");
-        let identity = credential_identity("blue");
         let secrets = static_source("one");
-        pool.acquire(
-            domain(1),
-            "warehouse",
-            &endpoint,
-            &identity,
-            &secrets,
-            |_, _| memory_operator(),
-        )
+        pool.acquire(domain(1), "warehouse", &endpoint, &secrets, |_, _| {
+            memory_operator()
+        })
         .unwrap();
         let error = pool
-            .acquire(
-                domain(2),
-                "warehouse",
-                &endpoint,
-                &identity,
-                &secrets,
-                |_, _| {
-                    Err(FileError::new(
-                        FileErrorKind::Invalid,
-                        "injected construction failure",
-                    ))
-                },
-            )
+            .acquire(domain(2), "warehouse", &endpoint, &secrets, |_, _| {
+                Err(FileError::new(
+                    FileErrorKind::Invalid,
+                    "injected construction failure",
+                ))
+            })
             .unwrap_err();
         assert_eq!(error.kind(), FileErrorKind::Invalid);
         pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
-            &identity,
             &secrets,
             |_, _| -> FileResult<Operator> { panic!("healthy entry must remain resident") },
         )
@@ -4800,13 +5289,11 @@ mod tests {
     #[test]
     fn canonical_equivalent_endpoints_share_one_provider_key() {
         let pool = ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(1)).unwrap();
-        let identity = credential_identity("blue");
         let secrets = static_source("one");
         pool.acquire(
             domain(1),
             "warehouse",
             &endpoint_config("HTTPS://EXAMPLE.COM:443/a/../api//"),
-            &identity,
             &secrets,
             |_, _| memory_operator(),
         )
@@ -4815,7 +5302,6 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint_config("https://example.com/api"),
-            &identity,
             &secrets,
             |_, _| -> FileResult<Operator> {
                 panic!("canonical equivalent endpoint must reuse the resident provider")
@@ -4842,7 +5328,7 @@ mod tests {
                 Instant::now() + Duration::from_secs(900),
             )),
         );
-        let loader = AuthorityCredentialLoad {
+        let loader = AuthoritySigningSource {
             authority: Arc::clone(&authority),
             denial: Arc::new(CredentialDenialLatch::default()),
             budget: Duration::from_secs(60),
@@ -4850,8 +5336,7 @@ mod tests {
 
         for _ in 0..3 {
             let credential = runtime
-                .block_on(loader.load_credential(reqwest::Client::new()))
-                .unwrap()
+                .block_on(loader.credential_for_request_in(None))
                 .expect("material in hand is served");
             assert_eq!(credential.access_key_id, "access-live");
             assert_eq!(credential.secret_access_key, "secret-live");
@@ -4927,6 +5412,7 @@ mod tests {
         let operator = build_object_store_operator(
             &endpoint,
             &ObjectStoreCredentialSource::Authority(Arc::clone(&authority)),
+            test_s3_http_client(),
         )
         .unwrap();
 
@@ -4966,6 +5452,7 @@ mod tests {
         let operator = build_object_store_operator(
             &endpoint,
             &ObjectStoreCredentialSource::Authority(Arc::clone(&authority)),
+            test_s3_http_client(),
         )
         .unwrap();
 
@@ -5068,7 +5555,7 @@ mod tests {
         failure: AcquisitionFailure,
     ) -> (Operator, Arc<StorageAuthority>, Arc<FixedAuthorityFailure>) {
         let capability = if matches!(&failure, AcquisitionFailure::NoRenewalCapability) {
-            AuthorityCapabilityPath::SeededWithoutRenewal
+            AuthorityCapabilityPath::SeededWithoutRenewal { grant: None }
         } else {
             AuthorityCapabilityPath::CredentialsEndpoint {
                 principal: StaticCredentialReference::try_new("executor", "v1").unwrap(),
@@ -5106,6 +5593,7 @@ mod tests {
         let operator = build_object_store_operator(
             &endpoint,
             &ObjectStoreCredentialSource::Authority(authority.clone()),
+            test_s3_http_client(),
         )
         .unwrap();
         (operator, authority, source)
@@ -5298,6 +5786,210 @@ mod tests {
         assert!(mapped.authority_cause().is_none());
     }
 
+    // One finite server owner multiplexes every accepted socket, so an
+    // accidental per-operator client produces a count failure, not a hang
+    // waiting for a second connection behind the first keepalive socket.
+    struct S3KeepaliveObservation {
+        accepted: usize,
+        targets: Vec<String>,
+    }
+
+    struct S3KeepaliveFixture {
+        address: std::net::SocketAddr,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        server: Option<JoinHandle<std::io::Result<S3KeepaliveObservation>>>,
+    }
+
+    impl S3KeepaliveFixture {
+        fn start() -> Self {
+            use std::io::{Error, ErrorKind, Read, Write};
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let server = std::thread::spawn(move || {
+                struct Connection {
+                    stream: std::net::TcpStream,
+                    request: Vec<u8>,
+                    response_offset: Option<usize>,
+                }
+                const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"fixture\"\r\nLast-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\nConnection: keep-alive\r\n\r\n";
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut connections = Vec::<Connection>::new();
+                let mut accepted = 0;
+                let mut targets = Vec::new();
+                while !server_stop.load(Ordering::Acquire) {
+                    if Instant::now() >= deadline {
+                        return Err(Error::new(
+                            ErrorKind::TimedOut,
+                            "keepalive fixture deadline",
+                        ));
+                    }
+                    loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                if accepted == 8 {
+                                    return Err(Error::other("too many fixture connections"));
+                                }
+                                stream.set_nonblocking(true)?;
+                                accepted += 1;
+                                connections.push(Connection {
+                                    stream,
+                                    request: Vec::new(),
+                                    response_offset: None,
+                                });
+                            }
+                            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    let mut index = 0;
+                    while index < connections.len() {
+                        let connection = &mut connections[index];
+                        let mut closed = false;
+                        if connection.response_offset.is_none() {
+                            let mut bytes = [0; 4096];
+                            match connection.stream.read(&mut bytes) {
+                                Ok(0) => closed = true,
+                                Ok(count) => {
+                                    connection.request.extend_from_slice(&bytes[..count]);
+                                    if connection.request.len() > 8192 {
+                                        return Err(Error::other("oversized fixture request"));
+                                    }
+                                    if connection.request.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        let line = connection
+                                            .request
+                                            .split(|b| *b == b'\n')
+                                            .next()
+                                            .unwrap();
+                                        let line = std::str::from_utf8(line).map_err(|error| {
+                                            Error::new(ErrorKind::InvalidData, error)
+                                        })?;
+                                        if !line.starts_with("HEAD ") || targets.len() == 8 {
+                                            return Err(Error::other("unexpected fixture request"));
+                                        }
+                                        targets.push(line.trim_end().to_string());
+                                        connection.request.clear();
+                                        connection.response_offset = Some(0);
+                                    }
+                                }
+                                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        if let Some(offset) = connection.response_offset {
+                            match connection.stream.write(&RESPONSE[offset..]) {
+                                Ok(0) => {
+                                    return Err(Error::new(
+                                        ErrorKind::WriteZero,
+                                        "fixture response",
+                                    ));
+                                }
+                                Ok(count) => {
+                                    connection.response_offset = if offset + count == RESPONSE.len()
+                                    {
+                                        None
+                                    } else {
+                                        Some(offset + count)
+                                    };
+                                }
+                                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        if closed {
+                            connections.swap_remove(index);
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(S3KeepaliveObservation { accepted, targets })
+            });
+            Self {
+                address,
+                stop,
+                server: Some(server),
+            }
+        }
+
+        fn finish(mut self) -> std::io::Result<S3KeepaliveObservation> {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            self.server
+                .take()
+                .unwrap()
+                .join()
+                .map_err(|_| std::io::Error::other("keepalive fixture panicked"))?
+        }
+    }
+
+    impl Drop for S3KeepaliveFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(server) = self.server.take() {
+                // Also runs after a failed client assertion, without a second panic.
+                let _ = server.join();
+            }
+        }
+    }
+
+    #[test]
+    fn pool_http_client_reuses_one_connection_across_bucket_and_credential_operators() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = S3KeepaliveFixture::start();
+        let pool = ObjectStoreProviderPool::new_for_test(8, Duration::from_secs(60)).unwrap();
+        let mut config = endpoint_config(&format!("http://{}", server.address));
+        config.retry_max_times = Some(0);
+        config.timeout_ms = Some(5_000);
+        config.io_timeout_ms = Some(5_000);
+        let acquire = |bucket: &str, generation: &str| {
+            pool.acquire(
+                domain(77),
+                bucket,
+                &config,
+                &ObjectStoreCredentialSource::Static {
+                    reference: static_reference(generation),
+                    material: secret_material(generation),
+                },
+                |endpoint, credentials| pool.build_operator(endpoint, credentials),
+            )
+            .unwrap()
+        };
+        let one = acquire("one", "first");
+        let two = acquire("two", "first");
+        let alias = acquire("one", "second");
+        runtime.block_on(async {
+            one.stat("object").await.unwrap();
+            two.stat("object").await.unwrap();
+        });
+        let constructions = pool.metrics_snapshot().unwrap().operator_constructions;
+        // An external operator alias retains the client after the original
+        // pool owner exits. Pool destruction is not an HTTP-exit proof.
+        drop(pool);
+        runtime.block_on(alias.stat("object")).unwrap();
+        drop((one, two, alias));
+        let S3KeepaliveObservation { accepted, targets } = server.finish().unwrap();
+        assert_eq!(constructions, 3);
+        assert_eq!(
+            targets,
+            [
+                "HEAD /one/object HTTP/1.1",
+                "HEAD /two/object HTTP/1.1",
+                "HEAD /one/object HTTP/1.1",
+            ]
+        );
+        assert_eq!(
+            accepted, 1,
+            "bucket and credential aliases share the pool client"
+        );
+    }
+
     #[test]
     fn real_s3_http_failures_keep_their_generic_connector_facts() {
         use novarocks_failure_contract::FailureProjection;
@@ -5352,6 +6044,7 @@ mod tests {
             let operator = build_object_store_operator(
                 &endpoint,
                 &ObjectStoreCredentialSource::Authority(authority.clone()),
+                test_s3_http_client(),
             )
             .unwrap();
             let result = runtime.block_on(operator.stat("sales/orders/part-0.parquet"));
@@ -5364,5 +6057,169 @@ mod tests {
             assert_eq!((fact.reason().domain(), fact.reason().code()), (4, code));
             assert_eq!(authority.metrics().blocking_waits, 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod hdfs_user_tests {
+    use super::*;
+
+    #[test]
+    fn decoded_user_is_the_exact_comparison_and_cache_identity() {
+        let a = parse_hdfs_path("hdfs://%61lice@warehouse-ha/data/a").unwrap();
+        let b = parse_hdfs_path("hdfs://alice@warehouse-ha/data/b").unwrap();
+        assert_eq!(a.name_node, "hdfs://warehouse-ha");
+        assert_eq!(a.user.as_deref(), Some("alice"));
+        assert_eq!(a.user, b.user);
+        assert_eq!(
+            parse_hdfs_path("hdfs://%2561lice@warehouse-ha/file")
+                .unwrap()
+                .user
+                .as_deref(),
+            Some("%61lice")
+        );
+        assert_eq!(
+            HdfsOperatorKey {
+                name_node: a.name_node,
+                user: a.user
+            },
+            HdfsOperatorKey {
+                name_node: b.name_node,
+                user: b.user
+            },
+        );
+        assert_eq!(
+            parse_hdfs_path("hdfs://%C3%A9@nn:8020/file")
+                .unwrap()
+                .user
+                .as_deref(),
+            Some("é")
+        );
+        for (encoded, expected) in [
+            ("alice%3Ateam", "alice:team"),
+            ("alice%40realm", "alice@realm"),
+        ] {
+            let parsed = parse_hdfs_path(&format!("hdfs://{encoded}@nn:8020/file")).unwrap();
+            assert_eq!(parsed.name_node, "hdfs://nn:8020");
+            assert_eq!(parsed.user.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn invalid_user_utf8_and_original_forbidden_uri_components_fail_before_build() {
+        for raw in [
+            "hdfs://%FF@nn:8020/file",
+            "hdfs://alice:password@nn:8020/file",
+            "hdfs://alice@nn:8020/file?query",
+            "hdfs://alice@nn:8020/file#fragment",
+        ] {
+            let Err(error) = parse_hdfs_path(raw) else {
+                panic!("invalid HDFS URI was accepted")
+            };
+            assert_eq!(error.kind(), FileErrorKind::Invalid);
+        }
+        let locations = vec![
+            FsLocation::parse("hdfs://alice@nn:8020/a").unwrap(),
+            FsLocation::parse("hdfs://bob@nn:8020/b").unwrap(),
+        ];
+        let result =
+            resolve_hdfs_locations(StorageAccessDomainId::from_bytes([0; 32]), locations, None);
+        let Err(error) = result else {
+            panic!("mixed effective users were accepted")
+        };
+        assert_eq!(error.kind(), FileErrorKind::Invalid);
+    }
+    #[test]
+    fn hdfs_cache_is_shared_only_by_the_same_runtime_view_and_unready_cannot_hit() {
+        let first_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let second_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let first = FsAccessResolver::with_runtime(first_runtime.handle().clone());
+        let first_clone = first.clone();
+        let second = FsAccessResolver::with_runtime(second_runtime.handle().clone());
+        let configuration_only = FsAccessResolver::new();
+        let key = HdfsOperatorKey {
+            name_node: "hdfs://namenode.invalid:8020".into(),
+            user: Some("alice".into()),
+        };
+        // Populate the original cache with real storage instances. Memory
+        // makes the cache selection oracle independent of DNS/RPC or Hadoop
+        // machine configuration; production misses use the actual SDK client.
+        let first_operator = Operator::new(opendal::services::Memory::default()).unwrap();
+        let second_operator = Operator::new(opendal::services::Memory::default()).unwrap();
+        first_runtime
+            .block_on(first_operator.write("data", Bytes::from_static(b"first")))
+            .unwrap();
+        second_runtime
+            .block_on(second_operator.write("data", Bytes::from_static(b"second")))
+            .unwrap();
+        first
+            .hdfs
+            .as_ref()
+            .unwrap()
+            .operators
+            .lock()
+            .unwrap()
+            .insert(key.clone(), first_operator);
+        second
+            .hdfs
+            .as_ref()
+            .unwrap()
+            .operators
+            .lock()
+            .unwrap()
+            .insert(key, second_operator);
+        let domain = StorageAccessDomainId::from_bytes([19; 32]);
+        let location = "hdfs://alice@namenode.invalid:8020/data";
+        assert!(configuration_only.parse_location(location).is_ok());
+        let unready_sync = configuration_only
+            .resolve_location(domain, location, None)
+            .unwrap_err();
+        let unready_async = first_runtime
+            .block_on(configuration_only.resolve_location_async(
+                domain,
+                location,
+                None,
+                &FileCancellation::new(),
+            ))
+            .unwrap_err();
+        let first_file = first.resolve_location(domain, location, None).unwrap();
+        let clone_file = first_clone
+            .resolve_location(domain, location, None)
+            .unwrap();
+        let second_file = second_runtime
+            .block_on(second.resolve_location_async(
+                domain,
+                location,
+                None,
+                &FileCancellation::new(),
+            ))
+            .unwrap();
+        let first_data = first_runtime
+            .block_on(first_file.operator().read("data"))
+            .unwrap()
+            .to_bytes();
+        let clone_data = first_runtime
+            .block_on(clone_file.operator().read("data"))
+            .unwrap()
+            .to_bytes();
+        let second_data = second_runtime
+            .block_on(second_file.operator().read("data"))
+            .unwrap()
+            .to_bytes();
+        // All raw outputs and runtime views exit before their original owners.
+        drop((first_file, clone_file, second_file));
+        drop((first, first_clone, second, configuration_only));
+        drop((first_runtime, second_runtime));
+        assert_eq!(unready_sync.kind(), FileErrorKind::Internal);
+        assert_eq!(unready_async.kind(), FileErrorKind::Internal);
+        assert_eq!(&first_data[..], b"first");
+        assert_eq!(&clone_data[..], b"first");
+        assert_eq!(&second_data[..], b"second");
     }
 }

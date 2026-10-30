@@ -34,10 +34,22 @@ pub(crate) enum DocumentKey {
 }
 
 pub(crate) fn corrupt(key: &str, reason: impl std::fmt::Display) -> ConnectorError {
-    ConnectorError::new(
+    let error = ConnectorError::new(
         ConnectorErrorKind::CorruptData,
         format!("invalid document key {key}: {reason}"),
-    )
+    );
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&error);
+    // Keep the original corruption identity in the operator diagnostic. Do not
+    // format metadata values, arbitrary reasons or the Connector source chain.
+    tracing::warn!(
+        document_key = ?key,
+        connector_kind = ?error.kind(),
+        failure_class = ?fact.class(),
+        failure_domain = fact.reason().domain(),
+        failure_code = fact.reason().code(),
+        "Iceberg keyed document corruption"
+    );
+    error
 }
 
 pub(crate) fn is_legacy_key(key: &str) -> bool {

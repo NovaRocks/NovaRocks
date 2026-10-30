@@ -23,11 +23,14 @@ import importlib.util
 import json
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[5]
+sys.path.insert(0, str(ROOT / "docker/fixture-inputs"))
+from fixture_inputs import native_platform, FixtureInputError
 RESOLVER_PATH = ROOT / "tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py"
 SPEC = importlib.util.spec_from_file_location("fixture_resolver", RESOLVER_PATH)
 RESOLVER = importlib.util.module_from_spec(SPEC)
@@ -53,6 +56,34 @@ class FixtureContractTest(unittest.TestCase):
         self.assertNotIn("staging_identity", first)
         self.assertTrue(first["ready_uri"].endswith("/READY.json"))
         self.assertTrue(first["staging_parent"].endswith("/staging"))
+
+    def test_oss_producer_tracks_its_complete_derived_spark_closure(self):
+        baseline = self.resolve()
+        cloud = RESOLVER.resolve_fixture(self.model, ROOT, "ssb", "1", object_store_kind="aliyun-oss")
+        self.assertNotEqual(baseline["dataset_key"], cloud["dataset_key"])
+        self.assertEqual(cloud["producer_fingerprint"]["object_store_kind"], "aliyun-oss")
+        projection = cloud["producer_fingerprint"]["lock_projections"][0]["projection"]
+        self.assertEqual(projection["derived_image"], "iceberg-spark-oss")
+        base = projection["derived_bases"][0]["projection"]
+        self.assertEqual(base["derived_image"], "iceberg-spark")
+        self.assertTrue(base["definition_sha256"])
+        self.assertTrue(base["bases"][0]["manifest_digest"])
+        self.assertTrue(any(item["name"] == "hadoop-aws-3.3.4.jar" for item in base["artifacts"]))
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            lock = json.loads((ROOT / "docker/fixture-inputs/lock.json").read_text())
+            sources = set(self.model["fixture"]["producer_inputs"].values()) | {"docker/fixture-inputs/lock.json"}
+            for name in ["iceberg-spark", "iceberg-spark-oss"]:
+                sources.update(lock["derived_images"][name]["definition_files"])
+            for name in sources:
+                target = workspace / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / name, target)
+            old = RESOLVER.resolve_fixture(self.model, workspace, "ssb", "1", object_store_kind="aliyun-oss")
+            spark = workspace / "docker/iceberg-rest/spark/Dockerfile"
+            spark.write_bytes(spark.read_bytes() + b"\n# changed Spark recipe\n")
+            changed = RESOLVER.resolve_fixture(self.model, workspace, "ssb", "1", object_store_kind="aliyun-oss")
+            self.assertNotEqual(old["dataset_key"], changed["dataset_key"])
 
     def test_scale_normalization(self):
         self.assertEqual(self.resolve(scale="1.0")["dataset_key"], self.resolve(scale="1")["dataset_key"])
@@ -150,8 +181,6 @@ class FixtureContractTest(unittest.TestCase):
             positives = [
                 ("images", "iceberg-spark-base", "manifest_digest", "sha256:new"),
                 ("images", "iceberg-spark-base", "source", "different/spark"),
-                ("images", "iceberg-spark-base", "platform", "linux/other"),
-                ("derived_images", "iceberg-spark", "platform", "linux/other"),
                 ("derived_images", "iceberg-spark", "dockerfile", "other/Dockerfile"),
                 ("artifacts", "hadoop-aws-3.3.4.jar", "sha1", "different"),
                 ("artifacts", "hadoop-aws-3.3.4.jar", "bytes", 42),
@@ -159,18 +188,30 @@ class FixtureContractTest(unittest.TestCase):
             ]
             for section, name, field, value in positives:
                 changed = deepcopy(lock)
-                changed[section][name][field] = value
+                item = changed[section][name]
+                if section == "images" and field == "manifest_digest":
+                    item = item["variants"][native_platform()]
+                item[field] = value
                 self.assertNotEqual(baseline, projection(changed), (section, field))
             changed = deepcopy(lock)
-            changed["images"]["iceberg-rest"]["manifest_digest"] = "other"
+            changed["images"]["iceberg-rest"]["variants"][native_platform()]["manifest_digest"] = "other"
             changed["images"]["paimon-spark-base"]["source"] = "other"
             changed["artifacts"]["paimon-s3.jar"]["sha1"] = "other"
-            changed["images"]["iceberg-spark-base"]["alias"] = "transport-only"
-            changed["derived_images"]["iceberg-spark"]["alias"] = "transport-only"
+            changed["images"]["iceberg-spark-base"]["variants"][native_platform()]["alias"] = "transport-only"
+            changed["derived_images"]["iceberg-spark"]["variants"][native_platform()]["alias"] = "transport-only"
             changed["derived_images"]["iceberg-spark"]["build_args"] = {"RENAMED": "unused"}
             changed["unrelated_ports"] = [1001, 2002]
             self.assertEqual(baseline, projection(changed))
             self.assertNotIn("docker/iceberg-rest/shared.env", self.model["fixture"]["producer_inputs"].values())
+
+    def test_producer_projection_selects_native_variant_and_rejects_missing_one(self):
+        declarations = self.model["fixture"]["producer_lock_projections"]
+        amd = RESOLVER.producer_lock_projections(ROOT, declarations, platform="linux/amd64")
+        arm = RESOLVER.producer_lock_projections(ROOT, declarations, platform="linux/arm64")
+        self.assertNotEqual(amd, arm)
+        self.assertEqual(amd[0]["projection"]["platform"], "linux/amd64")
+        with self.assertRaises(FixtureInputError):
+            RESOLVER.producer_lock_projections(ROOT, declarations, platform="linux/riscv64")
 
     def test_ready_and_error_schemas_fail_closed(self):
         resolved = self.resolve()
@@ -206,14 +247,14 @@ class FixtureContractTest(unittest.TestCase):
         declarations = self.model["fixture"]["producer_lock_projections"]
         baseline = RESOLVER.producer_lock_projections(ROOT, declarations)
         lock["images"]["independent-builder"] = {
-            "source": "example.invalid/builder", "platform": "linux/arm64",
-            "manifest_digest": "sha256:independent", "alias": "fixture/builder:locked",
+            "source": "example.invalid/builder", "variants": {"linux/arm64": {
+                "platform": "linux/arm64", "manifest_digest": "sha256:independent", "alias": "fixture/builder:locked"}},
         }
         lock["artifacts"]["independent-source.tar.gz"] = {
             "url": "https://example.invalid/source.tar.gz", "bytes": 42, "sha1": "independent",
         }
         lock["derived_images"]["independent-catalog"] = {
-            "platform": "linux/arm64", "alias": "fixture/catalog:current",
+            "variants": {"linux/arm64": {"platform": "linux/arm64", "alias": "fixture/catalog:current"}},
             "bases": {"BUILDER": "independent-builder", "REST_BASE": "iceberg-rest"},
             "dockerfile": "other/Dockerfile", "artifacts": ["independent-source.tar.gz"],
         }

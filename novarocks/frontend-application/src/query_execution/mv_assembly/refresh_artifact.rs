@@ -447,6 +447,14 @@ pub struct PreparedMvIncrementalWrite {
 }
 
 impl PreparedMvIncrementalWrite {
+    pub(crate) const fn request(&self) -> &MvIncrementalWriteRequest {
+        &self.request
+    }
+
+    pub(crate) const fn mode(&self) -> MvIncrementalWriteMode {
+        self.mode
+    }
+
     pub fn operation_id(&self) -> ConnectorWriteOperationId {
         self.request.operation_id
     }

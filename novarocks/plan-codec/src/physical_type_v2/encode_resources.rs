@@ -267,11 +267,11 @@ impl Model {
         Ok(())
     }
     /// Work of the actual strict Field visit, admitted before its iterator.
-    /// A zero-capacity map is constant. Nonempty/deleted source maps keep their
-    /// original source envelope; it is never reused for execution-only nodes.
+    /// Metadata without Arc backing is constant. Shared source metadata keeps
+    /// the existing conservative source envelope, never reused for execution-only nodes.
     pub(super) fn strict_field(&mut self, field: &Field) -> Result<(), E> {
         self.work = add(self.work, add(128, mul(field.name().len(), 8)?)?)?;
-        if field.metadata().capacity() != 0 {
+        if field.metadata().as_arc().is_some() {
             let iteration =
                 hashmap::source_iterator_work_upper_bound(self.source, field.metadata().len())
                     .map_err(hash_error)?;
@@ -319,9 +319,9 @@ impl Model {
         self.string(field.name().len())?;
         self.request(array::<(&str, &str)>(entries)?, 1)?;
         self.request(array::<plan::ArrowFieldMetadataEntry>(entries)?, 1)?;
-        // Empty zero-capacity metadata has no deleted buckets to visit.
-        // Existing arbitrary maps retain the original source-provenance bound.
-        if field.metadata().capacity() == 0 {
+        // Canonical empty Metadata has no Arc backing or entries to visit.
+        // A retained source Arc keeps the existing conservative provenance bound.
+        if field.metadata().as_arc().is_none() {
             self.work = add(self.work, 2)?;
         } else {
             // The original Count walk and encode_metadata each iterate the

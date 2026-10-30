@@ -31,6 +31,11 @@ mod wire;
 
 pub const RESOURCE_DECODE_MODEL_REVISION: u32 = 1;
 
+// Prost 0.13's default decoder rejects recursion beyond 100 calls. The
+// resource cursor mirrors that actual library boundary and its frame storage;
+// this is not an independently chosen package-size or work quota.
+pub(crate) const PROST_RECURSION_LIMIT: usize = 100;
+
 // The source proof covers the default Prost recursion model. Feature
 // unification must not silently enable the unbounded alternative.
 const _: () = assert!(std::mem::size_of::<prost::encoding::DecodeContext>() != 0);

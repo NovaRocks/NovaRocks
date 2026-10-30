@@ -699,7 +699,7 @@ fn classify_dynamic_filter_status(address: &str, status: &tonic::Status) -> Dyna
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_query_application::coordination::AttemptFailureClass;
+    use novarocks_coordination_contract::AttemptFailureClass;
 
     fn root() -> TaskIdentity {
         TaskIdentity::new(

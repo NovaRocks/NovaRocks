@@ -2,7 +2,7 @@
 // See the NOTICE file distributed with this work for additional information regarding copyright ownership.
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
-use std::{fmt, io::BufReader, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey};
 use novarocks_types::NativeEndpoint;
@@ -10,7 +10,7 @@ use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     client::Resumption,
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject},
     version::TLS13,
 };
 
@@ -88,19 +88,15 @@ impl PemTransportMaterial {
         ),
         NativeTrustFailureKind,
     > {
-        let mut certificate_reader = BufReader::new(self.certificate_chain.as_slice());
-        let certificates = rustls_pemfile::certs(&mut certificate_reader)
+        let certificates = CertificateDer::pem_slice_iter(&self.certificate_chain)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| NativeTrustFailureKind::TransportConfiguration)?;
         if certificates.is_empty() {
             return Err(NativeTrustFailureKind::TransportConfiguration);
         }
-        let mut key_reader = BufReader::new(self.private_key.as_slice());
-        let private_key = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|_| NativeTrustFailureKind::TransportConfiguration)?
-            .ok_or(NativeTrustFailureKind::TransportConfiguration)?;
-        let mut roots_reader = BufReader::new(self.trust_roots.as_slice());
-        let roots = rustls_pemfile::certs(&mut roots_reader)
+        let private_key = PrivateKeyDer::from_pem_slice(&self.private_key)
+            .map_err(|_| NativeTrustFailureKind::TransportConfiguration)?;
+        let roots = CertificateDer::pem_slice_iter(&self.trust_roots)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| NativeTrustFailureKind::TransportConfiguration)?;
         if roots.is_empty() {
@@ -397,5 +393,33 @@ mod tests {
         let mut stream = client.connect().await.unwrap();
         stream.write_all(&[7]).await.unwrap();
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn pem_material_rejects_missing_and_truncated_private_keys() {
+        let certified = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let certificate = certified.cert.pem();
+        let missing_key = PemTransportMaterial::new(
+            certificate.clone().into_bytes(),
+            certificate.clone().into_bytes(),
+            certificate.clone().into_bytes(),
+        );
+        assert_eq!(
+            missing_key.unwrap_err(),
+            NativeTrustFailureKind::TransportConfiguration
+        );
+        let private_key = certified.key_pair.serialize_pem();
+        let truncated_key = private_key.lines().take(2).collect::<Vec<_>>().join("\n");
+        assert!(truncated_key.starts_with("-----BEGIN "));
+        assert!(!truncated_key.contains("-----END "));
+        let truncated = PemTransportMaterial::new(
+            certificate.clone().into_bytes(),
+            truncated_key.into_bytes(),
+            certificate.into_bytes(),
+        );
+        assert_eq!(
+            truncated.unwrap_err(),
+            NativeTrustFailureKind::TransportConfiguration
+        );
     }
 }

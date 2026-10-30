@@ -544,62 +544,143 @@ pub(crate) mod tests {
     #[derive(Clone, Debug, Default)]
     pub(crate) struct RangeReceipts(pub(crate) RangeReceiptLog, Option<opendal::ErrorKind>);
     #[derive(Debug)]
-    pub(crate) struct RangeReceiptAccessor<A: opendal::raw::Access> {
-        inner: A,
+    pub(crate) struct RangeReceiptAccessor {
+        inner: opendal::raw::Servicer,
         receipts: RangeReceipts,
     }
-    impl<A: opendal::raw::Access> opendal::raw::Layer<A> for RangeReceipts {
-        type LayeredAccess = RangeReceiptAccessor<A>;
-        fn layer(&self, inner: A) -> Self::LayeredAccess {
-            RangeReceiptAccessor {
+    impl opendal::raw::Layer for RangeReceipts {
+        fn apply_service(&self, inner: opendal::raw::Servicer) -> opendal::raw::Servicer {
+            Arc::new(RangeReceiptAccessor {
                 inner,
                 receipts: self.clone(),
-            }
+            })
         }
     }
-    impl<A: opendal::raw::Access> opendal::raw::LayeredAccess for RangeReceiptAccessor<A> {
-        type Inner = A;
-        type Reader = A::Reader;
-        type Writer = A::Writer;
-        type Lister = A::Lister;
-        type Deleter = A::Deleter;
-        fn inner(&self) -> &Self::Inner {
-            &self.inner
+    impl opendal::raw::Service for RangeReceiptAccessor {
+        type Reader = RangeReceiptReader;
+        type Writer = opendal::raw::oio::Writer;
+        type Lister = opendal::raw::oio::Lister;
+        type Deleter = opendal::raw::oio::Deleter;
+        type Copier = opendal::raw::oio::Copier;
+        fn info(&self) -> opendal::raw::ServiceInfo {
+            opendal::raw::Service::info(&self.inner)
         }
-        async fn write(
+        fn capability(&self) -> opendal::Capability {
+            opendal::raw::Service::capability(&self.inner)
+        }
+        async fn create_dir(
             &self,
+            ctx: &opendal::OperationContext,
             path: &str,
-            args: opendal::raw::OpWrite,
-        ) -> opendal::Result<(opendal::raw::RpWrite, Self::Writer)> {
-            self.inner.write(path, args).await
+            args: opendal::raw::OpCreateDir,
+        ) -> opendal::Result<opendal::raw::RpCreateDir> {
+            opendal::raw::Service::create_dir(&self.inner, ctx, path, args).await
         }
-        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
-            self.inner.delete().await
-        }
-        async fn list(
+        async fn stat(
             &self,
+            ctx: &opendal::OperationContext,
             path: &str,
-            args: opendal::raw::OpList,
-        ) -> opendal::Result<(opendal::raw::RpList, Self::Lister)> {
-            self.inner.list(path, args).await
+            args: opendal::raw::OpStat,
+        ) -> opendal::Result<opendal::raw::RpStat> {
+            opendal::raw::Service::stat(&self.inner, ctx, path, args).await
         }
-        async fn read(
+        fn read(
             &self,
+            ctx: &opendal::OperationContext,
             path: &str,
             args: opendal::raw::OpRead,
-        ) -> opendal::Result<(opendal::raw::RpRead, Self::Reader)> {
-            self.receipts.0.lock().unwrap().push((
-                path.to_string(),
-                args.range().offset(),
-                args.range().size(),
-            ));
+        ) -> opendal::Result<Self::Reader> {
+            Ok(RangeReceiptReader {
+                inner: opendal::raw::Service::read(&self.inner, ctx, path, args)?,
+                path: path.to_owned(),
+                receipts: self.receipts.clone(),
+            })
+        }
+        fn write(
+            &self,
+            ctx: &opendal::OperationContext,
+            path: &str,
+            args: opendal::raw::OpWrite,
+        ) -> opendal::Result<Self::Writer> {
+            opendal::raw::Service::write(&self.inner, ctx, path, args)
+        }
+        fn delete(&self, ctx: &opendal::OperationContext) -> opendal::Result<Self::Deleter> {
+            opendal::raw::Service::delete(&self.inner, ctx)
+        }
+        fn list(
+            &self,
+            ctx: &opendal::OperationContext,
+            path: &str,
+            args: opendal::raw::OpList,
+        ) -> opendal::Result<Self::Lister> {
+            opendal::raw::Service::list(&self.inner, ctx, path, args)
+        }
+        fn copy(
+            &self,
+            ctx: &opendal::OperationContext,
+            from: &str,
+            to: &str,
+            args: opendal::raw::OpCopy,
+            opts: opendal::raw::OpCopier,
+        ) -> opendal::Result<Self::Copier> {
+            opendal::raw::Service::copy(&self.inner, ctx, from, to, args, opts)
+        }
+        async fn rename(
+            &self,
+            ctx: &opendal::OperationContext,
+            from: &str,
+            to: &str,
+            args: opendal::raw::OpRename,
+        ) -> opendal::Result<opendal::raw::RpRename> {
+            opendal::raw::Service::rename(&self.inner, ctx, from, to, args).await
+        }
+        async fn presign(
+            &self,
+            ctx: &opendal::OperationContext,
+            path: &str,
+            args: opendal::raw::OpPresign,
+        ) -> opendal::Result<opendal::raw::RpPresign> {
+            opendal::raw::Service::presign(&self.inner, ctx, path, args).await
+        }
+    }
+    pub(crate) struct RangeReceiptReader {
+        inner: opendal::raw::oio::Reader,
+        path: String,
+        receipts: RangeReceipts,
+    }
+    impl RangeReceiptReader {
+        fn record(&self, range: opendal::BytesRange) -> opendal::Result<()> {
+            self.receipts
+                .0
+                .lock()
+                .unwrap()
+                .push((self.path.clone(), range.offset(), range.size()));
             if let Some(kind) = self.receipts.1 {
                 return Err(opendal::Error::new(
                     kind,
                     "identified delete-object read failure",
                 ));
             }
-            self.inner.read(path, args).await
+            Ok(())
+        }
+    }
+    impl opendal::raw::oio::Read for RangeReceiptReader {
+        async fn open(
+            &self,
+            range: opendal::BytesRange,
+        ) -> opendal::Result<(
+            opendal::raw::RpRead,
+            Box<dyn opendal::raw::oio::ReadStreamDyn>,
+        )> {
+            self.record(range)?;
+            opendal::raw::oio::Read::open(&self.inner, range).await
+        }
+        async fn read(
+            &self,
+            range: opendal::BytesRange,
+        ) -> opendal::Result<(opendal::raw::RpRead, opendal::Buffer)> {
+            self.record(range)?;
+            opendal::raw::oio::Read::read(&self.inner, range).await
         }
     }
     pub(crate) fn recorded_access(
@@ -657,12 +738,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn retags_iceberg_map_without_narrowing_runtime_key_nullability() {
-        let keys = Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef;
-        let values = Arc::new(Int64Array::from(vec![Some(10), Some(20)])) as ArrayRef;
+    fn retags_iceberg_map_with_required_key_and_nullable_value() {
+        let keys = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let values = Arc::new(Int64Array::from(vec![Some(10), None])) as ArrayRef;
         let entries = StructArray::new(
             Fields::from(vec![
-                Field::new("key", DataType::Int32, true),
+                Field::new("key", DataType::Int32, false),
                 Field::new("value", DataType::Int64, true),
             ]),
             vec![keys, values],
@@ -690,7 +771,7 @@ pub(crate) mod tests {
             false,
         );
 
-        let out = retag_iceberg_array(&source, &target).expect("retag nullable map key");
+        let out = retag_iceberg_array(&source, &target).expect("retag valid map metadata");
 
         let DataType::Map(entries, false) = out.data_type() else {
             panic!("expected map");
@@ -700,9 +781,48 @@ pub(crate) mod tests {
             panic!("expected entries struct");
         };
         assert_eq!(fields[0].name(), "iceberg_key");
-        assert!(fields[0].is_nullable());
+        assert!(!fields[0].is_nullable());
+        assert!(fields[1].is_nullable());
         let map = out.as_any().downcast_ref::<MapArray>().expect("map array");
-        assert!(map.keys().is_null(1));
+        assert_eq!(map.keys().null_count(), 0);
+        assert_eq!(
+            map.keys()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &[1, 2]
+        );
+        assert!(map.values().is_null(1));
+    }
+    #[test]
+    fn arrow_rejects_nullable_map_keys_before_iceberg_metadata_retagging() {
+        let entries = StructArray::new(
+            vec![
+                Field::new("key", DataType::Int32, true),
+                Field::new("value", DataType::Int64, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+            ],
+            None,
+        );
+        let error = MapArray::try_new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::from_lengths([2]),
+            entries,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            arrow::error::ArrowError::InvalidArgumentError(_)
+        ));
+        assert!(error.to_string().contains("keys field cannot be nullable"));
     }
     #[test]
     fn position_path_predicate_reads_related_groups_and_reports_layout_degradation() {
@@ -723,7 +843,7 @@ pub(crate) mod tests {
                     crate::delete_semantics::POSITION_FILE_PATH_FIELD_ID.to_string(),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
             ),
             Field::new("pos", DataType::Int64, false).with_metadata(
                 [(
@@ -731,7 +851,7 @@ pub(crate) mod tests {
                     (i32::MAX - 102).to_string(),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
             ),
             Field::new("unrelated_payload", DataType::Binary, false),
         ]));
@@ -935,7 +1055,7 @@ pub(crate) mod tests {
                     crate::delete_semantics::POSITION_FILE_PATH_FIELD_ID.to_string(),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
             ),
             Field::new("pos", DataType::Int64, false).with_metadata(
                 [(
@@ -943,7 +1063,7 @@ pub(crate) mod tests {
                     (i32::MAX - 102).to_string(),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
             ),
         ]));
         let mut writer = ArrowWriter::try_new(

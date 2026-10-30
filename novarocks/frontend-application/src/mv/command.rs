@@ -21,9 +21,7 @@ use crate::mv::domain::application::{
     MvAlterAction, MvAlterStatement, MvCreateDistribution, MvCreatePartitionField,
     MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvRefreshRequest, MvShowStatement,
 };
-use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use novarocks_mv_application::activity::MvActivityOwner;
 use novarocks_parser::ast::{
     CallStatement, Literal, LiteralKind, MaterializedViewAlterAction as TypedAlterAction,
     MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
@@ -31,10 +29,9 @@ use novarocks_parser::ast::{
     MaterializedViewRefreshPolicy as TypedRefreshPolicy, MaterializedViewStatement,
     ObjectName as TypedObjectName,
 };
-use novarocks_query_application::admitted_query_context::{QueryExecutionContext, RequestContext};
+use novarocks_query_application::admitted_query_context::RequestContext;
 use novarocks_query_application::api::{
     CommandContext, MaterializedViewCommand, MaterializedViewCommandConsumer,
-    build_string_query_result,
 };
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
@@ -43,16 +40,13 @@ use novarocks_types::naming::normalize_identifier;
 
 use super::FrontendMvProductAdapter;
 use crate::mv::domain::refresh::resolve_refresh_mv_target;
-use crate::mv::domain::{
-    alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports, list_mvs_with_backend,
-};
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct MvCommandExecutor {
+    execution_services: Option<crate::query::mv_action::MvExecutionServices>,
     ports: IcebergMvCorePorts,
     refresh_service: Arc<FrontendMvProductAdapter>,
-    mv_backend: Arc<IcebergMvBackend>,
     /// The one process-local owner of management continuation. Absent only on
     /// a composition with no management authority at all, where the management
     /// procedures have nothing to report and say so.
@@ -67,7 +61,6 @@ impl MvCommandExecutor {
         ports: IcebergMvCorePorts,
         refresh_service: Arc<FrontendMvProductAdapter>,
         _storage_observation: Arc<dyn MvStorageObservationPort>,
-        mv_backend: Arc<IcebergMvBackend>,
         continuation: Option<
             Arc<novarocks_mv_application::management::ManagementContinuationService>,
         >,
@@ -76,122 +69,141 @@ impl MvCommandExecutor {
         >,
     ) -> Self {
         Self {
+            execution_services: None,
             ports,
             refresh_service,
-            mv_backend,
             continuation,
             management_audit,
         }
     }
 
-    /// Executes one parser-admitted MV command through explicit ports. Refresh
-    /// and repartition receive the request's already-admitted execution
-    /// context; they never capture a second topology or cancellation scope.
-    // Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
-    pub fn execute(
+    pub(crate) fn with_execution_services(
+        mut self,
+        services: crate::query::mv_action::MvExecutionServices,
+    ) -> Self {
+        self.execution_services = Some(services);
+        self
+    }
+
+    fn prepare_statement_action(
         &self,
         statement: &MaterializedViewStatement,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-        execution: &QueryExecutionContext,
-    ) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
-        match statement {
-            MaterializedViewStatement::Create(statement) => {
-                let statement = lower_typed_create(statement)?;
-                let target = resolve_refresh_mv_target(
-                    current_catalog,
-                    current_database,
-                    &statement.name_parts,
-                )?;
-                self.refresh_service.execute_serialized(
-                    &target,
-                    MvActivityOwner::Create,
-                    execution,
-                    || {
-                        create_mv_with_ports(
-                            &self.ports,
-                            self.refresh_service.as_ref(),
-                            current_catalog,
-                            current_database,
-                            &statement,
-                            connector_context,
-                        )
-                    },
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::api::CommandError,
+    > {
+        if matches!(
+            statement,
+            MaterializedViewStatement::Show(_) | MaterializedViewStatement::ExplainRefresh(_)
+        ) {
+            let services = self.execution_services.clone().ok_or_else(|| {
+                novarocks_query_application::api::CommandError::new(
+                    novarocks_query_application::api::CommandErrorKind::Unsupported,
+                    "MV execution services are unavailable",
                 )
-            }
-            MaterializedViewStatement::Drop(statement) => {
-                let statement = MvDropStatement {
-                    name_parts: lower_typed_name_parts(&statement.name)?,
-                    if_exists: statement.if_exists,
-                };
-                let target = resolve_refresh_mv_target(
-                    current_catalog,
-                    current_database,
-                    &statement.name_parts,
-                )?;
-                self.refresh_service
-                    .execute_serialized(&target, MvActivityOwner::Drop, execution, || {
-                        drop_mv_with_ports(
-                            self.refresh_service.product_service(),
-                            &self.ports,
-                            current_catalog,
-                            current_database,
-                            &statement,
-                            connector_context,
-                        )
-                    })
-                    .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
-            }
-            MaterializedViewStatement::Alter(statement)
-                if !matches!(&statement.action, TypedAlterAction::Repartition(_)) =>
-            {
-                let statement = lower_typed_alter(statement)?;
-                let target = resolve_refresh_mv_target(
-                    current_catalog,
-                    current_database,
-                    &statement.name_parts,
-                )?;
-                self.refresh_service
-                    .execute_serialized(&target, MvActivityOwner::Alter, execution, || {
-                        alter_mv_with_ports(
-                            &self.ports,
-                            current_catalog,
-                            current_database,
-                            &statement,
-                            connector_context,
-                        )
-                    })
-                    .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
-            }
-            MaterializedViewStatement::Alter(statement) => self.execute_repartition(
-                current_catalog,
-                current_database,
-                &lower_typed_alter(statement)?,
-                connector_context,
-                execution,
-            ),
-            MaterializedViewStatement::Refresh(statement) => self.execute_refresh(
-                current_catalog,
-                current_database,
-                &lower_typed_refresh(statement)?,
-                connector_context,
-                execution,
-            ),
-            MaterializedViewStatement::Show(statement) => list_mvs_with_backend(
-                self.mv_backend.as_ref(),
-                current_catalog,
-                &lower_typed_show(statement)?,
-            )
-            .map_err(novarocks_sql::compiler::SqlCompileError::Compilation),
-            MaterializedViewStatement::ExplainRefresh(statement) => self.execute_explain_refresh(
-                current_catalog,
-                current_database,
-                &lower_typed_refresh(&statement.refresh)?,
-                lower_typed_explain_level(statement.level),
-                connector_context,
-            ),
+            })?;
+            let request = match statement {
+                MaterializedViewStatement::Show(show) => crate::query::mv_read_action::ReadRequest::Show {
+                    catalog: context.session().current_catalog().map(str::to_owned),
+                    statement: lower_typed_show(show)?,
+                },
+                MaterializedViewStatement::ExplainRefresh(explain) => crate::query::mv_read_action::ReadRequest::Explain(Box::new(
+                    crate::query_execution::mv_assembly::refresh_explain::MvExplainPreparationInput {
+                        ports: self.ports.clone(),
+                        current_catalog: context.session().current_catalog().map(str::to_owned),
+                        current_database: context.session().current_database().to_owned(),
+                        statement: lower_typed_refresh(&explain.refresh)?,
+                        level: lower_typed_explain_level(explain.level),
+                        context: command_context.connector_context().clone(),
+                    })),
+                _ => unreachable!(),
+            };
+            return crate::query::mv_read_action::prepare(
+                self.ports.clone(),
+                services,
+                request,
+                context.execution().clone(),
+                *context.session().presentation(),
+            );
         }
+        use crate::query::mv_action::{CreateRequest, MvCommandRequest, prepare};
+        let catalog = context.session().current_catalog();
+        let database = context.session().current_database();
+        let request = match statement {
+            MaterializedViewStatement::Refresh(refresh) => {
+                let statement = lower_typed_refresh(refresh)?;
+                let requested =
+                    resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
+                MvCommandRequest::Refresh {
+                    statement,
+                    requested,
+                }
+            }
+            MaterializedViewStatement::Alter(alter)
+                if matches!(&alter.action, TypedAlterAction::Repartition(_)) =>
+            {
+                let alter = lower_typed_alter(alter)?;
+                let MvAlterAction::Repartition(fields) = alter.action else {
+                    unreachable!()
+                };
+                let target = resolve_refresh_mv_target(catalog, database, &alter.name_parts)?;
+                MvCommandRequest::Repartition {
+                    statement: MvRefreshRequest {
+                        name_parts: alter.name_parts,
+                        full: false,
+                    },
+                    target,
+                    fields: fields.iter().map(IcebergPartitionFieldExpr::from).collect(),
+                }
+            }
+            MaterializedViewStatement::Create(create) => {
+                let statement = lower_typed_create(create)?;
+                let target = resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
+                MvCommandRequest::Create(Box::new(CreateRequest { target, statement }))
+            }
+            MaterializedViewStatement::Drop(drop) => {
+                let statement = MvDropStatement {
+                    name_parts: lower_typed_name_parts(&drop.name)?,
+                    if_exists: drop.if_exists,
+                };
+                let target = resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
+                MvCommandRequest::Control(crate::query::mv_action::MvControlRequest::Drop {
+                    target,
+                    statement,
+                })
+            }
+            MaterializedViewStatement::Alter(alter) => {
+                let statement = lower_typed_alter(alter)?;
+                let target = resolve_refresh_mv_target(catalog, database, &statement.name_parts)?;
+                MvCommandRequest::Control(crate::query::mv_action::MvControlRequest::Alter {
+                    target,
+                    statement,
+                })
+            }
+            MaterializedViewStatement::Show(_) | MaterializedViewStatement::ExplainRefresh(_) => {
+                unreachable!("MV read statements were selected before the mutation action")
+            }
+        };
+        let services = self.execution_services.clone().ok_or_else(|| {
+            novarocks_query_application::api::CommandError::new(
+                novarocks_query_application::api::CommandErrorKind::Unsupported,
+                "MV execution services are unavailable",
+            )
+        })?;
+        let (product, activation) = self.refresh_service.original_refresh_ports();
+        prepare(
+            catalog.map(str::to_owned),
+            database.to_owned(),
+            self.ports.clone(),
+            activation,
+            product,
+            services,
+            request,
+            context.execution().clone(),
+            command_context.connector_context().clone(),
+        )
     }
 
     /// Executes the MV management procedures and the test-only stateless
@@ -259,145 +271,33 @@ impl MvCommandExecutor {
             Ok(None)
         }
     }
+}
 
-    fn execute_explain_refresh(
-        &self,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        statement: &MvRefreshRequest,
-        level: novarocks_sql::compiler::ExplainLevel,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
-        let lines = crate::query_execution::mv_assembly::refresh_explain::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
-            &self.ports,
-            current_catalog,
-            current_database,
-            statement,
-            level,
-            connector_context,
-        )?;
-        build_string_query_result("Explain String", lines)
-            .map(StatementResult::Query)
-            .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
-    }
-
-    fn execute_repartition(
-        &self,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        statement: &MvAlterStatement,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-        execution: &QueryExecutionContext,
-    ) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
-        let MvAlterAction::Repartition(fields) = &statement.action else {
-            return Err("MV repartition executor received a non-repartition action"
-                .to_string()
-                .into());
-        };
-        let target =
-            resolve_refresh_mv_target(current_catalog, current_database, &statement.name_parts)?;
-        let refresh_statement = MvRefreshRequest {
-            name_parts: statement.name_parts.clone(),
-            full: false,
-        };
-        let repartition_fields = fields
-            .iter()
-            .map(IcebergPartitionFieldExpr::from)
-            .collect::<Vec<_>>();
-        let preparation =
-            crate::query_execution::mv_assembly::refresh_preparation::FrontendMvRefreshPreparationService::new_repartition_with_ports(
-                &self.ports,
-                current_catalog,
-                current_database,
-                &refresh_statement,
-                &repartition_fields,
-                connector_context,
-            );
-        self.refresh_service
-            .prepare_and_execute_refresh(
-                &preparation,
-                refresh_statement.sql_refresh_statement(),
-                target,
-                MvActivityOwner::Repartition,
-                connector_context.clone(),
-                execution,
-            )
-            .map(|()| StatementResult::Ok)
-            .map_err(mv_compile_error)
-    }
-
-    fn execute_refresh(
-        &self,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        statement: &MvRefreshRequest,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-        execution: &QueryExecutionContext,
-    ) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
-        let requested_target =
-            resolve_refresh_mv_target(current_catalog, current_database, &statement.name_parts)?;
-        let target_catalog = requested_target.catalog.as_deref().ok_or_else(|| {
-            "REFRESH MATERIALIZED VIEW for an Iceberg MV requires current Iceberg catalog context"
-                .to_string()
-        })?;
-        let requested_object = novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
-            target_catalog,
-            &requested_target.database,
-            &requested_target.name,
-        );
-        let steps =
-            crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_readiness(
-                self.ports.readiness().as_ref(),
-                &requested_object,
-            )?;
-        let mut step_context = connector_context.clone();
-        let mut last_result = None;
-        for step in steps {
-            if !step.is_iceberg() {
-                return Err(format!(
-                    "REFRESH MATERIALIZED VIEW is only supported for Iceberg-backed materialized views: {}",
-                    step.display_name().trim_start_matches("mv:")
-                ).into());
-            }
-            let target = step.into_target();
-            let target_catalog = target.catalog.clone();
-            let target_database = target.database.clone();
-            let target_name = target.name.clone();
-            let step_statement = MvRefreshRequest {
-                name_parts: vec![target_database.clone(), target_name],
-                full: statement.full && target == requested_target,
-            };
-            let preparation =
-                crate::query_execution::mv_assembly::refresh_preparation::FrontendMvRefreshPreparationService::new_with_ports(
-                    &self.ports,
-                    target_catalog.as_deref(),
-                    &target_database,
-                    &step_statement,
-                    &step_context,
-                );
-            last_result = Some(
-                self.refresh_service
-                    .prepare_and_execute_refresh(
-                        &preparation,
-                        step_statement.sql_refresh_statement(),
-                        target,
-                        MvActivityOwner::ManualRefresh,
-                        step_context.clone(),
-                        execution,
-                    )
-                    .map(|()| StatementResult::Ok)
-                    .map_err(mv_compile_error)?,
-            );
-            // The next dependency must observe the upstream commit, not the
-            // request-local metadata snapshot frozen before this step.
-            step_context = step_context.after_external_effect();
+pub(crate) fn mv_application_command_error(
+    error: crate::mv::domain::application::MvApplicationError,
+) -> novarocks_query_application::api::CommandError {
+    use crate::mv::domain::application::MvApplicationErrorKind;
+    use novarocks_query_application::api::StatementExternalEffectDisposition;
+    // These two kinds are emitted only with the original publication's fact.
+    // Other business failures alone do not prove the absence of an effect.
+    let disposition = match error.kind() {
+        MvApplicationErrorKind::CommitUnknown => {
+            Some(StatementExternalEffectDisposition::CommitUnknown)
         }
-        last_result.ok_or_else(|| {
-            novarocks_sql::compiler::SqlCompileError::Compilation(
-                "MV refresh dependency planner returned no steps".to_string(),
-            )
-        })
-    }
+        MvApplicationErrorKind::KnownCommittedFinalizeFailed => {
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        }
+        _ => None,
+    };
+    let command = if let Some(cause) = error.original_failure() {
+        // A Provider source is not a compiler failure. Retain a compile
+        // sidecar only when the actual compiler already supplied one.
+        novarocks_query_application::api::CommandError::from_failure_cause(cause.clone())
+            .with_compile_control(error.compile_control_error())
+    } else {
+        mv_command_error(mv_compile_error(error))
+    };
+    command.with_external_effect_disposition(disposition)
 }
 
 fn mv_compile_error(
@@ -413,10 +313,10 @@ fn mv_compile_error(
 }
 
 #[cfg(test)]
-pub(super) fn project_product_failure_for_test(
+pub(crate) fn project_product_failure_for_test(
     error: crate::mv::domain::application::MvApplicationError,
 ) -> novarocks_query_application::api::CommandError {
-    mv_command_error(mv_compile_error(error))
+    mv_application_command_error(error)
 }
 
 /// Role-local implementation of the Query Application MV consumer. It owns
@@ -434,21 +334,17 @@ impl FrontendMvCommandConsumer {
 }
 
 impl MaterializedViewCommandConsumer for FrontendMvCommandConsumer {
-    fn execute(
+    fn prepare_statement_action(
         &self,
-        command: &MaterializedViewCommand,
-        context: &RequestContext,
-        command_context: &CommandContext,
-    ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
+        command: MaterializedViewCommand,
+        context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::api::CommandError,
+    > {
         self.executor
-            .execute(
-                command.statement(),
-                context.session().current_catalog(),
-                context.session().current_database(),
-                command_context.connector_context(),
-                context.execution(),
-            )
-            .map_err(mv_command_error)
+            .prepare_statement_action(command.statement(), &context, &command_context)
     }
 }
 
@@ -480,15 +376,16 @@ fn mv_command_error(
             Some(error) => {
                 novarocks_query_application::api::CommandError::from_compile_control(error)
             }
+            None if error.kind()
+                == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation =>
+            {
+                novarocks_query_application::api::CommandError::from_user_error(
+                    error.to_user_error(None),
+                )
+            }
             None => novarocks_query_application::api::CommandError::new(
                 novarocks_query_application::api::CommandErrorKind::Failed,
-                if error.kind()
-                    == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation
-                {
-                    error.to_user_error(None).to_string()
-                } else {
-                    error.to_string()
-                },
+                error.to_string(),
             ),
         },
         error => novarocks_query_application::api::CommandError::new(
@@ -1058,66 +955,21 @@ mod tests {
 
 #[cfg(test)]
 mod refresh_refusal_projection_tests {
-    use super::{mv_command_error, mv_compile_error};
+    use super::mv_application_command_error;
     use crate::mv::domain::application::MvApplicationErrorKind;
-    use crate::mv::domain::lifecycle::RefreshError;
-    use crate::mv::service::prepare_refresh_step;
-    use crate::query_execution::mv_assembly::refresh_handoff::{
-        MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
-    };
+    use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError;
     use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
-    use novarocks_mv_application::service::MvKeyedProductService;
     use novarocks_query_application::api::CommandErrorKind;
     use novarocks_sql::{
         analyze_error::{AnalyzeError, AnalyzeErrorKind},
         compiler::SqlCompileError,
-        planning::mv::{MvRefreshStatement, SqlMvTarget},
     };
     use novarocks_type_contract::CompileControlError;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct RefusingPreparation {
-        expected: MvRefreshPreparationRequest,
-        error: SqlCompileError,
-        calls: AtomicUsize,
-    }
-
-    impl MvRefreshPreparationService for RefusingPreparation {
-        fn prepare_step(
-            &self,
-            request: MvRefreshPreparationRequest,
-        ) -> Result<PreparedMvRefresh, RefreshError> {
-            assert_eq!(request, self.expected);
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Err(RefreshError::from(self.error.clone()))
-        }
-    }
 
     fn prepare_failure(
         error: SqlCompileError,
     ) -> crate::mv::domain::application::MvApplicationError {
-        let request = MvRefreshPreparationRequest {
-            statement: MvRefreshStatement {
-                name_parts: vec!["db".into(), "mv".into()],
-                full: true,
-            },
-            target: SqlMvTarget {
-                catalog: Some("iceberg".into()),
-                database: "db".into(),
-                name: "mv".into(),
-            },
-            attempt: MvKeyedProductService::default().reserve_refresh_attempt(),
-        };
-        let preparation = RefusingPreparation {
-            expected: request.clone(),
-            error,
-            calls: AtomicUsize::new(0),
-        };
-        let failure = match prepare_refresh_step(&preparation, request) {
-            Ok(_) => panic!("the preparation port must refuse before execution"),
-            Err(failure) => failure,
-        };
-        assert_eq!(preparation.calls.load(Ordering::SeqCst), 1);
+        let failure = PreparationError::from(error).0;
         assert_eq!(failure.kind(), MvApplicationErrorKind::InvalidRequest);
         failure
     }
@@ -1132,17 +984,16 @@ mod refresh_refusal_projection_tests {
         };
         let expected_user = expected.to_user_error(None).to_string();
         let failure = prepare_failure(compile.clone());
-        let projected = mv_compile_error(failure);
-        let SqlCompileError::Analyze(analyze) = &projected else {
-            panic!("command reconstruction must keep the typed analysis cause");
-        };
+        let analyze = failure
+            .unavailable_implementation()
+            .expect("preparation must keep the typed analysis cause");
         assert_eq!(analyze, expected);
         assert_eq!(analyze.kind(), AnalyzeErrorKind::UnavailableImplementation);
         assert_eq!(
             analyze.code().as_str(),
             "sql.analyze.unavailable_implementation"
         );
-        let user = mv_command_error(projected);
+        let user = mv_application_command_error(failure);
         assert_eq!(user.kind(), CommandErrorKind::Failed);
         assert_eq!(user.compile_control_error(), None);
         assert_eq!(user.to_string(), expected_user);
@@ -1159,19 +1010,20 @@ mod refresh_refusal_projection_tests {
             let fact = source.failure_fact();
             let failure = prepare_failure(SqlCompileError::CompilationSource(source.clone()));
             assert_eq!(failure.unavailable_implementation(), None);
-            let SqlCompileError::CompilationSource(carried) = mv_compile_error(failure) else {
-                panic!("command reconstruction must retain the compile source");
-            };
-            assert_eq!(carried, source);
-            assert_eq!(carried.failure_fact(), fact);
-            let user = mv_command_error(SqlCompileError::CompilationSource(carried));
-            let Some(CompileControlError::Source(carried)) = user.compile_control_error() else {
-                panic!("the final command must retain the same source");
-            };
-            assert_eq!(user.kind(), CommandErrorKind::Failed);
-            assert_eq!(carried, source);
-            assert_eq!(carried.failure_fact(), fact);
-            assert_eq!(user.to_string(), source.to_string());
+            assert_eq!(failure.original_failure(), Some(&source));
+            let actual = mv_application_command_error(failure.clone());
+            assert_eq!(actual.kind(), CommandErrorKind::Failed);
+            assert_eq!(actual.failure_cause(), Some(&source));
+            assert_eq!(actual.failure_cause().unwrap().failure_fact(), fact);
+            assert_eq!(actual.execution_failure().unwrap().fact(), fact);
+            assert_eq!(
+                actual.compile_control_error(),
+                Some(CompileControlError::Source(source.clone()))
+            );
+            assert_eq!(
+                actual.to_string(),
+                actual.execution_failure().unwrap().user_error().to_string()
+            );
         }
     }
 
@@ -1184,11 +1036,10 @@ mod refresh_refusal_projection_tests {
         ] {
             let failure = prepare_failure(compile);
             assert_eq!(failure.unavailable_implementation(), None);
-            let projected = mv_compile_error(failure);
-            assert!(
-                matches!(&projected, SqlCompileError::Compilation(actual) if actual == message)
-            );
-            let user = mv_command_error(projected);
+            let user = mv_application_command_error(failure);
+            assert_eq!(user.failure_cause(), None);
+            assert_eq!(user.execution_failure(), None);
+            assert_eq!(user.user_error(), None);
             assert_eq!(user.kind(), CommandErrorKind::Failed);
             assert_eq!(user.compile_control_error(), None);
             assert_eq!(user.to_string(), message);
@@ -1196,7 +1047,7 @@ mod refresh_refusal_projection_tests {
     }
 
     #[test]
-    fn refresh_prepare_step_control_keeps_command_cause_and_rollback_policy() {
+    fn refresh_prepare_step_control_keeps_command_cause_and_priority() {
         for control in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
@@ -1206,14 +1057,10 @@ mod refresh_refusal_projection_tests {
                 SqlCompileError::from(control.clone()),
                 SqlCompileError::Analyze(AnalyzeError::control(control.clone())),
             ] {
-                let refresh = RefreshError::from(compile.clone());
-                assert!(refresh.kind.should_rollback_after_commit());
-                assert_eq!(refresh.compile_control_error(), Some(control.clone()));
-                assert_eq!(refresh.unavailable_implementation(), None);
                 let failure = prepare_failure(compile);
                 assert_eq!(failure.compile_control_error(), Some(control.clone()));
                 assert_eq!(failure.unavailable_implementation(), None);
-                let user = mv_command_error(mv_compile_error(failure));
+                let user = mv_application_command_error(failure);
                 assert_eq!(user.compile_control_error(), Some(control.clone()));
                 assert_eq!(user.to_string(), control.to_string());
                 assert_eq!(
@@ -1230,9 +1077,69 @@ mod refresh_refusal_projection_tests {
             ));
             let failure = prepare_failure(missing).with_compile_control(Some(control.clone()));
             assert!(failure.unavailable_implementation().is_some());
-            let user = mv_command_error(mv_compile_error(failure));
+            let user = mv_application_command_error(failure);
             assert_eq!(user.compile_control_error(), Some(control.clone()));
             assert_eq!(user.to_string(), control.to_string());
+        }
+    }
+}
+
+#[cfg(test)]
+mod original_publication_effect_tests {
+    use super::*;
+    use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
+    use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+    use novarocks_query_application::api::StatementExternalEffectDisposition;
+
+    #[test]
+    fn original_publication_fact_survives_the_independent_provider_failure() {
+        let source = SharedFailureCause::new(novarocks_workload_control::WorkError::Capacity(
+            "original provider operation failed",
+        ));
+        let original_fact = source.failure_fact();
+        for (kind, effect) in [
+            (
+                MvApplicationErrorKind::CommitUnknown,
+                Some(StatementExternalEffectDisposition::CommitUnknown),
+            ),
+            (
+                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                Some(StatementExternalEffectDisposition::KnownCommitted),
+            ),
+            (MvApplicationErrorKind::Engine, None),
+            (MvApplicationErrorKind::InvalidRequest, None),
+        ] {
+            let command = mv_application_command_error(
+                MvApplicationError::new(kind, "MV operation failed")
+                    .with_original_failure(source.clone()),
+            );
+            assert_eq!(command.failure_cause(), Some(&source));
+            assert_eq!(
+                command.failure_cause().unwrap().failure_fact(),
+                original_fact
+            );
+            assert_eq!(command.compile_control_error(), None);
+            assert_eq!(command.external_effect_disposition(), effect);
+            if let Some(effect) = effect {
+                assert!(effect.do_not_retry());
+            }
+        }
+        // The publication fact is independent of whether this older error
+        // already carries a typed cause, so a legacy diagnostic keeps it too.
+        for (kind, effect) in [
+            (
+                MvApplicationErrorKind::CommitUnknown,
+                StatementExternalEffectDisposition::CommitUnknown,
+            ),
+            (
+                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                StatementExternalEffectDisposition::KnownCommitted,
+            ),
+        ] {
+            let command =
+                mv_application_command_error(MvApplicationError::new(kind, "publication failed"));
+            assert_eq!(command.external_effect_disposition(), Some(effect));
+            assert_eq!(command.failure_cause(), None);
         }
     }
 }

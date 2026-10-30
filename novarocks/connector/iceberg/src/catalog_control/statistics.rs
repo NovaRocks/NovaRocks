@@ -30,16 +30,18 @@ use novarocks_connector_iceberg_functions::{
     validate_compact_theta,
 };
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorOperationControl,
-    ConnectorStatistics, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsArtifactDraft,
-    StatisticsArtifactIdentity, StatisticsBasisRelation, StatisticsCollection,
-    StatisticsCollectionSession, StatisticsCollectionStart, StatisticsCollectionStartRequest,
-    StatisticsColumnSelection, StatisticsDataVersion, StatisticsEvidence,
-    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
-    StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
-    StatisticsMissingKind, StatisticsNumericNature, StatisticsReadRequest, StatisticsReader,
-    StatisticsReceipt, StatisticsRequiredAggregation, StatisticsRowCoverage, StatisticsScanColumn,
+    AsyncStatisticsCollectionSession, AsyncStatisticsCollectionStart, ConnectorError,
+    ConnectorErrorKind, ConnectorMutationFailure, ConnectorOperationControl, ConnectorStatistics,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, StatisticsArtifactDraft, StatisticsArtifactIdentity,
+    StatisticsBasisRelation, StatisticsCollection, StatisticsCollectionSession,
+    StatisticsCollectionStart, StatisticsCollectionStartRequest, StatisticsColumnSelection,
+    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric,
+    StatisticsMetricObservation, StatisticsMetricSource, StatisticsMetricState,
+    StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature,
+    StatisticsPublicationClose, StatisticsPublicationReady, StatisticsReadRequest,
+    StatisticsReader, StatisticsReceipt, StatisticsRequiredAggregation, StatisticsRowCoverage,
+    StatisticsScanColumn, StatisticsSessionFuture,
 };
 use sha2::{Digest, Sha256};
 
@@ -47,11 +49,15 @@ use crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
 use crate::iceberg::spec::Type;
 use crate::manifest::{DataFileWithStats, extract_data_files_with_stats_at_with_control};
 use crate::metadata::{IcebergMetadata, IcebergTablePayload};
-use crate::statistics_ancestry::{AncestorNdv, resolve_ancestor_ndv};
+use crate::statistics_ancestry::AncestorNdv;
 use crate::statistics_basis::basis_relation;
 use crate::statistics_codec::{statistics_data_version, statistics_metric_column};
+#[path = "statistics/async_publication.rs"]
+mod async_publication;
 #[path = "statistics/publication.rs"]
 mod publication;
+#[path = "statistics/scoped_cpu.rs"]
+pub(crate) mod scoped_cpu;
 
 const STATISTICS_OPERATION_KIND: &str = "statistics-publish";
 const STATISTICS_PUBLICATION_EVIDENCE_VERSION: u16 = 2;
@@ -73,197 +79,270 @@ impl StatisticsReader for IcebergMetadata {
         &self,
         request: StatisticsReadRequest,
     ) -> Result<StatisticsEvidence, ConnectorError> {
-        validate_context(&request.context)?;
-        let table = self.table_payload(&request.table)?;
-        let table_info = base_table_info(&table, "statistics read")?;
-        let expected = pinned_data_version(table_info)?;
-        if request.data_version != expected {
-            return Err(invalid(
-                "Iceberg statistics request does not match its resolved table pin",
-            ));
-        }
-        let snapshot_id = table_info.current_snapshot_id.ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::NotFound,
-                "Iceberg table has no current snapshot for statistics",
-            )
-        })?;
-        let physical = self
-            .runtime()
-            .load_table_for_request(&table.namespace, &table.table, &request.context)
-            .map_err(unavailable)?;
-        let metadata = physical.table.metadata();
-        // Deliberately no currentness check. The query was planned on this
-        // snapshot; the table moving on afterwards does not make that snapshot's
-        // statistics wrong, it only makes them describe an older state — which
-        // is what the per-metric basis facts are for.
-
-        // Manifest-derivable metrics always come from the snapshot being
-        // queried, whether or not a statistics file exists. Letting a published
-        // artifact supply them would answer with whichever snapshot ANALYZE
-        // happened to measure, and letting its absence blank them out was how a
-        // table with no Puffin ended up with no statistics at all.
-        let table_for_files = physical.table.clone();
-        let control = request.context.clone();
-        let files_result = self
-            .runtime()
+        let owner = self.clone();
+        self.runtime()
             .resources()
             .catalog_runtime()
-            .block_on(async move {
-                extract_data_files_with_stats_at_with_control(
-                    &table_for_files,
-                    snapshot_id,
-                    Some(&control as &dyn ConnectorOperationControl),
-                )
-                .await
-            });
+            .block_on(async move { owner.read_statistics_async(request).await })
+            .map_err(unavailable)?
+    }
+
+    fn prepare_scoped_read(
+        &self,
+        request: novarocks_spi::connector::ConnectorTableRequest,
+        original: novarocks_spi::connector::ConnectorOriginalResultScope,
+    ) -> Result<Arc<dyn novarocks_spi::connector::StatisticsReadOriginal>, ConnectorError> {
         self.validate_context(&request.context)?;
-        let files = files_result.map_err(unavailable)?.map_err(unavailable)?;
-        let arrow_schema =
-            crate::scalar_integer_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
-        for file in &files {
-            for field in arrow_schema.fields() {
-                let domain = match field.data_type() {
-                    DataType::Int8 => Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int8),
-                    DataType::Int16 => {
-                        Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int16)
-                    }
-                    _ => None,
-                };
-                let Some(domain) = domain else {
-                    continue;
-                };
-                if let Some(metric) = column_stats(file, field.name()) {
-                    for bytes in [metric.lower_bound.as_deref(), metric.upper_bound.as_deref()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        let value = i32::from_le_bytes(bytes.try_into().map_err(|_| {
+        if request
+            .context
+            .io_admission()
+            .and_then(std::sync::Weak::upgrade)
+            .is_none()
+        {
+            return Err(invalid(
+                "scoped statistics read requires its original MIO source",
+            ));
+        }
+        Ok(scoped_cpu::StatisticsCpuOriginal::read_source(
+            self.clone(),
+            request,
+            original,
+        ))
+    }
+
+    fn read_statistics_async(
+        &self,
+        request: StatisticsReadRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<StatisticsEvidence, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            validate_context(&request.context)?;
+            let table = self.table_payload(&request.table)?;
+            let table_info = base_table_info(&table, "statistics read")?;
+            let expected = pinned_data_version(table_info)?;
+            if request.data_version != expected {
+                return Err(invalid(
+                    "Iceberg statistics request does not match its resolved table pin",
+                ));
+            }
+            let snapshot_id = table_info.current_snapshot_id.ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "Iceberg table has no current snapshot for statistics",
+                )
+            })?;
+            let physical = self
+                .runtime()
+                .load_table_for_request_async(&table.namespace, &table.table, &request.context)
+                .await
+                .map_err(unavailable)?;
+            let metadata = physical.table.metadata();
+            // Deliberately no currentness check. The query was planned on this
+            // snapshot; the table moving on afterwards does not make that snapshot's
+            // statistics wrong, it only makes them describe an older state — which
+            // is what the per-metric basis facts are for.
+
+            // Manifest-derivable metrics always come from the snapshot being
+            // queried, whether or not a statistics file exists. Letting a published
+            // artifact supply them would answer with whichever snapshot ANALYZE
+            // happened to measure, and letting its absence blank them out was how a
+            // table with no Puffin ended up with no statistics at all.
+            let table_for_files = physical.table.clone();
+            let control = request.context.clone();
+            let files_result = extract_data_files_with_stats_at_with_control(
+                &table_for_files,
+                snapshot_id,
+                Some(&control as &dyn ConnectorOperationControl),
+            )
+            .await;
+            self.validate_context(&request.context)?;
+            let files = files_result.map_err(unavailable)?;
+            project_statistics_evidence(
+                metadata,
+                table_info,
+                snapshot_id,
+                &expected,
+                &request,
+                &files,
+            )
+        })
+    }
+}
+
+/// Only the file facts needed by table statistics; a scoped read borrows its
+/// original read snapshot instead of cloning the scan/delete graph.
+trait StatisticsFileFacts {
+    fn record_count(&self) -> Option<i64>;
+    fn stats(&self) -> Option<&HashMap<String, crate::scan_model::IcebergColumnStats>>;
+    fn has_deletes(&self) -> bool;
+}
+impl StatisticsFileFacts for DataFileWithStats {
+    fn record_count(&self) -> Option<i64> {
+        self.record_count
+    }
+    fn stats(&self) -> Option<&HashMap<String, crate::scan_model::IcebergColumnStats>> {
+        self.column_stats.as_ref()
+    }
+    fn has_deletes(&self) -> bool {
+        !self.delete_files.is_empty()
+    }
+}
+impl StatisticsFileFacts for crate::read_model::IcebergReadFile {
+    fn record_count(&self) -> Option<i64> {
+        self.record_count
+    }
+    fn stats(&self) -> Option<&HashMap<String, crate::scan_model::IcebergColumnStats>> {
+        self.column_stats.as_ref()
+    }
+    fn has_deletes(&self) -> bool {
+        self.deletes.members().next().is_some()
+    }
+}
+fn project_statistics_evidence<F: StatisticsFileFacts>(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    table_info: &crate::scan_model::IcebergTableInfo,
+    snapshot_id: i64,
+    expected: &StatisticsDataVersion,
+    request: &StatisticsReadRequest,
+    files: &[F],
+) -> Result<StatisticsEvidence, ConnectorError> {
+    let arrow_schema =
+        crate::scalar_integer_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
+    for file in files {
+        for field in arrow_schema.fields() {
+            let domain = match field.data_type() {
+                DataType::Int8 => Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int8),
+                DataType::Int16 => Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int16),
+                _ => None,
+            };
+            let Some(domain) = domain else {
+                continue;
+            };
+            if let Some(metric) = column_stats(file, field.name()) {
+                for bytes in [metric.lower_bound.as_deref(), metric.upper_bound.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let value =
+                        i32::from_le_bytes(bytes.try_into().map_err(|_| {
                             corrupt("Iceberg scalar integer bound is not four bytes")
                         })?);
-                        domain.value(value)?;
-                    }
+                    domain.value(value)?;
                 }
             }
         }
-        let field_ids = metadata
-            .current_schema()
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|field| (field.name.to_ascii_lowercase(), field.id))
-            .collect::<HashMap<_, _>>();
-        let data_types = arrow_schema
-            .fields()
-            .iter()
-            .map(|field| (field.name().to_ascii_lowercase(), field.data_type().clone()))
-            .collect::<HashMap<_, _>>();
-        // Two independent questions that used to share one boolean. Whether the
-        // manifest accounts for every row is a coverage fact; whether delete
-        // files make a summed number an over-count is a per-metric numeric
-        // fact, and it only bends the metrics it actually affects.
-        let row_coverage = if files.iter().all(|file| file.record_count.is_some()) {
-            StatisticsRowCoverage::AllVisibleRows
-        } else {
-            StatisticsRowCoverage::PartialRows
-        };
-        let has_deletes = files.iter().any(|file| !file.delete_files.is_empty());
-
-        let mut metrics: BTreeMap<StatisticsMetric, StatisticsMetricState> = request
-            .metrics
-            .metrics()
-            .iter()
-            .filter(|metric| !matches!(metric, StatisticsMetric::ThetaNdv { .. }))
-            .cloned()
-            .map(|metric| {
-                let state = manifest_metric(&metric, &files, &data_types, has_deletes, &expected);
-                (metric, state)
-            })
-            .collect();
-
-        // NDV lives only in Puffin, and Puffin is published against the snapshot
-        // that was measured — so each column searches its own ancestry.
-        let wanted_ndv: BTreeMap<i32, StatisticsMetric> = request
-            .metrics
-            .metrics()
-            .iter()
-            .filter(|metric| matches!(metric, StatisticsMetric::ThetaNdv { .. }))
-            .filter_map(|metric| {
-                let column = statistics_metric_column(metric)?;
-                let field_id = field_ids.get(&column.to_ascii_lowercase())?;
-                Some((*field_id, metric.clone()))
-            })
-            .collect();
-        let resolved_ndv = if wanted_ndv.is_empty() {
-            HashMap::new()
-        } else {
-            let table_for_ndv = physical.table.clone();
-            let field_set = wanted_ndv.keys().copied().collect::<BTreeSet<_>>();
-            let result = self
-                .runtime()
-                .resources()
-                .catalog_runtime()
-                .block_on(async move {
-                    resolve_ancestor_ndv(
-                        table_for_ndv.metadata(),
-                        table_for_ndv.file_io(),
-                        snapshot_id,
-                        &field_set,
-                    )
-                    .await
-                });
-            self.validate_context(&request.context)?;
-            result.map_err(unavailable)?
-        };
-        let row_count_ceiling = row_count_ceiling(&metrics);
-        for metric in request.metrics.metrics() {
-            if !matches!(metric, StatisticsMetric::ThetaNdv { .. }) {
-                continue;
-            }
-            let resolved = wanted_ndv
-                .iter()
-                .find(|(_, wanted)| *wanted == metric)
-                .and_then(|(field_id, _)| resolved_ndv.get(field_id));
-            let state = match resolved {
-                Some(resolved) => {
-                    let basis_version = statistics_data_version(
-                        table_info
-                            .table_uuid
-                            .as_deref()
-                            .expect("pinned data version requires a table UUID"),
-                        Some(resolved.basis_snapshot_id),
-                    )?;
-                    StatisticsMetricState::Available(StatisticsMetricObservation::new(
-                        StatisticsMetricValue::F64(cap_ndv(resolved.ndv, row_count_ceiling)),
-                        basis_version,
-                        StatisticsMetricSource::ProviderArtifact,
-                        // A Theta sketch estimates in both directions however
-                        // complete its input was.
-                        StatisticsNumericNature::TwoSidedApproximate,
-                        basis_relation(metadata, resolved.basis_snapshot_id, snapshot_id),
-                    ))
-                }
-                None => StatisticsMetricState::Missing(StatisticsMissing {
-                    kind: StatisticsMissingKind::NotCollected,
-                    message: Arc::from("no ancestor snapshot published a sketch for this column"),
-                }),
-            };
-            metrics.insert(metric.clone(), state);
-        }
-
-        // The revision identifies the exact set of artifacts behind this answer.
-        // Ancestors matter: a statistics file may be replaced on any snapshot in
-        // the chain, and the cache must not keep serving the previous one.
-        let revision = evidence_revision(
-            table_info
-                .table_uuid
-                .as_deref()
-                .expect("pinned data version requires a table UUID"),
-            snapshot_id,
-            &resolved_ndv,
-        )?;
-        StatisticsEvidence::try_new(expected, revision, row_coverage, metrics)
     }
+    let field_ids = metadata
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| (field.name.to_ascii_lowercase(), field.id))
+        .collect::<HashMap<_, _>>();
+    let data_types = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| (field.name().to_ascii_lowercase(), field.data_type().clone()))
+        .collect::<HashMap<_, _>>();
+    // Two independent questions that used to share one boolean. Whether the
+    // manifest accounts for every row is a coverage fact; whether delete
+    // files make a summed number an over-count is a per-metric numeric
+    // fact, and it only bends the metrics it actually affects.
+    let row_coverage = if files.iter().all(|file| file.record_count().is_some()) {
+        StatisticsRowCoverage::AllVisibleRows
+    } else {
+        StatisticsRowCoverage::PartialRows
+    };
+    let has_deletes = files.iter().any(|file| file.has_deletes());
+
+    let mut metrics: BTreeMap<StatisticsMetric, StatisticsMetricState> = request
+        .metrics
+        .metrics()
+        .iter()
+        .filter(|metric| !matches!(metric, StatisticsMetric::ThetaNdv { .. }))
+        .cloned()
+        .map(|metric| {
+            let state = manifest_metric(&metric, files, &data_types, has_deletes, expected);
+            (metric, state)
+        })
+        .collect();
+
+    // NDV lives only in Puffin, and Puffin is published against the snapshot
+    // that was measured — so each column searches its own ancestry.
+    let wanted_ndv: BTreeMap<i32, StatisticsMetric> = request
+        .metrics
+        .metrics()
+        .iter()
+        .filter(|metric| matches!(metric, StatisticsMetric::ThetaNdv { .. }))
+        .filter_map(|metric| {
+            let column = statistics_metric_column(metric)?;
+            let field_id = field_ids.get(&column.to_ascii_lowercase())?;
+            Some((*field_id, metric.clone()))
+        })
+        .collect();
+    let resolved_ndv = if wanted_ndv.is_empty() {
+        HashMap::new()
+    } else {
+        let field_set = wanted_ndv.keys().copied().collect::<BTreeSet<_>>();
+        crate::statistics_ancestry::resolve_ancestor_ndv_from_metadata(
+            metadata,
+            snapshot_id,
+            &field_set,
+        )
+    };
+    let row_count_ceiling = row_count_ceiling(&metrics);
+    for metric in request.metrics.metrics() {
+        if !matches!(metric, StatisticsMetric::ThetaNdv { .. }) {
+            continue;
+        }
+        let resolved = wanted_ndv
+            .iter()
+            .find(|(_, wanted)| *wanted == metric)
+            .and_then(|(field_id, _)| resolved_ndv.get(field_id));
+        let state = match resolved {
+            Some(resolved) => {
+                let basis_version = statistics_data_version(
+                    table_info
+                        .table_uuid
+                        .as_deref()
+                        .expect("pinned data version requires a table UUID"),
+                    Some(resolved.basis_snapshot_id),
+                )?;
+                StatisticsMetricState::Available(StatisticsMetricObservation::new(
+                    StatisticsMetricValue::F64(cap_ndv(resolved.ndv, row_count_ceiling)),
+                    basis_version,
+                    StatisticsMetricSource::ProviderArtifact,
+                    // A Theta sketch estimates in both directions however
+                    // complete its input was.
+                    StatisticsNumericNature::TwoSidedApproximate,
+                    basis_relation(metadata, resolved.basis_snapshot_id, snapshot_id),
+                ))
+            }
+            None => StatisticsMetricState::Missing(StatisticsMissing {
+                kind: StatisticsMissingKind::NotCollected,
+                message: Arc::from("no ancestor snapshot published a sketch for this column"),
+            }),
+        };
+        metrics.insert(metric.clone(), state);
+    }
+
+    // The revision identifies the exact set of artifacts behind this answer.
+    // Ancestors matter: a statistics file may be replaced on any snapshot in
+    // the chain, and the cache must not keep serving the previous one.
+    let revision = evidence_revision(
+        table_info
+            .table_uuid
+            .as_deref()
+            .expect("pinned data version requires a table UUID"),
+        snapshot_id,
+        &resolved_ndv,
+    )?;
+    StatisticsEvidence::try_new(expected.clone(), revision, row_coverage, metrics)
 }
 
 /// Row count usable as the ceiling for an NDV, when one is available.
@@ -355,6 +434,27 @@ fn evidence_revision(
 }
 
 impl StatisticsCollection for IcebergMetadata {
+    fn scoped_cpu_source_type_id(&self) -> Option<std::any::TypeId> {
+        Some(std::any::TypeId::of::<scoped_cpu::StatisticsCpuOriginal>())
+    }
+
+    fn io_profile(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile, ConnectorError>
+    {
+        novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile::from_geometry(
+            statistics_collection_io_geometry()?,
+            self.runtime().metadata_action_initial_dependencies()?,
+        )
+    }
+    fn begin_collection_async(
+        &self,
+        request: StatisticsCollectionStartRequest,
+        cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    ) -> StatisticsSessionFuture<'_, AsyncStatisticsCollectionStart> {
+        Box::pin(self.begin_collection_original_async(request, cpu))
+    }
+
     fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
         self.descriptor()
     }
@@ -385,11 +485,42 @@ impl StatisticsCollection for IcebergMetadata {
                 &request.context,
             )
             .map_err(unavailable)?;
+        let (table, version, ordinal, requirements, session) =
+            self.collection_session(request, table_payload, physical.table)?;
+        StatisticsCollectionStart::try_new(table, version, ordinal, requirements, Box::new(session))
+    }
+}
+
+type CollectionSessionParts = (
+    novarocks_spi::connector::ConnectorTableHandle,
+    StatisticsDataVersion,
+    Option<i64>,
+    Vec<StatisticsRequiredAggregation>,
+    IcebergStatisticsCollectionSession,
+);
+
+impl IcebergMetadata {
+    fn collection_session(
+        &self,
+        request: StatisticsCollectionStartRequest,
+        table_payload: IcebergTablePayload,
+        physical_table: crate::iceberg::table::Table,
+    ) -> Result<CollectionSessionParts, ConnectorError> {
+        self.collection_session_borrowed(&request, &table_payload, &physical_table, None)
+    }
+    fn collection_session_borrowed(
+        &self,
+        request: &StatisticsCollectionStartRequest,
+        table_payload: &IcebergTablePayload,
+        physical_table: &crate::iceberg::table::Table,
+        cpu: Option<std::sync::Weak<dyn novarocks_spi::connector::StatisticsCpuPort>>,
+    ) -> Result<CollectionSessionParts, ConnectorError> {
+        let info = base_table_info(table_payload, "statistics collection")?;
         let expected_uuid = info
             .table_uuid
             .as_deref()
             .ok_or_else(|| corrupt("Iceberg table payload is missing its table UUID"))?;
-        if physical.table.metadata().uuid().to_string() != expected_uuid {
+        if physical_table.metadata().uuid().to_string() != expected_uuid {
             return Err(invalid(
                 "Iceberg statistics collection resolved a different physical table UUID",
             ));
@@ -397,8 +528,7 @@ impl StatisticsCollection for IcebergMetadata {
 
         let (snapshot_id, sequence_number, requirements) = match info.current_snapshot_id {
             Some(snapshot_id) => {
-                let snapshot = physical
-                    .table
+                let snapshot = physical_table
                     .metadata()
                     .snapshot_by_id(snapshot_id)
                     .ok_or_else(|| {
@@ -407,7 +537,7 @@ impl StatisticsCollection for IcebergMetadata {
                         )
                     })?;
                 let schema = snapshot
-                    .schema(physical.table.metadata())
+                    .schema(physical_table.metadata())
                     .map_err(|error| {
                         corrupt(format!(
                             "resolve the schema of the measured Iceberg snapshot: {error}"
@@ -416,7 +546,7 @@ impl StatisticsCollection for IcebergMetadata {
                 let execution =
                     crate::metadata::with_pure_schema_creation(&request.context, |creation| {
                         crate::schema_mapping::catalog_value::table(
-                            physical.table.metadata(),
+                            physical_table.metadata(),
                             &schema,
                             &[],
                             creation,
@@ -438,27 +568,79 @@ impl StatisticsCollection for IcebergMetadata {
             .map(|requirement| requirement.artifact().clone())
             .collect();
         let session = IcebergStatisticsCollectionSession {
-            provider: self.clone(),
-            operation_id: request.operation_id,
-            table_payload,
-            data_version: request.data_version.clone(),
-            physical_table: physical.table,
-            snapshot_id,
-            sequence_number,
-            expectations,
-            context: request.context,
+            body: Arc::new(StatisticsSessionBody {
+                provider: self.clone(),
+                operation_id: request.operation_id,
+                table_payload: table_payload.clone(),
+                data_version: request.data_version.clone(),
+                physical_table: physical_table.clone(),
+                snapshot_id,
+                sequence_number,
+                expectations,
+                context: request.context.clone(),
+            }),
+            publication: None,
+            cpu,
         };
-        StatisticsCollectionStart::try_new(
-            request.table,
-            request.data_version,
+        Ok((
+            request.table.clone(),
+            request.data_version.clone(),
             snapshot_id,
             requirements,
-            Box::new(session),
-        )
+            session,
+        ))
+    }
+
+    async fn begin_collection_original_async(
+        &self,
+        request: StatisticsCollectionStartRequest,
+        cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    ) -> Result<AsyncStatisticsCollectionStart, ConnectorError> {
+        validate_context(&request.context)?;
+        let port = async_publication::original_io(&request.context)?;
+        let profile = <Self as StatisticsCollection>::io_profile(self)?;
+        port.configure_read_source(&profile)?;
+        std::future::poll_fn(|cx| port.poll_read_source_ready(cx)).await?;
+        let table_payload = self.table_payload(&request.table)?;
+        let info = base_table_info(&table_payload, "statistics collection")?;
+        if request.data_version != pinned_data_version(info)? {
+            return Err(invalid(
+                "Iceberg statistics collection does not match its resolved table pin",
+            ));
+        }
+        let physical = self
+            .runtime()
+            .load_table_for_request_async(
+                &table_payload.namespace,
+                &table_payload.table,
+                &request.context,
+            )
+            .await
+            .map_err(unavailable)?;
+        let source = scoped_cpu::StatisticsCpuOriginal::schema(
+            self.clone(),
+            request,
+            table_payload,
+            physical.table,
+            Arc::downgrade(&cpu),
+        );
+        scoped_cpu::run_schema(&cpu, &source).await?;
+        source.take_schema_result()
     }
 }
 
 struct IcebergStatisticsCollectionSession {
+    body: Arc<StatisticsSessionBody>,
+    publication: Option<async_publication::PreparedStatisticsPublication>,
+    cpu: Option<std::sync::Weak<dyn novarocks_spi::connector::StatisticsCpuPort>>,
+}
+impl std::ops::Deref for IcebergStatisticsCollectionSession {
+    type Target = StatisticsSessionBody;
+    fn deref(&self) -> &Self::Target {
+        &self.body
+    }
+}
+struct StatisticsSessionBody {
     provider: IcebergMetadata,
     operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
     table_payload: IcebergTablePayload,
@@ -500,7 +682,7 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
             return statistics_receipt(
                 &this.provider,
                 this.operation_id,
-                this.data_version,
+                this.data_version.clone(),
                 revision,
                 Bytes::new(),
                 ExternalMutationEffect::NoOp,
@@ -514,6 +696,187 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
         // its operation and artifacts only when finish consumes this authority.
         Ok(())
     }
+}
+
+impl AsyncStatisticsCollectionSession for IcebergStatisticsCollectionSession {
+    fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
+        self.provider.descriptor()
+    }
+    fn incarnation(&self) -> novarocks_spi::connector::ProviderBindingEpoch {
+        self.provider.incarnation()
+    }
+    fn operation_id(&self) -> novarocks_spi::connector::ConnectorMutationOperationId {
+        self.operation_id
+    }
+    fn expectations(&self) -> &[StatisticsArtifactIdentity] {
+        &self.expectations
+    }
+    fn io_profile(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile, ConnectorError>
+    {
+        <IcebergMetadata as StatisticsCollection>::io_profile(&self.provider)
+    }
+    fn prepare_publication_async<'a>(
+        &'a mut self,
+        artifacts: &'a mut Option<Vec<StatisticsArtifactDraft>>,
+    ) -> StatisticsSessionFuture<'a, ()> {
+        Box::pin(self.prepare_original(artifacts))
+    }
+    fn finish_publication_async(
+        &mut self,
+    ) -> StatisticsSessionFuture<'_, StatisticsPublicationReady> {
+        Box::pin(self.finish_original())
+    }
+    fn close_publication_async<'a>(
+        &'a mut self,
+        current: &'a novarocks_spi::connector::ConnectorRequestContext,
+    ) -> StatisticsSessionFuture<'a, StatisticsPublicationClose> {
+        Box::pin(self.close_original(current))
+    }
+}
+
+impl IcebergStatisticsCollectionSession {
+    async fn prepare_original(
+        &mut self,
+        artifacts: &mut Option<Vec<StatisticsArtifactDraft>>,
+    ) -> Result<(), ConnectorError> {
+        if self.publication.is_some() {
+            return Err(invalid("Statistics publication is already prepared"));
+        }
+        validate_context(&self.context)?;
+        async_publication::original_io(&self.context)?;
+        let drafts = artifacts
+            .as_ref()
+            .ok_or_else(|| invalid("Statistics artifacts slot is empty"))?;
+        let peak = crate::stats_assembler::statistics_publication_owned_bytes(
+            drafts,
+            &self.physical_table,
+            &self.expectations,
+        )?;
+        self.context.reserve_owned_metadata(peak).await?;
+        let cpu = scoped_cpu::original_cpu(&self.cpu)?;
+        let source = scoped_cpu::StatisticsCpuOriginal::artifacts(
+            Arc::clone(&self.body),
+            artifacts.take().expect("checked original artifacts"),
+            Arc::downgrade(&cpu),
+        );
+        if let Err(error) = scoped_cpu::run_artifacts(&cpu, &source).await {
+            // submit refusal keeps the same original drafts, not a truncated copy.
+            source.restore_artifacts_in(artifacts);
+            return Err(error);
+        }
+        match source.take_publication_result() {
+            Ok(prepared) => self.publication = Some(prepared),
+            Err(error) => {
+                source.restore_artifacts_in(artifacts);
+                return Err(error);
+            }
+        }
+
+        Ok(())
+    }
+    async fn finish_original(&mut self) -> Result<StatisticsPublicationReady, ConnectorError> {
+        let prepared = self
+            .publication
+            .as_mut()
+            .ok_or_else(|| invalid("Statistics publication is not prepared"))?;
+        match prepared {
+            async_publication::PreparedStatisticsPublication::NoOp(outcome) => {
+                Ok(StatisticsPublicationReady::Settled(outcome.clone()))
+            }
+            async_publication::PreparedStatisticsPublication::Active(source) => {
+                let ready = source.finish().await?;
+                if matches!(
+                    &ready,
+                    StatisticsPublicationReady::Committed { .. }
+                        | StatisticsPublicationReady::Settled(
+                            ExternalMutationOutcome::KnownCommitted { .. }
+                        )
+                ) {
+                    self.provider
+                        .runtime()
+                        .control_state()
+                        .invalidate_table(&self.table_payload.namespace, &self.table_payload.table);
+                }
+                Ok(ready)
+            }
+        }
+    }
+    async fn close_original(
+        &mut self,
+        current: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<StatisticsPublicationClose, ConnectorError> {
+        async_publication::same_original_io(&self.context, current)?;
+        if let Some(weak) = &self.cpu {
+            let cpu = weak
+                .upgrade()
+                .ok_or_else(|| invalid("Statistics CPU source is gone"))?;
+            std::future::poll_fn(|cx| cpu.poll_closed(cx)).await?;
+        }
+        if self.publication.is_none() {
+            // Begin owns only immutable measurement facts. There is no
+            // operation, output allocation, or publication to settle. Install
+            // the real closed state before returning, so prepare cannot reopen.
+            self.publication = Some(async_publication::PreparedStatisticsPublication::NoOp(
+                known_uncommitted(invalid("Statistics collection closed before publication")),
+            ));
+        }
+        let close = match self
+            .publication
+            .as_mut()
+            .expect("original closed/prepared slot")
+        {
+            async_publication::PreparedStatisticsPublication::NoOp(outcome) => {
+                StatisticsPublicationClose::Observed {
+                    outcome: outcome.clone(),
+                    owned_objects_disposed: true,
+                }
+            }
+            async_publication::PreparedStatisticsPublication::Active(source) => {
+                source.close(current).await?
+            }
+        };
+        if matches!(
+            &close,
+            StatisticsPublicationClose::Observed {
+                outcome: ExternalMutationOutcome::KnownCommitted { .. },
+                ..
+            }
+        ) {
+            self.provider
+                .runtime()
+                .control_state()
+                .invalidate_table(&self.table_payload.namespace, &self.table_payload.table);
+        }
+        Ok(close)
+    }
+}
+
+/// The actual statistics factory's original headers and borrowed async frames.
+/// Payload graphs grow from the actual drafts under the same MIO port.
+pub fn statistics_collection_io_geometry()
+-> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry, ConnectorError> {
+    async_publication::geometry(
+        future3_bytes(IcebergMetadata::begin_collection_original_async)
+            .max(IcebergMetadata::statistics_binding_future_bytes())
+            .max(scoped_cpu::StatisticsCpuOriginal::read_future_bytes())
+            .max(future2_bytes(
+                IcebergStatisticsCollectionSession::prepare_original,
+            ))
+            .max(future1_bytes(
+                IcebergStatisticsCollectionSession::finish_original,
+            ))
+            .max(future2_bytes(
+                IcebergStatisticsCollectionSession::close_original,
+            )),
+    )
+}
+fn future1_bytes<A, F>(_: fn(A) -> F) -> usize {
+    std::mem::size_of::<F>()
+}
+fn future2_bytes<A, B, F>(_: fn(A, B) -> F) -> usize {
+    std::mem::size_of::<F>()
 }
 
 fn collection_requirements(
@@ -714,9 +1077,9 @@ fn pinned_data_version(
     )
 }
 
-fn manifest_metric(
+fn manifest_metric<F: StatisticsFileFacts>(
     metric: &StatisticsMetric,
-    files: &[DataFileWithStats],
+    files: &[F],
     data_types: &HashMap<String, DataType>,
     has_deletes: bool,
     basis_version: &StatisticsDataVersion,
@@ -736,7 +1099,7 @@ fn manifest_metric(
         StatisticsMetric::RowCount => files
             .iter()
             .try_fold(0_u64, |total, file| {
-                total.checked_add(u64::try_from(file.record_count?).ok()?)
+                total.checked_add(u64::try_from(file.record_count()?).ok()?)
             })
             .map(|value| available(StatisticsMetricValue::U64(value)))
             .unwrap_or_else(|| incomplete("Iceberg manifest does not report every row count")),
@@ -754,7 +1117,7 @@ fn manifest_metric(
             }),
         StatisticsMetric::AverageSize { column } => {
             let total_rows = files.iter().try_fold(0_u64, |total, file| {
-                total.checked_add(u64::try_from(file.record_count?).ok()?)
+                total.checked_add(u64::try_from(file.record_count()?).ok()?)
             });
             let total_size = files.iter().try_fold(0_u64, |total, file| {
                 total.checked_add(u64::try_from(column_stats(file, column)?.column_size?).ok()?)
@@ -800,12 +1163,11 @@ fn manifest_metric(
     }
 }
 
-fn column_stats<'a>(
-    file: &'a DataFileWithStats,
+fn column_stats<'a, F: StatisticsFileFacts>(
+    file: &'a F,
     column: &str,
 ) -> Option<&'a crate::scan_model::IcebergColumnStats> {
-    file.column_stats
-        .as_ref()?
+    file.stats()?
         .iter()
         .find_map(|(name, stats)| name.eq_ignore_ascii_case(column).then_some(stats))
 }
@@ -876,6 +1238,7 @@ fn statistics_receipt(
     effect: ExternalMutationEffect,
 ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
     Ok(ExternalMutationOutcome::KnownCommitted {
+        cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
         effect,
         receipt: StatisticsReceipt::try_new(
             provider.descriptor().clone(),
@@ -944,6 +1307,10 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
 
 fn internal(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Internal, message.into())
+}
+
+fn future3_bytes<A, B, C, F: std::future::Future>(_: fn(A, B, C) -> F) -> usize {
+    std::mem::size_of::<F>()
 }
 
 #[cfg(test)]

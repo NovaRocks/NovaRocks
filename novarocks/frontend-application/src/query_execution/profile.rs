@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::outcome::FragmentProfileSet;
 use novarocks_execution::task_execution::FinalTaskInfo;
-use novarocks_proto_codec::lifecycle::QueryTerminalProfileContributionV1;
+use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionRef;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
 use novarocks_types::{BackendProcessId, QueryExecutionId};
@@ -38,6 +38,7 @@ const TASK_OPERATOR_OUTPUT_ROWS: &str = "PullRowNum";
 const TASK_OPERATOR_TOTAL_TIME: &str = "OperatorTotalTime";
 /// Set when a task had more operators than its final info could carry.
 const OPERATOR_STATISTICS_TRUNCATED: &str = "OperatorStatisticsTruncated";
+const FINAL_TASK_INFO_UNAVAILABLE: &str = "FinalTaskInfoUnavailable";
 /// Where one operator's own named counters are rebuilt.
 ///
 /// A node of its own, because on the backend these live in the operator's
@@ -101,6 +102,10 @@ impl FragmentProfileTree {
         self.fragment_root_plan_node_id
     }
 
+    pub(crate) fn has_runtime_statistics(&self) -> bool {
+        profile_tree_has_runtime_statistics(&self.tree)
+    }
+
     pub(crate) fn into_tree(self) -> RuntimeProfileTree {
         self.tree
     }
@@ -138,7 +143,7 @@ impl ProfileTerminalBuilder {
         process_id: BackendProcessId,
         telemetry: &QueryTerminalProfileContributionTelemetry,
     ) -> Result<(), DistributedQueryError> {
-        let Some(contribution) = telemetry.available() else {
+        let Some(contribution) = telemetry.available_ref() else {
             return Ok(());
         };
         if contribution.as_proto().channels.is_empty()
@@ -262,6 +267,26 @@ impl ProfileTerminalBuilder {
         Ok(())
     }
 
+    /// Preserve an exact Task whose final info was unavailable. No operator,
+    /// row count or wall time is fabricated for this missing observation.
+    pub(crate) fn apply_missing_task_information(
+        &mut self,
+        identity: novarocks_execution_contract::TaskIdentity,
+        fragment_root_plan_node_id: i32,
+    ) {
+        let task = RuntimeProfile::new(format!(
+            "Task (stage={} task={})",
+            identity.stage_id(),
+            identity.task_id()
+        ));
+        task.child(COMMON_METRICS)
+            .counter_set(FINAL_TASK_INFO_UNAVAILABLE, ProfileUnit::Unit, 1);
+        self.profiles.push(FragmentProfileTree::for_fragment(
+            fragment_root_plan_node_id,
+            task.to_native_tree(),
+        ));
+    }
+
     pub fn finish(self) -> FragmentProfileSet {
         FragmentProfileSet::new(self.profiles)
     }
@@ -296,7 +321,7 @@ struct RuntimeFilterProfileTotals {
 
 impl RuntimeFilterProfileTotals {
     fn from_contribution(
-        contribution: &QueryTerminalProfileContributionV1,
+        contribution: &QueryTerminalProfileContributionRef<'_>,
     ) -> Result<Self, DistributedQueryError> {
         let mut totals = Self::default();
         for consumer in contribution.consumers() {
@@ -346,7 +371,7 @@ impl RuntimeFilterProfileTotals {
 fn runtime_filter_profile_tree(
     execution_id: QueryExecutionId,
     process_id: BackendProcessId,
-    contribution: &QueryTerminalProfileContributionV1,
+    contribution: &QueryTerminalProfileContributionRef<'_>,
     totals: RuntimeFilterProfileTotals,
 ) -> Result<RuntimeProfileTree, DistributedQueryError> {
     let participant = RuntimeProfile::new(format!(
@@ -655,7 +680,10 @@ pub(crate) fn collect_distributed_profile_summary_from_profile_trees(
     trees: &[RuntimeProfileTree],
 ) -> DistributedProfileSummary {
     let mut summary = DistributedProfileSummary::default();
-    for tree in trees {
+    for tree in trees
+        .iter()
+        .filter(|tree| profile_tree_has_runtime_statistics(tree))
+    {
         merge_summary(&mut summary, &summarize_one_tree(tree));
     }
     summary
@@ -717,6 +745,9 @@ pub(crate) fn collect_per_fragment_profile_summaries(
 ) -> HashMap<i32, DistributedProfileSummary> {
     let mut by_fragment: HashMap<i32, DistributedProfileSummary> = HashMap::new();
     for profile in profiles {
+        if !profile.has_runtime_statistics() {
+            continue;
+        }
         let Some(fragment_key) = profile.fragment_root_plan_node_id() else {
             continue;
         };
@@ -724,6 +755,19 @@ pub(crate) fn collect_per_fragment_profile_summaries(
         merge_summary(by_fragment.entry(fragment_key).or_default(), &one);
     }
     by_fragment
+}
+
+// The marker belongs to the exact missing Task's root CommonMetrics, never
+// to an operator counter. Keep its diagnostic node without treating absence
+// as an observed zero-time fragment in either summary projection.
+fn profile_tree_has_runtime_statistics(tree: &RuntimeProfileTree) -> bool {
+    !tree
+        .root
+        .children
+        .iter()
+        .filter(|child| child.name == COMMON_METRICS)
+        .flat_map(|child| &child.counters)
+        .any(|counter| counter.name == FINAL_TASK_INFO_UNAVAILABLE && counter.value != 0)
 }
 
 /// Summarize one fragment-instance profile tree into a single-instance summary.
@@ -1835,6 +1879,43 @@ mod tests {
         assert_eq!(b.fragment_instance_count, 1);
         assert_eq!(b.operator_active_time_ns, 5_000);
         assert_eq!(b.driver_blocked_time_ns, 300);
+    }
+
+    #[test]
+    fn missing_final_info_retains_exact_task_without_fabricating_operator_metrics() {
+        let identity = TaskIdentity::new(
+            NativeQueryExecutionId::new(
+                NativeQueryId::new(31, 41),
+                NativeAttemptId::new(1).unwrap(),
+            )
+            .unwrap(),
+            StageId::new(2).unwrap(),
+            TaskId::new(4).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        let mut builder = ProfileTerminalBuilder::new();
+        builder.apply_missing_task_information(identity, 7);
+        let profiles = builder.finish().into_profiles();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].fragment_root_plan_node_id(), Some(7));
+        assert_eq!(profiles[0].tree.root.name, "Task (stage=2 task=4)");
+        let common = &profiles[0].tree.root.children[0];
+        assert_eq!(common.name, COMMON_METRICS);
+        assert_eq!(common.counters.len(), 1);
+        assert_eq!(common.counters[0].name, "FinalTaskInfoUnavailable");
+        assert_eq!(common.counters[0].value, 1);
+        assert!(common.children.is_empty());
+        assert!(!profiles[0].has_runtime_statistics());
+        assert!(collect_per_fragment_profile_summaries(&profiles).is_empty());
+        assert_eq!(
+            collect_distributed_profile_summary_from_profile_trees(&[profiles[0].tree.clone()])
+                .fragment_instance_count,
+            0
+        );
+        assert!(
+            collect_actuals_by_plan_node_id_from_profile_trees(&[profiles[0].tree.clone()])
+                .is_empty()
+        );
     }
 
     fn finished_task_info(

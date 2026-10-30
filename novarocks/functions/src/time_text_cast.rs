@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! The original text-to-TIME parser and array projection, shared by both callers.
-//! Arrow retains its own distinct LargeUtf8/Utf8View parser; no normalization occurs.
+//! LargeUtf8/Utf8View retain the original distinct raw Arrow parser; no normalization occurs.
 use arrow_array::{Array, ArrayRef, StringArray, Time64MicrosecondArray};
 use arrow_schema::{DataType, TimeUnit};
 use chrono::Timelike;
@@ -180,8 +180,45 @@ pub fn evaluate_arrays_observed<E>(
             }
         }
         observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-        let output = arrow_cast::cast(array.as_ref(), target)
-            .map_err(crate::temporal_carrier::TemporalCastFailure::Arrow);
+        let output = match array.data_type() {
+            DataType::LargeUtf8 => array
+                .as_any()
+                .downcast_ref::<arrow_array::LargeStringArray>()
+                .map(|source| {
+                    let values = source
+                        .iter()
+                        .map(|text| text.and_then(parse_raw_arrow_time_microseconds));
+                    // SAFETY: mapping ArrayIter preserves its exact upper length.
+                    Arc::new(unsafe { Time64MicrosecondArray::from_trusted_len_iter(values) })
+                        as ArrayRef
+                }),
+            DataType::Utf8View => array
+                .as_any()
+                .downcast_ref::<arrow_array::StringViewArray>()
+                .map(|source| {
+                    let values = source
+                        .iter()
+                        .map(|text| text.and_then(parse_raw_arrow_time_microseconds));
+                    // SAFETY: mapping ArrayIter preserves its exact upper length.
+                    Arc::new(unsafe { Time64MicrosecondArray::from_trusted_len_iter(values) })
+                        as ArrayRef
+                }),
+            _ => {
+                let output = arrow_cast::cast(array.as_ref(), target)
+                    .map_err(crate::temporal_carrier::TemporalCastFailure::Arrow);
+                if output.is_ok() {
+                    observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
+                }
+                return Ok(output);
+            }
+        }
+        .ok_or_else(|| {
+            crate::temporal_carrier::TemporalCastFailure::Contract(
+                novarocks_failure_contract::BoundedDetail::truncating_display(
+                    "TIME source has a foreign text carrier",
+                ),
+            )
+        });
         if output.is_ok() {
             observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
         }
@@ -199,4 +236,13 @@ pub fn evaluate_arrays(
         Ok(result) => result,
         Err(never) => match never {},
     }
+}
+
+/// The original raw Time64(Microsecond) parser. The public nanosecond parser
+/// retains its grammar; no later SDK whitespace retry is used here.
+fn parse_raw_arrow_time_microseconds(raw: &str) -> Option<i64> {
+    arrow_cast::parse::string_to_time_nanoseconds(raw)
+        .ok()
+        .map(|nanos| nanos / 1_000)
+        .or_else(|| raw.parse::<i64>().ok())
 }

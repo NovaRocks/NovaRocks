@@ -60,8 +60,8 @@ impl IcebergCatalogRuntime {
     /// synchronous SPI factory safe when it is invoked from a runtime worker.
     pub fn block_on<F>(&self, future: F) -> Result<F::Output, String>
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: Future + Send,
+        F::Output: Send,
     {
         let handle = self.handle.clone();
         // Retained through join, including panic and statement cancellation.
@@ -69,17 +69,22 @@ impl IcebergCatalogRuntime {
             .activity
             .as_ref()
             .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::Bridge));
-        std::thread::Builder::new()
-            .name("iceberg-catalog-runtime".to_string())
-            .spawn(move || handle.block_on(future))
-            .map_err(|error| {
-                if let Some(activity) = &self.activity {
-                    activity.bridge_spawn_failed();
-                }
-                format!("spawn Iceberg catalog runtime bridge: {error}")
-            })?
-            .join()
-            .map_err(|_| "Iceberg catalog runtime bridge panicked".to_string())
+        // The named synchronous P05 consumers borrow their original session;
+        // a scoped join does not require a cloneable commit authority. New
+        // asynchronous consumers never enter this transitional bridge.
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("iceberg-catalog-runtime".to_string())
+                .spawn_scoped(scope, move || handle.block_on(future))
+                .map_err(|error| {
+                    if let Some(activity) = &self.activity {
+                        activity.bridge_spawn_failed();
+                    }
+                    format!("spawn Iceberg catalog runtime bridge: {error}")
+                })?
+                .join()
+                .map_err(|_| "Iceberg catalog runtime bridge panicked".to_string())
+        })
     }
 }
 

@@ -25,7 +25,7 @@
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
 use novarocks_spi::connector::{
-    ConnectorReadSelector, ConnectorRequestContext, MvCreateSourceObservation,
+    ConnectorReadSelector, ConnectorRequestContext, MvSourceSchemaObservation,
     MvStorageObservationPort,
 };
 use novarocks_sql::planning::mv::{
@@ -40,7 +40,7 @@ use novarocks_mv_application::persistence::aggregate_bindings::{
 /// already used. Repeated SQL references to one relation produce distinct
 /// occurrence records, even though they deliberately reuse one request-local
 /// source metadata binding.
-pub(crate) fn observe_mv_create_source_bindings(
+pub(crate) fn observe_mv_create_source_bindings_original(
     observer: &dyn MvStorageObservationPort,
     sql_facts: &SqlMvCreatePersistenceFacts,
     bindings: &QueryTableBindingStore,
@@ -50,74 +50,32 @@ pub(crate) fn observe_mv_create_source_bindings(
         Vec<MvCreateRelationObservation>,
         novarocks_mv_application::persistence::codec::keyed::BindingDocument,
     ),
-    String,
+    crate::mv::domain::application::MvApplicationError,
 > {
     let mut formats = Vec::new();
-    let observations =
-    sql_facts
-        .relation_occurrences()
-        .iter()
-        .map(|relation| {
-            let binding = bindings
-                .strict_base_binding(
-                    relation.catalog(),
-                    relation.namespace(),
-                    relation.relation(),
-                )
-                .ok_or_else(|| {
-                    format!(
-                        "CREATE source occurrence {} has no admitted connector binding",
-                        relation.occurrence_id().get()
-                    )
-                })?;
-            let metadata = binding.source_metadata.as_ref().ok_or_else(|| {
-                format!(
-                    "CREATE source occurrence {} was not admitted from exact provider metadata",
-                    relation.occurrence_id().get()
-                )
-            })?;
-            let lease = binding.admission.exact_planning_lease()?;
-            let observed = observer
-                .observe_create_source(&lease, metadata, context.clone())
-                .map_err(|error| {
-                    format!(
-                        "observe CREATE source fields for {}.{}.{}: {error}",
-                        relation.catalog(),
-                        relation.namespace(),
-                        relation.relation()
-                    )
-                })?;
-            validate_same_generation(metadata, &observed)?;
-            let revision = lease
-                .binding()
-                .metadata()
-                .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
-                .map_err(|error| {
-                    format!(
-                        "observe exact CREATE source revision for {}.{}.{}: {error}",
-                        relation.catalog(),
-                        relation.namespace(),
-                        relation.relation()
-                    )
-                })?;
-            if revision.object_identity().value().as_ref()
-                != observed.object_id().as_bytes().as_ref()
-            {
-                return Err(
-                    "CREATE source field observation and exact revision identify different objects"
-                        .to_string(),
-                );
-            }
-            formats.push(novarocks_mv_application::persistence::codec::keyed::DataVersionFormat::from_issued_fact(revision.data_version()).map_err(|error|error.to_string())?);
-            let (object_id, _data_version) =
-                persist_exact_connector_revision(&revision).map_err(|error| error.to_string())?;
-            bind_relation_fields(
-                relation,
-                &observed,
-                bytes::Bytes::copy_from_slice(object_id.as_bytes()),
-            )
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let observations = sql_facts.relation_occurrences().iter().map(|relation| {
+        let binding = bindings.strict_base_binding(relation.catalog(), relation.namespace(), relation.relation())
+            .ok_or_else(|| invalid(format!("CREATE source occurrence {} has no admitted connector binding", relation.occurrence_id().get())))?;
+        let metadata = binding.source_metadata.as_ref().ok_or_else(|| invalid(format!(
+            "CREATE source occurrence {} was not admitted from exact provider metadata", relation.occurrence_id().get())))?;
+        let lease = binding.admission.exact_planning_lease().map_err(invalid)?;
+        let observed = observer.observe_source_schema(&lease, metadata, context.clone())
+            .map_err(|error| provider(error, format!("observe CREATE source fields for {}.{}.{}",
+                relation.catalog(), relation.namespace(), relation.relation())))?;
+        validate_same_generation(metadata, &observed).map_err(invalid)?;
+        let revision = lease.binding().metadata().exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
+            .map_err(|error| provider(error, format!("observe exact CREATE source revision for {}.{}.{}",
+                relation.catalog(), relation.namespace(), relation.relation())))?;
+        if revision.object_identity().value().as_ref() != observed.object_id().as_bytes().as_ref() {
+            return Err(invalid("CREATE source field observation and exact revision identify different objects"));
+        }
+        formats.push(novarocks_mv_application::persistence::codec::keyed::DataVersionFormat::from_issued_fact(revision.data_version())
+            .map_err(codec_failure)?);
+        let (object_id, _data_version) = persist_exact_connector_revision(&revision)
+            .map_err(|error| provider(error, "persist exact CREATE source revision"))?;
+        bind_relation_fields(relation, &observed, bytes::Bytes::copy_from_slice(object_id.as_bytes()))
+            .map_err(invalid)
+    }).collect::<Result<Vec<_>, _>>()?;
     Ok((
         observations,
         novarocks_mv_application::persistence::codec::keyed::BindingDocument {
@@ -125,10 +83,38 @@ pub(crate) fn observe_mv_create_source_bindings(
         },
     ))
 }
+fn invalid(message: impl Into<String>) -> crate::mv::domain::application::MvApplicationError {
+    crate::mv::domain::application::MvApplicationError::new(
+        crate::mv::domain::application::MvApplicationErrorKind::InvalidRequest,
+        message,
+    )
+}
+fn provider(
+    error: novarocks_spi::connector::ConnectorError,
+    context: impl std::fmt::Display,
+) -> crate::mv::domain::application::MvApplicationError {
+    use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
+    let message = format!("{context}: {error}");
+    let kind = if error.kind() == novarocks_spi::connector::ConnectorErrorKind::Unavailable {
+        MvApplicationErrorKind::Unavailable
+    } else {
+        MvApplicationErrorKind::Engine
+    };
+    let original = MvApplicationError::from_connector(kind, error);
+    MvApplicationError::new(kind, message)
+        .with_original_failure(original.original_failure().unwrap().clone())
+}
+fn codec_failure(
+    error: novarocks_mv_application::persistence::codec::PersistenceCodecError,
+) -> crate::mv::domain::application::MvApplicationError {
+    let message = error.to_string();
+    invalid(message)
+        .with_original_failure(novarocks_failure_contract::SharedFailureCause::new(error))
+}
 
 fn bind_relation_fields(
     relation: &SqlMvPersistenceRelationOccurrenceFacts,
-    observed: &MvCreateSourceObservation,
+    observed: &MvSourceSchemaObservation,
     provider_object_id: bytes::Bytes,
 ) -> Result<MvCreateRelationObservation, String> {
     let mut source_ordinals = std::collections::BTreeSet::new();
@@ -175,7 +161,7 @@ fn bind_relation_fields(
 
 fn validate_same_generation(
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
-    observed: &MvCreateSourceObservation,
+    observed: &MvSourceSchemaObservation,
 ) -> Result<(), String> {
     if observed.table() != &metadata.identity {
         return Err("CREATE source observation table does not match admitted metadata".to_string());
@@ -246,7 +232,7 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
-        ConnectorTableObjectId, MvCreateSourceObservation, MvObservedSourceField,
+        ConnectorTableObjectId, MvObservedSourceField, MvSourceSchemaObservation,
     };
 
     fn context() -> ConnectorRequestContext {
@@ -287,10 +273,12 @@ mod tests {
                 false,
             )],
         );
-        let observed = MvCreateSourceObservation::try_new(
+        let observed = MvSourceSchemaObservation::try_new(
             identity,
             ConnectorTableObjectId::try_new(Bytes::from_static(b"object-1")).expect("object"),
             Bytes::from_static(b"schema-2"),
+            true,
+            true,
             vec![
                 MvObservedSourceField::try_new(
                     Bytes::from_static(b"field-1"),
@@ -308,5 +296,30 @@ mod tests {
                 .expect_err("schema version mismatch")
                 .contains("schema version")
         );
+    }
+}
+
+#[cfg(test)]
+mod original_codec_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn actual_binding_document_decode_failure_keeps_its_codec_source_through_create() {
+        let error = novarocks_mv_application::persistence::codec::keyed::decode_binding(
+            &[0xff],
+            novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(&error, novarocks_mv_application::persistence::codec::PersistenceCodecError::ProtobufDecode(_) | novarocks_mv_application::persistence::codec::PersistenceCodecError::MalformedWire(_)));
+        let expected = error.failure_fact();
+        let application = codec_failure(error);
+        let cause = application.original_failure().unwrap().clone();
+        assert!(matches!(cause.downcast_ref::<novarocks_mv_application::persistence::codec::PersistenceCodecError>(),
+            Some(novarocks_mv_application::persistence::codec::PersistenceCodecError::ProtobufDecode(_) | novarocks_mv_application::persistence::codec::PersistenceCodecError::MalformedWire(_))));
+        let selected = crate::mv::command::project_product_failure_for_test(application);
+        assert_eq!(selected.failure_cause(), Some(&cause));
+        assert_eq!(cause.failure_fact(), expected);
+        assert_eq!(expected.class(), FailureClass::Data);
+        assert!(selected.compile_control_error().is_none());
     }
 }

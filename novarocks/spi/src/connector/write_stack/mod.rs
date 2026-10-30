@@ -101,11 +101,13 @@ pub use runtime::{
     ConnectorWriterHandle,
 };
 pub use session::{
-    ConnectorManagedPublicationShape, ConnectorWriteBeginRequest, ConnectorWriteCohortRoutingBody,
-    ConnectorWriteCohortRoutingProof, ConnectorWriteColocation, ConnectorWriteControl,
-    ConnectorWriteCopyOnWriteRoutingPlan, ConnectorWriteFinishPublication,
-    ConnectorWriteFinishRequest, ConnectorWriteLayoutPreference,
-    ConnectorWriteProviderDerivedValue, ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
+    ConnectorManagedPublicationShape, ConnectorWriteAbortProduction, ConnectorWriteBeginRequest,
+    ConnectorWriteCleanupState, ConnectorWriteCohortRoutingBody, ConnectorWriteCohortRoutingProof,
+    ConnectorWriteColocation, ConnectorWriteControl, ConnectorWriteCopyOnWriteRoutingPlan,
+    ConnectorWriteFinishPublication, ConnectorWriteFinishRequest, ConnectorWriteFinishRequestRef,
+    ConnectorWriteLayoutPreference, ConnectorWriteNeededHandoffNotice, ConnectorWriteNeededReady,
+    ConnectorWriteNeededReadyReceiving, ConnectorWriteProviderDerivedValue,
+    ConnectorWritePublicationCompletion, ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
     ConnectorWriteRouteRequirements, ConnectorWriteSelectionBinding,
     ConnectorWriteSelectionBindingRole, ConnectorWriteSessionAbortRequest,
     ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest,

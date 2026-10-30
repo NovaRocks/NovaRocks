@@ -26,6 +26,7 @@ publish = false
 workspace = true
 
 [dependencies]
+novarocks-transport-io.workspace = true
 anyhow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
@@ -55,8 +56,10 @@ novarocks-result-contract.workspace = true
 novarocks-native-trust.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-secret.workspace = true
+novarocks-spi.workspace = true
 novarocks-types.workspace = true
 novarocks-version.workspace = true
+parquet.workspace = true
 prost.workspace = true
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
@@ -75,6 +78,9 @@ runtime-inputs = [
     "docs/testing/**",
     "docker/iceberg-rest/*.sh",
     "docker/iceberg-rest/*.py",
+    "tests/system-test-runner/src/scenarios/trino_interop/**",
+    "tests/datasketches-tck/interop/trino/rest-catalog/**",
+    "tests/datasketches-tck/interop/trino/verify_rest_catalog.sh",
     "docker/iceberg-rest/templates/*.yml",
     "docker/iceberg-rest/shared.env",
     "docker/iceberg-rest/spark/Dockerfile",
@@ -85,14 +91,26 @@ runtime-inputs = [
     "tests/fixtures/iceberg-rest-publication/src/**",
 ]
 env-inputs = [
-    { name = "NOVA_FIXTURE_STORE", kind = "value" },
+    { name = "NOVA_TRINO_IMAGE", kind = "value" },
+    { name = "PATH", kind = "value" },
     { name = "HOME", kind = "value" },
+    { name = "TMPDIR", kind = "value" },
+    { name = "LANG", kind = "value" },
+    { name = "LC_ALL", kind = "value" },
+    { name = "SSL_CERT_FILE", kind = "file-content" },
+    { name = "DOCKER_CONTEXT", kind = "value" },
+    { name = "DOCKER_HOST", kind = "value" },
+    { name = "DOCKER_TLS_VERIFY", kind = "value" },
+    { name = "DOCKER_CERT_PATH", kind = "value" },
+    { name = "DOCKER_CONFIG", kind = "value" },
+    { name = "XDG_CONFIG_HOME", kind = "value" },
     { name = "XDG_CACHE_HOME", kind = "value" },
-    { name = "UEA7_TEST_CONTROL_URI", kind = "value" },
+    { name = "XDG_STATE_HOME", kind = "value" },
+    { name = "NOVA_FIXTURE_STORE", kind = "value" },
     { name = "NOVAROCKS_UEA4G_ORACLE_RECEIPT", kind = "file-content" },
     { name = "NOVAROCKS_UEA4G_ORACLE_OUTPUT", kind = "value" },
 ]
 ignored = [
-    { filter = "test(=actors::catalog::tests::reads_live_fixture_trace_and_metrics)", class = "heavy", requires = ["fixture:iceberg-rest-publication"], reason = "Requires a live isolated publication fixture control endpoint" },
+    { filter = "test(=actors::catalog::tests::reads_live_fixture_trace_and_metrics)", class = "heavy", requires = ["fixture:docker"], reason = "Owns an isolated publication-hook fixture; requires Docker and locally provisioned fixture inputs" },
     { filter = "test(=scenarios::iceberg_delete_oracle::tests::frozen_receipt_replay_without_native)", class = "heavy", requires = ["dataset:iceberg-java-oracle"], reason = "Requires an independently prepared frozen Java oracle receipt and captured output" },
 ]

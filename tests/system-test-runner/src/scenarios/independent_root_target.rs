@@ -1003,17 +1003,14 @@ mod binding_projection_tests {
             connection_id: 71,
             connection_generation: 19,
             session_connection_id: 71,
-            session_epoch: 23,
+            session_key: 23,
             statement_generation: 29,
             sql_sha256: [31; 32],
         };
         let binding = ActualBinding::from_original_sources(raw, &target).unwrap();
         assert_eq!(binding.connection.generation, 19);
         assert_eq!(
-            (
-                binding.statement.session_epoch,
-                binding.statement.generation
-            ),
+            (binding.statement.session_key, binding.statement.generation),
             (23, 29)
         );
         assert_eq!(

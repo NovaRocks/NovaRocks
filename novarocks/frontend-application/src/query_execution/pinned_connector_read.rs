@@ -133,38 +133,6 @@ fn pinned_file_set_query_table_binding(
         write_target_admission: None,
         frozen_cohort_read: Some(QueryFrozenCohortRead::PinnedFileSet(read)),
         frozen_snapshot_materializations: BTreeMap::new(),
-        admitted_change_scans: BTreeMap::new(),
+        prepared_source_reads: BTreeMap::new(),
     })
-}
-
-/// Prospective result-derived conversion copies for the one closed COW read.
-/// The binding store itself and general SQL optimizer/materialization graphs
-/// belong to planning Work; this reports the concrete source/schema/overlay
-/// copies created by this module and the two current analyzer projections.
-pub(crate) fn cow_overlay_conversion_upper(
-    namespace: &str,
-    schema: &arrow::datatypes::Schema,
-    pinned: &novarocks_spi::connector::ConnectorPinnedFileSet,
-) -> Result<u64, novarocks_spi::connector::ConnectorError> {
-    use crate::query_execution::dml::cow_compile_receipt::compiler_handoff as geometry;
-    let exhausted = |_| {
-        novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
-            "COW schema and overlay conversion footprint overflow",
-        )
-    };
-    let copies =
-        geometry::KnownCompilerCopies::before_closed_identity_growth(namespace, schema, pinned)
-            .map_err(exhausted)?
-            .simultaneous_request_terms()
-            .map_err(exhausted)?;
-    let closure = geometry::prospective_arc_request::<PinnedFileSetOverlay>().map_err(exhausted)?;
-    // The compiler copies the one COW overlay slice into a Vec before the
-    // materializer consumes it. Its strings are counted above; this is the
-    // concrete additional Vec slot, separate from generic binding map Work.
-    let compiler_overlay_slot = std::mem::size_of::<QueryLocalTableOverlay>() as u64;
-    copies
-        .checked_add(closure)
-        .and_then(|upper| upper.checked_add(compiler_overlay_slot))
-        .ok_or_else(|| exhausted(geometry::FootprintError::Overflow))
 }

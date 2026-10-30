@@ -38,6 +38,8 @@ tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+novarocks-failure-contract.workspace = true
 novarocks-state-store-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 

@@ -101,6 +101,25 @@ impl<A> ReadAccessSink<A> {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Actual fixed Source allocation. Entry backing belongs to the original
+    /// input/result owner; this fact grants no capacity or access authority.
+    pub fn known_source_layouts() -> Result<
+        [std::alloc::Layout; 2],
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
+        let mutex_backing = if cfg!(all(target_os = "macos", target_pointer_width = "64")) {
+            // Same pinned platform mutex policy as the original QA Source.
+            std::alloc::Layout::from_size_align(64, 8)
+                .map_err(|_| LayoutResourceError::Arithmetic)?
+        } else {
+            std::alloc::Layout::new::<()>()
+        };
+        Ok([
+            arc_layout(std::alloc::Layout::new::<Mutex<TakenState<A>>>())?,
+            mutex_backing,
+        ])
+    }
 
     /// Account for one capability at the instant it is taken.
     ///

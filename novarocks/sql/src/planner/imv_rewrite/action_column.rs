@@ -53,6 +53,13 @@ use novarocks_types::schema::ColumnDef;
 
 pub(crate) struct ImvActionColumn;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImvActionColumnDeclarationError {
+    Duplicate,
+    WrongType,
+    Nullable,
+}
+
 impl ImvActionColumn {
     pub(crate) const NAME: &'static str = crate::common::CHANGE_OP_COLUMN;
     // Consumed by IMV refresh execution.
@@ -76,6 +83,46 @@ impl ImvActionColumn {
     /// Returns true iff `column` is the IMV action column.
     pub(crate) fn matches(column: &OutputColumn) -> bool {
         column.is_internal && column.name.eq_ignore_ascii_case(Self::NAME)
+    }
+
+    /// The physical bridge's current interface carries no compile control.
+    /// Keep it on the same declaration author without inventing an allowance.
+    pub(crate) fn declared(
+        columns: &[OutputColumn],
+    ) -> Result<Option<&OutputColumn>, ImvActionColumnDeclarationError> {
+        match Self::declared_observed(columns, || Ok::<(), std::convert::Infallible>(())) {
+            Ok(declaration) => declaration,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Observe each completed column inspection through the caller's original
+    /// control. Outer refusal remains distinct from the declaration result.
+    pub(crate) fn declared_observed<E>(
+        columns: &[OutputColumn],
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<Option<&OutputColumn>, ImvActionColumnDeclarationError>, E> {
+        let mut declared = None;
+        for column in columns {
+            let matches = Self::matches(column);
+            observe()?;
+            if matches {
+                if declared.is_some() {
+                    return Ok(Err(ImvActionColumnDeclarationError::Duplicate));
+                }
+                declared = Some(column);
+            }
+        }
+        let Some(column) = declared else {
+            return Ok(Ok(None));
+        };
+        if column.value_type.data_type() != &DataType::Int8 {
+            return Ok(Err(ImvActionColumnDeclarationError::WrongType));
+        }
+        if column.value_type.nullable() {
+            return Ok(Err(ImvActionColumnDeclarationError::Nullable));
+        }
+        Ok(Ok(Some(column)))
     }
 
     pub(crate) fn ensure_metadata_column(columns: &mut Vec<ColumnDef>) {
@@ -319,44 +366,81 @@ fn validate_signed_delta_input(plan: &LogicalPlanNode) -> Result<(), String> {
     }
 }
 
-fn validate_scan(scan: &PlanScanNode) -> Result<(), String> {
-    let fqn = sql_scan_source(&scan.table.source)
+/// Mandatory IMV producer-leaf validation. Optimizer rule selection and
+/// aggregate-root exceptions cannot remove a Delta input's signed contract.
+/// Ordinary SQL Delta reads do not enter the IMV rewrite entrypoint.
+pub(crate) fn validate_delta_producer_scans(
+    plan: &LogicalPlanNode,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), SqlCompileError> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )
+    .map_err(SqlCompileError::from)?;
+    // Keep a cursor per ancestor rather than eagerly copying a wide node's
+    // children into a pending frontier. Each next edge is observed separately.
+    let mut pending = vec![std::slice::from_ref(plan).iter()];
+    while let Some(children) = pending.last_mut() {
+        let Some(node) = children.next() else {
+            pending.pop();
+            work.step().map_err(SqlCompileError::from)?;
+            continue;
+        };
+        work.step().map_err(SqlCompileError::from)?;
+        if let LogicalPlanKind::Scan(scan) = &node.kind
+            && is_delta_scan_source(&scan.table.source)
+        {
+            let declaration = ImvActionColumn::declared_observed(&scan.columns, || work.step())
+                .map_err(SqlCompileError::from)?;
+            validate_required_delta_action_columns(&scan_fqn(scan), declaration)
+                .map_err(SqlCompileError::Compilation)?;
+        }
+        pending.push(node.children.iter());
+        work.step().map_err(SqlCompileError::from)?;
+    }
+    work.finish().map_err(SqlCompileError::from)
+}
+
+fn scan_fqn(scan: &PlanScanNode) -> String {
+    sql_scan_source(&scan.table.source)
         .map(|source| {
             format!(
                 "{}.{}.{}",
                 source.table.catalog, source.table.namespace, source.table.table
             )
         })
-        .unwrap_or_else(|| scan.table.name.clone());
+        .unwrap_or_else(|| scan.table.name.clone())
+}
 
-    let action_columns: Vec<&OutputColumn> = scan
-        .columns
-        .iter()
-        .filter(|c| ImvActionColumn::matches(c))
-        .collect();
+fn validate_required_delta_action_columns(
+    fqn: &str,
+    declaration: Result<Option<&OutputColumn>, ImvActionColumnDeclarationError>,
+) -> Result<(), String> {
+    let failure = match declaration {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => "missing action column",
+        Err(ImvActionColumnDeclarationError::Duplicate) => "has duplicate action columns",
+        Err(ImvActionColumnDeclarationError::WrongType) => "has non-Int8 action column",
+        Err(ImvActionColumnDeclarationError::Nullable) => "has nullable action column",
+    };
+    Err(format!("Delta-bound scan {fqn} {failure}"))
+}
 
+fn validate_scan(scan: &PlanScanNode) -> Result<(), String> {
+    let fqn = scan_fqn(scan);
     match sql_scan_source(&scan.table.source).map(|source| &source.kind) {
-        Some(SqlScanKind::Delta { .. }) => match action_columns.as_slice() {
-            [] => Err(format!("Delta-bound scan {fqn} missing action column")),
-            [col] => {
-                if *col.value_type.data_type() != DataType::Int8 {
-                    return Err(format!("Delta-bound scan {fqn} has non-Int8 action column"));
-                }
-                if col.value_type.nullable() {
-                    return Err(format!("Delta-bound scan {fqn} has nullable action column"));
-                }
-                // V7: _row_id must be present so the apply-key projection can reference it.
-                if !scan.columns.iter().any(ImvRowIdColumn::matches) {
-                    return Err(format!("Delta-bound scan {fqn} missing _row_id column"));
-                }
-                Ok(())
+        Some(SqlScanKind::Delta { .. }) => {
+            validate_required_delta_action_columns(&fqn, ImvActionColumn::declared(&scan.columns))?;
+            // Preserve the original rule's row-identity check. The mandatory
+            // producer exit only enforces the action declaration contract.
+            if !scan.columns.iter().any(ImvRowIdColumn::matches) {
+                return Err(format!("Delta-bound scan {fqn} missing _row_id column"));
             }
-            _ => Err(format!(
-                "Delta-bound scan {fqn} has duplicate action columns"
-            )),
-        },
+            Ok(())
+        }
         Some(_) if is_version_bound_scan_source(&scan.table.source) => {
-            if !action_columns.is_empty() {
+            if scan.columns.iter().any(ImvActionColumn::matches) {
                 return Err(format!(
                     "Version-bound scan {fqn} must not carry action column"
                 ));
@@ -471,6 +555,44 @@ mod tests {
     };
     use novarocks_types::schema::ColumnDef;
     use std::num::{NonZeroU32, NonZeroU64};
+
+    #[test]
+    fn mandatory_delta_validation_observes_child_edges_without_expanding_wide_fanout() {
+        struct Stop;
+        impl novarocks_type_contract::PureCompileControl for Stop {
+            fn checkpoint(
+                &self,
+                _: novarocks_type_contract::CompilePhase,
+                units: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                if units == novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK {
+                    Err(novarocks_type_contract::CompileControlError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut scan = delta_scan_with(None);
+        let ScanSource::Sql(source) = &mut scan.table.source;
+        source.kind = SqlScanKind::Data {
+            version: SqlTableVersionSelector::Current,
+        };
+        let child = scan_plan(scan);
+        let plan = LogicalPlanNode::new(
+            LogicalPlanKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: Vec::new(),
+            }),
+            vec![child; 1024],
+            None,
+        );
+        // A wide ordinary subtree still observes each original child edge;
+        // it neither copies all siblings at once nor invents a fanout cap.
+        assert_eq!(
+            validate_delta_producer_scans(&plan, &Stop),
+            Err(SqlCompileError::Cancelled)
+        );
+    }
 
     #[test]
     fn output_column_has_expected_shape() {

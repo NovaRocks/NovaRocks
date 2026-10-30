@@ -212,7 +212,7 @@ impl ConnectorReadPublicFacts {
             ),
             context,
         )?;
-        budget.metadata_with_bound_observed(
+        budget.attributes_with_bound_observed(
             source_schema.schema_attributes(),
             source_schema.attribute_work_upper_bound(),
             context,
@@ -252,7 +252,7 @@ impl ConnectorReadPublicFacts {
                 completed_law(budget.add(default.as_json().len()), context)?;
                 context.source_floor(default.as_json().len())?;
             }
-            budget.metadata_with_bound_observed(
+            budget.attributes_with_bound_observed(
                 field.attributes(),
                 field.attribute_work_upper_bound(),
                 context,
@@ -477,6 +477,20 @@ where
             self.creation
                 .request_layout(layout)
                 .map_err(Self::Error::Creator)?;
+        }
+        Ok(())
+    }
+    fn opaque_model_request(&mut self, bytes: usize, copies: usize) -> Result<(), Self::Error> {
+        let layout = std::alloc::Layout::array::<u8>(bytes).map_err(|_| self.arithmetic())?;
+        self.original
+            .request(layout, copies)
+            .map_err(Self::Error::Contract)?;
+        if bytes != 0 {
+            for _ in 0..copies {
+                self.creation
+                    .observe_opaque_upper_bound(bytes)
+                    .map_err(Self::Error::Creator)?;
+            }
         }
         Ok(())
     }

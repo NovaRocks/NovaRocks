@@ -68,7 +68,7 @@ fn fixtures() -> Vec<(&'static str, i256)> {
     ]
 }
 
-fn public_encoder(value: i256, precision: u8, scale: i8) -> ArrowMysqlTextEncoder {
+fn public_encoder(value: i256, precision: u8, scale: i8) -> ArrowClientRowEncoder {
     let child = Arc::new(
         Decimal256Array::from_iter_values([value])
             .with_precision_and_scale(precision, scale)
@@ -100,6 +100,7 @@ fn public_encoder(value: i256, precision: u8, scale: i8) -> ArrowMysqlTextEncode
         nullable: true,
     };
     let schema = ClientRenderSchema::try_new(
+        novarocks_result_contract::ClientPresentationFamily::MysqlText,
         vec![RenderColumn {
             source_ordinal: 0,
             source_slot: None,
@@ -113,7 +114,7 @@ fn public_encoder(value: i256, precision: u8, scale: i8) -> ArrowMysqlTextEncode
         1,
     )
     .unwrap();
-    ArrowMysqlTextEncoder::try_new(Arc::new(schema), batch).unwrap()
+    ArrowClientRowEncoder::try_new(Arc::new(schema), batch).unwrap()
 }
 
 fn append_public_record(text: &mut String, name: &str, value: i256, scale: i8, capacity: usize) {

@@ -73,7 +73,10 @@ fn types() -> DecodedTypeTable {
         i64::MIN,
         true,
     )
-    .with_metadata([("author".to_owned(), "original".to_owned())].into());
+    .with_metadata(std::collections::HashMap::<String, String>::from([(
+        "author".to_owned(),
+        "original".to_owned(),
+    )]));
     let input = [
         (0, FunctionValueType::new(DataType::Int64, false)),
         (

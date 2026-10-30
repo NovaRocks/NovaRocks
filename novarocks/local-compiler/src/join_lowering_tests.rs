@@ -783,6 +783,70 @@ fn left_build_right_semi_and_anti_mirror_to_probe_preserving_left_kinds() {
 }
 
 #[test]
+fn mirrored_right_outer_permutation_keeps_source_and_nullable_target_ordinals() {
+    let source = fixture(Case {
+        family: hash(JoinKind::RightOuter, JoinSide::Left),
+        residual: Residual::Separate,
+        output: Output::Permuted,
+    });
+    let program = compile(&source.package);
+    let (join, kind) = join_node(&program);
+    let ProgramNodeKind::Join {
+        left,
+        right,
+        join_type,
+        runtime_filters,
+        ..
+    } = kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(*join_type, JoinType::LeftOuter);
+    assert_eq!(*left, local_of(&program, RIGHT));
+    assert_eq!(*right, local_of(&program, LEFT));
+    assert!(runtime_filters.is_empty());
+    let canonical = program.graph().nodes()[join.index()].output_layout();
+    assert_eq!(
+        canonical
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.is_nullable())
+            .collect::<Vec<_>>(),
+        [false, false, true, true]
+    );
+    let root = program.graph().root();
+    let selection = &program.graph().nodes()[root.index()];
+    let ProgramNodeKind::Project {
+        input,
+        is_subordinate,
+        ..
+    } = selection.kind()
+    else {
+        panic!("physical output needs a selection Project")
+    };
+    assert_eq!((*input, *is_subordinate), (join, true));
+    // Physical [source.w, target.k] maps to canonical [probe.w, extended-build.k].
+    for (expression, ordinal) in [(0u32, 1u32), (1, 2)] {
+        assert_eq!(
+            slot_sources(
+                &program,
+                site(
+                    root,
+                    ProgramNodeExpressionRole::ProjectOutput { expression }
+                )
+            ),
+            vec![(
+                canonical.slots()[ordinal as usize],
+                layout(join, ProgramChannelLayoutRole::NodeOutput, ordinal)
+            )]
+        );
+    }
+    assert!(!selection.output_layout().schema().field(0).is_nullable());
+    assert!(selection.output_layout().schema().field(1).is_nullable());
+}
+
+#[test]
 fn one_definition_shared_by_key_and_residual_keeps_a_source_per_use() {
     let source = fixture(Case {
         family: hash(JoinKind::Inner, JoinSide::Right),

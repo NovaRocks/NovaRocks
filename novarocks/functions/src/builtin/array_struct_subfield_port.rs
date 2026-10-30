@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Operation/control adapter; all values and Cast semantics belong to the core.
+//! Operation/control adapter; the core projects its prepared field exactly.
 use super::array_scalar_diagnostic_source::HostProjectionDiagnostics;
 use super::array_struct_subfield_core::{ProjectionOperation, ProjectionPort};
 use crate::ScalarInvocationFailure;
@@ -42,7 +42,7 @@ impl ProjectionPort for ArrayStructSubfieldPort<'_, '_, '_> {
                 self.diagnostics.before_operation(operation)
             }
             // The current runtime retains control observations, not the retired
-            // opaque payload measurement gates. No invented Cast budget.
+            // opaque payload measurement gates.
             _ => self.diagnostics.after_operation(),
         }
     }

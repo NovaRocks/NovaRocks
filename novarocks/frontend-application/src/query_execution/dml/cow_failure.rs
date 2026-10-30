@@ -100,6 +100,17 @@ impl CowFailure {
         self,
         terminal: Option<&novarocks_spi::connector::LakePublicationTerminal>,
     ) -> String {
+        let presentation = self.borrowed_presentation(terminal);
+        drop(self); // Actual raw cause exit precedes publication of this String.
+        presentation
+    }
+
+    /// The supervised source retains the move-only cause while publishing the
+    /// same bounded client projection. This borrows no erased formatter.
+    pub(crate) fn borrowed_presentation(
+        &self,
+        terminal: Option<&novarocks_spi::connector::LakePublicationTerminal>,
+    ) -> String {
         let mut out = DiagnosticPrefix(String::with_capacity(WIRE_DIAGNOSTIC_BYTES + 3));
         out.push("Executor: ");
         match &self.cause {
@@ -141,7 +152,6 @@ impl CowFailure {
                 use crate::query_execution::dml::cow_closed_ast::BuildError;
                 match error {
                     BuildError::Original(error) => out.original(error),
-                    BuildError::Control(error) => out.connector(error),
                     _ => {
                         let _ = write!(&mut out, "{error}");
                     }
@@ -152,10 +162,7 @@ impl CowFailure {
                 out.push("connector write lease has no immutable catalog runtime identity")
             }
             Cause::BeforeBegin(error) => match error {
-                cow_necessary_before_begin::Error::Control(error)
-                | cow_necessary_before_begin::Error::ResourceExhausted(error) => {
-                    out.connector(error)
-                }
+                cow_necessary_before_begin::Error::Control(error) => out.connector(error),
                 cow_necessary_before_begin::Error::Scope(error) => {
                     // Concrete WorkError is a closed first-party enum. Its
                     // implementation reads only finite enums/static labels.
@@ -191,9 +198,8 @@ impl CowFailure {
                 terminal.do_not_retry()
             );
         }
-        let presentation = out.0;
-        drop(self); // Actual raw cause exit precedes publication of this String.
-        presentation
+
+        out.0
     }
     #[cfg(test)]
     pub(crate) fn with_exit_probe(mut self, probe: impl FnOnce() + Send + 'static) -> Self {
@@ -204,10 +210,7 @@ impl CowFailure {
     fn original_connector(&self) -> Option<&ConnectorError> {
         match &self.cause {
             Cause::Lease(e) | Cause::Provider(e) => Some(e),
-            Cause::BeforeBegin(
-                cow_necessary_before_begin::Error::Control(e)
-                | cow_necessary_before_begin::Error::ResourceExhausted(e),
-            ) => Some(e),
+            Cause::BeforeBegin(cow_necessary_before_begin::Error::Control(e)) => Some(e),
             _ => None,
         }
     }

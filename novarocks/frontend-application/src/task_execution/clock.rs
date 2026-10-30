@@ -26,21 +26,20 @@
 use std::sync::Mutex;
 #[cfg(test)]
 use std::time::Duration;
+#[cfg(test)]
 use std::time::Instant;
 
-use novarocks_query_application::coordination::MonotonicInstant;
-
-/// The clock a task-protocol owner reads.
-pub trait TaskProtocolClock: std::fmt::Debug + Send + Sync {
-    fn now(&self) -> MonotonicInstant;
-}
+#[cfg(test)]
+use novarocks_coordination_contract::{MonotonicClock, MonotonicInstant};
 
 /// Readings from this process's own monotonic timeline.
 #[derive(Debug)]
+#[cfg(test)]
 pub struct ProcessMonotonicClock {
     origin: Instant,
 }
 
+#[cfg(test)]
 impl ProcessMonotonicClock {
     pub fn new() -> Self {
         Self {
@@ -49,13 +48,15 @@ impl ProcessMonotonicClock {
     }
 }
 
+#[cfg(test)]
 impl Default for ProcessMonotonicClock {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TaskProtocolClock for ProcessMonotonicClock {
+#[cfg(test)]
+impl MonotonicClock for ProcessMonotonicClock {
     fn now(&self) -> MonotonicInstant {
         MonotonicInstant::from_origin(self.origin.elapsed())
     }
@@ -85,7 +86,7 @@ impl ManualClock {
 }
 
 #[cfg(test)]
-impl TaskProtocolClock for ManualClock {
+impl MonotonicClock for ManualClock {
     fn now(&self) -> MonotonicInstant {
         MonotonicInstant::from_origin(*self.elapsed.lock().expect("manual clock"))
     }

@@ -606,3 +606,121 @@ fn document_partition_replacement_is_bound_to_its_publication_operation() {
             .contains("does not match the write operation")
     );
 }
+
+// This gate represents only the provider's physical observation. The returned
+// view still has to pass the ORIGINAL lease's exact validation after Ready.
+struct AsyncObservation {
+    original: Observation,
+    gate: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    async_calls: Arc<AtomicUsize>,
+}
+impl ConnectorDocumentStorageObservation for AsyncObservation {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.original.descriptor
+    }
+    fn incarnation(&self) -> ProviderBindingEpoch {
+        request().owner.incarnation
+    }
+    fn observe_keyed_documents(
+        &self,
+        _: KeyedDocumentObservationRequest,
+    ) -> Result<KeyedDocumentView, KeyedDocumentReadError> {
+        panic!("async lease must not call the sync observation")
+    }
+    fn observe_full_keyed_documents(
+        &self,
+        _: KeyedDocumentObservationRequest,
+    ) -> Result<FullKeyedDocumentView, KeyedDocumentReadError> {
+        panic!("async lease must not call the sync full observation")
+    }
+    fn decode_keyed_slot_change_evidence(
+        &self,
+        _: KeyedDocumentObservationRequest,
+        _: crate::connector::ExternalMutationEvidence,
+    ) -> Result<UnknownCommitEvidence, ConnectorError> {
+        panic!("no mutation evidence is decoded")
+    }
+    fn resolve_keyed_commit(
+        &self,
+        _: KeyedDocumentObservationRequest,
+        _: UnknownCommitEvidence,
+    ) -> Result<CommitConclusion, ConnectorError> {
+        panic!("async lease must not call sync resolution")
+    }
+    fn discover_documents(
+        &self,
+        _: ConnectorDocumentDiscoveryRequest,
+    ) -> Result<ConnectorDocumentDiscoveryPage, ConnectorError> {
+        panic!("no discovery in this observation")
+    }
+    fn observe_keyed_documents_async(
+        &self,
+        request: KeyedDocumentObservationRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<KeyedDocumentView, KeyedDocumentReadError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.async_calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.await.expect("fixture releases original observation");
+            }
+            self.original.observe_keyed_documents(request)
+        })
+    }
+}
+#[tokio::test]
+async fn async_keyed_lease_waits_then_validates_the_same_owner_object_and_generation() {
+    use futures::FutureExt;
+    let (release, gate) = futures::channel::oneshot::channel();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let original_calls = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let observation = Arc::new(AsyncObservation {
+        original: Observation {
+            calls: Arc::clone(&original_calls),
+            descriptor: descriptor(),
+            foreign_object: true,
+            foreign_token: false,
+        },
+        gate: Mutex::new(Some(gate)),
+        async_calls: Arc::clone(&calls),
+    });
+    let lease = lease_with(Some(observation), None, Arc::clone(&drops));
+    let mut original = Box::pin(lease.observe_keyed_documents_async(request()));
+    assert!(original.as_mut().now_or_never().is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(original_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    release.send(()).unwrap();
+    let error = original.await.unwrap_err();
+    assert!(
+        matches!(error,KeyedDocumentReadError::Invalid(ref e) if e.kind()==ConnectorErrorKind::InvalidRequest)
+    );
+    assert_eq!(original_calls.load(Ordering::SeqCst), 1);
+    drop(lease);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn async_keyed_lease_rejects_foreign_request_before_provider_poll() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observation = Arc::new(AsyncObservation {
+        original: Observation {
+            calls: Default::default(),
+            descriptor: descriptor(),
+            foreign_object: false,
+            foreign_token: false,
+        },
+        gate: Mutex::new(None),
+        async_calls: Arc::clone(&calls),
+    });
+    let lease = lease_with(Some(observation), None, Default::default());
+    let mut foreign = request();
+    foreign.owner.incarnation = ProviderBindingEpoch::from_bytes([2; 16]);
+    assert!(lease.observe_keyed_documents_async(foreign).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}

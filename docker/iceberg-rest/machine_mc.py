@@ -37,15 +37,26 @@ def main(argv=None):
     parser.add_argument('--context-file', type=Path)
     parser.add_argument('--script-file', type=Path)
     parser.add_argument('--cleanup', action='store_true')
-    parser.add_argument('--cleanup-run', action='store_true')
+    operations = parser.add_mutually_exclusive_group()
+    operations.add_argument('--cleanup-run', action='store_true')
+    operations.add_argument('--check-users-absent', action='store_true')
+    operations.add_argument('--cleanup-users', action='store_true')
+    operations.add_argument('--oss-operation', action='store_true')
+    operations.add_argument('--benchmark-oss', action='store_true')
     args = parser.parse_args(argv)
     runtime.install_signal_handlers()
     try:
+        if args.cleanup and (args.oss_operation or args.benchmark_oss):
+            raise runtime.RuntimeFailure('RunBudgetRejected', 'SDK work cannot use the cleanup reserve')
         raw = args.context_file.read_text() if args.context_file else os.environ.get('NOVA_FIXTURE_RUN_CONTEXT', '')
         if len(raw) > 16384:
             raise runtime.RuntimeFailure('RunBudgetRejected', 'run context exceeds its input bound')
         context = json.loads(raw)
         identity = ScratchIdentity.from_dict(context.get('identity'))
+        if args.check_users_absent and args.cleanup:
+            raise runtime.RuntimeFailure('RunBudgetRejected', 'IAM absence check requires the original work phase')
+        if args.cleanup_users and not args.cleanup:
+            raise runtime.RuntimeFailure('RunBudgetRejected', 'IAM cleanup requires the original cleanup phase')
         owner = machine.MachineOwner(args.root, daemon=args.daemon)
         state = owner.read_saved_state()
         if not state:
@@ -66,20 +77,52 @@ def main(argv=None):
                 if len(inherited_storage) > 16384:
                     raise runtime.RuntimeFailure('RunBudgetRejected', 'run storage exceeds its input bound')
                 RunStorageScope.from_dict(json.loads(inherited_storage)).validate_against(identity, snapshot)
-            if args.cleanup_run:
-                if not args.cleanup:
+            if args.cleanup_run or args.check_users_absent or args.cleanup_users:
+                if args.cleanup_run and not args.cleanup:
                     raise runtime.RuntimeFailure('RunBudgetRejected', 'exact run cleanup requires the original cleanup phase')
                 request = json.loads(script)
+                if ((args.check_users_absent or args.cleanup_users)
+                        and (not isinstance(request, dict) or set(request) != {'identity', 'storage', 'users'})):
+                    raise runtime.RuntimeFailure('RunBudgetRejected', 'invalid exact IAM request shape')
                 if ScratchIdentity.from_dict(request.get('identity')) != identity:
                     raise runtime.RuntimeFailure('RunBudgetRejected', 'cleanup identity differs from original context')
                 scope = RunStorageScope.from_dict(request.get('storage'))
                 scope.validate_against(identity, snapshot)
-                report = ScratchSweeper(snapshot, owner.backend).cleanup_run(scope, request.get('users'), deadline=deadline)
+                sweeper = ScratchSweeper(snapshot, owner.backend)
+                if args.check_users_absent:
+                    report = sweeper.check_users_absent(scope, request.get('users'), deadline=deadline)
+                elif args.cleanup_users:
+                    report = sweeper.cleanup_users(scope, request.get('users'), deadline=deadline)
+                else:
+                    report = sweeper.cleanup_run(scope, request.get('users'), deadline=deadline)
                 if not report.get('complete'):
                     sys.stderr.write(json.dumps(report) + '\n')
-                    raise runtime.RuntimeFailure('ScratchCleanupIncomplete', 'exact run cleanup did not complete')
+                    if args.check_users_absent:
+                        raise runtime.RuntimeFailure('ScratchIamAbsenceUnconfirmed', 'exact IAM absence was not confirmed')
+                    detail = 'exact IAM cleanup did not complete' if args.cleanup_users else 'exact run cleanup did not complete'
+                    raise runtime.RuntimeFailure('ScratchCleanupIncomplete', detail)
                 output = json.dumps(report) + '\n'
+            elif args.benchmark_oss:
+                import benchmark_oss
+                output = benchmark_oss.run_operation(snapshot, owner.backend, json.loads(script), deadline=deadline)
+            elif args.oss_operation:
+                from machine_operation import validate_sdk_arguments
+                request = json.loads(script)
+                if not isinstance(request, dict) or set(request) != {'storage', 'args'}:
+                    raise runtime.RuntimeFailure('InvalidScratchScope', 'OSS request requires its exact run projection')
+                scope = RunStorageScope.from_dict(request['storage']).validate_against(identity, snapshot)
+                if scope.storage_owner.get('provider') != 'aliyun-oss':
+                    raise runtime.RuntimeFailure('InvalidScratchScope', 'OSS work requires a cloud run projection')
+                arguments = request['args']
+                if not isinstance(arguments, list) or len(arguments) < 3 or not scope.belongs(arguments[2]):
+                    raise runtime.RuntimeFailure('InvalidScratchScope', 'OSS request leaves the original run')
+                arguments = list(arguments)
+                if arguments[2].startswith('s3a://'):
+                    arguments[2] = 's3://' + arguments[2][6:]
+                output = owner.backend.run_oss(snapshot, validate_sdk_arguments(arguments), deadline=deadline)
             else:
+                if snapshot.get('config', {}).get('object_store') is not None:
+                    raise runtime.RuntimeFailure('CloudIamUnsupported', 'cloud runs require an explicit OSS operation')
                 output = owner.backend.run_mc(snapshot, script, deadline=deadline)
         sys.stdout.write(output)
         return 0

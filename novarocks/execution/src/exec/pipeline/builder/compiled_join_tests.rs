@@ -1574,10 +1574,19 @@ fn compiled_join_schema_prepare_keeps_first_memory_refusal_and_rolls_back() {
 fn compiled_join_schema_last_slot_keeps_creator_after_plan_and_operators_exit() {
     use crate::runtime::mem_tracker::MemTracker;
     for nested in [false, true] {
-        let runtime = RuntimeState::default();
         let (program, mut operator, mut build, input, error) = schema_owner_join_operators(nested);
         let weak = Arc::downgrade(&program);
         let tracker = MemTracker::new_root("join independent output schema creator");
+        let runtime = RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::clone(&tracker)),
+            None,
+            Arc::clone(&error),
+        );
         let factory =
             super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error);
         operator.set_construction_factory(factory.clone());
@@ -1850,7 +1859,6 @@ fn compiled_join_output_last_batch_ref_keeps_original_source_creator() {
     use crate::runtime::mem_tracker::MemTracker;
     use novarocks_type_contract::ValueTypeStorageLifetime;
     for nested in [false, true] {
-        let runtime = RuntimeState::default();
         let (program, mut operator, mut build, input, error) = schema_owner_join_operators(nested);
         let weak = Arc::downgrade(&program);
         let source_tracker = MemTracker::new_root("join input source construction");
@@ -1876,6 +1884,16 @@ fn compiled_join_output_last_batch_ref_keeps_original_source_creator() {
         drop(source_factory);
         assert!(source_tracker.current() > 0);
         let tracker = MemTracker::new_root("join owned output construction");
+        let runtime = RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::clone(&tracker)),
+            None,
+            Arc::clone(&error),
+        );
         let factory =
             super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error);
         operator.set_construction_factory(factory.clone());
@@ -2098,8 +2116,17 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
         values.batch().unwrap().clone(),
         ChunkSchema::from_compiled_layout(source.output_layout()).unwrap(),
     );
-    let runtime = RuntimeState::default();
     let tracker = MemTracker::new_root("duplicate hash match cursor");
+    let runtime = RuntimeState::new(
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&tracker)),
+        None,
+        Arc::clone(&error),
+    );
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
     let factory =
         super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error.clone());

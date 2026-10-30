@@ -19,16 +19,16 @@ under the License.
 
 # 分布式部署
 
-分布式部署使用 NovaRocks native 角色能力，将协调节点和计算节点拆分为不同进程。FE 角色提供 MySQL 入口、SQL 解析、优化和 fragment 调度；BE 角色通过独立的 Native Data 与 Control gRPC listener 执行 fragment 和处理控制请求。
+分布式部署使用 NovaRocks native 角色能力，将协调节点和计算节点拆分为不同进程。FE 角色提供 Trino HTTP 与 MySQL 客户端入口、SQL 解析、优化和 fragment 调度；BE 角色通过独立的 Native Data 与 Control gRPC listener 执行 fragment 和处理控制请求。
 
-该模式不依赖 StarRocks FE。当前 Server 只封装 Iceberg 与 Paimon provider；StarRocks 已废弃，没有 active read capability，旧 `[connector.starrocks]` 配置会在启动解析阶段明确失败。
+该模式不依赖 StarRocks FE。当前 Server 的封闭 provider manifest 保留 Iceberg 与 Paimon；Iceberg 保留现有读写能力。Paimon 保留注册、catalog 配置与投影，目录和读取操作返回 `Unsupported`，不进入 pure catalogue。恢复须等待 paimon-rust 及其依赖支持 Arrow 60 与 zstd 0.14，并重新满足 ADR-0138 的授权读取边界，见 [ADR-0204](../../adr/ADR-0204-upstream-iceberg-backports-and-provider-suspension.md)。StarRocks 已废弃，没有 active read capability，旧 `[connector.starrocks]` 配置会在启动解析阶段明确失败。
 
 ## 部署拓扑
 
 典型拓扑如下：
 
 ```text
-MySQL client
+Trino / MySQL client
   |
   v
 NovaRocks role=fe
@@ -41,7 +41,7 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 
 | 角色 | 作用 | 对外端口 |
 | --- | --- | --- |
-| `fe` | 接收 MySQL 连接，解析 SQL，优化计划，调度 fragment 到后端 | MySQL：`[standalone_server].mysql_port`；Native coordinator-report gRPC：`[server].grpc_port`；FE management HTTP：`[server].http_port` |
+| `fe` | 接收客户端语句，解析 SQL，优化计划，调度 fragment 到后端 | Trino HTTP：`[standalone_server].trino_port`；MySQL：`[standalone_server].mysql_port`；Native coordinator-report gRPC：`[server].grpc_port`；FE management HTTP：`[server].http_port` |
 | `be` | 执行 FE 下发的 fragment，处理 exchange、结果回传和 lifecycle control | Native Data gRPC：`[server].grpc_port`；Native Control gRPC：`[server].control_grpc_port`；BE management HTTP：`[server].http_port` |
 
 ## 前提条件
@@ -179,7 +179,7 @@ BE readiness marker 在两条 advertised endpoint 的启动就绪检查成功后
 `*_grpc_port` 是本地 bind 端口，不能替代 NAT 后的 advertised port。`role=be` 不提供
 MySQL 端口，`--port` 参数对 BE 无效。
 
-`[connector.object_store]` 是 native connector 读取 Iceberg 或 Paimon/S3 数据时使用的
+`[connector.object_store]` 是 native connector 当前读取 Iceberg/S3 数据时使用的
 role-local 静态启动配置。静态绑定须使 FE metadata 用途和 BE execution 用途分别获得
 覆盖所需资源的访问权；这不要求两种用途共享 secret。REST Catalog 的 vended 材料
 由签请求的 BE 本地 `StorageAuthority` 按需取得和续期。FE 随凭证租约公告取得路径：
@@ -250,6 +250,8 @@ max_blocking_threads = 64
 
 [standalone_server]
 mysql_port = 9030
+trino_port = 8080
+trino_client_timeout_ms = 300000
 user = "root"
 
 [connector.object_store]
@@ -275,8 +277,8 @@ FE 的 `[runtime.native_ingress]` 只设置本角色 Native report listener 的 
 使 `[state_store]` 成为该 authority 的 durable carrier；StaticFile deployment 仍可配置 SQLite
 作为可重建 Accelerator carrier，但必须只从 static snapshot 读取 catalog truth。membership 只是
 可重建的内存投影：FE 重启后由仍在运行的 BE renew announce 重建。不得添加第二套 metadata store、seed
-或内存 fallback。持久用户表属于 external Iceberg 或 Paimon catalog；只有 Iceberg 当前支持
-native 写入。`[connector.object_store]` 只提供 connector execution 的进程本地凭据。
+或内存 fallback。持久用户表属于 external Iceberg 或 Paimon catalog；Iceberg 当前支持
+native 读写，Paimon 保留 catalog 配置与投影，目录和读取操作已暂停。`[connector.object_store]` 只提供 connector execution 的进程本地凭据。
 
 启动 FE：
 
@@ -288,10 +290,23 @@ NO_PROXY=127.0.0.1,localhost \
 启动成功后会输出：
 
 ```text
-NOVAROCKS_READY mysql_port=9030 pid=<pid>
+NOVAROCKS_READY mysql_port=9030 pid=<pid> trino_port=8080
 ```
 
-当前 MySQL 入口绑定在 `127.0.0.1`。如果需要远程访问，请在 FE 节点上使用 SSH tunnel、反向代理或本机客户端连接。
+FE 的 Trino 与 MySQL 客户端入口固定绑定 `127.0.0.1`，不读取 `[server].host` 扩展监听地址。
+Trino 的 `trino_port` 默认 `8080`，复用 `[standalone_server].user`（默认 `root`）；`trino_client_timeout_ms` 默认 `300000`，
+约束两次针对同一查询的客户端请求间隔，`HEAD nextUri` 也刷新它。单个 HTTP 响应另有 30 秒写出期限；期限到达只中止本次响应，原页可按同 token 重试。
+查询执行继续使用原查询期限与取消。Trino 端口应与 FE 的 MySQL、Native gRPC 和 management HTTP 端口分别配置。
+
+Trino 请求的 Host 必须是 `localhost`、`127.0.0.1` 或 `[::1]`（可带数字端口），否则返回 403；语句请求的 `X-Trino-User`
+必须等于配置用户，否则返回 401。生成 `nextUri` 时保留本机名称及显式端口，并将数字端口规范化。
+该入口没有客户端 TLS 或非空认证；Native trust 不保护客户端 HTTP。如果从其他主机使用客户端，可通过 SSH tunnel 连接 FE 本机入口：
+
+```bash
+ssh -L 18080:127.0.0.1:8080 user@fe-host
+```
+
+随后客户端连接 `http://127.0.0.1:18080`，请求 Host 仍为允许的本机名称；远端身份与通道保护由 SSH 提供。
 
 ## Native 握手资格与文件描述符基线
 
@@ -408,11 +423,32 @@ TLS profile、证书要求、DNS/IP identity、轮换和故障 runbook 见
 
 ## 验证集群
 
-连接 FE：
+在 FE 主机上使用 Trino CLI 连接，SQL 仍采用 NovaRocks 当前方言：
+
+```bash
+trino --server http://127.0.0.1:8080 --user root --execute 'SELECT 1'
+```
+
+`--catalog lake --schema sales` 可把 catalog/schema 名称带入每条语句；服务端只在实际使用名称时解析存在性。
+CLI 按响应头应用 `USE` / `SET` 产生的会话变化。客户端必须沿 `nextUri` 消费至结束页：最后一个数据页仍带 `nextUri`，
+下一次请求才确认它；重试同一 token 得到相同响应，`DELETE nextUri` 请求取消查询。
+
+也可使用原 MySQL 入口：
 
 ```bash
 mysql -h 127.0.0.1 -P 9030 -uroot
 ```
+
+HTTP 入口观察可使用以下两项；它们不证明 BE 已经获得调度资格：
+
+```bash
+curl --noproxy '*' -fsS http://127.0.0.1:8080/v1/info
+curl --noproxy '*' -fsSI http://127.0.0.1:8080/v1/statement
+```
+
+采用 Trino 客户端协议不扩展 SQL 方言、时间语义、元数据查询、预编译语句或多语句事务。
+Trino 呈现对宽整数、无符号整数、opaque 与精度大于 38 的 decimal 在规划期具名拒绝；DDL 与会话语句提供 `updateType`，
+没有真实逻辑写计数时不填 `updateCount`。
 
 查看后端：
 
@@ -428,7 +464,7 @@ SHOW BACKENDS;
 SELECT 1;
 ```
 
-如果集群连接了 external Iceberg 或 Paimon catalog，再执行一条真实表查询，确认 FE 调度、BE 执行和外部存储访问均可用。Paimon 查询还要求外部 GC/expiration 的保留窗口覆盖最长查询时长，详见 [Paimon 只读 Connector](../connectors/paimon.md)。
+如果集群连接了 external Iceberg catalog，再执行一条真实表查询，确认 FE 调度、BE 执行和外部存储访问均可用。配置了 Paimon catalog 时，确认 catalog 投影保留、目录及读取操作返回 `Unsupported`。Paimon 的恢复条件与恢复后的外部 GC/expiration 保留前提见 [Paimon Connector（读取暂停）](../connectors/paimon.md)。
 
 ## 配置与管理 BE
 
@@ -468,6 +504,8 @@ identity 的不同 descriptor announce 也会拒绝。二者完全一致才调�
 1. 在 LB/Gateway 中 external deactivate 旧 FE，先停止把新连接路由到它。
 2. 对旧 FE 发送 `SIGTERM`。它会立即拒绝新 statement/background work，保留已准入 attempt 最多
    300 秒；management `/livez` 在 drain 中仍为 200，`/readyz` 变为 503。
+   Trino 拒绝新的 `POST`，已登记但尚未执行的查询在首次 `GET` 时同样得到 `SERVER_SHUTTING_DOWN`；
+   执行中的查询继续响应取页、取消与心跳，直到结算或原排空期限到达。
 3. 为 Pod 配置 `terminationGracePeriodSeconds: 360`：300 秒 drain + 30 秒 cleanup，外加 30 秒
    orchestrator margin。不要用短于该总预算的 preStop sleep 代替本地 drain。
 4. FE 退出后再停止其 BE，或由外部 orchestrator 按 BE 自己的 drain 协议处理。
@@ -480,13 +518,33 @@ identity 的不同 descriptor announce 也会拒绝。二者完全一致才调�
 | BE 一直不 Eligible | 确认 FE 能访问 BE 的两个 advertised endpoint，特别是 Heartbeat 的 Control 端口；检查 announce 与完整 heartbeat descriptor、process identity 和 build diagnostics。 |
 | `Unauthenticated` 或 native trust startup failure | 检查每个 FE/BE 的 `deployment_id`、environment-resolved secret 与 transport mode 完全一致；不要为恢复连接而删除 `[native_trust]`。 |
 | TLS handshake / certificate failure | 所有 role 必须使用同一 TLS mode；检查 advertised IP/DNS reference 与 certificate SAN，PEM mode 还要检查显式 trust roots。 |
+| Trino 返回 HTTP 403/401 | 使用允许的本机 Host，核对 CLI `--user` 与 FE 配置用户；远程访问通过本机客户端或 SSH tunnel。 |
+| Trino 返回 `ABANDONED_QUERY` | 客户端超过 `trino_client_timeout_ms` 没有拉取或心跳；这与查询执行超时不同。 |
 | 查询报 `role=fe: no live backend available` | 当前 FE 没有可调度的 live BE；先恢复或注册 BE。 |
 | FE 启动时提示缺少 catalog source | StaticFile mode 必须提供可读、完整的 snapshot file；DynamicStateStore mode 必须配置 `[state_store]`。不要使用 core metadata 或内存 registry 作为 fallback。 |
 | BE 启动时配置校验失败 | `role=be` 必须配置 `[cluster].frontend_endpoint` 和非零独立 `[server].control_grpc_port`，且不能配置 FE heartbeat 或 lease 设置。 |
-| Native 或 management endpoint 冲突 | 让 FE MySQL、FE Native gRPC、FE management HTTP、BE Data gRPC、BE Control gRPC、BE management HTTP 使用不重叠的 bind endpoint；同时检查 wildcard bind。 |
+| Native 或 management endpoint 冲突 | 让 FE Trino、FE MySQL、FE Native gRPC、FE management HTTP、BE Data gRPC、BE Control gRPC、BE management HTTP 使用不重叠的 bind endpoint；同时检查 wildcard bind。 |
 | 启动拒绝 Native descriptor baseline | 检查 BE soft `RLIMIT_NOFILE` 至少 1024、FE 至少 2048；在启动环境设置，不依赖 Server 自动提高。 |
 | `/metrics` 在 gRPC port 不可用 | 改访问对应 role 的 `[server].http_port`；metrics 使用 role-local registry，不会跨 FE/BE 混合。 |
 
 ### MEM-1-M07 配置迁移
 
 `[runtime.frontend_workload]` 中的 `control_bytes`、`per_scope_bytes` 已退役，旧键会报配置错误。FE 使用计数准入与固定结果窗口；不再从进程内存上限派生通用 LRA result budget。进程 MemoryAuthority 的控制 floor 使用 `[runtime.memory].control_bytes`，默认保持 64 MiB，FE/BE 进程启动仍在 work account 之前安装该保护。需要调整控制 floor 的部署应把原控制值移到新位置；`per_scope_bytes` 无替代 FE 配置。BE retained 保护与 M03/M04 后续接线边界保持独立。
+
+### FE 分布式执行容量
+
+FE 默认将每个依赖域的累计保管上限设为 12 GiB，将原 Native 进程发送队列的累计字节上限设为 1 GiB。前者包含尚未交付的结果、写入和清理责任；后者覆盖排队及已接收发送的原始字节。它们是准入上限，不是启动时预分配量，也不代表进程 RSS 上限。默认支持目标是至少 8 个完整依赖域，同时保留前台与收尾操作的保护空间；实际支持界由启动时各资源作者的完整报价和物理容量共同验证。
+
+依赖域来自真实选中的 Provider、存储和 Native endpoint，数量不等于 BE 数。同一 BE 的 Data 与 Control endpoint 可能分别形成依赖域。计划使用的完整集合超过当前支持界时，会明确拒绝；系统不会丢弃域、猜测单机数量或自动提高显式配置。
+
+可通过正常部署配置覆盖这两项：
+
+```toml
+[runtime]
+task_backend_max_queued_bytes = 1073741824
+
+[runtime.frontend_workload.dependency_custody]
+retained_payload_bytes = 12884901888
+```
+
+较低的显式值仍按原值执行，可能减少可支持的完整依赖域数量或拒绝相应动作。部署调大上限时，应同时检查完整保管、Native 队列字节与位置、元数据、计算和未交付写入责任；只提高保管字节不能补足物理队列。新默认允许更多累计保管暴露，满载时仍由全局、每域及各执行类别的原准入保护限制。

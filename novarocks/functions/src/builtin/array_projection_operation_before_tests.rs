@@ -45,7 +45,7 @@ fn input(child: ArrayRef, valid: Vec<bool>) -> ArrayRef {
     ))
 }
 #[test]
-fn array_operation_original_run_null_indices_keep_actual_zero_payload_and_can_expand_child_bytes() {
+fn array_operation_original_run_null_indices_keep_nulls_without_hidden_payload_copy() {
     let strings = StringArray::from(vec!["x".repeat(1001), "z".to_string()]);
     let ends = Int32Array::from(vec![4, 8]);
     let run = Arc::new(RunArray::<Int32Type>::try_new(&ends, &strings).unwrap());
@@ -69,14 +69,21 @@ fn array_operation_original_run_null_indices_keep_actual_zero_payload_and_can_ex
         .downcast_ref::<RunArray<Int32Type>>()
         .unwrap();
     let strings = run.values().as_any().downcast_ref::<StringArray>().unwrap();
-    // Original take_run sees primitive raw values, including zero NULL payload.
-    assert_eq!(run.run_ends().values(), &[5, 6, 7, 8]);
-    assert_eq!(strings.len(), 4);
-    assert_eq!(strings.value(0), "x".repeat(1001));
-    assert_eq!(strings.value(1), "z");
-    assert_eq!(strings.value(2), "x".repeat(1001));
-    assert_eq!(strings.value(3), "z");
-    assert!(strings.value_data().len() > source_bytes);
+    assert_eq!(run.run_ends().values(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(
+        strings.iter().collect::<Vec<_>>(),
+        vec![
+            None,
+            Some("x".repeat(1001).as_str()),
+            None,
+            Some("x".repeat(1001).as_str()),
+            None,
+            Some("z"),
+            None,
+            Some("z")
+        ]
+    );
+    assert!(strings.value_data().len() <= 2 * source_bytes);
     let indices = UInt32Array::from(vec![
         None,
         Some(1),
@@ -141,10 +148,10 @@ fn array_operation_original_sparse_union_null_indices_keep_original_type_ids_and
 }
 
 #[test]
-fn array_operation_original_case_colliding_fields_require_the_real_conditional_cast() {
+fn array_operation_case_collision_is_rejected_before_any_output_conversion() {
     use crate::{
         ConstantPolicy, ConstantValue, FunctionArgument, FunctionBindingRequest, FunctionKind,
-        FunctionResultType, FunctionValueType,
+        FunctionValueType,
     };
     use arrow_array::Int64Array;
     use novarocks_type_contract::CompilePhase;
@@ -200,7 +207,7 @@ fn array_operation_original_case_colliding_fields_require_the_real_conditional_c
         },
     ];
     let catalogue = crate::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let binding = catalogue
+    let error = catalogue
         .resolve_bound_user(
             "__array_struct_subfield",
             FunctionKind::Scalar,
@@ -211,27 +218,23 @@ fn array_operation_original_case_colliding_fields_require_the_real_conditional_c
             },
             crate::binding_test_control(),
         )
-        .unwrap();
-    let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
-        panic!("original scalar binding")
-    };
-    let DataType::List(item) = result.data_type() else {
-        panic!("original List result")
-    };
-    // Actual original binder picks the first case-insensitive field, Int32.
-    assert_eq!(item.data_type(), &DataType::Int32);
-    let names: ArrayRef = Arc::new(StringArray::from(vec!["id"; 3]));
-    let output = project(&input, &names, Some(result.data_type())).unwrap();
-    let output = output.as_any().downcast_ref::<ListArray>().unwrap();
-    let values = output
-        .values()
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
-    // ONE original exact-byte projection picks Int64 `id`, then original safe
-    // cast is genuinely necessary. Do not replace binder or projection policy.
-    assert_eq!(
-        values.iter().collect::<Vec<_>>(),
-        vec![Some(123), None, None]
+        .unwrap_err();
+    assert!(
+        matches!(&error, crate::FunctionBindingError::InvalidBinding(message) if message.contains("ambiguous"))
     );
+    let names: ArrayRef = Arc::new(StringArray::from(vec!["id"; 3]));
+    let direct = project(&input, &names, None).unwrap_err();
+    assert!(direct.to_string().contains("ambiguous"));
+    let mut source: &dyn std::error::Error = &direct;
+    loop {
+        if let Some(crate::FunctionBindingError::InvalidBinding(detail)) =
+            source.downcast_ref::<crate::FunctionBindingError>()
+        {
+            assert!(detail.contains("ambiguous"));
+            break;
+        }
+        source = source
+            .source()
+            .expect("binding ambiguity must remain discoverable");
+    }
 }

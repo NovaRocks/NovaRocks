@@ -67,11 +67,14 @@ NOVA_CI_NATIVE_CROSS_PROCESS_CORE="${NOVA_CI_NATIVE_CROSS_PROCESS_CORE:-0}"
 NOVA_CI_NATIVE_CROSS_PROCESS_FULL="${NOVA_CI_NATIVE_CROSS_PROCESS_FULL:-0}"
 NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED="${NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED:-0}"
 
+# Design: ADR-0200 (docs/adr/ADR-0200-advisory-discovery-is-independent-of-admission.md)
 ci_list_stages() {
   cat <<'STAGES'
 {
   "schema": 1,
   "stages": [
+    {"name": "Linux environment tests", "tier": "admission", "domain": ["tools/dev/**"]},
+    {"name": "Aliyun CI platform tests", "tier": "admission", "domain": ["tools/ci/aliyun_ci/**", ".github/workflows/aliyun-ci*.yml"]},
     {"name": "CI build inputs", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "locked Cargo metadata", "tier": "admission", "domain": ["**"]},
     {"name": "Cargo dependency policy", "tier": "admission", "domain": ["**"]},
@@ -99,6 +102,7 @@ ci_list_stages() {
     {"name": "verification composition tests", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "local CI classification tests", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "disabled SQL suite tests", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "Cargo dependency advisories", "tier": "full", "domain": ["Cargo.lock", "deny.toml", "tools/ci/dependency-advisories.py", ".github/workflows/dependency-advisories.yml"]},
     {"name": "memory-model:loom", "tier": "full", "domain": ["novarocks/memory/**", "tools/ci/memory-model-checks.sh"]},
     {"name": "memory-model:miri", "tier": "full", "domain": ["novarocks/memory/**", "tools/ci/memory-model-checks.sh"]},
     {"name": "native-compatibility", "tier": "full", "domain": ["tools/ci/**"]}
@@ -678,6 +682,10 @@ MATERIALS
 }
 
 run_cargo_gates() {
+  run_fail_fast_stage "Linux environment tests" "linux-environment-tests.log" \
+    python3 -m unittest discover -s tools/dev/tests -p 'test_*.py'
+  run_fail_fast_stage "Aliyun CI platform tests" "aliyun-ci-platform-tests.log" \
+    bash -c 'cd tools/ci && python3 -m unittest discover -s aliyun_ci/tests -t . -p "test_*.py"'
   ci_set_default_build_jobs || return $?
   run_fail_fast_stage "CI build inputs" "build-inputs.log" \
     ci_validate_build_inputs "$NOVA_CI_CARGO_PROFILE"
@@ -688,7 +696,7 @@ run_cargo_gates() {
   run_fail_fast_stage "locked Cargo metadata" "cargo-metadata.log" \
     cargo metadata --locked --format-version 1
   run_fail_fast_stage "Cargo dependency policy" "cargo-deny.log" \
-    cargo deny --locked check advisories bans licenses sources
+    cargo deny --locked check bans licenses sources
   run_fail_fast_stage "unused dependencies" "cargo-machete.log" \
     ci_check_unused_dependencies
   run_fail_fast_stage "unused dependencies tests" "cargo-machete-test.log" \
@@ -884,7 +892,7 @@ validate_explicit_suites_early() {
 
   for suite in "${REQUESTED_SUITES[@]}"; do
     if [ "$suite" = "paimon" ]; then
-      echo "error: SQL suite paimon is disabled pending detailed connector design" >&2
+      echo "error: SQL suite paimon is disabled: provider suspended until paimon-rust and its readers support Arrow 60 and zstd 0.14" >&2
       exit 2
     fi
     if ! ci_suite_exists "$REPO_ROOT" "$suite"; then
@@ -1299,6 +1307,9 @@ ci_execute_selected_stage() (
   case "$CI_SELECTED_STAGE" in
     'workspace nextest and doctests')
       ci_stage_native_command "$CI_SELECTED_STAGE" python3 "$SCRIPT_DIR/test-run.py" batch --output "$CI_RUN_DIR/rust-stage"
+      return $? ;;
+    'Cargo dependency advisories')
+      ci_stage_native_command "$CI_SELECTED_STAGE" python3 "$SCRIPT_DIR/dependency-advisories.py" --output "$CI_RUN_DIR/dependency-advisories"
       return $? ;;
     memory-model:loom) ci_stage_native_command "$CI_SELECTED_STAGE" bash "$SCRIPT_DIR/memory-model-checks.sh" --loom; return $? ;;
     memory-model:miri) ci_stage_native_command "$CI_SELECTED_STAGE" bash "$SCRIPT_DIR/memory-model-checks.sh" --miri; return $? ;;

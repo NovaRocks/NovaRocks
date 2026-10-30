@@ -27,13 +27,17 @@ pub use take_host::{
     CopyIndexView, CopyIndices, CopyOperationError, CopyOperationFacts, RetainedTakeResult,
     take_copy_in,
 };
+#[path = "selected_copy/fixed_binary.rs"]
+mod fixed_binary;
+pub use fixed_binary::preflight_fixed_binary_constructor_extent;
 #[path = "selected_copy/construction.rs"]
 mod construction;
 pub use construction::{
-    ValuesCopyKind, copy_nested_values_construction, preflight_empty_construction,
-    preflight_empty_construction_observed, preflight_flat_array_structure_construction,
-    preflight_flat_arrow_structure_construction, preflight_interleave_construction,
-    preflight_null_arrow_structure_observed, preflight_null_structure_construction,
+    ValuesCopyKind, copy_nested_values_construction, preflight_arrow_node_structure_construction,
+    preflight_empty_construction, preflight_empty_construction_observed,
+    preflight_flat_array_structure_construction, preflight_flat_arrow_structure_construction,
+    preflight_interleave_construction, preflight_null_arrow_structure_observed,
+    preflight_null_construction, preflight_null_structure_construction,
     preflight_null_structure_construction_observed, preflight_primitive_vec_adoption_construction,
     preflight_primitive_vec_adoption_construction_observed, preflight_uint64_indices_construction,
     values_copy_kind_observed,
@@ -265,12 +269,40 @@ struct Block {
     raw_null: bool,
     raw_outside: usize,
 }
+impl Block {
+    fn occurrences<E: From<CopyError>>(
+        &self,
+        work: &mut CopyObservation<'_, E>,
+    ) -> Result<usize, E> {
+        let one = self
+            .ranges
+            .iter()
+            .try_fold(self.raw_outside, |count, range| {
+                work.step()?;
+                add(count, range.len()).map_err(E::from)
+            })?;
+        mul(one, self.repeats).map_err(E::from)
+    }
+}
 struct Selection {
     blocks: ChildScratchVec<Block>,
     nulls: usize,
     null_ops: usize,
 }
 impl Selection {
+    fn raw_null_count<E: From<CopyError>>(
+        &self,
+        work: &mut CopyObservation<'_, E>,
+    ) -> Result<usize, E> {
+        self.blocks.iter().try_fold(0, |count, block| {
+            work.step()?;
+            if block.raw_null {
+                add(count, block.occurrences(work)?).map_err(E::from)
+            } else {
+                Ok(count)
+            }
+        })
+    }
     fn len<E: From<CopyError>>(&self, work: &mut CopyObservation<'_, E>) -> Result<usize, E> {
         self.blocks.iter().try_fold(self.nulls, |total, block| {
             work.step()?;
@@ -538,7 +570,9 @@ fn mutable_constructor_geometry<E: From<CopyError>>(
                 work.step()?;
                 let end =
                     add(if concat { cumulative } else { 0 }, dictionary.len()).map_err(E::from)?;
-                // Arrow validates offset + len, including an unused dictionary.
+                // Preserve the existing complete-domain admission, including
+                // unused values. Arrow 60.1 accepts one more entry at its last
+                // representable index; that does not widen this copy profile.
                 if mode != CopyMode::OriginalConcat {
                     limit(end, maximum, CopyLayout::Dictionary).map_err(E::from)?;
                 }
@@ -700,6 +734,45 @@ fn full_child_selection<E: From<CopyError>>(
         nulls: 0,
         null_ops: 0,
     })
+}
+
+fn original_projection_failure<E: From<CopyError>>(cause: CopyConstructionError<E>) -> E {
+    match cause {
+        CopyConstructionError::Creator(cause) => cause,
+        CopyConstructionError::Copy(cause) => cause.into(),
+        CopyConstructionError::Resource(cause) => {
+            CopyError::Control(KernelFailure::from_domain(cause)).into()
+        }
+    }
+}
+
+// Mirror only the SDK's source selection, without declaring SQL nullability.
+// Each recursive field is already the same frozen Arrow carrier; work remains
+// observable and the caller's first control/creator refusal returns unchanged.
+fn field_can_represent_take_null<E: From<CopyError>>(
+    field: &arrow_schema::Field,
+    work: &mut CopyObservation<'_, E>,
+) -> Result<bool, E> {
+    work.step()?;
+    if !field.is_nullable() {
+        return Ok(false);
+    }
+    match field.data_type() {
+        DataType::RunEndEncoded(_, values) => field_can_represent_take_null(values, work),
+        DataType::Union(fields, _) => Ok(take_union_null_child(fields, work)?.is_some()),
+        _ => Ok(true),
+    }
+}
+fn take_union_null_child<E: From<CopyError>>(
+    fields: &arrow_schema::UnionFields,
+    work: &mut CopyObservation<'_, E>,
+) -> Result<Option<i8>, E> {
+    for (id, field) in fields.iter() {
+        if field_can_represent_take_null(field, work)? {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 fn visit<E: From<CopyError>>(
@@ -884,10 +957,13 @@ fn visit<E: From<CopyError>>(
                         let array: &FixedSizeListArray = downcast(sources[source])?;
                         for row in range.clone() {
                             work.step()?;
-                            // Original Arrow take generates UInt32 child indices:
-                            // value_offset returns i32, then is cast to u32. The
-                            // signed bit pattern is not a representability gate.
-                            let start = array.value_offset(row) as u32;
+                            // Arrow60.1 computes the actual usize offset and
+                            // checks its UInt32 conversion. A failed conversion
+                            // belongs to the original SDK ComputeError, before
+                            // any child copy; this projection does not replace it.
+                            let Ok(start) = u32::try_from(array.value_offset_at(row)) else {
+                                continue;
+                            };
                             if let Some(end) = start.checked_add(width as u32) {
                                 work.push(output, start as usize..end as usize)?;
                             }
@@ -994,18 +1070,126 @@ fn visit<E: From<CopyError>>(
         DataType::LargeListView(_) => list_view::<i64, _>(sources, selection, mode, true, work),
         DataType::Union(fields, union_mode) => {
             let _array: &UnionArray = downcast(array)?;
+            let raw_nulls = if mode.is_raw_take() {
+                selection.raw_null_count(work)?
+            } else {
+                0
+            };
+            let null_child = if raw_nulls != 0 {
+                take_union_null_child(fields, work)?
+            } else {
+                None
+            };
+            if raw_nulls != 0 && null_child.is_none() {
+                // The actual SDK returns its ComputeError before taking type
+                // ids or children. Do not turn it into a preflight refusal.
+                return Ok(());
+            }
+            if let Some(invoice) = work.3.as_deref_mut() {
+                if mode.is_raw_take() && raw_nulls != 0 {
+                    invoice.original_nullable_union_scratch(
+                        fields.len(),
+                        rows,
+                        mode,
+                        *union_mode,
+                    )?;
+                } else if mode == CopyMode::Extend && selection.nulls != 0 {
+                    // extend_nulls creates one temporary Vec<i8> per call;
+                    // total null slots bound their summed requests.
+                    invoice.original_union_padding_scratch(selection.nulls)?;
+                }
+            }
+            let padding_child = fields.iter().position(|(_, field)| field.is_nullable());
             if *union_mode == UnionMode::Sparse {
                 for (id, _) in fields.iter() {
                     let children = child_sources(sources, work, |source| {
                         let source: &UnionArray = downcast(source)?;
                         Ok(source.child(id).as_ref())
                     })?;
-                    visit(&children, selection, mode, work)?;
+                    if raw_nulls == 0 || null_child == Some(id) {
+                        visit(&children, selection, mode, work)?;
+                    } else {
+                        let mut child = selection.map_ranges(
+                            work,
+                            |_source, range, raw_null, output, work| {
+                                if !raw_null {
+                                    work.push(output, range.clone())?;
+                                }
+                                Ok(())
+                            },
+                        )?;
+                        for (original, mapped) in
+                            selection.blocks.iter().zip(child.blocks.iter_mut())
+                        {
+                            if original.raw_null {
+                                let count = original.occurrences(work)?;
+                                mapped.raw_null = false;
+                                mapped.raw_outside = 0;
+                                mapped.repeats = count;
+                                if !children[original.source].is_empty() {
+                                    // indices_without_nulls substitutes non-null
+                                    // zero for every unselected sparse child.
+                                    work.push(&mut mapped.ranges, 0..1)?;
+                                }
+                            }
+                        }
+                        if children.iter().all(|child| child.is_empty()) {
+                            // This special SDK route constructs new_null_array,
+                            // drops its top validity, then validates the root.
+                            // Reuse the original zeroed-constructor author.
+                            if let Some(invoice) = work.3.take() {
+                                let mut observe = |boundary| {
+                                    (if boundary {
+                                        work.boundary()
+                                    } else {
+                                        work.step()
+                                    })
+                                    .map_err(CopyConstructionError::Creator)
+                                };
+                                let metadata = match construction::null_node(
+                                    children[0].data_type(),
+                                    rows,
+                                    invoice,
+                                    true,
+                                    &mut observe,
+                                ) {
+                                    Ok(metadata) => metadata,
+                                    Err(CopyConstructionError::Copy(
+                                        CopyError::Invalid(_) | CopyError::Unsupported(_),
+                                    )) => {
+                                        // A nonempty new_null of a fieldless Union
+                                        // still panics in60.1. Keep that SDK outcome;
+                                        // its constructor prefix has already been
+                                        // projected. The borrowed original tree
+                                        // supplies the remaining header envelope.
+                                        crate::array_backing_geometry::copy_metadata_bytes_observed(
+                                            children[0],
+                                            &mut observe,
+                                        )
+                                        .map_err(original_projection_failure)?
+                                    }
+                                    Err(cause) => return Err(original_projection_failure(cause)),
+                                };
+                                invoice.original_null_scratch_metadata(metadata)?;
+                                if matches!(children[0].data_type(), DataType::Union(..)) {
+                                    invoice.original_union_validation_scratch()?;
+                                }
+                                work.3 = Some(invoice);
+                            }
+                        } else {
+                            visit(&children, &child, mode, work)?;
+                        }
+                    }
                 }
             } else {
                 for (child_index, (id, _)) in fields.iter().enumerate() {
                     let mut child =
-                        selection.map_ranges(work, |source, range, _raw_null, output, work| {
+                        selection.map_ranges(work, |source, range, raw_null, output, work| {
+                            // Null offsets retain validity in60.1. The child's
+                            // take must not read payload at the hidden offset.
+                            if mode.is_raw_take() && raw_null {
+                                return Ok(());
+                            }
                             let array: &UnionArray = downcast(sources[source])?;
                             for row in range.clone() {
                                 work.step()?;
@@ -1022,29 +1206,20 @@ fn visit<E: From<CopyError>>(
                         {
                             block.raw_null = false;
                             block.raw_outside = 0;
-                            if original.raw_null && original.raw_outside != 0 && id == 0 {
-                                let array: &UnionArray = downcast(sources[original.source])?;
-                                // Original take_native supplies type-id zero and
-                                // offset zero, independently of source row zero.
-                                if array.child(id).is_empty() {
-                                    block.raw_outside = original.raw_outside;
-                                } else {
-                                    work.push(&mut block.ranges, 0..1)?;
-                                    block.repeats = mul(original.repeats, original.raw_outside)
-                                        .map_err(E::from)?;
-                                }
+                            if original.raw_null && null_child == Some(id) {
+                                block.raw_null = true;
+                                block.raw_outside = original.occurrences(work)?;
+                                block.repeats = 1;
                             }
                             work.step()?;
                         }
                     }
-                    // MutableArrayData appends NULLs to the first declared child
-                    // and casts its end offset to i32. Include that padding in
-                    // both the offset bound and the child's recursive extent.
-                    if mode == CopyMode::Extend && child_index == 0 {
+                    // MutableArrayData60.1 pads the first nullable field;
+                    // ordinary new_null_array still pads its first field.
+                    if mode == CopyMode::Extend && Some(child_index) == padding_child {
                         child.nulls = selection.nulls;
                         child.null_ops = selection.null_ops;
                     }
-                    // Both take and MutableArrayData write signed i32 offsets.
                     if !mode.is_original_operation() {
                         limit(child.len(work)?, i32::MAX as usize, CopyLayout::DenseUnion)
                             .map_err(E::from)?;
@@ -1285,6 +1460,62 @@ fn run<R: RunEndIndexType, E: From<CopyError>>(
 ) -> Result<(), E> {
     if !mode.is_original_operation() {
         limit(selection.len(work)?, maximum, CopyLayout::RunEnd).map_err(E::from)?;
+    }
+    if mode.is_raw_take() && selection.raw_null_count(work)? != 0 {
+        let first: &RunArray<R> = downcast(sources[0])?;
+        if !first.values_field().is_nullable() {
+            // take_run returns before constructing its comparator or children.
+            return Ok(());
+        }
+    }
+    if mode.is_take() && selection.len(work)? != 0 && work.3.is_some() {
+        for source in sources {
+            let source: &RunArray<R> = downcast(*source)?;
+            let bytes = crate::arrow_sort_construction::original_take_comparator_upper_observed(
+                source.values().as_ref(),
+                &mut |boundary| {
+                    if boundary {
+                        work.boundary()
+                    } else {
+                        work.step()
+                    }
+                },
+            )?;
+            work.3
+                .as_deref_mut()
+                .expect("same original invoice")
+                .original_comparator_scratch(bytes)?;
+        }
+    }
+    if mode.is_raw_take() {
+        //60.1 discards hidden integers at NULL logical slots before mapping
+        // valid indices to physical runs. Equal neighbouring values may merge;
+        // one selected value per logical occurrence is a source-derived upper,
+        // so no equality evaluator or alternative output encoding is needed.
+        let mut selected =
+            selection.map_ranges(work, |source, range, raw_null, output, work| {
+                if raw_null || range.is_empty() {
+                    return Ok(());
+                }
+                let array: &RunArray<R> = downcast(sources[source])?;
+                work.boundary()?;
+                let start = array.get_physical_index(range.start);
+                let end = add(array.get_physical_index(range.end - 1), 1).map_err(E::from)?;
+                work.boundary()?;
+                work.push(output, start..end)
+            })?;
+        for (original, mapped) in selection.blocks.iter().zip(selected.blocks.iter_mut()) {
+            work.step()?;
+            if original.raw_null {
+                mapped.raw_outside = original.occurrences(work)?;
+                mapped.repeats = 1;
+            }
+        }
+        let children = child_sources(sources, work, |source| {
+            let source: &RunArray<R> = downcast(source)?;
+            Ok(source.values().as_ref())
+        })?;
+        return visit(&children, &selected, mode, work);
     }
     let mut output = ChildScratchVec::new(work.selection_allocator());
     let mut previous = None;
@@ -1640,7 +1871,8 @@ fn take_construction_core<H>(
             "copy invoice payload/metadata relation is inconsistent",
         ))?;
     let result = add(facts.retained_new_backing_upper(), result_metadata)?;
-    let diagnostic = copy_diagnostic::OriginalTakeDiagnosticFacts::try_new()?;
+    let diagnostic =
+        copy_diagnostic::OriginalTakeDiagnosticFacts::try_new_observed(array.data_type(), work)?;
     facts.admit_original_take_diagnostic(&diagnostic)?;
     work(true)?;
     match ports {
@@ -1700,7 +1932,10 @@ pub fn preflight_take_structure_construction<H>(
     let temporary_metadata = invoice.temporary_metadata_upper()?;
     let result_metadata = invoice.result_metadata_upper();
     let mut facts = invoice.finish(source_metadata)?;
-    let diagnostic = copy_diagnostic::OriginalTakeDiagnosticFacts::try_new()?;
+    let diagnostic = copy_diagnostic::OriginalTakeDiagnosticFacts::try_new_observed(
+        array.data_type(),
+        &mut work,
+    )?;
     facts.admit_original_take_diagnostic(&diagnostic)?;
     work(true)?;
     temporary

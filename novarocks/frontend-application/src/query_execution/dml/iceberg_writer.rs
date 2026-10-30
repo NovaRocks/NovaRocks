@@ -20,25 +20,20 @@
 //! Frontend DML services own production statement routing and transaction
 //! orchestration over these primitives.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::catalog_application::resolver::TargetBackend;
 use crate::connector::backend::ResolvedTable;
 use crate::query_execution::kernels::DmlExecutionKernel;
-use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
-};
-use crate::query_execution::write_transaction::{
-    IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionSpec,
-    IcebergWriteValidationPolicy,
 };
 use novarocks_parser::ast::{Query, Statement};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
-    ConnectorWriteIntent, ConnectorWriteOperationId,
+    ConnectorWriteIntent,
 };
 #[cfg(test)]
 use novarocks_sql::literal::bytes_to_latin1_string;
@@ -55,52 +50,14 @@ pub(crate) enum IcebergWriteMode {
     DynamicPartitionOverwrite,
 }
 
-impl IcebergWriteMode {
-    const fn is_overwrite(self) -> bool {
-        !matches!(self, Self::Append)
-    }
-}
-
-/// Provider-owned identity and snapshot facts for a prepared Iceberg write.
-///
-/// The application layer may preallocate the opaque operation identity, but it
-/// never interprets or constructs Iceberg commit state. In particular, MV
-/// refresh uses this to make the staged writer, snapshot marker, and durable
-/// frontend ledger refer to one attempt before any external action starts.
-#[derive(Clone, Debug)]
-pub(crate) struct IcebergWritePreparationOptions {
-    pub(crate) operation_id: ConnectorWriteOperationId,
-    pub(crate) snapshot_properties: BTreeMap<String, String>,
-}
-
-impl IcebergWritePreparationOptions {
-    pub(crate) fn new(operation_id: ConnectorWriteOperationId) -> Self {
-        Self {
-            operation_id,
-            snapshot_properties: BTreeMap::new(),
-        }
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for staged query-execution DML recovery and connector wiring."
-    )]
-    pub(crate) fn with_snapshot_properties(
-        mut self,
-        snapshot_properties: BTreeMap<String, String>,
-    ) -> Self {
-        self.snapshot_properties = snapshot_properties;
-        self
-    }
-}
-
-/// Prepare an Iceberg write with an application-preallocated operation
-/// identity. This still performs no writer execution or catalog mutation.
+/// Resolve and prepare the original INSERT through direct asynchronous
+/// Provider I/O. The admitted action retains its InitialComputationReservation;
+/// this entry neither reserves the old coordinator nor compiles a native plan.
 #[expect(
     clippy::too_many_arguments,
-    reason = "The write preparation boundary validates the frozen target, options, and owner ports independently; a wrapper would duplicate the write contract."
+    reason = "The write preparation boundary keeps the exact target, statement and provider generation explicit."
 )]
-pub(crate) fn prepare_iceberg_write_with_options(
+pub(crate) async fn prepare_iceberg_write_async(
     state: &DmlExecutionKernel,
     target: &TargetBackend,
     resolved: &ResolvedTable,
@@ -108,80 +65,38 @@ pub(crate) fn prepare_iceberg_write_with_options(
     source: &Query,
     overwrite_mode: IcebergWriteMode,
     target_ref: &str,
-    execution: Option<QueryExecutionContext>,
+    execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    options: IcebergWritePreparationOptions,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-    attempt_reservation: crate::query_execution::completion::QueryAttemptReservation,
+    begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
 ) -> Result<PreparedIcebergWrite, String> {
     debug_assert_eq!(target.provider_id.as_str(), "iceberg");
-
-    // 1. Resolve the write target through the exact planning generation.
-    //
-    // The caller already holds the planning lease, so the metadata is loaded
-    // through that same lease rather than re-resolving `latest`: a concurrent
-    // commit must not be able to split one statement across two generations.
-    // What comes back is neutral -- Arrow schema, bounded planning facts and an
-    // opaque handle -- so this layer no longer holds a concrete Iceberg table.
-    let write_target = crate::connector::write_target::ConnectorWriteTargetBinding::new(
-        crate::connector::metadata_load_connector_table_with_planning_lease(
-            &planning_lease,
-            connector_context.clone(),
-            &target.namespace,
-            &target.table,
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )?,
-        planning_lease,
-    );
-
-    // 2. Provider admission runs on the exact frozen table before source
-    // shaping renders any SQL casts. Unsupported target types must be refused
-    // by their provider even when SQL has no DDL spelling for that type.
-
-    prepare_iceberg_distributed_write(
-        state,
-        target,
-        resolved,
-        insert_columns,
-        source,
-        overwrite_mode,
-        target_ref,
-        &write_target,
-        execution,
-        connector_context,
-        options,
-        attempt_reservation,
+    let context =
+        crate::connector::context_for_planning_lease(&planning_lease, connector_context.clone())?;
+    let metadata = crate::connector::schema_creation::load_frontend_table_async(
+        planning_lease.binding().metadata().as_ref(),
+        novarocks_spi::connector::ConnectorTableRequest {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: planning_lease.binding().descriptor().instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            context,
+        },
     )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The distributed write builder receives separate frozen plan facts and connector capabilities; bundling would duplicate their owner-specific contracts."
-)]
-fn prepare_iceberg_distributed_write(
-    state: &DmlExecutionKernel,
-    target: &TargetBackend,
-    resolved: &ResolvedTable,
-    insert_columns: &[String],
-    source: &Query,
-    overwrite_mode: IcebergWriteMode,
-    target_ref: &str,
-    write_target: &crate::connector::write_target::ConnectorWriteTargetBinding,
-    execution: Option<QueryExecutionContext>,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    options: IcebergWritePreparationOptions,
-    attempt_reservation: crate::query_execution::completion::QueryAttemptReservation,
-) -> Result<PreparedIcebergWrite, String> {
+    .await
+    .map_err(|error| error.to_string())?;
+    let write_target =
+        crate::connector::write_target::ConnectorWriteTargetBinding::new(metadata, planning_lease);
     let write_lease = write_target.derive_write_lease()?;
     let source_control =
         crate::query_execution::planning::sql_compile_control_from_connector_request(
             connector_context,
         );
-    let intent = match overwrite_mode {
-        IcebergWriteMode::Append => ConnectorWriteIntent::Append,
-        IcebergWriteMode::FullTableOverwrite => ConnectorWriteIntent::Overwrite,
-        IcebergWriteMode::DynamicPartitionOverwrite => ConnectorWriteIntent::PartitionOverwrite,
-    };
+    let intent = iceberg_write_intent(overwrite_mode);
+    // The same closed SQL author admits the original provider input before
+    // shaping any casts. This is pure work, never a joining metadata wrapper.
     let (query, source_constants, input) = build_iceberg_write_plan(
         &write_lease,
         target_ref,
@@ -194,26 +109,90 @@ fn prepare_iceberg_distributed_write(
         state.constant_policy(),
         &source_control,
     )?;
-    // One logical data branch, admitted on the same generation that resolved
-    // the target. The session is opened before the plan is compiled because it
-    // owns the recipes that plan's writer node carries.
-    let write_session = crate::query_execution::write_session::begin_connector_write_session(
-        write_target.derive_write_stack_lease(state.typed_connector_control())?,
-        &write_lease,
-        connector_write_begin_request(
-            target,
-            target_ref,
-            intent,
-            input,
-            ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::Ordinary,
-            connector_context.clone(),
-        )?,
-    )?;
+    let catalog_properties = write_lease.catalog_properties().cloned().ok_or_else(|| {
+        "connector write lease has no immutable catalog runtime identity".to_string()
+    })?;
+    // The same original receiving source stores the plan/session before the
+    // Provider child Future's Drop. The action retains this Arc and observes
+    // its local health until actual exit; this phase owns only an alias.
+    let write_session =
+        crate::query_execution::write_session::ConnectorWriteSession::begin_async_in(
+            write_target.derive_write_stack_lease(state.typed_connector_control())?,
+            catalog_properties,
+            connector_write_begin_request(
+                target,
+                target_ref,
+                intent,
+                input,
+                ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::Ordinary,
+                connector_context.clone(),
+            )?,
+            begin_receiving.as_ref(),
+        )
+        .await
+        .map_err(|error| format!("begin connector write session: {error}"))?;
+    let (sql_write_input, table_bindings) =
+        bind_iceberg_session_write_input(target, &write_target, &write_session)?;
+    // Preserve the original RefHead observation and branch validation order.
+    // The write session retains its provider-sealed base independently.
+    let facts = crate::connector::metadata_read_reference_facts_with_planning_lease_async(
+        write_target.lease().clone(),
+        connector_context.clone(),
+        write_target.identity().namespace.as_ref(),
+        write_target.identity().table.as_ref(),
+    )
+    .await?;
+    let _base_snapshot_id = if target_ref == "main" {
+        facts.current_snapshot_id()
+    } else {
+        Some(
+            facts
+                .named_references()
+                .iter()
+                .find(|reference| reference.name.as_ref() == target_ref)
+                .map(|reference| reference.snapshot_id)
+                .ok_or_else(|| {
+                    format!("iceberg ref: branch '{target_ref}' not found in table metadata")
+                })?,
+        )
+    };
+    Ok(finish_iceberg_prepared_write(
+        state,
+        target,
+        query,
+        source_constants,
+        sql_write_input,
+        table_bindings,
+        Some(execution),
+        connector_context,
+        write_session,
+    ))
+}
+
+const fn iceberg_write_intent(overwrite_mode: IcebergWriteMode) -> ConnectorWriteIntent {
+    match overwrite_mode {
+        IcebergWriteMode::Append => ConnectorWriteIntent::Append,
+        IcebergWriteMode::FullTableOverwrite => ConnectorWriteIntent::Overwrite,
+        IcebergWriteMode::DynamicPartitionOverwrite => ConnectorWriteIntent::PartitionOverwrite,
+    }
+}
+
+fn bind_iceberg_session_write_input(
+    target: &TargetBackend,
+    write_target: &crate::connector::write_target::ConnectorWriteTargetBinding,
+    write_session: &crate::query_execution::write_session::ConnectorWriteSession,
+) -> Result<
+    (
+        novarocks_sql::planning::dml::DmlWritePlanInput,
+        Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+    ),
+    String,
+> {
     // The plan's target is the one the session sealed: its input shape carries
     // the provider's field tokens for the very handle the writer carries, so
     // the plan and that writer's recipe cannot name two different signings.
-    let session_target = sole_session_write_target(&write_session)?;
+    let session_target = sole_session_write_target(write_session)?;
     let table_bindings =
         Arc::new(crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()?);
     let target_binding = admit_session_connector_write_target(
@@ -233,16 +212,24 @@ fn prepare_iceberg_distributed_write(
         novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
     )?;
 
-    let connector_operation_id = options.operation_id;
-    // Preserve the journal's historical RefHead observation. This is not the
-    // opaque base sealed into `preparation`; aligning those two values is the
-    // separately recorded F7 lifecycle change.
-    let base_snapshot_id =
-        write_target.journal_ref_head_snapshot_id(target_ref, connector_context.clone())?;
+    Ok((sql_write_input, table_bindings))
+}
+
+fn finish_iceberg_prepared_write(
+    state: &DmlExecutionKernel,
+    target: &TargetBackend,
+    query: Query,
+    source_constants: Option<novarocks_sql::compiler::SqlExpressionConstants>,
+    sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+    execution: Option<QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+) -> PreparedIcebergWrite {
     let semantic_binding = FrozenIcebergWriteSemanticBinding {
         state: state.clone(),
         target: target.clone(),
-        query: query.clone(),
+        query,
         source_constants,
         sql_write_input,
         table_bindings,
@@ -250,26 +237,9 @@ fn prepare_iceberg_distributed_write(
         connector_context: connector_context.clone(),
         write_session,
     };
-    let spec = IcebergWriteTransactionSpec {
-        is_overwrite: overwrite_mode.is_overwrite(),
-        attempt_id: connector_operation_id.to_string(),
-        commit: IcebergWriteCommitPolicy {
-            base_snapshot_id,
-            base_snapshot_map: BTreeMap::new(),
-            target_ref: target_ref.to_string(),
-            snapshot_properties: options.snapshot_properties,
-        },
-        validation: IcebergWriteValidationPolicy {
-            require_v3_for_branch: target_ref != "main",
-        },
-        source: IcebergWriteSource::CoordinatedPlan,
-    };
-    Ok(PreparedIcebergWrite {
+    PreparedIcebergWrite {
         semantic_binding: Arc::new(semantic_binding),
-        spec,
-        native_assembly: Mutex::new(None),
-        attempt_reservation: Mutex::new(Some(attempt_reservation)),
-    })
+    }
 }
 
 /// Build the begin request for one distributed write.
@@ -342,35 +312,23 @@ pub(crate) fn sole_session_write_target(
 
 pub(crate) struct PreparedIcebergWrite {
     semantic_binding: Arc<FrozenIcebergWriteSemanticBinding>,
-    spec: IcebergWriteTransactionSpec,
-    native_assembly: Mutex<Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>>,
-    /// This exact reservation collected every vended response observed while
-    /// preparing the write. It is consumed only when the matching native
-    /// bundle is submitted to the raw attempt lifecycle.
-    attempt_reservation: Mutex<Option<crate::query_execution::completion::QueryAttemptReservation>>,
 }
 
 impl PreparedIcebergWrite {
-    pub(crate) fn target(&self) -> &TargetBackend {
-        &self.semantic_binding.target
-    }
-
-    pub(crate) fn is_overwrite(&self) -> bool {
-        self.spec.is_overwrite
-    }
-
-    pub(crate) fn base_snapshot_id(&self) -> Option<i64> {
-        self.spec.commit.base_snapshot_id
-    }
-
-    fn prepare_native_assembly_for_execution(
+    /// Compile only after the original action has installed this Prepared and
+    /// session in its stable source. The phase Future merely borrows them.
+    pub(crate) async fn prepare_native_assembly_for_execution_async(
         &self,
-        execution: Option<&QueryExecutionContext>,
+        provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
+        query_options: Option<novarocks_proto_codec::lifecycle::QueryOptions>,
     ) -> Result<
         crate::query_execution::compiler::PreparedDmlWriteAssembly,
         crate::dml::error::DmlExecutionError,
     > {
-        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session_and_constants(
+        let execution = self.semantic_binding.execution.as_ref().ok_or_else(|| {
+            "async Iceberg write compilation requires the original admitted execution".to_string()
+        })?;
+        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session_and_constants_async(
             &self.semantic_binding.state,
             Some(&self.semantic_binding.target.catalog),
             &self.semantic_binding.target.namespace,
@@ -378,71 +336,13 @@ impl PreparedIcebergWrite {
             self.semantic_binding.source_constants.clone(),
             self.semantic_binding.sql_write_input.clone(),
             Arc::clone(&self.semantic_binding.table_bindings),
-            None,
+            query_options,
             novarocks_sql::compiler::RootDistributionRequirement::Any,
             execution,
             &self.semantic_binding.connector_context,
             Arc::clone(&self.semantic_binding.write_session),
-        )
-    }
-
-    /// Plan this INSERT's write if it has not been planned, then submit it.
-    ///
-    /// The plan is encoded when it is prepared, so submitting it takes
-    /// nothing the caller has to assemble first.
-    pub(crate) fn run_coordinated_write(
-        &self,
-    ) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
-        {
-            let mut assembly = self
-                .native_assembly
-                .lock()
-                .expect("prepared Iceberg write native assembly lock poisoned");
-            if assembly.is_none() {
-                *assembly = Some(self.prepare_native_assembly_for_execution(
-                    self.semantic_binding.execution.as_ref(),
-                )?);
-            }
-        }
-        let assembly = self
-            .native_assembly
-            .lock()
-            .expect("prepared Iceberg write native assembly lock poisoned")
-            .take()
-            .ok_or_else(|| {
-                "prepared Iceberg write native assembly was already consumed".to_string()
-            })?;
-        let (query_execution, request) = assembly.into_request()?;
-        let attempt_reservation = self
-            .attempt_reservation
-            .lock()
-            .expect("prepared Iceberg write attempt reservation lock poisoned")
-            .take()
-            .ok_or_else(|| {
-                "prepared Iceberg write attempt reservation was already consumed".to_string()
-            })?;
-        let outcome = query_execution
-            .execute_prepared_raw(
-                crate::query_execution::completion::PreparedRawDistributedRequest::new(request)
-                    .with_attempt_reservation(attempt_reservation),
-            )
-            .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
-            .map_err(crate::dml::error::DmlExecutionError::from_distributed)?;
-        Ok(outcome.into_execution_result())
-    }
-
-    /// Convert a validated Iceberg write into SQL's inert distributed-write
-    /// handoff. This registers no writer attempt and executes no query; the
-    /// connector control service has already retained the provider-private
-    /// committer under the operation identity carried by the resulting plan.
-    ///
-    /// Frontend application owners use this form when they must persist their
-    /// intent and retain an exact connector lease before submitting native
-    /// fragments.
-    pub(crate) fn terminal_request_context(
-        &self,
-    ) -> novarocks_spi::connector::ConnectorRequestContext {
-        self.semantic_binding.connector_context.clone()
+            provider_source,
+        ).await
     }
 
     pub(crate) fn finalize(&self) -> Result<(), String> {
@@ -1201,10 +1101,12 @@ mod tests {
         }
         let ty = FunctionValueType::new(DataType::Binary, true);
         let metadata = write_metadata(
-            vec![
-                Field::new("v", DataType::Binary, true)
-                    .with_metadata([("nr_logical_type".into(), "unknown".into())].into()),
-            ],
+            vec![Field::new("v", DataType::Binary, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "nr_logical_type".into(),
+                    "unknown".into(),
+                )]),
+            )],
             vec![ty.clone()],
         );
         let columns = insert_columns_from_connector_metadata(&metadata, &HashMap::new()).unwrap();
@@ -1379,10 +1281,19 @@ mod tests {
     }
 
     #[test]
-    fn write_mode_preserves_append_and_overwrite_classification() {
-        assert!(!IcebergWriteMode::Append.is_overwrite());
-        assert!(IcebergWriteMode::FullTableOverwrite.is_overwrite());
-        assert!(IcebergWriteMode::DynamicPartitionOverwrite.is_overwrite());
+    fn write_mode_preserves_provider_intent() {
+        assert_eq!(
+            iceberg_write_intent(IcebergWriteMode::Append),
+            ConnectorWriteIntent::Append
+        );
+        assert_eq!(
+            iceberg_write_intent(IcebergWriteMode::FullTableOverwrite),
+            ConnectorWriteIntent::Overwrite
+        );
+        assert_eq!(
+            iceberg_write_intent(IcebergWriteMode::DynamicPartitionOverwrite),
+            ConnectorWriteIntent::PartitionOverwrite
+        );
     }
 
     #[test]
@@ -1848,6 +1759,13 @@ mod provider_admission_before_shaping_tests {
         .unwrap();
         let metadata =
             super::tests::write_metadata(vec![value.try_to_field("key").unwrap()], vec![value]);
+        run_with_metadata(metadata, failure)
+    }
+
+    fn run_with_metadata(
+        metadata: novarocks_spi::connector::ConnectorTableMetadata,
+        failure: Option<ConnectorErrorKind>,
+    ) -> (String, Arc<Control>) {
         let columns = insert_columns_from_connector_metadata(&metadata, &HashMap::new()).unwrap();
         // This source cannot be shaped without inventing a SQL UUID spelling.
         let source = super::tests::parse_query("SELECT NULL");
@@ -1925,5 +1843,138 @@ mod provider_admission_before_shaping_tests {
             );
             assert_eq!(control.calls.load(Ordering::SeqCst), 1);
         }
+    }
+
+    struct AsyncAdmissionMetadata {
+        owner: novarocks_spi::connector::ConnectorInstanceId,
+        release: tokio::sync::Notify,
+        observed: AtomicUsize,
+        created: AtomicUsize,
+        value: novarocks_type_contract::FunctionValueType,
+    }
+    impl novarocks_spi::connector::ConnectorMetadata for AsyncAdmissionMetadata {
+        fn instance_id(&self) -> &novarocks_spi::connector::ConnectorInstanceId {
+            &self.owner
+        }
+        fn namespace_exists(
+            &self,
+            _: novarocks_spi::connector::ConnectorNamespaceRequest,
+        ) -> Result<bool, ConnectorError> {
+            unreachable!("write target load does not probe a namespace")
+        }
+        fn table_exists(
+            &self,
+            _: novarocks_spi::connector::ConnectorTableRequest,
+        ) -> Result<bool, ConnectorError> {
+            unreachable!("write target load does not probe table existence")
+        }
+        fn list_tables(
+            &self,
+            _: novarocks_spi::connector::ConnectorListTablesRequest,
+        ) -> Result<Vec<novarocks_spi::connector::ConnectorTableIdentity>, ConnectorError> {
+            unreachable!("write target load does not list tables")
+        }
+        fn load_table(
+            &self,
+            _: novarocks_spi::connector::ConnectorTableRequest,
+            _: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
+            panic!("async INSERT must not call the synchronous joining table load")
+        }
+        fn prepare_table(
+            &self,
+            request: novarocks_spi::connector::ConnectorTableRequest,
+        ) -> novarocks_spi::connector::ConnectorTablePreparationFuture<'_> {
+            Box::pin(async move {
+                assert_eq!(request.table.instance_id, self.owner);
+                assert_eq!(
+                    request.resolution,
+                    novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable
+                );
+                self.observed.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+                Ok(novarocks_spi::connector::ConnectorTablePreparation::new(
+                    self.owner.clone(),
+                    request.table,
+                ))
+            })
+        }
+        fn create_prepared_table(
+            &self,
+            preparation: novarocks_spi::connector::ConnectorTablePreparation,
+            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
+            let identity = preparation
+                .into_facts::<novarocks_spi::connector::ConnectorTableIdentity>(&self.owner)?;
+            self.created.fetch_add(1, Ordering::SeqCst);
+            crate::connector::schema_creation::declared_test_metadata_with_creation(
+                novarocks_spi::connector::ConnectorTableMetadataHeader {
+                    identity,
+                    planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+                    definition_facts:
+                        novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
+                    version: None,
+                    statistics_data_version: None,
+                    table: novarocks_spi::connector::ConnectorTableHandle::try_new(
+                        self.owner.clone(),
+                        bytes::Bytes::from_static(b"target"),
+                    )?,
+                },
+                Arc::new(arrow::datatypes::Schema::new(vec![
+                    self.value.try_to_field("key").unwrap(),
+                ])),
+                vec![self.value.clone()],
+                creation,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn async_target_observation_keeps_provider_admission_before_source_shaping() {
+        use futures::FutureExt;
+        let provider = AsyncAdmissionMetadata {
+            owner: novarocks_spi::connector::ConnectorInstanceId::parse("writer_domain_test")
+                .unwrap(),
+            release: tokio::sync::Notify::new(),
+            observed: AtomicUsize::new(0),
+            created: AtomicUsize::new(0),
+            value: novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                arrow::datatypes::DataType::FixedSizeBinary(16),
+                true,
+                novarocks_type_contract::ValueLogicalType::Uuid,
+            )
+            .unwrap(),
+        };
+        let stop = novarocks_spi::connector::ConnectorStopOwner::default();
+        let context = crate::connector::connector_request_context(None, stop.view()).unwrap();
+        let request = novarocks_spi::connector::ConnectorTableRequest {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: provider.owner.clone(),
+                namespace: Arc::from("db"),
+                table: Arc::from("target"),
+            },
+            resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            context,
+        };
+        let load = crate::connector::schema_creation::load_frontend_table_async(&provider, request);
+        tokio::pin!(load);
+        assert!(load.as_mut().now_or_never().is_none());
+        assert_eq!(provider.observed.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.created.load(Ordering::SeqCst), 0);
+        provider.release.notify_one();
+        let metadata = load.await.unwrap();
+        assert_eq!(provider.created.load(Ordering::SeqCst), 1);
+        // The actual original SELECT source still cannot be rendered as UUID;
+        // the same provider author must reject it before that SQL projection.
+        let (error, control) = run_with_metadata(metadata, None);
+        assert!(error.contains("Iceberg uuid writes are not supported"));
+        assert!(!error.contains("UUID has no SQL DDL type spelling"));
+        assert_eq!(control.calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -68,6 +68,7 @@
 
 mod admission;
 mod cancellation;
+pub mod joint_admission;
 mod observation;
 mod queue;
 mod resource;
@@ -78,6 +79,7 @@ pub use admission::{
     QueryAdmission, ResultQueryAdmission, Stage, StageAdmission, StagePermit, StageRequest,
 };
 pub use cancellation::{CancellationReason, CancellationView};
+pub use joint_admission::ResponsibilityConfig;
 pub use observation::{
     ControlIntent, ControlIntents, ControlPermit, Obligation, ObligationEndSnapshot, ObligationKey,
     ObligationKind, ObligationSnapshot, OwnerState, RootLifecycleSnapshot, ScopeSnapshot,
@@ -89,15 +91,17 @@ pub use resource::{
 };
 pub use result_window::{
     ResultCapacityConfig, ResultCapacityHandle, ResultCapacitySnapshot, ResultClosingCut,
-    ResultWindowAlias, ResultWindowClass, ResultWindowGrant,
+    ResultPayloadBytes, ResultWindowAlias, ResultWindowClass, ResultWindowGrant,
 };
+pub use role_poll::{PollRoleGeometry, PollRoleSourceBacking};
 pub use scope::{
     BusinessPermit, CountedWorkloadControlParts, DeadlineExpiryHandle, PendingQueryRoot,
     QueryConcurrencyPermit, RootAdmissionHandle, RootWork, ServingState,
     WorkCancellationRequestOutcome, WorkCancellationRequester, WorkClass, WorkId, WorkOwner,
-    WorkRequest, WorkScope, WorkSuccessSealOutcome, WorkSuccessSealer, WorkloadConfig,
-    WorkloadControl, WorkloadControlParts, WorkloadProgress, WorkloadProgressRevision,
-    WorkloadShutdown, WorkloadShutdownError, WorkloadShutdownFailure,
+    WorkRequest, WorkRetirementObserver, WorkScope, WorkSuccessSealOutcome, WorkSuccessSealer,
+    WorkloadConfig, WorkloadControl, WorkloadControlParts, WorkloadProgress,
+    WorkloadProgressNotification, WorkloadProgressRevision, WorkloadShutdown,
+    WorkloadShutdownError, WorkloadShutdownFailure,
 };
 
 mod failure_projection;
@@ -144,3 +148,13 @@ impl std::fmt::Display for WorkError {
 }
 
 impl std::error::Error for WorkError {}
+
+mod control_storage;
+mod role_poll;
+
+pub use control_storage::ControlStorageConfig;
+pub use role_poll::ingress::{MountAttempt, RoleIngress};
+pub use role_poll::{
+    PollCompletion, PollFailure, PollOutput, PollTurnCompletion, RoleBackingRetirementObserver,
+    RolePollBank,
+};

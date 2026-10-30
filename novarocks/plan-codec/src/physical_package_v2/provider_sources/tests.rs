@@ -312,7 +312,9 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
         pure.clone(),
     )
     .unwrap();
-    let attrs = |original: &HashMap<String, String>| {
+    let attrs = |original: &arrow::datatypes::Metadata| {
+        // Borrow Arrow attributes, then author the independent domain HashMap
+        // with its original reserve and copied String invoice.
         let table = novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<
             String,
             String,

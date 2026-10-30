@@ -17,6 +17,7 @@
 
 """Machine authority tests; Docker effects are observed independently."""
 import copy
+import io
 import json
 from pathlib import Path
 import sys
@@ -34,12 +35,12 @@ import machine_runtime as machine
 
 
 def bom():
-    return {"lock_sha256": "locked-inputs", "images": {
+    return {"schema": 2, "platform": "linux/arm64", "lock_sha256": "locked-inputs", "images": {
         n: {"alias": n, "manifest_digest": "sha256:" + n, "platform": "linux/arm64"}
-        for n in ("minio", "minio-mc", "iceberg-rest")}, "derived_images": {
+        for n in ("iceberg-rest",)}, "derived_images": {
         n: {"alias": n + ":current", "image_id": "sha256:" + n,
             "definition_sha256": "definition-" + n, "platform": "linux/arm64"}
-        for n in ("iceberg-spark", "rest-mv")}}
+        for n in ("minio", "minio-mc", "iceberg-spark", "rest-mv")}}
 
 
 class Backend:
@@ -137,6 +138,39 @@ class Backend:
 
     def disconnect(self, record, container):
         self.events.append(("disconnect", container))
+
+
+class DerivedObjectStoreInputTests(unittest.TestCase):
+    def test_object_store_uses_exact_derived_ids_and_definition_facts(self):
+        inputs = bom()
+        inputs["derived_images"]["minio"]["alias"] = "mutable-minio-alias"
+        inputs["derived_images"]["minio-mc"]["alias"] = "mutable-mc-alias"
+        backend = Backend()
+        with mock.patch.object(backend, "image_id", wraps=backend.image_id) as inspect:
+            images, facts = machine.input_facts(inputs, backend)
+        self.assertEqual(images["minio"]["image_id"], "sha256:minio")
+        self.assertEqual(images["mc"]["image_id"], "sha256:minio-mc")
+        self.assertEqual(images["mc-init"], images["mc"])
+        self.assertEqual(facts["minio"]["receipt"]["definition_sha256"], "definition-minio")
+        self.assertEqual(facts["minio-mc"]["receipt"]["definition_sha256"], "definition-minio-mc")
+        self.assertIn(mock.call("sha256:minio"), inspect.call_args_list)
+        self.assertIn(mock.call("sha256:minio-mc"), inspect.call_args_list)
+        self.assertNotIn(mock.call("mutable-minio-alias"), inspect.call_args_list)
+        self.assertNotIn(mock.call("mutable-mc-alias"), inspect.call_args_list)
+
+    def test_object_store_requires_derived_definition_and_exact_installed_id(self):
+        for name in ("minio", "minio-mc"):
+            with self.subTest(name=name, fault="definition"):
+                inputs = bom()
+                inputs["derived_images"][name].pop("definition_sha256")
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "derived definition identity is missing"):
+                    machine.input_facts(inputs, Backend())
+            with self.subTest(name=name, fault="image"):
+                backend = Backend()
+                original = backend.image_id
+                with mock.patch.object(backend, "image_id", side_effect=lambda reference: "sha256:other" if reference == "sha256:" + name else original(reference)):
+                    with self.assertRaisesRegex(runtime.RuntimeFailure, "derived image differs from verified receipt"):
+                        machine.input_facts(bom(), backend)
 
 
 class SupervisionPrerequisiteTests(unittest.TestCase):
@@ -303,6 +337,178 @@ class ReadonlyControlTimeoutTests(unittest.TestCase):
                 {"undispatched":True,"missing_output":True,"changes":{"cli_pid":12345}}):
             with self.subTest(kwargs=kwargs):
                 self.assertIs(self.invoke(**kwargs).readonly_deadline_settled, False)
+
+
+class FailedReadonlyObservationRecoveryTests(unittest.TestCase):
+    def fixture(self, directory):
+        directory = str(Path(directory).resolve())
+        backend = machine.MachineDocker()
+        daemon = "test-daemon"
+        base = Path(directory) / ("machine-" + runtime.digest(daemon)[:16])
+        path = base / "operations" / ("control-" + "a" * 32 + ".json")
+        state = dict(schema=machine.PROTOCOL, kind="machine", id=base.name, daemon_id=daemon,
+                     control_root=directory, project=machine.PROJECT,
+                     required_services=["minio", "mc-init", "rest", "rest-mv", "spark"])
+        fact = dict(schema=1, kind="control", phase="cleanup-failed", error="PermissionError",
+                    control_root=directory, machine=base.name, mutating=False,
+                    command_dispatched=True, cli_pid=12345, group_exit_confirmed=False)
+        request = dict(operation="control", deadline_monotonic=1234.5, environment={"PATH": "/usr/bin"},
+                       args=["ps", "-a", "--filter", "label=com.docker.compose.project=" + machine.PROJECT,
+                             "--filter", "label=com.docker.compose.service=rest-mv", "--format", "{{.ID}}"])
+        for name, value in ((base / "state.json", state), (path, fact), (path.with_suffix(".request"), request)):
+            runtime.atomic_json(name, value)
+        backend.maintenance_fd, backend.maintenance_base = 123, base
+        return backend, base, path, fact, request
+
+    def test_explicit_settlement_preserves_failure_and_unknown_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend, base, path, fact, request = self.fixture(directory)
+            self.assertEqual(backend.unsettled_operations(base), [(path, fact)])
+            with mock.patch.object(backend, "command", side_effect=AssertionError("no new Docker command")):
+                self.assertTrue(backend.reconcile_failed_readonly_control(path, runtime.read_json(path), base))
+            result = runtime.read_json(path)
+            self.assertEqual({k: v for k, v in result.items() if k != "observation_disposition"}, fact)
+            self.assertNotIn("leader_waited", result)
+            self.assertNotIn("group_exit_observed", result)
+            self.assertEqual(result["observation_disposition"]["mutation_obligation"], "none")
+            self.assertEqual(result["phase"], "cleanup-failed")
+            self.assertEqual(backend.unsettled_operations(base), [])
+            self.assertEqual(backend.unsettled_operations(base, include_disposed=True), [(path, result)])
+            self.assertEqual(runtime.read_json(path.with_suffix(".request")), request)
+            status = backend.failed_observation_status(base)
+            self.assertEqual(status[0]["error"], "PermissionError")
+            self.assertTrue(status[0]["disposition_valid"])
+
+    def test_undisposed_readonly_requires_explicit_owner_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend, base, path, fact, _ = self.fixture(directory)
+            backend.maintenance_fd = None
+            self.assertFalse(backend.reconcile_failed_readonly_control(path, fact, base))
+            self.assertEqual(runtime.read_json(path), fact)
+            self.assertEqual(len(backend.unsettled_operations(base)), 1)
+
+    def test_mutation_or_forged_request_remains_blocked(self):
+        mutations = ("mutating", "exec", "unknown-verb", "mutation-with-inspect-word", "foreign-machine")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                backend, base, path, fact, request = self.fixture(directory)
+                if mutation == "mutating": fact["mutating"] = True
+                if mutation == "exec": request["args"] = ["exec", "container", "sh"]
+                if mutation == "unknown-verb": request["args"] = ["unknown", "inspect", "container"]
+                if mutation == "mutation-with-inspect-word": request["args"] = ["run", "inspect", "container"]
+                if mutation == "foreign-machine": fact["machine"] = "machine-foreign"
+                runtime.atomic_json(path, fact)
+                runtime.atomic_json(path.with_suffix(".request"), request)
+                self.assertFalse(backend.reconcile_failed_readonly_control(path, fact, base))
+                self.assertEqual(runtime.read_json(path), fact)
+                self.assertEqual(len(backend.unsettled_operations(base)), 1)
+
+    def test_readonly_verbs_and_different_original_failure_shapes_are_preserved(self):
+        cases = (["info", "--format", "{{.ID}}"], ["version"], ["inspect", "container"],
+                 ["context", "show"], ["context", "inspect", "local"],
+                 ["container", "inspect", "container"], ["image", "inspect", "image"],
+                 ["network", "inspect", "network"], ["volume", "inspect", "volume"],
+                 ["ps", "--all", "--format", "{{.ID}}"])
+        for index, args in enumerate(cases):
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as directory:
+                backend, base, path, fact, request = self.fixture(directory)
+                fact.update(phase="command-unknown", error="ArbitraryOriginalFailure",
+                            command_exit=1, leader_waited=True, group_exit_observed=True,
+                            group_exit_confirmed=True, command_succeeded=False, timed_out=False)
+                if index % 2:
+                    fact.pop("error")
+                    fact.pop("leader_waited")
+                    fact.pop("group_exit_observed")
+                request["args"] = args
+                runtime.atomic_json(path, fact)
+                runtime.atomic_json(path.with_suffix(".request"), request)
+                self.assertTrue(backend.readonly_command(args))
+                self.assertTrue(backend.reconcile_failed_readonly_control(path, fact, base))
+                saved = runtime.read_json(path)
+                self.assertEqual({k: v for k, v in saved.items() if k != "observation_disposition"}, fact)
+                self.assertEqual(backend.unsettled_operations(base), [])
+                self.assertTrue(backend.failed_observation_status(base)[0]["disposition_valid"])
+                self.assertEqual(runtime.read_json(path.with_suffix(".request")), request)
+
+    def test_copied_disposition_cannot_hide_changed_request_or_failure(self):
+        for change in ("request", "failure"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                backend, base, path, _, request = self.fixture(directory)
+                self.assertTrue(backend.reconcile_failed_readonly_control(path, runtime.read_json(path), base))
+                result = runtime.read_json(path)
+                if change == "request":
+                    request["args"] = ["rm", "-f", "container"]
+                    runtime.atomic_json(path.with_suffix(".request"), request)
+                else:
+                    result["cli_pid"] += 1
+                    runtime.atomic_json(path, result)
+                self.assertEqual(len(backend.unsettled_operations(base)), 1)
+                self.assertFalse(backend.failed_observation_status(base)[0]["disposition_valid"])
+
+
+class ReadonlyObservationOwnerTests(unittest.TestCase):
+    def fixture(self, directory):
+        backend, base, path, fact, request = FailedReadonlyObservationRecoveryTests().fixture(directory)
+        state = runtime.read_json(base / "state.json")
+        state.update(phase="ready", credentials={"secret_key": "must-not-escape"})
+        runtime.atomic_json(base / "state.json", state)
+        owner = machine.MachineOwner(directory, backend=backend, daemon="test-daemon")
+        return owner, backend, base, path, fact, request
+
+    def test_exact_owner_resolution_is_idempotent_and_does_not_sweep(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner, backend, base, path, fact, request = self.fixture(directory)
+            with mock.patch.object(backend, "daemon_id", return_value="test-daemon"), \
+                    mock.patch.object(backend, "settle_operations", side_effect=AssertionError("no operation loop")), \
+                    mock.patch.object(backend, "command", side_effect=AssertionError("no Docker mutation")):
+                first = owner.resolve_readonly_observation(path)
+                identity = backend._terminal_material(path)
+                second = owner.resolve_readonly_observation(path)
+                self.assertEqual(backend._terminal_material(path), identity)
+            self.assertEqual(first, second)
+            self.assertTrue(first["disposition_valid"])
+            self.assertEqual(first["phase"], "cleanup-failed")
+            self.assertFalse(first["original_completion"]["group_exit_confirmed"])
+            self.assertNotIn("leader_waited", first["original_completion"])
+            self.assertNotIn("must-not-escape", json.dumps(first))
+            self.assertEqual(runtime.read_json(path.with_suffix(".request")), request)
+            self.assertIsNone(getattr(backend, "operation_deadline", None))
+
+    def test_mutation_foreign_path_or_daemon_is_rejected_without_rewrite(self):
+        for kind in ("mutation", "foreign-path", "daemon"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                owner, backend, base, path, fact, _ = self.fixture(directory)
+                if kind == "mutation":
+                    fact["mutating"] = True
+                    runtime.atomic_json(path, fact)
+                before = path.read_bytes()
+                target = path if kind != "foreign-path" else base.parent / "foreign" / path.name
+                daemon = "foreign-daemon" if kind == "daemon" else "test-daemon"
+                with mock.patch.object(backend, "daemon_id", return_value=daemon):
+                    with self.assertRaises(runtime.RuntimeFailure): owner.resolve_readonly_observation(target)
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_cli_dispatches_only_exact_journal_and_redacts_output(self):
+        resolver = mock.Mock(return_value={"phase": "cleanup-failed", "error": "OriginalFailure",
+                                          "credentials": {"secret_key": "must-not-escape"}})
+        owner = SimpleNamespace(resolve_readonly_observation=resolver)
+        target = Path("/exact/machine/operations/control.json")
+        output = io.StringIO()
+        with mock.patch.object(machine, "MachineOwner", return_value=owner), \
+                mock.patch.object(runtime, "install_signal_handlers"), mock.patch.object(sys, "stdout", output):
+            self.assertEqual(machine.main(["resolve-readonly-observation", "--journal", str(target)]), 0)
+        resolver.assert_called_once_with(target)
+        self.assertNotIn("must-not-escape", output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["error"], "OriginalFailure")
+
+    def test_cli_preserves_owner_refusal_as_error(self):
+        owner = SimpleNamespace(resolve_readonly_observation=mock.Mock(side_effect=
+            runtime.RuntimeFailure("MachineOperationUnconfirmed", "not a readonly request")))
+        error = io.StringIO()
+        with mock.patch.object(machine, "MachineOwner", return_value=owner), \
+                mock.patch.object(runtime, "install_signal_handlers"), mock.patch.object(sys, "stderr", error):
+            self.assertEqual(machine.main(["resolve-readonly-observation", "--journal", "/exact/control.json"]), 1)
+        self.assertIn("MachineOperationUnconfirmed", error.getvalue())
 
 
 class TerminalPortRecoveryTests(unittest.TestCase):
@@ -619,6 +825,56 @@ class MachineTests(unittest.TestCase):
 
     def changed(self):
         return self.definition(ports={"rest": 31002})
+
+    def test_readonly_check_missing_machine_creates_no_state_or_lock(self):
+        self.assertFalse(self.owner.root.exists())
+        self.assert_code("MachineUnavailable", lambda: self.owner.check_ready(bom()))
+        self.assertFalse(self.owner.root.exists())
+        self.assertEqual(self.backend.events, [])
+        self.assertIsNone(getattr(self.backend, "maintenance_fd", None))
+
+    def test_readonly_check_reuses_exact_readiness_without_rewrites_or_journals(self):
+        original = self.start()
+        before = {str(path.relative_to(self.owner.root)): (path.stat().st_mtime_ns, path.read_bytes())
+                  for path in self.owner.root.rglob("*") if path.is_file()}
+        events = list(self.backend.events)
+        def healthy(state):
+            self.assertIsNone(getattr(self.backend, "maintenance_fd", None))
+            self.assertIsNone(getattr(self.backend, "maintenance_base", None))
+            return True
+        with mock.patch.object(self.backend, "healthy", side_effect=healthy):
+            actual = self.owner.check_ready(bom())
+        self.assertEqual(actual["generation"], original["generation"])
+        self.assertEqual(actual["version"], original["version"])
+        self.assertTrue(actual["observed_healthy"])
+        after = {str(path.relative_to(self.owner.root)): (path.stat().st_mtime_ns, path.read_bytes())
+                 for path in self.owner.root.rglob("*") if path.is_file()}
+        self.assertEqual(after, before)
+        self.assertEqual(self.backend.events, events)
+        changed = bom(); changed["lock_sha256"] = "another-source-lock"
+        self.assert_code("MachineVersionMismatch", lambda: self.owner.check_ready(changed))
+        self.assert_code("MachineVersionMismatch", lambda: self.owner.check_ready(bom(), {"ports": {"rest": 31002}}))
+        self.backend.failure = "health"
+        self.assert_code("MachineUnavailable", lambda: self.owner.check_ready(bom()))
+
+    def test_readonly_check_cannot_cross_an_existing_maintenance_lock(self):
+        self.start()
+        observer = machine.MachineOwner(self.owner.root, backend=copy.deepcopy(self.backend), timeout=0.01)
+        with self.owner.maintenance_lock():
+            self.assert_code("MachineMaintaining", lambda: observer.check_ready(bom()))
+
+    def test_cli_check_uses_original_bom_and_safe_snapshot(self):
+        original = self.start()
+        with mock.patch.object(machine, "MachineOwner", return_value=self.owner), \
+                mock.patch.object(machine, "verified_bom", return_value=bom()) as verify, \
+                mock.patch.object(machine.runtime, "install_signal_handlers"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(machine.main(["check", "--store", "/original-store"]), 0)
+        verify.assert_called_once_with(runtime.SCRIPT_DIR.parent.parent, Path("/original-store"), consumer="iceberg-rest")
+        actual = json.loads(output.getvalue())
+        self.assertEqual(actual["phase"], "ready")
+        self.assertEqual(actual["generation"], original["generation"])
+        self.assertNotIn("credentials", actual)
 
     def test_machine_configuration_rejects_protected_and_rest_domain_overlap_before_effects(self):
         for root in ("s3://warehouse/fixture-machine", "s3://warehouse/fixture-machine/rest/",

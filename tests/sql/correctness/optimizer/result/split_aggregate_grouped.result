@@ -1,11 +1,15 @@
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: singleton
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
 0:SORT BY [k ASC NULLS FIRST] stats={rows=4}
   1:GATHER stats={rows=4}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: follow-sources([2])
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: HASH_PARTITIONED (k)
   STREAM DATA SINK
     EXCHANGE ID: 1
@@ -16,6 +20,8 @@ PLAN FRAGMENT 1
     4:HASH EXCHANGE stats={rows=4}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
+  STAGE PLACEMENT: scan-work
+  DRIVER DOMAIN: min=1, max=5, power-of-two=false
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 4

@@ -33,7 +33,6 @@ impl Drop for Witness {
     }
 }
 struct Scope {
-    limit: u64,
     stop: AtomicBool,
     guard: ConnectorPayloadRetentionGuard,
 }
@@ -48,25 +47,15 @@ impl OriginalScope for Scope {
             Ok(())
         }
     }
-    fn check_total(&self, total: u64) -> Result<(), ConnectorError> {
-        if total > self.limit {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "original projection capacity refused",
-            ))
-        } else {
-            Ok(())
-        }
-    }
+
     fn original_guard(&self) -> ConnectorPayloadRetentionGuard {
         self.guard.clone()
     }
 }
-fn scope(limit: u64) -> (Scope, Arc<AtomicUsize>) {
+fn scope() -> (Scope, Arc<AtomicUsize>) {
     let drops = Arc::new(AtomicUsize::new(0));
     (
         Scope {
-            limit,
             stop: AtomicBool::new(false),
             guard: ConnectorPayloadRetentionGuard::new(Witness(drops.clone())),
         },
@@ -167,10 +156,10 @@ fn stock_v1_v2_v3_actual_frozen_source_and_reader_defaults_are_unchanged() {
             .expect("actual snapshot")
             .schema(&metadata)
             .expect("snapshot schema");
-        let (scope, _) = scope(u64::MAX); // Pure component only, not a real FE window receipt.
+        let (scope, _) = scope(); // Original control/retention component; it grants no capacity.
         let mut checked = Plan::inspect(&metadata, &schema, &scope)
             .expect("borrowed count")
-            .authorize(1, 0, 0, &scope)
+            .for_copies(1, &scope)
             .expect("component checker");
         let projection = checked.build_one().expect("same original serializers");
         let catalog = ConnectorInstanceId::parse("iceberg").expect("catalog");
@@ -240,11 +229,11 @@ fn same_original_guard_stays_until_the_last_actual_projection_exits() {
         .unwrap()
         .schema(&metadata)
         .unwrap();
-    let (scope, drops) = scope(u64::MAX);
+    let (scope, drops) = scope();
     let (first, last) = {
         let mut checked = Plan::inspect(&metadata, &schema, &scope)
             .unwrap()
-            .authorize(2, 0, 0, &scope)
+            .for_copies(2, &scope)
             .unwrap();
         (checked.build_one().unwrap(), checked.build_one().unwrap())
     };
@@ -259,42 +248,42 @@ fn same_original_guard_stays_until_the_last_actual_projection_exits() {
     // This is opaque same-holder evidence. No Work/Native join or real window claim.
 }
 #[test]
-fn whole_copy_coexistence_is_refused_before_an_output_can_be_built() {
+fn exact_copy_count_refuses_an_extra_output_without_minting_a_guard() {
     let metadata = metadata(FormatVersion::V2);
     let schema = metadata
         .snapshot_by_id(41)
         .unwrap()
         .schema(&metadata)
         .unwrap();
-    let (scope, _) = scope(1);
-    let plan = Plan::inspect(&metadata, &schema, &scope).unwrap();
-    let error = plan
-        .authorize(2, 0, 0, &scope)
-        .err()
-        .expect("whole output refusal");
-    match error {
-        Error::Control(error) => assert_eq!(
-            error,
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "original projection capacity refused"
-            )
-        ),
-        _ => panic!("original capacity error lost"),
-    }
+    let (scope, drops) = scope();
+    let (first, second) = {
+        let mut checked = Plan::inspect(&metadata, &schema, &scope)
+            .unwrap()
+            .for_copies(2, &scope)
+            .unwrap();
+        let first = checked.build_one().unwrap();
+        let second = checked.build_one().unwrap();
+        assert!(matches!(checked.build_one(), Err(Error::ShapeChanged)));
+        (first, second)
+    };
+    drop(scope);
+    drop(first);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(second);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 #[test]
-fn stop_after_approval_prevents_a_late_output_and_preserves_original_error() {
+fn stop_before_output_prevents_a_late_output_and_preserves_original_error() {
     let metadata = metadata(FormatVersion::V2);
     let schema = metadata
         .snapshot_by_id(41)
         .unwrap()
         .schema(&metadata)
         .unwrap();
-    let (scope, _) = scope(u64::MAX);
+    let (scope, _) = scope();
     let mut checked = Plan::inspect(&metadata, &schema, &scope)
         .unwrap()
-        .authorize(1, 0, 0, &scope)
+        .for_copies(1, &scope)
         .unwrap();
     scope.stop.store(true, Ordering::SeqCst);
     match checked.build_one().err().expect("original stop") {
@@ -326,9 +315,7 @@ impl OriginalScope for MidWriteScope {
         }
         Ok(())
     }
-    fn check_total(&self, _: u64) -> Result<(), ConnectorError> {
-        Ok(())
-    }
+
     fn original_guard(&self) -> ConnectorPayloadRetentionGuard {
         self.guard.clone()
     }
@@ -338,7 +325,7 @@ fn actual_serde_write_all_midwrite_cancellation_returns_first_error_without_retr
     let error = ConnectorError::new(ConnectorErrorKind::Cancelled, "original-midwrite-stop")
         .with_cleanup_context("original-provider-context");
     let message_ptr = error.message().as_ptr();
-    let (ordinary, _) = scope(u64::MAX);
+    let (ordinary, _) = scope();
     let original = MidWriteScope {
         checks: std::cell::Cell::new(0),
         original: std::cell::RefCell::new(Some(error)),
@@ -370,7 +357,7 @@ fn subsequent_direct_writer_call_cannot_replace_or_recheck_first_cancellation() 
     use std::io::Write;
     let error = ConnectorError::new(ConnectorErrorKind::DeadlineExceeded, "original-expiry");
     let message_ptr = error.message().as_ptr();
-    let (ordinary, _) = scope(u64::MAX);
+    let (ordinary, _) = scope();
     let original = MidWriteScope {
         checks: std::cell::Cell::new(3),
         original: std::cell::RefCell::new(Some(error)),
@@ -437,9 +424,7 @@ impl OriginalScope<Box<OpaqueCause>> for OpaqueScope {
         );
         Ok(())
     }
-    fn check_total(&self, _: u64) -> Result<(), Box<OpaqueCause>> {
-        Ok(())
-    }
+
     fn original_guard(&self) -> ConnectorPayloadRetentionGuard {
         self.guard.clone()
     }
@@ -451,7 +436,7 @@ fn actual_serde_midwrite_moves_opaque_cause_once_without_formatting_or_retry() {
         drops: drops.clone(),
     });
     let identity = (&*cause) as *const OpaqueCause;
-    let (ordinary, _) = scope(u64::MAX);
+    let (ordinary, _) = scope();
     let original = OpaqueScope {
         checks: std::cell::Cell::new(0),
         cause: std::cell::RefCell::new(Some(cause)),
@@ -482,4 +467,21 @@ fn actual_serde_midwrite_moves_opaque_cause_once_without_formatting_or_retry() {
         Ok(_) => panic!("cancelled serialization unexpectedly succeeded"),
     }
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn actual_json_count_is_an_exact_serializer_ceiling_not_a_graph_allowance() {
+    let (scope, _) = scope();
+    let value = ["escaped\nquoted\"", "unchanged"];
+    let length = count(&value, &scope).expect("original serializer count");
+    let actual = exact_json(&value, length, &scope).expect("exact original output");
+    assert_eq!(actual, serde_json::to_string(&value).unwrap());
+    assert!(matches!(
+        exact_json(&value, length - 1, &scope),
+        Err(Error::ShapeChanged)
+    ));
+    assert!(matches!(
+        exact_json(&value, length + 1, &scope),
+        Err(Error::ShapeChanged)
+    ));
 }

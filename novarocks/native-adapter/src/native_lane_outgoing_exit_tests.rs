@@ -782,10 +782,9 @@ async fn public_queue_recipe(ready_only: bool) -> Result<QueueRun, StdError> {
             // This is the actual connector firstpoll and original public dial
             // guard. The test pause owns that guard until actual IO is returned.
             if signals.attempts.fetch_add(1, Ordering::AcqRel) != 0 {
-                return Err::<
-                    hyper_util::rt::TokioIo<novarocks_native_trust::BoxedNativeIo>,
-                    StdError,
-                >("queue recipe attempted a second connector".into());
+                return Err::<hyper_util::rt::TokioIo<novarocks_transport_io::BoxedIo>, StdError>(
+                    "queue recipe attempted a second connector".into(),
+                );
             }
             let dial = admission.try_dial_lane(FrontendNativeLane::ResultData)?;
             let mut released = signals
@@ -813,9 +812,7 @@ async fn public_queue_recipe(ready_only: bool) -> Result<QueueRun, StdError> {
             })
             .await?;
             let io = native.connect().await?;
-            let io: novarocks_native_trust::BoxedNativeIo = Box::new(
-                novarocks_native_trust::OwnedNativeIo::with_guard(io, dial.established()?),
-            );
+            let io: novarocks_transport_io::BoxedIo = Box::new(dial.established_io(io)?);
             Ok(hyper_util::rt::TokioIo::new(io))
         }
     });
@@ -1032,4 +1029,181 @@ async fn eight_actual_ready_only_reservations_do_not_prove_public_queue_messages
     assert!(!facts.original_connector_first_pending);
     assert!(public_queue_fill_source(&facts).is_err());
     assert_eq!(run.peer_requests, Some(0));
+}
+
+// One real public readiness poll. Pending does not retain a local waiter; the
+// original service's bounded recheck is responsible for the next attempt.
+async fn reserve_once(selected: &SelectedNativeCall) -> Poll<Result<ReservedNativeCall, StdError>> {
+    std::future::poll_fn(|cx| Poll::Ready(selected.try_reserve(cx))).await
+}
+
+fn lazy_selected_lane(streams: usize) -> NativeLaneChannel {
+    let endpoint = tonic::transport::Endpoint::from_static("http://127.0.0.1:1");
+    NativeLaneChannel::with_streams(
+        configure_native_endpoint(endpoint).connect_lazy(),
+        NativeLane::Observation,
+        streams,
+        None,
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn selected_call_refusal_keeps_no_partial_stream_or_buffer_position() {
+    let lane = lazy_selected_lane(16);
+    let selected = lane.select_local_call();
+    let mut reserved = Vec::with_capacity(8);
+    // These are eight actual Tower Buffer permits, with no request dispatched.
+    for _ in 0..8 {
+        match reserve_once(&selected).await {
+            Poll::Ready(Ok(call)) => reserved.push(call),
+            other => panic!("original local reservation unexpectedly refused: {other:?}"),
+        }
+    }
+    assert_eq!(lane.available_streams(), 8);
+    assert!(matches!(reserve_once(&selected).await, Poll::Pending));
+    assert_eq!(lane.available_streams(), 8, "Buffer refusal kept a stream");
+    // Real refusal must return its assigned queue waiter too, so this exact
+    // selected connection can immediately use an actual returned qualification.
+    drop(reserved.pop());
+    assert_eq!(lane.available_streams(), 9);
+    let next = match reserve_once(&selected).await {
+        Poll::Ready(Ok(call)) => call,
+        other => panic!("returned original Buffer position was not usable: {other:?}"),
+    };
+    assert_eq!(lane.available_streams(), 8);
+    drop(next);
+    drop(reserved);
+    assert_eq!(lane.available_streams(), 16);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn selected_call_cannot_borrow_a_different_connection_gate() {
+    let a = lazy_selected_lane(1);
+    let b = lazy_selected_lane(1);
+    let selected_a = a.select_local_call();
+    let selected_b = b.select_local_call();
+    let held_a = match reserve_once(&selected_a).await {
+        Poll::Ready(Ok(call)) => call,
+        other => panic!("first original stream unexpectedly refused: {other:?}"),
+    };
+    assert!(matches!(reserve_once(&selected_a).await, Poll::Pending));
+    assert_eq!(a.available_streams(), 0);
+    let held_b = match reserve_once(&selected_b).await {
+        Poll::Ready(Ok(call)) => call,
+        other => panic!("independent original stream unexpectedly refused: {other:?}"),
+    };
+    assert_eq!(b.available_streams(), 0);
+    drop(held_b);
+    assert_eq!(a.available_streams(), 0);
+    assert_eq!(b.available_streams(), 1);
+    drop(held_a);
+    assert_eq!(a.available_streams(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn selected_call_moves_ready_channel_into_generated_grpc_and_body_exit() {
+    let admission = small_frontend();
+    let mut peer = OriginalH2Peer::start().await.unwrap();
+    let mut original = None;
+    // Original peer/join remains outside this cancellable operation. All
+    // scenario errors reach the same actual stop and IO-exit observation.
+    let primary = bounded(async {
+        original = Some(peer.channel(&admission).await?);
+        let lane = original.as_ref().ok_or("original channel missing")?;
+        let selected = lane.select_local_call();
+        let reserved = match reserve_once(&selected).await {
+            Poll::Ready(Ok(call)) => call,
+            Poll::Ready(Err(error)) => return Err(error.to_string()),
+            Poll::Pending => return Err("connected original lane refused local positions".into()),
+        };
+        if lane.available_streams() != lane.stream_limit() - 1 {
+            return Err("reservation did not hold the original stream".into());
+        }
+        let interceptor = |request: tonic::Request<()>| Ok(request);
+        let mut grpc =
+            crate::generated::nova_rocks_grpc_client::NovaRocksGrpcClient::with_interceptor(
+                reserved,
+                interceptor,
+            );
+        let call = grpc.subscribe_task_status(tonic::Request::new(
+            novarocks_proto_models::novarocks::SubscribeTaskStatusRequest::default(),
+        ));
+        let serve = async {
+            let reply = peer
+                .heads
+                .recv()
+                .await
+                .ok_or("original peer did not receive request")?;
+            let (frames, receiver) = mpsc::channel(1);
+            let response = hyper::http::Response::builder()
+                .header("content-type", "application/grpc")
+                .body(PeerBody(receiver))
+                .map_err(|error| error.to_string())?;
+            reply
+                .send(response)
+                .map_err(|_| "original response waiter exited")?;
+            Ok::<_, String>(frames)
+        };
+        let (response, frames) = tokio::join!(call, serve);
+        let response = response.map_err(|error| error.to_string())?;
+        let frames = frames?;
+        if lane.available_streams() != lane.stream_limit() - 1 {
+            return Err("headers prematurely returned original stream position".into());
+        }
+        drop(response);
+        drop(frames);
+        if lane.available_streams() != lane.stream_limit() {
+            return Err("generated response Drop kept original stream position".into());
+        }
+        // The generated Grpc cannot consume a second local qualification from
+        // this one-shot carrier. Its normal ready adapter returns an error.
+        if grpc
+            .subscribe_task_status(tonic::Request::new(
+                novarocks_proto_models::novarocks::SubscribeTaskStatusRequest::default(),
+            ))
+            .await
+            .is_ok()
+        {
+            return Err("one reservation dispatched more than one request".into());
+        }
+        Ok::<_, String>(())
+    })
+    .await;
+    drop(original);
+    let cleanup = peer.stop().await;
+    let io_exit = actual_io_exit(&admission).await;
+    assert!(
+        primary.is_ok(),
+        "scenario watchdog: {primary:?}; cleanup: {cleanup:?}; IO: {io_exit:?}"
+    );
+    assert!(
+        primary.as_ref().is_ok_and(Result::is_ok),
+        "scenario: {primary:?}; cleanup: {cleanup:?}; IO: {io_exit:?}"
+    );
+    assert!(cleanup.is_ok(), "actual peer cleanup: {cleanup:?}");
+    assert!(io_exit.is_ok(), "actual IO exit: {io_exit:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn selected_call_role_close_refuses_an_already_ready_carrier() {
+    let admission = small_frontend();
+    let mut lane = lazy_selected_lane(1);
+    lane.outgoing_admission = Some(admission.clone());
+    let selected = lane.select_local_call();
+    let mut held = match reserve_once(&selected).await {
+        Poll::Ready(Ok(call)) => call,
+        other => panic!("initial qualification unexpectedly refused: {other:?}"),
+    };
+    admission.close_frontend_outgoing().unwrap();
+    assert!(matches!(
+        std::future::poll_fn(|cx| Poll::Ready(held.poll_ready(cx))).await,
+        Poll::Ready(Err(_)),
+    ));
+    assert!(matches!(reserve_once(&selected).await, Poll::Ready(Err(_))));
+    drop(held);
+    assert_eq!(lane.available_streams(), 1);
+    assert_eq!(
+        admission.frontend_outgoing_snapshot().unwrap().requests,
+        [0; 4]
+    );
 }

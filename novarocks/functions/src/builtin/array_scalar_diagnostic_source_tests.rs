@@ -213,13 +213,13 @@ fn data(result: Result<ArrayRef, ScalarInvocationFailure>) -> ScalarInvocationDa
     }
 }
 #[test]
-fn array_diagnostic_source_case_sensitive_original_message_and_last_drop() {
+fn array_diagnostic_source_missing_field_original_message_and_last_drop() {
     let input = list(1);
-    let names: ArrayRef = Arc::new(StringArray::from(vec!["id"]));
+    let names: ArrayRef = Arc::new(StringArray::from(vec!["missing"]));
     let original = project(&input, &names, None).unwrap_err().to_string();
     assert_eq!(
         original,
-        "__array_struct_subfield field 'id' does not exist"
+        "__array_struct_subfield field 'missing' does not exist"
     );
     let host = Host::with_limit(128 * 1024);
     let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
@@ -330,7 +330,7 @@ fn array_diagnostic_source_field_name_values_and_carrier_contracts_are_distinct(
 #[test]
 fn array_diagnostic_source_every_real_allocation_and_opaque_request_keep_seven_causes() {
     let input = list(1);
-    let names: ArrayRef = Arc::new(StringArray::from(vec!["id"]));
+    let names: ArrayRef = Arc::new(StringArray::from(vec!["missing"]));
     let call = contract();
     let host = Host::with_limit(128 * 1024);
     let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
@@ -399,7 +399,7 @@ fn array_diagnostic_source_every_real_allocation_and_opaque_request_keep_seven_c
 #[test]
 fn array_diagnostic_source_every_actual_checkpoint_has_no_tail_and_failed_latch() {
     let input = list(321);
-    let names: ArrayRef = Arc::new(StringArray::from(vec!["id"; 321]));
+    let names: ArrayRef = Arc::new(StringArray::from(vec!["missing"; 321]));
     let call = contract();
     let host = Host::with_limit(128 * 1024);
     let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
@@ -441,7 +441,7 @@ fn array_diagnostic_source_every_actual_checkpoint_has_no_tail_and_failed_latch(
 #[test]
 fn array_diagnostic_source_published_data_does_not_run_footer_or_replay() {
     let input = list(1);
-    let names: ArrayRef = Arc::new(StringArray::from(vec!["id"]));
+    let names: ArrayRef = Arc::new(StringArray::from(vec!["missing"]));
     let call = contract();
     let host = Host::with_limit(128 * 1024);
     let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
@@ -499,7 +499,7 @@ fn array_diagnostic_source_successful_v1_projection_preserves_original_values_an
 #[test]
 fn array_diagnostic_source_actual_empty_call_keeps_wrongcase_data_without_inventing_activation() {
     let input = list(0);
-    let names: ArrayRef = Arc::new(StringArray::from(vec!["id"]));
+    let names: ArrayRef = Arc::new(StringArray::from(vec!["missing"]));
     let original = project(&input, &names, None).unwrap_err().to_string();
     let host = Host::with_limit(128 * 1024);
     let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();

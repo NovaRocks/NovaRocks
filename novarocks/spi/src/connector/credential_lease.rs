@@ -33,6 +33,98 @@ use super::{
     StorageCredentialScopePrefix,
 };
 
+/// Identity minted once by an existing process-local acquisition owner.
+/// It is neither an authorization grant nor an endpoint fault-domain key.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct CredentialAcquisitionOwnerId(uuid::Uuid);
+impl CredentialAcquisitionOwnerId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+}
+impl Default for CredentialAcquisitionOwnerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl std::fmt::Debug for CredentialAcquisitionOwnerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CredentialAcquisitionOwnerId { .. }")
+    }
+}
+
+/// One original seed authorization instance, independent of query/lease ids.
+/// Copies of this value name the same grant; a new grant gets a fresh identity.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct VendedS3SeedGrantId(uuid::Uuid);
+impl VendedS3SeedGrantId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+}
+impl Default for VendedS3SeedGrantId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl std::fmt::Debug for VendedS3SeedGrantId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VendedS3SeedGrantId { .. }")
+    }
+}
+
+/// The original acquisition capability's non-secret, immutable cache key.
+/// The full scope is retained because the refresher validates the whole set.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct VendedS3InProcessAcquisitionIdentity {
+    owner: CredentialAcquisitionOwnerId,
+    renewal_path: Option<CredentialRenewalPath>,
+    prefixes: Arc<[StorageCredentialScopePrefix]>,
+}
+impl VendedS3InProcessAcquisitionIdentity {
+    pub fn try_new(
+        owner: CredentialAcquisitionOwnerId,
+        renewal_path: Option<CredentialRenewalPath>,
+        mut prefixes: Vec<StorageCredentialScopePrefix>,
+    ) -> Result<Self, ConnectorError> {
+        if prefixes.is_empty() || prefixes.len() > MAX_CREDENTIAL_LEASE_PREFIXES {
+            return Err(exhausted("in-process credential acquisition prefix set"));
+        }
+        prefixes.sort();
+        if prefixes.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(invalid(
+                "duplicate in-process credential acquisition prefix",
+            ));
+        }
+        Ok(Self {
+            owner,
+            renewal_path,
+            prefixes: prefixes.into(),
+        })
+    }
+    pub fn renewal_path(&self) -> Option<&CredentialRenewalPath> {
+        self.renewal_path.as_ref()
+    }
+    pub fn prefixes(&self) -> &[StorageCredentialScopePrefix] {
+        &self.prefixes
+    }
+}
+
+/// The exact capability and its identity travel together inside this process.
+#[derive(Clone)]
+pub struct VendedS3InProcessAcquisition {
+    identity: VendedS3InProcessAcquisitionIdentity,
+    refresher: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>,
+}
+impl VendedS3InProcessAcquisition {
+    pub fn identity(&self) -> &VendedS3InProcessAcquisitionIdentity {
+        &self.identity
+    }
+    pub fn refresher(&self) -> &Arc<dyn ConnectorVendedS3CredentialLeaseRefresher> {
+        &self.refresher
+    }
+}
+
 pub const MAX_CREDENTIAL_LEASES_PER_QUERY: usize = 64;
 pub const MAX_CREDENTIAL_LEASE_PREFIXES: usize = 64;
 /// Bounded like every other wire string here: an address a server advertises
@@ -153,7 +245,10 @@ pub struct VendedS3CredentialLeaseContribution {
     /// catalog's statement, not a canonical route a client may assume
     /// (CAD-1 D2).
     renewal_path: Option<CredentialRenewalPath>,
-    refresher: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
+    refresher: Option<(
+        CredentialAcquisitionOwnerId,
+        Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>,
+    )>,
 }
 
 impl VendedS3CredentialLeaseContribution {
@@ -184,9 +279,10 @@ impl VendedS3CredentialLeaseContribution {
     /// response-local contribution.
     pub fn with_refresher(
         mut self,
+        owner: CredentialAcquisitionOwnerId,
         refresher: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>,
     ) -> Result<Self, ConnectorError> {
-        self.refresher = Some(refresher);
+        self.refresher = Some((owner, refresher));
         Ok(self)
     }
 
@@ -217,7 +313,7 @@ impl VendedS3CredentialLeaseContribution {
     }
 
     pub fn refresher(&self) -> Option<&Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>> {
-        self.refresher.as_ref()
+        self.refresher.as_ref().map(|(_, refresher)| refresher)
     }
 
     /// Transfer the complete response-local contribution to the sole
@@ -239,9 +335,23 @@ impl VendedS3CredentialLeaseContribution {
     ) -> (
         Vec<VendedS3CredentialLeaseEntry>,
         Option<CredentialRenewalPath>,
-        Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
+        Option<VendedS3InProcessAcquisition>,
     ) {
-        (self.entries, self.renewal_path, self.refresher)
+        let acquisition = self
+            .refresher
+            .map(|(owner, refresher)| VendedS3InProcessAcquisition {
+                identity: VendedS3InProcessAcquisitionIdentity {
+                    owner,
+                    renewal_path: self.renewal_path.clone(),
+                    prefixes: self
+                        .entries
+                        .iter()
+                        .map(|entry| entry.prefix.clone())
+                        .collect(),
+                },
+                refresher,
+            });
+        (self.entries, self.renewal_path, acquisition)
     }
 }
 
@@ -376,6 +486,22 @@ pub trait ConnectorVendedS3CredentialLeaseRefresher: Send + Sync {
         &self,
         policy: VendedS3CredentialRefreshCallPolicy,
     ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError>;
+
+    /// Explicit async acquisition for the original governed request. The old
+    /// synchronous capability is never used as a fallback on this path.
+    fn refresh_vended_s3_credentials_async<'a>(
+        &'a self,
+        _policy: VendedS3CredentialRefreshCallPolicy,
+        _request: super::ConnectorRequestContext,
+    ) -> futures::future::BoxFuture<'a, Result<VendedS3CredentialLeaseRefresh, ConnectorError>>
+    {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "async vended credential refresh requires an explicit provider author",
+            ))
+        })
+    }
 }
 
 /// FE-local receiver for provider vended-credential contributions.
@@ -894,14 +1020,14 @@ mod tests {
 
     use super::{
         ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
-        ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
-        CredentialLeaseProvider, CredentialLoadTableDelegation, CredentialRenewalPath,
-        CredentialRoutingContext, MAX_CREDENTIAL_LEASE_PREFIXES,
-        MAX_CREDENTIAL_ROUTING_HEADER_BYTES, MAX_CREDENTIAL_ROUTING_HEADERS,
-        MAX_CREDENTIALS_ENDPOINT_BYTES, VendedS3CredentialLeaseContribution,
-        VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
-        VendedS3CredentialRefreshCallPolicy, VendedS3CredentialRefreshDispatch,
-        VendedS3CredentialRefreshDispatchGuard,
+        ConnectorVendedS3CredentialLeaseRefresher, CredentialAcquisitionOwnerId,
+        CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
+        CredentialLoadTableDelegation, CredentialRenewalPath, CredentialRoutingContext,
+        MAX_CREDENTIAL_LEASE_PREFIXES, MAX_CREDENTIAL_ROUTING_HEADER_BYTES,
+        MAX_CREDENTIAL_ROUTING_HEADERS, MAX_CREDENTIALS_ENDPOINT_BYTES,
+        VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
+        VendedS3CredentialLeaseRefresh, VendedS3CredentialRefreshCallPolicy,
+        VendedS3CredentialRefreshDispatch, VendedS3CredentialRefreshDispatchGuard,
     };
     use crate::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
@@ -1025,7 +1151,10 @@ mod tests {
             None,
         )
         .expect("contribution")
-        .with_refresher(Arc::new(ProviderLocalRefresher))
+        .with_refresher(
+            CredentialAcquisitionOwnerId::new(),
+            Arc::new(ProviderLocalRefresher),
+        )
         .expect("provider-local refresh needs no fabricated endpoint");
 
         assert!(contribution.refresh_endpoint().is_none());

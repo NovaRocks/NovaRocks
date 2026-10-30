@@ -171,6 +171,11 @@ pub enum QueryLifecycleFaultKind {
     /// Fails the single root aggregation at commit-fragment carrier
     /// validation. Like the writer fault it only rejects, never repairs.
     ConnectorWriteRootFailure,
+    /// Refuses the first real write Root Data before offering it to the FE.
+    ConnectorWriteRootReadBeforeDataFailure,
+    /// Refuses the original write Root read after its first Data was consumed,
+    /// before offering any second Data or End. It does not fail a Task.
+    ConnectorWriteRootReadAfterPrefixFailure,
     /// Rejects an ordinary partial aggregate update inside `TableWriter`.
     ConnectorWritePartialUpdateFailure,
     /// Rejects ordinary partial aggregate finalization inside `TableWriter`.
@@ -186,7 +191,7 @@ pub enum QueryLifecycleFaultKind {
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 30] = [
         Self::TerminalAckDrop,
         Self::TerminalSnapshotConflict,
         Self::RuntimeFilterContributionAckDrop,
@@ -210,6 +215,8 @@ impl QueryLifecycleFaultKind {
         Self::RuntimeFilterFeedbackForeignAttempt,
         Self::ConnectorWriteWriterFailure,
         Self::ConnectorWriteRootFailure,
+        Self::ConnectorWriteRootReadBeforeDataFailure,
+        Self::ConnectorWriteRootReadAfterPrefixFailure,
         Self::ConnectorWritePartialUpdateFailure,
         Self::ConnectorWritePartialFinalizeFailure,
         Self::ConnectorWriteFinalMergeFailure,
@@ -248,6 +255,12 @@ impl QueryLifecycleFaultKind {
             Self::RuntimeFilterFeedbackForeignAttempt => "runtime-filter-feedback-foreign-attempt",
             Self::ConnectorWriteWriterFailure => "connector-write-writer-failure",
             Self::ConnectorWriteRootFailure => "connector-write-root-failure",
+            Self::ConnectorWriteRootReadBeforeDataFailure => {
+                "connector-write-root-read-before-data-failure"
+            }
+            Self::ConnectorWriteRootReadAfterPrefixFailure => {
+                "connector-write-root-read-after-prefix-failure"
+            }
             Self::ConnectorWritePartialUpdateFailure => "connector-write-partial-update-failure",
             Self::ConnectorWritePartialFinalizeFailure => {
                 "connector-write-partial-finalize-failure"
@@ -274,7 +287,7 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 26] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 28] = [
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDropRendezvous,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
@@ -315,6 +328,8 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 26] = [
     // boundaries; none substitutes a carrier or aggregate value.
     QueryLifecycleFaultKind::ConnectorWriteWriterFailure,
     QueryLifecycleFaultKind::ConnectorWriteRootFailure,
+    QueryLifecycleFaultKind::ConnectorWriteRootReadBeforeDataFailure,
+    QueryLifecycleFaultKind::ConnectorWriteRootReadAfterPrefixFailure,
     QueryLifecycleFaultKind::ConnectorWritePartialUpdateFailure,
     QueryLifecycleFaultKind::ConnectorWritePartialFinalizeFailure,
     QueryLifecycleFaultKind::ConnectorWriteFinalMergeFailure,

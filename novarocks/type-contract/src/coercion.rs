@@ -272,7 +272,11 @@ fn field_marker<E>(
     creation.name(crate::NR_LOGICAL_TYPE_KEY.len())?;
     creation.name(value.len())?;
     creation.table::<String, String>(1)?;
-    Ok(field.with_metadata([(crate::NR_LOGICAL_TYPE_KEY.to_owned(), value.to_owned())].into()))
+    creation.metadata_conversion(1, crate::NR_LOGICAL_TYPE_KEY.len())?;
+    Ok(field.with_metadata(std::collections::HashMap::from([(
+        crate::NR_LOGICAL_TYPE_KEY.to_owned(),
+        value.to_owned(),
+    )])))
 }
 fn wider_struct_fields_by_name<E>(
     left_fields: &Fields,
@@ -309,8 +313,8 @@ fn wider_map_type<E>(
 ) -> Result<DataType, crate::ValueConstructionFailure<E>> {
     let malformed = |creation: &mut crate::value_construction::ValueConstruction<'_, E>| {
         creation.name(left_entries.name().len())?;
-        creation.cloned_annotations(left_entries.metadata().capacity())?;
-        // Field::clone copies its owned name/annotation map and DataType Boxes.
+        creation.cloned_annotations(left_entries.metadata().len())?;
+        // Field::clone copies its owned name and DataType Boxes; Metadata shares its Arc.
         creation.cloned_type_backing(left_entries.data_type())?;
         creation.exact(|| {
             crate::owned_resources::layout::arc_layout(std::alloc::Layout::new::<Field>())
@@ -511,10 +515,12 @@ mod tests {
 
     #[test]
     fn reconstruction_preserves_main_logical_domain_and_nullability() {
-        let tagged =
-            Arc::new(Field::new("item", DataType::Utf8, false).with_metadata(
-                [(crate::NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string())].into(),
-            ));
+        let tagged = Arc::new(Field::new("item", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                crate::NR_LOGICAL_TYPE_KEY.to_string(),
+                "json".to_string(),
+            )]),
+        ));
         let left = DataType::List(Arc::clone(&tagged));
         // Identical carriers retain the existing exact object shape.
         assert_eq!(wider_type(&left, &left), left);
@@ -525,7 +531,10 @@ mod tests {
             wider_type(&left, &right),
             DataType::List(Arc::new(
                 Field::new("item", DataType::Utf8, true).with_metadata(
-                    [(crate::NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string())].into()
+                    std::collections::HashMap::<String, String>::from([(
+                        crate::NR_LOGICAL_TYPE_KEY.to_string(),
+                        "json".to_string()
+                    )])
                 )
             ))
         );

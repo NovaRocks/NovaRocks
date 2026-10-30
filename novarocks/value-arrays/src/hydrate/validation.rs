@@ -40,7 +40,55 @@ pub fn validate_required_observed<E>(
 ) -> Result<(), ValueFailure<E>> {
     validate_with_options(source, binding, HydrateOptions::default(), work, observe)
 }
+/// Check the original value promise using the caller's exact frozen projection.
+pub fn validate_required_with_options_observed<E>(
+    source: &ArrayRef,
+    binding: &TypedValueBinding,
+    options: HydrateOptions,
+    work: &mut Work<'_, E>,
+    observe: &mut HydrateObserver<'_, E>,
+) -> Result<(), ValueFailure<E>> {
+    validate_with_options(source, binding, options, work, observe)
+}
+
+/// Observe a target requirement without treating it as an input value promise.
+/// The same logical-NULL traversal keeps dictionary and active-parent rules.
+/// Invalid structure/keys and caller failures remain their original errors.
+pub fn required_values_satisfied_observed<E>(
+    source: &ArrayRef,
+    binding: &TypedValueBinding,
+    options: HydrateOptions,
+    work: &mut Work<'_, E>,
+    observe: &mut HydrateObserver<'_, E>,
+) -> Result<bool, ValueFailure<E>> {
+    validate_structure(source, binding, options, work, observe)?;
+    let mut satisfied = true;
+    let mut missing = || {
+        satisfied = false;
+        Ok(())
+    };
+    for row in 0..source.len() {
+        validate_row(source, binding.borrowed(), options, row, work, &mut missing)?;
+    }
+    Ok(satisfied)
+}
+
 pub(super) fn validate_with_options<E>(
+    source: &ArrayRef,
+    binding: &TypedValueBinding,
+    options: HydrateOptions,
+    work: &mut Work<'_, E>,
+    observe: &mut HydrateObserver<'_, E>,
+) -> Result<(), ValueFailure<E>> {
+    validate_structure(source, binding, options, work, observe)?;
+    let mut missing = || Err(ValueError::Invariant(ValueViolation::RequiredNull).into());
+    for row in 0..source.len() {
+        validate_row(source, binding.borrowed(), options, row, work, &mut missing)?;
+    }
+    Ok(())
+}
+
+fn validate_structure<E>(
     source: &ArrayRef,
     binding: &TypedValueBinding,
     options: HydrateOptions,
@@ -75,11 +123,9 @@ pub(super) fn validate_with_options<E>(
         return Err(ValueError::Invariant(ValueViolation::Layout).into());
     }
     inspect(source, work, observe, 0)?;
-    for row in 0..source.len() {
-        validate_row(source, binding.borrowed(), options, row, work)?;
-    }
     Ok(())
 }
+
 fn inspect<E>(
     source: &ArrayRef,
     work: &mut Work<'_, E>,
@@ -158,6 +204,7 @@ fn validate_row<E>(
     options: HydrateOptions,
     row: usize,
     work: &mut Work<'_, E>,
+    missing: &mut dyn FnMut() -> Result<(), ValueFailure<E>>,
 ) -> Result<(), ValueFailure<E>> {
     work(1).map_err(ValueFailure::Caller)?;
     let is_null = if matches!(source.data_type(), DataType::Dictionary(..)) {
@@ -172,7 +219,7 @@ fn validate_row<E>(
     };
     if is_null {
         if !binding.value_type().nullable() {
-            return Err(ValueError::Invariant(ValueViolation::RequiredNull).into());
+            return missing();
         }
         return Ok(());
     }
@@ -196,14 +243,15 @@ fn validate_row<E>(
         };
         let binding = child(binding, index)?;
         for row in start..end {
-            validate_row(input, binding, options, row, work)?;
+            validate_row(input, binding, options, row, work, missing)?;
         }
         Ok(())
     })
 }
 
-// Primitive override changes only dictionary-value storage. All ordinary
-// physical parameters, named occurrences and NULL declarations remain exact.
+// Primitive override changes only dictionary-value storage. Byte projection
+// is an explicit plain-leaf operation; only the signed names/NULL mode relaxes
+// those declarations. All other scalar and container parameters stay exact.
 fn parameterized_shape<E>(
     source: &ArrayRef,
     binding: BorrowedTypedValueBinding<'_>,
@@ -219,12 +267,12 @@ fn parameterized_shape<E>(
         work: &mut Work<'_, E>,
     ) -> Result<bool, ValueFailure<E>> {
         work(1).map_err(ValueFailure::Caller)?;
-        if options.projection == HydrateProjection::Exact
+        if options.projection != HydrateProjection::FrozenNamesAndNullability
             && expected.is_nullable() != actual.is_nullable()
         {
             return Ok(false);
         }
-        if named && options.projection == HydrateProjection::Exact {
+        if named && options.projection != HydrateProjection::FrozenNamesAndNullability {
             if expected.name().len() != actual.name().len() {
                 return Ok(false);
             }
@@ -271,6 +319,15 @@ fn parameterized_shape<E>(
                     layout.is_utf8() && &layout.data_type() == values.as_ref()
                 }));
         }
+        if options.projection == HydrateProjection::ExactByteLayouts
+            && let (Some(target), Some(source)) = (
+                ByteLayout::from_data_type(expected),
+                ByteLayout::from_data_type(actual),
+            )
+        {
+            // This is representation projection, never a text/binary cast.
+            return Ok(target.is_utf8() == source.is_utf8());
+        }
         match (expected, actual) {
             (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => {
                 for (a, b) in a.iter().zip(b) {
@@ -297,7 +354,7 @@ fn parameterized_shape<E>(
             }
             (DataType::Map(a, asort), DataType::Map(b, bsort))
                 if asort == bsort
-                    && (options.projection != HydrateProjection::Exact
+                    && (options.projection == HydrateProjection::FrozenNamesAndNullability
                         || a.is_nullable() == b.is_nullable()) =>
             {
                 let (DataType::Struct(af), DataType::Struct(bf)) = (a.data_type(), b.data_type())

@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "object_store_kind": "aliyun-oss",
+  "support": {
+    "os_id": "ubuntu",
+    "version_id": "26.04",
+    "platform": "linux/amd64"
+  },
+  "docker_registry_mirrors": [
+    "https://docker.m.daocloud.io"
+  ],
+  "rustup_dist_server": "https://rsproxy.cn",
+  "rustup_update_root": "https://rsproxy.cn/rustup",
+  "download_timeout_seconds": 600,
+  "locale": "zh_CN.UTF-8",
+  "cargo_build_jobs": "available",
+  "fixture_image_sources": {
+    "gradle-builder": "docker.m.daocloud.io/library/gradle",
+    "iceberg-rest": "docker.m.daocloud.io/apache/iceberg-rest-fixture",
+    "iceberg-spark-base": "docker.m.daocloud.io/apache/spark"
+  },
+  "tool_download_urls": {
+    "rustup": "https://rsproxy.cn/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init"
+  },
+  "fixture_artifact_url_prefixes": {
+    "https://repo.maven.apache.org/maven2/": "https://maven.aliyun.com/repository/public/",
+    "https://files.pythonhosted.org/packages/": "https://mirrors.aliyun.com/pypi/packages/",
+    "https://plugins.gradle.org/m2/": "https://maven.aliyun.com/repository/gradle-plugin/"
+  }
+}

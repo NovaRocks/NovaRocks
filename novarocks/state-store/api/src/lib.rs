@@ -29,12 +29,13 @@
 mod attempt;
 mod contract;
 mod error;
+mod execution;
 mod limits;
 mod provider;
 mod range;
 
 pub use attempt::{
-    AttemptId, AttemptOutcome, AttemptSupervisor, CommitObservation,
+    AttemptId, AttemptOutcome, AttemptSupervisor, CommitObservation, CommitObservationState,
     DEFAULT_MAX_OUTSTANDING_ATTEMPTS, InDoubtAdjudicator, InstanceScope, WriteAttempt,
 };
 pub use contract::{
@@ -42,10 +43,19 @@ pub use contract::{
     StateStore, StoreIdentity, StoreRevision, Value, VersionToken, WriteTransaction,
 };
 pub use error::{StateStoreError, StateStoreErrorKind};
+pub use execution::{
+    OriginalReadTransaction, OriginalWriteTransaction, StateStoreBlockingExit,
+    StateStoreBlockingOrigin, StateStoreBlockingOriginal, StateStoreBlockingPhase,
+    StateStoreBlockingRequest, StateStoreBlockingSlot, StateStoreBlockingSourceVocabulary,
+    StateStoreExecutionContext, StateStoreExecutionFailure, StateStoreExecutionPort,
+    StateStoreExecutionRequests, StateStoreOriginalClose, StateStoreOriginalOpen,
+    StateStoreOriginalUnsupported, StateStoreReadExecution,
+};
 pub use limits::{
     DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_TRANSACTION_BYTES,
     MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
 };
+pub use novarocks_resource_contract::SharedDependency;
 pub use provider::{
     StateStoreOpenRequest, StateStoreProviderDescriptor, StateStoreProviderFactory,
     StateStoreProviderId, StateStoreProviderIdError, StateStoreProviderInstance,

@@ -605,6 +605,44 @@ fn extract(
     )
 }
 
+/// Real checked writer/finish packages frozen by the production artifact author.
+/// This component fixture installs no provider runtime or application workload.
+pub(crate) fn frozen_write_fragments() -> (
+    p::PhysicalPlan,
+    crate::query_execution::native_fragment::NativeFragmentAttachment,
+) {
+    let (plan, session) = insert_values_plan();
+    let control = SqlCompileControl::unbounded();
+    let writes = author_frozen_writes(&plan, &session, &control).expect("sealed write recipes");
+    let packages = extract(&plan, &writes).expect("checked writer/finish packages");
+    let fragments = packages
+        .into_iter()
+        .map(|(id, package)| {
+            let artifact =
+                crate::native::fragment_encoder::frozen::FragmentArtifact::freeze_package(
+                    &package,
+                    plan.edges(),
+                    &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
+                        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                        novarocks_plan_codec::physical_package_v2::test_support::encode_limits(),
+                    ),
+                    &control,
+                )
+                .expect("production frozen writer facts");
+            (id.get(), artifact)
+        })
+        .collect();
+    let root = crate::query_execution::physical_encoding::completed_plan_topology(&plan)
+        .unwrap()
+        .anchor;
+    let attachment =
+        crate::query_execution::native_fragment::NativeFragmentAttachment::for_completed_plan(
+            fragments, root,
+        )
+        .unwrap();
+    (plan, attachment)
+}
+
 fn writer_target(plan: &p::PhysicalPlan) -> (p::NodeId, &p::WriterTarget) {
     plan.fragments()
         .values()
@@ -655,6 +693,26 @@ fn the_sealing_session_authors_the_written_recipe_the_package_carries() {
             BTreeMap::new()
         };
         assert_eq!(package.writes(), &expected, "fragment {id:?}");
+        let frozen = crate::native::fragment_encoder::frozen::FragmentArtifact::freeze_package(
+            package,
+            plan.edges(),
+            &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
+                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                encode_limits(),
+            ),
+            &control,
+        )
+        .expect("freeze the same checked write package");
+        let facts = frozen.facts();
+        assert_eq!(facts.declares_table_writer(), writes_here);
+        if writes_here {
+            assert_eq!(facts.table_writers().len(), 1);
+            assert_eq!(facts.table_writers()[0].node(), writer);
+            assert_eq!(facts.table_writers()[0].target(), ordinal);
+        } else {
+            assert!(facts.table_writers().is_empty());
+        }
+
         let bytes = encode_fragment_package(package, &encode_limits(), &control)
             .unwrap_or_else(|error| panic!("fragment {id:?} encodes: {error}"))
             .encode_to_vec();
@@ -855,7 +913,7 @@ fn a_compiled_root_relation_passes_the_frontend_exact_schema_decoder() {
         Chunk::try_new_with_chunk_schema(batch, schema).expect("root chunk")
     };
     let ordinal = WriteTargetOrdinal::try_new(0).expect("ordinal");
-    let mut decoder = RootWriteResultDecoder::new(
+    let mut decoder = RootWriteResultDecoder::for_test_local(
         RootWriteDecodeContract::try_new(&[ordinal], session.write_targets())
             .expect("decode contract"),
     );
@@ -886,7 +944,7 @@ fn a_compiled_root_relation_passes_the_frontend_exact_schema_decoder() {
         root_result_layout.slots(),
     )
     .expect("drifted schema");
-    let mut decoder = RootWriteResultDecoder::new(
+    let mut decoder = RootWriteResultDecoder::for_test_local(
         RootWriteDecodeContract::try_new(&[ordinal], session.write_targets())
             .expect("decode contract"),
     );

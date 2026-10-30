@@ -93,9 +93,16 @@ fn cancelled_create_has_no_side_effect() {
 
 #[test]
 fn unsupported_backend_fails_before_write() {
+    // Memory now supports atomic create; explicitly model an endpoint that
+    // does not advertise it while retaining real storage for the no-write check.
     let operator = Operator::new(opendal::services::Memory::default())
         .expect("memory operator")
-        .finish();
+        .layer(opendal::layers::CapabilityOverrideLayer::new(
+            |mut capability| {
+                capability.write_with_if_not_exists = false;
+                capability
+            },
+        ));
     let location = FsLocation::parse("unsupported.metadata.json").expect("memory path");
     let path = ResolvedFsPath::new(location, "unsupported.metadata.json").expect("resolved path");
     let access = FsAccessHandle::new(

@@ -79,7 +79,7 @@ pub(crate) async fn completed_literal_query(
 ) -> CompletedPlanWithAccess<()> {
     let (_root, scope) = query_scope();
     FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-        .complete(literal_query_request(version, sql), &scope)
+        .complete_for_test(literal_query_request(version, sql), &scope)
         .await
         .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"))
 }

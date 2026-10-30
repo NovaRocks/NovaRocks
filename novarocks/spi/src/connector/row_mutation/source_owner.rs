@@ -56,6 +56,7 @@ pub struct ConnectorRowMutationSourceBuilder {
     charged: usize,
     nodes: usize,
     retention: Option<ConnectorPayloadRetentionGuard>,
+    budgeted: bool,
 }
 
 #[derive(Debug)]
@@ -114,21 +115,37 @@ impl ConnectorRowMutationSourceChildren {
 
 impl ConnectorRowMutationSourceBuilder {
     pub fn try_new(schema: SchemaRef) -> Result<Self, ConnectorError> {
-        Self::try_new_inner(schema, None)
+        Self::try_new_inner(schema, None, false)
     }
 
-    /// The caller supplies the actual admitted holder before any construction.
-    /// This factory still cannot adopt arbitrary Arrow allocations.
+    /// Governed construction requires the original byte-budget author.
+    /// Plain lifetime retention cannot authorize new payload allocation.
     pub fn try_new_with_guard(
         schema: SchemaRef,
         guard: ConnectorPayloadRetentionGuard,
     ) -> Result<Self, ConnectorError> {
-        Self::try_new_inner(schema, Some(guard))
+        if !guard.is_byte_budget() {
+            return Err(no_byte_budget());
+        }
+        Self::try_new_inner(schema, Some(guard), true)
+    }
+
+    /// Explicit local lifetime retention; no Root byte authorization is claimed.
+    /// Budget authors must use the governed constructor instead.
+    pub fn try_new_with_retention(
+        schema: SchemaRef,
+        guard: ConnectorPayloadRetentionGuard,
+    ) -> Result<Self, ConnectorError> {
+        if guard.is_byte_budget() {
+            return Err(no_byte_budget());
+        }
+        Self::try_new_inner(schema, Some(guard), false)
     }
 
     fn try_new_inner(
         schema: SchemaRef,
         retention: Option<ConnectorPayloadRetentionGuard>,
+        budgeted: bool,
     ) -> Result<Self, ConnectorError> {
         if schema.fields().len() > MAX_NODES {
             return Err(exhausted());
@@ -154,6 +171,7 @@ impl ConnectorRowMutationSourceBuilder {
             charged,
             nodes: 0,
             retention,
+            budgeted,
         })
     }
 
@@ -190,12 +208,31 @@ impl ConnectorRowMutationSourceBuilder {
         bytes: &[u8],
     ) -> Result<ConnectorRowMutationSourceBuffer, ConnectorError> {
         let capacity = bytes.len().checked_add(63).ok_or_else(exhausted)? & !63;
-        self.reserve(checked_add(capacity, BUFFER_HEADER_BYTES)?)?;
+        // Preserve the original local construction profile independently of
+        // the Root payload budget: its header allowance is not payload bytes.
+        let next = checked_add(self.charged, checked_add(capacity, BUFFER_HEADER_BYTES)?)?;
+        let guard = if self.budgeted {
+            // Pinned Arrow from_slice_ref uses a round-to-64 Layout of exactly
+            // this capacity. Reserve before that allocation, including zero.
+            Some(
+                self.retention
+                    .as_ref()
+                    .expect("governed source author")
+                    .reserve_owned_bytes(capacity)?,
+            )
+        } else {
+            self.retention
+                .as_ref()
+                .map(ConnectorPayloadRetentionGuard::try_clone)
+                .transpose()
+                .map_err(|_| exhausted())?
+        };
         let original = Buffer::from_slice_ref(bytes);
-        let buffer = match &self.retention {
-            Some(guard) => retain_buffer(original, guard.clone()),
+        let buffer = match guard {
+            Some(guard) => retain_buffer(original, guard),
             None => original,
         };
+        self.charged = next;
         Ok(ConnectorRowMutationSourceBuffer {
             identity: Arc::clone(&self.identity),
             buffer,
@@ -461,6 +498,12 @@ struct RetainedBuffer {
     _guard: ConnectorPayloadRetentionGuard,
 }
 
+fn no_byte_budget() -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::InvalidRequest,
+        "COW source construction requires its explicit byte-budget mode",
+    )
+}
 fn exhausted() -> ConnectorError {
     ConnectorError::new(
         ConnectorErrorKind::ResourceExhausted,
@@ -1115,7 +1158,7 @@ mod retention_tests {
         let holder = Arc::new(());
         let weak = Arc::downgrade(&holder);
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-        let mut builder = ConnectorRowMutationSourceBuilder::try_new_with_guard(
+        let mut builder = ConnectorRowMutationSourceBuilder::try_new_with_retention(
             schema.clone(),
             ConnectorPayloadRetentionGuard::new(holder),
         )
@@ -1154,7 +1197,7 @@ mod retention_tests {
             let sources = if empty {
                 vec![]
             } else {
-                let mut builder = ConnectorRowMutationSourceBuilder::try_new_with_guard(
+                let mut builder = ConnectorRowMutationSourceBuilder::try_new_with_retention(
                     schema.clone(),
                     guard.clone(),
                 )
@@ -1180,7 +1223,7 @@ mod retention_tests {
     #[test]
     fn guarded_source_refuses_excess_before_copy_and_drops_payload_before_holder() {
         let schema = Arc::new(Schema::empty());
-        let mut builder = ConnectorRowMutationSourceBuilder::try_new_with_guard(
+        let mut builder = ConnectorRowMutationSourceBuilder::try_new_with_retention(
             schema,
             ConnectorPayloadRetentionGuard::new(()),
         )
@@ -1225,5 +1268,203 @@ mod retention_tests {
         assert!(events.lock().unwrap().is_empty());
         drop(alias);
         assert_eq!(*events.lock().unwrap(), ["payload", "holder"]);
+    }
+}
+
+#[cfg(test)]
+mod byte_budget_tests {
+    use super::*;
+    use crate::connector::ConnectorPayloadByteBudget;
+    use arrow::datatypes::{Field, Schema};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct State {
+        held: usize,
+        requests: Vec<usize>,
+    }
+    struct OriginalBudget {
+        limit: usize,
+        state: Arc<Mutex<State>>,
+    }
+    struct OriginalReceipt {
+        bytes: usize,
+        state: Arc<Mutex<State>>,
+    }
+    impl Drop for OriginalReceipt {
+        fn drop(&mut self) {
+            let mut state = self.state.lock().unwrap();
+            state.held = state.held.checked_sub(self.bytes).unwrap();
+        }
+    }
+    impl ConnectorPayloadByteBudget for OriginalBudget {
+        fn reserve_bytes(
+            &self,
+            bytes: usize,
+        ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+            let mut state = self.state.lock().unwrap();
+            state.requests.push(bytes);
+            let next = state
+                .held
+                .checked_add(bytes)
+                .filter(|n| *n <= self.limit)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::ResourceExhausted,
+                        "original Root payload byte budget is full",
+                    )
+                })?;
+            state.held = next;
+            drop(state);
+            Ok(ConnectorPayloadRetentionGuard::from_shared(Arc::new(
+                OriginalReceipt {
+                    bytes,
+                    state: Arc::clone(&self.state),
+                },
+            )))
+        }
+    }
+    fn budget(limit: usize) -> Arc<OriginalBudget> {
+        Arc::new(OriginalBudget {
+            limit,
+            state: Arc::new(Mutex::new(State::default())),
+        })
+    }
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]))
+    }
+    fn governed(budget: &Arc<OriginalBudget>) -> ConnectorRowMutationSourceBuilder {
+        ConnectorRowMutationSourceBuilder::try_new_with_guard(
+            schema(),
+            ConnectorPayloadRetentionGuard::from_byte_budget(Arc::clone(budget)),
+        )
+        .unwrap()
+    }
+    fn batch(owner: &mut ConnectorRowMutationSourceBuilder) -> ConnectorRowMutationSourceChildren {
+        let values = owner.copy_buffer(&1_i32.to_ne_bytes()).unwrap();
+        let empty = owner.children(0).unwrap();
+        let column = owner.array(0, 1, None, Some(values), None, empty).unwrap();
+        let mut columns = owner.children(1).unwrap();
+        columns.push(column).unwrap();
+        columns
+    }
+
+    #[test]
+    fn governed_source_requires_a_byte_author_and_local_retention_is_explicit() {
+        let plain = ConnectorPayloadRetentionGuard::new(());
+        assert_eq!(
+            plain.reserve_owned_bytes(1).unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            ConnectorRowMutationSourceBuilder::try_new_with_guard(schema(), plain.clone())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        ConnectorRowMutationSourceBuilder::try_new_with_retention(schema(), plain).unwrap();
+        let original = budget(64);
+        assert_eq!(
+            ConnectorRowMutationSourceBuilder::try_new_with_retention(
+                schema(),
+                ConnectorPayloadRetentionGuard::from_byte_budget(original),
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn budget_capability_clone_does_not_charge_and_receipt_clone_releases_once() {
+        let original = budget(64);
+        let author = ConnectorPayloadRetentionGuard::from_byte_budget(Arc::clone(&original));
+        let copy = author.try_clone().unwrap();
+        assert!(original.state.lock().unwrap().requests.is_empty());
+        let receipt = copy.reserve_owned_bytes(64).unwrap();
+        let receipt_copy = receipt.try_clone().unwrap();
+        assert_eq!(original.state.lock().unwrap().held, 64);
+        drop((author, copy, receipt));
+        assert_eq!(original.state.lock().unwrap().held, 64);
+        drop(receipt_copy);
+        assert_eq!(original.state.lock().unwrap().held, 0);
+    }
+
+    #[test]
+    fn original_byte_refusal_precedes_copy_and_preserves_the_local_profile() {
+        let original = budget(63);
+        let mut owner = governed(&original);
+        let before = owner.reserved_bytes();
+        let error = owner.copy_buffer(&[1]).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert_eq!(error.message(), "original Root payload byte budget is full");
+        assert_eq!(owner.reserved_bytes(), before);
+        let state = original.state.lock().unwrap();
+        assert_eq!(state.requests, [64]);
+        assert_eq!(state.held, 0);
+    }
+
+    #[test]
+    fn exact_buffer_receipt_survives_finish_raw_array_and_last_buffer_slice() {
+        let original = budget(64);
+        let mut owner = governed(&original);
+        let columns = batch(&mut owner);
+        let source = owner.finish(1, columns).unwrap();
+        let raw_array = Arc::clone(source.batch().column(0));
+        let raw_data = raw_array.to_data();
+        let last_slice = raw_data.buffers()[0].slice(1);
+        assert_eq!(original.state.lock().unwrap().requests, [64]);
+        // The original local profile includes schema/header allowances. These
+        // are not reinterpreted as the Root's retained payload-byte debit.
+        assert!(source.source_bytes() > 64);
+        drop(source);
+        assert_eq!(original.state.lock().unwrap().held, 64);
+        drop((raw_array, raw_data));
+        assert_eq!(original.state.lock().unwrap().held, 64);
+        drop(last_slice);
+        assert_eq!(original.state.lock().unwrap().held, 0);
+    }
+
+    #[test]
+    fn independent_buffer_alias_does_not_pin_other_exited_payload_allocations() {
+        let original = budget(128);
+        let mut owner = governed(&original);
+        let first = owner.copy_buffer(&[1]).unwrap();
+        let second = owner.copy_buffer(&[2]).unwrap();
+        let first_alias = first.buffer.clone();
+        drop((first, second, owner));
+        assert_eq!(original.state.lock().unwrap().held, 64);
+        drop(first_alias);
+        assert_eq!(original.state.lock().unwrap().held, 0);
+    }
+
+    #[test]
+    fn local_profile_refusal_does_not_request_original_bytes() {
+        let original = budget(64);
+        let mut owner = governed(&original);
+        owner.charged = MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES;
+        assert_eq!(
+            owner.copy_buffer(&[1]).unwrap_err().kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        assert!(original.state.lock().unwrap().requests.is_empty());
+    }
+    #[test]
+    fn one_source_cumulative_refusal_is_released_by_the_actual_buffer_exit() {
+        let original = budget(64);
+        let mut owner = governed(&original);
+        let first = owner.copy_buffer(&[1]).unwrap();
+        let before = owner.reserved_bytes();
+        assert_eq!(
+            owner.copy_buffer(&[2]).unwrap_err().kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        assert_eq!(owner.reserved_bytes(), before);
+        assert_eq!(original.state.lock().unwrap().held, 64);
+        drop(first);
+        let second = owner.copy_buffer(&[2]).unwrap();
+        assert_eq!(original.state.lock().unwrap().held, 64);
+        drop((owner, second));
+        assert_eq!(original.state.lock().unwrap().held, 0);
     }
 }

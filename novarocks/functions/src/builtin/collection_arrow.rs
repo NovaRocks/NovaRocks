@@ -43,6 +43,7 @@ pub(super) enum ArrowSite {
     Cast,
     Take,
     Construct,
+    Extend,
 }
 #[derive(Debug)]
 enum CollectionArrowFailure {
@@ -76,6 +77,7 @@ impl std::fmt::Display for CollectionArrowFailure {
                     ArrowSite::Cast => "failed to cast output",
                     ArrowSite::Take => "take failed",
                     ArrowSite::Construct => "array construction failed",
+                    ArrowSite::Extend => "array extension failed",
                 }
             ),
         }
@@ -139,6 +141,25 @@ pub(super) fn arrow_failure(label: &str, site: ArrowSite, source: ArrowError) ->
         site,
         source,
     })
+}
+
+/// Only an actual extension failure owns this completion priority. Other
+/// collection contract failures keep their existing caller completion rules.
+pub(super) fn is_extension_failure(failure: &KernelFailure) -> bool {
+    let mut source = std::error::Error::source(failure);
+    while let Some(current) = source {
+        if let Some(failure) = current.downcast_ref::<CollectionArrowFailure>() {
+            return matches!(
+                failure,
+                CollectionArrowFailure::Arrow {
+                    site: ArrowSite::Extend,
+                    ..
+                }
+            );
+        }
+        source = current.source();
+    }
+    false
 }
 
 /// Check the actual List offset-header geometry before allocating it. Entries

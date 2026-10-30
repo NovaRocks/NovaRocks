@@ -58,7 +58,7 @@ fn statistics_application_target(
     })
 }
 
-fn statistics_application_result(
+pub(crate) fn statistics_application_result(
     result: StatisticsApplicationResult,
 ) -> Result<StatementResult, String> {
     match result {
@@ -134,11 +134,33 @@ impl StatisticsCommandExecutor {
         Self { application }
     }
 
+    pub(crate) fn prepare_statement_action(
+        &self,
+        command: &StatisticsSqlCommand,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+        family: novarocks_result_contract::ClientPresentationFamily,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        String,
+    > {
+        self.application
+            .prepare_statement_action(
+                lower_application_command(command, current_catalog, current_database)?,
+                execution,
+                context,
+                family,
+            )
+            .map_err(|e| e.to_string())
+    }
+
     /// Executes the complete semantic command admitted by Query Application.
     ///
     /// This adapter receives no parser AST and cannot reparse source SQL. It
     /// owns only the role-local projection to the statistics product port.
-    pub fn execute_command(
+    pub async fn execute_command(
         &self,
         command: &StatisticsSqlCommand,
         current_catalog: Option<&str>,
@@ -147,63 +169,72 @@ impl StatisticsCommandExecutor {
             &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         >,
     ) -> Result<StatementResult, String> {
-        let command = match command {
-            StatisticsSqlCommand::AnalyzeTable {
-                mode,
-                table,
-                columns,
-                with_sync_mode,
-            } => {
-                if *mode != AnalyzeModeSql::Default || *with_sync_mode {
-                    return Err(
-                        "ANALYZE mode and sync options are not supported by the statistics application"
-                            .to_string(),
-                    );
-                }
-                StatisticsApplicationCommand::AnalyzeTable {
-                    target: statistics_application_target(
-                        &table.parts,
-                        current_catalog,
-                        current_database,
-                    )?,
-                    columns: if columns.is_empty() {
-                        StatisticsColumnIntent::AllColumns
-                    } else {
-                        StatisticsColumnIntent::Explicit(columns.clone())
-                    },
-                }
-            }
-            StatisticsSqlCommand::ShowAnalyzeJobs => StatisticsApplicationCommand::ShowAnalyzeJobs,
-            StatisticsSqlCommand::CancelAnalyze { job_id } => {
-                StatisticsApplicationCommand::CancelAnalyze {
-                    job_id: uuid::Uuid::parse_str(job_id)
-                        .map_err(|error| format!("invalid ANALYZE job ID '{job_id}': {error}"))?,
-                }
-            }
-            StatisticsSqlCommand::ShowTableStats { table } => {
-                StatisticsApplicationCommand::ShowTableStats {
-                    target: statistics_application_target(
-                        &table.parts,
-                        current_catalog,
-                        current_database,
-                    )?,
-                }
-            }
-            StatisticsSqlCommand::ShowBasicStatsMeta
-            | StatisticsSqlCommand::ShowHistogramStatsMeta
-            | StatisticsSqlCommand::DropStats { .. }
-            | StatisticsSqlCommand::DropHistogram { .. }
-            | StatisticsSqlCommand::DropMultipleColumnsStats { .. } => {
-                return Err(
-                    "statistics command is not supported by the statistics application".to_string(),
-                );
-            }
-        };
+        let command = lower_application_command(command, current_catalog, current_database)?;
         self.application
             .execute(command, execution)
+            .await
             .map_err(|error| error.to_string())
             .and_then(statistics_application_result)
     }
+}
+
+fn lower_application_command(
+    command: &StatisticsSqlCommand,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<StatisticsApplicationCommand, String> {
+    Ok(match command {
+        StatisticsSqlCommand::AnalyzeTable {
+            mode,
+            table,
+            columns,
+            with_sync_mode,
+        } => {
+            if *mode != AnalyzeModeSql::Default || *with_sync_mode {
+                return Err(
+                    "ANALYZE mode and sync options are not supported by the statistics application"
+                        .to_string(),
+                );
+            }
+            StatisticsApplicationCommand::AnalyzeTable {
+                target: statistics_application_target(
+                    &table.parts,
+                    current_catalog,
+                    current_database,
+                )?,
+                columns: if columns.is_empty() {
+                    StatisticsColumnIntent::AllColumns
+                } else {
+                    StatisticsColumnIntent::Explicit(columns.clone())
+                },
+            }
+        }
+        StatisticsSqlCommand::ShowAnalyzeJobs => StatisticsApplicationCommand::ShowAnalyzeJobs,
+        StatisticsSqlCommand::CancelAnalyze { job_id } => {
+            StatisticsApplicationCommand::CancelAnalyze {
+                job_id: uuid::Uuid::parse_str(job_id)
+                    .map_err(|error| format!("invalid ANALYZE job ID '{job_id}': {error}"))?,
+            }
+        }
+        StatisticsSqlCommand::ShowTableStats { table } => {
+            StatisticsApplicationCommand::ShowTableStats {
+                target: statistics_application_target(
+                    &table.parts,
+                    current_catalog,
+                    current_database,
+                )?,
+            }
+        }
+        StatisticsSqlCommand::ShowBasicStatsMeta
+        | StatisticsSqlCommand::ShowHistogramStatsMeta
+        | StatisticsSqlCommand::DropStats { .. }
+        | StatisticsSqlCommand::DropHistogram { .. }
+        | StatisticsSqlCommand::DropMultipleColumnsStats { .. } => {
+            return Err(
+                "statistics command is not supported by the statistics application".to_string(),
+            );
+        }
+    })
 }
 
 #[cfg(test)]
@@ -244,52 +275,62 @@ mod tests {
     }
 
     impl StatisticsApplicationPort for RecordingStatisticsApplicationPort {
-        fn execute(
-            &self,
+        fn execute<'a>(
+            &'a self,
             command: StatisticsApplicationCommand,
             _execution: Option<
-                &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+                &'a novarocks_query_application::admitted_query_context::QueryExecutionContext,
             >,
-        ) -> Result<StatisticsApplicationResult, StatisticsApplicationError> {
-            self.commands
-                .lock()
-                .expect("statistics commands")
-                .push(command.clone());
-            match command {
-                StatisticsApplicationCommand::AnalyzeTable { target, .. } => Ok(
-                    StatisticsApplicationResult::JobSubmitted(StatisticsJobView {
-                        job_id: Uuid::nil(),
-                        operation_id: novarocks_spi::connector::LakePublicationId::new_v7(),
-                        state: "SUBMITTED".into(),
-                        attempt: 0,
-                        target,
-                        error_kind: None,
-                        error_message: None,
-                    }),
-                ),
-                StatisticsApplicationCommand::ShowAnalyzeJobs
-                | StatisticsApplicationCommand::CancelAnalyze { .. } => {
-                    Ok(StatisticsApplicationResult::AnalyzeJobs(Vec::new()))
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<StatisticsApplicationResult, StatisticsApplicationError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                self.commands
+                    .lock()
+                    .expect("statistics commands")
+                    .push(command.clone());
+                match command {
+                    StatisticsApplicationCommand::AnalyzeTable { target, .. } => Ok(
+                        StatisticsApplicationResult::JobSubmitted(StatisticsJobView {
+                            job_id: Uuid::nil(),
+                            operation_id: novarocks_spi::connector::LakePublicationId::new_v7(),
+                            state: "SUBMITTED".into(),
+                            attempt: 0,
+                            target,
+                            error_kind: None,
+                            error_message: None,
+                        }),
+                    ),
+                    StatisticsApplicationCommand::ShowAnalyzeJobs
+                    | StatisticsApplicationCommand::CancelAnalyze { .. } => {
+                        Ok(StatisticsApplicationResult::AnalyzeJobs(Vec::new()))
+                    }
+                    StatisticsApplicationCommand::ShowTableStats { .. } => {
+                        Ok(StatisticsApplicationResult::TableStats(vec![
+                            StatisticsTableStatView {
+                                metric: "row_count".into(),
+                                value: Some("42".into()),
+                                status: "AVAILABLE".into(),
+                                basis_version: "SAME".into(),
+                                source: "PROVIDER_ARTIFACT".into(),
+                                numeric_nature: "EXACT".into(),
+                                basis_relation: "IDENTICAL".into(),
+                            },
+                        ]))
+                    }
                 }
-                StatisticsApplicationCommand::ShowTableStats { .. } => {
-                    Ok(StatisticsApplicationResult::TableStats(vec![
-                        StatisticsTableStatView {
-                            metric: "row_count".into(),
-                            value: Some("42".into()),
-                            status: "AVAILABLE".into(),
-                            basis_version: "SAME".into(),
-                            source: "PROVIDER_ARTIFACT".into(),
-                            numeric_nature: "EXACT".into(),
-                            basis_relation: "IDENTICAL".into(),
-                        },
-                    ]))
-                }
-            }
+            })
         }
     }
 
-    #[test]
-    fn typed_statistics_statements_use_the_frontend_application_owner() {
+    #[tokio::test]
+    async fn typed_statistics_statements_use_the_frontend_application_owner() {
         let port = Arc::new(RecordingStatisticsApplicationPort::default());
         let executor =
             StatisticsCommandExecutor::new(Arc::clone(&port) as Arc<dyn StatisticsApplicationPort>);
@@ -298,11 +339,13 @@ mod tests {
         assert!(
             executor
                 .execute_command(&analyze, None, "default", None)
+                .await
                 .is_ok()
         );
         let show = statistics_command("SHOW TABLE STATS ice.analytics.orders");
         let show_stats = executor
             .execute_command(&show, None, "default", None)
+            .await
             .expect("show typed table stats");
         let novarocks_query_application::protocol_delivery::QuerySessionOutput::Query(show_stats) =
             show_stats
@@ -353,5 +396,27 @@ mod tests {
             error,
             "statistics application returned malformed tabular result"
         );
+    }
+    #[tokio::test]
+    async fn local_command_borrows_application_future_without_eager_dispatch() {
+        use std::future::Future;
+        let port = Arc::new(RecordingStatisticsApplicationPort::default());
+        let executor = StatisticsCommandExecutor::new(port.clone());
+        let command = statistics_command("SHOW ANALYZE JOBS");
+        let mut borrowed = Box::pin(executor.execute_command(&command, None, "default", None));
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(borrowed.as_mut().poll(&mut cx).is_pending());
+        assert!(port.commands().is_empty());
+        drop(borrowed);
+        assert!(port.commands().is_empty());
+        executor
+            .execute_command(&command, None, "default", None)
+            .await
+            .expect("same original local application");
+        assert!(matches!(
+            port.commands().as_slice(),
+            [StatisticsApplicationCommand::ShowAnalyzeJobs]
+        ));
     }
 }

@@ -158,14 +158,31 @@ fn ordinary_metadata_keeps_its_owned_copy_and_cow_never_adopts_a_prospective_gen
         .expect("ordinary handoff");
     assert!(!std::ptr::eq(statistics.as_ref(), ordinary.as_ref()));
     let shared = IcebergAdmissionStatisticsMetadata::from_loaded_table(&table, true);
-    let failure = shared
-        .for_statistics(Some(original.as_ref()), true)
+    assert!(std::ptr::eq(shared.as_ref(), original.as_ref()));
+    let foreign = stock_metadata();
+    assert_ne!(foreign.uuid(), original.uuid());
+    // Even an equal generation supplied as prospective metadata cannot replace
+    // the original shared owner. A distinct table generation is refused too.
+    for prospective in [original.as_ref(), &foreign] {
+        let failure = shared
+            .for_statistics(Some(prospective), true)
+            .err()
+            .expect("COW rejects caller-supplied prospective metadata");
+        assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+    let failure = ordinary
+        .for_statistics(None, true)
         .err()
-        .expect("COW rejects prospective metadata");
+        .expect("an owned copy cannot impersonate the original COW owner");
     assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
+    let retained = shared
+        .for_statistics(None, true)
+        .expect("refusal preserves the original COW owner for a valid handoff");
+    assert!(std::ptr::eq(retained.as_ref(), original.as_ref()));
+    assert_eq!(retained.uuid(), original.uuid());
     assert_eq!(
-        failure.message(),
-        "Iceberg COW admission lost its original immutable metadata owner"
+        retained.current_snapshot_id(),
+        original.current_snapshot_id()
     );
 }
 

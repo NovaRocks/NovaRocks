@@ -82,6 +82,20 @@ impl Scenario for Documents {
     }
     fn launch_config(&self, root: &Path) -> Result<ScenarioLaunchConfig> {
         let (fixture, mut launch) = ManagedMvRestFixture::start_recorded(root, self.catalog())?;
+        if matches!(self.kind, Kind::Consistent) {
+            // Use the existing FE file-log owner, isolated under this scenario's
+            // collected artifacts. Public SQL errors never carry document keys.
+            let diagnostics = root.join("provider-diagnostics");
+            fs::create_dir_all(&diagnostics)?;
+            launch.child_environment.fe.insert(
+                "NOVAROCKS_LOG_DIR".into(),
+                diagnostics.to_string_lossy().into_owned(),
+            );
+            launch.child_environment.fe.insert(
+                "NOVAROCKS_LOG_BASENAME".into(),
+                "mv-document-consistent".into(),
+            );
+        }
         launch
             .config_overlay
             .fe
@@ -1342,14 +1356,44 @@ impl Documents {
                 )?;
             }
             let frozen = load_metadata(context, rest, NS, case)?;
+            let diagnostic_path = context
+                .scenario_root()
+                .join("provider-diagnostics/mv-document-consistent.WARNING");
+            let prior_diagnostics = fs::read_to_string(&diagnostic_path).with_context(|| {
+                format!("read original FE warning log {}", diagnostic_path.display())
+            })?;
             let error = conn
                 .query_drop(format!("REFRESH MATERIALIZED VIEW {case} WITH SYNC MODE"))
                 .expect_err("corrupt current documents must refuse refresh")
                 .to_string();
             context.action(format!("corruption {case} rejected: {error}"));
             ensure!(
-                error.to_ascii_lowercase().contains("corrupt") && error.contains(&key),
-                "current corruption failed without CorruptData/key {key}: {error}"
+                error.contains("[query.execution.invalid_data]")
+                    && !error.contains("novarocks.doc."),
+                "current corruption lost its public invalid-data category or exposed a private document key: {error}"
+            );
+            let diagnostics = fs::read_to_string(&diagnostic_path).with_context(|| {
+                format!("read original FE warning log {}", diagnostic_path.display())
+            })?;
+            let current = diagnostics
+                .strip_prefix(&prior_diagnostics)
+                .context("original FE warning log rotated during one corruption request")?;
+            let exact_key = format!("document_key={key:?}");
+            ensure!(
+                current.lines().any(|line| {
+                    line.contains("Iceberg keyed document corruption")
+                        && line.split_whitespace().any(|field| field == exact_key)
+                        && [
+                            "connector_kind=CorruptData",
+                            "failure_class=Data",
+                            "failure_domain=4",
+                            "failure_code=9",
+                        ]
+                        .iter()
+                        .all(|expected| line.split_whitespace().any(|field| field == *expected))
+                }),
+                "current corruption lost its exact original document key or typed Connector corruption fact in {}",
+                diagnostic_path.display()
             );
             let after = load_metadata(context, rest, NS, case)?;
             ensure!(

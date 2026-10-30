@@ -3224,11 +3224,15 @@ fn data_type_dynamic_bytes(
             checked_sum(fields.iter().map(|field| field_bytes(field))),
         ]),
         DataType::Union(fields, _) => checked_sum([
-            checked_mul(fields.len(), std::mem::size_of::<i8>()),
-            checked_mul(
-                fields.len(),
-                std::mem::size_of::<arrow::datatypes::FieldRef>(),
-            ),
+            std::alloc::Layout::array::<(i8, arrow::datatypes::FieldRef)>(fields.len())
+                .ok()
+                .and_then(|payload| {
+                    novarocks_type_contract::owned_resources::layout::arc_layout(payload).ok()
+                })
+                .ok_or(CompletionProtocolError::ResourceCountOverflow(
+                    CompletionResource::ExchangeBytes,
+                ))
+                .and_then(|layout| checked_size(layout.size())),
             checked_sum(fields.iter().map(|(_, field)| field_bytes(field))),
         ]),
         DataType::Dictionary(key, value) => checked_sum([
@@ -3246,10 +3250,13 @@ fn data_type_dynamic_bytes(
 fn field_bytes(field: &arrow::datatypes::Field) -> Result<u64, CompletionProtocolError> {
     let metadata =
         checked_sum([
-            checked_mul(
-                field.metadata().capacity(),
-                std::mem::size_of::<(String, String)>(),
-            ),
+            novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
+                field.metadata().len(),
+            )
+            .map_err(|_| {
+                CompletionProtocolError::ResourceCountOverflow(CompletionResource::ExchangeBytes)
+            })
+            .and_then(checked_size),
             checked_sum(field.metadata().iter().map(|(key, value)| {
                 checked_sum([checked_size(key.len()), checked_size(value.len())])
             })),
@@ -3856,6 +3863,44 @@ mod tests {
             },
             algorithm: PartitionHashAlgorithm::NativeExchangeV1,
         }
+    }
+
+    #[test]
+    fn exchange_field_metadata_keeps_text_length_not_spare_capacity() {
+        use arrow::datatypes::{DataType, Field};
+        let field = |key_capacity, value_capacity| {
+            let mut key = String::with_capacity(key_capacity);
+            key.push('k');
+            let mut value = String::with_capacity(value_capacity);
+            value.push('v');
+            Field::new("x", DataType::Int32, false)
+                .with_metadata(std::collections::HashMap::from([(key, value)]))
+        };
+        assert_eq!(
+            field_bytes(&field(1, 1)).unwrap(),
+            field_bytes(&field(64, 96)).unwrap()
+        );
+        assert_eq!(
+            field_bytes(&Field::new("x", DataType::Int32, false)).unwrap(),
+            (std::mem::size_of::<Field>() + 1) as u64
+        );
+    }
+
+    #[test]
+    fn exchange_union_pair_padding_and_empty_arc_are_counted() {
+        use arrow::datatypes::{DataType, Field, UnionFields, UnionMode};
+        let empty = DataType::Union(UnionFields::empty(), UnionMode::Sparse);
+        assert_eq!(data_type_dynamic_bytes(&empty).unwrap(), 16);
+        let fields: UnionFields = [(
+            3,
+            std::sync::Arc::new(Field::new("x", DataType::Int32, false)),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            data_type_dynamic_bytes(&DataType::Union(fields, UnionMode::Sparse)).unwrap(),
+            (32 + std::mem::size_of::<Field>() + 1) as u64
+        );
     }
 
     #[test]

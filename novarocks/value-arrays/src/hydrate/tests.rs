@@ -550,39 +550,44 @@ fn growth_control_and_structure_refusals_preserve_original_caller_and_source() {
     );
 }
 #[test]
-fn metadata_empty_allocations_are_rebuilt_and_unchanged_subtrees_share() {
-    let child: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
-    let mut metadata = std::collections::HashMap::with_capacity(8);
-    metadata.insert("temporary".to_owned(), "value".to_owned());
-    metadata.clear();
-    let field = Arc::new(Field::new("n", DataType::Int32, false).with_metadata(metadata));
-    let source: ArrayRef =
-        Arc::new(StructArray::try_new(vec![field].into(), vec![child.clone()], None).unwrap());
-    let target = DataType::Struct(vec![Arc::new(Field::new("n", DataType::Int32, false))].into());
-    let output = execute(
-        &plan(&source, &binding(target.clone(), false)),
-        &mut ValueConversionContext::default(),
-    );
-    assert!(!Arc::ptr_eq(&source, &output));
-    let result = output.as_any().downcast_ref::<StructArray>().unwrap();
-    // Safe ArrayData reboxing creates child headers; its immutable payload
-    // remains the same source allocation rather than being copied.
-    let original = child.as_any().downcast_ref::<Int32Array>().unwrap();
-    let rebuilt = result
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
-    assert_eq!(original.values().as_ptr(), rebuilt.values().as_ptr());
-    let DataType::Struct(fields) = output.data_type() else {
-        panic!("struct")
-    };
-    assert_eq!(fields[0].metadata().capacity(), 0);
-    let second = execute(
-        &plan(&output, &binding(target, false)),
-        &mut ValueConversionContext::default(),
-    );
-    assert!(Arc::ptr_eq(&second, &output));
+fn metadata_backing_drives_rebuild_and_unchanged_payloads_share() {
+    for has_metadata in [false, true] {
+        let child: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let mut metadata = std::collections::HashMap::with_capacity(8);
+        metadata.insert("temporary".to_owned(), "value".to_owned());
+        if !has_metadata {
+            metadata.clear();
+        }
+        let field = Arc::new(Field::new("n", DataType::Int32, false).with_metadata(metadata));
+        let source: ArrayRef =
+            Arc::new(StructArray::try_new(vec![field].into(), vec![child.clone()], None).unwrap());
+        let target =
+            DataType::Struct(vec![Arc::new(Field::new("n", DataType::Int32, false))].into());
+        let output = execute(
+            &plan(&source, &binding(target.clone(), false)),
+            &mut ValueConversionContext::default(),
+        );
+        assert_eq!(Arc::ptr_eq(&source, &output), !has_metadata);
+        let result = output.as_any().downcast_ref::<StructArray>().unwrap();
+        // A real annotation rebuilds the parent, while both inputs retain the
+        // exact immutable child payload. Cleared staging has no backing to remove.
+        let original = child.as_any().downcast_ref::<Int32Array>().unwrap();
+        let rebuilt = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(original.values().as_ptr(), rebuilt.values().as_ptr());
+        let DataType::Struct(fields) = output.data_type() else {
+            panic!("struct")
+        };
+        assert!(fields[0].metadata().as_arc().is_none());
+        let second = execute(
+            &plan(&output, &binding(target, false)),
+            &mut ValueConversionContext::default(),
+        );
+        assert!(Arc::ptr_eq(&second, &output));
+    }
 }
 #[test]
 fn real_field_arithmetic_preserves_large_offsets_and_complete_top_row_prefixes() {
@@ -1397,4 +1402,98 @@ fn dense_and_sparse_union_occurrences_keep_encoding_demands_and_reachable_requir
         );
         assert!(matches!(dictionary.data_type(), DataType::Dictionary(..)));
     }
+}
+
+#[test]
+fn target_requirements_predicate_keeps_original_promise_error_and_dictionary_null_rules() {
+    let source = dictionary(vec![Some("kept"), None], vec![Some(0), Some(1), None]);
+    let target = binding(DataType::Utf8View, false);
+    assert!(
+        !required_values_satisfied_observed(
+            &source,
+            &target,
+            HydrateOptions::default(),
+            &mut |_| Ok::<_, Infallible>(()),
+            &mut |_| Ok(()),
+        )
+        .unwrap()
+    );
+    assert!(matches!(
+        validate_required_observed(
+            &source,
+            &target,
+            &mut |_| Ok::<_, Infallible>(()),
+            &mut |_| Ok(()),
+        ),
+        Err(ValueFailure::Value(ValueError::Invariant(
+            ValueViolation::RequiredNull
+        )))
+    ));
+    assert!(
+        required_values_satisfied_observed(
+            &source,
+            &binding(DataType::Utf8View, true),
+            HydrateOptions::default(),
+            &mut |_| Ok::<_, Infallible>(()),
+            &mut |_| Ok(()),
+        )
+        .unwrap()
+    );
+    let error = required_values_satisfied_observed(
+        &source,
+        &target,
+        HydrateOptions::default(),
+        &mut |_| Err("original control"),
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ValueFailure::Caller("original control")));
+}
+
+#[test]
+fn target_requirements_use_the_same_active_parent_rule_without_masking_layout() {
+    let field = Arc::new(Field::new("child", DataType::Int32, true));
+    let values: ArrayRef = Arc::new(Int32Array::from(vec![None::<i32>]));
+    let target = binding(
+        DataType::Struct(vec![Arc::new(Field::new("child", DataType::Int32, false))].into()),
+        true,
+    );
+    let options = HydrateOptions {
+        dictionary_value_layout: None,
+        projection: HydrateProjection::FrozenNamesAndNullability,
+    };
+    for (active, expected) in [(false, true), (true, false)] {
+        let source: ArrayRef = Arc::new(
+            StructArray::try_new(
+                vec![Arc::clone(&field)].into(),
+                vec![Arc::clone(&values)],
+                Some(NullBuffer::from(vec![active])),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            required_values_satisfied_observed(
+                &source,
+                &target,
+                options,
+                &mut |_| Ok::<_, Infallible>(()),
+                &mut |_| Ok(()),
+            )
+            .unwrap(),
+            expected
+        );
+    }
+    let wrong: ArrayRef = Arc::new(Int32Array::from(vec![None::<i32>]));
+    assert!(matches!(
+        required_values_satisfied_observed(
+            &wrong,
+            &target,
+            options,
+            &mut |_| Ok::<_, Infallible>(()),
+            &mut |_| Ok(()),
+        ),
+        Err(ValueFailure::Value(ValueError::Invariant(
+            ValueViolation::Layout
+        )))
+    ));
 }

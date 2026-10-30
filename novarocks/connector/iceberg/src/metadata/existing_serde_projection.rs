@@ -21,7 +21,7 @@ use crate::iceberg::spec::{NestedField, Schema, TableMetadata, Type};
 use crate::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 use novarocks_spi::connector::{ConnectorError, ConnectorPayloadRetentionGuard};
 use serde::Serialize;
-use std::{io, mem::size_of};
+use std::io;
 #[path = "raw_defaults.rs"]
 mod raw_defaults;
 
@@ -46,18 +46,8 @@ impl<E> std::fmt::Display for Error<E> {
         std::fmt::Debug::fmt(self, f)
     }
 }
-fn add<E>(a: u64, b: u64) -> Result<u64, Error<E>> {
-    a.checked_add(b).ok_or(Error::Overflow)
-}
-fn mul<E>(a: u64, b: u64) -> Result<u64, Error<E>> {
-    a.checked_mul(b).ok_or(Error::Overflow)
-}
-
-// This only forwards the ORIGINAL window checker, deadline/stop and holder.
-// No default implementation, capacity acquisition, deadline or new work scope.
 pub(crate) trait OriginalScope<E = ConnectorError> {
     fn check_active(&self) -> Result<(), E>;
-    fn check_total(&self, whole_live_upper: u64) -> Result<(), E>;
     fn original_guard(&self) -> ConnectorPayloadRetentionGuard;
 }
 
@@ -193,46 +183,6 @@ fn for_children<E>(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Shape {
     pub metadata_json: u64,
-    pub schema_owned_upper: u64,
-    pub maximum_field_temporary: u64,
-}
-impl Shape {
-    pub fn owned_upper<E>(self) -> Result<u64, Error<E>> {
-        add(
-            add(self.metadata_json, self.schema_owned_upper)?,
-            (size_of::<OwnedProjection>() - size_of::<IcebergSchemaDef>()) as u64,
-        )
-    }
-    // Field JSON N, RawValue nesting scratch old+new <= 3N+16. Default
-    // substring copies are already counted in the COMPLETE schema graph.
-    fn field_temporary<E>(n: u64) -> Result<u64, Error<E>> {
-        add(mul(n, 4)?, 16)
-    }
-}
-fn inspect_field<E>(
-    field: &NestedField,
-    scope: &dyn OriginalScope<E>,
-    graph: &mut u64,
-    temporary: &mut u64,
-) -> Result<(), Error<E>> {
-    scope.check_active().map_err(Error::Control)?;
-    // No Nova Literal.clone / Value graph. Public Serialize's internal child
-    // clones are the narrow D17 library invocation, measured by its owner.
-    let field_json = count(field, scope)?;
-    *graph = add(*graph, field.name.len() as u64)?;
-    // Both raw default slices are DISJOINT members of this exact field JSON.
-    *graph = add(*graph, field_json)?;
-    *graph = add(
-        *graph,
-        mul(
-            child_count(&field.field_type) as u64,
-            size_of::<IcebergSchemaFieldDef>() as u64,
-        )?,
-    )?;
-    *temporary = (*temporary).max(Shape::field_temporary(field_json)?);
-    for_children(&field.field_type, |child| {
-        inspect_field(child, scope, graph, temporary)
-    })
 }
 
 pub(crate) struct Plan<'a> {
@@ -247,48 +197,18 @@ impl<'a> Plan<'a> {
         scope: &dyn OriginalScope<E>,
     ) -> Result<Self, Error<E>> {
         let metadata_json = count(metadata, scope)?;
-        let fields = snapshot_schema.as_struct().fields();
-        let mut graph = add(
-            size_of::<IcebergSchemaDef>() as u64,
-            mul(
-                fields.len() as u64,
-                size_of::<IcebergSchemaFieldDef>() as u64,
-            )?,
-        )?;
-        let mut temporary = 0;
-        for field in fields {
-            inspect_field(field, scope, &mut graph, &mut temporary)?;
-        }
         Ok(Self {
             metadata,
             schema: snapshot_schema,
-            shape: Shape {
-                metadata_json,
-                schema_owned_upper: graph,
-                maximum_field_temporary: temporary,
-            },
+            shape: Shape { metadata_json },
         })
     }
-    pub fn shape(&self) -> Shape {
-        self.shape
-    }
-    // Caller supplies truthful coexisting backing and ALL other new own
-    // allocation recipes, not a wire cap. No zero fallback exists here.
-    // Invoke BEFORE the first branch's output/schema/new DTO allocation.
-    pub fn authorize<E>(
+    pub fn for_copies<E>(
         self,
         copies: usize,
-        existing_upper: u64,
-        other_new_upper: u64,
         scope: &'a dyn OriginalScope<E>,
     ) -> Result<Checked<'a, E>, Error<E>> {
-        let owned = mul(copies as u64, self.shape.owned_upper()?)?;
-        let total = add(
-            add(add(existing_upper, other_new_upper)?, owned)?,
-            self.shape.maximum_field_temporary,
-        )?;
         scope.check_active().map_err(Error::Control)?;
-        scope.check_total(total).map_err(Error::Control)?;
         Ok(Checked {
             plan: self,
             scope,

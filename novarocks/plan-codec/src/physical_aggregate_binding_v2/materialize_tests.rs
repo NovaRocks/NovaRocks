@@ -384,7 +384,7 @@ fn aggregate_materialization_full_lambda_nominal_metadata_and_dictionary_owned_c
         assert!(Arc::ptr_eq(&fields[0], &original[0]));
         assert_eq!(fields[0].name(), "authored-name");
         assert!(fields[0].is_nullable());
-        assert_eq!(fields[0].metadata().capacity(), 0);
+        assert!(fields[0].metadata().as_arc().is_none());
         let original = headers.functions().type_table().value_type(8).unwrap();
         assert_eq!(binding.intermediate_type, *original);
         assert_eq!(binding.intermediate_type.data_type(), &DataType::Utf8);

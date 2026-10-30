@@ -88,6 +88,9 @@ struct KeyedManagementObservationCaps {
     conclusions:
         std::sync::Mutex<std::collections::VecDeque<novarocks_spi::connector::CommitConclusion>>,
     calls: Arc<std::sync::atomic::AtomicUsize>,
+    async_calls: std::sync::atomic::AtomicUsize,
+    async_exits: std::sync::atomic::AtomicUsize,
+    async_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 fn unused_keyed_management_test_capability() -> novarocks_spi::connector::ConnectorError {
@@ -115,6 +118,37 @@ impl novarocks_spi::connector::ConnectorDocumentStorageObservation
     > {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.reply.lock().unwrap().clone()
+    }
+    fn observe_keyed_documents_async(
+        &self,
+        _request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        novarocks_spi::connector::KeyedDocumentView,
+                        novarocks_spi::connector::KeyedDocumentReadError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.async_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let gate = self.async_gate.lock().unwrap().take();
+        Box::pin(async move {
+            struct Exit<'a>(&'a std::sync::atomic::AtomicUsize);
+            impl Drop for Exit<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _exit = Exit(&self.async_exits);
+            if let Some(gate) = gate {
+                gate.await.expect("test releases the original observation");
+            }
+            self.reply.lock().unwrap().clone()
+        })
     }
     fn observe_full_keyed_documents(
         &self,
@@ -245,6 +279,9 @@ fn keyed_management_lease_with_caps(
         after_resolution: std::sync::Mutex::new(None),
         conclusions: std::sync::Mutex::new(std::collections::VecDeque::new()),
         calls: Arc::clone(&calls),
+        async_calls: std::sync::atomic::AtomicUsize::new(0),
+        async_exits: std::sync::atomic::AtomicUsize::new(0),
+        async_gate: std::sync::Mutex::new(None),
     });
     let documents = ConnectorDocumentStorageBinding::try_new(
         descriptor,
@@ -4274,4 +4311,510 @@ fn shared_current_reader_foreign_scope_does_not_revoke_another_target() {
             )
             .unwrap(),
     );
+}
+
+#[test]
+fn borrowed_terminal_releases_real_activity_before_the_stable_lease_is_destroyed() {
+    let (entrance, target, request) =
+        publication_terminal_fixture(ConnectorDocumentManagementOperation::Publication);
+    let mut first = entrance
+        .request(
+            request.clone(),
+            crate::activity::MvActivityOwner::ScheduledRefresh,
+        )
+        .unwrap();
+    let mut first = first.try_acquire().unwrap().unwrap();
+    first
+        .mark_dispatched(EffectResponsibility::new(
+            EffectIdentity::from_bytes([91; 16]),
+            target.clone(),
+            incarnation("inc-a"),
+            EffectScope::CATALOG_COMMIT,
+            ManagementTimestamp::from_unix_millis(1_000),
+        ))
+        .unwrap();
+    let mut next = entrance
+        .request(request, crate::activity::MvActivityOwner::ManualRefresh)
+        .unwrap();
+    assert!(next.try_acquire().unwrap().is_none());
+    first
+        .record_terminal_in_place(EffectDisposition::KnownUncommitted)
+        .unwrap();
+    let next = next
+        .try_acquire()
+        .unwrap()
+        .expect("actual terminal releases the original FIFO turn");
+    // Keep the old stable lease alive through the proof. Its later Drop must
+    // neither pin the turn nor invent an Unknown effect after real settlement.
+    drop(first);
+    assert!(entrance.unsettled_effects(target.table()).is_empty());
+    drop(next);
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::Manageable
+    );
+}
+
+#[test]
+fn actual_provider_view_revokes_foreign_management_without_projection_or_another_observation() {
+    use crate::persistence::keyed_documents::{management_slot, management_slot_name};
+    for publication in ["valid", "missing", "malformed"] {
+        let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
+        let (_, prior, _) = entrance
+            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .unwrap();
+        {
+            let mut reply = caps.reply.lock().unwrap();
+            let view = reply.as_mut().unwrap();
+            view.slots
+                .get_mut(&management_slot_name().unwrap())
+                .unwrap()
+                .value = management_slot(&owner("deployment-b"), &incarnation("inc-b")).unwrap();
+            match publication {
+                "missing" => view.current_records.clear(),
+                "malformed" => view.current_records[0].payload = Bytes::from_static(b"invalid P"),
+                _ => {}
+            }
+        }
+        let before = caps.calls.load(std::sync::atomic::Ordering::SeqCst);
+        // This is the same provider observation the guard already obtained.
+        // The negative author does not decode P or issue another storage call.
+        let view = lease.observe_keyed_documents(request.clone()).unwrap();
+        assert!(
+            entrance
+                .revoke_foreign_current_management(&view, &request.catalog_handle)
+                .unwrap()
+        );
+        assert_eq!(
+            caps.calls.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+        assert!(!prior.is_open());
+        assert_eq!(
+            entrance.management_phase(target.table()),
+            MvManagementPhase::OwnerMismatch
+        );
+        assert!(
+            entrance
+                .acquire(
+                    ManagementRequest::try_new(
+                        target.catalog().clone(),
+                        target.table().clone(),
+                        Some(target.object_id().clone()),
+                        ConnectorDocumentManagementOperation::Publication,
+                        Some(dependencies),
+                        EffectScope::CATALOG_COMMIT,
+                    )
+                    .unwrap(),
+                    || false
+                )
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn actual_foreign_provider_scope_cannot_revoke_another_management_target() {
+    let (entrance, target, _, lease, request, caps) = installed_keyed_drop_fixture();
+    let (_, prior, _) = entrance
+        .observe_keyed_admission(&lease, request.clone(), Default::default())
+        .unwrap();
+    {
+        use crate::persistence::keyed_documents::{management_slot, management_slot_name};
+        caps.reply
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .slots
+            .get_mut(&management_slot_name().unwrap())
+            .unwrap()
+            .value = management_slot(&owner("deployment-b"), &incarnation("inc-b")).unwrap();
+    }
+    let view = lease.observe_keyed_documents(request.clone()).unwrap();
+    let before = caps.calls.load(std::sync::atomic::Ordering::SeqCst);
+    let mut foreign = view.clone();
+    foreign.object_id =
+        ConnectorTableObjectId::try_new(Bytes::from_static(b"another-object")).unwrap();
+    assert!(
+        !entrance
+            .revoke_foreign_current_management(&foreign, &request.catalog_handle)
+            .unwrap()
+    );
+    let other_catalog = CatalogHandle::new(
+        target.table().instance_id.clone(),
+        CatalogVersion::from_bytes([91; 32]),
+    );
+    assert!(
+        !entrance
+            .revoke_foreign_current_management(&view, &other_catalog)
+            .unwrap()
+    );
+    assert!(prior.is_open());
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::Manageable
+    );
+    assert_eq!(caps.calls.load(std::sync::atomic::Ordering::SeqCst), before);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_keyed_pending_observation_mints_the_same_exact_fresh_capability() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let target = target("mv", b"async-object");
+    let mut state = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    let id = ManagementObservationRequestId::from_bytes([101; 16]);
+    let pending = state.begin_current_observation(id).unwrap();
+    let view = keyed_management_view(&target, "deployment-a", "inc-a", 2);
+    let expected_version = view.metadata_version.clone();
+    let (lease, request, caps) = keyed_management_lease_with_caps(&target, Ok(view));
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *caps.async_gate.lock().unwrap() = Some(gate);
+    let mut observation = Box::pin(pending.complete_keyed_async(&lease, request));
+    assert!(futures::poll!(observation.as_mut()).is_pending());
+    assert_eq!(caps.async_calls.load(SeqCst), 1);
+    assert_eq!(caps.calls.load(SeqCst), 0, "no synchronous fallback");
+    assert_eq!(caps.async_exits.load(SeqCst), 0);
+    release.send(()).unwrap();
+    let (fresh, actual) = observation.await.unwrap();
+    assert_eq!(fresh.target(), &target);
+    assert_eq!(fresh.owner(), &owner("deployment-a"));
+    assert_eq!(fresh.incarnation(), &incarnation("inc-a"));
+    assert_eq!(fresh.metadata_version(), &expected_version);
+    assert_eq!(actual.object_id, *target.object_id());
+    assert_eq!(
+        state.accept_current_observation(fresh).unwrap(),
+        ManagementObservationPhase::Ready,
+    );
+    assert_eq!(caps.async_calls.load(SeqCst), 1);
+    assert_eq!(caps.async_exits.load(SeqCst), 1);
+    assert_eq!(
+        state.begin_current_observation(id).err().unwrap(),
+        ManagementObservationError::ReusedObservationRequest,
+    );
+    let id = ManagementObservationRequestId::from_bytes([110; 16]);
+    let pending = state.begin_current_observation(id).unwrap();
+    let (lease, request, caps) = keyed_management_lease_with_caps(
+        &target,
+        Ok(keyed_management_view(&target, "deployment-a", "inc-a", 3)),
+    );
+    let (phase, view) = state
+        .complete_keyed_current_observation_async(pending, &lease, request)
+        .await
+        .unwrap();
+    assert_eq!(phase, ManagementObservationPhase::Ready);
+    assert_eq!(view.object_id, *target.object_id());
+    assert_eq!(caps.async_calls.load(SeqCst), 1);
+    assert_eq!(caps.async_exits.load(SeqCst), 1);
+    assert_eq!(caps.calls.load(SeqCst), 0);
+    assert_eq!(
+        state.begin_current_observation(id).err().unwrap(),
+        ManagementObservationError::ReusedObservationRequest
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_state_consumes_the_ticket_before_foreign_pending_or_borrower_drop() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let target = target("mv", b"async-object");
+    let mut state = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    let id = ManagementObservationRequestId::from_bytes([102; 16]);
+    let pending = state.begin_current_observation(id).unwrap();
+    let (lease, request, caps) = keyed_management_lease_with_caps(
+        &target,
+        Ok(keyed_management_view(&target, "deployment-a", "inc-a", 2)),
+    );
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *caps.async_gate.lock().unwrap() = Some(gate);
+    let mut observation =
+        Box::pin(state.complete_keyed_current_observation_async(pending, &lease, request));
+    assert!(futures::poll!(observation.as_mut()).is_pending());
+    assert_eq!(caps.async_calls.load(SeqCst), 1);
+    assert_eq!(caps.async_exits.load(SeqCst), 0);
+    drop(observation);
+    assert!(
+        release.send(()).is_err(),
+        "the original borrowed future exited"
+    );
+    assert_eq!(caps.async_exits.load(SeqCst), 1);
+    assert_eq!(state.phase(), ManagementObservationPhase::Ready);
+    assert!(state.liveness().is_open());
+    assert_eq!(
+        state.begin_current_observation(id).err().unwrap(),
+        ManagementObservationError::ReusedObservationRequest,
+    );
+    state
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([103; 16]))
+        .expect("the spent ticket does not leave an active request behind");
+    assert_eq!(caps.calls.load(SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_keyed_failure_preserves_the_original_shared_cause_and_fact() {
+    use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    use std::sync::atomic::Ordering::SeqCst;
+    let target = target("mv", b"async-object");
+    let mut state = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    let id = ManagementObservationRequestId::from_bytes([104; 16]);
+    let pending = state.begin_current_observation(id).unwrap();
+    let error = ConnectorError::compile_interruption(
+        novarocks_type_contract::CompileControlError::Cancelled,
+    );
+    let original = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<SharedFailureCause>())
+        .unwrap()
+        .clone();
+    let original_fact = original.failure_fact();
+    let (lease, request, caps) = keyed_management_lease_with_caps(&target, Err(error.into()));
+    let failure = state
+        .complete_keyed_current_observation_async(pending, &lease, request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.kind(),
+        &ManagementObservationError::UnsealedObservation
+    );
+    assert_eq!(failure.original_failure(), Some(&original));
+    assert_eq!(
+        failure.original_failure().unwrap().failure_fact(),
+        original_fact
+    );
+    assert_eq!(
+        std::error::Error::source(&failure)
+            .and_then(|source| source.downcast_ref::<SharedFailureCause>()),
+        Some(&original),
+    );
+    assert_eq!(failure.clone(), failure);
+    assert_eq!(caps.async_calls.load(SeqCst), 1);
+    assert_eq!(caps.calls.load(SeqCst), 0);
+    assert!(state.liveness().is_open());
+    assert_eq!(
+        state.begin_current_observation(id).err().unwrap(),
+        ManagementObservationError::ReusedObservationRequest,
+    );
+    // A plain Provider error is retained as that actual error, not a message.
+    let id = ManagementObservationRequestId::from_bytes([105; 16]);
+    let pending = state.begin_current_observation(id).unwrap();
+    let (lease, request, _) = keyed_management_lease_with_caps(
+        &target,
+        Err(
+            ConnectorError::new(ConnectorErrorKind::Unavailable, "original provider offline")
+                .into(),
+        ),
+    );
+    let failure = state
+        .complete_keyed_current_observation_async(pending, &lease, request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure
+            .original_failure()
+            .unwrap()
+            .downcast_ref::<ConnectorError>()
+            .unwrap()
+            .kind(),
+        ConnectorErrorKind::Unavailable,
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_keyed_replacement_closes_the_original_liveness_and_retains_the_source() {
+    use novarocks_spi::connector::{ConnectorError, ConnectorTableObjectBindingFailure};
+    use std::sync::atomic::Ordering::SeqCst;
+    let target = target("mv", b"async-object");
+    let mut state = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    let original_liveness = state.liveness().clone();
+    let id = ManagementObservationRequestId::from_bytes([106; 16]);
+    let pending = state.begin_current_observation(id).unwrap();
+    let (lease, request, caps) = keyed_management_lease_with_caps(
+        &target,
+        Err(ConnectorError::table_object_binding(
+            ConnectorTableObjectBindingFailure::Replaced,
+            "original exact target was replaced",
+        )
+        .into()),
+    );
+    let failure = state
+        .complete_keyed_current_observation_async(pending, &lease, request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.kind(),
+        &ManagementObservationError::Ownership(ManagementOwnershipError::TargetReplaced)
+    );
+    assert_eq!(
+        state.phase(),
+        ManagementObservationPhase::ClosedObjectReplacement
+    );
+    assert!(!original_liveness.is_open());
+    assert_eq!(caps.async_calls.load(SeqCst), 1);
+    assert_eq!(caps.async_exits.load(SeqCst), 1);
+    assert_eq!(
+        failure
+            .original_failure()
+            .unwrap()
+            .downcast_ref::<ConnectorError>()
+            .unwrap()
+            .table_object_binding_failure(),
+        Some(ConnectorTableObjectBindingFailure::Replaced),
+    );
+    assert_eq!(
+        state.begin_current_observation(id).err().unwrap(),
+        ManagementObservationError::ObservationNotAllowed,
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_keyed_request_and_provenance_refusals_cannot_install_foreign_management() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let target = target("mv", b"async-object");
+    let mut state = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    let id = ManagementObservationRequestId::from_bytes([107; 16]);
+    let pending = state.begin_current_observation(id).unwrap();
+    let mut foreign = keyed_management_view(&target, "deployment-b", "inc-b", 2);
+    foreign.slots.clear();
+    let (lease, mut request, caps) = keyed_management_lease_with_caps(&target, Ok(foreign));
+    let original_request = request.clone();
+    request.object_id = object(b"another-object");
+    let failure = state
+        .complete_keyed_current_observation_async(pending, &lease, request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.kind(),
+        &ManagementObservationError::EffectTargetMismatch
+    );
+    assert!(failure.original_failure().is_none());
+    assert_eq!(
+        caps.async_calls.load(SeqCst),
+        0,
+        "request is checked before foreign I/O"
+    );
+    assert_eq!(state.phase(), ManagementObservationPhase::Ready);
+    assert!(state.liveness().is_open());
+    assert_eq!(
+        state.begin_current_observation(id).err().unwrap(),
+        ManagementObservationError::ReusedObservationRequest
+    );
+    let id = ManagementObservationRequestId::from_bytes([108; 16]);
+    let pending = state.begin_current_observation(id).unwrap();
+    let failure = state
+        .complete_keyed_current_observation_async(pending, &lease, original_request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.kind(),
+        &ManagementObservationError::InvalidProvenance
+    );
+    assert!(failure.original_failure().is_none());
+    assert_eq!(caps.async_calls.load(SeqCst), 1);
+    assert_eq!(state.phase(), ManagementObservationPhase::Ready);
+    assert!(
+        state.liveness().is_open(),
+        "unproven foreign marker cannot revoke the target"
+    );
+    assert_eq!(caps.calls.load(SeqCst), 0);
+    let mut escaped = keyed_management_view(&target, "deployment-a", "inc-a", 3);
+    escaped.object_id = object(b"another-provider-object");
+    *caps.reply.lock().unwrap() = Ok(escaped);
+    let pending = state
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([111; 16]))
+        .unwrap();
+    let failure = state
+        .complete_keyed_current_observation_async(pending, &lease, original_request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.kind(),
+        &ManagementObservationError::UnsealedObservation
+    );
+    assert_eq!(
+        failure
+            .original_failure()
+            .unwrap()
+            .downcast_ref::<novarocks_spi::connector::ConnectorError>()
+            .unwrap()
+            .kind(),
+        novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+    );
+    assert_eq!(caps.async_calls.load(SeqCst), 2);
+    assert_eq!(state.phase(), ManagementObservationPhase::Ready);
+    assert!(state.liveness().is_open());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_keyed_legacy_refusal_retains_the_actual_codec_source_and_fact() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause, domain};
+    use novarocks_spi::connector::KeyedDocumentReadError;
+    let target = target("mv", b"async-object");
+    let mut state = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    let pending = state
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([109; 16]))
+        .unwrap();
+    let legacy = KeyedDocumentReadError::LegacyFormat {
+        key: "original-legacy-key".into(),
+    };
+    let (lease, request, _) = keyed_management_lease_with_caps(&target, Err(legacy.clone()));
+    let failure = state
+        .complete_keyed_current_observation_async(pending, &lease, request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.kind(),
+        &ManagementObservationError::UnsealedObservation
+    );
+    let original = failure.original_failure().expect("actual codec refusal");
+    assert_eq!(
+        original.downcast_ref::<KeyedDocumentReadError>(),
+        Some(&legacy)
+    );
+    assert_eq!(original.failure_fact(), legacy.failure_fact());
+    assert_eq!(original.failure_fact().class(), FailureClass::Unsupported);
+    assert_eq!(
+        original.failure_fact().reason().domain(),
+        domain::METADATA.get()
+    );
+    assert_eq!(original.failure_fact().reason().code(), 916);
+    assert_eq!(
+        std::error::Error::source(&failure)
+            .and_then(|source| source.downcast_ref::<SharedFailureCause>()),
+        Some(original),
+    );
+    assert_eq!(failure.clone().original_failure(), Some(original));
+    assert!(failure.to_string().contains("original-legacy-key"));
+    assert_eq!(failure.clone(), failure);
+    assert!(state.liveness().is_open());
+}
+
+#[tokio::test]
+async fn async_keyed_drop_preserves_the_original_pending_observation_and_exact_guard() {
+    use std::future::Future;
+    use std::sync::atomic::Ordering::SeqCst;
+    let (entrance, target, _, lease, request, caps) = installed_keyed_drop_fixture();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *caps.async_gate.lock().unwrap() = Some(gate);
+    let mut original =
+        Box::pin(entrance.observe_keyed_drop_async(&lease, request.clone(), Default::default()));
+    let mut borrowed = Box::pin(std::future::poll_fn(|cx| original.as_mut().poll(cx)));
+    assert!(futures::poll!(borrowed.as_mut()).is_pending());
+    assert_eq!(caps.async_calls.load(SeqCst), 1);
+    assert_eq!(caps.async_exits.load(SeqCst), 0);
+    drop(borrowed);
+    assert_eq!(caps.async_exits.load(SeqCst), 0);
+    release.send(()).unwrap();
+    let (first, _) = original.await.unwrap();
+    assert_eq!(first.target(), &target);
+    assert_eq!(caps.async_calls.load(SeqCst), 1);
+    assert_eq!(caps.async_exits.load(SeqCst), 1);
+    let management = entrance
+        .acquire_async(first.request(), std::future::pending::<()>())
+        .await
+        .unwrap();
+    let (second, _) = entrance
+        .observe_keyed_drop_async(&lease, request, Default::default())
+        .await
+        .unwrap();
+    assert!(first.matches(&second));
+    drop(management);
 }

@@ -269,7 +269,7 @@ impl RootRelayFrontier {
             }
             RootReadResponse::Refused(refused) => {
                 self.last_read = None;
-                return Ok(RootRelayStep::Refused(refused.clone()));
+                return Ok(RootRelayStep::Refused(refused.as_ref().clone()));
             }
             RootReadResponse::Reply(reply) => reply,
         };

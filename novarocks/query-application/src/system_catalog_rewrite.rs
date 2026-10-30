@@ -37,6 +37,9 @@ use novarocks_spi::connector::ConnectorRequestContext;
 use crate::system_catalog::{SystemCatalog, SystemCatalogInputs};
 use novarocks_types::schema::ColumnDef;
 
+mod asynchronous;
+pub use asynchronous::rewrite_query_async;
+
 pub const INFORMATION_SCHEMA_DB: &str = "information_schema";
 
 /// Immutable catalog names gathered by a role-local reader for one virtual
@@ -68,6 +71,16 @@ impl SystemCatalogFacts {
 pub trait SystemCatalogFactsPort: Send + Sync {
     fn local_system_catalog_facts(&self) -> Result<SystemCatalogFacts, String>;
 
+    fn external_system_catalog_facts_async<'a>(
+        &'a self,
+        request: &'a ConnectorRequestContext,
+        catalog_name: &'a str,
+        include_table_names: bool,
+    ) -> futures::future::BoxFuture<'a, Result<Option<SystemCatalogFacts>, String>> {
+        Box::pin(async move {
+            self.external_system_catalog_facts(request, catalog_name, include_table_names)
+        })
+    }
     fn external_system_catalog_facts(
         &self,
         request: &ConnectorRequestContext,

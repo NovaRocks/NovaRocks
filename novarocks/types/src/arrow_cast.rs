@@ -1045,6 +1045,15 @@ pub fn cast_scalar_with_special_rules(
         return Ok(Arc::new(builder.finish()));
     }
     match (array.data_type(), target_type) {
+        (DataType::LargeUtf8, DataType::Date32) => {
+            let source = array
+                .as_any()
+                .downcast_ref::<arrow_array::LargeStringArray>()
+                .ok_or_else(|| scalar_contract("DATE text CAST has a foreign carrier"))?;
+            Ok(novarocks_functions::temporal_carrier::cast_large_date_text(
+                source,
+            ))
+        }
         (DataType::Utf8, DataType::Date32) => {
             let arr = array
                 .as_any()

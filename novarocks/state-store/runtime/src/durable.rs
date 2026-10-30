@@ -29,7 +29,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use novarocks_state_store_api::{
-    Key, Precondition, StateStore, StateStoreError, StateStoreLimits, Value, WriteTransaction,
+    Key, OriginalWriteTransaction, Precondition, StateStore, StateStoreError,
+    StateStoreExecutionFailure, StateStoreLimits, Value, WriteTransaction,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -236,6 +237,17 @@ impl DurableRecordStore {
         precondition: Precondition,
     ) -> Result<(), StateStoreError> {
         transaction.put(key, record.0, precondition).await
+    }
+    /// Move the SAME already checked bytes into an original transaction.
+    /// Encoding and the durable budget are never repeated at this boundary.
+    pub async fn put_encoded_in(
+        &self,
+        transaction: &mut dyn OriginalWriteTransaction,
+        key: Key,
+        record: EncodedRecord,
+        precondition: Precondition,
+    ) -> Result<(), StateStoreExecutionFailure> {
+        transaction.put_in(key, record.0, precondition).await
     }
 }
 

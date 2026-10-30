@@ -296,6 +296,12 @@ fn normalize_role_config(
                 input.runtime.fe_mysql_port,
                 "$FE_MYSQL",
             )?;
+            replace_exact_integer(
+                root,
+                &["standalone_server", "trino_port"],
+                input.runtime.fe_trino_port,
+                "$FE_TRINO",
+            )?;
             ensure!(
                 get_path(root, &["cluster", "frontend_endpoint"]).is_none(),
                 "effective FE config must not contain cluster.frontend_endpoint"
@@ -321,6 +327,10 @@ fn normalize_role_config(
             ensure!(
                 get_path(root, &["standalone_server", "mysql_port"]).is_none(),
                 "effective BE config must not contain standalone_server.mysql_port"
+            );
+            ensure!(
+                get_path(root, &["standalone_server", "trino_port"]).is_none(),
+                "effective BE config must not contain standalone_server.trino_port"
             );
             replace_exact_string(
                 root,
@@ -602,6 +612,7 @@ mod tests {
         grpc: u16,
         control_grpc: Option<u16>,
         mysql: Option<u16>,
+        trino: Option<u16>,
         frontend_grpc: u16,
         runtime_dir: &'a Path,
         extra: &'a str,
@@ -617,6 +628,7 @@ mod tests {
             grpc,
             control_grpc,
             mysql,
+            trino,
             frontend_grpc,
             runtime_dir,
             extra,
@@ -629,6 +641,9 @@ mod tests {
             .unwrap_or_default();
         let mysql = mysql
             .map(|port| format!("mysql_port = {port}"))
+            .unwrap_or_default();
+        let trino = trino
+            .map(|port| format!("trino_port = {port}"))
             .unwrap_or_default();
         let role_fields = if role == "fe" {
             format!(
@@ -648,7 +663,7 @@ mod tests {
         };
         format!(
             "[server]\nhost = \"127.0.0.1\"\nhttp_port = {http}\ngrpc_port = {grpc}\n{control}\
-             [standalone_server]\n{mysql}\n\
+             [standalone_server]\n{mysql}\n{trino}\n\
              [cluster]\nrole = \"{role}\"\n{role_fields}\
              [runtime]\nexchange_wait_ms = 1000\n{extra}\n\
              [native_trust]\ndeployment_id = \"novarocks-system-tests\"\nshared_secret = \"${{ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}}\"\n\
@@ -658,7 +673,7 @@ mod tests {
 
     fn evidence(
         root: &Path,
-        ports: (u16, u16, u16, u16, u16, u16),
+        ports: (u16, u16, u16, u16, u16, u16, u16),
         secret: &str,
         extra: &str,
         profile: LaunchProfile,
@@ -668,7 +683,7 @@ mod tests {
 
     fn evidence_with_options(
         root: &Path,
-        ports: (u16, u16, u16, u16, u16, u16),
+        ports: (u16, u16, u16, u16, u16, u16, u16),
         secret: &str,
         extra: &str,
         profile: LaunchProfile,
@@ -685,6 +700,7 @@ mod tests {
             fe_http_port: ports.0,
             fe_grpc_port: ports.1,
             fe_mysql_port: ports.2,
+            fe_trino_port: ports.6,
         };
         let advertised_port = proxy_limit.map(|_| ports.4 + 1);
         let advertised_control_port = proxy_limit.map(|_| ports.5 + 1);
@@ -694,6 +710,7 @@ mod tests {
             grpc: ports.1,
             control_grpc: None,
             mysql: Some(ports.2),
+            trino: Some(ports.6),
             frontend_grpc: ports.1,
             runtime_dir: root,
             extra,
@@ -707,6 +724,7 @@ mod tests {
             grpc: ports.4,
             control_grpc: Some(ports.5),
             mysql: None,
+            trino: None,
             frontend_grpc: ports.1,
             runtime_dir: root,
             extra,
@@ -750,7 +768,7 @@ mod tests {
         let second_root = PathBuf::from("/tmp/effective-config-second");
         let first = evidence(
             &first_root,
-            (1101, 1102, 1103, 1104, 1105, 1205),
+            (1101, 1102, 1103, 1104, 1105, 1205, 1106),
             "secret-canary-first",
             "worker_threads = 4",
             LaunchProfile::Performance,
@@ -758,7 +776,7 @@ mod tests {
         .unwrap();
         let second = evidence(
             &second_root,
-            (2101, 2102, 2103, 2104, 2105, 2205),
+            (2101, 2102, 2103, 2104, 2105, 2205, 2106),
             "secret-canary-second",
             "worker_threads = 4",
             LaunchProfile::Performance,
@@ -772,6 +790,8 @@ mod tests {
         assert_eq!(first.artifact_sha256(), first.semantics_sha256());
         let artifact = String::from_utf8(first.artifact_bytes().to_vec()).unwrap();
         assert!(artifact.contains("$ROLE_CONTROL_GRPC"));
+        assert!(artifact.contains("$FE_TRINO"));
+        assert!(!artifact.contains("1106"));
         assert!(!artifact.contains("secret-canary"));
         assert!(!artifact.contains(first_root.to_string_lossy().as_ref()));
     }
@@ -781,7 +801,7 @@ mod tests {
         let root = PathBuf::from("/tmp/effective-config-stable");
         let base = evidence(
             &root,
-            (1101, 1102, 1103, 1104, 1105, 1205),
+            (1101, 1102, 1103, 1104, 1105, 1205, 1106),
             "secret-a",
             "worker_threads = 4",
             LaunchProfile::Performance,
@@ -789,7 +809,7 @@ mod tests {
         .unwrap();
         let runtime_changed = evidence(
             &root,
-            (1101, 1102, 1103, 1104, 1105, 1205),
+            (1101, 1102, 1103, 1104, 1105, 1205, 1106),
             "secret-a",
             "worker_threads = 5",
             LaunchProfile::Performance,
@@ -797,7 +817,7 @@ mod tests {
         .unwrap();
         let profile_changed = evidence(
             &root,
-            (1101, 1102, 1103, 1104, 1105, 1205),
+            (1101, 1102, 1103, 1104, 1105, 1205, 1106),
             "secret-a",
             "worker_threads = 4",
             LaunchProfile::FaultScenario,
@@ -805,7 +825,7 @@ mod tests {
         .unwrap();
         let timeout_changed = evidence(
             &root,
-            (1101, 1102, 1103, 1104, 1105, 1205),
+            (1101, 1102, 1103, 1104, 1105, 1205, 1106),
             "secret-a",
             "worker_threads = 4\ncontrol_timeout_ms = 9000",
             LaunchProfile::Performance,
@@ -819,7 +839,7 @@ mod tests {
     #[test]
     fn tls_credential_environment_and_proxy_changes_change_semantics() {
         let root = PathBuf::from("/tmp/effective-config-contract");
-        let ports = (1101, 1102, 1103, 1104, 1105, 1205);
+        let ports = (1101, 1102, 1103, 1104, 1105, 1205, 1106);
         let base = evidence_with_options(
             &root,
             ports,
@@ -944,6 +964,120 @@ mod tests {
     }
 
     #[test]
+    fn trino_port_requires_exact_fe_value_and_be_absence() {
+        let root = Path::new("/tmp/effective-config-trino-role");
+        let runtime = CrossProcessRuntime {
+            be: vec![BePorts {
+                http: 1104,
+                grpc: 1105,
+                control_grpc: 1205,
+            }],
+            fe_http_port: 1101,
+            fe_grpc_port: 1102,
+            fe_mysql_port: 1103,
+            fe_trino_port: 1106,
+        };
+        let frontend = config(TestRoleConfig {
+            role: "fe",
+            http: 1101,
+            grpc: 1102,
+            control_grpc: None,
+            mysql: Some(1103),
+            trino: Some(1106),
+            frontend_grpc: 1102,
+            runtime_dir: root,
+            extra: "",
+            transport_mode: "disabled",
+            advertised_port: None,
+            advertised_control_port: None,
+        });
+        let backend = config(TestRoleConfig {
+            role: "be",
+            http: 1104,
+            grpc: 1105,
+            control_grpc: Some(1205),
+            mysql: None,
+            trino: None,
+            frontend_grpc: 1102,
+            runtime_dir: root,
+            extra: "",
+            transport_mode: "disabled",
+            advertised_port: None,
+            advertised_control_port: None,
+        });
+        let environment = BTreeMap::new();
+        let proxy = CrossProcessNativeFaultProxyConfig::default();
+        let input = EffectiveLaunchConfigInput {
+            launch_profile: LaunchProfile::FaultScenario,
+            cluster_size: 1,
+            expected_eligible_backend_count: 1,
+            runtime: &runtime,
+            runtime_dir: root,
+            advertise_host: "127.0.0.1",
+            frontend_config: &frontend,
+            backend_configs: std::slice::from_ref(&backend),
+            frontend_environment: &environment,
+            backend_environments: std::slice::from_ref(&environment),
+            native_proxy_config: &proxy,
+            native_root_reply_fault: None,
+            advertised_backend_grpc_ports: &[1105],
+            advertised_backend_control_grpc_ports: &[1205],
+        };
+        let valid = normalize_role_config(
+            RoleConfigInput {
+                role: "fe",
+                backend_index: None,
+                config: &frontend,
+            },
+            &input,
+        )
+        .unwrap();
+        assert!(serde_json::to_string(&valid).unwrap().contains("$FE_TRINO"));
+        for changed in [
+            frontend.replace("trino_port = 1106", "trino_port = 8080"),
+            frontend.replace("trino_port = 1106", ""),
+        ] {
+            let error = normalize_role_config(
+                RoleConfigInput {
+                    role: "fe",
+                    backend_index: None,
+                    config: &changed,
+                },
+                &input,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("standalone_server.trino_port"));
+        }
+        normalize_role_config(
+            RoleConfigInput {
+                role: "be",
+                backend_index: Some(0),
+                config: &backend,
+            },
+            &input,
+        )
+        .unwrap();
+        let invalid_backend = backend.replace(
+            "[standalone_server]",
+            "[standalone_server]\ntrino_port = 1106",
+        );
+        let error = normalize_role_config(
+            RoleConfigInput {
+                role: "be",
+                backend_index: Some(0),
+                config: &invalid_backend,
+            },
+            &input,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("effective BE config must not contain standalone_server.trino_port")
+        );
+    }
+
+    #[test]
     fn static_catalog_attachment_binds_content_not_runtime_path() {
         let runtime_dir = std::env::temp_dir().join(format!(
             "novarocks-effective-config-static-{}",
@@ -961,6 +1095,7 @@ mod tests {
             fe_http_port: 1101,
             fe_grpc_port: 1102,
             fe_mysql_port: 1103,
+            fe_trino_port: 1106,
         };
         let frontend = format!(
             "{}\n[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"catalogs.toml\"\n",
@@ -970,6 +1105,7 @@ mod tests {
                 grpc: 1102,
                 control_grpc: None,
                 mysql: Some(1103),
+                trino: Some(1106),
                 frontend_grpc: 1102,
                 runtime_dir: &runtime_dir,
                 extra: "worker_threads = 4",
@@ -988,6 +1124,7 @@ mod tests {
             grpc: 1105,
             control_grpc: Some(1205),
             mysql: None,
+            trino: None,
             frontend_grpc: 1102,
             runtime_dir: &runtime_dir,
             extra: "worker_threads = 4",

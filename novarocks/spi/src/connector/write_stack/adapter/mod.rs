@@ -102,6 +102,20 @@ impl<P: ProviderWriteRuntime> WriteRuntimeAdapter<P> {
         ConnectorCommitFragment::from_parts(self.binding.clone(), OpaqueWritePayload::new(fragment))
     }
 
+    /// Retain an already-admitted original holder in the same Arc as the
+    /// Provider artifact. This neither authorizes allocation nor estimates the
+    /// graph; the original creator must check its complete coexistence budget.
+    pub fn wrap_retained_commit_fragment(
+        &self,
+        fragment: P::CommitFragment,
+        retention: crate::connector::ConnectorPayloadRetentionGuard,
+    ) -> ConnectorCommitFragment {
+        ConnectorCommitFragment::from_parts(
+            self.binding.clone(),
+            OpaqueWritePayload::retained(fragment, retention),
+        )
+    }
+
     /// Recover a provider commit handle only through this adapter's exact
     /// binding.
     pub fn commit_handle<'a>(
@@ -222,6 +236,64 @@ mod tests {
         fn catalog_handle(&self) -> &CatalogHandle {
             &self.catalog_handle
         }
+    }
+
+    #[derive(Debug)]
+    struct TrackedFragment {
+        value: u8,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+    impl Drop for TrackedFragment {
+        fn drop(&mut self) {
+            self.events.lock().unwrap().push("payload");
+        }
+    }
+    struct TrackedRetention(Arc<std::sync::Mutex<Vec<&'static str>>>);
+    impl Drop for TrackedRetention {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("retention");
+        }
+    }
+    struct TrackedProvider(Arc<FakeProvider>);
+    impl ProviderWriteRuntime for TrackedProvider {
+        type CommitHandle = FakeCommit;
+        type WriterHandle = FakeWriterHandle;
+        type CommitFragment = TrackedFragment;
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.0.descriptor
+        }
+        fn catalog_handle(&self) -> &CatalogHandle {
+            &self.0.catalog_handle
+        }
+    }
+
+    #[test]
+    fn opaque_alias_retains_the_original_holder_until_its_real_payload_exits() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter =
+            WriteRuntimeAdapter::new(Arc::new(TrackedProvider(FakeProvider::new("unit", 1))));
+        let fragment = adapter.wrap_retained_commit_fragment(
+            TrackedFragment {
+                value: 9,
+                events: Arc::clone(&events),
+            },
+            crate::connector::ConnectorPayloadRetentionGuard::new(TrackedRetention(Arc::clone(
+                &events,
+            ))),
+        );
+        assert_eq!(adapter.commit_fragment(&fragment).unwrap().value, 9);
+        let opaque_alias = fragment.payload().clone();
+        drop(fragment);
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(
+            opaque_alias
+                .downcast_ref::<TrackedFragment>()
+                .unwrap()
+                .value,
+            9
+        );
+        drop(opaque_alias);
+        assert_eq!(*events.lock().unwrap(), vec!["payload", "retention"]);
     }
 
     #[test]

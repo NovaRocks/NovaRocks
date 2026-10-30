@@ -26,7 +26,7 @@ use crate::iceberg::spec::{
     DataFileBuilder, ManifestListWriter, ManifestWriterBuilder, Operation, SnapshotReference,
     SnapshotRetention, Struct, Summary,
 };
-use crate::opendal::raw::{Access, AccessDyn, OpStat, RpDelete, RpStat, oio};
+use crate::opendal::raw::oio;
 use crate::rest_protocol::test_server::{Reply, Script, TestServer};
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -214,65 +214,127 @@ impl Storage for ReadStorage {
 }
 #[derive(Debug, Clone)]
 struct DeleteAccess {
-    inner: crate::opendal::raw::Accessor,
+    inner: crate::opendal::raw::Servicer,
     events: Arc<Events>,
 }
-impl Access for DeleteAccess {
-    type Reader = oio::Reader;
-    type Writer = oio::Writer;
-    type Lister = oio::Lister;
-    type Deleter = oio::Deleter;
-    fn info(&self) -> Arc<crate::opendal::raw::AccessorInfo> {
-        self.inner.info()
+impl crate::opendal::raw::Service for DeleteAccess {
+    type Reader = ();
+    type Writer = ();
+    type Lister = ();
+    type Deleter = crate::opendal::raw::oio::Deleter;
+    type Copier = ();
+    fn info(&self) -> crate::opendal::raw::ServiceInfo {
+        crate::opendal::raw::Service::info(&self.inner)
     }
-    async fn stat(&self, path: &str, args: OpStat) -> crate::opendal::Result<RpStat> {
+    fn capability(&self) -> crate::opendal::Capability {
+        crate::opendal::raw::Service::capability(&self.inner)
+    }
+    async fn create_dir(
+        &self,
+        ctx: &crate::opendal::OperationContext,
+        path: &str,
+        args: crate::opendal::raw::OpCreateDir,
+    ) -> crate::opendal::Result<crate::opendal::raw::RpCreateDir> {
+        crate::opendal::raw::Service::create_dir(&(), ctx, path, args).await
+    }
+    async fn stat(
+        &self,
+        ctx: &crate::opendal::OperationContext,
+        path: &str,
+        args: crate::opendal::raw::OpStat,
+    ) -> crate::opendal::Result<crate::opendal::raw::RpStat> {
         self.events.record("STAT", path);
         if let Some(ms) = self.events.stat_advance.lock().unwrap().remove(path) {
             self.events.clock.advance(ms);
         }
-        self.inner.stat_dyn(path, args).await
+        crate::opendal::raw::Service::stat(&self.inner, ctx, path, args).await
     }
-    async fn delete(&self) -> crate::opendal::Result<(RpDelete, Self::Deleter)> {
-        let (rp, inner) = self.inner.delete_dyn().await?;
-        Ok((
-            rp,
-            Box::new(DeleteRecorder {
-                inner,
-                events: self.events.clone(),
-                paths: Vec::new(),
-            }),
-        ))
+    fn read(
+        &self,
+        ctx: &crate::opendal::OperationContext,
+        path: &str,
+        args: crate::opendal::raw::OpRead,
+    ) -> crate::opendal::Result<Self::Reader> {
+        crate::opendal::raw::Service::read(&(), ctx, path, args)
+    }
+    fn write(
+        &self,
+        ctx: &crate::opendal::OperationContext,
+        path: &str,
+        args: crate::opendal::raw::OpWrite,
+    ) -> crate::opendal::Result<Self::Writer> {
+        crate::opendal::raw::Service::write(&(), ctx, path, args)
+    }
+    fn delete(
+        &self,
+        ctx: &crate::opendal::OperationContext,
+    ) -> crate::opendal::Result<Self::Deleter> {
+        Ok(Box::new(DeleteRecorder {
+            inner: crate::opendal::raw::Service::delete(&self.inner, ctx)?,
+            events: self.events.clone(),
+        }))
+    }
+    fn list(
+        &self,
+        ctx: &crate::opendal::OperationContext,
+        path: &str,
+        args: crate::opendal::raw::OpList,
+    ) -> crate::opendal::Result<Self::Lister> {
+        crate::opendal::raw::Service::list(&(), ctx, path, args)
+    }
+    fn copy(
+        &self,
+        ctx: &crate::opendal::OperationContext,
+        from: &str,
+        to: &str,
+        args: crate::opendal::raw::OpCopy,
+        opts: crate::opendal::raw::OpCopier,
+    ) -> crate::opendal::Result<Self::Copier> {
+        crate::opendal::raw::Service::copy(&(), ctx, from, to, args, opts)
+    }
+    async fn rename(
+        &self,
+        ctx: &crate::opendal::OperationContext,
+        from: &str,
+        to: &str,
+        args: crate::opendal::raw::OpRename,
+    ) -> crate::opendal::Result<crate::opendal::raw::RpRename> {
+        crate::opendal::raw::Service::rename(&(), ctx, from, to, args).await
+    }
+    async fn presign(
+        &self,
+        ctx: &crate::opendal::OperationContext,
+        path: &str,
+        args: crate::opendal::raw::OpPresign,
+    ) -> crate::opendal::Result<crate::opendal::raw::RpPresign> {
+        crate::opendal::raw::Service::presign(&(), ctx, path, args).await
     }
 }
 struct DeleteRecorder {
     inner: oio::Deleter,
     events: Arc<Events>,
-    paths: Vec<String>,
 }
 impl oio::Delete for DeleteRecorder {
-    fn delete(&mut self, p: &str, a: crate::opendal::raw::OpDelete) -> crate::opendal::Result<()> {
-        self.inner.delete_dyn(p, a)?;
-        self.paths.push(p.to_owned());
-        Ok(())
-    }
-    async fn flush(&mut self) -> crate::opendal::Result<usize> {
-        // Exact actual external operation start; queue/enqueue isn't DELETE.
-        let issued = !self.paths.is_empty();
-        let consumes_time = self
-            .paths
-            .iter()
-            .any(|p| !self.events.data_only_time || p.starts_with("data-"));
-        for p in self.paths.drain(..) {
-            self.events.record("DELETE", &p);
-        }
-        if issued && !self.events.delete_delay.is_zero() {
+    async fn delete(
+        &mut self,
+        path: &str,
+        args: crate::opendal::raw::OpDelete,
+    ) -> crate::opendal::Result<()> {
+        // This fixture wraps Fs OneShotDeleter: delete, not handle creation
+        // or close, is the real external operation in OpenDAL 0.58.1.
+        self.events.record("DELETE", path);
+        let consumes_time = !self.events.data_only_time || path.starts_with("data-");
+        if !self.events.delete_delay.is_zero() {
             tokio::time::sleep(self.events.delete_delay).await;
         }
-        let result = self.inner.flush_dyn().await;
+        let result = oio::Delete::delete(&mut self.inner, path, args).await;
         if consumes_time {
             self.events.clock.advance(self.events.delete_advance);
         }
         result
+    }
+    async fn close(&mut self) -> crate::opendal::Result<()> {
+        oio::Delete::close(&mut self.inner).await
     }
 }
 struct TestStorage {
@@ -597,13 +659,13 @@ impl Fixture {
         let plain = crate::opendal::Operator::new(
             crate::opendal::services::Fs::default().root(dir.path().to_str().unwrap()),
         )
-        .unwrap()
-        .finish();
-        let accessor: crate::opendal::raw::Accessor = Arc::new(DeleteAccess {
-            inner: plain.into_inner(),
+        .unwrap();
+        let (context, inner) = plain.into_parts();
+        let service: crate::opendal::raw::Servicer = Arc::new(DeleteAccess {
+            inner,
             events: events.clone(),
         });
-        let operator = crate::opendal::Operator::from_inner(accessor);
+        let operator = crate::opendal::Operator::from_parts(context, service);
         events
             .read_advance
             .lock()

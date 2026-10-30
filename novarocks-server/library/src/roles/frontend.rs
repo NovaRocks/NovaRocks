@@ -21,10 +21,10 @@ use std::future::Future;
 use std::sync::Arc;
 
 use novarocks_frontend_application::{
-    FrontendApplicationError, FrontendApplicationOpenConfig, FrontendManagementConfig,
-    FrontendServingConfig, open_frontend_application_for_server,
-    serve_ready_frontend_session_factory, shutdown_frontend_application_to_convergence,
-    start_frontend_management_server,
+    FrontendApplicationError, FrontendApplicationHost, FrontendApplicationOpenConfig,
+    FrontendManagementConfig, FrontendManagementServer, FrontendServingConfig,
+    prepare_frontend_application_for_server, serve_ready_frontend_session_factory,
+    shutdown_frontend_application_to_convergence, start_frontend_management_server,
 };
 use tokio::runtime::Handle;
 
@@ -41,46 +41,104 @@ pub struct FrontendRoleConfig {
     pub mv_storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
 }
 
-/// Runs one already-composed Frontend role until its process owner requests
-/// shutdown or a role-owned listener reports a failure.
-pub async fn run_until_shutdown<F>(
+/// Stable process aggregate field. The role future only borrows this owner.
+/// The command owner retains it across startup cancellation and shutdown passes.
+pub struct FrontendRoleOwner {
     config: FrontendRoleConfig,
-    data_runtime: Handle,
+    host: FrontendApplicationHost,
+    management: Option<FrontendManagementServer>,
+}
+impl FrontendRoleOwner {
+    pub fn prepare(
+        config: FrontendRoleConfig,
+        data_runtime: Handle,
+    ) -> Result<Self, FrontendApplicationError> {
+        let host = prepare_frontend_application_for_server(&config.application, data_runtime)?;
+        Ok(Self {
+            config,
+            host,
+            management: None,
+        })
+    }
+}
+
+/// Runs the same installed Frontend aggregate. Dropping this borrower cannot
+/// drop an opening Source, late instance receiver, or physical receipt.
+pub async fn run_until_shutdown<F>(
+    owner: &mut FrontendRoleOwner,
     shutdown: F,
 ) -> Result<(), FrontendApplicationError>
 where
     F: Future<Output = ()> + Send,
 {
-    let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
-    let cleanup_timeout = config.serving.frontend_cleanup_timeout;
-    let mut host = open_frontend_application_for_server(&config.application, data_runtime).await?;
-    let management = config.management;
-    let mut management_server = match start_frontend_management_server(&management, &host) {
-        Ok(server) => server,
+    let cleanup_timeout = owner.config.serving.frontend_cleanup_timeout;
+    tokio::pin!(shutdown);
+    let startup = {
+        let bootstrap = owner.host.open_prepared();
+        tokio::pin!(bootstrap);
+        tokio::select! {
+            biased;
+            result = &mut bootstrap => Some(result),
+            _ = &mut shutdown => None,
+        }
+    };
+    match startup {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            let cleanup =
+                shutdown_frontend_application_to_convergence(&mut owner.host, cleanup_timeout)
+                    .await;
+            return combine(Err(error), cleanup);
+        }
+        None => {
+            return shutdown_frontend_application_to_convergence(&mut owner.host, cleanup_timeout)
+                .await;
+        }
+    }
+    // Preserve a ready bootstrap result, then observe an already requested
+    // process stop before constructing serving products.
+    tokio::select! {
+        biased;
+        _ = &mut shutdown => return shutdown_frontend_application_to_convergence(
+            &mut owner.host, cleanup_timeout,
+        ).await,
+        _ = std::future::ready(()) => {},
+    }
+    owner.management = match start_frontend_management_server(&owner.config.management, &owner.host)
+    {
+        Ok(server) => Some(server),
         Err(error) => {
             let cleanup =
-                shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
+                shutdown_frontend_application_to_convergence(&mut owner.host, cleanup_timeout)
+                    .await;
             return combine(Err(error), cleanup);
         }
     };
-    if let Err(error) = management_server.install(&host) {
+    if let Err(error) = owner.management.as_mut().unwrap().install(&owner.host) {
         let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = management_server
+            shutdown_frontend_application_to_convergence(&mut owner.host, cleanup_timeout).await;
+        let cleanup = owner
+            .management
+            .take()
+            .unwrap()
             .stop()
             .map_err(FrontendApplicationError::server);
         return combine(Err(error), combine(shutdown, cleanup));
     }
     let serving = serve_ready_frontend_session_factory(
-        config.serving,
-        &mut host,
-        mv_storage_observation,
-        shutdown,
-        &mut management_server,
+        owner.config.serving.clone(),
+        &mut owner.host,
+        Arc::clone(&owner.config.mv_storage_observation),
+        shutdown.as_mut(),
+        owner.management.as_mut().unwrap(),
     )
     .await;
-    let shutdown = shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-    let cleanup = management_server
+    let shutdown =
+        shutdown_frontend_application_to_convergence(&mut owner.host, cleanup_timeout).await;
+    let cleanup = owner
+        .management
+        .take()
+        .unwrap()
         .stop()
         .map_err(FrontendApplicationError::server);
     combine(combine(serving, shutdown), cleanup)
@@ -98,7 +156,7 @@ fn combine(
             #[cfg(feature = "mem-1-m07-closing-pressure")]
             return Err(primary.with_role_cleanup(cleanup));
             #[cfg(not(feature = "mem-1-m07-closing-pressure"))]
-            Err(primary.with_cleanup_context(cleanup))
+            Err(primary.with_application_cleanup(cleanup))
         }
     }
 }

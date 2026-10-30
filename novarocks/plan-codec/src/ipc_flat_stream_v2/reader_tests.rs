@@ -140,6 +140,10 @@ fn retained(input: &Vec<u8>, field: &Field) -> usize {
     input.capacity()
         + 4096
         + field.name().len()
+        + novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
+            field.metadata().len(),
+        )
+        .unwrap()
         + field
             .metadata()
             .iter()
@@ -796,17 +800,29 @@ fn actual_reader_wide_repeated_view_work_reaches_original_quantum_without_replay
 }
 
 #[test]
-fn actual_reader_sparse_source_metadata_capacity_is_admitted_before_pool_delegate() {
+fn actual_reader_sparse_staging_is_replaced_by_equivalent_shared_metadata() {
     let mut metadata = HashMap::with_capacity(1 << 16);
     metadata.insert("provider_id".to_owned(), "71".to_owned());
+    assert!(metadata.capacity() >= 1 << 16);
     let sparse = Arc::new(Field::new("source", DataType::Int64, true).with_metadata(metadata));
     let dense = Arc::new(
         Field::new("source", DataType::Int64, true)
             .with_metadata(HashMap::from([("provider_id".to_owned(), "71".to_owned())])),
     );
     assert_eq!(sparse.as_ref(), dense.as_ref());
-    assert!(sparse.metadata().capacity() >= 1 << 16);
-    assert!(dense.metadata().capacity() < 16);
+    assert!(sparse.metadata().as_arc().is_some());
+    assert!(dense.metadata().as_arc().is_some());
+    // Distinct conversions own distinct trees; immutable clones share one.
+    assert!(!Arc::ptr_eq(
+        sparse.metadata().as_arc().unwrap(),
+        dense.metadata().as_arc().unwrap(),
+    ));
+    let shared = sparse.metadata().clone();
+    assert!(Arc::ptr_eq(
+        sparse.metadata().as_arc().unwrap(),
+        shared.as_arc().unwrap(),
+    ));
+    assert_eq!(shared.get("provider_id").map(String::as_str), Some("71"));
     let generous = FlatReaderProjectionLimits {
         max_cumulative_library_work: 128 * 1024 * 1024,
         ..reader_limits()
@@ -817,16 +833,17 @@ fn actual_reader_sparse_source_metadata_capacity_is_admitted_before_pool_delegat
     let sparse_stream = checked(&sparse_input, &sparse);
     let dense_stream = checked(&dense_input, &dense);
     assert!(std::ptr::eq(sparse_stream.field(), sparse.as_ref()));
-    // Explicit fixture retention includes generous space for the existing map
-    // buckets. It is not an allocation measurement or a host funding receipt.
-    let sparse_retention = retained(&sparse_input, &sparse)
-        + 2 * sparse.metadata().capacity() * std::mem::size_of::<(String, String)>();
+    // Both attached sources have the same public BTree/Arc shape and text;
+    // their consumed HashMap staging capacity is no longer retained.
+    assert_eq!(sparse_input, dense_input);
+    let sparse_retention = retained(&sparse_input, &sparse);
     let dense_retention = retained(&dense_input, &dense);
+    assert_eq!(sparse_retention, dense_retention);
     let dense_facts = dense_stream
         .preflight_reader_resources(&ty, dense_retention, policy(), generous, &Control::good())
         .unwrap();
     let low = FlatReaderProjectionLimits {
-        max_cumulative_library_work: dense_facts.cumulative_library_work_upper_bound,
+        max_cumulative_library_work: 0,
         ..reader_limits()
     };
     let control = Control::good();
@@ -839,11 +856,11 @@ fn actual_reader_sparse_source_metadata_capacity_is_admitted_before_pool_delegat
     let trace = control.trace();
     assert!(
         trace.len() >= 2,
-        "ordinary capacity refusal omitted its tail"
+        "ordinary source-work refusal omitted its tail"
     );
     assert!(
         trace.len() <= 3,
-        "capacity refusal reached the pool delegate"
+        "zero-work refusal reached the pool delegate"
     );
     for at in 0..trace.len() {
         for cause in CAUSES {
@@ -860,10 +877,7 @@ fn actual_reader_sparse_source_metadata_capacity_is_admitted_before_pool_delegat
     let facts = sparse_stream
         .preflight_reader_resources(&ty, sparse_retention, policy(), generous, &Control::good())
         .unwrap();
-    assert!(
-        facts.cumulative_library_work_upper_bound
-            >= dense_facts.cumulative_library_work_upper_bound + sparse.metadata().capacity()
-    );
+    assert_eq!(facts, dense_facts);
     let pool = materialize(
         &sparse_stream,
         &sparse,
@@ -879,17 +893,12 @@ fn actual_reader_sparse_source_metadata_capacity_is_admitted_before_pool_delegat
 }
 
 #[test]
-fn actual_reader_deleted_metadata_keeps_original_backing_invoice_work_authority() {
+fn actual_reader_converted_metadata_keeps_original_source_invoice_authority() {
     let mut metadata = HashMap::with_capacity(1 << 16);
     for ordinal in 0..(1 << 16) {
         metadata.insert(format!("provider_{ordinal}"), "71".to_owned());
     }
-    let original_capacity = metadata.capacity();
-    // Save a conservative allowance while the original bucket allocation is
-    // still fully populated. Deletion can change public capacity/tombstones
-    // without replacing that allocation; later capacity is not its invoice.
-    let original_backing_allowance =
-        2 * original_capacity * std::mem::size_of::<(String, String)>();
+    let staging_capacity = metadata.capacity();
     for ordinal in 1..(1 << 16) {
         assert_eq!(
             metadata.remove(&format!("provider_{ordinal}")).as_deref(),
@@ -897,13 +906,20 @@ fn actual_reader_deleted_metadata_keeps_original_backing_invoice_work_authority(
         );
     }
     assert_eq!(metadata.len(), 1);
-    assert!(metadata.capacity() <= original_capacity);
+    assert!(metadata.capacity() <= staging_capacity);
     let field = Arc::new(Field::new("source", DataType::Int64, true).with_metadata(metadata));
     let ty = FunctionValueType::new(DataType::Int64, true);
     let input = writer_stream(Arc::new(Int64Array::from(vec![71])), &field);
     let stream = checked(&input, &field);
     assert!(std::ptr::eq(stream.field(), field.as_ref()));
-    let invoice = retained(&input, &field) + original_backing_allowance;
+    assert!(field.metadata().as_arc().is_some());
+    assert_eq!(
+        field.metadata().get("provider_0").map(String::as_str),
+        Some("71")
+    );
+    // Historical staging buckets have exited; only attached BTree/Arc/text
+    // backing belongs in the original source allowance.
+    let invoice = retained(&input, &field);
     let delta = 65536;
     let enlarged_invoice = invoice + delta;
     let generous = FlatReaderProjectionLimits {

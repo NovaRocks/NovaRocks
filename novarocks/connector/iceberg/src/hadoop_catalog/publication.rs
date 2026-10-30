@@ -509,7 +509,7 @@ impl HadoopFileSystemCatalog {
         if !access
             .operator()
             .info()
-            .full_capability()
+            .capability()
             .write_with_if_not_exists
         {
             return Err(Error::new(

@@ -34,6 +34,7 @@ mod error;
 mod execution;
 mod handle;
 mod identity;
+mod io_admission;
 mod listing;
 mod metadata;
 mod metadata_maintenance;
@@ -66,7 +67,8 @@ pub use binding::{
     ConnectorExecutionReadBinding, ConnectorExecutionRoleBinding, ConnectorExecutionWriteBinding,
     ConnectorMaterializationError, ConnectorMaterializationErrorClass,
     ConnectorMaterializationRetryDisposition, ConnectorReadAttemptAccess,
-    ConnectorReadAttemptCapabilities, MaterializationContext, NormalizedCatalogProperties,
+    ConnectorReadAttemptCapabilities, ConnectorReadAttemptCapabilitiesFuture,
+    MaterializationContext, NormalizedCatalogProperties,
 };
 pub use cancellation::{ConnectorStopOwner, ConnectorStopView};
 pub use catalog::{
@@ -78,12 +80,14 @@ pub use catalog::{
 pub use catalog_runtime::{CatalogRuntime, CatalogRuntimeMaterializer};
 pub use cleanup_maintenance::{
     BatchReceipt, BatchReceiptSummary, CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION,
-    CandidatePage, ConnectorCleanupCandidate, ConnectorCleanupCandidatePageRequest,
+    CandidatePage, ConnectorCleanupAsyncExecution, ConnectorCleanupAsyncObservation,
+    ConnectorCleanupAsyncOutput, ConnectorCleanupAsyncSource, ConnectorCleanupAsyncStart,
+    ConnectorCleanupAsyncStep, ConnectorCleanupCandidate, ConnectorCleanupCandidatePageRequest,
     ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
     ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver,
     ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefIdentity,
     ConnectorCleanupOwnedRefSelection, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
-    ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
+    ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest, ConnectorCleanupScanSafety,
     MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS, MAX_CONNECTOR_CLEANUP_BATCHES,
     MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS,
     MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS, MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES,
@@ -119,22 +123,25 @@ pub use credential::{
     CatalogNonSecretProperty, CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind,
     CredentialConsumerRole, MAX_CATALOG_CREDENTIAL_BINDINGS, MAX_CATALOG_NON_SECRET_PROPERTIES,
     MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES,
-    StaticCredentialReference, StorageAccessDomainId, StorageCredentialScopePrefix,
-    canonical_catalog_credential_binding_bytes, canonicalize_catalog_credential_bindings,
+    NodeLocalCredentialReference, StaticCredentialReference, StorageAccessDomainId,
+    StorageCredentialScopePrefix, canonical_catalog_credential_binding_bytes,
+    canonicalize_catalog_credential_bindings,
 };
 pub use credential_lease::{
     ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
-    ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
-    CredentialLeaseProvider, CredentialLeaseSecretEnvelope, CredentialLoadTableDelegation,
-    CredentialRenewalPath, CredentialRoutingContext, CredentialRoutingHeader,
-    MAX_CREDENTIAL_IDENTIFIER_BYTES, MAX_CREDENTIAL_LEASE_ID_BYTES, MAX_CREDENTIAL_LEASE_PREFIXES,
+    ConnectorVendedS3CredentialLeaseRefresher, CredentialAcquisitionOwnerId,
+    CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
+    CredentialLeaseSecretEnvelope, CredentialLoadTableDelegation, CredentialRenewalPath,
+    CredentialRoutingContext, CredentialRoutingHeader, MAX_CREDENTIAL_IDENTIFIER_BYTES,
+    MAX_CREDENTIAL_LEASE_ID_BYTES, MAX_CREDENTIAL_LEASE_PREFIXES,
     MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES, MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES,
     MAX_CREDENTIAL_LEASES_PER_QUERY, MAX_CREDENTIAL_NAMESPACE_LEVELS,
     MAX_CREDENTIAL_ROUTING_HEADER_BYTES, MAX_CREDENTIAL_ROUTING_HEADERS,
     MAX_CREDENTIALS_ENDPOINT_BYTES, VendedS3CredentialLeaseContribution,
     VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
     VendedS3CredentialRefreshCallPolicy, VendedS3CredentialRefreshDispatch,
-    VendedS3CredentialRefreshDispatchGuard,
+    VendedS3CredentialRefreshDispatchGuard, VendedS3InProcessAcquisition,
+    VendedS3InProcessAcquisitionIdentity, VendedS3SeedGrantId,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,
@@ -158,10 +165,11 @@ pub use distributed_rewrite::{
     ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
     ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary,
     ConnectorDistributedRewriteResolver, ConnectorDistributedRewriteShape,
-    ConnectorFrozenRewriteGroup, ConnectorRewriteCohortRead,
-    MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS,
+    ConnectorFrozenRewriteGroup, ConnectorRewriteCohortRead, ConnectorRewritePlanSource,
+    ConnectorRewritePrepared, ConnectorRewriteSelection, ConnectorRewriteSourceRequest,
+    ConnectorRewriteWriteBeginSource, MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS,
     MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES, REWRITE_DATA_FILES_KIND,
-    REWRITE_POSITION_DELETES_KIND,
+    REWRITE_POSITION_DELETES_KIND, RewriteCpuInput, RewriteCpuPort, RewritePlanCpuSource,
 };
 pub use distribution::ProviderBindingEpoch;
 pub use document_storage::*;
@@ -174,6 +182,12 @@ pub use handle::{
 };
 pub use identity::{
     ConnectorIdentityError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
+};
+pub use io_admission::{
+    ConnectorIoAdmissionPort, ConnectorIoCleanupFuture, ConnectorIoPermit,
+    ConnectorIoProgressSource, ConnectorIoRequest, ConnectorIoRequestSource,
+    ConnectorIoStreamCustody, ConnectorIoWeakPhase, HdfsServiceOrigin, NetworkServiceOrigin,
+    SelectedThriftServiceOrigin, SharedDependency, ThriftServiceOrigin,
 };
 pub use listing::{ConnectorListingBound, ConnectorListingBudget, ConnectorListingCollector};
 pub use metadata::{
@@ -189,7 +203,8 @@ pub use metadata::{
     ConnectorTableJobAdmissionRequest, ConnectorTableJobKind, ConnectorTableMetadata,
     ConnectorTableMetadataHeader, ConnectorTableObjectBinding, ConnectorTableObjectCaptureRequest,
     ConnectorTableObjectId, ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector,
-    ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorTableObjectSnapshotFuture, ConnectorTablePlanningFacts, ConnectorTablePreparation,
+    ConnectorTablePreparationFuture, ConnectorTableRequest, ConnectorTableResolution,
     ConnectorTableUniqueConstraint, MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH,
     MAX_CONNECTOR_COLUMN_DEFAULT_NODES, MAX_CONNECTOR_TABLE_DEFINITION_COLUMNS,
     MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH, MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES,
@@ -200,18 +215,24 @@ pub use metadata::{
 };
 pub use metadata_maintenance::{
     CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorMaxCompactableDataFiles,
-    ConnectorMaxCompactableDataFilesRequest, ConnectorMetadataMaintenance,
-    ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceLease,
-    ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlan,
-    ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
-    ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReceiptSummary,
-    ConnectorMetadataMaintenanceResolver, EXPIRE_TABLE_VERSIONS_KIND,
-    MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
+    ConnectorMaxCompactableDataFilesExecution, ConnectorMaxCompactableDataFilesRequest,
+    ConnectorMaxCompactableDataFilesSource, ConnectorMetadataCleanupResponsibility,
+    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceExecuteRequest,
+    ConnectorMetadataMaintenanceExecution, ConnectorMetadataMaintenanceExecutionSource,
+    ConnectorMetadataMaintenanceFuture, ConnectorMetadataMaintenanceIoGeometry,
+    ConnectorMetadataMaintenanceIoProfile, ConnectorMetadataMaintenanceLease,
+    ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenanceOutcome,
+    ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanSummary,
+    ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
+    ConnectorMetadataMaintenanceReceiptSummary, ConnectorMetadataMaintenanceResolver,
+    EXPIRE_TABLE_VERSIONS_KIND, MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
     MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES, REWRITE_METADATA_LAYOUT_KIND,
 };
 pub use mutation::{
-    ConnectorCatalogMutation, ConnectorCatalogMutationLease, ConnectorCatalogMutationOperation,
-    ConnectorCatalogMutationReceipt, ConnectorCatalogMutationReconcileRequest,
+    ConnectorCatalogMutation, ConnectorCatalogMutationLease,
+    ConnectorCatalogMutationNeededCommitted, ConnectorCatalogMutationObservation,
+    ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
+    ConnectorCatalogMutationReceiving, ConnectorCatalogMutationReconcileRequest,
     ConnectorCatalogMutationRequest, ConnectorCatalogMutationResolver, ConnectorColumnAggregation,
     ConnectorColumnDefinition, ConnectorColumnPath, ConnectorColumnPosition,
     ConnectorCommittedVersion, ConnectorDataType, ConnectorDefaultValue,
@@ -226,19 +247,19 @@ pub use mutation::{
 };
 pub use mv_storage_observation::{
     MAX_MV_OBSERVATION_FIELDS, MAX_MV_OBSERVATION_PARTITION_FIELDS, MAX_MV_OBSERVATION_REFS,
-    MAX_MV_OBSERVATION_SNAPSHOTS, MvCreateSourceObservation, MvCreatedTargetObservation,
-    MvExactPartitionField, MvExactPartitionTransform, MvMaintenanceMetadataObservation,
-    MvObservedField, MvObservedMaintenancePolicy, MvObservedPartitionField,
-    MvObservedPartitionSpec, MvObservedPartitionTransform, MvObservedRefreshMarker,
-    MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
-    MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
+    MAX_MV_OBSERVATION_SNAPSHOTS, MvCreatedTargetObservation, MvExactPartitionField,
+    MvExactPartitionTransform, MvMaintenanceMetadataObservation, MvObservedField,
+    MvObservedMaintenancePolicy, MvObservedPartitionField, MvObservedPartitionSpec,
+    MvObservedPartitionTransform, MvObservedRefreshMarker, MvObservedSnapshot,
+    MvObservedSourceField, MvRefreshBaseObservation, MvRefreshTargetObservation,
+    MvSchemaValidationObservation, MvSourceSchemaObservation, MvStorageObservationPort,
     UnavailableMvStorageObservationPort,
 };
 pub use original_result_scope::{
     ConnectorOriginalResultScope, ConnectorOriginalResultScopeCheck, OriginalResultCheckClass,
     OriginalResultCheckError,
 };
-pub use payload_retention::ConnectorPayloadRetentionGuard;
+pub use payload_retention::{ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard};
 pub use predicate::{
     ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateId,
@@ -266,7 +287,7 @@ pub use publication::{
 pub use read::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorChangePartition,
     ConnectorChangePartitionField, ConnectorChangePartitionTransform,
-    ConnectorChangePartitionValue, ConnectorChangeWindow, ConnectorChangeWindowAdmission,
+    ConnectorChangePartitionValue, ConnectorChangeWindowAdmission,
     ConnectorChangeWindowFullRebuildReason, ConnectorChangeWindowPartitionImpact,
     ConnectorChangeWindowReplaceFailure, ConnectorReadPurpose, ConnectorReadSelector,
     ConnectorScan, ConnectorScanAdmission, ConnectorScanSelection, ConnectorSplitPlanningMetrics,
@@ -310,30 +331,38 @@ pub use staged_create::{
     ConnectorCtasUnanchoredDiscoveryRequest, ConnectorCtasUnanchoredProvenance,
     ConnectorPreparedCreateDocumentTarget, ConnectorPreparedCreateFieldBinding,
     ConnectorStagedCreate, ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
-    ConnectorStagedCreateLease, ConnectorStagedCreateMode, ConnectorStagedCreateOperationId,
-    ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
+    ConnectorStagedCreateLease, ConnectorStagedCreateMode, ConnectorStagedCreateNeededCommitted,
+    ConnectorStagedCreateOperationId, ConnectorStagedCreatePrepareOutcome,
+    ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublication,
     ConnectorStagedCreatePublicationAdjudicationOutcome,
-    ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublicationPayload,
-    ConnectorStagedCreatePublishOutcome, ConnectorStagedCreatePublishRequest,
-    ConnectorStagedCreateReceipt, ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
+    ConnectorStagedCreatePublicationAdjudicationRequest,
+    ConnectorStagedCreatePublicationObservation, ConnectorStagedCreatePublicationPayload,
+    ConnectorStagedCreatePublicationReceiving, ConnectorStagedCreatePublicationRecorder,
+    ConnectorStagedCreatePublicationSource, ConnectorStagedCreatePublishOutcome,
+    ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
+    ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
     ConnectorStagedWriteProof, ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease,
 };
 pub use statistics::{
-    ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
+    AsyncStatisticsCollectionSession, AsyncStatisticsCollectionStart, ConnectorStatistics,
+    ConnectorStatisticsLease, ConnectorStatisticsResolver,
     MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
     MAX_CONNECTOR_STATISTICS_COLUMNS, MAX_CONNECTOR_STATISTICS_METRICS,
     MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
     MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES, StatisticsArtifactDraft,
-    StatisticsArtifactIdentity, StatisticsArtifactParts, StatisticsBasisRelation,
-    StatisticsCollection, StatisticsCollectionSession, StatisticsCollectionStart,
-    StatisticsCollectionStartRequest, StatisticsColumnSelection, StatisticsDataVersion,
-    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsInterval, StatisticsMetric,
-    StatisticsMetricError, StatisticsMetricErrorKind, StatisticsMetricObservation,
-    StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
-    StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature, StatisticsReadRequest,
-    StatisticsReader, StatisticsReceipt, StatisticsRequiredAggregation, StatisticsRowCoverage,
-    StatisticsScanColumn,
+    StatisticsArtifactIdentity, StatisticsArtifactParts, StatisticsArtifactsCpuSource,
+    StatisticsBasisRelation, StatisticsBindingCpuSource, StatisticsCollection,
+    StatisticsCollectionSession, StatisticsCollectionStart, StatisticsCollectionStartRequest,
+    StatisticsColumnSelection, StatisticsCpuInput, StatisticsCpuPort, StatisticsDataVersion,
+    StatisticsEvidence, StatisticsEvidenceCpuSource, StatisticsEvidenceRevision,
+    StatisticsInterval, StatisticsMetric, StatisticsMetricError, StatisticsMetricErrorKind,
+    StatisticsMetricObservation, StatisticsMetricRequest, StatisticsMetricSource,
+    StatisticsMetricState, StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind,
+    StatisticsNumericNature, StatisticsPublicationClose, StatisticsPublicationReady,
+    StatisticsReadCpuSource, StatisticsReadOriginal, StatisticsReadRequest, StatisticsReader,
+    StatisticsReceipt, StatisticsRequiredAggregation, StatisticsRowCoverage, StatisticsScanColumn,
+    StatisticsSchemaCpuSource, StatisticsSessionFuture,
 };
 pub use view_metadata::{
     ConnectorListViewsRequest, ConnectorViewMetadata, ConnectorViewMetadataValue,
@@ -361,3 +390,6 @@ pub use write::{
 };
 
 pub use process_local::ConnectorProcessLocalPayload;
+
+mod provider_metadata_cpu;
+pub use provider_metadata_cpu::*;

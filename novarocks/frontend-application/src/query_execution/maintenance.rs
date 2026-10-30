@@ -23,25 +23,29 @@
 
 use std::sync::Arc;
 
+mod action_state;
+pub(crate) mod cleanup_action;
 pub mod command;
+pub(crate) mod io_admission;
+mod rewrite_capture;
+pub(crate) mod rewrite_computation;
+pub(crate) mod rewrite_job;
+pub(crate) mod rewrite_preparation;
+pub(crate) mod rewrite_submission;
+pub use action_state::MaintenanceActionState;
 pub(crate) mod iceberg;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::connector::cleanup_maintenance::{CleanupBatchExecution, CleanupMaintenanceSession};
-use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
-use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
 use novarocks_query_application::api::QueryResult;
-use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_spi::connector::{
     CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
-    ConnectorControlResolver, ConnectorDistributedRewriteReceipt, ConnectorError,
-    ConnectorRewriteCohortRead, ConnectorTableObjectBindingFailure,
-    ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
-    ConnectorTableObjectSelector, ConnectorTableResolution, ConnectorWriteAbortOutcome,
-    ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
-    ExternalMutationOutcome, PreparedBatch,
+    ConnectorControlResolver, ConnectorError, ConnectorRewriteCohortRead,
+    ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
+    ConnectorTableObjectSelector, ConnectorTableResolution, ConnectorWriteCohortId,
+    ConnectorWriteInputShape, PreparedBatch,
 };
 use novarocks_table_maintenance::runtime::TerminalError;
 use novarocks_table_maintenance::{
@@ -60,169 +64,47 @@ pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance servi
 pub struct PreparedDistributedRewriteCohort {
     description: novarocks_query_application::preparation::FrozenExecutionDescription,
     template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
-    query_execution: crate::query_execution::service::QueryExecutionService,
     execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
     write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
 impl PreparedDistributedRewriteCohort {
-    fn new(
-        encoded: crate::query_execution::physical_encoding::EncodedCompletedPlan,
-        version: novarocks_physical_plan::PlanVersionId,
-        query_execution: crate::query_execution::service::QueryExecutionService,
-        execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
-        write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    ) -> Result<Self, String> {
-        let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
-        let description =
-            novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
-                novarocks_query_application::api::QueryExecutionKind::Write,
-                candidate,
-                template
-                    .attempt_scheduling_facts()?
-                    .fragments
-                    .iter()
-                    .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
-                    .collect(),
-                novarocks_query_application::preparation::OutputContract::CompletionOnly,
-                novarocks_query_application::coordination::ExecutionEffect::External,
-                novarocks_query_application::coordination::RecoveryMode::NoRecovery,
-                Vec::new(),
-                novarocks_query_application::preparation::FrozenCostEstimate::unknown(
-                    novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
-                ),
-                novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
-                    novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
-                ),
-            )?;
-        Ok(Self {
-            description,
-            template,
-            query_execution,
-            execution,
-            write_session,
-        })
-    }
-
-    /// Submit the sealed connector write.
-    pub fn finish(
+    /// Consume this exact frozen cohort through the common governed Write
+    /// consumer. Its receiving port appends once to this SAME session; the
+    /// returned Ready is not an input to legacy accumulate(prepared).
+    pub(crate) fn prepare_computation(
         self,
-    ) -> Result<crate::query_execution::outcome::ConnectorWriteSessionCompletion, TerminalError>
-    {
+        initial: crate::query_execution::logical_execution::InitialComputationReservation,
+        runtime: crate::query_execution::internal_consumer::decoded::DecodedConsumerRuntime,
+    ) -> Result<
+        (
+            crate::query_execution::logical_execution::PreparedLogicalComputation,
+            novarocks_query_application::api::ReservedExecutionIdentity,
+            crate::query_execution::internal_consumer::write::WriteComputationOutput,
+        ),
+        novarocks_query_application::api::QueryExecutionError,
+    > {
         let options =
             crate::query_execution::contract::synthetic_statement_query_options(&self.execution);
-        let request = crate::query_execution::contract::build_request_from_finalized_execution(
-            crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
-                self.description,
-                self.template,
+        crate::query_execution::internal_consumer::write::prepare_write_computation(
+            self.description,
+            self.template,
+            Arc::new(
+                crate::query_execution::contract::ResolvedQueryOptions::from_upstream(Some(
+                    options,
+                )),
             ),
-            Some(options),
-            crate::query_execution::contract::DistributedQueryIntent::Write,
-            &self.execution,
-            None,
+            self.write_session,
+            initial,
+            runtime,
         )
-        .map_err(rewrite_execution_terminal)?;
-        let request = crate::query_execution::contract::with_connector_write_session(
-            request,
-            std::sync::Arc::clone(&self.write_session),
-        )
-        .map_err(rewrite_execution_terminal)?;
-        let session_completion = self
-            .query_execution
-            .execute(request)
-            .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
-            .map(crate::query_execution::outcome::WriteExecutionOutcome::into_write_session)
-            .map_err(rewrite_execution_terminal)?;
-        // The dual barrier is what produces a session completion, so its
-        // absence here means the write data plane never closed -- not that the
-        // group happened to stage nothing.
-        session_completion.ok_or_else(|| {
-            TerminalError::pre_dispatch_failed(
-                "connector staging terminal closed without a prepared write set",
-            )
-        })
     }
-}
-
-// The native attempt has already selected its failure and site. Retain that
-// input before rendering; a maintenance publication verdict is independent.
-fn rewrite_execution_terminal(
-    error: crate::query_execution::contract::DistributedQueryError,
-) -> TerminalError {
-    TerminalError::pre_dispatch_failed(error.to_string())
-        .with_compile_control(error.compile_control_error())
-        .with_execution_failure(error.execution_failure().cloned())
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct MaintenanceRequestContext<'a> {
     pub current_catalog: Option<&'a str>,
     pub current_database: &'a str,
-}
-
-/// Immutable worker-owned cancellation context for automatic maintenance.
-/// It crosses the Core-to-Frontend port without exposing a session, catalog,
-/// or provider object. Implementations must check it before every durable
-/// dispatch and preserve durable recovery state if cancellation races a
-/// dispatched external mutation.
-#[derive(Clone)]
-pub struct AutomaticMaintenanceContext {
-    cancellation: QueryCancellationView,
-    deadline: Option<Instant>,
-    runtime: Option<tokio::runtime::Handle>,
-}
-
-impl AutomaticMaintenanceContext {
-    pub fn with_deadline_on_runtime(
-        cancellation: QueryCancellationView,
-        deadline: Instant,
-        runtime: tokio::runtime::Handle,
-    ) -> Self {
-        Self {
-            cancellation,
-            deadline: Some(deadline),
-            runtime: Some(runtime),
-        }
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled()
-    }
-
-    pub fn connector_request_context(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
-        let deadline = self.deadline.ok_or_else(|| {
-            "automatic maintenance requires an exact request deadline".to_string()
-        })?;
-        match &self.runtime {
-            Some(runtime) => crate::connector::query_connector_request_context_on_runtime(
-                runtime,
-                deadline,
-                self.cancellation.clone(),
-            ),
-            None => crate::connector::connector_request_context_for_deadline(
-                deadline,
-                self.cancellation.clone(),
-            ),
-        }
-        .map(|context| {
-            context
-                .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Background)
-        })
-    }
-
-    pub fn ensure_active(&self) -> Result<(), String> {
-        if self.is_cancelled() {
-            return Err("automatic maintenance cancelled before durable dispatch".to_string());
-        }
-        self.deadline
-            .is_none_or(|deadline| Instant::now() < deadline)
-            .then_some(())
-            .ok_or_else(|| {
-                "automatic maintenance deadline elapsed before durable dispatch".to_string()
-            })
-    }
 }
 
 /// Write capability for one frontend-owned maintenance execution attempt.
@@ -317,14 +199,16 @@ pub enum MaintenanceStatementResult {
 /// the maintenance application; this stable Core domain port remains available
 /// to the Frontend MV background runtime until CLS-R3.
 // Design: ADR-0083 (docs/adr/ADR-0083-frontend-owns-table-maintenance-execution-port.md)
+#[async_trait::async_trait]
 pub trait TableMaintenanceEngine: Send + Sync {
     /// Bind the one already-admitted root before any distributed rewrite
     /// construction. This capability never enters durable job descriptions.
-    fn for_admitted_execution(
+    fn for_original_background_root(
         &self,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    ) -> Result<Arc<dyn TableMaintenanceEngine>, String>;
-
+        _owner: &novarocks_workload_control::WorkOwner,
+    ) -> Result<RequestScopedMaintenanceEngine, String> {
+        Err("original governed Rewrite engine is unsupported".into())
+    }
     #[cfg(novarocks_dev_controls)]
     fn test_statement_nomination(
         &self,
@@ -359,29 +243,25 @@ pub trait TableMaintenanceEngine: Send + Sync {
         target: &MaintenanceTarget,
     ) -> Result<ConnectorTableObjectId, String>;
 
-    /// Rebind the logical target only when it remains the captured physical
-    /// object. This intentionally has no default: silently skipping the
-    /// binding check would allow maintenance work on a replacement table.
-    fn rebind_target_object(
+    async fn reject_user_action_on_mv(
         &self,
         target: &MaintenanceTarget,
-        expected_object_id: &ConnectorTableObjectId,
-    ) -> Result<MaintenanceTargetRebind, String>;
-
-    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String>;
+    ) -> Result<(), novarocks_query_application::session_error::QueryServiceError>;
 
     fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String>;
 
-    fn execute_action(
+    async fn execute_action(
         &self,
+        state: &MaintenanceActionState,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String>;
 
     /// Automatic metadata effects retain the MV owner's exact identity and
     /// the provider's typed terminal state. A missing implementation closes
     /// management before a provider dispatch.
-    fn execute_automatic_metadata_action(
+    async fn execute_automatic_metadata_action(
         &self,
+        _state: &MaintenanceActionState,
         _request: MaintenanceActionRequest,
         _effect_id: MaintenanceEffectId,
     ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
@@ -472,53 +352,6 @@ pub trait TableMaintenanceEngine: Send + Sync {
     ) -> Result<(), String> {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
-
-    fn plan_distributed_rewrite(
-        &self,
-        _target: &MaintenanceTarget,
-        _operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-        _intent: DistributedRewriteIntent,
-    ) -> Result<DistributedRewriteMaintenanceSession, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn prepare_distributed_rewrite_cohort(
-        &self,
-        _session: &DistributedRewriteMaintenanceSession,
-        _cohort_id: ConnectorWriteCohortId,
-    ) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string().into())
-    }
-
-    fn accumulate_distributed_rewrite_group(
-        &self,
-        _session: &DistributedRewriteMaintenanceSession,
-        _completion: crate::query_execution::outcome::ConnectorWriteSessionCompletion,
-    ) -> Result<(), String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn commit_distributed_rewrite(
-        &self,
-        _session: &DistributedRewriteMaintenanceSession,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn abort_distributed_rewrite(
-        &self,
-        _session: &DistributedRewriteMaintenanceSession,
-    ) -> Result<ConnectorWriteAbortOutcome, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn finalize_distributed_rewrite(
-        &self,
-        _session: &DistributedRewriteMaintenanceSession,
-        _receipt: &ConnectorWriteReceipt,
-    ) -> Result<ConnectorDistributedRewriteReceipt, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
 }
 
 #[async_trait::async_trait]
@@ -531,6 +364,7 @@ pub trait TableMaintenanceService: Send + Sync {
     async fn handle_typed_statement(
         &self,
         _engine: &dyn TableMaintenanceEngine,
+        _state: &MaintenanceActionState,
         _statement: crate::table_maintenance::ParsedMaintenanceStatement,
         _spark_procedure: bool,
         _context: MaintenanceRequestContext<'_>,
@@ -554,39 +388,21 @@ pub trait TableMaintenanceService: Send + Sync {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
-    /// The MV management owner has already frozen and admitted this action's
-    /// effect identity. Implementations must pass it to the provider and keep
-    /// the exact terminal classification.
-    async fn execute_automatic_action_with_effect_id(
-        &self,
-        _engine: &dyn TableMaintenanceEngine,
-        _request: MaintenanceActionRequest,
-        _effect_id: MaintenanceEffectId,
-        _context: &AutomaticMaintenanceContext,
-    ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
-        Err(TerminalError::pre_dispatch_failed(
-            "automatic maintenance effect identity is unsupported",
-        ))
+    fn original_optimize_host(&self) -> Result<OriginalOptimizeHost, String> {
+        Err("original Optimize job host is unavailable".into())
     }
-
-    /// An automatic MV OPTIMIZE runs under one caller-owned management effect.
-    /// The service waits for the exact submitted handle and returns whether
-    /// that job actually committed a provider mutation.
-    fn execute_automatic_optimize_with_effect_id(
-        &self,
-        _engine: &dyn TableMaintenanceEngine,
-        _target: MaintenanceTarget,
-        _effect_id: MaintenanceEffectId,
-        _context: &AutomaticMaintenanceContext,
-    ) -> Result<novarocks_table_maintenance::AutomaticOptimizeOutcome, TerminalError> {
-        Err(TerminalError::pre_dispatch_failed(
-            "automatic optimize effect identity is unsupported",
-        ))
-    }
-
     async fn shutdown_until(&self, deadline: Instant) -> Result<(), String>;
 
     fn request_shutdown_for_process_exit(&self);
+}
+
+#[doc(hidden)]
+pub struct OriginalOptimizeHost {
+    pub(crate) product: Arc<novarocks_table_maintenance::product::TableMaintenanceProduct>,
+    pub(crate) roots: novarocks_workload_control::RootAdmissionHandle,
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) controls:
+        Option<Arc<crate::table_maintenance::test_controls::MaintenanceTestControls>>,
 }
 
 /// One foreground SQL maintenance command bound to the exact request admitted
@@ -601,6 +417,57 @@ pub(crate) struct RequestScopedMaintenanceEngine {
 }
 
 impl RequestScopedMaintenanceEngine {
+    pub(crate) fn original_result_capacity(
+        &self,
+    ) -> Option<&novarocks_query_application::admitted_query_context::QueryResultCapacityBinding>
+    {
+        self.execution.result_capacity()
+    }
+
+    pub(crate) async fn reject_direct_rewrite_on_mv(
+        &self,
+        target: &MaintenanceTarget,
+        exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    ) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
+            self.kernel.mv_storage_observation().as_ref(),
+            exact_lease,
+            self.kernel.mv_readiness().as_ref(),
+            &crate::catalog_application::resolver::TargetBackend {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .expect("static Iceberg provider ID"),
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
+            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,
+            self.connector_context.clone(),
+        ).await
+    }
+
+    pub(crate) async fn reject_direct_rewrite_on_mv_governed(
+        &self,
+        target: &MaintenanceTarget,
+        exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    ) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_governed_planning_lease_and_context_async(
+            self.kernel.mv_storage_observation().as_ref(),
+            exact_lease,
+            self.kernel.mv_readiness().as_ref(),
+            &crate::catalog_application::resolver::TargetBackend {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .expect("static Iceberg provider ID"),
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
+            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,
+            self.connector_context.clone(),
+            cpu,
+        ).await
+    }
+
     pub fn new(
         kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
         execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
@@ -639,19 +506,6 @@ impl RequestScopedMaintenanceEngine {
         capture_target_object_id_with_ports(
             self.kernel.connector_control().as_ref(),
             target,
-            self.connector_context.clone(),
-        )
-    }
-
-    fn rebind_target_object_with_context(
-        &self,
-        target: &MaintenanceTarget,
-        expected_object_id: &ConnectorTableObjectId,
-    ) -> Result<MaintenanceTargetRebind, String> {
-        rebind_target_object_with_ports(
-            self.kernel.connector_control().as_ref(),
-            target,
-            expected_object_id,
             self.connector_context.clone(),
         )
     }
@@ -744,32 +598,6 @@ fn capture_admitted_optimize_target_with_ports(
     })
 }
 
-fn rebind_target_object_with_ports(
-    controls: &dyn ConnectorControlResolver,
-    target: &MaintenanceTarget,
-    expected_object_id: &ConnectorTableObjectId,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<MaintenanceTargetRebind, String> {
-    let identity = RequestScopedMaintenanceEngine::target_identity(target)?;
-    let lease = controls
-        .acquire_current(&identity.instance_id)
-        .map_err(|error| {
-            format!("acquire current connector generation for target rebind: {error}")
-        })?;
-    let binding =
-        lease
-            .binding()
-            .metadata()
-            .rebind_table_object_binding(ConnectorTableObjectRebindRequest {
-                table: identity,
-                expected_object_id: expected_object_id.clone(),
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                selector: ConnectorTableObjectSelector::Current,
-                context,
-            });
-    maintenance_target_rebind_from_connector_result(binding.map(|_| ()))
-}
-
 fn captured_target_object_id_from_connector_result(
     object_id: Result<ConnectorTableObjectId, ConnectorError>,
 ) -> Result<ConnectorTableObjectId, String> {
@@ -825,12 +653,13 @@ impl BackgroundMaintenanceAttempt {
 /// for each call. There is deliberately no Core default, process-global lookup
 /// or application-facade fallback.
 pub trait BackgroundMaintenanceAttemptFactory: Send + Sync {
-    fn begin_automatic_maintenance_attempt(
+    fn begin_original_root_maintenance_attempt(
         &self,
-        capacity: Option<
-            &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-        >,
-    ) -> Result<BackgroundMaintenanceAttempt, String>;
+        _owner: &novarocks_workload_control::WorkOwner,
+    ) -> Result<BackgroundMaintenanceAttempt, String> {
+        Err("original governed maintenance context is unsupported".into())
+    }
+    fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String>;
 }
 
 /// Long-lived automatic-maintenance engine.
@@ -857,9 +686,7 @@ impl BackgroundMaintenanceEngine {
     }
 
     fn request_engine(&self) -> Result<RequestScopedMaintenanceEngine, String> {
-        let attempt = self
-            .attempt_factory
-            .begin_automatic_maintenance_attempt(None)?;
+        let attempt = self.attempt_factory.begin_automatic_maintenance_attempt()?;
         Ok(RequestScopedMaintenanceEngine::new(
             self.kernel.clone(),
             attempt.execution,
@@ -882,7 +709,53 @@ impl crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer
     }
 }
 
+#[async_trait::async_trait]
 impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
+    fn for_original_background_root(
+        &self,
+        owner: &novarocks_workload_control::WorkOwner,
+    ) -> Result<RequestScopedMaintenanceEngine, String> {
+        let root = owner.scope();
+        root.check().map_err(|e| e.to_string())?;
+        let cancellation = root.cancellation().map_err(|e| e.to_string())?;
+        let deadline = cancellation
+            .deadline()
+            .map(std::time::Instant::from)
+            .map_or(self.execution.deadline(), |root_deadline| {
+                Some(
+                    self.execution
+                        .deadline()
+                        .map_or(root_deadline, |old| old.min(root_deadline)),
+                )
+            });
+        let execution = novarocks_query_application::admitted_query_context::QueryExecutionContext::new(
+            self.execution.role(),
+            self.execution.topology().clone(),
+            deadline,
+            novarocks_query_application::cancellation::QueryCancellationView::governed(
+                cancellation,
+                None,
+            ),
+            self.execution.optimizer_settings().clone(),
+            self.execution.sql_semantics().clone(),
+        ).with_result_capacity(
+            novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_root_owner(owner)
+                .map_err(|error| error.to_string())?
+        ).map_err(|error| error.to_string())?;
+        let connector = crate::connector::connector_request_context_for_execution_on_runtime(
+            None,
+            &execution,
+            self.kernel
+                .rewrite_runtime()
+                .map_err(|e| e.to_string())?
+                .execution
+                .0
+                .runtime(),
+        )?
+        .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::JobAttempt);
+        Ok(Self::new(self.kernel.clone(), execution, connector))
+    }
+
     #[cfg(novarocks_dev_controls)]
     fn test_statement_nomination(
         &self,
@@ -894,32 +767,6 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             );
         nomination.validate().ok()?;
         Some(nomination)
-    }
-
-    fn for_admitted_execution(
-        &self,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    ) -> Result<Arc<dyn TableMaintenanceEngine>, String> {
-        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
-            capacity.scope(),
-            &capacity.window_alias(),
-        )?;
-        let original = self
-            .execution
-            .result_capacity()
-            .ok_or("request maintenance engine has no admitted root binding")?;
-        if !original.window_alias().is_for_scope(capacity.scope())
-            || !original
-                .window_alias()
-                .shares_capacity_with(&capacity.window_alias())
-        {
-            return Err("request maintenance engine cannot change its admitted root".into());
-        }
-        Ok(Arc::new(Self::new(
-            self.kernel.clone(),
-            self.execution.clone(),
-            self.connector_context.clone(),
-        )))
     }
 
     fn capture_admitted_optimize_target(
@@ -975,37 +822,22 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         self.capture_target_object_id_with_context(target)
     }
 
-    fn rebind_target_object(
+    async fn reject_user_action_on_mv(
         &self,
         target: &MaintenanceTarget,
-        expected_object_id: &ConnectorTableObjectId,
-    ) -> Result<MaintenanceTargetRebind, String> {
-        self.rebind_target_object_with_context(target, expected_object_id)
-    }
-
-    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
+    ) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
         use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
-        let instance_id = ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
+        let instance_id = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
+            crate::mv::domain::readiness::application_error(format!(
+                "parse Iceberg catalog identity for MV guard: {error}"
+            ))
+        })?;
         let exact_lease = ConnectorControlResolver::acquire_current(
             self.kernel.connector_control().as_ref(),
             &instance_id,
         )
-        .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
-        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
-            self.kernel.mv_storage_observation().as_ref(),
-            &exact_lease,
-            self.kernel.mv_readiness().as_ref(),
-            &crate::catalog_application::resolver::TargetBackend {
-                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                    .expect("static Iceberg provider ID"),
-                catalog: target.catalog.clone(),
-                namespace: target.namespace.clone(),
-                table: target.table.clone(),
-            },
-            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,
-            self.connector_context.clone(),
-        )
+        .map_err(crate::mv::domain::readiness::connector_application_error)?;
+        self.reject_direct_rewrite_on_mv(target, &exact_lease).await
     }
 
     fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String> {
@@ -1016,36 +848,25 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         )
     }
 
-    fn execute_action(
+    async fn execute_action(
         &self,
+        state: &MaintenanceActionState,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String> {
-        if matches!(request, MaintenanceActionRequest::RemoveOrphanFiles { .. }) {
-            return Err(
-                "remove orphan files must be dispatched by the frontend durable cleanup owner"
-                    .to_string(),
-            );
-        }
-        self::iceberg::execute_action_with_ports(
-            self.kernel.connector_control().as_ref(),
-            &self.kernel,
-            request,
-            self.connector_context.clone(),
-        )
+        state.install_engine(self.clone())?;
+        state.execute(request).await
     }
 
-    fn execute_automatic_metadata_action(
+    async fn execute_automatic_metadata_action(
         &self,
+        state: &MaintenanceActionState,
         request: MaintenanceActionRequest,
         effect_id: MaintenanceEffectId,
     ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
-        self::iceberg::execute_automatic_metadata_action_with_ports(
-            self.kernel.connector_control().as_ref(),
-            &self.kernel,
-            request,
-            effect_id,
-            self.connector_context.clone(),
-        )
+        state
+            .install_engine(self.clone())
+            .map_err(TerminalError::pre_dispatch_failed)?;
+        state.execute_automatic(request, effect_id).await
     }
 
     fn plan_cleanup_maintenance(
@@ -1154,146 +975,40 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             .finalize_terminal()
             .map_err(|error| format!("finalize orphan cleanup artifacts: {error}"))
     }
-
-    fn plan_distributed_rewrite(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-        intent: DistributedRewriteIntent,
-    ) -> Result<DistributedRewriteMaintenanceSession, String> {
-        self.plan_distributed_rewrite_with_context(
-            target,
-            operation_id,
-            intent,
-            self.connector_context.clone(),
-        )
-    }
-
-    fn prepare_distributed_rewrite_cohort(
-        &self,
-        session: &DistributedRewriteMaintenanceSession,
-        cohort_id: ConnectorWriteCohortId,
-    ) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
-        prepare_frozen_rewrite_cohort_with_ports(
-            self.kernel.connector_control().as_ref(),
-            self.kernel.typed_connector_control(),
-            Arc::clone(self.kernel.function_catalog()),
-            self.kernel.static_plan_carrier(),
-            self.kernel.query_execution(),
-            session.session(),
-            cohort_id,
-            session.execution(),
-            session.context(),
-            self.kernel.constant_policy(),
-            &crate::query_execution::planning::sql_compile_control_from_execution(
-                session.execution(),
-            ),
-        )
-    }
-
-    fn accumulate_distributed_rewrite_group(
-        &self,
-        session: &DistributedRewriteMaintenanceSession,
-        completion: crate::query_execution::outcome::ConnectorWriteSessionCompletion,
-    ) -> Result<(), String> {
-        let (_, prepared) = completion.into_parts();
-        session
-            .session()
-            .accumulate(prepared)
-            .map_err(|error| format!("accumulate distributed rewrite group: {error}"))
-    }
-
-    fn commit_distributed_rewrite(
-        &self,
-        session: &DistributedRewriteMaintenanceSession,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
-        session
-            .session()
-            .commit(session.context().clone())
-            .map_err(|error| format!("commit distributed rewrite operation: {error}"))
-    }
-
-    fn abort_distributed_rewrite(
-        &self,
-        session: &DistributedRewriteMaintenanceSession,
-    ) -> Result<ConnectorWriteAbortOutcome, String> {
-        session
-            .session()
-            .abort(session.context().clone())
-            .map_err(|error| format!("abort distributed rewrite operation: {error}"))
-    }
-
-    fn finalize_distributed_rewrite(
-        &self,
-        session: &DistributedRewriteMaintenanceSession,
-        receipt: &ConnectorWriteReceipt,
-    ) -> Result<ConnectorDistributedRewriteReceipt, String> {
-        session
-            .session()
-            .finalize_committed(receipt)
-            .map_err(|error| format!("finalize distributed rewrite operation: {error}"))
-    }
 }
 
-impl RequestScopedMaintenanceEngine {
-    fn plan_distributed_rewrite_with_context(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-        intent: DistributedRewriteIntent,
-        connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<DistributedRewriteMaintenanceSession, String> {
-        let capacity = self
-            .execution
-            .result_capacity()
-            .ok_or("distributed maintenance rewrite has no admitted Internal window")?;
-        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
-            capacity.scope(),
-            &capacity.window_alias(),
-        )?;
-        let identity = Self::target_identity(target)?;
-        crate::connector::distributed_rewrite_application::plan_distributed_rewrite_session(
-            self.kernel.query_execution(),
-            self.kernel.connector_control().as_ref(),
-            self.kernel.typed_connector_control(),
-            &identity.instance_id.clone(),
-            identity,
-            operation_id,
-            intent,
-            self.execution.clone(),
-            connector_context,
-        )
-    }
-}
-
+#[async_trait::async_trait]
 impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
-    fn for_admitted_execution(
+    fn for_original_background_root(
         &self,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    ) -> Result<Arc<dyn TableMaintenanceEngine>, String> {
-        crate::query_execution::internal_result_cpu::require_internal_result_capacity(
-            capacity.scope(),
-            &capacity.window_alias(),
-        )?;
+        owner: &novarocks_workload_control::WorkOwner,
+    ) -> Result<RequestScopedMaintenanceEngine, String> {
+        let root = owner.scope();
+        root.check().map_err(|e| e.to_string())?;
         let attempt = self
             .attempt_factory
-            .begin_automatic_maintenance_attempt(Some(capacity))?;
-        let returned = attempt
+            .begin_original_root_maintenance_attempt(owner)?;
+        let capacity = attempt
             .execution
             .result_capacity()
-            .ok_or("automatic maintenance factory omitted its admitted root")?;
-        if !returned.window_alias().is_for_scope(capacity.scope())
-            || !returned
-                .window_alias()
-                .shares_capacity_with(&capacity.window_alias())
+            .ok_or("original maintenance Root retention is absent")?;
+        let window = capacity
+            .try_window_alias()
+            .map_err(|error| error.to_string())?;
+        if !capacity.is_root_backed_internal()
+            || !window.is_for_scope(&root)
+            || window
+                .internal_manifest_binding()
+                .map_err(|error| error.to_string())?
+                .is_some()
         {
-            return Err("automatic maintenance factory replaced its admitted root".into());
+            return Err("unmounted maintenance context has foreign or computation capacity".into());
         }
-        Ok(Arc::new(RequestScopedMaintenanceEngine::new(
+        Ok(RequestScopedMaintenanceEngine::new(
             self.kernel.clone(),
             attempt.execution,
             attempt.connector_context,
-        )))
+        ))
     }
 
     fn resolve_target(
@@ -1311,38 +1026,49 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
         self.request_engine()?.capture_target_object_id(target)
     }
 
-    fn rebind_target_object(
+    async fn reject_user_action_on_mv(
         &self,
         target: &MaintenanceTarget,
-        expected_object_id: &ConnectorTableObjectId,
-    ) -> Result<MaintenanceTargetRebind, String> {
-        self.request_engine()?
-            .rebind_target_object(target, expected_object_id)
-    }
-
-    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
-        self.request_engine()?.reject_user_action_on_mv(target)
+    ) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
+        self.request_engine()
+            .map_err(crate::mv::domain::readiness::application_error)?
+            .reject_user_action_on_mv(target)
+            .await
     }
 
     fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String> {
         self.request_engine()?.current_snapshot_id(target)
     }
 
-    fn execute_action(
+    async fn execute_action(
         &self,
+        state: &MaintenanceActionState,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String> {
-        self.request_engine()?.execute_action(request)
+        if !state.has_engine()? {
+            state.install_engine(self.request_engine()?)?;
+        }
+        state.execute(request).await
     }
 
-    fn execute_automatic_metadata_action(
+    async fn execute_automatic_metadata_action(
         &self,
+        state: &MaintenanceActionState,
         request: MaintenanceActionRequest,
         effect_id: MaintenanceEffectId,
     ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
-        self.request_engine()
+        if !state
+            .has_engine()
             .map_err(TerminalError::pre_dispatch_failed)?
-            .execute_automatic_metadata_action(request, effect_id)
+        {
+            state
+                .install_engine(
+                    self.request_engine()
+                        .map_err(TerminalError::pre_dispatch_failed)?,
+                )
+                .map_err(TerminalError::pre_dispatch_failed)?;
+        }
+        state.execute_automatic(request, effect_id).await
     }
 
     fn plan_cleanup_maintenance(
@@ -1436,79 +1162,28 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
     fn finalize_cleanup_terminal(&self, session: &CleanupMaintenanceSession) -> Result<(), String> {
         self.request_engine()?.finalize_cleanup_terminal(session)
     }
-
-    fn plan_distributed_rewrite(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-        intent: DistributedRewriteIntent,
-    ) -> Result<DistributedRewriteMaintenanceSession, String> {
-        self.request_engine()?
-            .plan_distributed_rewrite(target, operation_id, intent)
-    }
-
-    fn prepare_distributed_rewrite_cohort(
-        &self,
-        session: &DistributedRewriteMaintenanceSession,
-        cohort_id: ConnectorWriteCohortId,
-    ) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
-        self.request_engine()?
-            .prepare_distributed_rewrite_cohort(session, cohort_id)
-    }
-
-    fn accumulate_distributed_rewrite_group(
-        &self,
-        session: &DistributedRewriteMaintenanceSession,
-        completion: crate::query_execution::outcome::ConnectorWriteSessionCompletion,
-    ) -> Result<(), String> {
-        self.request_engine()?
-            .accumulate_distributed_rewrite_group(session, completion)
-    }
-
-    fn commit_distributed_rewrite(
-        &self,
-        session: &DistributedRewriteMaintenanceSession,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
-        self.request_engine()?.commit_distributed_rewrite(session)
-    }
-
-    fn abort_distributed_rewrite(
-        &self,
-        session: &DistributedRewriteMaintenanceSession,
-    ) -> Result<ConnectorWriteAbortOutcome, String> {
-        self.request_engine()?.abort_distributed_rewrite(session)
-    }
-
-    fn finalize_distributed_rewrite(
-        &self,
-        session: &DistributedRewriteMaintenanceSession,
-        receipt: &ConnectorWriteReceipt,
-    ) -> Result<ConnectorDistributedRewriteReceipt, String> {
-        self.request_engine()?
-            .finalize_distributed_rewrite(session, receipt)
-    }
 }
 
-/// Prepare one provider-frozen rewrite cohort through the ordinary connector
-/// read and write contracts retained by its exact composite lease. Native
-/// assembly remains a Frontend-only step after this sealed Core preparation.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The frozen rewrite cohort validates each maintenance port and plan fact independently; bundling would obscure the exact owner boundary."
-)]
-fn prepare_frozen_rewrite_cohort_with_ports(
-    _connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-    static_plan_carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
-    query_execution: &crate::query_execution::service::QueryExecutionService,
+pub(super) struct RewriteCohortRecipe {
+    bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+    physical_plan: novarocks_sql::planning::query_execution::FrozenConnectorScanPlan,
+    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
+    need: novarocks_sql::compiler::ProviderReadNeed,
+    session: crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
+    cohort_id: ConnectorWriteCohortId,
+    execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
+}
+struct RewriteCohortPlanParts {
+    encoded: crate::query_execution::physical_encoding::PreparedStaticPlan,
+    description: novarocks_query_application::preparation::FrozenExecutionDescription,
+    version: novarocks_physical_plan::PlanVersionId,
+}
+fn prepare_rewrite_cohort_recipe(
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     context: &novarocks_spi::connector::ConnectorRequestContext,
-    constant_policy: novarocks_functions::ConstantPolicy,
-    control: &novarocks_sql::compiler::SqlCompileControl,
-) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
+) -> Result<RewriteCohortRecipe, novarocks_sql::compiler::SqlCompileError> {
     let cohort = session
         .plan()
         .cohorts()
@@ -1597,10 +1272,6 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )?;
     crate::connector::validate_request_context(context)?;
-    let optimizer_settings = execution.optimizer_settings().clone();
-    let write_session = session
-        .write_session()
-        .ok_or_else(|| "distributed rewrite no-op has no write session".to_string())?;
 
     // Freeze the read. The capability it leaves is deposited as it is taken,
     // so the plan and what performs its read are accounted for together.
@@ -1609,20 +1280,37 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         cohort.scan_execution_schema(),
         &cohort_read,
     )?;
-    let connector_session = crate::query_execution::compiler::typed_connector_session()?;
-    let sink_access = novarocks_query_application::preparation::ReadAccessSink::new();
-    let read_fact = crate::query_execution::provider_read_facts::freeze_one_read(
-        &need,
-        typed_connector_control.as_ref(),
-        table_bindings.as_ref(),
-        &connector_session,
-        context,
-        &sink_access.deposits(),
-    )?;
-    let access = sink_access
-        .try_into_access()
-        .map_err(|(error, _returned)| error.to_string())?;
+    Ok(RewriteCohortRecipe {
+        bindings: table_bindings,
+        physical_plan,
+        sink,
+        need,
+        session: session.clone(),
+        cohort_id,
+        execution: execution.clone(),
+    })
+}
 
+fn freeze_rewrite_cohort_recipe(
+    recipe: &RewriteCohortRecipe,
+    read_fact: novarocks_sql::compiler::ProviderReadFact,
+    access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+        crate::query_execution::provider_read_facts::FrozenProviderRead,
+    >,
+    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    static_plan_carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<RewriteCohortPlanParts, novarocks_sql::compiler::SqlCompileError> {
+    let session = &recipe.session;
+    let execution = &recipe.execution;
+    let write_session = session
+        .write_session()
+        .ok_or("rewrite no-op has no write session")?;
+    let write_target = session
+        .write_target(recipe.cohort_id)
+        .map_err(|e| e.to_string())?;
+    let optimizer_settings = execution.optimizer_settings().clone();
     // The handle the plan states is the same one the session sealed, encoded
     // as the payload a plan carries rather than as the wire form the encoder
     // stamps. Both come from this session's own handle encoder, so a plan
@@ -1641,8 +1329,8 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     };
 
     let plan = novarocks_sql::planning::dml::build_final_frozen_connector_write_plan(
-        physical_plan,
-        sink,
+        recipe.physical_plan.clone(),
+        recipe.sink.clone(),
         write_target.ordinal(),
         write_target.statistics().requirements(),
         function_catalog.clone(),
@@ -1686,26 +1374,70 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             )
         })
         .map_err(|error| error.to_string())?;
-    let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
-        candidate, access,
-    )
-    .map_err(|(error, _returned)| error.to_string())?;
-    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
-        paired,
+    let encoded = crate::query_execution::physical_encoding::encode_completed_write_plan_borrowed(
+        candidate,
+        access,
         static_plan_carrier,
         constant_policy,
-        Some(&write_target_facts),
+        &write_target_facts,
         control,
     )
     .map_err(crate::query_execution::mv_native_write::encode_compile_error)?;
-    PreparedDistributedRewriteCohort::new(
+    // Every fallible pairing/description check still borrows the unique access
+    // held in the original CPU Source. The final receiving step only moves it.
+    let encoded = encoded
+        .prepare_access(access)
+        .map_err(crate::query_execution::mv_native_write::encode_compile_error)?;
+    let scheduling = encoded.scheduling_facts(version)?;
+    let description =
+        novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
+            novarocks_query_application::api::QueryExecutionKind::Write,
+            encoded.candidate().clone(),
+            scheduling
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
+                .collect(),
+            novarocks_query_application::preparation::OutputContract::CompletionOnly,
+            novarocks_coordination_contract::ExecutionEffect::External,
+            novarocks_coordination_contract::RecoveryMode::NoRecovery,
+            Vec::new(),
+            novarocks_query_application::preparation::FrozenCostEstimate::unknown(
+                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+            ),
+            novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
+                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+            ),
+        )?;
+    Ok(RewriteCohortPlanParts {
         encoded,
+        description,
         version,
-        query_execution.clone(),
-        execution.clone(),
-        write_session.clone(),
-    )
-    .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
+    })
+}
+
+fn finish_rewrite_cohort_recipe(
+    recipe: &RewriteCohortRecipe,
+    parts: RewriteCohortPlanParts,
+    access: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+        crate::query_execution::provider_read_facts::FrozenProviderRead,
+    >,
+) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
+    // Same access was already checked by prepare_access; bind is infallible.
+    let template = parts
+        .encoded
+        .bind_access(access)
+        .into_attempt_template(parts.version);
+    Ok(PreparedDistributedRewriteCohort {
+        description: parts.description,
+        template,
+        execution: recipe.execution.clone(),
+        write_session: recipe
+            .session
+            .write_session()
+            .expect("same non-noop Rewrite recipe")
+            .clone(),
+    })
 }
 
 /// How much one rewrite cohort's scan may return in a batch.
@@ -2196,8 +1928,8 @@ mod admitted_background_context_tests {
         BackendTopologyValidationError,
     };
     use novarocks_workload_control::{
-        ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
-        WorkloadConfig, WorkloadControl,
+        ResourceConfig, ResultCapacityConfig, WorkClass, WorkRequest, WorkloadConfig,
+        WorkloadControl,
     };
     use std::time::Duration;
 
@@ -2208,7 +1940,7 @@ mod admitted_background_context_tests {
         fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
             assert!(
                 self.allow_snapshot,
-                "capacity refusal must precede topology capture"
+                "Root refusal must precede topology capture"
             );
             Ok(BackendTopologySnapshot::empty(7))
         }
@@ -2253,56 +1985,69 @@ mod admitted_background_context_tests {
     }
 
     #[tokio::test]
-    async fn local_window_refuses_before_automatic_topology_capture() {
+    async fn cancelled_original_root_refuses_before_background_topology_capture() {
         let (control, _) = control();
-        let (root, window) = control
+        let root = control
             .root_admission()
-            .try_begin_root_with_result(
-                WorkRequest::new(WorkClass::Management),
-                ResultWindowClass::Local,
-            )
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
             .unwrap();
-        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
-        let result = crate::capabilities::background_maintenance_attempt(
+        root.owner
+            .cancel(novarocks_workload_control::CancellationReason::Requested);
+        let expected = root.owner.scope().check().unwrap_err().to_string();
+        let result = crate::capabilities::original_background_maintenance_attempt(
             novarocks_types::ClusterRole::Fe,
             Arc::new(TopologyProbe {
                 allow_snapshot: false,
             }),
             Duration::from_secs(60),
             &tokio::runtime::Handle::current(),
-            Some(&binding),
+            &root.owner,
         );
-        assert!(matches!(result, Err(error) if error.contains("Internal")));
-        drop(binding);
-        drop(window);
+        assert!(matches!(result, Err(error) if error == expected));
+        let notice = control
+            .next_control()
+            .expect("the original Cancel notification");
+        assert_eq!(notice.scope().id(), root.owner.scope().id());
+        assert!(
+            notice
+                .intents()
+                .contains(novarocks_workload_control::ControlIntent::Cancel)
+        );
+        notice.acknowledge();
+        assert!(control.next_control().is_none());
         root.owner.complete();
         root.business.release();
+        control.close_admission();
+        control.shutdown().unwrap_or_else(|failure| {
+            panic!(
+                "cancelled maintenance Root did not drain: {}",
+                failure.error()
+            )
+        });
     }
 
     #[tokio::test]
-    async fn automatic_attempt_keeps_original_root_deadline_cancellation_and_window() {
-        let (control, capacity) = control();
+    async fn background_attempt_keeps_original_root_deadline_cancellation_and_data_budget() {
+        let (control, _) = control();
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut request = WorkRequest::new(WorkClass::Management);
         request.deadline = Some(deadline.into());
-        let (root, window) = control
-            .root_admission()
-            .try_begin_root_with_result(request, ResultWindowClass::Internal)
-            .unwrap();
-        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
-        let attempt = crate::capabilities::background_maintenance_attempt(
+        let root = control.root_admission().try_begin_root(request).unwrap();
+        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_root_owner(&root.owner).unwrap();
+        let attempt = crate::capabilities::original_background_maintenance_attempt(
             novarocks_types::ClusterRole::Fe,
             Arc::new(TopologyProbe {
                 allow_snapshot: true,
             }),
             Duration::from_secs(60),
             &tokio::runtime::Handle::current(),
-            Some(&binding),
+            &root.owner,
         )
         .unwrap();
         assert_eq!(attempt.execution.deadline(), Some(deadline));
         assert_eq!(attempt.execution.topology().revision(), 7);
         let returned = attempt.execution.result_capacity().unwrap();
+        assert!(returned.is_root_backed_internal());
         assert!(returned.window_alias().is_for_scope(binding.scope()));
         assert!(
             returned
@@ -2312,53 +2057,87 @@ mod admitted_background_context_tests {
         root.owner
             .cancel(novarocks_workload_control::CancellationReason::Requested);
         assert!(attempt.execution.cancellation().is_cancelled());
+        let notice = control
+            .next_control()
+            .expect("the original Cancel notification");
+        assert_eq!(notice.scope().id(), root.owner.scope().id());
+        assert!(
+            notice
+                .intents()
+                .contains(novarocks_workload_control::ControlIntent::Cancel)
+        );
+        notice.acknowledge();
+        assert!(control.next_control().is_none());
         drop(binding);
-        drop(window);
         root.owner.complete();
         root.business.release();
-        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
         drop(attempt);
-        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        control.close_admission();
+        control.shutdown().unwrap_or_else(|failure| {
+            panic!(
+                "original maintenance Root did not drain: {}",
+                failure.error()
+            )
+        });
     }
 }
 
 #[cfg(test)]
 mod rewrite_selected_failure_tests {
     use super::*;
-    use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-    use novarocks_query_application::cancellation::QueryCancellationReason;
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_query_application::{
+        cancellation::QueryCancellationReason,
+        session_error::{QueryServiceError, QueryServiceErrorKind},
+    };
 
     #[test]
-    fn rewrite_finish_retains_selected_input_but_does_not_infer_one_from_text() {
+    fn rewrite_guard_retains_selected_input_but_does_not_infer_one_from_text() {
         let input = novarocks_query_application::session_outcome::cancellation_failure_input(
             QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 17,
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(17)
+                        .expect("nonzero fixture requester"),
             },
         );
-        let error =
-            rewrite_execution_terminal(DistributedQueryError::from_execution(input.clone()));
-        assert_eq!(error.execution_failure, Some(input.clone()));
-        assert_eq!(error.compile_control, None);
-        let error = rewrite_execution_terminal(DistributedQueryError::new(
-            DistributedQueryErrorKind::Failed,
+        let terminal = rewrite_job::guard_terminal_error(
+            QueryServiceError::from_execution_failure(input.clone()),
+        );
+        assert_eq!(terminal.execution_failure, Some(input.clone()));
+        assert_eq!(terminal.compile_control, None);
+        let projected = rewrite_job::computation_service_error(terminal);
+        assert_eq!(projected.execution_failure(), Some(&input));
+        let plain = rewrite_job::guard_terminal_error(QueryServiceError::new(
+            QueryServiceErrorKind::Internal,
             input.user_error().to_string(),
         ));
-        assert_eq!(error.execution_failure, None);
-        assert_eq!(error.compile_control, None);
+        assert_eq!(plain.execution_failure, None);
+        assert_eq!(plain.compile_control, None);
+        assert_eq!(plain.failure_cause, None);
     }
+
     #[test]
-    fn rewrite_finish_preserves_domain_source_which_already_authors_execution_input() {
+    fn rewrite_guard_preserves_original_provider_cause_and_fact_through_service_projection() {
         let source = novarocks_failure_contract::SharedFailureCause::new(
             novarocks_spi::connector::ConnectorError::new(
                 novarocks_spi::connector::ConnectorErrorKind::Unavailable,
                 "private connector source diagnostic",
             ),
         );
-        let original =
-            DistributedQueryError::from_source(DistributedQueryErrorKind::Failed, source);
-        let expected = original.execution_failure().unwrap().clone();
-        let terminal = rewrite_execution_terminal(original);
-        assert_eq!(terminal.execution_failure, Some(expected));
+        let terminal = rewrite_job::guard_terminal_error(QueryServiceError::from_failure_cause(
+            source.clone(),
+        ));
+        assert_eq!(terminal.failure_cause.as_ref(), Some(&source));
+        assert_eq!(
+            terminal.selected_failure_fact(),
+            Some(source.failure_fact())
+        );
         assert_eq!(terminal.compile_control, None);
+        let projected = rewrite_job::computation_service_error(terminal);
+        assert_eq!(projected.failure_cause(), Some(&source));
+        assert_eq!(
+            projected.execution_failure().unwrap().fact(),
+            source.failure_fact()
+        );
     }
 }

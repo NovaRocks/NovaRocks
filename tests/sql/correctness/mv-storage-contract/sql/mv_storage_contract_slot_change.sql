@@ -16,16 +16,16 @@ PROPERTIES (
   "uri" = "${iceberg_rest_uri}",
   "warehouse" = "${iceberg_rest_warehouse}",
   "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "static",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
+  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
   "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
   "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "static",
-  "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
+  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
   "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
   "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.region" = "us-east-1",
-  "aws.s3.enable_path_style_access" = "true"
+  "aws.s3.region" = "${oss_region}",
+  "aws.s3.enable_path_style_access" = "${oss_path_style}"
 );
 
 -- query 2
@@ -100,7 +100,7 @@ curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}
 -- query 14
 -- @publication_catalog_fault=table-commit,before-requirement-check-hold-for-concurrent-shell
 -- @publication_catalog_concurrent_shell=tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-slot-conflict-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.conflict_slot_mv SELECT * FROM ice_rest.ns_${uuid0}.conflict_slot_mv LIMIT 1;" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
--- @expect_error=did not commit
+-- @expect_error=disposition=KnownUncommitted
 SET CATALOG mvslot_${uuid0};
 USE ns_${uuid0};
 ALTER MATERIALIZED VIEW conflict_slot_mv PAUSE REFRESH;
@@ -151,6 +151,7 @@ CALL novarocks_mv_management_status('mvslot_${uuid0}', 'ns_${uuid0}', 'unknown_s
 SET CATALOG mvslot_${uuid0};
 USE ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS first_slot_mv;
+DROP MATERIALIZED VIEW IF EXISTS conflict_slot_mv;
 DROP MATERIALIZED VIEW IF EXISTS unknown_slot_mv;
 DROP TABLE mvslot_${uuid0}.ns_${uuid0}.fact FORCE;
 DROP DATABASE mvslot_${uuid0}.ns_${uuid0};

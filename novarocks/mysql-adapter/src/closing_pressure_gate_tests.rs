@@ -40,7 +40,13 @@ fn inputs() -> [ArmInput; TARGETS] {
     })
 }
 fn statement(slot: usize) -> StatementToken {
-    StatementToken::new(SessionToken::new(slot as u32 + 100, 71), 83)
+    StatementToken::new(
+        SessionToken::new(
+            novarocks_query_application::session_control::ClientSessionKey::new(slot as u64 + 100)
+                .unwrap(),
+        ),
+        83,
+    )
 }
 fn bound(slot: usize) -> io::Result<(PressureOwner, PressureController, PressureScope)> {
     let (owner, mut controller) =
@@ -49,6 +55,7 @@ fn bound(slot: usize) -> io::Result<(PressureOwner, PressureController, Pressure
     let scope = owner
         .bind_statement(
             ClientConnectionToken::new(slot as u32 + 100, 59).expect("fixed token"),
+            statement(slot).session(),
             statement(slot),
             ORIGINAL_SQL_SHA256,
         )?
@@ -192,6 +199,7 @@ async fn frozen_65_arm_rejects_duplicate_and_cannot_rearm() {
         owner
             .bind_statement(
                 ClientConnectionToken::new(100, 59).unwrap(),
+                statement(0).session(),
                 statement(0),
                 ORIGINAL_SQL_SHA256
             )
@@ -208,7 +216,21 @@ async fn frozen_65_arm_rejects_duplicate_and_cannot_rearm() {
         owner
             .bind_statement(
                 ClientConnectionToken::new(999, 59).unwrap(),
-                StatementToken::new(SessionToken::new(999, 71), 83),
+                StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(999)
+                            .expect("nonzero fixture session")
+                    ),
+                    83
+                )
+                .session(),
+                StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(999)
+                            .expect("nonzero fixture session")
+                    ),
+                    83
+                ),
                 [0; 32]
             )
             .unwrap()
@@ -220,11 +242,16 @@ async fn original_distinct_tokens_and_duplicate_binding_stay_first_cause() {
     let (owner, controller, scope) = bound(0).unwrap();
     let facts = scope.snapshot().unwrap();
     assert_eq!(facts.connection.unwrap().generation(), 59);
-    assert_eq!(facts.statement.unwrap().session().session_epoch(), 71);
+    assert_eq!(facts.statement.unwrap().session(), statement(0).session());
     assert_eq!(facts.statement.unwrap().generation(), 83);
     assert!(
         owner
-            .bind_statement(facts.connection.unwrap(), statement(0), ORIGINAL_SQL_SHA256)
+            .bind_statement(
+                facts.connection.unwrap(),
+                statement(0).session(),
+                statement(0),
+                ORIGINAL_SQL_SHA256
+            )
             .is_err()
     );
     assert!(scope.begin_rows(statement(0), baseline()).is_err());
@@ -234,7 +261,7 @@ async fn original_distinct_tokens_and_duplicate_binding_stay_first_cause() {
     );
 }
 #[tokio::test]
-async fn frozen_sql_and_zero_original_epoch_are_refused() {
+async fn frozen_sql_and_foreign_original_session_are_refused() {
     let (owner, mut controller) =
         PressureOwner::new(frontend(), Instant::now() + Duration::from_secs(20)).unwrap();
     let mut targets = inputs();
@@ -249,7 +276,14 @@ async fn frozen_sql_and_zero_original_epoch_are_refused() {
         owner
             .bind_statement(
                 ClientConnectionToken::new(100, 59).unwrap(),
-                StatementToken::new(SessionToken::new(100, 0), 83),
+                statement(0).session(),
+                StatementToken::new(
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(999)
+                            .unwrap()
+                    ),
+                    83
+                ),
                 ORIGINAL_SQL_SHA256
             )
             .is_err()
@@ -415,7 +449,12 @@ async fn synthetic_closing_hold_blocks_all_writes_and_flush_then_release_recover
     let later = StatementToken::new(statement(0).session(), 84);
     assert!(
         owner
-            .bind_statement(ClientConnectionToken::new(100, 59).unwrap(), later, [1; 32])
+            .bind_statement(
+                ClientConnectionToken::new(100, 59).unwrap(),
+                later.session(),
+                later,
+                [1; 32]
+            )
             .unwrap()
             .is_none()
     );
@@ -764,6 +803,7 @@ async fn tcp_cut_owned<W: AsyncWrite + Unpin>(
             let scope = owner
                 .bind_statement(
                     ClientConnectionToken::new(100, 59).unwrap(),
+                    statement(0).session(),
                     statement(0),
                     ORIGINAL_SQL_SHA256,
                 )?

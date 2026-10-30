@@ -461,8 +461,12 @@ fn original_nested_metadata_and_child_encoded_nulls_preserve_root_contribution_a
         .unwrap(),
     );
     let field = Arc::new(
-        Field::new("source", dictionary.data_type().clone(), true)
-            .with_metadata([("deep-source".into(), "x".repeat(1300))].into()),
+        Field::new("source", dictionary.data_type().clone(), true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "deep-source".into(),
+                "x".repeat(1300),
+            )]),
+        ),
     );
     let values: ArrayRef = Arc::new(StructArray::new(
         vec![field.clone()].into(),

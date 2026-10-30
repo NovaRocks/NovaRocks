@@ -123,8 +123,23 @@ pub(super) fn select_union_cast_field_typed<'a, 's>(
     Ok(None)
 }
 
-/// Mirrors Arrow's scalar cast-path choice, ignoring nominal metadata while
-/// choosing a child, then retaining the selected path's logical identity.
+/// Preserve the original primitive capability and deferred-refusal boundary.
+/// These two interval profiles were admitted for Int64 digits but never had a
+/// successful runtime conversion; later SDK capability cleanup must not move
+/// their actual nonempty-call failure into preparation.
+pub(super) fn primitive_cast_capability(source: &DataType, target: &DataType) -> bool {
+    matches!(
+        (source, target),
+        (
+            DataType::Interval(
+                arrow_schema::IntervalUnit::YearMonth | arrow_schema::IntervalUnit::DayTime
+            ),
+            DataType::Int64
+        )
+    ) || arrow_cast::can_cast_types(source, target)
+}
+
+/// Mirrors the original scalar cast path, retaining the chosen logical identity.
 /// The caller must first run the shared observed full-type preflight.
 pub(super) fn cast_capability_typed(
     source: &DataType,
@@ -168,7 +183,7 @@ pub(super) fn cast_capability_typed(
         // Only primitive leaf inputs reach Arrow's existing capability owner.
         _ => {
             work.step()?;
-            if arrow_cast::can_cast_types(source, &target.data_type()) {
+            if primitive_cast_capability(source, &target.data_type()) {
                 CastCapability::Physical
             } else {
                 CastCapability::Unavailable
@@ -516,7 +531,14 @@ mod tests {
             for target in [CastTarget::Float64, CastTarget::Int64] {
                 assert_eq!(
                     probe(&ty, target) == CastCapability::Physical,
-                    arrow_cast::can_cast_types(&ty, &target.data_type()),
+                    arrow_cast::can_cast_types(&ty, &target.data_type())
+                        || matches!(
+                            (&ty, target),
+                            (
+                                DataType::Interval(IntervalUnit::YearMonth | IntervalUnit::DayTime),
+                                CastTarget::Int64
+                            )
+                        ),
                     "{ty:?}"
                 );
             }

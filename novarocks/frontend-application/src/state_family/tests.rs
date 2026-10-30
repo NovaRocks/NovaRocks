@@ -232,7 +232,9 @@ fn backend_config() -> ClusterBackendOpenConfig {
 /// family wrote its control record on exactly this path.
 async fn open_application(input: StateStoreHostInput) -> FrontendApplicationHost {
     let registry = state_store_fixture::persistent_registry();
+    let mut host_receiving_12 = None;
     FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+        &mut host_receiving_12,
         Some(input),
         &registry,
         FrontendExecutionConfig::new_for_test(

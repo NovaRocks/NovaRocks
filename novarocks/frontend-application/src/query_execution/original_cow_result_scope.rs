@@ -17,14 +17,13 @@
 
 //! COW-only projection of an existing Internal result admission.
 
-use super::internal_result_cpu::INTERNAL_PEAK_BYTES;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_spi::connector::{
     ConnectorOperationControl, ConnectorOperationControlView, ConnectorOriginalResultScope,
     ConnectorOriginalResultScopeCheck, ConnectorRequestContext, OriginalResultCheckClass as Class,
     OriginalResultCheckError as Failure,
 };
-use novarocks_workload_control::{ResultWindowClass, WorkError};
+use novarocks_workload_control::ResultWindowClass;
 use std::{fmt, sync::Arc, time::Instant};
 
 // No ActivityLease. The executing command/job owns activity until actual exit.
@@ -40,6 +39,14 @@ impl fmt::Display for InvalidOriginal {
     }
 }
 impl std::error::Error for InvalidOriginal {}
+impl novarocks_failure_contract::FailureProjection for InvalidOriginal {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+        )
+    }
+}
+
 impl ConnectorOriginalResultScopeCheck for OriginalCowResultScope {
     fn original_deadline(&self) -> Instant {
         self.control.deadline()
@@ -54,32 +61,14 @@ impl ConnectorOriginalResultScopeCheck for OriginalCowResultScope {
             .map_err(|e| Failure::new(Class::Admission, e))?;
         Ok(())
     }
-    fn check_before_growth(&self, total: u64) -> Result<(), Failure> {
-        self.check_active()?;
-        // The 1024 MiB physical window does not enlarge the 1008 MiB profile.
-        if total > INTERNAL_PEAK_BYTES {
-            return Err(Failure::new(
-                Class::Coverage,
-                WorkError::Capacity("COW Internal construction profile"),
-            ));
-        }
-        self.binding
-            .window_alias()
-            .check_backing_total(total)
-            .map_err(|e| Failure::new(Class::Coverage, e))?;
-        self.check_active()
-    }
 }
 
-/// existing_upper is the caller's actual prospective receipt before this Arc
-/// grows. Add this newly allocated carrier once, before Arc::new; the returned
-/// scalar is a conservative existing caller upper for provider coexistence.
-/// It is not a provider recipe and never covers later provider graphs by fiat.
+/// Retain the SAME original binding and operation control without acquiring
+/// an activity lease or treating a metadata invoice as payload authorization.
 pub(crate) fn from_original_binding(
     binding: &QueryResultCapacityBinding,
     context: &ConnectorRequestContext,
-    existing_upper: u64,
-) -> Result<(ConnectorOriginalResultScope, u64), Failure> {
+) -> Result<ConnectorOriginalResultScope, Failure> {
     context
         .check_active()
         .map_err(|e| Failure::new(Class::Control, e))?;
@@ -94,43 +83,12 @@ pub(crate) fn from_original_binding(
             InvalidOriginal("COW requires its original Internal result binding"),
         ));
     }
-    window
-        .check_backing_total(INTERNAL_PEAK_BYTES)
-        .map_err(|e| Failure::new(Class::Coverage, e))?;
-    let caller_with_scope_upper = existing_upper
-        .checked_add(
-            carrier_header_upper()
-                .ok_or_else(|| Failure::new(Class::Coverage, WorkError::ArithmeticOverflow))?,
-        )
-        .ok_or_else(|| Failure::new(Class::Coverage, WorkError::ArithmeticOverflow))?;
-    if caller_with_scope_upper > INTERNAL_PEAK_BYTES {
-        return Err(Failure::new(
-            Class::Coverage,
-            WorkError::Capacity("COW Internal construction profile"),
-        ));
-    }
-    window
-        .check_backing_total(caller_with_scope_upper)
-        .map_err(|e| Failure::new(Class::Coverage, e))?;
-    let owner = Arc::new(OriginalCowResultScope {
+    let original = ConnectorOriginalResultScope::from_original(Arc::new(OriginalCowResultScope {
         control: context.original_operation_control(),
         binding: binding.clone(),
-    });
-    let original = ConnectorOriginalResultScope::from_original(owner);
+    }));
     original.check_active()?;
-    Ok((original, caller_with_scope_upper))
-}
-
-pub(crate) fn carrier_header_upper() -> Option<u64> {
-    let alignment =
-        std::mem::align_of::<OriginalCowResultScope>().max(std::mem::align_of::<usize>());
-    2usize
-        .checked_mul(std::mem::size_of::<usize>())?
-        .checked_add(alignment - 1)?
-        .checked_add(std::mem::size_of::<OriginalCowResultScope>())?
-        .checked_add(alignment - 1)?
-        .try_into()
-        .ok()
+    Ok(original)
 }
 
 #[cfg(test)]
@@ -171,6 +129,14 @@ mod tests {
         }
     }
     impl Error for Canary {}
+    impl novarocks_failure_contract::FailureProjection for Box<Canary> {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            novarocks_failure_contract::FailureProjection::failure_fact(
+                &novarocks_spi::connector::ConnectorErrorKind::Interrupted,
+            )
+        }
+    }
+
     impl Drop for Canary {
         fn drop(&mut self) {
             self.held_during_cause_exit.store(
@@ -180,16 +146,12 @@ mod tests {
         }
     }
     #[test]
-    fn original_scope_refuses_growth_without_releasing_its_last_window_alias() {
+    fn original_scope_is_lifetime_custody_and_does_not_qualify_metadata_invoices() {
         let (_control, root, binding, capacity) =
             super::super::internal_result_cpu::admitted_internal_fixture();
-        let (scope, carrier_upper) = from_original_binding(&binding, &context(), 0).unwrap();
-        assert!(carrier_upper > 0);
-        scope.check_before_growth(carrier_upper).unwrap();
-        let error = scope
-            .check_before_growth(INTERNAL_PEAK_BYTES + 1)
-            .unwrap_err();
-        assert_eq!(error.class(), Class::Coverage);
+        let scope = from_original_binding(&binding, &context()).unwrap();
+        // This is the same original lifetime view, not a byte-budget author.
+        scope.check_active().unwrap();
         let last = scope.retention_guard();
         drop(scope);
         drop(binding);
@@ -204,10 +166,7 @@ mod tests {
     fn failure_and_last_neutral_alias_keep_actual_window_without_activity() {
         let (_control, root, binding, capacity) =
             super::super::internal_result_cpu::admitted_internal_fixture();
-        // This fixture has no result payload/header/provider graph. Existing
-        // result backing really is empty; the new carrier is counted by factory.
-        let (scope, carrier_upper) = from_original_binding(&binding, &context(), 0).unwrap();
-        let counted_carrier = carrier_upper > 0;
+        let scope = from_original_binding(&binding, &context()).unwrap();
         let last = scope.retention_guard();
         let held = Arc::new(AtomicBool::new(false));
         let source = Box::new(Canary {
@@ -245,7 +204,6 @@ mod tests {
         drop(last);
         observer.join().unwrap();
         let final_count = capacity.snapshot().held_positions;
-        assert!(counted_carrier);
         assert!(no_activity);
         assert!(actual_canary);
         assert!(presentation.contains("copy-on-write begin failed"));
@@ -267,7 +225,7 @@ mod tests {
             64 * 1024 * 1024,
         )
         .unwrap();
-        let (scope, _) = from_original_binding(&binding, &context, 0).unwrap();
+        let scope = from_original_binding(&binding, &context).unwrap();
         let copy = scope.clone();
         let same = scope.is_same_original(&copy);
         let actual_deadline = scope.original_deadline();

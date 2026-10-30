@@ -77,7 +77,7 @@ async fn fs_operator_can_read_and_parse_parquet() -> Result<()> {
     writer.close().context("close parquet writer")?;
 
     let fs = opendal::services::Fs::default().root(dir.path().to_string_lossy().as_ref());
-    let op = Operator::new(fs)?.finish();
+    let op = Operator::new(fs)?;
 
     let data = op
         .read("test.parquet")

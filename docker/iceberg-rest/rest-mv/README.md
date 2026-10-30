@@ -7,7 +7,7 @@
 - 源码：`apache-iceberg-1.10.1.tar.gz`，commit `ccb8bc435062171e64bc8b7e5f56e6aed9c5b934`，SHA-1 `09690aa963fd38cefdba69a0d4c7b4eabe0d9ed1`，9216396 字节。下载字节已对照 Apache 发布的 SHA-512。
 - 规范：[apache/iceberg#11041](https://github.com/apache/iceberg/pull/11041)，commit `f14886bb4c54d3e292df85161a0250fbb9ae6d12`。
 - PoC：[apache/iceberg#9830](https://github.com/apache/iceberg/pull/9830)，commit `bb460f9a9493ceef13d10b6afbf0ee677b8f3a37`。提取时核对 PR head，与补丁中声明的 commit 一致。
-- builder：官方 Gradle 8.14.3 + JDK 17，平台 `linux/arm64`；digest 由 `docker/fixture-inputs/lock.json` 锁定。直接调用镜像中的 Gradle，避免源码包 `gradlew` 下载未校验的 wrapper JAR。
+- builder：官方 Gradle 8.14.3 + JDK 17，原生平台 `linux/amd64` / `linux/arm64`；digest 由 `docker/fixture-inputs/lock.json` 锁定。直接调用镜像中的 Gradle，避免源码包 `gradlew` 下载未校验的 wrapper JAR。
 - 运行 base：lock 中现有 `iceberg-rest`。最终镜像只覆盖 adapter JAR，继承用户、环境与启动方式。
 
 ## 补丁
@@ -17,6 +17,8 @@
 | `0001` | 移植 PoC 的 6 个服务端类与解析测试；`fromJson` 保留 1.10.1 的 JsonUtil 调用形式。没有移植 Spark 或 refresh-state。 |
 | `0002` | 本地规范修正：版本等价判断包含 storage-table；仅修改指针产生不同版本。 |
 | `0003` | 本地规范修正：显式 null 与缺失字段同为普通 view；写出省略 null，非法非空形状仍拒绝；测试 servlet 将请求解析错误映射为 HTTP 400，实际 Reader I/O 错误仍向上传递。 |
+
+显式供给的 `--artifact-url-prefix ORIGINAL=TRANSPORT` 也通过 recipe 声明的 `artifact_url_prefix_build_arg` 传给此构建。`transport.init.gradle` 在原 Gradle 命令执行前监听 settings/pluginManagement、buildscript 和 project Maven 仓库，仅改写匹配的目录 URL，未匹配仓库和原顺序保持不变，不额外加入 fallback。Maven Central 与 Gradle plugin portal 可分别选择镜像，完整参数见 [fixture 输入来源](../../fixture-inputs/README.md)。该 JSON 只存在于 builder 阶段，运行镜像不继承它；版本和校验元数据不因传输位置改变。
 
 构建执行 `TestViewVersionParser`、`TestViewMetadata` 和 `TestRESTCatalogServlet`，然后构建 `:iceberg-open-api:shadowJar`。依赖与插件使用仓库内 `verification-metadata.xml` 的 SHA-256 严格校验；缺失或不符即构建失败。Gradle 使用 2 个 worker、1536 MiB heap；构建资源实测记录在实施计划。
 
@@ -76,11 +78,13 @@ python3 docker/iceberg-rest/rest-mv/probe.py parity --manifest /path/to/referenc
 源码基线、补丁或构建任务改变时，运行：
 
 ```bash
-docker/iceberg-rest/rest-mv/update-verification-metadata.sh
+docker/iceberg-rest/rest-mv/update-verification-metadata.sh \
+  --artifact-url-prefix https://repo.maven.apache.org/maven2/=https://maven.aliyun.com/repository/public/ \
+  --artifact-url-prefix https://plugins.gradle.org/m2/=https://maven.aliyun.com/repository/gradle-plugin/
 git diff -- docker/iceberg-rest/rest-mv/build/verification-metadata.xml
 ```
 
-工具通过 provision 的 `--context-only rest-mv` 组装同一构建上下文，执行 Dockerfile 的 `verification-metadata-export` 目标，并用 `--refresh-dependencies` 重新解析父 POM，避免热缓存遗漏校验条目，再将结果写回 `build/verification-metadata.xml`。它会获取锁定的 base 和源码输入并联网解析依赖，但不发布 fixture store 的 BOM/READY，也不改写 derived image 别名。可选参数为 `--image-source NAME=REPOSITORY`（可重复，显式选择锁定镜像的下载仓库）和 `--docker-pull-timeout-seconds <seconds>`；镜像仍须匹配 lock 中的 digest。
+工具通过 provision 的 `--context-only rest-mv` 组装同一构建上下文，执行 Dockerfile 的 `verification-metadata-export` 目标，并用 `--refresh-dependencies` 重新解析父 POM，避免热缓存遗漏校验条目，再将结果写回 `build/verification-metadata.xml`。它会获取锁定的 base 和源码输入并联网解析依赖，但不发布 fixture store 的 BOM/READY，也不改写 derived image 别名。可选参数为 `--image-source NAME=REPOSITORY`（可重复，显式选择锁定镜像的下载仓库）、`--artifact-url-prefix ORIGINAL=TRANSPORT`（可重复）和 `--docker-pull-timeout-seconds <seconds>`。维护入口与 provision 共用同一前缀校验和 recipe ARG 作者；context-only 下载及 metadata 构建消费相同映射。镜像仍须匹配 lock 中的 digest。
 
 维护者审查新增依赖、插件、来源与校验和后提交变更。正常 provision 使用严格校验，缺项或不符即失败；BuildKit 的 `/home/gradle/.gradle` 缓存可在严格校验下复用。修改探针或本 README 不改变构建身份；`build/` 中全部文件都属于 lock 的定义输入。
 

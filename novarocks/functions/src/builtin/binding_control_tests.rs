@@ -76,8 +76,12 @@ fn conversion_pair() -> (FunctionValueType, FunctionValueType) {
     let source = (0..320)
         .map(|i| {
             Arc::new(
-                Field::new(format!("c{i}"), DataType::Utf8, true)
-                    .with_metadata([(NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string())].into()),
+                Field::new(format!("c{i}"), DataType::Utf8, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        NR_LOGICAL_TYPE_KEY.to_string(),
+                        "json".to_string(),
+                    )]),
+                ),
             )
         })
         .collect::<Vec<_>>();
@@ -285,8 +289,11 @@ fn conversion_real_nested_domain_walk_and_selected_validation_are_controlled() {
 #[test]
 fn source_type_resource_failure_is_typed_and_domain_is_never_inferred() {
     let catalog = builtin_engine_function_catalog();
-    let field = Field::new("item", DataType::Int64, true)
-        .with_metadata((0..257).map(|i| (format!("k{i}"), "v".into())).collect());
+    let field = Field::new("item", DataType::Int64, true).with_metadata(
+        (0..257)
+            .map(|i| (format!("k{i}"), "v".into()))
+            .collect::<std::collections::HashMap<String, String>>(),
+    );
     let args = [value(FunctionValueType::from_legacy_declared_projection(
         DataType::List(Arc::new(field)),
         false,

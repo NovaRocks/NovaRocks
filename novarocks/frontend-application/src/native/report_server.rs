@@ -11,9 +11,8 @@ use novarocks_proto_codec::{ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
 
 use crate::query_execution::lifecycle_diagnostics::{
-    QueryLifecycleConvergenceErrorSource, QueryLifecycleConvergenceReader,
-    QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
-    RuntimeFilterTerminalRollupUnavailable,
+    QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot,
+    RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
 };
 use crate::query_execution::runtime_filter_terminal_rollup::{
     RuntimeFilterParticipantTerminalDetails, RuntimeFilterParticipantTerminalTelemetry,
@@ -33,7 +32,6 @@ struct LifecycleConvergenceDebugSnapshot {
     query_process_namespace: String,
     query_local_sequence: u64,
     query_attempt_id: u64,
-    error_source: Option<&'static str>,
     failure_fact: Option<Vec<u8>>,
     failure_detail: Option<String>,
     failure_site: Option<serde_json::Value>,
@@ -210,10 +208,6 @@ fn lifecycle_convergence_debug_snapshot(
         .query_id()
         .process_attribution()
         .expect("frontend query allocator always emits a positive local sequence");
-    let error_source = snapshot.error_source.map(|source| match source {
-        QueryLifecycleConvergenceErrorSource::BackendAttestation => "backend-attestation",
-        QueryLifecycleConvergenceErrorSource::FrontendLiveness => "frontend-liveness",
-    });
     LifecycleConvergenceDebugSnapshot {
         execution_id: format!(
             "{}:{}:{}",
@@ -224,7 +218,6 @@ fn lifecycle_convergence_debug_snapshot(
         query_process_namespace: attribution.namespace().to_string(),
         query_local_sequence: attribution.sequence().get(),
         query_attempt_id: snapshot.execution_id.attempt_id().get(),
-        error_source,
         failure_fact: snapshot.failure.as_ref().map(|input| {
             prost::Message::encode_to_vec(&novarocks_task_codec::status::encode_failure_fact(
                 input.fact(),
@@ -971,7 +964,6 @@ mod tests {
                 AttemptId::new(1).expect("nonzero attempt"),
             )
             .expect("execution id"),
-            error_source: None,
             primary_error: None,
             failure: None,
             worker_contexts_converged: false,

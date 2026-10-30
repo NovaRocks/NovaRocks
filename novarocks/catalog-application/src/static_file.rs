@@ -33,7 +33,8 @@ use crate::{CatalogApplicationError, CatalogApplicationErrorKind};
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, ConnectorInstanceId,
     ConnectorProviderId, CredentialConsumerRole, MAX_CATALOG_NON_SECRET_PROPERTIES,
-    StaticCredentialReference, canonicalize_catalog_credential_bindings,
+    NodeLocalCredentialReference, StaticCredentialReference,
+    canonicalize_catalog_credential_bindings,
 };
 
 const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
@@ -227,6 +228,18 @@ fn parse_credential_binding(
                     .map_err(|error| whole_file_error(error.to_string()))?,
             )
         }
+        "node-local" => {
+            let name = wire.name.as_deref().ok_or_else(|| {
+                whole_file_error("node-local catalog credential binding requires name")
+            })?;
+            let generation = wire.generation.as_deref().ok_or_else(|| {
+                whole_file_error("node-local catalog credential binding requires generation")
+            })?;
+            CatalogCredentialMode::NodeLocal(
+                NodeLocalCredentialReference::try_new(name, generation)
+                    .map_err(|error| whole_file_error(error.to_string()))?,
+            )
+        }
         "vended" => {
             if wire.name.is_some() || wire.generation.is_some() {
                 return Err(whole_file_error(
@@ -251,6 +264,44 @@ fn whole_file_error(message: impl Into<String>) -> CatalogApplicationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_local_source_bindings_are_preserved_by_static_catalog_input() {
+        let file = write_file(
+            br#"format_version = 3
+[[catalogs]]
+instance_id = "catalog.analytics"
+provider_id = "iceberg"
+display_name = "Analytics"
+config_format_version = 3
+[[catalogs.credential_bindings]]
+purpose = "object-store-data"
+consumer_role = "backend"
+mode = "node-local"
+name = "worker-source"
+generation = "blue"
+[[catalogs.credential_bindings]]
+purpose = "object-store-metadata"
+consumer_role = "frontend"
+mode = "node-local"
+name = "frontend-source"
+generation = "blue"
+[catalogs.properties]
+type = "iceberg"
+"#,
+        );
+        let entry = load_static_file_snapshot(file.path())
+            .unwrap()
+            .into_entries()
+            .next()
+            .unwrap();
+        assert_eq!(entry.config().credential_bindings().len(), 2);
+        for binding in entry.config().credential_bindings() {
+            assert!(binding.node_local_reference().is_some());
+            assert!(binding.static_reference().is_none());
+        }
+    }
+
     use std::io::Write;
 
     fn write_file(contents: &[u8]) -> tempfile::NamedTempFile {

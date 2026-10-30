@@ -30,7 +30,9 @@
 //! [`decode_static_package`]; a request that names an identity which already
 //! exists is answered from that task's lifecycle, and its static bytes are
 //! never read.
-// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
+// Design: ADR-0161 (docs/adr/ADR-0161-pure-local-programs-and-supervised-task-lifecycle.md)
+
+pub mod size;
 
 use std::any::Any;
 use std::collections::BTreeSet;

@@ -23,7 +23,14 @@ use crate::{
     WorkError, WorkId, WorkScope, WorkloadControl,
     scope::{Inner, State},
 };
-use std::sync::Arc;
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+
+pub(crate) mod retained_bytes;
+pub use retained_bytes::ResultPayloadBytes;
+use retained_bytes::RetainedBytes;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultWindowClass {
@@ -94,18 +101,12 @@ impl ResultCapacityConfig {
                 "client result computation and short-tail capacity",
             ));
         }
-        let mut total = 0u64;
+        // Positions count actual holders; each holder or Internal Root uses
+        // its own byte budget. No product of these declarations is reserved.
         for (positions, bytes) in self.positions.into_iter().zip(self.all_objects_bytes) {
-            if positions == 0 || positions > 1_000_000 || bytes == 0 {
+            if positions == 0 || bytes == 0 {
                 return Err(WorkError::InvalidConfig("result owner capacity"));
             }
-            total = total
-                .checked_add(
-                    bytes
-                        .checked_mul(positions as u64)
-                        .ok_or(WorkError::ArithmeticOverflow)?,
-                )
-                .ok_or(WorkError::ArithmeticOverflow)?;
         }
         Ok(self)
     }
@@ -135,7 +136,7 @@ impl WorkloadControl {
         }
         self.inner.update(|state| {
             if state.ready
-                || state.closed
+                || state.root_admission_is_closed()
                 || !state.nodes.is_empty()
                 || state.result_capacity.is_some()
             {
@@ -181,7 +182,12 @@ impl ResultCapacityHandle {
         }
         self.inner.update(|state| {
             let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
-            if cut == ResultClosingCut::AcceptedCancellation && node.cancellation.reason().is_none()
+            if cut == ResultClosingCut::AcceptedCancellation
+                && state
+                    .cancellations
+                    .cell(node.cancellation)
+                    .check_reason()
+                    .is_none()
             {
                 return Err(WorkError::Conflict);
             }
@@ -219,7 +225,7 @@ pub(crate) fn reserve_window(
     // Closing keeps the original responsibility after cancellation. It does
     // not admit new computation and must not clear its cancellation reason.
     if class != ResultWindowClass::Closing {
-        node.check()?;
+        node.check(&state.cancellations)?;
     }
     let all_objects_bytes = count_window(state, scope.id, class)?;
     Ok(adopt_window(scope, class, all_objects_bytes))
@@ -280,12 +286,66 @@ pub(crate) fn adopt_window(
             scope: scope.clone(),
             class,
             all_objects_bytes,
+            retained_bytes: RetainedBytes::new(all_objects_bytes),
+            computation: Arc::new(ClientComputationPosition::default()),
         }),
         closing_cut: None,
     }
 }
 
-struct WindowHolder {
+#[derive(Default)]
+struct ClientComputationPosition {
+    active_claim: AtomicU64,
+    window_exited: AtomicBool,
+}
+
+/// A fence to one original Client position. State serializes every transition;
+/// the cell never upgrades the holder or runs its destructor under State.
+#[derive(Clone)]
+pub(crate) struct ClientComputationWindow {
+    holder: Weak<WindowHolder>,
+    position: Arc<ClientComputationPosition>,
+    root: WorkId,
+}
+impl ClientComputationWindow {
+    pub(crate) fn room(&self) -> Result<bool, WorkError> {
+        self.validate_live()?;
+        Ok(self.position.active_claim.load(Ordering::Relaxed) == 0)
+    }
+    pub(crate) fn validate_live(&self) -> Result<(), WorkError> {
+        if self.holder.strong_count() == 0 {
+            Err(WorkError::Released)
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn acquire(&self, claim: u64) {
+        assert_eq!(self.position.active_claim.swap(claim, Ordering::Relaxed), 0);
+    }
+    pub(crate) fn validate_claim(&self, claim: u64) -> Result<(), WorkError> {
+        self.validate_live()?;
+        if self.position.active_claim.load(Ordering::Relaxed) != claim {
+            return Err(WorkError::Conflict);
+        }
+        Ok(())
+    }
+    pub(crate) fn same_original(&self, other: &Self) -> bool {
+        self.root == other.root
+            && Weak::ptr_eq(&self.holder, &other.holder)
+            && Arc::ptr_eq(&self.position, &other.position)
+    }
+    pub(crate) fn release(&self, state: &mut State, claim: u64) {
+        assert_eq!(self.position.active_claim.swap(0, Ordering::Relaxed), claim);
+        if self.position.window_exited.load(Ordering::Relaxed) {
+            uncount_window(state, self.root, ResultWindowClass::Client);
+            state.collect(self.root);
+        }
+    }
+}
+
+pub(crate) struct WindowHolder {
+    computation: Arc<ClientComputationPosition>,
+    retained_bytes: RetainedBytes,
     scope: WorkScope,
     class: ResultWindowClass,
     all_objects_bytes: u64,
@@ -293,8 +353,15 @@ struct WindowHolder {
 impl Drop for WindowHolder {
     fn drop(&mut self) {
         self.scope.inner.update(|state| {
-            uncount_window(state, self.scope.id, self.class);
-            state.collect(self.scope.id);
+            self.computation
+                .window_exited
+                .store(true, Ordering::Relaxed);
+            if self.computation.active_claim.load(Ordering::Relaxed) == 0 {
+                uncount_window(state, self.scope.id, self.class);
+                state.collect(self.scope.id);
+            }
+            // A live computation retains this exact counted Client position
+            // until its last actual execution alias exits.
         });
     }
 }
@@ -338,19 +405,50 @@ impl ResultWindowGrant {
     /// and keeps its position live until the last physical alias exits.
     pub fn retain_alias(&self) -> ResultWindowAlias {
         ResultWindowAlias {
-            holder: Arc::clone(&self.holder),
-            execution_scope: None,
+            backing: AliasBacking::Window {
+                holder: Arc::clone(&self.holder),
+                execution_scope: None,
+                manifest: None,
+                client_computation: None,
+            },
         }
     }
 }
-#[derive(Clone)]
+/// A view of the original result owner's data budget and retained lifetime.
+/// Internal Root pins do not acquire a delegated Node/control holder for an
+/// attributed execution scope, nor does retention take a computation position.
 pub struct ResultWindowAlias {
-    holder: Arc<WindowHolder>,
-    execution_scope: Option<Arc<WindowExecutionScope>>,
+    backing: AliasBacking,
+}
+type NativeComputationStamp = (WorkId, [u64; 2]);
+
+enum AliasBacking {
+    Window {
+        holder: Arc<WindowHolder>,
+        execution_scope: Option<Arc<WindowExecutionScope>>,
+        client_computation: Option<NativeComputationStamp>,
+        manifest: Option<(
+            crate::joint_admission::InternalManifestBinding,
+            crate::joint_admission::RetainedPayloadAlias,
+        )>,
+    },
+    RootRetention {
+        budget: Arc<RetainedBytes>,
+        pin: Arc<WindowExecutionScope>,
+        execution: WorkScope,
+    },
+    InternalRoot {
+        budget: Arc<RetainedBytes>,
+        payload: crate::joint_admission::RetainedPayloadAlias,
+        root: WorkScope,
+        execution: WorkScope,
+        binding: Option<crate::joint_admission::InternalManifestBinding>,
+        streamed_computation: Option<NativeComputationStamp>,
+    },
 }
 
-// A delegated alias holds the exact child's responsibility through real exit.
-// It consumes no second result position and cannot change the admitted class.
+// One existing scope resource pin. Root data and legacy window attribution
+// keep this original scope live independently of any computation position.
 struct WindowExecutionScope {
     scope: WorkScope,
 }
@@ -360,52 +458,643 @@ impl Drop for WindowExecutionScope {
             let node = state
                 .nodes
                 .get_mut(&self.scope.id)
-                .expect("delegated window alias retains its child scope");
+                .expect("result retention keeps its original scope");
             node.resource_holders -= 1;
             state.collect(self.scope.id);
         });
     }
 }
+fn internal_pin_error(error: novarocks_resource_contract::RetentionPinError) -> WorkError {
+    use novarocks_resource_contract::RetentionPinError;
+    match error {
+        RetentionPinError::Released => WorkError::Released,
+        RetentionPinError::Conflict => WorkError::Conflict,
+        RetentionPinError::Overflow => WorkError::ArithmeticOverflow,
+    }
+}
+#[derive(Clone)]
+pub(crate) enum NativeCapacityFence {
+    Window(std::sync::Weak<WindowHolder>),
+    ClientWindow {
+        holder: std::sync::Weak<WindowHolder>,
+        stage: WorkId,
+        key: [u64; 2],
+    },
+    InternalPayload {
+        payload: [u64; 2],
+        computation: Option<NativeComputationStamp>,
+    },
+}
+impl NativeCapacityFence {
+    pub(crate) fn validate(&self, state: &State, root: WorkId) -> Result<(), WorkError> {
+        match self {
+            Self::Window(holder) => {
+                // No upgrade/last-holder Drop while State is locked. The
+                // original alias was borrowed when this exact Weak was minted.
+                if holder.strong_count() == 0 {
+                    return Err(WorkError::Released);
+                }
+                Ok(())
+            }
+            Self::ClientWindow { holder, stage, key } => {
+                if holder.strong_count() == 0 {
+                    return Err(WorkError::Released);
+                }
+                crate::joint_admission::ledger::validate_native_computation_fence(
+                    state, root, *stage, *key,
+                )
+            }
+            Self::InternalPayload {
+                payload,
+                computation,
+            } => {
+                crate::joint_admission::ledger::validate_native_payload_fence(
+                    state, root, *payload,
+                )?;
+                if let Some((stage, key)) = computation {
+                    crate::joint_admission::ledger::validate_native_computation_fence(
+                        state, root, *stage, *key,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+fn internal_root_budget(state: &mut State, root: WorkId) -> Result<Arc<RetainedBytes>, WorkError> {
+    let limit = state
+        .result_capacity
+        .ok_or(WorkError::NotReady)?
+        .all_objects_bytes[ResultWindowClass::Internal.index()];
+    let node = state.nodes.get_mut(&root).ok_or(WorkError::Released)?;
+    Ok(match node.internal_result_bytes.upgrade() {
+        Some(budget) => budget,
+        None => {
+            let budget = Arc::new(RetainedBytes::new(limit));
+            node.internal_result_bytes = Arc::downgrade(&budget);
+            budget
+        }
+    })
+}
+
 impl ResultWindowAlias {
-    /// Numeric scope identities are local to one host. Capacity must match
-    /// both the exact scope and the runtime that admitted it.
+    /// Retain actual data under this unique active Root owner. This borrows
+    /// the installed per-Root byte budget without taking a computation/window
+    /// position, payload grant, manifest binding or physical execution source.
+    pub fn from_root_owner(owner: &crate::WorkOwner) -> Result<Self, WorkError> {
+        let root = owner.scope();
+        root.inner.update(|state| {
+            let node = state.nodes.get(&root.id).ok_or(WorkError::Released)?;
+            node.check(&state.cancellations)?;
+            if node.owner != crate::OwnerState::Active
+                || node.parent.is_some()
+                || node.root != root.id
+            {
+                return Err(WorkError::Conflict);
+            }
+            let holders = node
+                .resource_holders
+                .checked_add(1)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            let budget = internal_root_budget(state, root.id)?;
+            state.nodes.get_mut(&root.id).unwrap().resource_holders = holders;
+            Ok(Self {
+                backing: AliasBacking::RootRetention {
+                    budget,
+                    pin: Arc::new(WindowExecutionScope {
+                        scope: root.clone(),
+                    }),
+                    execution: root.clone(),
+                },
+            })
+        })
+    }
+
+    pub(crate) fn client_computation_window(
+        &self,
+        root: &WorkScope,
+    ) -> Result<ClientComputationWindow, WorkError> {
+        match &self.backing {
+            AliasBacking::Window { holder, .. }
+                if holder.class == ResultWindowClass::Client && self.is_for_scope(root) =>
+            {
+                Ok(ClientComputationWindow {
+                    holder: Arc::downgrade(holder),
+                    position: Arc::clone(&holder.computation),
+                    root: holder.scope.id,
+                })
+            }
+            _ => Err(WorkError::Conflict),
+        }
+    }
+
+    pub fn native_action_authority(
+        &self,
+    ) -> Result<crate::joint_admission::NativeAsyncActionAuthority, WorkError> {
+        let fence = match &self.backing {
+            AliasBacking::Window {
+                holder,
+                client_computation,
+                ..
+            } => {
+                if holder.class == ResultWindowClass::Closing {
+                    return Err(WorkError::Conflict);
+                }
+                if let Some((stage, key)) = client_computation {
+                    if self.execution_scope().id != *stage {
+                        return Err(WorkError::Conflict);
+                    }
+                    NativeCapacityFence::ClientWindow {
+                        holder: Arc::downgrade(holder),
+                        stage: *stage,
+                        key: *key,
+                    }
+                } else {
+                    NativeCapacityFence::Window(Arc::downgrade(holder))
+                }
+            }
+            AliasBacking::RootRetention { .. } => return Err(WorkError::Conflict),
+            AliasBacking::InternalRoot {
+                payload,
+                execution,
+                streamed_computation,
+                ..
+            } => {
+                if streamed_computation.is_some_and(|(stage, _)| execution.id != stage) {
+                    return Err(WorkError::Conflict);
+                }
+                NativeCapacityFence::InternalPayload {
+                    payload: payload.native_source_key()?,
+                    computation: *streamed_computation,
+                }
+            }
+        };
+        crate::joint_admission::ledger::delegate_native_actions(
+            self.root_scope(),
+            self.execution_scope(),
+            fence,
+        )
+    }
+    /// Delegates only from the original result owner, never from a numeric
+    /// window size. Neither capture nor its weak fence adds a position/pin.
+    pub fn native_action_source(
+        &self,
+        lane: crate::joint_admission::JointLane,
+        quote: crate::joint_admission::NativeAsyncActionQuote,
+    ) -> Result<crate::joint_admission::NativeAsyncActionSource, WorkError> {
+        let fence = match &self.backing {
+            AliasBacking::Window {
+                holder,
+                client_computation,
+                ..
+            } => {
+                if holder.class == ResultWindowClass::Closing {
+                    return Err(WorkError::Conflict);
+                }
+                if let Some((stage, key)) = client_computation {
+                    if self.execution_scope().id != *stage {
+                        return Err(WorkError::Conflict);
+                    }
+                    NativeCapacityFence::ClientWindow {
+                        holder: Arc::downgrade(holder),
+                        stage: *stage,
+                        key: *key,
+                    }
+                } else {
+                    NativeCapacityFence::Window(Arc::downgrade(holder))
+                }
+            }
+            AliasBacking::RootRetention { .. } => return Err(WorkError::Conflict),
+            AliasBacking::InternalRoot {
+                payload,
+                execution,
+                streamed_computation,
+                ..
+            } => {
+                if streamed_computation.is_some_and(|(stage, _)| execution.id != stage) {
+                    return Err(WorkError::Conflict);
+                }
+                NativeCapacityFence::InternalPayload {
+                    payload: payload.native_source_key()?,
+                    computation: *streamed_computation,
+                }
+            }
+        };
+        crate::joint_admission::ledger::capture_native_action(
+            self.root_scope(),
+            self.execution_scope(),
+            fence,
+            lane,
+            quote,
+        )
+    }
+    /// Project the original Root payload into an actual execution. This is
+    /// retention/attribution only, never a computation or physical grant.
+    pub fn from_internal_payload(
+        root: &WorkScope,
+        execution: &WorkScope,
+        grant: &crate::joint_admission::RetainedPayloadGrant,
+    ) -> Result<Self, WorkError> {
+        // Validate before creating a pin: refusal must not destroy even a
+        // temporary typed alias while an external receiver holds its lock.
+        if !grant.is_for_scope(root) {
+            return Err(WorkError::Conflict);
+        }
+        if !Arc::ptr_eq(&root.inner, &execution.inner) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        {
+            let state = root.inner.state.lock().unwrap();
+            let original = state.nodes.get(&root.id).ok_or(WorkError::Released)?;
+            original.check(&state.cancellations)?;
+            if original.parent.is_some() || original.root != root.id {
+                return Err(WorkError::Conflict);
+            }
+            let current = state.nodes.get(&execution.id).ok_or(WorkError::Released)?;
+            current.check(&state.cancellations)?;
+            if current.class != original.class
+                || (execution.id != root.id && current.parent != Some(root.id))
+            {
+                return Err(WorkError::Conflict);
+            }
+        }
+        let budget = {
+            let mut state = root.inner.state.lock().unwrap();
+            internal_root_budget(&mut state, root.id)?
+        };
+        let payload = grant.retain_alias().map_err(internal_pin_error)?;
+        Ok(Self {
+            backing: AliasBacking::InternalRoot {
+                budget,
+                payload,
+                root: root.clone(),
+                execution: execution.clone(),
+                binding: None,
+                streamed_computation: None,
+            },
+        })
+    }
+    /// Author the closed manifest binding only while borrowing the original
+    /// positive Root payload and actual direct-child computation grants.
+    pub fn from_internal_computation(
+        root: &WorkScope,
+        stage: &crate::WorkOwner,
+        payload: &crate::joint_admission::RetainedPayloadGrant,
+        computation: &crate::joint_admission::InternalComputationGrant,
+    ) -> Result<Self, WorkError> {
+        computation.validate_internal_position()?;
+        let binding = crate::joint_admission::InternalManifestBinding::from_grants(
+            root,
+            stage,
+            payload,
+            computation,
+        )?;
+        let mut alias = Self::from_internal_payload(root, &stage.scope(), payload)?;
+        let AliasBacking::InternalRoot {
+            binding: target, ..
+        } = &mut alias.backing
+        else {
+            unreachable!()
+        };
+        *target = Some(binding);
+        Ok(alias)
+    }
+    /// Attach only the same positive computation's weak Native liveness fence.
+    /// This borrows the original grants; ownership moves only in the receiving
+    /// QA custody author. Plain/borrowed Internal payloads keep their contract.
+    pub fn from_streamed_internal_computation(
+        root: &WorkScope,
+        stage: &crate::WorkOwner,
+        payload: &crate::joint_admission::RetainedPayloadGrant,
+        computation: &crate::joint_admission::InternalComputationGrant,
+    ) -> Result<Self, WorkError> {
+        let mut alias = Self::from_internal_computation(root, stage, payload, computation)?;
+        let AliasBacking::InternalRoot {
+            binding: Some(binding),
+            streamed_computation,
+            ..
+        } = &mut alias.backing
+        else {
+            unreachable!()
+        };
+        *streamed_computation = Some(binding.computation_identity());
+        Ok(alias)
+    }
+
+    /// Preserve the actual Client window while attaching only the original
+    /// positive Root/stage manifest authority. No Internal result window or
+    /// new quota is acquired, and retention alone cannot call this constructor.
+    pub fn from_client_computation(
+        root: &WorkScope,
+        stage: &crate::WorkOwner,
+        original: &Self,
+        payload: &crate::joint_admission::RetainedPayloadGrant,
+        computation: &crate::joint_admission::InternalComputationGrant,
+    ) -> Result<Self, WorkError> {
+        if original.class() != ResultWindowClass::Client || !original.is_for_scope(root) {
+            return Err(WorkError::Conflict);
+        }
+        computation.validate_client_position(&original.client_computation_window(root)?)?;
+        let binding = crate::joint_admission::InternalManifestBinding::from_grants(
+            root,
+            stage,
+            payload,
+            computation,
+        )?;
+        let retained = payload.retain_alias().map_err(internal_pin_error)?;
+        let mut alias = original.for_child(&stage.scope())?;
+        let AliasBacking::Window {
+            manifest,
+            client_computation,
+            ..
+        } = &mut alias.backing
+        else {
+            return Err(WorkError::Conflict);
+        };
+        // The QA activity owns the unique positive grant. Window aliases keep
+        // only its original incarnation fence and payload/window retention.
+        *client_computation = Some(binding.computation_identity());
+        *manifest = Some((binding, retained));
+        Ok(alias)
+    }
+    /// Observe the exact admitted window envelope. This grants no additional capacity.
+    pub fn all_objects_bytes(&self) -> Result<u64, WorkError> {
+        match &self.backing {
+            AliasBacking::Window { holder, .. } => Ok(holder.all_objects_bytes),
+            _ => Err(WorkError::Conflict),
+        }
+    }
+    /// Read the SAME original Client envelope, never a guessed peak constant.
+    pub fn client_all_objects_bytes(&self) -> Result<u64, WorkError> {
+        match &self.backing {
+            AliasBacking::Window { holder, .. } if holder.class == ResultWindowClass::Client => {
+                Ok(holder.all_objects_bytes)
+            }
+            _ => Err(WorkError::Conflict),
+        }
+    }
+    /// Borrow the exact positive-grant-derived capability carried by this
+    /// original alias. Plain payload/retention constructors cannot mint one.
+    pub fn internal_manifest_binding(
+        &self,
+    ) -> Result<Option<&crate::joint_admission::InternalManifestBinding>, WorkError> {
+        match &self.backing {
+            AliasBacking::Window {
+                manifest: Some((binding, payload)),
+                ..
+            } => {
+                binding.validate_alias(
+                    self.root_scope(),
+                    self.execution_scope(),
+                    payload.native_source_key()?,
+                )?;
+                Ok(Some(binding))
+            }
+            AliasBacking::InternalRoot {
+                binding: Some(binding),
+                root,
+                execution,
+                payload,
+                ..
+            } => {
+                binding.validate_alias(root, execution, payload.native_source_key()?)?;
+                Ok(Some(binding))
+            }
+            _ => Ok(None),
+        }
+    }
+    /// A streamed alias cannot become a legacy execution allowance through a
+    /// new activity binding. The marker grants no computation position itself.
+    pub fn has_streamed_computation_stamp(&self) -> bool {
+        matches!(
+            &self.backing,
+            AliasBacking::Window {
+                client_computation: Some(_),
+                ..
+            } | AliasBacking::InternalRoot {
+                streamed_computation: Some(_),
+                ..
+            }
+        )
+    }
+    pub fn is_root_backed_internal(&self) -> bool {
+        matches!(
+            self.backing,
+            AliasBacking::InternalRoot { .. } | AliasBacking::RootRetention { .. }
+        )
+    }
+    /// The physical payload owner remains the statement/job Root.
+    pub fn root_scope(&self) -> &WorkScope {
+        match &self.backing {
+            AliasBacking::Window { holder, .. } => &holder.scope,
+            AliasBacking::RootRetention { pin, .. } => &pin.scope,
+            AliasBacking::InternalRoot { root, .. } => root,
+        }
+    }
     pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
         self.execution_scope().id == scope.id
             && Arc::ptr_eq(&self.execution_scope().inner, &scope.inner)
     }
-    /// Compare the actual physical allowance, independently of child attribution.
-    pub fn shares_capacity_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.holder, &other.holder)
+    /// Move the same positive Root payload pin into statement retention.
+    /// The completed computation's identity is no longer an execution scope;
+    /// dropping its manifest capability cannot mint another computation grant.
+    pub fn into_root_retention(mut self) -> Result<Self, WorkError> {
+        match &mut self.backing {
+            AliasBacking::RootRetention { pin, execution, .. } => {
+                pin.scope.check()?;
+                *execution = pin.scope.clone();
+            }
+            AliasBacking::InternalRoot {
+                payload,
+                root,
+                execution,
+                binding,
+                ..
+            } => {
+                root.check()?;
+                payload.check_backing_total(0)?;
+                *execution = root.clone();
+                *binding = None;
+                // Keep any streamed marker: retention does not reopen the
+                // old stage's Native Foreground computation authority.
+            }
+            AliasBacking::Window { .. } => return Err(WorkError::Conflict),
+        }
+        Ok(self)
     }
 
+    /// Exact original Root identity, including its owning authority. This
+    /// comparison grants no payload or computation capacity.
+    pub fn is_for_root_scope(&self, root: &WorkScope) -> bool {
+        let original = self.root_scope();
+        original.id == root.id && Arc::ptr_eq(&original.inner, &root.inner)
+    }
+    pub fn shares_capacity_with(&self, other: &Self) -> bool {
+        match (&self.backing, &other.backing) {
+            (AliasBacking::Window { holder: a, .. }, AliasBacking::Window { holder: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
+            (
+                AliasBacking::InternalRoot { budget: a, .. }
+                | AliasBacking::RootRetention { budget: a, .. },
+                AliasBacking::InternalRoot { budget: b, .. }
+                | AliasBacking::RootRetention { budget: b, .. },
+            ) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
     pub fn scope_id(&self) -> WorkId {
         self.execution_scope().id()
     }
     fn execution_scope(&self) -> &WorkScope {
-        self.execution_scope
-            .as_ref()
-            .map_or(&self.holder.scope, |owner| &owner.scope)
+        match &self.backing {
+            AliasBacking::Window {
+                holder,
+                execution_scope,
+                ..
+            } => execution_scope
+                .as_ref()
+                .map_or(&holder.scope, |value| &value.scope),
+            AliasBacking::InternalRoot { execution, .. }
+            | AliasBacking::RootRetention { execution, .. } => execution,
+        }
     }
-
-    /// Authorize one live direct child to use this already-admitted window.
-    /// Exact parent/host identity is checked before recording its holder; a
-    /// sibling, foreign host or completed scope cannot obtain this capability.
+    pub fn try_clone(&self) -> Result<Self, WorkError> {
+        let backing = match &self.backing {
+            AliasBacking::Window {
+                holder,
+                execution_scope,
+                manifest,
+                client_computation,
+            } => AliasBacking::Window {
+                holder: Arc::clone(holder),
+                execution_scope: execution_scope.clone(),
+                client_computation: *client_computation,
+                manifest: manifest
+                    .as_ref()
+                    .map(|(binding, payload)| {
+                        Ok((
+                            binding.clone(),
+                            payload.try_clone().map_err(internal_pin_error)?,
+                        ))
+                    })
+                    .transpose()?,
+            },
+            AliasBacking::RootRetention {
+                budget,
+                pin,
+                execution,
+            } => AliasBacking::RootRetention {
+                budget: Arc::clone(budget),
+                pin: Arc::clone(pin),
+                execution: execution.clone(),
+            },
+            AliasBacking::InternalRoot {
+                budget,
+                payload,
+                root,
+                execution,
+                binding,
+                streamed_computation,
+            } => AliasBacking::InternalRoot {
+                budget: Arc::clone(budget),
+                payload: payload.try_clone().map_err(internal_pin_error)?,
+                root: root.clone(),
+                execution: execution.clone(),
+                binding: binding.clone(),
+                streamed_computation: *streamed_computation,
+            },
+        };
+        Ok(Self { backing })
+    }
+    /// Move this exact original payload pin to SPI without allocating a holder.
+    /// Legacy windows and Root-only retention have no such payload record and
+    /// are returned unchanged instead of inventing a payload lease.
+    pub fn into_internal_retention(
+        self,
+    ) -> Result<novarocks_resource_contract::ExistingOwnerRetentionLease, Self> {
+        match self.backing {
+            AliasBacking::InternalRoot { payload, .. } => Ok(payload.into_retention()),
+            backing => Err(Self { backing }),
+        }
+    }
     pub fn for_child(&self, child: &WorkScope) -> Result<Self, WorkError> {
         let parent = self.execution_scope();
         if !Arc::ptr_eq(&parent.inner, &child.inner) {
             return Err(WorkError::ForeignAuthority);
         }
-        if self.holder.class == ResultWindowClass::Closing {
+        if self.class() == ResultWindowClass::Closing {
             return Err(WorkError::Conflict);
         }
+        if let AliasBacking::RootRetention { budget, pin, .. } = &self.backing {
+            {
+                let state = parent.inner.state.lock().unwrap();
+                let original = state.nodes.get(&parent.id).ok_or(WorkError::Released)?;
+                original.check(&state.cancellations)?;
+                let current = state.nodes.get(&child.id).ok_or(WorkError::Released)?;
+                current.check(&state.cancellations)?;
+                if current.parent != Some(parent.id) || current.class != original.class {
+                    return Err(WorkError::Conflict);
+                }
+            }
+            return Ok(Self {
+                backing: AliasBacking::RootRetention {
+                    budget: Arc::clone(budget),
+                    pin: Arc::clone(pin),
+                    execution: child.clone(),
+                },
+            });
+        }
+        if let AliasBacking::InternalRoot {
+            budget,
+            payload,
+            root,
+            streamed_computation,
+            ..
+        } = &self.backing
+        {
+            // Clone while the original alias is borrowed, outside State. On
+            // refusal this cannot be the last payload pin.
+            let payload = payload.try_clone().map_err(internal_pin_error)?;
+            {
+                let state = parent.inner.state.lock().unwrap();
+                let original = state.nodes.get(&parent.id).ok_or(WorkError::Released)?;
+                original.check(&state.cancellations)?;
+                let current = state.nodes.get(&child.id).ok_or(WorkError::Released)?;
+                current.check(&state.cancellations)?;
+                if current.parent != Some(parent.id) || current.class != original.class {
+                    return Err(WorkError::Conflict);
+                }
+            }
+            return Ok(Self {
+                backing: AliasBacking::InternalRoot {
+                    budget: Arc::clone(budget),
+                    payload,
+                    root: root.clone(),
+                    execution: child.clone(),
+                    // A different execution cannot inherit the old stage's
+                    // positive-computation authority through retention alone.
+                    binding: None,
+                    streamed_computation: *streamed_computation,
+                },
+            });
+        }
+        let AliasBacking::Window {
+            holder,
+            client_computation,
+            ..
+        } = &self.backing
+        else {
+            unreachable!()
+        };
         child.inner.update(|state| {
             state
                 .nodes
                 .get(&parent.id)
                 .ok_or(WorkError::Released)?
-                .check()?;
+                .check(&state.cancellations)?;
             let node = state.nodes.get_mut(&child.id).ok_or(WorkError::Released)?;
-            node.check()?;
+            node.check(&state.cancellations)?;
             if node.parent != Some(parent.id) {
                 return Err(WorkError::Conflict);
             }
@@ -414,23 +1103,50 @@ impl ResultWindowAlias {
                 .checked_add(1)
                 .ok_or(WorkError::ArithmeticOverflow)?;
             Ok(Self {
-                holder: Arc::clone(&self.holder),
-                execution_scope: Some(Arc::new(WindowExecutionScope {
-                    scope: child.clone(),
-                })),
+                backing: AliasBacking::Window {
+                    holder: Arc::clone(holder),
+                    execution_scope: Some(Arc::new(WindowExecutionScope {
+                        scope: child.clone(),
+                    })),
+                    manifest: None,
+                    client_computation: *client_computation,
+                },
             })
         })
     }
-
     pub fn class(&self) -> ResultWindowClass {
-        self.holder.class
+        match &self.backing {
+            AliasBacking::Window { holder, .. } => holder.class,
+            AliasBacking::InternalRoot { .. } | AliasBacking::RootRetention { .. } => {
+                ResultWindowClass::Internal
+            }
+        }
     }
     pub fn check_backing_total(&self, simultaneously_live_bytes: u64) -> Result<(), WorkError> {
-        if simultaneously_live_bytes > self.holder.all_objects_bytes {
-            Err(WorkError::Capacity("result backing envelope"))
-        } else {
-            Ok(())
+        match &self.backing {
+            AliasBacking::Window { holder, .. }
+                if simultaneously_live_bytes > holder.all_objects_bytes =>
+            {
+                Err(WorkError::Capacity("result backing envelope"))
+            }
+            AliasBacking::Window { .. } => Ok(()),
+            AliasBacking::InternalRoot { budget, .. }
+            | AliasBacking::RootRetention { budget, .. } => {
+                if simultaneously_live_bytes > budget.limit() {
+                    Err(WorkError::Capacity("result backing envelope"))
+                } else {
+                    Ok(())
+                }
+            }
         }
+    }
+}
+// Existing callers still have an infallible Clone contract. Typed Internal
+// producers use try_clone; overflow preserves the original pin then fails fast.
+impl Clone for ResultWindowAlias {
+    fn clone(&self) -> Self {
+        self.try_clone()
+            .expect("original result backing pin clone failed")
     }
 }
 
@@ -672,6 +1388,69 @@ mod tests {
         let alias = window.retain_alias();
         assert!(alias.is_for_scope(&a.owner.scope()));
         assert!(!alias.is_for_scope(&b.owner.scope()));
+        assert!(alias.is_for_root_scope(&a.owner.scope()));
+        assert!(!alias.is_for_root_scope(&b.owner.scope()));
+    }
+
+    #[test]
+    fn root_drain_keeps_existing_windows_until_cancellation_or_execution_close() {
+        for hard_close in [false, true] {
+            let (control, capacity) = control();
+            let root = control
+                .try_begin_root(WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            let scope = root.owner.scope();
+            control.close_root_admission();
+            control.close_root_admission();
+            assert!(control.snapshot().admission_closed);
+            assert_eq!(control.snapshot().serving, crate::ServingState::Closed);
+            assert_eq!(control.mark_ready(), Err(WorkError::Closed));
+            assert!(matches!(
+                control.try_begin_root(WorkRequest::new(WorkClass::Management)),
+                Err(WorkError::Closed)
+            ));
+            assert!(matches!(
+                control.begin_warehouse_root(WorkRequest::new(WorkClass::Query)),
+                Err(WorkError::Closed)
+            ));
+            let original = capacity
+                .try_acquire(&scope, ResultWindowClass::Internal)
+                .unwrap();
+            let alias = original.retain_alias();
+            drop(original);
+            assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+            if hard_close {
+                control.close_admission();
+                assert!(matches!(
+                    capacity.try_acquire(&scope, ResultWindowClass::Local),
+                    Err(WorkError::Closed)
+                ));
+            } else {
+                root.owner
+                    .cancel(crate::CancellationReason::FrontendDrainDeadlineExceeded);
+                assert!(matches!(
+                    capacity.try_acquire(&scope, ResultWindowClass::Local),
+                    Err(WorkError::Cancelled(
+                        crate::CancellationReason::FrontendDrainDeadlineExceeded
+                    ))
+                ));
+            }
+            assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+            root.owner.complete_after_terminal_cancel_settled();
+            root.business.release();
+            assert_eq!(control.snapshot().root_responsibilities, 1);
+            drop(alias);
+            assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+            assert_eq!(control.snapshot().root_responsibilities, 0);
+            assert_eq!(
+                control
+                    .snapshot()
+                    .root_lifecycle
+                    .completed_after_admission_closed
+                    .query,
+                1
+            );
+        }
     }
 
     #[test]
@@ -1034,6 +1813,54 @@ mod tests {
     }
 
     #[test]
+    fn large_position_configuration_only_charges_actual_holder_and_bytes() {
+        let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
+        // Independent finite configuration, not a request to allocate this
+        // many holders or prepay their hypothetical combined payload.
+        let positions = 1_000_001;
+        let budget = 1u64 << 50;
+        let capacity = control
+            .configure_result_capacity(ResultCapacityConfig {
+                positions: [320, 16, positions, 64],
+                all_objects_bytes: [8 << 20, 96 << 20, budget, 8 << 20],
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        control.mark_ready().unwrap();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let alias = window.retain_alias();
+        let receipt = alias.reserve_payload_bytes(64).unwrap();
+        let backing = vec![0u8; 64];
+        assert_eq!(receipt.bytes(), backing.capacity() as u64);
+        assert_eq!(window.all_objects_bytes(), budget);
+        assert_eq!(alias.retained_payload_bytes(), 64);
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        assert!(matches!(
+            alias.reserve_payload_bytes(budget),
+            Err(WorkError::Capacity("retained result bytes"))
+        ));
+        assert_eq!(alias.retained_payload_bytes(), 64);
+        drop(window);
+        drop(backing);
+        drop(receipt);
+        assert_eq!(alias.retained_payload_bytes(), 0);
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(alias);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[test]
     fn capacity_is_explicit_startup_only_and_foreign_scopes_reject() {
         let (owner, capacity) = control();
         assert!(
@@ -1059,7 +1886,7 @@ mod tests {
         assert_eq!(other_capacity.snapshot().held_positions, [0; 4]);
         assert!(
             ResultCapacityConfig {
-                all_objects_bytes: [u64::MAX; 4],
+                all_objects_bytes: [0; 4],
                 ..ResultCapacityConfig::V1
             }
             .validate()
@@ -1067,3 +1894,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod internal_root_tests;

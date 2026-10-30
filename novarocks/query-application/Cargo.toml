@@ -11,6 +11,8 @@ workspace = true
 mem-1-m07-exact-mysql-write = []
 
 [dependencies]
+novarocks-failure-contract.workspace = true
+novarocks-coordination-contract.workspace = true
 novarocks-function-contract.workspace = true
 novarocks-failpoint = { workspace = true, features = ["typed"] }
 novarocks-type-contract.workspace = true
@@ -26,16 +28,20 @@ novarocks-sql.workspace = true
 novarocks-types.workspace = true
 novarocks-user-error.workspace = true
 novarocks-workload-control.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
 serde.workspace = true
 bytes.workspace = true
+futures.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+novarocks-resource-contract.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-sql = { workspace = true }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 
 [package.metadata.novarocks.test]
 runtime-inputs = []

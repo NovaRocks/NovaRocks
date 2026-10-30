@@ -18,7 +18,9 @@
 //! Validation of the provider-neutral commit-fragment carrier.
 
 use novarocks_proto_models::connector_write as dto;
-use novarocks_spi::connector::{ConnectorCodecCategory, ConnectorEncodedPayload};
+use novarocks_spi::connector::{
+    ConnectorCodecCategory, ConnectorEncodedPayload, ConnectorPayloadRetentionGuard,
+};
 use prost::Message;
 
 use super::MAX_COMMIT_FRAGMENT_ENCODED_BYTES;
@@ -31,6 +33,7 @@ use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedCommitFragment {
     provider_payload: ConnectorEncodedPayload,
+    encoded_len: usize,
 }
 
 impl ValidatedCommitFragment {
@@ -48,18 +51,21 @@ impl ValidatedCommitFragment {
                 ),
             ));
         }
-        let provider_payload = crate::connector_common::decode_embedded_connector_payload(
-            raw.provider_payload.as_ref(),
+        let provider_payload = crate::connector_common::decode_embedded_owned_connector_payload(
+            raw.provider_payload,
             ConnectorCodecCategory::CommitFragment,
             MAX_COMMIT_FRAGMENT_ENCODED_BYTES,
             path.field("provider_payload"),
         )?;
-        Ok(Self { provider_payload })
+        Ok(Self {
+            provider_payload,
+            encoded_len,
+        })
     }
 
     /// Canonical public encoded size used by root-fragment aggregation.
     pub fn encoded_len(&self) -> usize {
-        self.as_proto().encoded_len()
+        self.encoded_len
     }
 
     pub const fn provider_payload(&self) -> &ConnectorEncodedPayload {
@@ -68,6 +74,21 @@ impl ValidatedCommitFragment {
 
     pub fn into_provider_payload(self) -> ConnectorEncodedPayload {
         self.provider_payload
+    }
+
+    /// Keep the exact outer decode buffer receipt with its actual bytes.
+    /// A Provider that borrows/clones these Bytes carries the same receipt
+    /// through its last payload alias; no other collector buffers are pinned.
+    pub fn retain_provider_payload(mut self, receipt: ConnectorPayloadRetentionGuard) -> Self {
+        let (header, payload) = self.provider_payload.into_parts();
+        self.provider_payload = ConnectorEncodedPayload::new(
+            header,
+            bytes::Bytes::from_owner(RetainedProviderPayload {
+                payload,
+                _receipt: receipt,
+            }),
+        );
+        self
     }
 
     /// Rebuild the canonical public protobuf without retaining a second copy.
@@ -85,6 +106,17 @@ impl ValidatedCommitFragment {
                 &self.provider_payload,
             )),
         }
+    }
+}
+
+// Actual payload destruction precedes refunding its original byte receipt.
+struct RetainedProviderPayload {
+    payload: bytes::Bytes,
+    _receipt: ConnectorPayloadRetentionGuard,
+}
+impl AsRef<[u8]> for RetainedProviderPayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.payload
     }
 }
 
@@ -114,6 +146,48 @@ mod tests {
                 &payload,
             )),
         }
+    }
+
+    #[test]
+    fn owned_parse_moves_payload_backing_and_cached_size_without_a_second_copy() {
+        let mut raw = raw(ConnectorCodecCategory::CommitFragment);
+        raw.provider_payload.as_mut().unwrap().payload = vec![7; 8192];
+        let pointer = raw.provider_payload.as_ref().unwrap().payload.as_ptr();
+        let encoded_len = raw.encoded_len();
+        let validated = ValidatedCommitFragment::parse(raw, FieldPath::root("fragment")).unwrap();
+        assert_eq!(validated.provider_payload().payload().as_ptr(), pointer);
+        assert_eq!(validated.encoded_len(), encoded_len);
+        assert_eq!(validated.encoded_len(), validated.as_proto().encoded_len());
+    }
+
+    #[test]
+    fn exact_payload_receipt_follows_last_provider_bytes_alias() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct OriginalReceipt(Arc<AtomicUsize>);
+        impl Drop for OriginalReceipt {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let raw = raw(ConnectorCodecCategory::CommitFragment);
+        let pointer = raw.provider_payload.as_ref().unwrap().payload.as_ptr();
+        let exits = Arc::new(AtomicUsize::new(0));
+        let validated = ValidatedCommitFragment::parse(raw, FieldPath::root("fragment"))
+            .unwrap()
+            .retain_provider_payload(ConnectorPayloadRetentionGuard::new(OriginalReceipt(
+                exits.clone(),
+            )));
+        assert_eq!(validated.provider_payload().payload().as_ptr(), pointer);
+        let provider_alias = validated.provider_payload().payload().clone();
+        let last_slice = provider_alias.slice(1..);
+        drop((validated, provider_alias));
+        assert_eq!(exits.load(Ordering::Acquire), 0);
+        assert_eq!(last_slice.as_ref(), b"rtifact");
+        drop(last_slice);
+        assert_eq!(exits.load(Ordering::Acquire), 1);
     }
 
     #[test]

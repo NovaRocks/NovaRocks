@@ -29,8 +29,24 @@ pub(super) fn for_module(
     compatibility: bool,
 ) -> ScenarioDeclaration {
     let domains: &[&str] = match module {
+        "trino_protocol" => &[
+            "novarocks/trino-adapter/**",
+            "novarocks/result-render/**",
+            "novarocks/result-contract/**",
+            "novarocks/sql/src/compiler/root_render_type.rs",
+            "novarocks/query-application/src/session*.rs",
+            "novarocks/query-application/src/session_control/**",
+            "novarocks/query-application/src/sql/session/**",
+            "novarocks/query-application/src/query_control.rs",
+            "novarocks/query-application/src/protocol_delivery.rs",
+            "novarocks/query-application/src/client_query_id.rs",
+            "novarocks/frontend-application/**",
+            "novarocks-server/**",
+            "tests/system-test-runner/src/actors/trino_protocol.rs",
+        ],
         "backend_membership" => &[
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/worker/**",
             "novarocks/native-adapter/**",
             "novarocks/execution-contract/**",
@@ -41,6 +57,7 @@ pub(super) fn for_module(
             "novarocks/native-adapter/**",
             "novarocks/worker/**",
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/execution-contract/**",
             "novarocks-server/**",
         ],
@@ -51,6 +68,7 @@ pub(super) fn for_module(
         | "listing_real_rest" => &[
             "novarocks/catalog-application/**",
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/query-application/**",
             "novarocks/sql/**",
             "novarocks/connector/**",
@@ -66,6 +84,7 @@ pub(super) fn for_module(
             "novarocks/connector/**",
             "novarocks/fs/**",
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/worker/**",
             "novarocks/execution/**",
             "novarocks/sql/**",
@@ -76,6 +95,7 @@ pub(super) fn for_module(
             "novarocks/connector/iceberg/**",
             "novarocks/fs/**",
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/query-application/**",
             "novarocks/sql/**",
             "novarocks/execution/**",
@@ -86,11 +106,13 @@ pub(super) fn for_module(
             "novarocks/memory/**",
             "novarocks/execution/**",
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/worker/**",
             "novarocks-server/**",
         ],
         module if module.starts_with("mv_") => &[
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/query-application/**",
             "novarocks/catalog-application/**",
             "novarocks/connector/iceberg/**",
@@ -100,6 +122,7 @@ pub(super) fn for_module(
         ],
         _ => &[
             "novarocks/frontend-application/**",
+            "novarocks/coordination-contract/**",
             "novarocks/query-application/**",
             "novarocks/mysql-adapter/**",
             "novarocks/worker/**",
@@ -151,6 +174,40 @@ pub(super) fn for_module(
                 "novarocks/task-codec/**",
                 "novarocks/local-compiler/**",
                 "novarocks/result-render/**",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    }
+    if module == "mv_recovery" && name == "mv/current-dependency-recheck" {
+        paths.extend(
+            [
+                "novarocks/spi/src/connector/**",
+                "novarocks/connector-contract/**",
+                "novarocks/connector/iceberg/**",
+                "novarocks/failure-contract/**",
+                "tests/system-test-runner/src/scenarios/mv_control_plan.rs",
+                "tests/system-test-runner/src/scenarios/mv_uea7.rs",
+                "tests/system-test-runner/src/scenarios/mv_uea7_documents.rs",
+                "tests/system-test-runner/src/scenarios/mv_uea7_documents/wire.rs",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    }
+    if module == "distributed_writer" {
+        paths.extend(
+            [
+                "tests/system-test-runner/src/scenarios/distributed_writer_row_level.rs",
+                "tests/system-test-runner/src/scenarios/distributed_writer_dop_observation.rs",
+                "tests/system-test-runner/src/scenarios/distributed_writer_same_file.rs",
+                "novarocks/execution-contract/**",
+                "novarocks/result-contract/**",
+                "novarocks/physical-plan/**",
+                "novarocks/plan-codec/**",
+                "novarocks/task-codec/**",
+                "novarocks/local-program/**",
+                "novarocks/local-compiler/**",
             ]
             .into_iter()
             .map(str::to_owned),

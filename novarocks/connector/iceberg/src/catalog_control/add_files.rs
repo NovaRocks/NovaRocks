@@ -387,7 +387,7 @@ fn canonical_directory_identity(
             Ok(CanonicalDirectoryIdentity {
                 authority: format!(
                     "object-store\\0{}\\0{}",
-                    normalized_object_store_endpoint(&object_store.config().endpoint)?,
+                    normalized_object_store_endpoint(&object_store.endpoint_config().endpoint)?,
                     bucket.trim().to_ascii_lowercase(),
                 ),
                 path: canonical_nonlocal_directory_path(relative_path)?,

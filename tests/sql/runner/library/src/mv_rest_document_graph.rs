@@ -8,8 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use opendal::Operator;
+use novarocks_fs::FileCancellation;
 use serde_json::Value;
+
+use crate::fixture_object_store::FixtureObjectStore;
 mod wire;
 
 #[cfg(test)]
@@ -617,21 +619,18 @@ fn verify_no_document_files(metadata: &Value) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let storage = FixtureObjectStore::new(endpoint, access, secret)?;
     for (bucket, prefix) in document_prefixes(metadata, &warehouse)? {
-        let operator = Operator::new(
-            opendal::services::S3::default()
-                .endpoint(&endpoint)
-                .bucket(bucket)
-                .region("us-east-1")
-                .access_key_id(&access)
-                .secret_access_key(&secret),
-        )?
-        .finish();
-        let entries = runtime
-            .block_on(async { operator.list_with(&prefix).recursive(true).await })
+        let location = format!("s3://{bucket}/{prefix}");
+        let has_files = runtime
+            .block_on(async {
+                let cancellation = FileCancellation::new();
+                let access = storage.resolve(&location, &cancellation).await?;
+                storage.has_files(&access, &location, &cancellation).await
+            })
             .with_context(|| format!("LIST document prefix s3://{bucket}/{prefix}"))?;
         ensure!(
-            entries.iter().all(|entry| !entry.metadata().is_file()),
+            !has_files,
             "unexpected document object below s3://{bucket}/{prefix}"
         );
     }

@@ -29,12 +29,13 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use crate::task_execution::operation::OperationDispatchResult;
 use novarocks_execution::task_execution::{OperationKind, TaskOperationId};
 use novarocks_query_application::coordination::{
     AdmissionIssueReceipt, AdmissionIssueSettlement, EstablishIssueError, EstablishIssueSubmit,
     EstablishTransportAdmission, EstablishTransportReservation, EstablishTransportSink,
     EstablishTransportSubmission, LateEstablishWorkerSettlement, LogicalExecutionActorError,
-    NativeAttemptDrive, OperationDispatchResult,
+    NativeAttemptDrive,
 };
 use novarocks_types::NativeCompatibilityId;
 
@@ -153,7 +154,9 @@ impl ActorGateShared {
         let mut queue = self.queue.lock().expect("Task actor gate queue");
         for intent in intents {
             let operation_id = intent.operation_id();
-            queue.requested.remove(&operation_id);
+            if !queue.requested.remove(&operation_id) {
+                continue;
+            }
             match result {
                 Ok(()) => {
                     queue.authorized.insert(operation_id);
@@ -163,6 +166,19 @@ impl ActorGateShared {
                 }
             }
         }
+        drop(queue);
+        self.wake.wake();
+    }
+
+    fn retire_authorization(&self, operation_id: TaskOperationId) {
+        let mut queue = self.queue.lock().expect("Task actor gate queue");
+        queue.requested.remove(&operation_id);
+        queue.authorized.remove(&operation_id);
+        queue.rejected.remove(&operation_id);
+        queue.authorization_requests.retain_mut(|intents| {
+            intents.retain(|intent| intent.operation_id() != operation_id);
+            !intents.is_empty()
+        });
         drop(queue);
         self.wake.wake();
     }
@@ -242,8 +258,12 @@ impl ActorGatedTaskOperationSink {
 }
 
 impl TaskOperationSink for ActorGatedTaskOperationSink {
-    fn try_reserve_queue(&self, request: TaskOperationQueueRequest) -> TaskOperationQueueAdmission {
-        self.inner.try_reserve_queue(request)
+    fn try_reserve_queue(
+        &self,
+        request: TaskOperationQueueRequest,
+        preparation: &mut super::intent::TaskOperationQueuePreparation,
+    ) -> TaskOperationQueueAdmission {
+        self.inner.try_reserve_queue(request, preparation)
     }
 
     fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
@@ -339,6 +359,15 @@ impl ActorGateOwner {
         let mut moved = self.settle_acknowledgements(drive).await?;
         if self.active_authorization.is_none() {
             self.active_authorization = self.shared.take_authorization_request();
+        }
+        if let Some(intents) = self.active_authorization.as_mut() {
+            let queue = self.shared.queue.lock().expect("Task actor gate queue");
+            // A cancelled borrowed authorization can outlive its queued
+            // carrier. Only that carrier's still-requested intents may resume.
+            intents.retain(|intent| queue.requested.contains(&intent.operation_id()));
+            if intents.is_empty() {
+                self.active_authorization = None;
+            }
         }
         let Some(intents) = self.active_authorization.as_ref().cloned() else {
             return Ok(moved);
@@ -514,6 +543,17 @@ impl ActorGateOwner {
             let Some(acknowledgement) = self.active_acknowledgement.clone() else {
                 break;
             };
+            let operation_id = acknowledgement.operation_id();
+            let owns_acknowledgement = match acknowledgement.kind() {
+                OperationKind::AcquireQueryContextAdmissionTicket => {
+                    self.admission_issues.contains_key(&operation_id)
+                }
+                OperationKind::UpdateQueryContext => {
+                    self.establish_submissions.contains_key(&operation_id)
+                        || self.late_establish_settlements.contains_key(&operation_id)
+                }
+                _ => false,
+            };
             let settled = match acknowledgement.kind() {
                 OperationKind::AcquireQueryContextAdmissionTicket => {
                     self.settle_admission_acknowledgement(drive, &acknowledgement)
@@ -524,6 +564,21 @@ impl ActorGateOwner {
                 }
                 _ => Ok(0),
             };
+            if owns_acknowledgement
+                && acknowledgement.dispatch_result() != OperationDispatchResult::TransportUnknown
+            {
+                // A definitive result also retires an unsent replay's local
+                // authorization. TaskRound already cancelled that carrier;
+                // there will be no later transport handoff to clear this slot.
+                // The actual verdict and remote responsibility stay in QA.
+                self.shared.retire_authorization(operation_id);
+                if let Some(intents) = self.active_authorization.as_mut() {
+                    intents.retain(|intent| intent.operation_id() != operation_id);
+                    if intents.is_empty() {
+                        self.active_authorization = None;
+                    }
+                }
+            }
             match settled {
                 Ok(settled) => {
                     self.active_acknowledgement = None;
@@ -667,6 +722,18 @@ impl ActorGateOwner {
     }
 
     #[cfg(test)]
+    pub(crate) fn active_authorization_for_test(&self) -> Option<&[OperationIntent]> {
+        self.active_authorization.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_late_establish_for_test(&self, operation: TaskOperationId) -> bool {
+        self.late_establish_settlements
+            .get(&operation)
+            .is_some_and(|held| !held.is_empty())
+    }
+
+    #[cfg(test)]
     fn pending_authorizations(&self) -> usize {
         let queue = self.shared.queue.lock().expect("Task actor gate queue");
         queue.authorization_requests.len() + usize::from(self.active_authorization.is_some())
@@ -732,6 +799,8 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
+    use crate::task_protocol_config::DispatchLane;
+    use novarocks_coordination_contract::{ExecutionEffect, MonotonicInstant};
     use novarocks_execution::task_execution::{
         AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
         CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch,
@@ -740,8 +809,7 @@ mod tests {
         QueryContextRef, QueryContextState, TaskOperationId,
     };
     use novarocks_query_application::coordination::{
-        AbortQueryContextEffectPort, DispatchLane, ExecutionEffect, LogicalExecutionActorConfig,
-        MonotonicInstant,
+        AbortQueryContextEffectPort, LogicalExecutionActorConfig,
     };
     use novarocks_query_application::test_support::LogicalExecutionTestHarness;
     use novarocks_types::identity::{
@@ -765,6 +833,7 @@ mod tests {
         fn try_reserve_queue(
             &self,
             _request: TaskOperationQueueRequest,
+            _preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
         ) -> TaskOperationQueueAdmission {
             TaskOperationQueueAdmission::Admitted(test_queue_permit())
         }
@@ -782,6 +851,7 @@ mod tests {
         fn try_reserve_queue(
             &self,
             _request: TaskOperationQueueRequest,
+            _preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
         ) -> TaskOperationQueueAdmission {
             TaskOperationQueueAdmission::Admitted(test_queue_permit())
         }
@@ -1139,7 +1209,7 @@ mod tests {
             harness.request.envelope().operation_id(),
             OperationKind::UpdateQueryContext,
             OperationDispatchResult::IngressRejected(
-                novarocks_query_application::coordination::IngressRejection::WaitingCapacity,
+                crate::task_execution::operation::IngressRejection::WaitingCapacity,
             ),
             AckPayload::None,
         );
@@ -1163,7 +1233,38 @@ mod tests {
 
     #[tokio::test]
     async fn ingress_refusal_after_unknown_admission_keeps_context_abort_owner() {
+        use crate::task_execution::abort_effect::{
+            NativeAbortEffect, NativeAbortEffectIntake, NativeAbortEffectSettlement,
+        };
+        use novarocks_query_application::coordination::{
+            ContextClosureState, LogicalExecutionJoinReadiness,
+        };
+
+        async fn next_abort(intake: &mut NativeAbortEffectIntake) -> NativeAbortEffect {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match intake.try_recv() {
+                        Ok(effect) => return effect,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            panic!("the original actor Abort intake must remain connected");
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the original actor must progress its Abort")
+        }
+
         let context = context(BackendProcessId::new_v7());
+        let (mut logical, drive, mut abort_intake) = logical_execution(context).await;
+        let (sink, mut gate, observer) = ActorGatedTaskOperationSink::pair(
+            Arc::new(CountingSink::default()),
+            Arc::new(CountingWake::default()),
+            NativeCompatibilityId::new([31; 32]),
+        );
         let mut owner = QueryContextOwner::new(
             context,
             0,
@@ -1177,29 +1278,69 @@ mod tests {
         else {
             panic!("the context must begin admission");
         };
-        owner
-            .on_admission_ack(
-                &OperationAcknowledgement::transport_unknown(
-                    request.envelope().operation_id(),
-                    OperationKind::AcquireQueryContextAdmissionTicket,
-                ),
-                MonotonicInstant::ORIGIN,
-            )
-            .unwrap();
-        assert!(
-            owner
-                .admission_intent(MonotonicInstant::ORIGIN)
-                .unwrap()
-                .is_some()
+        let retained = match sink.try_submit(batch(
+            context.backend_process_id(),
+            OperationIntent::AcquireQueryContextAdmissionTicket(request),
+        )) {
+            TaskOperationSubmit::Backpressured(retained) => retained,
+            other => panic!("the original actor must authorize admission first: {other:?}"),
+        };
+        assert_eq!(gate.drive(&drive).await.unwrap(), 1);
+        assert!(matches!(
+            sink.try_submit(retained),
+            TaskOperationSubmit::Accepted
+        ));
+        let unknown = OperationAcknowledgement::transport_unknown(
+            request.envelope().operation_id(),
+            OperationKind::AcquireQueryContextAdmissionTicket,
         );
+        observer.observe_acknowledgement(&unknown).unwrap();
+        owner
+            .on_admission_ack(&unknown, MonotonicInstant::ORIGIN)
+            .unwrap();
+        assert_eq!(gate.drive(&drive).await.unwrap(), 0);
+        assert!(
+            gate.admission_transport_unknowns
+                .contains(&request.envelope().operation_id())
+        );
+        let replay = owner
+            .admission_intent(MonotonicInstant::ORIGIN)
+            .unwrap()
+            .unwrap();
+        let OperationIntent::AcquireQueryContextAdmissionTicket(replayed_request) = replay else {
+            panic!("unknown admission must retain its original request");
+        };
+        assert_eq!(replayed_request.envelope(), request.envelope());
+        assert_eq!(replayed_request.context(), request.context());
+        assert_eq!(replayed_request.valid_for(), request.valid_for());
+        assert_eq!(
+            replayed_request.native_compatibility_id(),
+            request.native_compatibility_id()
+        );
+        assert!(
+            replayed_request.admission_epoch_capability() == request.admission_epoch_capability()
+        );
+        let retained = match sink.try_submit(batch(
+            context.backend_process_id(),
+            OperationIntent::AcquireQueryContextAdmissionTicket(replayed_request),
+        )) {
+            TaskOperationSubmit::Backpressured(retained) => retained,
+            other => panic!("the exact admission replay needs actor authorization: {other:?}"),
+        };
+        assert_eq!(gate.drive(&drive).await.unwrap(), 1);
+        assert!(matches!(
+            sink.try_submit(retained),
+            TaskOperationSubmit::Accepted
+        ));
         let refusal = OperationAcknowledgement::from_dispatch_result(
             request.envelope().operation_id(),
             OperationKind::AcquireQueryContextAdmissionTicket,
             OperationDispatchResult::IngressRejected(
-                novarocks_query_application::coordination::IngressRejection::WaitingCapacity,
+                crate::task_execution::operation::IngressRejection::WaitingCapacity,
             ),
             AckPayload::None,
         );
+        observer.observe_acknowledgement(&refusal).unwrap();
         assert!(matches!(
             owner.on_admission_ack(&refusal, MonotonicInstant::ORIGIN),
             Err(TaskExecutionError::DispatchRejected {
@@ -1208,11 +1349,118 @@ mod tests {
             })
         ));
         assert!(!owner.is_released());
+        assert!(matches!(
+            gate.drive(&drive).await,
+            Err(TaskExecutionError::Actor(
+                LogicalExecutionActorError::Establish(EstablishIssueError::AdmissionRejected)
+            ))
+        ));
+        assert_eq!(
+            logical.actor_snapshot().await.unwrap().establish_error,
+            Some(EstablishIssueError::AdmissionRejected)
+        );
+        assert!(gate.prepare_convergence());
+        owner.begin_terminal_cleanup();
+        assert!(!owner.is_released());
         assert!(
             owner
-                .abort_intent(novarocks_execution::task_execution::AbortCause::QueryFailed)
-                .is_some()
+                .admission_intent(MonotonicInstant::ORIGIN)
+                .unwrap()
+                .is_none()
         );
+        drop(drive);
+        logical.abandon_running_attempt();
+
+        let first = next_abort(&mut abort_intake).await;
+        let OperationIntent::AbortQueryContext(first_request) = first.intent() else {
+            panic!("the original logical actor must own context Abort");
+        };
+        let first_request = *first_request;
+        assert_eq!(first_request.context(), context);
+        assert_eq!(
+            first_request.cause(),
+            novarocks_execution::task_execution::AbortCause::QueryFailed
+        );
+        let operation_id = first_request.envelope().operation_id();
+        let late = match first
+            .settle(&OperationAcknowledgement::transport_unknown(
+                operation_id,
+                OperationKind::AbortQueryContext,
+            ))
+            .unwrap()
+        {
+            NativeAbortEffectSettlement::TransportUnknown(late) => late,
+            NativeAbortEffectSettlement::WorkerSettled => {
+                panic!("unknown Abort cannot close the context")
+            }
+        };
+        assert!(!owner.is_released());
+        let snapshot = logical.stand_down_snapshot(context).await.unwrap().unwrap();
+        assert!(!matches!(
+            snapshot.closure(),
+            ContextClosureState::TerminalRetained | ContextClosureState::Gone
+        ));
+        assert!(!snapshot.closure().residual_resource_settled());
+        assert_eq!(late.identity().context(), context);
+        assert_eq!(late.identity().operation_id(), operation_id);
+
+        let second = next_abort(&mut abort_intake).await;
+        let OperationIntent::AbortQueryContext(second_request) = second.intent() else {
+            panic!("the exact actor replay must remain context Abort");
+        };
+        assert_eq!(second_request.envelope(), first_request.envelope());
+        assert_eq!(second_request.context(), first_request.context());
+        assert_eq!(second_request.cause(), first_request.cause());
+        let terminal = OperationAcknowledgement::worker_receipt(
+            operation_id,
+            OperationKind::AbortQueryContext,
+            OperationOutcome::ContextTerminalReceipt,
+            AckPayload::Context(QueryContextReceipt::new(
+                context,
+                QueryContextState::TerminalRetained,
+            )),
+        );
+        assert!(matches!(
+            second.settle(&terminal).unwrap(),
+            NativeAbortEffectSettlement::WorkerSettled
+        ));
+        late.resolved_by_other_generation();
+        // This is the same post-validation projection used by TaskRound. This
+        // test drives the authors directly, not the TaskRound dispatcher.
+        owner.observe_actor_abort_closure();
+        assert!(owner.is_released());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if logical
+                    .stand_down_snapshot(context)
+                    .await
+                    .unwrap()
+                    .is_some_and(|snapshot| {
+                        snapshot.closure() == ContextClosureState::TerminalRetained
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the exact Worker receipt must reach the original actor");
+        assert!(
+            !matches!(
+                logical.join_readiness().await.unwrap(),
+                LogicalExecutionJoinReadiness::Ready
+            ),
+            "a terminal context is not actual Worker stop"
+        );
+        logical
+            .observe_worker_stopped_and_context_fenced(context)
+            .await
+            .unwrap();
+        logical
+            .finish_until(std::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

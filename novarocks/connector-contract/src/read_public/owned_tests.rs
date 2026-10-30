@@ -130,8 +130,14 @@ fn borrowed_read_schema_detaches_root_nested_dictionary_and_metadata_backing() {
         assert_eq!(fields[0].dict_is_ordered(), Some(true));
     }
     assert_eq!(actual.schema().metadata()["schema"], "x".repeat(16 * 1024));
-    assert!(actual.schema().metadata().capacity() < schema.metadata().capacity());
-    assert!(fields[0].metadata().capacity() < child.metadata().capacity());
+    assert!(!Arc::ptr_eq(
+        actual.schema().metadata().as_arc().unwrap(),
+        schema.metadata().as_arc().unwrap()
+    ));
+    assert!(!Arc::ptr_eq(
+        fields[0].metadata().as_arc().unwrap(),
+        child.metadata().as_arc().unwrap()
+    ));
     assert_eq!(invoice.coexistence_bytes, SOURCE + invoice.requested_bytes);
 }
 #[test]

@@ -69,6 +69,8 @@ use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpe
 #[path = "writer_statement_actor.rs"]
 mod writer_statement_actor;
 use writer_statement_actor::{WriterActor, retain_write_result};
+#[path = "distributed_writer_row_level.rs"]
+mod row_level_contract;
 
 use super::connector::{
     await_resource_convergence, connector_launch_config, create_catalog, create_warehouse,
@@ -101,7 +103,11 @@ const SEED_ROWS: i64 = SEED_ROWS_PER_FILE * SEED_FILES;
 const SEED_SUM: i64 = SEED_ROWS * (SEED_ROWS + 1) / 2;
 const WIDE_STATISTICS_CHANNELS: usize = 1_024;
 const WIDE_SEED_FILES: i64 = 12;
-const WIDE_ROWS_PER_FILE: i64 = 4;
+// Compact Theta v3 stores 16 + 8*n bytes for exact n > 1. Sixteen
+// distinct inputs produce 144 bytes, crossing the IPC 64-byte payload bucket.
+// This keeps the 1024-channel case a real sparse-packing fixture when an
+// all-valid IPC bitmap is omitted, without changing the packet limit.
+const WIDE_ROWS_PER_FILE: i64 = 16;
 const WIDE_ROWS: i64 = WIDE_ROWS_PER_FILE * WIDE_SEED_FILES;
 const STATISTICS_PACKET_BYTES: usize = 320 * 1024;
 
@@ -119,9 +125,10 @@ const ABORT_DELAY_S: i64 = 5;
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(DistributedWriterDataflow),
+        Box::new(DistributedWriterConcurrentProgress::default()),
         Box::new(DistributedStatisticsDataflow),
         Box::new(DistributedWriterOverwrite),
-        Box::new(DistributedWriterRowLevel),
+        Box::new(DistributedWriterRowLevel::default()),
         Box::new(DistributedWriterFaults::default()),
     ]
 }
@@ -626,6 +633,468 @@ fn seed_delay_source_files(
             .with_context(|| format!("seed {catalog}.{database}.{source} row {row}"))?;
     }
     Ok(())
+}
+
+// Three normal DMLs share one real Blocking worker. Internal positions and
+// retained payload use the existing Result budget; transport values below are
+// the original Native defaults, not another admission model or a heap quote.
+const CONCURRENT_CAPACITY_OVERLAY: &str = r#"
+query_blocking_worker_threads = 1
+query_blocking_queue_capacity = 64
+task_dispatch_create_permits = 16
+task_dispatch_update_permits = 12
+task_dispatch_lifecycle_permits = 4
+task_dispatch_control_permits = 4
+task_operation_max_batch_items = 32
+task_operation_max_batch_encoded_bytes = 50331648
+task_descriptor_max_encoded_bytes = 16777216
+task_query_backend_max_queued_operations = 4096
+task_query_backend_max_queued_bytes = 268435456
+task_backend_max_queued_operations = 16384
+task_backend_max_queued_bytes = 536870912
+[runtime.frontend_workload]
+concurrency_limit = 3
+internal_result_positions = 3
+internal_result_all_objects_bytes = 1073741824
+scope_records_limit = 8192
+"#;
+// Keep the original BE root/process byte budgets explicit in the actual launch
+// config. They retain Arrow input plus encoded output until their real exit.
+const CONCURRENT_BACKEND_RESULT_OVERLAY: &str = r#"
+result_retained_bytes_per_root = 16777216
+result_retained_bytes_per_process = 4294967296
+"#;
+const CONCURRENT_CAPACITY_EXPECTED: &[(&[&str], i64)] = &[
+    (&["runtime", "query_blocking_worker_threads"], 1),
+    (&["runtime", "query_blocking_queue_capacity"], 64),
+    (&["runtime", "task_dispatch_create_permits"], 16),
+    (&["runtime", "task_dispatch_update_permits"], 12),
+    (&["runtime", "task_dispatch_lifecycle_permits"], 4),
+    (&["runtime", "task_dispatch_control_permits"], 4),
+    (&["runtime", "task_operation_max_batch_items"], 32),
+    (
+        &["runtime", "task_operation_max_batch_encoded_bytes"],
+        50331648,
+    ),
+    (&["runtime", "task_descriptor_max_encoded_bytes"], 16777216),
+    (
+        &["runtime", "task_query_backend_max_queued_operations"],
+        4096,
+    ),
+    (
+        &["runtime", "task_query_backend_max_queued_bytes"],
+        268435456,
+    ),
+    (&["runtime", "task_backend_max_queued_operations"], 16384),
+    (&["runtime", "task_backend_max_queued_bytes"], 536870912),
+    (&["runtime", "frontend_workload", "concurrency_limit"], 3),
+    (
+        &[
+            "runtime",
+            "frontend_workload",
+            "internal_result_all_objects_bytes",
+        ],
+        1073741824,
+    ),
+    (
+        &["runtime", "frontend_workload", "scope_records_limit"],
+        8192,
+    ),
+];
+const CONCURRENT_BACKEND_RESULT_EXPECTED: &[(&[&str], i64)] = &[
+    (&["runtime", "result_retained_bytes_per_root"], 16777216),
+    (
+        &["runtime", "result_retained_bytes_per_process"],
+        4294967296,
+    ),
+];
+const CONCURRENT_WRITERS: usize = 3;
+const CONCURRENT_APPEND_HOLD: &str = "connector-write-append-hold";
+const CONCURRENT_CATALOG: &str = "distributed_writer_concurrent";
+const CONCURRENT_DATABASE: &str = "distributed_writer_concurrent_db";
+const CONCURRENT_SOURCE: &str = "distributed_writer_concurrent_source";
+
+#[derive(Default)]
+struct DistributedWriterConcurrentProgress {
+    intent: SqlIntentOwner,
+}
+
+struct ConcurrentWriter {
+    ordinal: usize,
+    selected: SelectedStatement,
+    actor: WriterActor,
+    early_outcome: Option<mysql::Result<()>>,
+}
+
+fn concurrent_target(ordinal: usize) -> String {
+    format!("{CONCURRENT_CATALOG}.{CONCURRENT_DATABASE}.target_{ordinal}")
+}
+
+fn concurrent_insert(ordinal: usize) -> String {
+    format!(
+        "INSERT INTO {} SELECT v FROM {CONCURRENT_CATALOG}.{CONCURRENT_DATABASE}.{CONCURRENT_SOURCE}",
+        concurrent_target(ordinal)
+    )
+}
+
+fn require_concurrent_effective_config(context: &ScenarioContext) -> Result<usize> {
+    let evidence: serde_json::Value =
+        serde_json::from_slice(context.effective_launch_config_evidence().artifact_bytes())?;
+    let roles = evidence["semantics"]["roles"]
+        .as_array()
+        .context("missing effective roles for concurrent writer scenario")?;
+    let frontend = roles
+        .iter()
+        .filter(|role| role["role"] == "fe")
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        frontend.len() == 1,
+        "concurrent writer scenario requires one effective FE config"
+    );
+    let require_values = |role: &serde_json::Value, expected: &[(&[&str], i64)]| -> Result<()> {
+        for &(path, expected_value) in expected {
+            let mut value = &role["effective_config"];
+            for key in path {
+                anyhow::ensure!(
+                    value["type"] == "table",
+                    "effective {} config has no table before {}",
+                    role["role"],
+                    path.join(".")
+                );
+                value = &value["value"][*key];
+            }
+            anyhow::ensure!(
+                value["type"] == "integer" && value["value"].as_i64() == Some(expected_value),
+                "concurrent writer effective {} {} must be exactly {expected_value}",
+                role["role"],
+                path.join(".")
+            );
+        }
+        Ok(())
+    };
+    require_values(frontend[0], CONCURRENT_CAPACITY_EXPECTED)?;
+    let backends = roles
+        .iter()
+        .filter(|role| role["role"] == "be")
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        backends.len() == CONCURRENT_WRITERS,
+        "concurrent writer scenario requires three effective BE configs"
+    );
+    for backend in backends {
+        require_values(backend, CONCURRENT_BACKEND_RESULT_EXPECTED)?;
+    }
+    let config = &frontend[0]["effective_config"];
+    let integer = |path: &[&str]| -> Result<usize> {
+        let mut value = config;
+        for key in path {
+            value = &value["value"][*key];
+        }
+        usize::try_from(
+            value["value"]
+                .as_i64()
+                .with_context(|| format!("effective {} is not an integer", path.join(".")))?,
+        )
+        .with_context(|| format!("effective {} is not nonnegative", path.join(".")))
+    };
+    // The immutable prelaunch test-session plan nominates N=3 exact SQLs.
+    // Require enough real positions without deriving an execution limit from
+    // the Blocking worker count or changing the frozen three nominations.
+    let workers = integer(&["runtime", "query_blocking_worker_threads"])?;
+    let writers = integer(&["runtime", "frontend_workload", "internal_result_positions"])?;
+    anyhow::ensure!(
+        workers == 1 && writers >= CONCURRENT_WRITERS,
+        "concurrent progress requires one actual Blocking worker and at least {CONCURRENT_WRITERS} Internal positions: positions={writers}, workers={workers}"
+    );
+    Ok(CONCURRENT_WRITERS)
+}
+
+/// Read external data only before admission or after EVERY original writer
+/// actually exits. Readback can need the same warehouse query admission;
+/// adding it while the three writers are held would contaminate this proof.
+fn require_concurrent_source_data(control: &mut mysql::Conn) -> Result<()> {
+    let source = format!("{CONCURRENT_CATALOG}.{CONCURRENT_DATABASE}.{CONCURRENT_SOURCE}");
+    let rows = row_count(control, &source)?;
+    let total: Option<i64> = control
+        .query_first(format!("SELECT SUM(v) FROM {source}"))
+        .context("read concurrent writer source value sum")?;
+    anyhow::ensure!(
+        rows == SEED_ROWS && total == Some(SEED_SUM),
+        "concurrent source changed: rows={rows}, sum={total:?}; expected rows={SEED_ROWS}, sum={SEED_SUM}"
+    );
+    println!("concurrent-writer source rows={rows} sum={total:?}");
+    Ok(())
+}
+
+fn require_concurrent_targets_unpublished(
+    control: &mut mysql::Conn,
+    snapshots_before: &[i64],
+) -> Result<()> {
+    for (ordinal, &before) in snapshots_before.iter().enumerate() {
+        let target = concurrent_target(ordinal);
+        let rows = row_count(control, &target)?;
+        let snapshots = snapshot_count(control, &target)?;
+        anyhow::ensure!(
+            rows == 0 && snapshots == before,
+            "concurrent target {ordinal} published unexpected data: rows={rows}, snapshots={before}->{snapshots}; expected empty target and no new snapshot"
+        );
+        println!("concurrent-writer target={ordinal} rows={rows} snapshots={before}->{snapshots}");
+    }
+    Ok(())
+}
+
+impl Scenario for DistributedWriterConcurrentProgress {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        let mut declaration = crate::scenarios::declarations::for_module(
+            "distributed_writer",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        );
+        declaration.impact.paths.extend([
+            "novarocks/workload-control/**".into(),
+            "novarocks/result-contract/**".into(),
+            "novarocks/type-contract/**".into(),
+            "novarocks-server/**".into(),
+            "tests/system-test-runner/src/scenarios/writer_statement_actor.rs".into(),
+            "tests/system-test-runner/src/scenarios/native_sql_controls.rs".into(),
+        ]);
+        declaration
+    }
+
+    fn name(&self) -> &'static str {
+        "connector/distributed-writer-concurrent-progress"
+    }
+
+    fn launch_config(&self, _root: &Path) -> Result<ScenarioLaunchConfig> {
+        let capacity = CONCURRENT_CAPACITY_OVERLAY;
+        let mut launch = connector_launch_config();
+        launch.config_overlay.fe = Some(format!(
+            "{}\n[runtime]\n{capacity}\n",
+            launch.config_overlay.fe.take().unwrap_or_default()
+        ));
+        // connector_launch_config owns this existing runtime table and its
+        // reader-cache settings. Insert within it instead of repeating a TOML
+        // table or replacing the original backend configuration.
+        let backend = launch
+            .config_overlay
+            .be
+            .take()
+            .context("original connector BE overlay")?;
+        anyhow::ensure!(
+            backend.matches("[runtime]\n").count() == 1,
+            "original connector BE overlay must have one runtime table"
+        );
+        launch.config_overlay.be = Some(backend.replacen(
+            "[runtime]\n",
+            &format!("[runtime]\n{CONCURRENT_BACKEND_RESULT_OVERLAY}\n"),
+            1,
+        ));
+        Ok(launch)
+    }
+
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        anyhow::ensure!(
+            cluster_size == CONCURRENT_WRITERS,
+            "concurrent writer scenario requires native 1FE+3BE"
+        );
+        // The existing harness admits one selected token per (BE, fault kind).
+        // Distinct BE targets allow all three original statements to stay held
+        // concurrently without ending an earlier token or widening authority.
+        let statements = (0..CONCURRENT_WRITERS)
+            .map(|ordinal| StatementSpec {
+                sql: concurrent_insert(ordinal),
+                faults: vec![(ordinal, CONCURRENT_APPEND_HOLD)],
+                observations: vec![],
+            })
+            .collect();
+        Ok(Some(self.intent.freeze(
+            statements,
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let concurrent_writers = require_concurrent_effective_config(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        seed_source_files(
+            context,
+            &mut control,
+            CONCURRENT_CATALOG,
+            CONCURRENT_DATABASE,
+            CONCURRENT_SOURCE,
+            "distributed-writer-concurrent-progress",
+        )?;
+        for ordinal in 0..concurrent_writers {
+            control.query_drop(format!(
+                "CREATE TABLE {} (v BIGINT)",
+                concurrent_target(ordinal)
+            ))?;
+        }
+        require_concurrent_source_data(&mut control)?;
+        let snapshots_before = (0..concurrent_writers)
+            .map(|ordinal| snapshot_count(&mut control, &concurrent_target(ordinal)))
+            .collect::<Result<Vec<_>>>()?;
+        require_concurrent_targets_unpublished(&mut control, &snapshots_before)?;
+        control.finish()?;
+        await_resource_convergence(context, &baseline, "concurrent writer fixture setup")?;
+
+        // Reserve time from the original scenario deadline for cancellation,
+        // actor joins and resource convergence; do not renew a timeout per SQL.
+        let progress_budget = context
+            .remaining("start concurrent held writers")?
+            .checked_sub(Duration::from_secs(10))
+            .context("concurrent writers have no time left for actual cleanup")?
+            .min(Duration::from_secs(30));
+        anyhow::ensure!(
+            !progress_budget.is_zero(),
+            "no concurrent writer progress budget remains"
+        );
+        let progress_deadline = Instant::now() + progress_budget;
+        let mut writers = Vec::with_capacity(concurrent_writers);
+        let progress = (|| -> Result<()> {
+            // No required FE Blocking action is held here. A permanently
+            // stuck shared worker would legitimately prevent this progress;
+            // this scenario promises normal async concurrency, not isolation
+            // from an operation that never actually exits.
+            context.action("submit three independent INSERTs with one FE blocking worker");
+            for ordinal in 0..concurrent_writers {
+                let selected = self.intent.take(ordinal)?;
+                let actor = WriterActor::start(
+                    context,
+                    &concurrent_insert(ordinal),
+                    selected.clone(),
+                    None,
+                )?;
+                writers.push(ConcurrentWriter {
+                    ordinal,
+                    selected,
+                    actor,
+                    early_outcome: None,
+                });
+            }
+            await_concurrent_append_holds(context, &mut writers, progress_deadline)?;
+            context.action("all three exact INSERTs reached append hold before any KILL");
+            Ok(())
+        })();
+
+        // Do not return early after one cancellation or join fails: every actor
+        // admitted above retains its original connection and requires settlement.
+        let mut result = progress;
+        let deadline = context.deadline();
+        for writer in &writers {
+            if writer.early_outcome.is_none() {
+                let cancelled = context
+                    .handle()
+                    .kill_query_until(writer.actor.connection_id, deadline)
+                    .with_context(|| {
+                        format!("cancel original concurrent writer {}", writer.ordinal)
+                    });
+                result = writer_statement_actor::combine(result, cancelled);
+            }
+        }
+        for writer in writers {
+            let ordinal = writer.ordinal;
+            let outcome =
+                match writer.early_outcome {
+                    Some(outcome) => Ok(outcome),
+                    None => context
+                        .remaining("receive original concurrent writer cancellation")
+                        .and_then(|remaining| {
+                            writer.actor.done.recv_timeout(remaining).with_context(|| {
+                                format!("concurrent writer {ordinal} did not finish")
+                            })
+                        }),
+                };
+            let settled = writer.actor.settle(context, outcome).and_then(|outcome| {
+                match outcome {
+                    Err(mysql::Error::MySqlError(error))
+                        if error.code == 1317 && error.state == "70100" => Ok(()),
+                    other => bail!(
+                        "concurrent writer {ordinal} must return its public KILL cancellation: {other:?}"
+                    ),
+                }
+            });
+            result = writer_statement_actor::combine(result, settled);
+        }
+        let faults = context.handle().clear_query_lifecycle_faults();
+        result = writer_statement_actor::combine(result, faults);
+        let convergence =
+            await_resource_convergence(context, &baseline, "all original concurrent writers");
+        result = writer_statement_actor::combine(result, convergence);
+
+        // These are independent committed-data oracles, after real actor exit.
+        // The BE resource oracle above covers contexts/fragments/catalog leases;
+        // neither it nor empty tables proves unknown sealed objects disposed.
+        let external_effects = mysql_actor::connect_until(&user, port, context.deadline())
+            .and_then(|control| {
+                control.run(|control| {
+                    require_concurrent_targets_unpublished(control, &snapshots_before)?;
+                    require_concurrent_source_data(control)
+                })
+            });
+        result = writer_statement_actor::combine(result, external_effects);
+        let readback_cleanup =
+            await_resource_convergence(context, &baseline, "concurrent writer external readbacks");
+        writer_statement_actor::combine(result, readback_cleanup)
+    }
+}
+
+fn await_concurrent_append_holds(
+    context: &mut ScenarioContext,
+    writers: &mut [ConcurrentWriter],
+    deadline: Instant,
+) -> Result<()> {
+    let mut hit = vec![false; writers.len()];
+    loop {
+        for writer in writers.iter_mut() {
+            match writer.actor.done.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Ok(outcome) => {
+                    let detail = format!("{outcome:?}");
+                    writer.early_outcome = Some(outcome);
+                    bail!(
+                        "concurrent writer {} became terminal before all three held: {detail}",
+                        writer.ordinal
+                    );
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    bail!(
+                        "concurrent writer {} disconnected before all held",
+                        writer.ordinal
+                    );
+                }
+            }
+            hit[writer.ordinal] = context.handle().selected_query_lifecycle_fault_hit(
+                writer.ordinal,
+                CONCURRENT_APPEND_HOLD,
+                &writer.selected.token,
+            )?;
+        }
+        if hit.iter().all(|value| *value) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "three INSERTs did not independently reach append hold with one blocking worker; exact hits={hit:?}"
+        );
+        thread::sleep(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
 }
 
 /// Proves the shape the design is actually about: writers on more than one
@@ -1634,7 +2103,10 @@ impl Scenario for DistributedWriterOverwrite {
 /// refuses a commit whose artifact superseded a different reference set, so a
 /// second DELETE that both commits and preserves the first one's effect is
 /// end-to-end evidence that the merge used exactly the frozen references.
-struct DistributedWriterRowLevel;
+#[derive(Default)]
+struct DistributedWriterRowLevel {
+    observations: SqlIntentOwner,
+}
 
 impl Scenario for DistributedWriterRowLevel {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
@@ -1654,6 +2126,23 @@ impl Scenario for DistributedWriterRowLevel {
         Ok(connector_launch_config())
     }
 
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.observations.freeze(
+            row_level_contract::observation_specs(cluster_size),
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
@@ -1664,8 +2153,8 @@ impl Scenario for DistributedWriterRowLevel {
             context.remaining("connect row-level mutation control session")?,
         )?;
 
-        const CATALOG: &str = "row_level_writer";
-        const DATABASE: &str = "row_level_writer_db";
+        const CATALOG: &str = row_level_contract::CATALOG;
+        const DATABASE: &str = row_level_contract::DATABASE;
         let warehouse = create_warehouse(context, "distributed-writer-row-level")?;
         create_catalog(&mut control, CATALOG, &warehouse)?;
         control
@@ -1705,6 +2194,7 @@ impl Scenario for DistributedWriterRowLevel {
         control
             .query_drop(format!("DELETE FROM {dv} WHERE id IN (1, 5, 9)"))
             .context("first deletion-vector DELETE")?;
+        row_level_contract::assert_affected(&control, 3, "first deletion-vector DELETE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -1738,6 +2228,7 @@ impl Scenario for DistributedWriterRowLevel {
         control
             .query_drop(format!("DELETE FROM {dv} WHERE v > 10"))
             .context("second deletion-vector DELETE")?;
+        row_level_contract::assert_affected(&control, 2, "second deletion-vector DELETE")?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         assert_committed_once(
             before_terminals,
@@ -1789,6 +2280,7 @@ impl Scenario for DistributedWriterRowLevel {
         control
             .query_drop(format!("DELETE FROM {positional} WHERE id IN (1, 5, 9)"))
             .context("position-delete DELETE")?;
+        row_level_contract::assert_affected(&control, 3, "position-delete DELETE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -1849,6 +2341,7 @@ impl Scenario for DistributedWriterRowLevel {
                 "UPDATE {cow} SET v = v + 100 WHERE id IN (1, 5, 9)"
             ))
             .context("copy-on-write UPDATE")?;
+        row_level_contract::assert_affected(&control, 3, "copy-on-write UPDATE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -1898,6 +2391,11 @@ impl Scenario for DistributedWriterRowLevel {
                  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"
             ))
             .context("MERGE across the delete and data branches")?;
+        row_level_contract::assert_affected(
+            &control,
+            2,
+            "MERGE across the delete and data branches",
+        )?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -1933,6 +2431,8 @@ impl Scenario for DistributedWriterRowLevel {
         {
             bail!("MERGE left {merged:?}");
         }
+
+        row_level_contract::run(context, &mut control, CATALOG, DATABASE, &self.observations)?;
 
         await_resource_convergence(context, &baseline, "distributed row-level writes")?;
         Ok(())
@@ -2001,11 +2501,11 @@ enum WriteFault {
     /// writer append. Cancellation must abort those provider writers and must
     /// not publish a successful Root EOF.
     DeadlineAbort,
+    /// All writer inputs reached Root EOS, but its first real Data never leaves BE.
+    SealedBeforeRootData,
+    /// FE consumed the real first Root segment, but receives no second Data/End.
+    SealedAfterRootPrefix,
 }
-
-/// The backend the severed-stream case arms. Fixed so the scenario can name
-/// the process its evidence must come from; a backend index, never a count.
-const SEVERED_BACKEND: usize = 2;
 
 /// The task protocol's evidence that one task really failed on the backend the
 /// fault was armed on.
@@ -2028,6 +2528,16 @@ const TASK_CREATE_APPLIED: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
 const TASK_CONTEXT_ABORT_APPLIED: &str = "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED";
 
 impl WriteFault {
+    /// Incomplete delivery cuts own exclusive targets; the recovery matrix
+    /// and its healthy write share the base target.
+    const fn target_table(&self) -> &'static str {
+        match self {
+            Self::SealedBeforeRootData => "distributed_writer_fault_before_root_data",
+            Self::SealedAfterRootPrefix => "distributed_writer_fault_after_root_prefix",
+            _ => "distributed_writer_fault_data",
+        }
+    }
+
     /// How many times this fault has left evidence in a backend process.
     ///
     /// A fault that is nominated but never hit by its exact owner is inert, and an
@@ -2050,10 +2560,6 @@ impl WriteFault {
                         )?))
                 })
             }
-            InjectionEvidence::Backend(index, marker) => context
-                .handle()
-                .be_log_count(index, marker)
-                .with_context(|| format!("count {marker} on BE[{index}]")),
             InjectionEvidence::EveryBackend(marker) => backend_marker_total(context, marker),
             InjectionEvidence::AppendHolds => Ok(all_write_counters(context)?
                 .iter()
@@ -2070,9 +2576,13 @@ impl WriteFault {
             | Self::PartialAggregateUpdate
             | Self::PartialAggregateFinalize
             | Self::FinalAggregateMerge
-            | Self::FinalAggregateFinalize => InjectionEvidence::NativeFault,
+            | Self::FinalAggregateFinalize
+            | Self::SealedBeforeRootData
+            | Self::SealedAfterRootPrefix => InjectionEvidence::NativeFault,
             Self::SeveredWriterStream => {
-                InjectionEvidence::Backend(SEVERED_BACKEND, TASK_EXECUTION_FAILURE_INJECTED)
+                // The exact held Task is checked before reentry below; its
+                // backend is selected from the original frozen writer graph.
+                InjectionEvidence::EveryBackend(TASK_EXECUTION_FAILURE_INJECTED)
             }
             // Summed across the cluster rather than pinned to one backend: an
             // abort reaches the backends the scheduler placed this attempt on,
@@ -2093,7 +2603,11 @@ impl WriteFault {
             | Self::PartialAggregateFinalize
             | Self::FinalAggregateMerge
             | Self::FinalAggregateFinalize => (FailureClass::Unexpected, 10),
-            Self::SeveredWriterStream | Self::FetchAbort | Self::DeadlineAbort => return None,
+            Self::SeveredWriterStream
+            | Self::FetchAbort
+            | Self::DeadlineAbort
+            | Self::SealedBeforeRootData
+            | Self::SealedAfterRootPrefix => return None,
         };
         Some(FailureFact::new(
             class,
@@ -2112,7 +2626,9 @@ impl WriteFault {
             | Self::FinalAggregateMerge
             | Self::FinalAggregateFinalize
             | Self::SeveredWriterStream
-            | Self::DeadlineAbort => statements.full,
+            | Self::DeadlineAbort
+            | Self::SealedBeforeRootData
+            | Self::SealedAfterRootPrefix => statements.full,
         }
     }
 
@@ -2187,7 +2703,9 @@ impl WriteFault {
             | Self::PartialAggregateFinalize
             | Self::FinalAggregateMerge
             | Self::FinalAggregateFinalize
-            | Self::FetchAbort => Ok(()),
+            | Self::FetchAbort
+            | Self::SealedBeforeRootData
+            | Self::SealedAfterRootPrefix => Ok(()),
         }
     }
 
@@ -2202,6 +2720,10 @@ impl WriteFault {
             Self::SeveredWriterStream => "a writer stream that never reaches the root aggregation",
             Self::FetchAbort => "an aborted attempt that never fetches the root's result",
             Self::DeadlineAbort => "a deadline that fires after provider writers enter append",
+            Self::SealedBeforeRootData => "sealed objects before the first Root Data is offered",
+            Self::SealedAfterRootPrefix => {
+                "sealed objects after an accepted Root prefix without End"
+            }
         }
     }
 }
@@ -2210,8 +2732,6 @@ impl WriteFault {
 enum InjectionEvidence {
     /// Actual owner hit for this selected SQL, separately from nomination.
     NativeFault,
-    /// On the one backend the fault was armed on.
-    Backend(usize, &'static str),
     /// Anywhere across the backends, summed, because which backends the
     /// marker reaches is a property of the plan rather than of the cluster.
     EveryBackend(&'static str),
@@ -2274,9 +2794,13 @@ impl Scenario for DistributedWriterFaults {
         binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
-        Ok(Some(self.intent.freeze(
+        let selected = WRITE_FAULTS
+            .iter()
+            .position(|fault| matches!(fault, WriteFault::SeveredWriterStream))
+            .context("writer fault matrix has no remote sender case")?;
+        Ok(Some(self.intent.freeze_remote_writer_sender(
             writer_fault_specs(cluster_size),
-            &[],
+            selected,
             cluster_size,
             binary,
             deadline,
@@ -2329,9 +2853,48 @@ impl Scenario for DistributedWriterFaults {
 
         // A committed row would prove the frontend committed despite a broken
         // write, so seed nothing into the target and require it to stay empty.
+        let mut retained_objects = Vec::new();
         for (ordinal, fault) in WRITE_FAULTS.into_iter().enumerate() {
             let case = fault.case();
             let selected = self.intent.take(ordinal)?;
+            let case_target = format!("{CATALOG}.{DATABASE}.{}", fault.target_table());
+            let sealed_cut = matches!(
+                fault,
+                WriteFault::SealedBeforeRootData | WriteFault::SealedAfterRootPrefix
+            );
+            let case_snapshots_before = if sealed_cut {
+                // This owned table has exactly one future writer, the frozen
+                // original INSERT below. No old case can contribute a file.
+                control
+                    .query_drop(format!(
+                        "CREATE TABLE {case_target} (v BIGINT) \
+                     TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'true')"
+                    ))
+                    .context("create the original isolated sealed-object target")?;
+                let table_root = hadoop_table_root(
+                    &context
+                        .runtime_dir()
+                        .join("warehouses/distributed-writer-faults"),
+                    DATABASE,
+                    fault.target_table(),
+                );
+                anyhow::ensure!(
+                    owned_root_parquet_paths(context, &table_root)?.is_empty(),
+                    "fresh sealed-object target already contains data files"
+                );
+                snapshot_count(&mut control, &case_target)?
+            } else {
+                snapshots_before
+            };
+            let case_insert = if sealed_cut {
+                format!("INSERT INTO {case_target} SELECT v FROM {CATALOG}.{DATABASE}.{SOURCE}")
+            } else {
+                insert.clone()
+            };
+            let case_statements = WriteStatements {
+                full: &case_insert,
+                delayed: statements.delayed,
+            };
             context.action(format!("inject {case} and require no snapshot"));
             // Select the original finite grants before reading their hit baseline.
             // The SQL execution remains unbound until selected.arm below.
@@ -2351,12 +2914,35 @@ impl Scenario for DistributedWriterFaults {
                 &fault,
                 &user,
                 port,
-                &statements,
+                &case_statements,
                 selected.clone(),
                 capture_original_write_window,
             )?;
             if let Some(expected) = fault.originating_connector_fact() {
                 assert_connector_failure(context, &outcome, accepted.as_ref(), expected, case)?;
+            }
+            if matches!(
+                fault,
+                WriteFault::SealedBeforeRootData | WriteFault::SealedAfterRootPrefix
+            ) {
+                assert_sealed_root_read_failure(
+                    context,
+                    &fault,
+                    &outcome,
+                    accepted.as_ref(),
+                    &selected,
+                )?;
+                let table_root = hadoop_table_root(
+                    &context
+                        .runtime_dir()
+                        .join("warehouses/distributed-writer-faults"),
+                    DATABASE,
+                    fault.target_table(),
+                );
+                // The original statement's binding has drained and its worker
+                // contexts exited. Only its fresh owned target's actual data
+                // location is observed; other cases cannot contribute files.
+                retained_objects.push(capture_sealed_root_objects(context, &table_root)?);
             }
             let Err(error) = outcome else {
                 bail!("{case} did not fail the write");
@@ -2370,8 +2956,10 @@ impl Scenario for DistributedWriterFaults {
                 anyhow::ensure!(
                     error.code == 1317
                         && error.state == "70100"
-                        && error.message
-                            == "[query.execution.deadline_exceeded] statement execution was stopped by its control owner",
+                        && exact_uncommitted_write_publication_message(
+                            &error.message,
+                            "[query.execution.deadline_exceeded] logical execution deadline expired before success EOF",
+                        ),
                     "{case} lost its original deadline descriptor, errno, SQLSTATE or safe detail: {error:?}"
                 );
             }
@@ -2424,14 +3012,14 @@ impl Scenario for DistributedWriterFaults {
             }
             fault.assert_case_evidence(&delta, case)?;
 
-            let rows = row_count(&mut control, &target)?;
+            let rows = row_count(&mut control, &case_target)?;
             if rows != 0 {
                 bail!("{case} left {rows} committed rows; expected none");
             }
-            let snapshots = snapshot_count(&mut control, &target)?;
-            if snapshots != snapshots_before {
+            let snapshots = snapshot_count(&mut control, &case_target)?;
+            if snapshots != case_snapshots_before {
                 bail!(
-                    "{case} moved {target} from {snapshots_before} to {snapshots} snapshots; a \
+                    "{case} moved {case_target} from {case_snapshots_before} to {snapshots} snapshots; a \
                      failed write must publish none"
                 );
             }
@@ -2450,7 +3038,73 @@ impl Scenario for DistributedWriterFaults {
         }
 
         await_resource_convergence(context, &baseline, "distributed writer faults")?;
+        for objects in retained_objects {
+            for object in objects {
+                context.remaining("recheck the original sealed objects after native close")?;
+                anyhow::ensure!(
+                    sealed_object_digest(&object.path)? == (object.bytes, object.sha256),
+                    "sealed output disappeared or changed after original abort/Task/context retirement: {}",
+                    object.path.display()
+                );
+            }
+        }
         Ok(())
+    }
+}
+
+/// Exact original test controls, owned after the writer so unwind releases
+/// every parked Create before joining the client. This grants no new action.
+struct SeveredWriterRendezvous<'a> {
+    context: &'a mut ScenarioContext,
+    listener: Option<crate::scenarios::native_create_hold::HoldListener>,
+    held: Vec<crate::scenarios::native_create_hold::HeldCreate>,
+    token: String,
+    hold_backends: Vec<usize>,
+    closed: bool,
+}
+impl SeveredWriterRendezvous<'_> {
+    fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        let mut released = Ok(());
+        for create in &mut self.held {
+            released = writer_statement_actor::combine(released, create.release());
+        }
+        // End only the hold, keeping this query's task failure active. A
+        // replay or late connection cannot park after the observed releases.
+        let mut ended = Ok(());
+        for &backend in &self.hold_backends {
+            let result = match self
+                .context
+                .handle()
+                .armed_query_lifecycle_fault_token(backend, "create-task-before-worker-hold")
+            {
+                Ok(Some(token)) if token == self.token => {
+                    self.context.handle().end_selected_query_lifecycle_fault(
+                        backend,
+                        "create-task-before-worker-hold",
+                        &self.token,
+                    )
+                }
+                Ok(None) => Ok(()),
+                Ok(Some(_)) => Err(anyhow::anyhow!(
+                    "severed writer cleanup encountered a foreign hold token"
+                )),
+                Err(error) => Err(error),
+            };
+            ended = writer_statement_actor::combine(ended, result);
+        }
+        self.closed = ended.is_ok();
+        drop(self.listener.take());
+        writer_statement_actor::combine(released, ended)
+    }
+}
+impl Drop for SeveredWriterRendezvous<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            eprintln!("severed writer rendezvous cleanup failed: {error:#}");
+        }
     }
 }
 
@@ -2512,6 +3166,130 @@ fn run_faulted_write(
 )> {
     let insert = fault.statement(statements);
     match fault {
+        WriteFault::SeveredWriterStream => {
+            let baseline = all_write_counters(context)?;
+            let required_healthy = baseline
+                .len()
+                .checked_sub(1)
+                .filter(|count| *count >= 2)
+                .context("severed writer fixture needs its original three or more backends")?;
+            let listener = crate::scenarios::native_create_hold::HoldListener::bind(
+                &selected.token,
+                context.process_ids().backends.len(),
+            )?;
+            let write = WriterActor::start(context, insert, selected.clone(), None)?;
+            // Move the already-bound listener behind the actual writer in
+            // declaration order. This guard releases accepted/unobserved and
+            // future holds before WriterActor can cancel/join during unwind.
+            let mut gate = SeveredWriterRendezvous {
+                context,
+                listener: Some(listener),
+                held: Vec::new(),
+                token: selected.token.clone(),
+                hold_backends: selected
+                    .faults
+                    .iter()
+                    .filter_map(|&(backend, kind)| {
+                        (kind == "create-task-before-worker-hold").then_some(backend)
+                    })
+                    .collect(),
+                closed: false,
+            };
+            let primary = (|| {
+                loop {
+                    while let Some(create) = gate
+                        .listener
+                        .as_ref()
+                        .unwrap()
+                        .try_receive(&selected.token, gate.context.deadline())?
+                    {
+                        anyhow::ensure!(
+                            create.outbound_edges > 0
+                                && create.process
+                                    == gate
+                                        .context
+                                        .handle()
+                                        .backend_process_id(create.backend)?
+                                        .to_string()
+                                && create.execution.ends_with(":1")
+                                && gate.held.iter().all(|old| old.execution == create.execution
+                                    && old.stage == create.stage
+                                    && old.task == create.task
+                                    && old.backend == create.backend
+                                    && old.process == create.process),
+                            "severed writer hold is not its exact original remote sender: {}",
+                            create.payload
+                        );
+                        gate.held.push(create);
+                    }
+                    let current = all_write_counters(gate.context)?;
+                    let delta = write_delta(&baseline, &current);
+                    let healthy = gate.held.first().map_or(0, |sender| {
+                        delta
+                            .writing_backends
+                            .iter()
+                            .filter(|index| **index != sender.backend)
+                            .count()
+                    });
+                    if !gate.held.is_empty() && healthy >= required_healthy {
+                        gate.context.action(format!("{healthy} healthy writer backends opened before releasing original sender {}", gate.held[0].identity_marker()));
+                        break;
+                    }
+                    match write.done.try_recv() {
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Ok(outcome) => bail!(
+                            "severed writer became terminal before its live-sender fixture existed: {outcome:?}"
+                        ),
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            bail!("severed writer actor disconnected before its held sender")
+                        }
+                    }
+                    thread::sleep(
+                        gate.context
+                            .remaining(
+                                "observe original held sender and two healthy writer backends",
+                            )?
+                            .min(Duration::from_millis(20)),
+                    );
+                }
+                gate.close()?;
+                let result = write
+                    .done
+                    .recv_timeout(gate.context.remaining("await the severed writer result")?)
+                    .context("severed writer session did not finish")?;
+                let sender = gate
+                    .held
+                    .first()
+                    .context("original remote sender was not held")?;
+                let exact = format!(
+                    "{TASK_EXECUTION_FAILURE_INJECTED} {} backend_index={} token={}",
+                    sender.identity_marker(),
+                    sender.backend,
+                    selected.token
+                );
+                anyhow::ensure!(
+                    gate.context.handle().be_log_count(sender.backend, &exact)? == 1,
+                    "selected remote writer Task did not supply its exact once failure: {exact}"
+                );
+                let execution = format!(
+                    "{TASK_EXECUTION_FAILURE_INJECTED} execution_id={} ",
+                    sender.execution
+                );
+                anyhow::ensure!(
+                    backend_marker_total(gate.context, &execution)? == 1,
+                    "another Task of the same original execution also received the selected failure"
+                );
+                Ok(result)
+            })();
+            let cleanup = gate.close();
+            drop(gate);
+            settle_observed_writer(
+                write,
+                context,
+                retain_write_result(primary, cleanup),
+                before_reentry,
+            )
+        }
         WriteFault::FetchAbort => {
             let created_baseline = backend_marker_total(context, TASK_CREATE_APPLIED)?;
             let write = WriterActor::start(context, insert, selected, None)?;
@@ -2622,6 +3400,249 @@ fn run_faulted_write(
     }
 }
 
+/// Both actions are ordinary original Root read failures, not Task failures.
+/// Their exact role hit is separately required by the matrix below.
+fn assert_sealed_root_read_failure(
+    context: &mut ScenarioContext,
+    fault: &WriteFault,
+    outcome: &mysql::Result<()>,
+    snapshot: Option<&QueryLifecycleStructuredSnapshot>,
+    selected: &SelectedStatement,
+) -> Result<()> {
+    let (detail, action) = match fault {
+        WriteFault::SealedBeforeRootData => (
+            "injected write Root read failure before first Data",
+            "connector-write-root-read-before-data-failure",
+        ),
+        WriteFault::SealedAfterRootPrefix => (
+            "injected write Root read failure after accepted prefix",
+            "connector-write-root-read-after-prefix-failure",
+        ),
+        _ => bail!("object oracle requires its original Root read action"),
+    };
+    // The native convergence snapshot observes only the Task protocol's
+    // terminal, not the logical actor's independent Root read failure. Check
+    // that failure at its actual public boundary before inspecting the snapshot.
+    let Err(mysql::Error::MySqlError(error)) = outcome else {
+        bail!("Root read action did not return its original SQL error: {outcome:?}");
+    };
+    anyhow::ensure!(
+        error.code == 1105
+            && error.state == "HY000"
+            && exact_uncommitted_write_publication_message(
+                &error.message,
+                &format!("[query.execution.unexpected] {detail}")
+            ),
+        "Root read failure lost its exact public error/KnownUncommitted publication: {error:?}"
+    );
+    let snapshot =
+        snapshot.context("Root read action has no original Native convergence snapshot")?;
+    let execution = novarocks_types::QueryExecutionId::new(
+        novarocks_types::QueryId::new(
+            i64::from_ne_bytes(snapshot.process_namespace.to_ne_bytes()),
+            i64::from_ne_bytes(snapshot.local_sequence.to_ne_bytes()),
+        ),
+        novarocks_types::AttemptId::new(snapshot.attempt_id)
+            .map_err(|_| anyhow!("original statement has an invalid attempt identity"))?,
+    )
+    .map_err(|_| anyhow!("original statement has an invalid execution identity"))?;
+    anyhow::ensure!(
+        snapshot.attempt_id == 1
+            && snapshot.worker_contexts_converged
+            && snapshot.execution_id.as_deref()
+                == Some(
+                    format!(
+                        "{}:{}:{}",
+                        execution.query_id().high(),
+                        execution.query_id().low(),
+                        execution.attempt_id().get()
+                    )
+                    .as_str()
+                ),
+        "Root read action changed its original execution or physical context exit: {snapshot:?}"
+    );
+    // Only the actual Root reader can hit either action. The existing owner
+    // validates its immutable binding against this statement's original grant,
+    // backend process and launch; do not invent a Task site from a read refusal.
+    let mut hits = 0;
+    for &(index, kind) in &selected.faults {
+        anyhow::ensure!(
+            kind == action,
+            "sealed Root read has a foreign finite action"
+        );
+        hits += usize::from(context.handle().selected_query_lifecycle_fault_hit(
+            index,
+            kind,
+            &selected.token,
+        )?);
+    }
+    anyhow::ensure!(
+        hits == 1,
+        "sealed Root read requires its one actual Root-role hit, got {hits}"
+    );
+    Ok(())
+}
+
+struct SealedRootObject {
+    path: std::path::PathBuf,
+    bytes: u64,
+    sha256: [u8; 32],
+}
+
+impl SealedRootObject {
+    fn observe(path: std::path::PathBuf) -> Result<Self> {
+        let (bytes, sha256) = sealed_object_digest(&path)?;
+        Ok(Self {
+            path,
+            bytes,
+            sha256,
+        })
+    }
+}
+
+fn sealed_object_digest(path: &Path) -> Result<(u64, [u8; 32])> {
+    use sha2::{Digest, Sha256};
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_file() && metadata.len() != 0,
+        "sealed output is not an existing nonempty regular file: {}",
+        path.display()
+    );
+    let bytes = std::fs::read(path)?;
+    Ok((metadata.len(), Sha256::digest(bytes).into()))
+}
+
+fn owned_root_parquet_paths(
+    context: &mut ScenarioContext,
+    table_root: &Path,
+) -> Result<Vec<std::path::PathBuf>> {
+    // Hadoop publishes a canonical absolute location even when the runner's
+    // artifact root is relative or uses a filesystem alias.
+    let owned = table_root.canonicalize()?;
+    let table_root = owned.as_path();
+    let version = hadoop_metadata_version(table_root)?;
+    let metadata: TableMetadata = serde_json::from_slice(&std::fs::read(
+        table_root
+            .join("metadata")
+            .join(format!("v{version}.metadata.json")),
+    )?)?;
+    // Follow the actual table metadata, not a guessed SDK filename or a
+    // deletion-writer staging path. Each new target belongs to this one run.
+    let data = metadata
+        .properties()
+        .get("write.data.path")
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", metadata.location().trim_end_matches('/')));
+    let data = Path::new(data.strip_prefix("file://").unwrap_or(&data));
+    anyhow::ensure!(
+        data.is_absolute() && data.starts_with(table_root),
+        "object oracle refuses data outside its original local table"
+    );
+    // Fresh CREATE need not create a data directory before any append.
+    match std::fs::symlink_metadata(data) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "object oracle refuses a redirected data directory"
+        ),
+    }
+    let data = data.canonicalize()?;
+    anyhow::ensure!(
+        data.starts_with(&owned),
+        "object oracle refuses a redirected data root"
+    );
+    let mut pending = vec![data];
+    let mut objects = Vec::new();
+    while let Some(directory) = pending.pop() {
+        context.remaining("observe the original sealed writer objects")?;
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&directory)?.file_type().is_dir(),
+            "object oracle refuses a redirected directory"
+        );
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            anyhow::ensure!(
+                !kind.is_symlink(),
+                "object oracle refuses a redirected object"
+            );
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if entry.path().extension().is_some_and(|ext| ext == "parquet") {
+                anyhow::ensure!(kind.is_file(), "original data object is not a regular file");
+                objects.push(entry.path());
+            }
+        }
+    }
+    objects.sort();
+    Ok(objects)
+}
+
+fn capture_sealed_root_objects(
+    context: &mut ScenarioContext,
+    table_root: &Path,
+) -> Result<Vec<SealedRootObject>> {
+    let paths = owned_root_parquet_paths(context, table_root)?;
+    anyhow::ensure!(
+        !paths.is_empty(),
+        "real sealed writer collection has no surviving objects"
+    );
+    let objects = paths
+        .into_iter()
+        .map(SealedRootObject::observe)
+        .collect::<Result<Vec<_>>>()?;
+    assert_sealed_root_row_bag(&objects)?;
+    Ok(objects)
+}
+
+/// Independent original input: seed_source_files writes each integer in
+/// 1..=SEED_ROWS exactly once. Nonempty files alone could hide a deleted peer.
+fn assert_sealed_root_row_bag(objects: &[SealedRootObject]) -> Result<()> {
+    use arrow_array::{Array, Int64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let mut values = Vec::new();
+    for object in objects {
+        let path = &object.path;
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?.build()?;
+        let mut file_rows = 0;
+        for batch in reader {
+            let batch = batch?;
+            anyhow::ensure!(
+                batch.num_columns() == 1 && batch.schema().field(0).name() == "v",
+                "sealed data file lost the original single v column: {}",
+                path.display()
+            );
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("sealed original v column is not BIGINT")?;
+            anyhow::ensure!(
+                column.null_count() == 0,
+                "sealed original v column acquired NULLs: {}",
+                path.display()
+            );
+            file_rows += column.len();
+            values.extend(column.values().iter().copied());
+        }
+        anyhow::ensure!(
+            file_rows > 0,
+            "sealed original data file has no data rows: {}",
+            path.display()
+        );
+    }
+    values.sort_unstable();
+    let expected = (1..=SEED_ROWS).collect::<Vec<_>>();
+    anyhow::ensure!(
+        values == expected,
+        "sealed original object collection lost, duplicated or changed the complete seeded row bag: rows={}",
+        values.len()
+    );
+    Ok(())
+}
+
 // SQL receives the Task owner's neutral summary, never Connector Display.
 // The optional suffix is exactly the original driver-owned operator location.
 fn connector_neutral_detail(detail: &str, expected: FailureFact) -> bool {
@@ -2645,6 +3666,26 @@ fn connector_neutral_detail(detail: &str, expected: FailureFact) -> bool {
         && matches!(
             operation,
             "Control" | "Preparation" | "Push" | "Pull" | "Finishing" | "Admission"
+        )
+}
+
+fn exact_uncommitted_write_publication_message(message: &str, public_message: &str) -> bool {
+    let prefix = format!("{public_message} (lake publication id=");
+    let Some(publication) = message
+        .strip_prefix(prefix.as_str())
+        .and_then(|rest| rest.strip_suffix(" family=write disposition=KnownUncommitted)"))
+        .and_then(|id| {
+            id.parse::<novarocks_spi::connector::LakePublicationId>()
+                .ok()
+        })
+    else {
+        return false;
+    };
+    // The typed UUIDv7 parser plus complete round-trip equality rejects extra
+    // fields, noncanonical IDs, changed descriptors and any trailing text.
+    message
+        == format!(
+            "{public_message} (lake publication id={publication} family=write disposition=KnownUncommitted)"
         )
 }
 
@@ -2709,13 +3750,15 @@ fn assert_connector_failure(
     };
     let public_message = format!("[{descriptor}] {detail}");
     anyhow::ensure!(
-        error.code == 1105 && error.state == "HY000" && error.message == public_message,
+        error.code == 1105
+            && error.state == "HY000"
+            && exact_uncommitted_write_publication_message(&error.message, &public_message),
         "{case}: SQL code/state/detail differs from the accepted Connector failure: {error:?}"
     );
     Ok(())
 }
 
-const WRITE_FAULTS: [WriteFault; 9] = [
+const WRITE_FAULTS: [WriteFault; 11] = [
     WriteFault::WriterEgress,
     WriteFault::RootValidation,
     WriteFault::PartialAggregateUpdate,
@@ -2725,6 +3768,8 @@ const WRITE_FAULTS: [WriteFault; 9] = [
     WriteFault::SeveredWriterStream,
     WriteFault::FetchAbort,
     WriteFault::DeadlineAbort,
+    WriteFault::SealedBeforeRootData,
+    WriteFault::SealedAfterRootPrefix,
 ];
 
 fn writer_fault_specs(cluster_size: usize) -> Vec<StatementSpec> {
@@ -2736,16 +3781,22 @@ fn writer_fault_specs(cluster_size: usize) -> Vec<StatementSpec> {
     let delayed = format!(
         "INSERT INTO {target} SELECT v FROM distributed_writer_faults.distributed_writer_fault_db.distributed_writer_fault_delay WHERE sleep(delay_s)"
     );
-    let statements = WriteStatements {
-        full: &full,
-        delayed: &delayed,
-    };
     WRITE_FAULTS
         .into_iter()
         .map(|fault| {
+            let case_full = if matches!(fault, WriteFault::SealedBeforeRootData | WriteFault::SealedAfterRootPrefix) {
+                format!("INSERT INTO distributed_writer_faults.distributed_writer_fault_db.{} SELECT v FROM distributed_writer_faults.distributed_writer_fault_db.distributed_writer_fault_source", fault.target_table())
+            } else { full.clone() };
+            let statements = WriteStatements { full: &case_full, delayed: &delayed };
             let kind = match fault {
                 WriteFault::WriterEgress => Some("connector-write-writer-failure"),
                 WriteFault::RootValidation => Some("connector-write-root-failure"),
+                WriteFault::SealedBeforeRootData => {
+                    Some("connector-write-root-read-before-data-failure")
+                }
+                WriteFault::SealedAfterRootPrefix => {
+                    Some("connector-write-root-read-after-prefix-failure")
+                }
                 WriteFault::PartialAggregateUpdate => {
                     Some("connector-write-partial-update-failure")
                 }
@@ -2765,7 +3816,11 @@ fn writer_fault_specs(cluster_size: usize) -> Vec<StatementSpec> {
                 faults: kind
                     .map(|kind| {
                         if matches!(fault, WriteFault::SeveredWriterStream) {
-                            vec![(SEVERED_BACKEND, kind)]
+                            (0..cluster_size)
+                                .flat_map(|index| {
+                                    [(index, kind), (index, "create-task-before-worker-hold")]
+                                })
+                                .collect()
                         } else {
                             (0..cluster_size).map(|index| (index, kind)).collect()
                         }
@@ -2881,6 +3936,83 @@ mod controlled_writer_tests {
     use super::*;
 
     #[test]
+    fn original_parquet_row_bag_rejects_a_missing_or_changed_sealed_peer() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        fn write(path: &Path, values: &[i64]) {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(values.to_vec()))],
+            )
+            .unwrap();
+            let mut writer =
+                ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let left = directory.path().join("left.parquet");
+        let right = directory.path().join("right.parquet");
+        let rows = (1..=SEED_ROWS).collect::<Vec<_>>();
+        let split = rows.len() / 2;
+        write(&left, &rows[..split]);
+        write(&right, &rows[split..]);
+        let objects = vec![
+            SealedRootObject::observe(left.clone()).unwrap(),
+            SealedRootObject::observe(right.clone()).unwrap(),
+        ];
+        assert_sealed_root_row_bag(&objects).unwrap();
+        // The directory stays nonempty and every surviving file is real.
+        // Neither condition may stand in for the complete original inputs.
+        assert!(assert_sealed_root_row_bag(&objects[..1]).is_err());
+        let mut changed = rows[split..].to_vec();
+        changed[0] = rows[0];
+        write(&right, &changed);
+        assert!(assert_sealed_root_row_bag(&objects).is_err());
+        write(&right, &[]);
+        assert!(assert_sealed_root_row_bag(&objects).is_err());
+    }
+
+    #[test]
+    fn connector_failure_requires_the_complete_canonical_publication_message() {
+        let id = "018f1f07-1234-7000-8000-00000000000a";
+        for public in [
+            "[query.execution.unexpected] Unexpected failure (reason 4:10)",
+            "[query.execution.invalid_data] Invalid data (reason 4:9)",
+            "[query.execution.deadline_exceeded] logical execution deadline expired before success EOF",
+        ] {
+            let complete = format!(
+                "{public} (lake publication id={id} family=write disposition=KnownUncommitted)"
+            );
+            assert!(exact_uncommitted_write_publication_message(
+                &complete, public
+            ));
+            for wrong in [
+                public.to_owned(),
+                complete.replace("family=write", "family=data_mutation"),
+                complete.replace("KnownUncommitted", "CommitUnknown"),
+                complete.replace("KnownUncommitted", "CommittedSucceeded"),
+                complete.replace(id, "not-a-publication-id"),
+                complete.replace(id, "018f1f07-1234-4000-8000-00000000000a"),
+                complete.replace(id, &id.to_uppercase()),
+                complete.replace(" family=write", " extra=true family=write"),
+                complete.replace(" family=write", "  family=write"),
+                format!("{complete} trailing"),
+                format!("prefix {complete}"),
+            ] {
+                assert!(!exact_uncommitted_write_publication_message(&wrong, public));
+            }
+            assert!(!exact_uncommitted_write_publication_message(
+                &complete,
+                "[query.execution.unexpected] Unexpected failure (reason 4:9)"
+            ));
+        }
+    }
+
+    #[test]
     fn pre_dispatch_uncommitted_requires_one_terminal_and_all_other_labels_unchanged() {
         let before = PublicationTerminals {
             pre_dispatch_uncommitted: 10.0,
@@ -2924,7 +4056,7 @@ mod controlled_writer_tests {
     #[test]
     fn fault_matrix_has_only_targeted_write_permissions() {
         let specs = writer_fault_specs(3);
-        assert_eq!(specs.len(), 9);
+        assert_eq!(specs.len(), 11);
         assert!(specs.iter().all(|spec| {
             spec.sql
                 .starts_with("INSERT INTO distributed_writer_faults.")
@@ -2936,7 +4068,7 @@ mod controlled_writer_tests {
         }));
         assert_eq!(
             specs.iter().map(|spec| spec.faults.len()).sum::<usize>(),
-            22
+            33
         );
         assert_eq!(
             specs
@@ -2947,14 +4079,19 @@ mod controlled_writer_tests {
         );
         assert_eq!(
             specs[6].faults,
-            vec![(SEVERED_BACKEND, TASK_EXECUTION_FAILURE)]
+            (0..3)
+                .flat_map(|index| [
+                    (index, TASK_EXECUTION_FAILURE),
+                    (index, "create-task-before-worker-hold"),
+                ])
+                .collect::<Vec<_>>()
         );
         assert!(specs[7].faults.is_empty());
         assert!(specs[7].sql.ends_with("WHERE sleep(delay_s)"));
         assert!(specs.iter().flat_map(|spec| &spec.faults).all(|(_, kind)| {
             novarocks_failpoint::QueryLifecycleFaultKind::parse(kind).is_some()
         }));
-        // This is 26 FE grants: the statement owner plus 22 binds and three
+        // This is 37 FE grants: the statement owner plus 33 binds and three
         // Task observations. Seed/setup and the healthy post-matrix write
         // deliberately receive no permission.
         assert_eq!(
@@ -2962,7 +4099,7 @@ mod controlled_writer_tests {
                 .iter()
                 .map(|spec| spec.faults.len() + spec.observations.len())
                 .sum::<usize>(),
-            26
+            37
         );
     }
 }

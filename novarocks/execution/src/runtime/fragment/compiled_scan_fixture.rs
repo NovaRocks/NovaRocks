@@ -235,7 +235,7 @@ fn typed_frozen_read_with_distribution(
         .into_boxed_slice();
     let source_schema = ConnectorSourceSchemaFacts::try_new(
         shape,
-        original_source.metadata().clone(),
+        std::collections::HashMap::from(original_source.metadata()),
         source_fields,
         storage.clone(),
     )

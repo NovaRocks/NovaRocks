@@ -51,6 +51,8 @@ pub mod catalog_cache;
 pub mod catalog_config;
 pub mod catalog_control;
 mod catalog_metadata_root;
+pub use catalog_control::metadata_maintenance::metadata_maintenance_io_geometry;
+pub use commit::write_stack::control::write_control_io_geometry;
 pub mod catalog_runtime;
 pub mod change_planning;
 pub mod commit;
@@ -153,3 +155,6 @@ pub mod test_observation;
     all(not(novarocks_dev_controls), debug_assertions)
 ))]
 compile_error!("novarocks_dev_controls must match debug_assertions");
+
+/// Pure geometry of the original FE typed read factory.
+pub use typed_boundary::read_io_geometry;

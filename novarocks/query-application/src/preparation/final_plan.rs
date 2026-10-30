@@ -283,6 +283,60 @@ pub trait SqlCompletionFactSource: Send + Sync {
     ) -> Result<SqlFactBatch, String>;
 }
 
+/// A business verdict and the original physical-worker health are independent.
+pub type SqlCompletionCpuResult<T> =
+    Result<Result<T, FinalPlanCompletionError>, crate::api::StatementNativeHealthFailure>;
+
+/// The role explicitly supplies the three pure SQL operations. Metadata stays
+/// in the driver's single resolve loop; this port grants no execution capacity.
+#[async_trait]
+pub trait SqlCompletionCpuPort: Send + Sync {
+    async fn start(
+        &self,
+        request: SqlFinalPlanCompileRequest,
+    ) -> SqlCompletionCpuResult<SqlCompileProgress>;
+    async fn finish(
+        &self,
+        compilation: novarocks_sql::compiler::SqlCompilation,
+        facts: SqlFactBatch,
+        control: novarocks_sql::compiler::SqlCompileControl,
+    ) -> SqlCompletionCpuResult<SqlCompileProgress>;
+    async fn completed_candidate(
+        &self,
+        completed: novarocks_sql::compiler::SqlCompletedPlan,
+        control: novarocks_sql::compiler::SqlCompileControl,
+    ) -> SqlCompletionCpuResult<CompletedPhysicalPlanCandidate>;
+}
+
+/// The original pure operations and error projections. Scheduling is supplied
+/// by the explicit role port, never selected or defaulted inside SQL.
+pub struct SqlCompletionPureSteps;
+impl SqlCompletionPureSteps {
+    pub fn start(
+        request: SqlFinalPlanCompileRequest,
+    ) -> Result<SqlCompileProgress, FinalPlanCompletionError> {
+        let control = request.control().clone();
+        SqlCompiler::start(
+            request.try_into_completion().map_err(compiler_error)?,
+            &control,
+        )
+        .map_err(compiler_progress_error)
+    }
+    pub fn finish(
+        compilation: novarocks_sql::compiler::SqlCompilation,
+        facts: SqlFactBatch,
+        control: &novarocks_sql::compiler::SqlCompileControl,
+    ) -> Result<SqlCompileProgress, FinalPlanCompletionError> {
+        SqlCompiler::finish(compilation, facts, control).map_err(compiler_progress_error)
+    }
+    pub fn completed_candidate(
+        completed: novarocks_sql::compiler::SqlCompletedPlan,
+        control: &novarocks_sql::compiler::SqlCompileControl,
+    ) -> Result<CompletedPhysicalPlanCandidate, FinalPlanCompletionError> {
+        CompletedPhysicalPlanCandidate::from_completed(completed, control)
+    }
+}
+
 /// Drives one query's pure SQL completion protocol under its admitted scope.
 ///
 /// The driver carries no resource authority. It interrupts the pending role
@@ -309,9 +363,57 @@ impl<A: Send> FinalPlanCompletionDriver<A> {
         &self,
         request: SqlFinalPlanCompileRequest,
         scope: &WorkScope,
+        taken: &ReadAccessSink<A>,
+        cpu: &dyn SqlCompletionCpuPort,
+    ) -> SqlCompletionCpuResult<CompletedPhysicalPlanCandidate> {
+        let control = request.control().clone();
+        if let Err(error) = scope.check() {
+            return Ok(Err(governance_error(error)));
+        }
+        let cancellation = match scope.cancellation() {
+            Ok(cancellation) => cancellation,
+            Err(error) => return Ok(Err(governance_error(error))),
+        };
+        let mut progress = match cpu.start(request).await? {
+            Ok(progress) => progress,
+            Err(error) => return Ok(Err(error)),
+        };
+        loop {
+            if let Err(error) = scope.check() {
+                return Ok(Err(governance_error(error)));
+            }
+            progress = match progress {
+                SqlCompileProgress::Complete(completed) => {
+                    return cpu.completed_candidate(completed, control).await;
+                }
+                SqlCompileProgress::Incomplete(compilation) => {
+                    let facts = match self
+                        .resolve(
+                            &cancellation,
+                            control.deadline(),
+                            compilation.needs(),
+                            taken,
+                        )
+                        .await
+                    {
+                        Ok(facts) => facts,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    match cpu.finish(compilation, facts, control.clone()).await? {
+                        Ok(progress) => progress,
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+            };
+        }
+    }
+
+    /// Consume the original Source sink only after the borrowed loop returns.
+    pub fn pair_completed(
+        candidate: Result<CompletedPhysicalPlanCandidate, FinalPlanCompletionError>,
+        taken: ReadAccessSink<A>,
     ) -> Result<CompletedPlanWithAccess<A>, FinalPlanCompletionFailure<A>> {
-        let taken = ReadAccessSink::new();
-        let candidate = match self.complete_plan(request, scope, &taken).await {
+        let candidate = match candidate {
             Ok(candidate) => candidate,
             Err(error) => return Err(FinalPlanCompletionFailure::new(error, taken.into_taken())),
         };
@@ -324,43 +426,6 @@ impl<A: Send> FinalPlanCompletionDriver<A> {
         CompletedPlanWithAccess::try_pair(candidate, access).map_err(|(error, access)| {
             FinalPlanCompletionFailure::new(access_error(error), access.into_taken())
         })
-    }
-
-    async fn complete_plan(
-        &self,
-        request: SqlFinalPlanCompileRequest,
-        scope: &WorkScope,
-        taken: &ReadAccessSink<A>,
-    ) -> Result<CompletedPhysicalPlanCandidate, FinalPlanCompletionError> {
-        let control = request.control().clone();
-        scope.check().map_err(governance_error)?;
-        let cancellation = scope.cancellation().map_err(governance_error)?;
-        let mut progress = SqlCompiler::start(
-            request.try_into_completion().map_err(compiler_error)?,
-            &control,
-        )
-        .map_err(compiler_progress_error)?;
-
-        loop {
-            scope.check().map_err(governance_error)?;
-            progress = match progress {
-                SqlCompileProgress::Complete(completed) => {
-                    return CompletedPhysicalPlanCandidate::from_completed(completed, &control);
-                }
-                SqlCompileProgress::Incomplete(compilation) => {
-                    let facts = self
-                        .resolve(
-                            &cancellation,
-                            control.deadline(),
-                            compilation.needs(),
-                            taken,
-                        )
-                        .await?;
-                    SqlCompiler::finish(compilation, facts, &control)
-                        .map_err(compiler_progress_error)?
-                }
-            };
-        }
     }
 
     async fn resolve(
@@ -386,6 +451,51 @@ impl<A: Send> FinalPlanCompletionDriver<A> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+struct PureSqlCompletionCpuFixture;
+#[cfg(test)]
+#[async_trait]
+impl SqlCompletionCpuPort for PureSqlCompletionCpuFixture {
+    async fn start(
+        &self,
+        request: SqlFinalPlanCompileRequest,
+    ) -> SqlCompletionCpuResult<SqlCompileProgress> {
+        Ok(SqlCompletionPureSteps::start(request))
+    }
+    async fn finish(
+        &self,
+        compilation: novarocks_sql::compiler::SqlCompilation,
+        facts: SqlFactBatch,
+        control: novarocks_sql::compiler::SqlCompileControl,
+    ) -> SqlCompletionCpuResult<SqlCompileProgress> {
+        Ok(SqlCompletionPureSteps::finish(compilation, facts, &control))
+    }
+    async fn completed_candidate(
+        &self,
+        completed: novarocks_sql::compiler::SqlCompletedPlan,
+        control: novarocks_sql::compiler::SqlCompileControl,
+    ) -> SqlCompletionCpuResult<CompletedPhysicalPlanCandidate> {
+        Ok(SqlCompletionPureSteps::completed_candidate(
+            completed, &control,
+        ))
+    }
+}
+#[cfg(test)]
+impl<A: Send> FinalPlanCompletionDriver<A> {
+    pub(crate) async fn complete_for_test(
+        &self,
+        request: SqlFinalPlanCompileRequest,
+        scope: &WorkScope,
+    ) -> Result<CompletedPlanWithAccess<A>, FinalPlanCompletionFailure<A>> {
+        let taken = ReadAccessSink::new();
+        let candidate = self
+            .complete(request, scope, &taken, &PureSqlCompletionCpuFixture)
+            .await
+            .expect("pure fixture has no physical worker");
+        Self::pair_completed(candidate, taken)
     }
 }
 
@@ -735,7 +845,7 @@ mod tests {
         let (_root, scope) = scope();
 
         let completed = driver
-            .complete(values_request(), &scope)
+            .complete_for_test(values_request(), &scope)
             .await
             .expect("VALUES final plan completion");
         // A statement that scans no provider publishes an empty sidecar, not
@@ -759,7 +869,7 @@ mod tests {
         }));
         let (_root, scope) = scope();
         let completed = driver
-            .complete(
+            .complete_for_test(
                 request(
                     "SELECT COUNT(*)",
                     SqlCompileControl::unbounded(),
@@ -838,7 +948,10 @@ mod tests {
             calls: AtomicUsize::new(0),
         }));
         let (_root, scope) = scope();
-        let completed = driver.complete(values_request(), &scope).await.unwrap();
+        let completed = driver
+            .complete_for_test(values_request(), &scope)
+            .await
+            .unwrap();
         let plan = completed.candidate().plan();
         assert!(!plan.constants().entries().is_empty());
         assert!(
@@ -899,7 +1012,7 @@ mod tests {
         let driver = FinalPlanCompletionDriver::new(source.clone());
         let (_root, scope) = scope();
         let completed = driver
-            .complete(
+            .complete_for_test(
                 request(
                     "SELECT 1",
                     SqlCompileControl::unbounded(),
@@ -938,7 +1051,7 @@ mod tests {
         let (_root, scope) = scope();
         for client in [false, true] {
             let completed = driver
-                .complete(
+                .complete_for_test(
                     request(
                         "SELECT 1 AS display",
                         SqlCompileControl::unbounded(),
@@ -963,8 +1076,13 @@ mod tests {
                 .unwrap();
             let output = if client {
                 FrozenRootOutput::ClientRows(
-                    novarocks_sql::compiler::client_render_schema(completed.candidate().plan(), 0)
-                        .unwrap(),
+                    novarocks_sql::compiler::client_render_schema(
+                        completed.candidate().plan(),
+                        novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
+                            timezone_offset_seconds: 0,
+                        },
+                    )
+                    .unwrap(),
                 )
             } else {
                 FrozenRootOutput::CountOnly
@@ -998,7 +1116,10 @@ mod tests {
             calls: AtomicUsize::new(0),
         }));
         let (_root, scope) = scope();
-        let completed = driver.complete(values_request(), &scope).await.unwrap();
+        let completed = driver
+            .complete_for_test(values_request(), &scope)
+            .await
+            .unwrap();
         let alias = completed.candidate().clone();
         let (_, access) = completed
             .freeze_root_output(novarocks_result_contract::FrozenRootOutput::CountOnly)
@@ -1020,7 +1141,7 @@ mod tests {
         }));
         let (_root, scope) = scope();
         let completed = driver
-            .complete(values_request(), &scope)
+            .complete_for_test(values_request(), &scope)
             .await
             .expect("VALUES final plan completion");
         assert!(
@@ -1043,7 +1164,7 @@ mod tests {
         let (_root, scope) = scope();
 
         let candidate = driver
-            .complete(
+            .complete_for_test(
                 request(
                     "SELECT 1",
                     SqlCompileControl::unbounded(),
@@ -1090,7 +1211,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(10);
 
         let error = driver
-            .complete(
+            .complete_for_test(
                 request(
                     "SELECT * FROM iceberg.db.orders",
                     SqlCompileControl::new(deadline.into(), Arc::new(NeverCancelled)),

@@ -731,7 +731,7 @@ fn nullsafe_source_carrier_and_logical_metadata_are_checked_before_selected_null
         .iter()
         .map(|field| {
             let mut metadata = field.metadata().clone();
-            metadata.insert("nr_logical_type".into(), "Json".into());
+            metadata.insert("nr_logical_type".to_string(), "Json".to_string());
             field.as_ref().clone().with_metadata(metadata)
         })
         .collect::<Vec<_>>();

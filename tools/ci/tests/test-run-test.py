@@ -41,11 +41,95 @@ run = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(run)
 
 
+def start_controlling_shell(terminal, case, command):
+    # Install the original parent's exit receipt before its one foreground job.
+    # Source a private file: a long interactive input line can block on PTY echo.
+    script = case.parent / (case.name + ".shell.sh")
+    jobs = shlex.quote(str(case / "shell-jobs-before-wait.txt"))
+    remaining = shlex.quote(str(case / "shell-jobs-after-wait.txt"))
+    receipt = shlex.quote(str(case / "shell-child-wait.tsv"))
+    contents = ("umask 077\n"
+        "original_child_exit() {\n"
+        " trap '' HUP\n"
+        " jobs -p > " + jobs + "\n"
+        " if [ -s " + jobs + " ]; then kill -HUP %1; kill -CONT %1; fi\n"
+        " owner_count=0; owner_status=0\n"
+        " while IFS= read -r original_pid; do\n"
+        "  owner_count=$((owner_count + 1))\n"
+        "  wait \"$original_pid\"\n"
+        "  owner_status=$?\n"
+        " done < " + jobs + "\n"
+        " jobs -p > " + remaining + "\n"
+        " if [ ! -s " + remaining + " ]; then owner_empty=true; else owner_empty=false; fi\n"
+        " printf '%s\\t%s\\t%s\\t%s\\n' \"$$\" \"$owner_status\" \"$owner_empty\" \"$owner_count\" > " + receipt + "\n"
+        "}\n"
+        "trap original_child_exit EXIT\n" + command + "\n")
+    with os.fdopen(os.open(script, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
+        output.write(contents)
+    os.write(terminal, ("source " + shlex.quote(str(script)) + "\n").encode())
+
+
 def exit_controlling_shell(terminal):
-    # Every case has a fresh shell with exactly one owned job. Reconcile that
-    # job through Bash before exit: a wrapper receipt does not reap its owner.
-    # Keep the normal stopped-job warning and the original bounded shell wait.
+    # The installed EXIT trap performs the real parent wait for this same job.
     os.write(terminal, b"fg %1\nexit\n")
+
+
+def finish_controlling_shell(test, case, trace, shell, terminal, waited, deadline):
+    # Close our master first and bound observation by the original five seconds.
+    # The Bash EXIT trap owns child wait; this parent owns only shell wait.
+    deadline = deadline if deadline is not None else time.monotonic() + 5
+    primary_active = sys.exc_info()[0] is not None
+    cleanup = dict(shell_pid=shell, shell_reaped=waited, shell_wait_status=None,
+                   terminal_closed=terminal < 0, errors=[], owner_wait=None)
+    try:
+        if terminal >= 0:
+            try:
+                os.close(terminal)
+                cleanup["terminal_closed"] = True
+            except OSError as error:
+                cleanup["errors"].append("close original PTY master: " + str(error))
+            terminal = -1
+        while not waited and time.monotonic() < deadline:
+            try:
+                child, status = os.waitpid(shell, os.WNOHANG)
+            except OSError as error:
+                cleanup["errors"].append("wait original shell: " + str(error))
+                break
+            if child:
+                waited = True
+                cleanup["shell_wait_status"] = status
+                break
+            time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+        cleanup["shell_reaped"] = waited
+        receipt = case / "shell-child-wait.tsv"
+        if receipt.is_file():
+            try:
+                fields = receipt.read_text().strip().split("\t")
+                if len(fields) != 4 or int(fields[0]) != shell or fields[2] not in ("true", "false"):
+                    raise ValueError("original shell child-wait receipt differs")
+                count = int(fields[3])
+                if count not in (0, 1):
+                    raise ValueError("original controlling shell had more than its one job")
+                cleanup["owner_wait"] = dict(shell_pid=int(fields[0]), wait_command_status=int(fields[1]),
+                                              jobs_empty=fields[2] == "true", waited_job_count=count)
+            except (OSError, ValueError) as error:
+                cleanup["errors"].append("original child-wait receipt: " + str(error))
+        cleanup["owner_exit_confirmed"] = bool(
+            waited and cleanup["owner_wait"] and cleanup["owner_wait"]["jobs_empty"])
+        if not cleanup["owner_exit_confirmed"]:
+            cleanup["errors"].append("original shell child exit remains unconfirmed")
+        if not waited:
+            cleanup["errors"].append("original shell exit remains unobserved at cleanup deadline")
+    finally:
+        cleanup["original_root_retained"] = bool(cleanup["errors"])
+        if cleanup["original_root_retained"]:
+            test.retain_original_root = True
+        retain_pty_observation(case, trace, shell, terminal, waited)
+        (case / "pty-cleanup.json").write_text(json.dumps(cleanup, indent=2) + "\n")
+    # A cleanup refusal must not hide the first assertion. Retain the same root
+    # rather than deleting or moving input files still owned by unresolved work.
+    if cleanup["errors"] and not primary_active:
+        raise AssertionError("original controlling shell cleanup remained unresolved: " + "; ".join(cleanup["errors"]))
 
 
 def retain_pty_observation(case, trace, shell, terminal, waited):
@@ -56,13 +140,25 @@ def retain_pty_observation(case, trace, shell, terminal, waited):
         indent=2) + "\n")
 
 
+def controlling_shell_events(test, events):
+    # A shared fixture cannot start another event while its original work remains.
+    for event in events:
+        if test.retain_original_root:
+            return
+        yield event
+
+
 class Materials(unittest.TestCase):
     def setUp(self):
         (REPO / "target").mkdir(exist_ok=True)
-        self.temporary = tempfile.TemporaryDirectory(prefix="test-run-tests-", dir=REPO / "target")
-        self.root = Path(self.temporary.name)
+        self.root = Path(tempfile.mkdtemp(prefix="test-run-tests-", dir=REPO / "target"))
+        self.retain_original_root = False
 
     def tearDown(self):
+        if self.retain_original_root:
+            (self.root / "retained-original-root.json").write_text(json.dumps(dict(
+                original_root=str(self.root), reason="original PTY cleanup remained unresolved"),
+                indent=2) + "\n")
         evidence = os.environ.get("NOVA_CI_TEST_EVIDENCE_ROOT")
         if evidence:
             destination = Path(evidence) / self.id()
@@ -75,7 +171,8 @@ class Materials(unittest.TestCase):
                         target = destination / source.relative_to(self.root)
                         target.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(source, target)
-        self.temporary.cleanup()
+        if not self.retain_original_root:
+            shutil.rmtree(self.root)
 
 
     def test_controlling_shell_reaps_its_stopped_owner_after_wrapper_exit(self):
@@ -96,6 +193,7 @@ class Materials(unittest.TestCase):
             os.execl("/bin/bash", "bash", "--noprofile", "--norc", "-i")
         trace = bytearray()
         waited = False
+        cleanup_deadline = None
         def turn():
             readable, _, _ = select.select([terminal], [], [], 0.02)
             if readable:
@@ -105,7 +203,7 @@ class Materials(unittest.TestCase):
                     pass
         try:
             command = " ".join(shlex.quote(value) for value in [sys.executable, str(owner), str(case)])
-            os.write(terminal, (command + "\n").encode())
+            start_controlling_shell(terminal, case, command)
             receipt = case / "actual-wrapper-exit.json"
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
@@ -119,8 +217,8 @@ class Materials(unittest.TestCase):
             self.assertEqual(os.WEXITSTATUS(actual["wait_status"]), 0)
             self.assertFalse((case / "owner-continued.json").exists())
             exit_controlling_shell(terminal)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
+            cleanup_deadline = time.monotonic() + 5
+            while time.monotonic() < cleanup_deadline:
                 child, status = os.waitpid(shell, os.WNOHANG)
                 if child:
                     waited = True
@@ -131,17 +229,145 @@ class Materials(unittest.TestCase):
             self.assertEqual(os.WEXITSTATUS(status), 0)
             self.assertTrue((case / "owner-continued.json").is_file())
         finally:
+            finish_controlling_shell(self, case, trace, shell, terminal, waited, cleanup_deadline)
+
+    def test_unresolved_pty_owner_retains_inputs_and_blocks_shared_fixture_suffix(self):
+        case = self.root / "unresolved-owner"
+        case.mkdir()
+        payload = case / "original-input.txt"
+        payload.write_bytes(b"original shared fixture input")
+        owner = case / "owner.py"
+        owner.write_text("import json,os,signal,sys\nfrom pathlib import Path\n"
+            "root=Path(sys.argv[1]);release=int(sys.argv[2])\n"
+            "for number in (signal.SIGHUP,signal.SIGTERM): signal.signal(number,signal.SIG_IGN)\n"
+            "(root/'owner-ready.json').write_text(json.dumps(dict(pid=os.getpid())))\n"
+            "assert os.read(release,1)==b'R'\nos.close(release)\n"
+            "(root/'owner-exit.json').write_text(json.dumps(dict(pid=os.getpid(),released=True)))\n")
+        release_read, release_write = os.pipe()
+        os.set_inheritable(release_read, True)
+        owner_release_read = release_read
+        shell, terminal, waited, status = None, -1, False, None
+        original_failure = None
+        trace = bytearray()
+        # The component owns one eight-second case cut, including post-release
+        # observation. An expired cleanup cut below never gets another five seconds.
+        case_deadline = time.monotonic() + 8
+
+        def release_and_reap_after_tear_down():
+            nonlocal terminal, release_read, release_write, waited, status
+            root_retained = self.root.is_dir()
+            payload_retained = payload.is_file() and payload.read_bytes() == b"original shared fixture input"
+            retained_record = (self.root / "retained-original-root.json").is_file()
+            failure_path = case / "pty-cleanup.json"
+            failure_unchanged = failure_path.is_file() and failure_path.read_bytes() == original_failure
+            errors = []
+            # Release belongs to this creator and was held before the original
+            # Bash/job existed. No PID-based recovery or new actor is introduced.
             try:
-                retain_pty_observation(case, trace, shell, terminal, waited)
+                os.write(release_write, b"R")
+            except OSError as error:
+                errors.append("release original component owner: " + str(error))
             finally:
-                if not waited:
+                for descriptor in (release_read, release_write, terminal):
+                    if descriptor >= 0:
+                        try:
+                            os.close(descriptor)
+                        except OSError as error:
+                            errors.append("close original component endpoint: " + str(error))
+                release_read, release_write, terminal = -1, -1, -1
+            while shell is not None and not waited:
+                try:
+                    child, status = os.waitpid(shell, os.WNOHANG)
+                except OSError as error:
+                    errors.append("reap original component shell: " + str(error))
+                    break
+                if child:
+                    waited = True
+                    break
+                if time.monotonic() >= case_deadline:
+                    break
+                time.sleep(min(0.02, max(0, case_deadline - time.monotonic())))
+            receipt = case / "shell-child-wait.tsv"
+            fields = receipt.read_text().strip().split("\t") if receipt.is_file() else []
+            owner_exit = case / "owner-exit.json"
+            completed = json.loads(owner_exit.read_text()) if owner_exit.is_file() else None
+            ready = case / "owner-ready.json"
+            original = json.loads(ready.read_text()) if ready.is_file() else None
+            owner_reaped = bool(waited and len(fields) == 4 and fields[0] == str(shell)
+                                and fields[2] == "true" and fields[3] in ("0", "1")
+                                and original and completed == dict(pid=original["pid"], released=True))
+            result = dict(shell_pid=shell, shell_reaped=waited, shell_wait_status=status,
+                          owner_exit_confirmed=owner_reaped, errors=errors,
+                          root_retained_after_tear_down=root_retained,
+                          input_retained_after_tear_down=payload_retained,
+                          retained_root_record=retained_record,
+                          original_cleanup_failure_unchanged=failure_unchanged)
+            if case.is_dir():
+                (case / "post-release-reap.json").write_text(json.dumps(result, indent=2) + "\n")
+                evidence = os.environ.get("NOVA_CI_TEST_EVIDENCE_ROOT")
+                if evidence:
+                    destination = Path(evidence) / self.id() / "post-release"
+                    destination.mkdir(parents=True, exist_ok=False)
+                    for name in ("post-release-reap.json", "owner-exit.json", "shell-child-wait.tsv",
+                                 "shell-jobs-before-wait.txt", "shell-jobs-after-wait.txt"):
+                        source = case / name
+                        if source.is_file():
+                            shutil.copy2(source, destination / name)
+                # The failed cleanup snapshot remains unchanged. Only this
+                # creator's later actual reaps permit disposing its original root.
+                if owner_reaped and not errors:
+                    shutil.rmtree(self.root)
+            self.assertTrue(root_retained, result)
+            self.assertTrue(payload_retained, result)
+            self.assertTrue(retained_record, result)
+            self.assertTrue(failure_unchanged, result)
+            self.assertTrue(waited, result)
+            self.assertTrue(owner_reaped, result)
+            self.assertEqual(errors, [], result)
+
+        self.addCleanup(release_and_reap_after_tear_down)
+        try:
+            shell, terminal = pty.fork()
+            if shell == 0:
+                os.close(release_write)
+                os.execl("/bin/bash", "bash", "--noprofile", "--norc", "-i")
+            os.close(release_read)
+            release_read = -1
+            command = " ".join(shlex.quote(value) for value in [sys.executable, str(owner), str(case), str(owner_release_read)])
+            # The inherited descriptor number is captured before the parent's close.
+            # Use the actual pipe read descriptor rather than reconstructing an owner.
+            start_controlling_shell(terminal, case, command)
+            ready = case / "owner-ready.json"
+            while not ready.is_file() and time.monotonic() < case_deadline:
+                readable, _, _ = select.select([terminal], [], [], 0.02)
+                if readable:
                     try:
-                        os.write(terminal, b"kill -TERM %1; kill -CONT %1; wait; exit\n")
-                        os.kill(shell, signal.SIGHUP)
-                    except (OSError, ProcessLookupError):
+                        trace.extend(os.read(terminal, 65536))
+                    except OSError:
                         pass
-                    os.waitpid(shell, 0)
-                os.close(terminal)
+            self.assertTrue(ready.is_file(), trace.decode(errors="replace"))
+            child, status = os.waitpid(shell, os.WNOHANG)
+            waited = bool(child)
+            self.assertFalse(waited, "original pipe-held owner unexpectedly exited")
+            events = controlling_shell_events(self, ("original", "must-not-start"))
+            self.assertEqual(next(events), "original")
+            # Model entry after the normal absolute cleanup budget was already spent.
+            cleanup_deadline = time.monotonic()
+            endpoint, terminal = terminal, -1
+            with self.assertRaisesRegex(AssertionError, "original controlling shell cleanup remained unresolved"):
+                finish_controlling_shell(self, case, trace, shell, endpoint, waited, cleanup_deadline)
+            original_failure = (case / "pty-cleanup.json").read_bytes()
+            cleanup = json.loads(original_failure)
+            self.assertFalse(cleanup["shell_reaped"])
+            self.assertFalse(cleanup["owner_exit_confirmed"])
+            self.assertTrue(cleanup["original_root_retained"])
+            self.assertTrue(cleanup["errors"])
+            self.assertTrue(self.retain_original_root)
+            self.assertEqual(list(events), [], "unresolved original work admitted a shared-fixture suffix")
+
+        finally:
+            if shell is not None and not waited:
+                self.retain_original_root = True
 
     def context(self, name="run"):
         root = self.root / name
@@ -879,7 +1105,8 @@ while True:
             " elif os.WIFEXITED(status) or os.WIFSIGNALED(status):\n"
             "  Path(sys.argv[2],'actual-wrapper-exit.json').write_text(json.dumps(dict(pid=pid,wait_status=status)))\n"
             "  break\n")
-        for event in ("pause", "TTIN", "TTOU", "pause-TERM", "INT", "QUIT", "HUP", "TERM", "close", "doc-pause", "doc-TERM"):
+        for event in controlling_shell_events(self, (
+                "pause", "TTIN", "TTOU", "pause-TERM", "INT", "QUIT", "HUP", "TERM", "close", "doc-pause", "doc-TERM")):
             with self.subTest(event=event):
                 case = self.root / event
                 argv_file = self.root / (event + ".argv.json")
@@ -911,9 +1138,10 @@ while True:
                         turn()
                     self.fail("PTY did not reach expected state: " + trace.decode(errors="replace")[-3000:])
                 waited = False
+                cleanup_deadline = None
                 try:
                     command = " ".join(shlex.quote(value) for value in [sys.executable, str(owner), str(helper), str(case), str(argv_file), adapter])
-                    os.write(terminal, (command + "\n").encode())
+                    start_controlling_shell(terminal, case, command)
                     until(ready.exists)
                     pid = int((case / "wrapper.pid").read_text())
                     if event in ("pause", "TTIN", "TTOU", "pause-TERM", "doc-pause"):
@@ -959,8 +1187,8 @@ while True:
                         self.assertEqual(result["cancelled"], [getattr(signal, "SIG" + event.removeprefix("doc-"))])
                     if terminal >= 0:
                         exit_controlling_shell(terminal)
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline:
+                    cleanup_deadline = time.monotonic() + 5
+                    while time.monotonic() < cleanup_deadline:
                         child, status = os.waitpid(shell, os.WNOHANG)
                         if child:
                             waited = True
@@ -968,18 +1196,7 @@ while True:
                         turn()
                     self.assertTrue(waited, "controlling shell did not exit")
                 finally:
-                    try:
-                        retain_pty_observation(case, trace, shell, terminal, waited)
-                    finally:
-                        if not waited:
-                            try:
-                                os.write(terminal, b"kill -TERM %1; kill -CONT %1; wait; exit\n")
-                                os.kill(shell, signal.SIGHUP)
-                            except (OSError, ProcessLookupError):
-                                pass
-                            os.waitpid(shell, 0)
-                        if terminal >= 0:
-                            os.close(terminal)
+                    finish_controlling_shell(self, case, trace, shell, terminal, waited, cleanup_deadline)
 
 
 if __name__ == "__main__":

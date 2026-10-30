@@ -1,41 +1,75 @@
 {
-  "schema": 1,
+  "schema": 2,
   "images": {
     "paimon-spark-base": {
       "source": "apache/spark",
-      "platform": "linux/amd64",
-      "manifest_digest": "sha256:b2da01c5855fdf791328a6fa1267b406336a535d39abc05699214a48bee95955",
-      "alias": "novarocks/fixture-paimon-spark-base:b2da01c5855f"
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:b2da01c5855fdf791328a6fa1267b406336a535d39abc05699214a48bee95955",
+          "alias": "novarocks/fixture-paimon-spark-base:b2da01c5855f"
+        }
+      }
     },
     "iceberg-spark-base": {
       "source": "apache/spark",
-      "platform": "linux/arm64",
-      "manifest_digest": "sha256:96dc2bada923824300e1ece564389258934655ba6f463d6daff8753ff0c639ce",
-      "alias": "novarocks/fixture-iceberg-spark-base:96dc2bada923"
-    },
-    "minio": {
-      "source": "quay.io/minio/minio",
-      "platform": "linux/arm64",
-      "manifest_digest": "sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
-      "alias": "novarocks/fixture-minio:14cea493d9a3"
-    },
-    "minio-mc": {
-      "source": "quay.io/minio/mc",
-      "platform": "linux/arm64",
-      "manifest_digest": "sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
-      "alias": "novarocks/fixture-minio-mc:a7fe349ef4bd"
+      "variants": {
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "manifest_digest": "sha256:96dc2bada923824300e1ece564389258934655ba6f463d6daff8753ff0c639ce",
+          "alias": "novarocks/fixture-iceberg-spark-base:96dc2bada923"
+        },
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:bb8a7f0e5a98a627dca8c1502b959a2ca010b59fe104901123934243e7cc3537",
+          "alias": "novarocks/fixture-iceberg-spark-base:bb8a7f0e5a98"
+        }
+      }
     },
     "iceberg-rest": {
       "source": "apache/iceberg-rest-fixture",
-      "platform": "linux/arm64",
-      "manifest_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
-      "alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9"
+      "variants": {
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "manifest_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+          "alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9"
+        },
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:319afc30ef94300f79987b1d185c4911576db0cdfaa98246cb42757ec4d53463",
+          "alias": "novarocks/fixture-iceberg-rest:319afc30ef94"
+        }
+      }
     },
     "gradle-builder": {
       "source": "gradle",
-      "platform": "linux/arm64",
-      "manifest_digest": "sha256:ce50078d456e497bc86b76d386503e84aa45416d85069ad66bc072bf07566b25",
-      "alias": "novarocks/fixture-gradle-builder:ce50078d456e"
+      "variants": {
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "manifest_digest": "sha256:ce50078d456e497bc86b76d386503e84aa45416d85069ad66bc072bf07566b25",
+          "alias": "novarocks/fixture-gradle-builder:ce50078d456e"
+        },
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:b6db376528d71be79c82e173c2e85769b8cc78fccbf3dc6810b9a54706076b99",
+          "alias": "novarocks/fixture-gradle-builder:b6db376528d7"
+        }
+      }
+    },
+    "minio-runtime": {
+      "source": "alpine",
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "manifest_digest": "sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f",
+          "alias": "novarocks/fixture-minio-runtime:amd64-2e0b81d60597"
+        },
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "manifest_digest": "sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f",
+          "alias": "novarocks/fixture-minio-runtime:arm64-2e0b81d60597"
+        }
+      }
     }
   },
   "artifacts": {
@@ -73,12 +107,340 @@
       "url": "https://archive.apache.org/dist/iceberg/apache-iceberg-1.10.1/apache-iceberg-1.10.1.tar.gz",
       "bytes": 9216396,
       "sha1": "09690aa963fd38cefdba69a0d4c7b4eabe0d9ed1"
+    },
+    "minio-source.tar.gz": {
+      "url": "https://codeload.github.com/minio/minio/tar.gz/9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a",
+      "bytes": 24232282,
+      "sha1": "e0da54ffbde3a52844e594aab2bcf81f5a591982",
+      "sha256": "45521908307306e925c98d629e1c17d78c8b72b6ee242b1bfb1409f7d8ee5841"
+    },
+    "go-linux-amd64.tar.gz": {
+      "url": "https://mirrors.aliyun.com/golang/go1.24.8.linux-amd64.tar.gz",
+      "bytes": 78694215,
+      "sha1": "9071e95ff130fd0e5b00a62d68044b48af574985",
+      "sha256": "6842c516ca66c89d648a7f1dbe28e28c47b61b59f8f06633eb2ceb1188e9251d"
+    },
+    "go-linux-arm64.tar.gz": {
+      "url": "https://mirrors.aliyun.com/golang/go1.24.8.linux-arm64.tar.gz",
+      "bytes": 74938272,
+      "sha1": "3c131b2fa3530442b4441b8576650afafb686513",
+      "sha256": "38ac33b4cfa41e8a32132de7a87c6db49277ab5c0de1412512484db1ed77637e"
+    },
+    "mc-source.tar.gz": {
+      "url": "https://codeload.github.com/minio/mc/tar.gz/7394ce0dd2a80935aded936b09fa12cbb3cb8096",
+      "bytes": 564228,
+      "sha1": "c485fd0b0692dea74ff0440f92f30eaf4e19f9d5",
+      "sha256": "95cd293c7119f16921a6dc515a1fb74a2227f19fd994b9c8b770a154e802ac44"
+    },
+    "credentials-java-0.3.10.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/aliyun/credentials-java/0.3.10/credentials-java-0.3.10.jar",
+      "bytes": 115009,
+      "sha1": "424bdaac6762138088ac18e33cb28e6f510b8097",
+      "sha256": "c844d9bbfa84508dc54af60931f9a5ba717332067fba17c93d0e9adb30468741"
+    },
+    "tea-1.4.2.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/aliyun/tea/1.4.2/tea-1.4.2.jar",
+      "bytes": 58012,
+      "sha1": "3170fe899be5e0deedb04d277ce20ff80fb6e161",
+      "sha256": "3f5fe31c8548e3ae9a277fd4c14b8951f560116750db2b6ee904067db37ebb82"
+    },
+    "okhttp-4.12.0.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/squareup/okhttp3/okhttp/4.12.0/okhttp-4.12.0.jar",
+      "bytes": 789531,
+      "sha1": "2f4525d4a200e97e1b87449c2cd9bd2e25b7e8cd",
+      "sha256": "b1050081b14bb7a3a7e55a4d3ef01b5dcfabc453b4573a4fc019767191d5f4e0"
+    },
+    "okio-3.6.0.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/squareup/okio/okio/3.6.0/okio-3.6.0.jar",
+      "bytes": 25744,
+      "sha1": "8bf9683c80762d7dd47db12b68e99abea2a7ae05",
+      "sha256": "8e63292e5c53bb93c4a6b0c213e79f15990fed250c1340f1c343880e1c9c39b5"
+    },
+    "okio-jvm-3.6.0.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/squareup/okio/okio-jvm/3.6.0/okio-jvm-3.6.0.jar",
+      "bytes": 359580,
+      "sha1": "5600569133b7bdefe1daf9ec7f4abeb6d13e1786",
+      "sha256": "67543f0736fc422ae927ed0e504b98bc5e269fda0d3500579337cb713da28412"
+    },
+    "kotlin-stdlib-common-1.9.10.jar": {
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-common/1.9.10/kotlin-stdlib-common-1.9.10.jar",
+      "bytes": 225141,
+      "sha1": "dafaf2c27f27c09220cee312df10917d9a5d97ce",
+      "sha256": "cde3341ba18a2ba262b0b7cf6c55b20c90e8d434e42c9a13e6a3f770db965a88"
+    },
+    "kotlin-stdlib-jdk8-1.8.21.jar": {
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk8/1.8.21/kotlin-stdlib-jdk8-1.8.21.jar",
+      "bytes": 968,
+      "sha1": "67f57e154437cd9e6e9cf368394b95814836ff88",
+      "sha256": "3db752a30074f06ee6c57984aa6f27da44f4d2bbc7f5442651f6988f1cb2b7d7"
+    },
+    "kotlin-stdlib-1.8.21.jar": {
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/1.8.21/kotlin-stdlib-1.8.21.jar",
+      "bytes": 1670468,
+      "sha1": "43d50ab85bc7587adfe3dda3dbe579e5f8d51265",
+      "sha256": "042a1cd1ac976cdcfe5eb63f1d8e0b0b892c9248e15a69c8cfba495d546ea52a"
+    },
+    "annotations-13.0.jar": {
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/annotations/13.0/annotations-13.0.jar",
+      "bytes": 17536,
+      "sha1": "919f0dfe192fb4e063e7dacadee7f8bb9a2672a9",
+      "sha256": "ace2a10dc8e2d5fd34925ecac03e4988b2c0f851650c94b8cef49ba1bd111478"
+    },
+    "kotlin-stdlib-jdk7-1.8.21.jar": {
+      "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk7/1.8.21/kotlin-stdlib-jdk7-1.8.21.jar",
+      "bytes": 963,
+      "sha1": "7473b8cd3c0ef9932345baf569bc398e8a717046",
+      "sha256": "33d148db0e11debd0d90677d28242bced907f9c77730000fd597867089039d86"
+    },
+    "slf4j-api-2.0.16.jar": {
+      "url": "https://repo.maven.apache.org/maven2/org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.jar",
+      "bytes": 69435,
+      "sha1": "0172931663a09a1fa515567af5fbef00897d3c04",
+      "sha256": "a12578dde1ba00bd9b816d388a0b879928d00bab3c83c240f7013bf4196c579a"
+    },
+    "ini4j-0.5.4.jar": {
+      "url": "https://repo.maven.apache.org/maven2/org/ini4j/ini4j/0.5.4/ini4j-0.5.4.jar",
+      "bytes": 102220,
+      "sha1": "4a3ee4146a90c619b20977d65951825f5675b560",
+      "sha256": "aad60635eee567254ed29f18fb18c0f9e4c4dacf51c8229128203183bb35e2dd"
+    },
+    "gson-2.11.0.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/google/code/gson/gson/2.11.0/gson-2.11.0.jar",
+      "bytes": 298435,
+      "sha1": "527175ca6d81050b53bdd4c457a6d6e017626b0e",
+      "sha256": "57928d6e5a6edeb2abd3770a8f95ba44dce45f3b23b7a9dc2b309c581552a78b"
+    },
+    "error_prone_annotations-2.27.0.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/google/errorprone/error_prone_annotations/2.27.0/error_prone_annotations-2.27.0.jar",
+      "bytes": 19370,
+      "sha1": "91b2c29d8a6148b5e2e4930f070d4840e2e48e34",
+      "sha256": "24c923372c58e35d0b9f16a028929bb9aedc77521867c274f2bd0735df5ba1f5"
+    },
+    "org.jacoco.agent-0.8.8-runtime.jar": {
+      "url": "https://repo.maven.apache.org/maven2/org/jacoco/org.jacoco.agent/0.8.8/org.jacoco.agent-0.8.8-runtime.jar",
+      "bytes": 292790,
+      "sha1": "819fa4951ab75fba23be23f9f2793ced7fc423d7",
+      "sha256": "67de51e9ca1db044f3a3d10613518befb02e8eee1015f2ff6d56cfb9d4506546"
+    },
+    "jaxb-api-2.3.0.jar": {
+      "url": "https://repo.maven.apache.org/maven2/javax/xml/bind/jaxb-api/2.3.0/jaxb-api-2.3.0.jar",
+      "bytes": 125632,
+      "sha1": "99f802e0cb3e953ba3d6e698795c4aeb98d37c48",
+      "sha256": "883007989d373d19f352ba9792b25dec21dc7d0e205a710a93a3815101bb3d03"
+    },
+    "jaxb-core-2.3.0.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/sun/xml/bind/jaxb-core/2.3.0/jaxb-core-2.3.0.jar",
+      "bytes": 255502,
+      "sha1": "d044c784e41d026778693fb44a8026c1fd9a7506",
+      "sha256": "33061af8d2a07379d452f8f0fddcbbf518428dfd3b83d9e2d479c1948020795b"
+    },
+    "jaxb-impl-2.3.0.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/sun/xml/bind/jaxb-impl/2.3.0/jaxb-impl-2.3.0.jar",
+      "bytes": 963660,
+      "sha1": "3a3c6a62719d967175b76b63925f1fb495f11437",
+      "sha256": "edd691fc6ad7c7f3167e1a6833372367bedf6f4f2a4b8230df444a59bb3718b1"
+    },
+    "oss-python/apscheduler-3.11.3-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/42/c9/8638db32514dbb9157b3d82680c6faea89283523edf9ed2415ea3884f2ae/apscheduler-3.11.3-py3-none-any.whl",
+      "bytes": 66024,
+      "sha256": "bbeb2ec02d23d3c06a6c07ed7f0f3939ada6680eb121fae809a69bb42c537a30",
+      "sha1": "90104426d5ab40dfdd3f5cc8f851814cbf8a58d5"
+    },
+    "oss-python/aiofiles-24.1.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/a5/45/30bb92d442636f570cb5651bc661f52b610e2eec3f891a5dc3a4c3667db0/aiofiles-24.1.0-py3-none-any.whl",
+      "bytes": 15896,
+      "sha256": "b4ec55f4195e3eb5d7abd1bf7e061763e864dd4954231fb8539a0ef8bb8260e5",
+      "sha1": "cf4ace2787f5a90fbb72a8c10fcda6dd9ffe78c7"
+    },
+    "oss-python/aiohappyeyeballs-2.7.1-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/71/43/1947f06babed6b3f1d7f38b0c767f52df66bfb2bc10b468c4a7de9eceff2/aiohappyeyeballs-2.7.1-py3-none-any.whl",
+      "bytes": 15038,
+      "sha256": "9243213661e29250eb41368e5daa826fc017156c3b8a11440826b2e3ed376472",
+      "sha1": "bc972d222fbcb8b25a0c0f09b542a4c50194f57c"
+    },
+    "oss-python/aiohttp-3.14.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/a6/66/55a8904b3a129fafdf94f9cc0a2e4ca09a3c914650be52355db7ad0bbdb6/aiohttp-3.14.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "bytes": 1888041,
+      "sha256": "94684b879ac1d71e4238850c99b62dc1b28d9086b156a2555f082010b85a865c",
+      "sha1": "d3c201025a86597491eeec9cc9982a578a25a335"
+    },
+    "oss-python/aiosignal-1.4.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/fb/76/641ae371508676492379f16e2fa48f4e2c11741bd63c48be4b12a6b09cba/aiosignal-1.4.0-py3-none-any.whl",
+      "bytes": 7490,
+      "sha256": "053243f8b92b990551949e63930a839ff0cf0b0ebbe0597b0f3fb19e1a0fe82e",
+      "sha1": "f1616df72e8890bb271fbcb8d26873ed538636f3"
+    },
+    "oss-python/alibabacloud_credentials-1.0.12-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/89/40/8efa0f2efb400876f9355bde104fe98b621648182d4f076150f26c64e770/alibabacloud_credentials-1.0.12-py3-none-any.whl",
+      "bytes": 52000,
+      "sha256": "c09afcf579663374df056c20482fc1397240d20b4ccb143d23c287f3f8a91109",
+      "sha1": "6f0fe971070b3ebea0efe28401e2c4787326a175"
+    },
+    "oss-python/alibabacloud_credentials_api-1.0.1-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/0b/49/ff401af96d77d40ab918096d831bd3360f3eec60f10e65125e5789c4e617/alibabacloud_credentials_api-1.0.1-py3-none-any.whl",
+      "bytes": 2230,
+      "sha256": "5f27889113214fc53493b3e918eb26d73dfab2022e22bdaac262849b8e58cbc0",
+      "sha1": "ff4e9edf46709af10cbec60e5047b790d3946679"
+    },
+    "oss-python/alibabacloud-tea-0.4.3.tar.gz": {
+      "url": "https://files.pythonhosted.org/packages/9a/7d/b22cb9a0d4f396ee0f3f9d7f26b76b9ed93d4101add7867a2c87ed2534f5/alibabacloud-tea-0.4.3.tar.gz",
+      "bytes": 8785,
+      "sha256": "ec8053d0aa8d43ebe1deb632d5c5404339b39ec9a18a0707d57765838418504a",
+      "sha1": "1b877edb9b6ffae579243720d6ca722fee6e5f8d"
+    },
+    "oss-python/aliyun_python_sdk_core-2.16.1-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/ea/38/eb3be49159d6442e68189f21a2205a199b51ca46cf42a3f874e695ff0ba9/aliyun_python_sdk_core-2.16.1-py3-none-any.whl",
+      "bytes": 521331,
+      "sha256": "0f25a6e8ec1ea29c76610278cff81cbff85149a6e692bf2398a6f9b77e5e7424",
+      "sha1": "045c530e12f2be6209685bb0b7455176ee793c88"
+    },
+    "oss-python/aliyun_python_sdk_kms-2.16.5-py2.py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/11/5c/0132193d7da2c735669a1ed103b142fd63c9455984d48c5a88a1a516efaa/aliyun_python_sdk_kms-2.16.5-py2.py3-none-any.whl",
+      "bytes": 99495,
+      "sha256": "24b6cdc4fd161d2942619479c8d050c63ea9cd22b044fe33b60bbb60153786f0",
+      "sha1": "c3bd093994ac4e772df49967be5c32119c774e38"
+    },
+    "oss-python/attrs-26.1.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/64/b4/17d4b0b2a2dc85a6df63d1157e028ed19f90d4cd97c36717afef2bc2f395/attrs-26.1.0-py3-none-any.whl",
+      "bytes": 67548,
+      "sha256": "c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309",
+      "sha1": "46726c79267928f86dfea02aa0872d12057ace2f"
+    },
+    "oss-python/certifi-2026.10.23-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/32/d1/a3652fe2c19134d0d15922177821d863cbd7e842d53a21bbe7e8e3a1b5ac/certifi-2026.10.23-py3-none-any.whl",
+      "bytes": 135082,
+      "sha256": "e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1",
+      "sha1": "ff0f0aade1a73d1f80324ebe5f1089b856de5b4d"
+    },
+    "oss-python/cffi-2.1.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/e9/02/4e7d553a7ac4b4238b38b3c1b80d486e9d4436f8d2acbf87a0997fe3f402/cffi-2.1.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+      "bytes": 221525,
+      "sha256": "b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96",
+      "sha1": "e150218cd16489f82440caeab14bb344896b13bc"
+    },
+    "oss-python/charset_normalizer-3.5.2-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/18/24/bad3ac4271589df29cf5ce2f5ae490518a5739358052bd0d61209e6fea54/charset_normalizer-3.5.2-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "bytes": 255056,
+      "sha256": "34276fd796040bf0993ab33a369aa572e6979c7aab225a88893667ad8eac8f7a",
+      "sha1": "ac5ec250e73ff19d2f10198a238b3599fda2ede6"
+    },
+    "oss-python/crcmod-1.7.tar.gz": {
+      "url": "https://files.pythonhosted.org/packages/6b/b0/e595ce2a2527e169c3bcd6c33d2473c1918e0b7f6826a043ca1245dd4e5b/crcmod-1.7.tar.gz",
+      "bytes": 89670,
+      "sha256": "dc7051a0db5f2bd48665a990d3ec1cc305a466a77358ca4492826f41f283601e",
+      "sha1": "61d9fea169099b87c2e36ce572d2d25e0fd2de59"
+    },
+    "oss-python/cryptography-50.0.2-cp311-abi3-manylinux_2_34_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/d3/69/2c833a049475e0a3444e94c7d0aca0aa51d166374a449b09e92ac98138de/cryptography-50.0.2-cp311-abi3-manylinux_2_34_x86_64.whl",
+      "bytes": 4752576,
+      "sha256": "9dab55f57c74c3cad24c323bacbbd04be4705ba6eb0d92e920b1fc4837ed5079",
+      "sha1": "bc2410886f65e2e74c0c41108ec16ba4e1dda493"
+    },
+    "oss-python/frozenlist-1.8.0-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/a7/b2/fabede9fafd976b991e9f1b9c8c873ed86f202889b864756f240ce6dd855/frozenlist-1.8.0-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+      "bytes": 231298,
+      "sha256": "cba69cb73723c3f329622e34bdbf5ce1f80c21c290ff04256cff1cd3c2036ed2",
+      "sha1": "6fd107fc0120bd47d701eb3443bfdaa4d8b9d168"
+    },
+    "oss-python/idna-3.20-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/58/a2/bb081bab032533a855d44de1d56f8e8426114ff1ba5d1f07a438a0a654f8/idna-3.20-py3-none-any.whl",
+      "bytes": 69583,
+      "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c",
+      "sha1": "ce5c41ba27de27450c59a015c4c1545a015e73af"
+    },
+    "oss-python/jmespath-1.1.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/14/2f/967ba146e6d58cf6a652da73885f52fc68001525b4197effc174321d70b4/jmespath-1.1.0-py3-none-any.whl",
+      "bytes": 20419,
+      "sha256": "a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64",
+      "sha1": "934d4dc274f2d9cbf957be5ba730acac23816d46"
+    },
+    "oss-python/multidict-7.2.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/3b/8f/bff861e3bd5a7cc13bd1f040d22aee8aa32b4f2755bba29b0c31a1d2ae25/multidict-7.2.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "bytes": 506944,
+      "sha256": "822a7fcd33f6922b650e1b26594f09d53c5d011fe655fea7ded27b2728ce2a1b",
+      "sha1": "eb7685a657367bafc51e6aa8882c2c5a22a7683c"
+    },
+    "oss-python/oss2-2.19.1.tar.gz": {
+      "url": "https://files.pythonhosted.org/packages/df/b5/f2cb1950dda46ac2284d6c950489fdacd0e743c2d79a347924d3cc44b86f/oss2-2.19.1.tar.gz",
+      "bytes": 298845,
+      "sha256": "a8ab9ee7eb99e88a7e1382edc6ea641d219d585a7e074e3776e9dec9473e59c1",
+      "sha1": "39b24e3e25c2c3b4609341eebaeefe7f82caa4d1"
+    },
+    "oss-python/propcache-0.5.4-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/96/d3/e97cd6f5de2176bd90ed4076c7a9b5e09d0f0b9687d00a576507988bb62c/propcache-0.5.4-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "bytes": 232757,
+      "sha256": "cc07876cfb079b6f6f36d21ce75784ad6c2c6b563eeac0ed26c2fa2669b85df9",
+      "sha1": "a2262e605f0aa584e4f7dee8de89b54d60601c26"
+    },
+    "oss-python/pycparser-3.12-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/b6/ae/315bbeee126a769cbde43cf4908acb4b40408d8bf8bbf334dd7368d8dadf/pycparser-3.12-py3-none-any.whl",
+      "bytes": 62600,
+      "sha256": "a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e",
+      "sha1": "e92d87658a748314f307edd1d41bfc6c7a26dcbb"
+    },
+    "oss-python/pycryptodome-4.2.0-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/18/88/33df6b1176b63aed427745696d88ed38f7877104cf0f6004ee9ad600f897/pycryptodome-4.2.0-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+      "bytes": 2976488,
+      "sha256": "76777686de3a354c41710727988c2284448d5db9bd82e5ddb9a9b6710d17d9df",
+      "sha1": "e3e4df669cf7e93eeecb7529d80963c53931289b"
+    },
+    "oss-python/requests-2.34.2-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/a0/f4/c67b0b3f1b9245e8d266f0f112c500d50e5b4e83cb6f3b71b6528104182a/requests-2.34.2-py3-none-any.whl",
+      "bytes": 73075,
+      "sha256": "2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0",
+      "sha1": "0d0a12b6ff772b35c4446abb03719f93cb07b0cc"
+    },
+    "oss-python/six-1.17.0-py2.py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl",
+      "bytes": 11050,
+      "sha256": "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274",
+      "sha1": "6e8f2653019f7cfb05196f8f08b9a905eab3d8dd"
+    },
+    "oss-python/tzlocal-5.4.5-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/7b/c1/9be4e1a8a30db8729a86628073910e56f85aaf8a659e053f376a2e6ea5a8/tzlocal-5.4.5-py3-none-any.whl",
+      "bytes": 18215,
+      "sha256": "ecab534f6d65d9deb4c4ea52c121ab6dd5958e9b878e71dcb102578269752454",
+      "sha1": "6d20b4f97e015d81bed1efdf6d38a8da80166e50"
+    },
+    "oss-python/urllib3-2.8.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl",
+      "bytes": 135717,
+      "sha256": "0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3",
+      "sha1": "0163c6af2fb37cddf2b3be2d6d896a6dfe1437ff"
+    },
+    "oss-python/yarl-1.25.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/a2/be/415b00c0fe5a0615b062a456b26623d7ec91c2bee20faea1a14045aa0469/yarl-1.25.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "bytes": 117199,
+      "sha256": "30eec96e8a91bd588ce897c9543f6d5d8d34b28fbcba28a4dedf20ebeae9fe57",
+      "sha1": "2a7ae324cbcddce3b7f3e3df8d6076a827d787e4"
+    },
+    "oss-python/setuptools-84.2.1-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/ef/55/6dc6d6bb953bdfc52519a0059592c52b6e3b8ad51cf8256dffceb55b0610/setuptools-84.2.1-py3-none-any.whl",
+      "bytes": 876263,
+      "sha256": "ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2",
+      "sha1": "3a52493933c18f26b571c8a6e43d75ef93e2a2fd"
+    },
+    "oss-python/wheel-0.48.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/2e/29/69cfbb602cd91690c55d38ba9fe53e6a7e76a6fa647bf38f19c138d25449/wheel-0.48.0-py3-none-any.whl",
+      "bytes": 33320,
+      "sha256": "3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab",
+      "sha1": "29b07e9566f5c6f4841a8495ff98256a45e1a0ae"
+    },
+    "oss-python/pip-26.2.2-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl",
+      "bytes": 1819850,
+      "sha256": "fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70",
+      "sha1": "a46082791d1cd145853b3896875dea3153cfe3ae"
+    },
+    "oss-python/packaging-26.3-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/63/34/ba1c580383c9eada3711951fef0795c80b829a078d72188184bcab9dd527/packaging-26.3-py3-none-any.whl",
+      "bytes": 129956,
+      "sha256": "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c",
+      "sha1": "008c9ef15b75b688a0ae7d847cf069822aa7c800"
     }
   },
   "derived_images": {
     "paimon-writer": {
-      "platform": "linux/amd64",
-      "alias": "novarocks/fixture-paimon-writer:current",
       "bases": {
         "SPARK_BASE": "paimon-spark-base"
       },
@@ -91,11 +453,15 @@
       "artifacts": [
         "paimon-spark.jar",
         "paimon-s3.jar"
-      ]
+      ],
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-paimon-writer:current"
+        }
+      }
     },
     "iceberg-spark": {
-      "platform": "linux/arm64",
-      "alias": "novarocks/fixture-iceberg-spark:current",
       "bases": {
         "SPARK_BASE": "iceberg-spark-base"
       },
@@ -108,11 +474,19 @@
         "iceberg-aws-bundle-1.11.0.jar",
         "hadoop-aws-3.3.4.jar",
         "aws-java-sdk-bundle-1.12.262.jar"
-      ]
+      ],
+      "variants": {
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "alias": "novarocks/fixture-iceberg-spark:current"
+        },
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-iceberg-spark:amd64"
+        }
+      }
     },
     "rest-mv": {
-      "platform": "linux/arm64",
-      "alias": "novarocks/fixture-iceberg-rest-mv:current",
       "bases": {
         "BUILDER": "gradle-builder",
         "REST_BASE": "iceberg-rest"
@@ -124,11 +498,385 @@
         "docker/iceberg-rest/rest-mv/build/patches/0001-backport-storage-table.patch",
         "docker/iceberg-rest/rest-mv/build/patches/0002-storage-table-version-equivalence.patch",
         "docker/iceberg-rest/rest-mv/build/patches/0003-null-storage-table.patch",
+        "docker/iceberg-rest/rest-mv/build/transport.init.gradle",
         "docker/iceberg-rest/rest-mv/build/verification-metadata.xml"
       ],
       "artifacts": [
         "apache-iceberg-1.10.1.tar.gz"
-      ]
+      ],
+      "variants": {
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "alias": "novarocks/fixture-iceberg-rest-mv:current"
+        },
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-iceberg-rest-mv:amd64"
+        }
+      },
+      "artifact_url_prefix_build_arg": "NOVA_FIXTURE_URL_PREFIXES"
+    },
+    "minio": {
+      "bases": {
+        "RUNTIME_BASE": "minio-runtime"
+      },
+      "dockerfile": "docker/fixture-inputs/minio/Dockerfile",
+      "definition_files": [
+        "docker/fixture-inputs/minio/Dockerfile"
+      ],
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-minio:20251015-amd64",
+          "artifacts": [
+            "minio-source.tar.gz",
+            "go-linux-amd64.tar.gz"
+          ]
+        },
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "alias": "novarocks/fixture-minio:20251015-arm64",
+          "artifacts": [
+            "minio-source.tar.gz",
+            "go-linux-arm64.tar.gz"
+          ]
+        }
+      }
+    },
+    "minio-mc": {
+      "bases": {
+        "RUNTIME_BASE": "minio-runtime"
+      },
+      "dockerfile": "docker/fixture-inputs/mc/Dockerfile",
+      "definition_files": [
+        "docker/fixture-inputs/mc/Dockerfile"
+      ],
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-minio-mc:20250813-amd64",
+          "artifacts": [
+            "mc-source.tar.gz",
+            "go-linux-amd64.tar.gz"
+          ]
+        },
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "alias": "novarocks/fixture-minio-mc:20250813-arm64",
+          "artifacts": [
+            "mc-source.tar.gz",
+            "go-linux-arm64.tar.gz"
+          ]
+        }
+      }
+    },
+    "iceberg-rest-oss": {
+      "bases": {
+        "BUILDER": "gradle-builder",
+        "SERVICE_BASE": "iceberg-rest"
+      },
+      "dockerfile": "docker/iceberg-rest/aliyun-credentials/Dockerfile",
+      "context": "docker/iceberg-rest/aliyun-credentials",
+      "definition_files": [
+        "docker/iceberg-rest/aliyun-credentials/Dockerfile",
+        "docker/iceberg-rest/aliyun-credentials/README.md",
+        "docker/iceberg-rest/aliyun-credentials/build.sh",
+        "docker/iceberg-rest/aliyun-credentials/entrypoint.sh",
+        "docker/iceberg-rest/aliyun-credentials/runtime-jars.txt",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/AliyunEcsCredentialsProvider.java",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/AliyunEcsSource.java",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/AliyunEcsV1CredentialsProvider.java",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/RestLauncher.java",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/SessionCredentialSource.java",
+        "docker/iceberg-rest/aliyun-credentials/src/test/java/org/novarocks/fixture/auth/ProviderContractTest.java",
+        "docker/iceberg-rest/aliyun-credentials/src/test/java/org/novarocks/fixture/auth/V2OnlyContractTest.java",
+        "docker/iceberg-rest/aliyun-credentials/tests/test_oss_ops.py"
+      ],
+      "artifacts": [
+        "credentials-java-0.3.10.jar",
+        "tea-1.4.2.jar",
+        "okhttp-4.12.0.jar",
+        "okio-3.6.0.jar",
+        "okio-jvm-3.6.0.jar",
+        "kotlin-stdlib-common-1.9.10.jar",
+        "kotlin-stdlib-jdk8-1.8.21.jar",
+        "kotlin-stdlib-1.8.21.jar",
+        "annotations-13.0.jar",
+        "kotlin-stdlib-jdk7-1.8.21.jar",
+        "slf4j-api-2.0.16.jar",
+        "ini4j-0.5.4.jar",
+        "gson-2.11.0.jar",
+        "error_prone_annotations-2.27.0.jar",
+        "org.jacoco.agent-0.8.8-runtime.jar",
+        "jaxb-api-2.3.0.jar",
+        "jaxb-core-2.3.0.jar",
+        "jaxb-impl-2.3.0.jar",
+        "iceberg-aws-bundle-1.11.0.jar",
+        "aws-java-sdk-bundle-1.12.262.jar"
+      ],
+      "build_args": {
+        "SERVICE_KIND": "rest",
+        "SERVICE_USER": "iceberg:iceberg"
+      },
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-iceberg-rest-oss:amd64"
+        },
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "alias": "novarocks/fixture-iceberg-rest-oss:arm64"
+        }
+      }
+    },
+    "iceberg-spark-oss": {
+      "bases": {
+        "BUILDER": "gradle-builder"
+      },
+      "dockerfile": "docker/iceberg-rest/aliyun-credentials/Dockerfile",
+      "context": "docker/iceberg-rest/aliyun-credentials",
+      "definition_files": [
+        "docker/iceberg-rest/aliyun-credentials/Dockerfile",
+        "docker/iceberg-rest/aliyun-credentials/README.md",
+        "docker/iceberg-rest/aliyun-credentials/build.sh",
+        "docker/iceberg-rest/aliyun-credentials/entrypoint.sh",
+        "docker/iceberg-rest/aliyun-credentials/runtime-jars.txt",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/AliyunEcsCredentialsProvider.java",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/AliyunEcsSource.java",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/AliyunEcsV1CredentialsProvider.java",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/RestLauncher.java",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/SessionCredentialSource.java",
+        "docker/iceberg-rest/aliyun-credentials/src/test/java/org/novarocks/fixture/auth/ProviderContractTest.java",
+        "docker/iceberg-rest/aliyun-credentials/src/test/java/org/novarocks/fixture/auth/V2OnlyContractTest.java",
+        "docker/iceberg-rest/aliyun-credentials/tests/test_oss_ops.py"
+      ],
+      "artifacts": [
+        "credentials-java-0.3.10.jar",
+        "tea-1.4.2.jar",
+        "okhttp-4.12.0.jar",
+        "okio-3.6.0.jar",
+        "okio-jvm-3.6.0.jar",
+        "kotlin-stdlib-common-1.9.10.jar",
+        "kotlin-stdlib-jdk8-1.8.21.jar",
+        "kotlin-stdlib-1.8.21.jar",
+        "annotations-13.0.jar",
+        "kotlin-stdlib-jdk7-1.8.21.jar",
+        "slf4j-api-2.0.16.jar",
+        "ini4j-0.5.4.jar",
+        "gson-2.11.0.jar",
+        "error_prone_annotations-2.27.0.jar",
+        "org.jacoco.agent-0.8.8-runtime.jar",
+        "jaxb-api-2.3.0.jar",
+        "jaxb-core-2.3.0.jar",
+        "jaxb-impl-2.3.0.jar",
+        "iceberg-aws-bundle-1.11.0.jar",
+        "aws-java-sdk-bundle-1.12.262.jar"
+      ],
+      "build_args": {
+        "SERVICE_KIND": "spark",
+        "SERVICE_USER": "root"
+      },
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-iceberg-spark-oss:amd64"
+        },
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "alias": "novarocks/fixture-iceberg-spark-oss:arm64"
+        }
+      },
+      "derived_bases": {
+        "SERVICE_BASE": "iceberg-spark"
+      }
+    },
+    "rest-mv-oss": {
+      "bases": {
+        "BUILDER": "gradle-builder"
+      },
+      "dockerfile": "docker/iceberg-rest/aliyun-credentials/Dockerfile",
+      "context": "docker/iceberg-rest/aliyun-credentials",
+      "definition_files": [
+        "docker/iceberg-rest/aliyun-credentials/Dockerfile",
+        "docker/iceberg-rest/aliyun-credentials/README.md",
+        "docker/iceberg-rest/aliyun-credentials/build.sh",
+        "docker/iceberg-rest/aliyun-credentials/entrypoint.sh",
+        "docker/iceberg-rest/aliyun-credentials/runtime-jars.txt",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/AliyunEcsCredentialsProvider.java",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/AliyunEcsSource.java",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/AliyunEcsV1CredentialsProvider.java",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/RestLauncher.java",
+        "docker/iceberg-rest/aliyun-credentials/src/main/java/org/novarocks/fixture/auth/SessionCredentialSource.java",
+        "docker/iceberg-rest/aliyun-credentials/src/test/java/org/novarocks/fixture/auth/ProviderContractTest.java",
+        "docker/iceberg-rest/aliyun-credentials/src/test/java/org/novarocks/fixture/auth/V2OnlyContractTest.java",
+        "docker/iceberg-rest/aliyun-credentials/tests/test_oss_ops.py"
+      ],
+      "artifacts": [
+        "credentials-java-0.3.10.jar",
+        "tea-1.4.2.jar",
+        "okhttp-4.12.0.jar",
+        "okio-3.6.0.jar",
+        "okio-jvm-3.6.0.jar",
+        "kotlin-stdlib-common-1.9.10.jar",
+        "kotlin-stdlib-jdk8-1.8.21.jar",
+        "kotlin-stdlib-1.8.21.jar",
+        "annotations-13.0.jar",
+        "kotlin-stdlib-jdk7-1.8.21.jar",
+        "slf4j-api-2.0.16.jar",
+        "ini4j-0.5.4.jar",
+        "gson-2.11.0.jar",
+        "error_prone_annotations-2.27.0.jar",
+        "org.jacoco.agent-0.8.8-runtime.jar",
+        "jaxb-api-2.3.0.jar",
+        "jaxb-core-2.3.0.jar",
+        "jaxb-impl-2.3.0.jar",
+        "iceberg-aws-bundle-1.11.0.jar",
+        "aws-java-sdk-bundle-1.12.262.jar"
+      ],
+      "build_args": {
+        "SERVICE_KIND": "rest",
+        "SERVICE_USER": "iceberg:iceberg"
+      },
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-rest-mv-oss:amd64"
+        },
+        "linux/arm64": {
+          "platform": "linux/arm64",
+          "alias": "novarocks/fixture-rest-mv-oss:arm64"
+        }
+      },
+      "derived_bases": {
+        "SERVICE_BASE": "rest-mv"
+      }
+    }
+  },
+  "python_environments": {
+    "oss-sdk": {
+      "python_version": "3.14",
+      "definition_files": [
+        "docker/fixture-inputs/python_environment.py",
+        "docker/iceberg-rest/oss_ops.py"
+      ],
+      "packages": {
+        "apscheduler": "3.11.3",
+        "aiofiles": "24.1.0",
+        "aiohappyeyeballs": "2.7.1",
+        "aiohttp": "3.14.5",
+        "aiosignal": "1.4.0",
+        "alibabacloud-credentials": "1.0.12",
+        "alibabacloud-credentials-api": "1.0.1",
+        "alibabacloud-tea": "0.4.3",
+        "aliyun-python-sdk-core": "2.16.1",
+        "aliyun-python-sdk-kms": "2.16.5",
+        "attrs": "26.1.0",
+        "certifi": "2026.10.23",
+        "cffi": "2.1.1",
+        "charset-normalizer": "3.5.2",
+        "crcmod": "1.7",
+        "cryptography": "50.0.2",
+        "frozenlist": "1.8.0",
+        "idna": "3.20",
+        "jmespath": "1.1.0",
+        "multidict": "7.2.1",
+        "oss2": "2.19.1",
+        "propcache": "0.5.4",
+        "pycparser": "3.12",
+        "pycryptodome": "4.2.0",
+        "requests": "2.34.2",
+        "six": "1.17.0",
+        "tzlocal": "5.4.5",
+        "urllib3": "2.8.0",
+        "yarl": "1.25.1",
+        "setuptools": "84.2.1",
+        "wheel": "0.48.0",
+        "pip": "26.2.2",
+        "packaging": "26.3"
+      },
+      "package_artifacts": {
+        "apscheduler": "oss-python/apscheduler-3.11.3-py3-none-any.whl",
+        "aiofiles": "oss-python/aiofiles-24.1.0-py3-none-any.whl",
+        "aiohappyeyeballs": "oss-python/aiohappyeyeballs-2.7.1-py3-none-any.whl",
+        "aiohttp": "oss-python/aiohttp-3.14.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "aiosignal": "oss-python/aiosignal-1.4.0-py3-none-any.whl",
+        "alibabacloud-credentials": "oss-python/alibabacloud_credentials-1.0.12-py3-none-any.whl",
+        "alibabacloud-credentials-api": "oss-python/alibabacloud_credentials_api-1.0.1-py3-none-any.whl",
+        "alibabacloud-tea": "oss-python/alibabacloud-tea-0.4.3.tar.gz",
+        "aliyun-python-sdk-core": "oss-python/aliyun_python_sdk_core-2.16.1-py3-none-any.whl",
+        "aliyun-python-sdk-kms": "oss-python/aliyun_python_sdk_kms-2.16.5-py2.py3-none-any.whl",
+        "attrs": "oss-python/attrs-26.1.0-py3-none-any.whl",
+        "certifi": "oss-python/certifi-2026.10.23-py3-none-any.whl",
+        "cffi": "oss-python/cffi-2.1.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        "charset-normalizer": "oss-python/charset_normalizer-3.5.2-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "crcmod": "oss-python/crcmod-1.7.tar.gz",
+        "cryptography": "oss-python/cryptography-50.0.2-cp311-abi3-manylinux_2_34_x86_64.whl",
+        "frozenlist": "oss-python/frozenlist-1.8.0-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+        "idna": "oss-python/idna-3.20-py3-none-any.whl",
+        "jmespath": "oss-python/jmespath-1.1.0-py3-none-any.whl",
+        "multidict": "oss-python/multidict-7.2.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "oss2": "oss-python/oss2-2.19.1.tar.gz",
+        "propcache": "oss-python/propcache-0.5.4-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "pycparser": "oss-python/pycparser-3.12-py3-none-any.whl",
+        "pycryptodome": "oss-python/pycryptodome-4.2.0-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        "requests": "oss-python/requests-2.34.2-py3-none-any.whl",
+        "six": "oss-python/six-1.17.0-py2.py3-none-any.whl",
+        "tzlocal": "oss-python/tzlocal-5.4.5-py3-none-any.whl",
+        "urllib3": "oss-python/urllib3-2.8.0-py3-none-any.whl",
+        "yarl": "oss-python/yarl-1.25.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "setuptools": "oss-python/setuptools-84.2.1-py3-none-any.whl",
+        "wheel": "oss-python/wheel-0.48.0-py3-none-any.whl",
+        "pip": "oss-python/pip-26.2.2-py3-none-any.whl",
+        "packaging": "oss-python/packaging-26.3-py3-none-any.whl"
+      },
+      "artifacts": [
+        "oss-python/apscheduler-3.11.3-py3-none-any.whl",
+        "oss-python/aiofiles-24.1.0-py3-none-any.whl",
+        "oss-python/aiohappyeyeballs-2.7.1-py3-none-any.whl",
+        "oss-python/aiohttp-3.14.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "oss-python/aiosignal-1.4.0-py3-none-any.whl",
+        "oss-python/alibabacloud_credentials-1.0.12-py3-none-any.whl",
+        "oss-python/alibabacloud_credentials_api-1.0.1-py3-none-any.whl",
+        "oss-python/alibabacloud-tea-0.4.3.tar.gz",
+        "oss-python/aliyun_python_sdk_core-2.16.1-py3-none-any.whl",
+        "oss-python/aliyun_python_sdk_kms-2.16.5-py2.py3-none-any.whl",
+        "oss-python/attrs-26.1.0-py3-none-any.whl",
+        "oss-python/certifi-2026.10.23-py3-none-any.whl",
+        "oss-python/cffi-2.1.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        "oss-python/charset_normalizer-3.5.2-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "oss-python/crcmod-1.7.tar.gz",
+        "oss-python/cryptography-50.0.2-cp311-abi3-manylinux_2_34_x86_64.whl",
+        "oss-python/frozenlist-1.8.0-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+        "oss-python/idna-3.20-py3-none-any.whl",
+        "oss-python/jmespath-1.1.0-py3-none-any.whl",
+        "oss-python/multidict-7.2.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "oss-python/oss2-2.19.1.tar.gz",
+        "oss-python/propcache-0.5.4-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "oss-python/pycparser-3.12-py3-none-any.whl",
+        "oss-python/pycryptodome-4.2.0-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        "oss-python/requests-2.34.2-py3-none-any.whl",
+        "oss-python/six-1.17.0-py2.py3-none-any.whl",
+        "oss-python/tzlocal-5.4.5-py3-none-any.whl",
+        "oss-python/urllib3-2.8.0-py3-none-any.whl",
+        "oss-python/yarl-1.25.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "oss-python/setuptools-84.2.1-py3-none-any.whl",
+        "oss-python/wheel-0.48.0-py3-none-any.whl",
+        "oss-python/pip-26.2.2-py3-none-any.whl",
+        "oss-python/packaging-26.3-py3-none-any.whl"
+      ],
+      "bootstrap_artifacts": [
+        "oss-python/pip-26.2.2-py3-none-any.whl",
+        "oss-python/setuptools-84.2.1-py3-none-any.whl",
+        "oss-python/wheel-0.48.0-py3-none-any.whl",
+        "oss-python/packaging-26.3-py3-none-any.whl"
+      ],
+      "pip_artifact": "oss-python/pip-26.2.2-py3-none-any.whl",
+      "wheelhouse": "oss-python",
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64"
+        }
+      }
     }
   }
 }

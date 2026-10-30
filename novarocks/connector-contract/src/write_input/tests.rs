@@ -109,7 +109,10 @@ fn owned_input_preserves_each_role_order_tokens_and_complete_fields() {
         711,
         true,
     )
-    .with_metadata([("tag".to_owned(), "中\0".to_owned())].into());
+    .with_metadata(std::collections::HashMap::<String, String>::from([(
+        "tag".to_owned(),
+        "中\0".to_owned(),
+    )]));
     let nested =
         ConnectorWriteFieldBinding::new(ConnectorWriteFieldToken::from_bytes([7; 32]), field);
     let shapes = [

@@ -14,6 +14,7 @@ doctest = false
 novarocks-failure-contract.workspace = true
 arrow.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 novarocks-functions.workspace = true
 novarocks-result-contract.workspace = true
 novarocks-type-contract.workspace = true

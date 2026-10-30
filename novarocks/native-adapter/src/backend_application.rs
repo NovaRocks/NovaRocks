@@ -14,6 +14,7 @@ use novarocks_native_trust::{NativeProcessIdentity, NativeTrust};
 use novarocks_plan_codec::physical_package_v2::PackageDecodeLimits;
 use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
+#[cfg(test)]
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 use novarocks_worker::sink_commit::ConfiguredWorkerSinkCommitPort;
@@ -151,16 +152,17 @@ pub struct CompiledStaticPlan {
 }
 
 impl CompiledStaticPlan {
-    /// Builds the one decode model and shares it between the package receiver
+    /// Shares the host's one decode model between the package receiver
     /// and the ingress gate. The gate admits with the receiver's own wire
     /// limits, so both refuse the same bytes. Every input is host-authored;
     /// nothing here supplies a default.
-    pub fn try_new<E>(
+    pub fn new<E>(
+        model: Arc<FragmentDecodeResourceModel>,
         decode_limits: PackageDecodeLimits,
         functions: Arc<PureEngineFunctionCatalog>,
         providers: Arc<PureProviderProgramCatalog<E>>,
         constants: ConstantPolicy,
-    ) -> Result<Self, BackendApplicationError>
+    ) -> Self
     where
         E: std::error::Error
             + novarocks_execution_contract::failure::FailureProjection
@@ -169,14 +171,6 @@ impl CompiledStaticPlan {
             + 'static,
         PureProviderProgramCatalog<E>: Send + Sync,
     {
-        let model = Arc::new(
-            FragmentDecodeResourceModel::try_new(&CompositionControl).map_err(|error| {
-                BackendApplicationError::new(
-                    BackendApplicationErrorKind::Configuration,
-                    format!("build the fragment package decode model: {error}"),
-                )
-            })?,
-        );
         let admission = Arc::new(StaticPackageAdmission::new(
             Arc::clone(&model),
             decode_limits.wire,
@@ -188,17 +182,18 @@ impl CompiledStaticPlan {
             providers,
             constants,
         ));
-        Ok(Self {
+        Self {
             compiler,
             admission,
-        })
+        }
     }
 }
 
-/// Composition runs once, before any listener opens, over a statically sized
-/// generated schema; it has no caller that could cancel it.
+/// Test composition builds its generated model before any attempt exists.
+#[cfg(test)]
 struct CompositionControl;
 
+#[cfg(test)]
 impl PureCompileControl for CompositionControl {
     fn checkpoint(&self, _phase: CompilePhase, _units: u32) -> Result<(), CompileControlError> {
         Ok(())
@@ -1165,7 +1160,12 @@ impl BackendApplicationHost {
         );
         #[cfg(novarocks_dev_controls)]
         let root_reader = root_reader
-            .with_test_controls(test_session.as_ref().map(|session| session.native.clone()));
+            .with_test_controls(test_session.as_ref().map(|session| session.native.clone()))
+            .with_observation_controls(
+                test_session
+                    .as_ref()
+                    .and_then(|session| session.observation.clone()),
+            );
         let mut grpc_server = match NativeRpcServerHandle::start_with_admission(
             &bind_host,
             grpc_port,
@@ -2052,6 +2052,7 @@ mod tests {
             InstalledPureKernel, PureImplementationDeclaration, PureImplementationId,
             PureKernelAbi,
         };
+        use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         use novarocks_task_codec::identity::{
             encode_query_context_ref, encode_task_identity, encode_task_operation_id,
         };
@@ -2112,13 +2113,13 @@ mod tests {
             &Unbounded,
         )
         .expect("empty provider catalog");
-        let plan = CompiledStaticPlan::try_new(
+        let plan = CompiledStaticPlan::new(
+            Arc::new(FragmentDecodeResourceModel::try_new(&Unbounded).expect("generated model")),
             limits,
             Arc::new(functions),
             Arc::new(providers),
             constants,
-        )
-        .expect("compiled static plan");
+        );
 
         let services = compose_backend_application_services(
             test_data_runtime(),

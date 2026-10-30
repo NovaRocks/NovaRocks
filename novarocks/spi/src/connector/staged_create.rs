@@ -515,19 +515,56 @@ impl ConnectorStagedWritePlanningBinding {
 /// nothing from any of them. If a provider needs more than this to publish, the
 /// missing fact belongs *inside* the receipt its own session minted.
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum StagedWriteReceiptOwner {
+    Owned(Arc<ConnectorWriteReceipt>),
+    Needed(Arc<super::write_stack::ConnectorWriteNeededReady>),
+}
+#[derive(Clone, Debug)]
 pub struct ConnectorStagedWriteProof {
-    receipt: ConnectorWriteReceipt,
+    receipt: StagedWriteReceiptOwner,
     row_count: u64,
 }
+
+impl PartialEq for ConnectorStagedWriteProof {
+    fn eq(&self, other: &Self) -> bool {
+        self.row_count == other.row_count && self.receipt() == other.receipt()
+    }
+}
+impl Eq for ConnectorStagedWriteProof {}
 
 impl ConnectorStagedWriteProof {
     pub fn try_new(receipt: ConnectorWriteReceipt, row_count: u64) -> Result<Self, ConnectorError> {
         receipt.validate()?;
-        Ok(Self { receipt, row_count })
+        Ok(Self {
+            receipt: StagedWriteReceiptOwner::Owned(Arc::new(receipt)),
+            row_count,
+        })
     }
 
-    pub const fn receipt(&self) -> &ConnectorWriteReceipt {
-        &self.receipt
+    pub fn try_from_needed_ready(
+        needed: Arc<super::write_stack::ConnectorWriteNeededReady>,
+        row_count: u64,
+    ) -> Result<Self, ConnectorError> {
+        if !matches!(
+            needed.finalization(),
+            ExternalMutationFinalization::Complete
+        ) {
+            return Err(invalid(
+                "staged write publication requires completed necessary finalization",
+            ));
+        }
+        needed.receipt().validate()?;
+        Ok(Self {
+            receipt: StagedWriteReceiptOwner::Needed(needed),
+            row_count,
+        })
+    }
+
+    pub fn receipt(&self) -> &ConnectorWriteReceipt {
+        match &self.receipt {
+            StagedWriteReceiptOwner::Owned(receipt) => receipt.as_ref(),
+            StagedWriteReceiptOwner::Needed(needed) => needed.receipt(),
+        }
     }
 
     pub const fn row_count(&self) -> u64 {
@@ -536,8 +573,8 @@ impl ConnectorStagedWriteProof {
 
     /// The identity two references to the same sealed write share. A staged
     /// target binds one of these and refuses to publish under another.
-    pub const fn digest(&self) -> [u8; 32] {
-        self.receipt.digest()
+    pub fn digest(&self) -> [u8; 32] {
+        self.receipt().digest()
     }
 }
 
@@ -776,7 +813,579 @@ pub enum ConnectorStagedCreatePublicationAdjudicationOutcome {
     },
 }
 
+/// One original publication, not a new dispatch or cleanup authority.
+/// The caller installs the returned strong Source before polling it.
+pub trait ConnectorStagedCreatePublicationSource: Send + Sync {
+    /// The same journal crossed its actual dispatch-start cut. No conclusion,
+    /// retry, abort or finalization authority follows from this observation.
+    fn dispatch_started(&self) -> bool;
+    fn poll_progress(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()>;
+    fn poll_closed(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorStagedCreateNeededCommitted {
+    pub effect: ExternalMutationEffect,
+    pub receipt: ConnectorStagedCreateReceipt,
+    pub finalization: ExternalMutationFinalization,
+}
+struct PublicationIdentity {
+    lease: ConnectorStagedCreateLease,
+    operation: ConnectorStagedCreateOperationId,
+    dispatch: ConnectorStagedCreateOperationId,
+    digest: [u8; 32],
+    write: BoundWriteProof,
+}
+#[derive(Default)]
+struct PublicationFacts {
+    confirmed_not_dispatched: bool,
+    applied: Option<ConnectorStagedCreateReceipt>,
+    needed: Option<ConnectorStagedCreateNeededCommitted>,
+    context: Option<Result<ConnectorRequestContext, ConnectorError>>,
+    raw: Option<Result<ConnectorStagedCreatePublishOutcome, ConnectorError>>,
+    validation: Option<Result<(), ConnectorError>>,
+}
+struct PublicationObservationInner {
+    source: std::sync::OnceLock<std::sync::Weak<dyn ConnectorStagedCreatePublicationSource>>,
+    identity: std::sync::OnceLock<PublicationIdentity>,
+    facts: Mutex<PublicationFacts>,
+    foreign: std::sync::atomic::AtomicBool,
+    exited: std::sync::atomic::AtomicBool,
+}
+/// Facts are shared independently of the strong original Source slot. The
+/// Provider may retain this observer without creating Source -> owner cycles.
+#[derive(Clone)]
+pub struct ConnectorStagedCreatePublicationObservation(Arc<PublicationObservationInner>);
+impl Default for ConnectorStagedCreatePublicationObservation {
+    fn default() -> Self {
+        Self(Arc::new(PublicationObservationInner {
+            source: std::sync::OnceLock::new(),
+            identity: std::sync::OnceLock::new(),
+            facts: Mutex::new(PublicationFacts::default()),
+            foreign: std::sync::atomic::AtomicBool::new(false),
+            exited: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+}
+impl ConnectorStagedCreatePublicationObservation {
+    /// A read-only loan of the installed original Source, outside facts locks.
+    /// False is not proof of non-dispatch; only its explicit negative fact is.
+    pub fn dispatch_started(&self) -> bool {
+        self.0
+            .source
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|source| source.dispatch_started())
+    }
+    fn identity(&self) -> Result<&PublicationIdentity, ConnectorError> {
+        self.0
+            .identity
+            .get()
+            .ok_or_else(|| invalid("staged publication has no original request"))
+    }
+    fn validate_receipt(
+        &self,
+        receipt: &ConnectorStagedCreateReceipt,
+    ) -> Result<(), ConnectorError> {
+        let identity = self.identity()?;
+        identity.lease.validate_receipt(
+            receipt,
+            identity.dispatch,
+            ConnectorStagedCreateReceiptPhase::Published,
+        )
+    }
+    /// Negative knowledge recorded by the same preparation-refusal author.
+    /// An empty observation, missing Applied or a raw error proves nothing.
+    /// This observation grants no abort right without the lease's exact proof.
+    pub fn confirmed_not_dispatched(&self) -> bool {
+        self.0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .confirmed_not_dispatched
+    }
+    pub fn applied_receipt(&self) -> Option<ConnectorStagedCreateReceipt> {
+        self.0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .applied
+            .clone()
+    }
+    pub fn needed_committed(&self) -> Option<ConnectorStagedCreateNeededCommitted> {
+        self.0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .needed
+            .clone()
+    }
+    pub fn finalization_context(&self) -> Option<Result<ConnectorRequestContext, ConnectorError>> {
+        self.0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context
+            .clone()
+    }
+    pub fn raw_outcome(
+        &self,
+    ) -> Option<Result<ConnectorStagedCreatePublishOutcome, ConnectorError>> {
+        self.0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .raw
+            .clone()
+    }
+    pub fn validation(&self) -> Option<Result<(), ConnectorError>> {
+        self.0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .validation
+            .clone()
+    }
+    pub fn provider_exited(&self) -> bool {
+        self.0.exited.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// True only during an actual foreign poll/Drop, or after its unwind. A
+    /// normal Pending clears it and does not prove the original F has exited.
+    pub fn foreign_exit_unproven(&self) -> bool {
+        self.0.foreign.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+/// Only the selected Provider factory receives this recorder. Public readers
+/// cannot manufacture dispatch, finite-context, or actual-exit observations.
+#[derive(Clone)]
+pub struct ConnectorStagedCreatePublicationRecorder {
+    observation: ConnectorStagedCreatePublicationObservation,
+}
+impl std::ops::Deref for ConnectorStagedCreatePublicationRecorder {
+    type Target = ConnectorStagedCreatePublicationObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
+}
+impl ConnectorStagedCreatePublicationRecorder {
+    pub fn enter_foreign(&self) {
+        assert!(
+            !self
+                .observation
+                .0
+                .foreign
+                .swap(true, std::sync::atomic::Ordering::AcqRel),
+            "poisoned original publication cannot be repolled"
+        );
+    }
+    pub fn leave_pending(&self) {
+        self.observation
+            .0
+            .foreign
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    pub fn record_provider_exit(&self) {
+        self.observation
+            .0
+            .exited
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.observation
+            .0
+            .foreign
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    pub fn record_applied_receipt(
+        &self,
+        receipt: &ConnectorStagedCreateReceipt,
+    ) -> Result<(), ConnectorError> {
+        self.validate_receipt(receipt)?;
+        if receipt.effect() != ExternalMutationEffect::Applied {
+            return Err(invalid(
+                "staged Applied requires its actual Applied receipt",
+            ));
+        }
+        let mut facts = self
+            .observation
+            .0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(prior) = &facts.applied {
+            if prior != receipt {
+                return Err(invalid(
+                    "staged Applied cannot replace its original receipt",
+                ));
+            }
+        } else {
+            facts.applied = Some(receipt.clone());
+        }
+        Ok(())
+    }
+    pub fn record_finalization_context(
+        &self,
+        receipt: &ConnectorStagedCreateReceipt,
+        context: Result<ConnectorRequestContext, ConnectorError>,
+    ) -> Result<(), ConnectorError> {
+        self.validate_receipt(receipt)?;
+        let mut facts = self
+            .observation
+            .0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if facts.applied.as_ref() != Some(receipt) {
+            return Err(invalid(
+                "staged finalization context requires the same actual Applied receipt",
+            ));
+        }
+        if facts.context.is_some() {
+            return Err(invalid("staged finalization context is received only once"));
+        }
+        facts.context = Some(context);
+        Ok(())
+    }
+    pub fn record_needed_committed(
+        &self,
+        effect: ExternalMutationEffect,
+        receipt: &ConnectorStagedCreateReceipt,
+        finalization: &ExternalMutationFinalization,
+    ) -> Result<(), ConnectorError> {
+        self.validate_receipt(receipt)?;
+        if receipt.effect() != effect {
+            return Err(invalid("staged necessary effect contradicts its receipt"));
+        }
+        let mut facts = self
+            .observation
+            .0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if effect == ExternalMutationEffect::Applied && facts.applied.as_ref() != Some(receipt) {
+            return Err(invalid(
+                "staged necessary Applied has no original positive receipt",
+            ));
+        }
+        let needed = ConnectorStagedCreateNeededCommitted {
+            effect,
+            receipt: receipt.clone(),
+            finalization: finalization.clone(),
+        };
+        if let Some(prior) = &facts.needed {
+            if prior != &needed {
+                return Err(invalid("staged necessary facts cannot be replaced"));
+            }
+        } else {
+            facts.needed = Some(needed);
+        }
+        Ok(())
+    }
+    /// Receive first, validate second, then expose the original lease state;
+    /// none of these steps can erase an already received positive journal fact.
+    pub fn record_preparation_refusal(&self, error: ConnectorError) {
+        {
+            let facts = self
+                .observation
+                .0
+                .facts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert!(
+                facts.applied.is_none() && facts.needed.is_none(),
+                "a preparation refusal cannot erase received publication facts"
+            );
+        }
+        self.record_raw_in(Err(error), true);
+    }
+    pub fn record_raw(&self, raw: Result<ConnectorStagedCreatePublishOutcome, ConnectorError>) {
+        self.record_raw_in(raw, false);
+    }
+    fn record_raw_in(
+        &self,
+        raw: Result<ConnectorStagedCreatePublishOutcome, ConnectorError>,
+        before_dispatch: bool,
+    ) {
+        {
+            let mut facts = self
+                .observation
+                .0
+                .facts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert!(
+                facts.raw.is_none(),
+                "one original staged publication outcome"
+            );
+            facts.raw = Some(raw.clone());
+        }
+        let identity = self
+            .identity()
+            .expect("installed original publication identity");
+        let mut validation = match &raw {
+            Ok(outcome) => identity
+                .lease
+                .validate_publish_outcome(identity.dispatch, outcome),
+            Err(error) => Err(error.clone()),
+        };
+        match &raw {
+            Ok(ConnectorStagedCreatePublishOutcome::Applied { receipt, .. })
+                if receipt.effect() != ExternalMutationEffect::Applied =>
+            {
+                validation = Err(invalid(
+                    "staged Applied raw outcome has a non-Applied receipt",
+                ))
+            }
+            Ok(ConnectorStagedCreatePublishOutcome::NoOp { receipt, .. })
+                if receipt.effect() != ExternalMutationEffect::NoOp =>
+            {
+                validation = Err(invalid("staged NoOp raw outcome has an effectful receipt"))
+            }
+            _ => {}
+        }
+        {
+            let facts = self
+                .observation
+                .0
+                .facts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(applied) = &facts.applied
+                && !matches!(&raw,Ok(ConnectorStagedCreatePublishOutcome::Applied{receipt,..}) if receipt==applied)
+            {
+                validation = Err(invalid(
+                    "staged raw outcome contradicts its original Applied receipt",
+                ));
+            }
+            if let Some(needed) = &facts.needed
+                && !matches!(&raw,Ok(ConnectorStagedCreatePublishOutcome::Applied{receipt,finalization}|ConnectorStagedCreatePublishOutcome::NoOp{receipt,finalization}) if receipt==&needed.receipt && finalization==&needed.finalization)
+            {
+                validation = Err(invalid(
+                    "staged raw outcome contradicts its necessary facts",
+                ));
+            }
+        }
+        if before_dispatch && raw.is_err() {
+            identity.lease.record_after_dispatch(
+                identity.operation,
+                Some(LeaseOperationState::Unpublished {
+                    handle_digest: identity.digest,
+                    bound_write: Some(identity.write),
+                }),
+            );
+        } else if validation.is_ok() {
+            let state = match &raw {
+                Ok(ConnectorStagedCreatePublishOutcome::Applied { .. }) => {
+                    LeaseOperationState::Published
+                }
+                Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. }) => {
+                    LeaseOperationState::PublicationUnknown {
+                        evidence_digest: evidence.digest(),
+                        handle_digest: identity.digest,
+                        bound_write: identity.write,
+                    }
+                }
+                _ => LeaseOperationState::Unpublished {
+                    handle_digest: identity.digest,
+                    bound_write: Some(identity.write),
+                },
+            };
+            identity
+                .lease
+                .record_after_dispatch(identity.operation, Some(state));
+        } else {
+            identity.lease.set_unknown_without_evidence(
+                identity.operation,
+                Some(identity.digest),
+                Some(identity.write),
+            );
+        }
+        let mut facts = self
+            .observation
+            .0
+            .facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Publish only after the exact original Unpublished/bound-write row
+        // has been restored above; no consumer reconstructs this from absence.
+        facts.confirmed_not_dispatched = before_dispatch && raw.is_err();
+        facts.validation = Some(validation);
+    }
+}
+/// Caller-owned strong original slot, installed before the first foreign poll.
+#[derive(Clone, Default)]
+pub struct ConnectorStagedCreatePublicationReceiving {
+    observation: ConnectorStagedCreatePublicationObservation,
+    source: Arc<std::sync::OnceLock<Arc<dyn ConnectorStagedCreatePublicationSource>>>,
+}
+impl ConnectorStagedCreatePublicationReceiving {
+    pub fn observation(&self) -> ConnectorStagedCreatePublicationObservation {
+        self.observation.clone()
+    }
+    pub fn original_owner(&self) -> Option<Arc<dyn ConnectorStagedCreatePublicationSource>> {
+        self.source.get().cloned()
+    }
+}
+pub struct ConnectorStagedCreatePublication {
+    receiving: ConnectorStagedCreatePublicationReceiving,
+}
+impl ConnectorStagedCreatePublication {
+    pub fn observation(&self) -> ConnectorStagedCreatePublicationObservation {
+        self.receiving.observation()
+    }
+    pub fn poll_result(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<ConnectorStagedCreatePublishOutcome, ConnectorError>> {
+        let source = self
+            .receiving
+            .source
+            .get()
+            .expect("installed original publication");
+        let progress = source.poll_progress(cx);
+        let observation = self.receiving.observation();
+        if let Some(result) = observation.raw_outcome()
+            && let Some(validation) = observation.validation()
+        {
+            validation?;
+            return std::task::Poll::Ready(result);
+        }
+        assert!(
+            progress.is_pending(),
+            "closed original publication has no received outcome"
+        );
+        std::task::Poll::Pending
+    }
+    pub fn poll_closed(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        self.receiving
+            .source
+            .get()
+            .expect("installed original publication")
+            .poll_closed(cx)
+    }
+}
+
 pub trait ConnectorStagedCreate: Send + Sync {
+    /// Pure construction only. Unsupported does not invoke the legacy method.
+    fn begin_publish_original(
+        &self,
+        _request: ConnectorStagedCreatePublishRequest,
+        _observation: ConnectorStagedCreatePublicationRecorder,
+    ) -> Result<Arc<dyn ConnectorStagedCreatePublicationSource>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector does not support original staged publication",
+        ))
+    }
+
+    fn prepare_async(
+        &self,
+        _request: ConnectorStagedCreatePrepareRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ConnectorStagedCreatePrepareOutcome, ConnectorError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector does not support direct asynchronous staged-create control",
+            ))
+        })
+    }
+
+    fn publish_async(
+        &self,
+        _request: ConnectorStagedCreatePublishRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ConnectorStagedCreatePublishOutcome, ConnectorError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector does not support direct asynchronous staged-create control",
+            ))
+        })
+    }
+
+    fn abort_async(
+        &self,
+        _request: ConnectorStagedCreateAbortRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ConnectorStagedCreateAbortOutcome, ConnectorError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector does not support direct asynchronous staged-create control",
+            ))
+        })
+    }
+
+    fn adjudicate_publication_async(
+        &self,
+        _request: ConnectorStagedCreatePublicationAdjudicationRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        ConnectorStagedCreatePublicationAdjudicationOutcome,
+                        ConnectorError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector does not support direct asynchronous staged-create control",
+            ))
+        })
+    }
+
+    fn acknowledge_cleanup_disposed(
+        &self,
+        _handle: &ConnectorStagedTableHandle,
+    ) -> Result<(), ConnectorError> {
+        Err(invalid(
+            "Connector has no exact staged cleanup disposition acknowledgement",
+        ))
+    }
+    /// Observes actual original cleanup responsibility; this grants no I/O authority.
+    fn cleanup_responsibility(
+        &self,
+        _handle: &ConnectorStagedTableHandle,
+    ) -> Result<super::ConnectorMetadataCleanupResponsibility, ConnectorError> {
+        Ok(super::ConnectorMetadataCleanupResponsibility::Retained)
+    }
+    /// Advance only cleanup already authorized by the original known outcome.
+    fn settle_cleanup_async(
+        &self,
+        _handle: ConnectorStagedTableHandle,
+        _context: ConnectorRequestContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<super::ConnectorMetadataCleanupResponsibility, ConnectorError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(super::ConnectorMetadataCleanupResponsibility::Retained) })
+    }
+
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn incarnation(&self) -> ProviderBindingEpoch;
 
@@ -967,6 +1576,46 @@ pub enum ConnectorCtasUnanchoredCleanupOutcome {
 /// lookup, validates provenance at the deterministic prefix, and only then
 /// deletes that prefix. Any negative or ambiguous observation is retained.
 pub trait ConnectorUnanchoredCtasCleanup: Send + Sync {
+    fn discover_unanchored_ctas_async(
+        &self,
+        _request: ConnectorCtasUnanchoredDiscoveryRequest,
+        _context: ConnectorRequestContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Vec<ConnectorCtasUnanchoredProvenance>, ConnectorError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector does not support direct asynchronous CTAS cleanup",
+            ))
+        })
+    }
+
+    fn inspect_then_delete_unanchored_ctas_async(
+        &self,
+        _request: ConnectorCtasUnanchoredCleanupRequest,
+        _context: ConnectorRequestContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ConnectorCtasUnanchoredCleanupOutcome, ConnectorError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector does not support direct asynchronous CTAS cleanup",
+            ))
+        })
+    }
+
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn incarnation(&self) -> ProviderBindingEpoch;
     fn warehouse_root(&self) -> Result<Arc<str>, ConnectorError>;
@@ -1000,6 +1649,100 @@ pub struct ConnectorUnanchoredCtasCleanupLease {
 }
 
 impl ConnectorUnanchoredCtasCleanupLease {
+    pub async fn discover_unanchored_ctas_async(
+        &self,
+        warehouse_root: Arc<str>,
+        cutoff_ms: i64,
+        context: ConnectorRequestContext,
+        receiving: &Mutex<Option<Result<Vec<ConnectorCtasUnanchoredProvenance>, ConnectorError>>>,
+    ) -> Result<Vec<ConnectorCtasUnanchoredProvenance>, ConnectorError> {
+        if receiving
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            return Err(invalid("CTAS original Provider receiving slot is occupied"));
+        }
+
+        let request = ConnectorCtasUnanchoredDiscoveryRequest::try_new(
+            self.provider_binding_key.clone(),
+            warehouse_root,
+            cutoff_ms,
+        )?;
+        {
+            let mut original = self
+                .capability
+                .discover_unanchored_ctas_async(request, context);
+            let outcome =
+                std::future::poll_fn(|cx| std::future::Future::poll(original.as_mut(), cx)).await;
+            {
+                let mut slot = receiving
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(
+                    slot.is_none(),
+                    "same CTAS Provider receiving slot changed during poll"
+                );
+                *slot = Some(outcome);
+            }
+            drop(original);
+
+            receiving
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("same stored CTAS Provider verdict")
+        }
+    }
+
+    pub async fn inspect_then_delete_unanchored_ctas_async(
+        &self,
+        warehouse_root: Arc<str>,
+        cutoff_ms: i64,
+        provenance: ConnectorCtasUnanchoredProvenance,
+        context: ConnectorRequestContext,
+        receiving: &Mutex<Option<Result<ConnectorCtasUnanchoredCleanupOutcome, ConnectorError>>>,
+    ) -> Result<ConnectorCtasUnanchoredCleanupOutcome, ConnectorError> {
+        if receiving
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            return Err(invalid("CTAS original Provider receiving slot is occupied"));
+        }
+
+        let request = ConnectorCtasUnanchoredCleanupRequest::try_new(
+            self.provider_binding_key.clone(),
+            warehouse_root,
+            cutoff_ms,
+            provenance,
+        )?;
+        {
+            let mut original = self
+                .capability
+                .inspect_then_delete_unanchored_ctas_async(request, context);
+            let outcome =
+                std::future::poll_fn(|cx| std::future::Future::poll(original.as_mut(), cx)).await;
+            {
+                let mut slot = receiving
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(
+                    slot.is_none(),
+                    "same CTAS Provider receiving slot changed during poll"
+                );
+                *slot = Some(outcome);
+            }
+            drop(original);
+
+            receiving
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("same stored CTAS Provider verdict")
+        }
+    }
+
     pub fn new_with_control_runtime(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
@@ -1125,6 +1868,519 @@ struct StagedCreateLeaseRelease {
 }
 
 impl ConnectorStagedCreateLease {
+    /// The immutable generation owner already pinned by this exact lease.
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
+        &self.provider_binding_key
+    }
+
+    pub fn acknowledge_cleanup_disposed(
+        &self,
+        handle: &ConnectorStagedTableHandle,
+    ) -> Result<(), ConnectorError> {
+        if handle.owner() != &self.provider_binding_key {
+            return Err(invalid(
+                "Staged cleanup acknowledgement has a foreign owner",
+            ));
+        }
+        self.capability.acknowledge_cleanup_disposed(handle)?;
+        let _retired = self
+            .operations
+            .lock()
+            .map_err(|error| invalid(format!("staged-create lease lock: {error}")))?
+            .remove(&handle.operation_id());
+        Ok(())
+    }
+    pub fn cleanup_responsibility(
+        &self,
+        handle: &ConnectorStagedTableHandle,
+    ) -> Result<super::ConnectorMetadataCleanupResponsibility, ConnectorError> {
+        if handle.owner() != &self.provider_binding_key {
+            return Err(invalid("Staged cleanup has a foreign handle owner"));
+        }
+        self.capability.cleanup_responsibility(handle)
+    }
+    pub async fn settle_cleanup_async(
+        &self,
+        handle: ConnectorStagedTableHandle,
+        context: ConnectorRequestContext,
+        receiving: &Mutex<
+            Option<Result<super::ConnectorMetadataCleanupResponsibility, ConnectorError>>,
+        >,
+    ) -> Result<super::ConnectorMetadataCleanupResponsibility, ConnectorError> {
+        if handle.owner() != &self.provider_binding_key {
+            return Err(invalid("Staged cleanup has a foreign handle owner"));
+        }
+        if receiving
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+        {
+            return Err(invalid("CTAS cleanup receiving slot is occupied"));
+        }
+        let mut original = self.capability.settle_cleanup_async(handle, context);
+        std::future::poll_fn(|cx| match original.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(result) => {
+                *receiving.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+                std::task::Poll::Ready(())
+            }
+        })
+        .await;
+        drop(original);
+        receiving
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .ok_or_else(|| invalid("CTAS cleanup lost its actual Provider result"))?
+    }
+    pub async fn prepare_async(
+        &self,
+        request: ConnectorStagedCreatePrepareRequest,
+        receiving: &Mutex<Option<Result<ConnectorStagedCreatePrepareOutcome, ConnectorError>>>,
+    ) -> Result<ConnectorStagedCreatePrepareOutcome, ConnectorError> {
+        if receiving
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            return Err(invalid("CTAS original Provider receiving slot is occupied"));
+        }
+
+        if request.owner != self.provider_binding_key
+            || request.table.instance_id != self.provider_binding_key.instance_id
+        {
+            return Err(invalid("staged-create prepare request has a foreign owner"));
+        }
+        if request.operation_id.to_bytes() != request.publication_id.to_bytes() {
+            return Err(invalid(
+                "staged-create operation ID must equal its statement publication ID",
+            ));
+        }
+        request
+            .mode
+            .validate_for(&request.owner, request.operation_id, &request.table)?;
+        let retained_request = request.clone();
+        let operation_id = request.operation_id;
+        {
+            let mut operations = self
+                .operations
+                .lock()
+                .map_err(|error| invalid(format!("staged-create lease lock: {error}")))?;
+            if operations.contains_key(&operation_id) {
+                return Err(invalid(
+                    "staged-create operation ID is already reserved by this lease",
+                ));
+            }
+            operations.insert(operation_id, LeaseOperationState::Preparing);
+        }
+        let original_outcome = {
+            let mut original = self.capability.prepare_async(request);
+            let outcome =
+                std::future::poll_fn(|cx| std::future::Future::poll(original.as_mut(), cx)).await;
+            {
+                let mut slot = receiving
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(
+                    slot.is_none(),
+                    "same CTAS Provider receiving slot changed during poll"
+                );
+                *slot = Some(outcome);
+            }
+            drop(original);
+
+            receiving
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("same stored CTAS Provider verdict")
+        };
+        let outcome = match original_outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.record_after_dispatch(
+                    operation_id,
+                    Some(LeaseOperationState::Unknown {
+                        handle_digest: None,
+                        bound_write: None,
+                    }),
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.validate_prepare_outcome(&retained_request, &outcome) {
+            self.record_after_dispatch(
+                operation_id,
+                Some(LeaseOperationState::Unknown {
+                    handle_digest: None,
+                    bound_write: None,
+                }),
+            );
+            return Err(error);
+        }
+        let state = match &outcome {
+            ConnectorStagedCreatePrepareOutcome::AppliedButUnusable { .. } => {
+                Some(LeaseOperationState::StageAppliedUnusable)
+            }
+            ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. } => {
+                Some(LeaseOperationState::Unpublished {
+                    handle_digest: handle.digest(),
+                    bound_write: None,
+                })
+            }
+            ConnectorStagedCreatePrepareOutcome::CommitUnknown { .. } => {
+                Some(LeaseOperationState::Unknown {
+                    handle_digest: None,
+                    bound_write: None,
+                })
+            }
+            ConnectorStagedCreatePrepareOutcome::Conflict { .. }
+            | ConnectorStagedCreatePrepareOutcome::KnownUncommitted { .. } => None,
+        };
+        self.record_after_dispatch(operation_id, state);
+        Ok(outcome)
+    }
+
+    /// The fixed receiving slot is claimed before the actual Provider factory.
+    /// The factory forms a strong Source; only the returned execution polls it.
+    pub fn begin_publish_original(
+        &self,
+        request: ConnectorStagedCreatePublishRequest,
+        receiving: &ConnectorStagedCreatePublicationReceiving,
+    ) -> Result<ConnectorStagedCreatePublication, ConnectorError> {
+        let write = self.require_bound_write(&request.handle, &request.write)?;
+        match &request.payload {
+            ConnectorStagedCreatePublicationPayload::Ordinary
+                if request.handle.document_target().is_none() => {}
+            ConnectorStagedCreatePublicationPayload::KeyedDocuments(intent) => {
+                intent.validate_for_handle(&request.handle)?
+            }
+            _ => {
+                return Err(invalid(
+                    "staged create publication payload does not match its prepared target mode",
+                ));
+            }
+        }
+        let identity = PublicationIdentity {
+            lease: self.clone(),
+            operation: request.handle.operation_id(),
+            dispatch: request.operation_id,
+            digest: request.handle.digest(),
+            write,
+        };
+        receiving
+            .observation
+            .0
+            .identity
+            .set(identity)
+            .map_err(|_| invalid("original staged publication receiving is already claimed"))?;
+        let recorder = ConnectorStagedCreatePublicationRecorder {
+            observation: receiving.observation(),
+        };
+        let source = match self
+            .capability
+            .begin_publish_original(request, recorder.clone())
+        {
+            Ok(source) => source,
+            Err(error) => {
+                // The factory contract is pure construction, before any F or
+                // I/O. Preserve this explicit refusal in the original row.
+                recorder.record_preparation_refusal(error.clone());
+                return Err(error);
+            }
+        };
+        assert!(
+            receiving
+                .observation
+                .0
+                .source
+                .set(Arc::downgrade(&source))
+                .is_ok(),
+            "one original staged publication observer"
+        );
+        assert!(
+            receiving.source.set(source).is_ok(),
+            "one original staged publication Source"
+        );
+        Ok(ConnectorStagedCreatePublication {
+            receiving: receiving.clone(),
+        })
+    }
+
+    pub async fn publish_async(
+        &self,
+        request: ConnectorStagedCreatePublishRequest,
+        receiving: &Mutex<Option<Result<ConnectorStagedCreatePublishOutcome, ConnectorError>>>,
+    ) -> Result<ConnectorStagedCreatePublishOutcome, ConnectorError> {
+        if receiving
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            return Err(invalid("CTAS original Provider receiving slot is occupied"));
+        }
+
+        let bound_write = self.require_bound_write(&request.handle, &request.write)?;
+        match &request.payload {
+            ConnectorStagedCreatePublicationPayload::Ordinary
+                if request.handle.document_target().is_none() => {}
+            ConnectorStagedCreatePublicationPayload::KeyedDocuments(intent) => {
+                intent.validate_for_handle(&request.handle)?;
+            }
+            _ => {
+                return Err(invalid(
+                    "staged create publication payload does not match its prepared target mode",
+                ));
+            }
+        }
+        let operation_id = request.handle.operation_id();
+        let handle_digest = request.handle.digest();
+        let dispatch_operation_id = request.operation_id;
+        let original_outcome = {
+            let mut original = self.capability.publish_async(request);
+            let outcome =
+                std::future::poll_fn(|cx| std::future::Future::poll(original.as_mut(), cx)).await;
+            {
+                let mut slot = receiving
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(
+                    slot.is_none(),
+                    "same CTAS Provider receiving slot changed during poll"
+                );
+                *slot = Some(outcome);
+            }
+            drop(original);
+
+            receiving
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("same stored CTAS Provider verdict")
+        };
+        let outcome = match original_outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.set_unknown_without_evidence(
+                    operation_id,
+                    Some(handle_digest),
+                    Some(bound_write),
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.validate_publish_outcome(dispatch_operation_id, &outcome) {
+            self.set_unknown_without_evidence(operation_id, Some(handle_digest), Some(bound_write));
+            return Err(error);
+        }
+        let state = match &outcome {
+            ConnectorStagedCreatePublishOutcome::Applied { .. } => LeaseOperationState::Published,
+            ConnectorStagedCreatePublishOutcome::NoOp { .. }
+            | ConnectorStagedCreatePublishOutcome::Conflict { .. }
+            | ConnectorStagedCreatePublishOutcome::KnownUncommitted { .. } => {
+                LeaseOperationState::Unpublished {
+                    handle_digest,
+                    bound_write: Some(bound_write),
+                }
+            }
+            ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. } => {
+                LeaseOperationState::PublicationUnknown {
+                    evidence_digest: evidence.digest(),
+                    handle_digest,
+                    bound_write,
+                }
+            }
+        };
+        self.record_after_dispatch(operation_id, Some(state));
+        Ok(outcome)
+    }
+
+    pub async fn abort_async(
+        &self,
+        request: ConnectorStagedCreateAbortRequest,
+        receiving: &Mutex<Option<Result<ConnectorStagedCreateAbortOutcome, ConnectorError>>>,
+    ) -> Result<ConnectorStagedCreateAbortOutcome, ConnectorError> {
+        if receiving
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            return Err(invalid("CTAS original Provider receiving slot is occupied"));
+        }
+
+        let bound_write = self.bound_write_for_abort(&request.handle, request.write.as_ref())?;
+        let operation_id = request.handle.operation_id();
+        let handle_digest = request.handle.digest();
+        let dispatch_operation_id = request.operation_id;
+        let original_outcome = {
+            let mut original = self.capability.abort_async(request);
+            let outcome =
+                std::future::poll_fn(|cx| std::future::Future::poll(original.as_mut(), cx)).await;
+            {
+                let mut slot = receiving
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(
+                    slot.is_none(),
+                    "same CTAS Provider receiving slot changed during poll"
+                );
+                *slot = Some(outcome);
+            }
+            drop(original);
+
+            receiving
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("same stored CTAS Provider verdict")
+        };
+        let outcome = match original_outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.set_unknown_without_evidence(operation_id, Some(handle_digest), bound_write);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.validate_abort_outcome(dispatch_operation_id, &outcome) {
+            self.set_unknown_without_evidence(operation_id, Some(handle_digest), bound_write);
+            return Err(error);
+        }
+        let state = match &outcome {
+            ConnectorStagedCreateAbortOutcome::Aborted { .. } => LeaseOperationState::Aborted,
+            ConnectorStagedCreateAbortOutcome::KnownUncommitted { .. } => {
+                LeaseOperationState::Unpublished {
+                    handle_digest,
+                    bound_write,
+                }
+            }
+            ConnectorStagedCreateAbortOutcome::CommitUnknown { .. } => {
+                LeaseOperationState::Unknown {
+                    handle_digest: Some(handle_digest),
+                    bound_write,
+                }
+            }
+        };
+        self.record_after_dispatch(operation_id, Some(state));
+        Ok(outcome)
+    }
+
+    pub async fn adjudicate_publication_async(
+        &self,
+        request: ConnectorStagedCreatePublicationAdjudicationRequest,
+        receiving: &Mutex<
+            Option<Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError>>,
+        >,
+    ) -> Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError> {
+        if receiving
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            return Err(invalid("CTAS original Provider receiving slot is occupied"));
+        }
+
+        let operation_id = request.target_operation_id;
+        let dispatch_operation_id = request.evidence.operation_id();
+        self.validate_evidence_for(
+            &request.evidence,
+            dispatch_operation_id,
+            "staged-create-publish",
+        )?;
+        let (unresolved_handle_digest, unresolved_bound_write) = {
+            let mut operations = self
+                .operations
+                .lock()
+                .map_err(|error| invalid(format!("staged-create lease lock: {error}")))?;
+            let prior = match operations.get(&operation_id) {
+                Some(LeaseOperationState::PublicationUnknown {
+                    evidence_digest,
+                    handle_digest,
+                    bound_write,
+                }) if *evidence_digest == request.evidence.digest() => {
+                    (*handle_digest, *bound_write)
+                }
+                _ => {
+                    return Err(invalid(
+                        "staged-create publication adjudication requires the exact publish-unknown evidence",
+                    ));
+                }
+            };
+            // Consume the sole observation permission under the same lock.
+            // A concurrent caller must fail before entering the provider.
+            operations.insert(
+                operation_id,
+                LeaseOperationState::Unknown {
+                    handle_digest: Some(prior.0),
+                    bound_write: Some(prior.1),
+                },
+            );
+            prior
+        };
+        let original_outcome = {
+            let mut original = self.capability.adjudicate_publication_async(request);
+            let outcome =
+                std::future::poll_fn(|cx| std::future::Future::poll(original.as_mut(), cx)).await;
+            {
+                let mut slot = receiving
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(
+                    slot.is_none(),
+                    "same CTAS Provider receiving slot changed during poll"
+                );
+                *slot = Some(outcome);
+            }
+            drop(original);
+
+            receiving
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("same stored CTAS Provider verdict")
+        };
+        let outcome = match original_outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // The sole observation attempt was consumed once the provider
+                // call began. Do not retain evidence that could authorize a
+                // second adjudication after a transport failure.
+                self.record_after_dispatch(
+                    operation_id,
+                    Some(LeaseOperationState::Unknown {
+                        handle_digest: Some(unresolved_handle_digest),
+                        bound_write: Some(unresolved_bound_write),
+                    }),
+                );
+                return Err(error);
+            }
+        };
+        let state = match &outcome {
+            ConnectorStagedCreatePublicationAdjudicationOutcome::Published { receipt, .. } => {
+                self.validate_receipt(
+                    receipt,
+                    dispatch_operation_id,
+                    ConnectorStagedCreateReceiptPhase::Published,
+                )?;
+                LeaseOperationState::Published
+            }
+            ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
+                evidence, ..
+            } => {
+                self.validate_evidence_for(
+                    evidence,
+                    dispatch_operation_id,
+                    "staged-create-publish",
+                )?;
+                LeaseOperationState::Unknown {
+                    handle_digest: Some(unresolved_handle_digest),
+                    bound_write: Some(unresolved_bound_write),
+                }
+            }
+        };
+        self.record_after_dispatch(operation_id, Some(state));
+        Ok(outcome)
+    }
+
     pub fn new_with_control_runtime(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
@@ -1241,11 +2497,6 @@ impl ConnectorStagedCreateLease {
             capability,
             release,
         )
-    }
-
-    #[cfg(test)]
-    pub fn owner(&self) -> &ConnectorProviderBindingKey {
-        &self.provider_binding_key
     }
 
     pub fn prepare(
@@ -1991,6 +3242,378 @@ mod tests {
     use super::*;
     use crate::connector::{CatalogVersion, ConnectorInstanceId, ConnectorProviderId};
 
+    fn original_publication_observation() -> (
+        ConnectorStagedCreatePublicationRecorder,
+        ConnectorStagedCreateLease,
+        ConnectorMutationOperationId,
+    ) {
+        let (descriptor, incarnation) = owner();
+        let capability = Arc::new(FakeCapability {
+            descriptor: descriptor.clone(),
+            incarnation,
+            aborts: AtomicUsize::new(0),
+            prepares: AtomicUsize::new(0),
+            unknown_prepare: false,
+            fail_prepare: false,
+            malformed_prepare: false,
+            unusable_prepare: false,
+            noop_publish: false,
+            conflict_publish: false,
+            unknown_abort: false,
+            binds: AtomicUsize::new(0),
+            publishes: AtomicUsize::new(0),
+        });
+        let lease = ConnectorStagedCreateLease::new(
+            ConnectorProviderBindingKey {
+                instance_id: descriptor.instance_id,
+                incarnation,
+            },
+            capability,
+            || {},
+        )
+        .unwrap();
+        let operation = ConnectorMutationOperationId::new();
+        let observation = ConnectorStagedCreatePublicationObservation::default();
+        assert!(
+            observation
+                .0
+                .identity
+                .set(PublicationIdentity {
+                    lease: lease.clone(),
+                    operation,
+                    dispatch: operation,
+                    digest: [7; 32],
+                    write: BoundWriteProof {
+                        receipt_digest: [8; 32],
+                        row_count: 0
+                    }
+                })
+                .is_ok()
+        );
+        (
+            ConnectorStagedCreatePublicationRecorder { observation },
+            lease,
+            operation,
+        )
+    }
+
+    #[test]
+    fn original_publication_receives_exact_applied_and_one_absolute_context_without_exit() {
+        let (observation, lease, operation) = original_publication_observation();
+        let receipt = ConnectorStagedCreateReceipt::try_new(
+            lease.owner().clone(),
+            operation,
+            ConnectorStagedCreateReceiptPhase::Published,
+            ExternalMutationEffect::Applied,
+            Bytes::new(),
+        )
+        .unwrap();
+        let stage_receipt = ConnectorStagedCreateReceipt::try_new(
+            lease.owner().clone(),
+            operation,
+            ConnectorStagedCreateReceiptPhase::Prepared,
+            ExternalMutationEffect::Applied,
+            Bytes::new(),
+        )
+        .unwrap();
+        assert!(
+            observation.record_applied_receipt(&stage_receipt).is_err(),
+            "the staging receipt is not final publication evidence"
+        );
+        let original = context();
+        let deadline = original.deadline();
+        assert!(observation.finalization_context().is_none());
+        observation.record_applied_receipt(&receipt).unwrap();
+        observation
+            .record_finalization_context(&receipt, Ok(original))
+            .unwrap();
+        assert_eq!(
+            observation
+                .finalization_context()
+                .unwrap()
+                .unwrap()
+                .deadline(),
+            deadline
+        );
+        assert!(
+            observation
+                .record_finalization_context(&receipt, Ok(context()))
+                .is_err()
+        );
+        assert_eq!(
+            observation
+                .finalization_context()
+                .unwrap()
+                .unwrap()
+                .deadline(),
+            deadline
+        );
+        assert!(observation.needed_committed().is_none());
+        assert!(!observation.provider_exited());
+        observation
+            .record_needed_committed(
+                ExternalMutationEffect::Applied,
+                &receipt,
+                &ExternalMutationFinalization::Complete,
+            )
+            .unwrap();
+        observation.record_raw(Ok(ConnectorStagedCreatePublishOutcome::Applied {
+            receipt: receipt.clone(),
+            finalization: ExternalMutationFinalization::Complete,
+        }));
+        assert_eq!(observation.validation().unwrap(), Ok(()));
+        assert_eq!(observation.applied_receipt(), Some(receipt));
+        assert!(
+            !observation.provider_exited(),
+            "a received result never proves the opaque Future Drop"
+        );
+        assert!(matches!(
+            lease.operations.lock().unwrap().get(&operation),
+            Some(LeaseOperationState::Published)
+        ));
+        observation.enter_foreign();
+        assert!(observation.foreign_exit_unproven());
+        observation.record_provider_exit();
+        assert!(observation.provider_exited());
+        assert!(!observation.foreign_exit_unproven());
+    }
+
+    #[test]
+    fn original_publication_noop_unknown_and_preparation_refusal_do_not_forge_applied_or_cleanup() {
+        let (noop, lease, operation) = original_publication_observation();
+        let receipt = ConnectorStagedCreateReceipt::try_new(
+            lease.owner().clone(),
+            operation,
+            ConnectorStagedCreateReceiptPhase::Published,
+            ExternalMutationEffect::NoOp,
+            Bytes::new(),
+        )
+        .unwrap();
+        assert!(noop.record_applied_receipt(&receipt).is_err());
+        assert!(
+            noop.record_finalization_context(&receipt, Ok(context()))
+                .is_err()
+        );
+        noop.record_needed_committed(
+            ExternalMutationEffect::NoOp,
+            &receipt,
+            &ExternalMutationFinalization::Complete,
+        )
+        .unwrap();
+        noop.record_raw(Ok(ConnectorStagedCreatePublishOutcome::NoOp {
+            receipt,
+            finalization: ExternalMutationFinalization::Complete,
+        }));
+        assert!(noop.applied_receipt().is_none());
+        assert!(noop.finalization_context().is_none());
+        assert_eq!(noop.validation().unwrap(), Ok(()));
+
+        let (unknown, lease, operation) = original_publication_observation();
+        assert!(!unknown.confirmed_not_dispatched());
+        let evidence = ExternalMutationEvidence::try_new(
+            1,
+            lease.capability.descriptor().clone(),
+            lease.owner().incarnation,
+            operation,
+            "staged-create-publish",
+            Bytes::from_static(b"unknown-original"),
+        )
+        .unwrap();
+        unknown.record_raw(Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown {
+            failure: ConnectorMutationFailure::new(
+                super::super::ConnectorMutationFailureKind::Unavailable,
+                "original unknown",
+            ),
+            evidence,
+        }));
+        assert!(unknown.applied_receipt().is_none());
+        assert!(unknown.needed_committed().is_none());
+        assert!(unknown.finalization_context().is_none());
+        assert!(!unknown.provider_exited());
+
+        let (expired, lease, operation) = original_publication_observation();
+        let receipt = ConnectorStagedCreateReceipt::try_new(
+            lease.owner().clone(),
+            operation,
+            ConnectorStagedCreateReceiptPhase::Published,
+            ExternalMutationEffect::Applied,
+            Bytes::new(),
+        )
+        .unwrap();
+        expired.record_applied_receipt(&receipt).unwrap();
+        let original = ConnectorError::new(
+            ConnectorErrorKind::DeadlineExceeded,
+            "original journal finalization grant expired",
+        );
+        expired
+            .record_finalization_context(&receipt, Err(original.clone()))
+            .unwrap();
+        assert_eq!(
+            expired.finalization_context().unwrap().err().unwrap(),
+            original
+        );
+        assert!(
+            expired
+                .record_finalization_context(&receipt, Ok(context()))
+                .is_err()
+        );
+        assert!(
+            expired.applied_receipt().is_some(),
+            "finite refusal cannot erase actual Applied"
+        );
+
+        assert!(!unknown.confirmed_not_dispatched());
+        let (refused, lease, operation) = original_publication_observation();
+        assert!(!refused.confirmed_not_dispatched());
+        let cause = ConnectorError::new(
+            ConnectorErrorKind::Cancelled,
+            "original preparation stopped before dispatch",
+        );
+        refused.record_preparation_refusal(cause.clone());
+        assert!(refused.confirmed_not_dispatched());
+        assert_eq!(refused.raw_outcome().unwrap().unwrap_err(), cause);
+        assert!(refused.needed_committed().is_none());
+        assert!(refused.applied_receipt().is_none());
+        assert!(
+            matches!(
+                lease.operations.lock().unwrap().get(&operation),
+                Some(LeaseOperationState::Unpublished { .. })
+            ),
+            "a proved preparation refusal must not become Unknown"
+        );
+    }
+
+    #[test]
+    fn pure_original_factory_refusal_preserves_unpublished_bound_write() {
+        let (_, lease, _) = original_publication_observation();
+        let operation = ConnectorMutationOperationId::new();
+        let ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. } = lease
+            .prepare(prepare_request(lease.owner().clone(), operation))
+            .unwrap()
+        else {
+            panic!("actual prepared target required")
+        };
+        let write = write_proof(1);
+        lease.bind_write(handle.clone(), write.clone()).unwrap();
+        let receiving = ConnectorStagedCreatePublicationReceiving::default();
+        let error = match lease.begin_publish_original(
+            ConnectorStagedCreatePublishRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                handle: handle.clone(),
+                write: write.clone(),
+                payload: ConnectorStagedCreatePublicationPayload::Ordinary,
+                context: context(),
+            },
+            &receiving,
+        ) {
+            Ok(_) => panic!("this explicit fixture has no original publication capability"),
+            Err(error) => error,
+        };
+        let observation = receiving.observation();
+        assert!(observation.confirmed_not_dispatched());
+        assert_eq!(observation.raw_outcome().unwrap().unwrap_err(), error);
+        assert!(!observation.dispatch_started());
+        assert!(observation.applied_receipt().is_none());
+        assert!(receiving.original_owner().is_none());
+        // This is an actual lease check, not a rule inferred from no receipt.
+        lease
+            .abort(ConnectorStagedCreateAbortRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                handle,
+                write: Some(write),
+                context: context(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn original_receiving_keeps_needed_and_weak_source_separate_from_actual_exit() {
+        struct HeldOriginal {
+            recorder: ConnectorStagedCreatePublicationRecorder,
+            receipt: ConnectorStagedCreateReceipt,
+            received: std::sync::atomic::AtomicBool,
+            finished: std::sync::atomic::AtomicBool,
+        }
+        impl ConnectorStagedCreatePublicationSource for HeldOriginal {
+            fn dispatch_started(&self) -> bool {
+                self.received.load(Ordering::Acquire)
+            }
+            fn poll_progress(&self, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+                if !self.received.swap(true, Ordering::AcqRel) {
+                    self.recorder.record_applied_receipt(&self.receipt).unwrap();
+                    self.recorder
+                        .record_needed_committed(
+                            ExternalMutationEffect::Applied,
+                            &self.receipt,
+                            &ExternalMutationFinalization::Complete,
+                        )
+                        .unwrap();
+                    self.recorder
+                        .record_raw(Ok(ConnectorStagedCreatePublishOutcome::Applied {
+                            receipt: self.receipt.clone(),
+                            finalization: ExternalMutationFinalization::Complete,
+                        }));
+                }
+                if self.finished.load(Ordering::Acquire) {
+                    self.recorder.record_provider_exit();
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+            fn poll_closed(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+                self.poll_progress(cx)
+            }
+        }
+        // Only the actual producer-shaped fixture receives a recorder. It
+        // grants no CPU/IO/Root capability or claim of full Provider coverage.
+        let (recorder, lease, operation) = original_publication_observation();
+        let observation = recorder.observation.clone();
+        let actual = Arc::new(HeldOriginal {
+            recorder,
+            receipt: ConnectorStagedCreateReceipt::try_new(
+                lease.owner().clone(),
+                operation,
+                ConnectorStagedCreateReceiptPhase::Published,
+                ExternalMutationEffect::Applied,
+                Bytes::new(),
+            )
+            .unwrap(),
+            received: false.into(),
+            finished: false.into(),
+        });
+        let source: Arc<dyn ConnectorStagedCreatePublicationSource> = actual.clone();
+        let weak = Arc::downgrade(&actual);
+        assert!(observation.0.source.set(Arc::downgrade(&source)).is_ok());
+        let receiving = ConnectorStagedCreatePublicationReceiving {
+            observation: observation.clone(),
+            source: Default::default(),
+        };
+        assert!(receiving.source.set(source).is_ok());
+        let mut execution = ConnectorStagedCreatePublication {
+            receiving: receiving.clone(),
+        };
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(!observation.dispatch_started());
+        assert!(matches!(
+            execution.poll_result(&mut cx),
+            std::task::Poll::Ready(Ok(ConnectorStagedCreatePublishOutcome::Applied { .. }))
+        ));
+        assert!(observation.needed_committed().is_some());
+        assert!(observation.dispatch_started());
+        assert!(!observation.provider_exited());
+        assert!(execution.poll_closed(&mut cx).is_pending());
+        actual.finished.store(true, Ordering::Release);
+        assert!(execution.poll_closed(&mut cx).is_ready());
+        assert!(observation.provider_exited());
+        drop(actual);
+        drop(execution);
+        drop(receiving);
+        assert!(
+            weak.upgrade().is_none(),
+            "read observer must not pin the original Source"
+        );
+    }
     #[test]
     fn unanchored_ctas_cleanup_provenance_is_target_bound_and_tamper_evident() {
         let instance_id = ConnectorInstanceId::parse("ice").unwrap();
@@ -3568,5 +5191,452 @@ mod tests {
             .unwrap();
         assert_eq!(capability.publishes.load(Ordering::SeqCst), 1);
         assert_eq!(capability.aborts.load(Ordering::SeqCst), 1);
+    }
+    mod governed_continuation_tests {
+        use super::*;
+        use crate::connector::ConnectorMetadataCleanupResponsibility as Responsibility;
+        use std::{
+            future::Future,
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct AsyncLifecycleCapability {
+            inner: FakeCapability,
+            targets: Mutex<HashMap<ConnectorStagedCreateOperationId, ([u8; 32], bool)>>,
+            acks: AtomicUsize,
+            observations: AtomicUsize,
+            drop_adjudication: bool,
+        }
+        struct OriginalAdjudication {
+            result:
+                Option<Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError>>,
+            drop_panics: bool,
+        }
+        impl Future for OriginalAdjudication {
+            type Output =
+                Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError>;
+            fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(self.result.take().unwrap())
+            }
+        }
+        impl Drop for OriginalAdjudication {
+            fn drop(&mut self) {
+                if self.drop_panics {
+                    panic!("actual original adjudication Future Drop failed");
+                }
+            }
+        }
+        impl ConnectorStagedCreate for AsyncLifecycleCapability {
+            fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+                self.inner.descriptor()
+            }
+            fn incarnation(&self) -> ProviderBindingEpoch {
+                self.inner.incarnation()
+            }
+            fn prepare(
+                &self,
+                request: ConnectorStagedCreatePrepareRequest,
+            ) -> Result<ConnectorStagedCreatePrepareOutcome, ConnectorError> {
+                let result = self.inner.prepare(request)?;
+                if let ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. } = &result {
+                    self.targets
+                        .lock()
+                        .unwrap()
+                        .insert(handle.operation_id(), (handle.digest(), false));
+                }
+                Ok(result)
+            }
+            fn prepare_async(
+                &self,
+                request: ConnectorStagedCreatePrepareRequest,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<ConnectorStagedCreatePrepareOutcome, ConnectorError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async move { self.prepare(request) })
+            }
+            fn plan_write(
+                &self,
+                request: ConnectorStagedWritePlanningRequest,
+            ) -> Result<ConnectorStagedWritePlanningBinding, ConnectorError> {
+                self.inner.plan_write(request)
+            }
+            fn bind_write(
+                &self,
+                handle: ConnectorStagedTableHandle,
+                write: ConnectorStagedWriteProof,
+            ) -> Result<(), ConnectorError> {
+                self.inner.bind_write(handle, write)
+            }
+            fn publish(
+                &self,
+                request: ConnectorStagedCreatePublishRequest,
+            ) -> Result<ConnectorStagedCreatePublishOutcome, ConnectorError> {
+                self.inner.publishes.fetch_add(1, Ordering::SeqCst);
+                Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        crate::connector::ConnectorMutationFailureKind::Unavailable,
+                        "original publication acknowledgement is unknown",
+                    ),
+                    evidence: self
+                        .inner
+                        .evidence_for(request.operation_id, "staged-create-publish"),
+                })
+            }
+            fn abort(
+                &self,
+                request: ConnectorStagedCreateAbortRequest,
+            ) -> Result<ConnectorStagedCreateAbortOutcome, ConnectorError> {
+                let digest = request.handle.digest();
+                let operation = request.handle.operation_id();
+                let result = self.inner.abort(request)?;
+                if matches!(
+                    result,
+                    ConnectorStagedCreateAbortOutcome::Aborted {
+                        finalization: ExternalMutationFinalization::Complete,
+                        ..
+                    }
+                ) {
+                    let mut targets = self.targets.lock().unwrap();
+                    let original = targets
+                        .get_mut(&operation)
+                        .ok_or_else(|| invalid("cleanup target was never prepared"))?;
+                    if original.0 != digest {
+                        return Err(invalid("cleanup target has a foreign exact handle"));
+                    }
+                    original.1 = true;
+                }
+                Ok(result)
+            }
+            fn abort_async(
+                &self,
+                request: ConnectorStagedCreateAbortRequest,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<ConnectorStagedCreateAbortOutcome, ConnectorError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async move { self.abort(request) })
+            }
+            fn cleanup_responsibility(
+                &self,
+                handle: &ConnectorStagedTableHandle,
+            ) -> Result<Responsibility, ConnectorError> {
+                let targets = self.targets.lock().unwrap();
+                let original = targets
+                    .get(&handle.operation_id())
+                    .ok_or_else(|| invalid("cleanup target was never prepared"))?;
+                if original.0 != handle.digest() {
+                    return Err(invalid("cleanup target has a foreign exact handle"));
+                }
+                Ok(if original.1 {
+                    Responsibility::Disposed
+                } else {
+                    Responsibility::Retained
+                })
+            }
+            fn acknowledge_cleanup_disposed(
+                &self,
+                handle: &ConnectorStagedTableHandle,
+            ) -> Result<(), ConnectorError> {
+                let mut targets = self.targets.lock().unwrap();
+                if !targets
+                    .get(&handle.operation_id())
+                    .is_some_and(|(digest, disposed)| *digest == handle.digest() && *disposed)
+                {
+                    return Err(invalid("cleanup acknowledgement lacks exact disposal"));
+                }
+                targets.remove(&handle.operation_id());
+                self.acks.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn adjudicate_publication(
+                &self,
+                request: ConnectorStagedCreatePublicationAdjudicationRequest,
+            ) -> Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError>
+            {
+                self.observations.fetch_add(1, Ordering::SeqCst);
+                Ok(
+                    ConnectorStagedCreatePublicationAdjudicationOutcome::Published {
+                        receipt: self.inner.receipt(
+                            request.evidence.operation_id(),
+                            ConnectorStagedCreateReceiptPhase::Published,
+                        ),
+                        finalization: ExternalMutationFinalization::Complete,
+                    },
+                )
+            }
+            fn adjudicate_publication_async(
+                &self,
+                request: ConnectorStagedCreatePublicationAdjudicationRequest,
+            ) -> Pin<
+                Box<
+                    dyn Future<
+                            Output = Result<
+                                ConnectorStagedCreatePublicationAdjudicationOutcome,
+                                ConnectorError,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(OriginalAdjudication {
+                    result: Some(self.adjudicate_publication(request)),
+                    drop_panics: self.drop_adjudication,
+                })
+            }
+        }
+        fn fixture(
+            unknown_prepare: bool,
+            drop_adjudication: bool,
+        ) -> (Arc<AsyncLifecycleCapability>, ConnectorStagedCreateLease) {
+            let (descriptor, incarnation) = owner();
+            let capability = Arc::new(AsyncLifecycleCapability {
+                inner: FakeCapability {
+                    descriptor: descriptor.clone(),
+                    incarnation,
+                    aborts: AtomicUsize::new(0),
+                    prepares: AtomicUsize::new(0),
+                    unknown_prepare,
+                    fail_prepare: false,
+                    malformed_prepare: false,
+                    unusable_prepare: false,
+                    noop_publish: false,
+                    conflict_publish: false,
+                    unknown_abort: false,
+                    binds: AtomicUsize::new(0),
+                    publishes: AtomicUsize::new(0),
+                },
+                targets: Mutex::new(HashMap::new()),
+                acks: AtomicUsize::new(0),
+                observations: AtomicUsize::new(0),
+                drop_adjudication,
+            });
+            let lease = ConnectorStagedCreateLease::new(
+                ConnectorProviderBindingKey {
+                    instance_id: descriptor.instance_id,
+                    incarnation,
+                },
+                capability.clone(),
+                || {},
+            )
+            .unwrap();
+            (capability, lease)
+        }
+        fn actual_return<F: Future>(future: F) -> F::Output {
+            let mut original = Box::pin(future);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            match original.as_mut().poll(&mut cx) {
+                Poll::Ready(result) => result,
+                Poll::Pending => panic!("scripted original should return in one poll"),
+            }
+        }
+        #[test]
+        fn prepared_target_cancel_before_any_writer_closes_by_exact_async_abort_and_ack() {
+            let (capability, lease) = fixture(false, false);
+            let operation = ConnectorMutationOperationId::new();
+            let request = prepare_request(lease.owner().clone(), operation);
+            let receiving = Mutex::new(None);
+            let prepared = actual_return(lease.prepare_async(request, &receiving)).unwrap();
+            let ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. } = prepared else {
+                panic!("actual prepared target")
+            };
+            let stop = crate::connector::ConnectorStopOwner::new();
+            let cancelled = ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                stop.view(),
+                crate::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                crate::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+            )
+            .unwrap();
+            stop.request_stop();
+            assert!(cancelled.is_cancelled());
+            assert_eq!(capability.inner.binds.load(Ordering::SeqCst), 0);
+            assert_eq!(capability.inner.publishes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                lease.cleanup_responsibility(&handle).unwrap(),
+                Responsibility::Retained
+            );
+            let aborted = actual_return(lease.abort_async(
+                ConnectorStagedCreateAbortRequest {
+                    operation_id: operation,
+                    handle: handle.clone(),
+                    write: None,
+                    context: cancelled,
+                },
+                &Mutex::new(None),
+            ))
+            .unwrap();
+            assert!(matches!(
+                aborted,
+                ConnectorStagedCreateAbortOutcome::Aborted {
+                    finalization: ExternalMutationFinalization::Complete,
+                    ..
+                }
+            ));
+            assert_eq!(
+                lease.cleanup_responsibility(&handle).unwrap(),
+                Responsibility::Disposed
+            );
+            lease.acknowledge_cleanup_disposed(&handle).unwrap();
+            assert!(lease.operations.lock().unwrap().is_empty());
+            assert!(capability.targets.lock().unwrap().is_empty());
+            assert_eq!(capability.inner.aborts.load(Ordering::SeqCst), 1);
+            assert_eq!(capability.acks.load(Ordering::SeqCst), 1);
+        }
+        #[test]
+        fn unknown_stage_never_grants_the_unlaunched_target_abort() {
+            let (capability, lease) = fixture(true, false);
+            let operation = ConnectorMutationOperationId::new();
+            let result = actual_return(lease.prepare_async(
+                prepare_request(lease.owner().clone(), operation),
+                &Mutex::new(None),
+            ))
+            .unwrap();
+            assert!(matches!(
+                result,
+                ConnectorStagedCreatePrepareOutcome::CommitUnknown { .. }
+            ));
+            let offered = ConnectorStagedTableHandle::try_new(
+                lease.owner().clone(),
+                operation,
+                Bytes::from_static(b"provider-handle"),
+            )
+            .unwrap();
+            assert!(
+                actual_return(lease.abort_async(
+                    ConnectorStagedCreateAbortRequest {
+                        operation_id: operation,
+                        handle: offered,
+                        write: None,
+                        context: context()
+                    },
+                    &Mutex::new(None)
+                ))
+                .is_err()
+            );
+            assert_eq!(capability.inner.aborts.load(Ordering::SeqCst), 0);
+        }
+        #[test]
+        fn exact_published_adjudication_is_stored_before_its_original_future_drop() {
+            let (capability, lease) = fixture(false, true);
+            let operation = ConnectorMutationOperationId::new();
+            let prepared = actual_return(lease.prepare_async(
+                prepare_request(lease.owner().clone(), operation),
+                &Mutex::new(None),
+            ))
+            .unwrap();
+            let ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. } = prepared else {
+                panic!("actual prepared target")
+            };
+            let write = write_proof(7);
+            lease.bind_write(handle.clone(), write.clone()).unwrap();
+            let publication = lease
+                .publish(ConnectorStagedCreatePublishRequest {
+                    operation_id: operation,
+                    handle,
+                    write,
+                    payload: ConnectorStagedCreatePublicationPayload::Ordinary,
+                    context: context(),
+                })
+                .unwrap();
+            let ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. } = publication
+            else {
+                panic!("original actual publish unknown")
+            };
+            let raw = Mutex::new(None);
+            let mut original = Box::pin(lease.adjudicate_publication_async(
+                ConnectorStagedCreatePublicationAdjudicationRequest {
+                    target_operation_id: operation,
+                    evidence: evidence.clone(),
+                    context: context(),
+                },
+                &raw,
+            ));
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| original
+                    .as_mut()
+                    .poll(&mut cx)))
+                .is_err()
+            );
+            let stored = raw.lock().unwrap();
+            let Some(Ok(ConnectorStagedCreatePublicationAdjudicationOutcome::Published {
+                receipt,
+                ..
+            })) = stored.as_ref()
+            else {
+                panic!("original raw published verdict must survive destructor failure")
+            };
+            assert_eq!(receipt.owner(), lease.owner());
+            assert_eq!(receipt.operation_id(), evidence.operation_id());
+            assert_eq!(
+                receipt.phase(),
+                ConnectorStagedCreateReceiptPhase::Published
+            );
+            drop(stored);
+            assert_eq!(capability.observations.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                lease.operations.lock().unwrap().get(&operation),
+                Some(LeaseOperationState::Unknown { .. })
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod needed_write_proof_tests {
+    use super::*;
+    use crate::connector::write_stack::ConnectorWritePublicationCompletion;
+
+    fn needed(
+        finalization: ExternalMutationFinalization,
+    ) -> Arc<super::super::write_stack::ConnectorWriteNeededReady> {
+        let ConnectorWritePublicationCompletion::KnownCommitted { needed, .. } =
+            ConnectorWritePublicationCompletion::from_committed_frontier(
+                ExternalMutationEffect::NoOp,
+                ConnectorWriteReceipt::try_new(Bytes::from_static(b"actual staged seal")).unwrap(),
+                finalization,
+            )
+        else {
+            unreachable!()
+        };
+        needed
+    }
+    #[test]
+    fn staged_proof_and_its_clones_borrow_the_original_needed_receipt() {
+        let needed = needed(ExternalMutationFinalization::Complete);
+        let original = needed.receipt() as *const ConnectorWriteReceipt;
+        let proof =
+            ConnectorStagedWriteProof::try_from_needed_ready(Arc::clone(&needed), 23).unwrap();
+        let cloned = proof.clone();
+        assert_eq!(proof.receipt() as *const ConnectorWriteReceipt, original);
+        assert_eq!(cloned.receipt() as *const ConnectorWriteReceipt, original);
+        assert_eq!(proof.digest(), needed.receipt().digest());
+        assert_eq!(proof.row_count(), 23);
+        let legacy = ConnectorStagedWriteProof::try_new(needed.receipt().clone(), 23).unwrap();
+        assert_eq!(
+            legacy, proof,
+            "receipt ownership form cannot change proof value equality"
+        );
+    }
+    #[test]
+    fn real_failed_needed_finalization_cannot_authorize_the_final_create() {
+        let needed = needed(ExternalMutationFinalization::Failed(
+            ConnectorMutationFailure::new(
+                super::super::ConnectorMutationFailureKind::Unavailable,
+                "actual necessary seal finalization failed",
+            ),
+        ));
+        assert!(ConnectorStagedWriteProof::try_from_needed_ready(Arc::clone(&needed), 23).is_err());
+        assert!(matches!(
+            needed.finalization(),
+            ExternalMutationFinalization::Failed(_)
+        ));
     }
 }

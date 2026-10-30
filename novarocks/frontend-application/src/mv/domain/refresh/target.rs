@@ -18,12 +18,8 @@
 //! Iceberg MV target identity and statement-name resolution.
 
 use crate::mv::domain::analysis::resolve_mv_name;
-use crate::mv::domain::refresh::target_binding::{
-    MvTargetBinding, load_mv_target_binding_with_ports, load_mv_target_binding_with_ports_typed,
-};
+use crate::mv::domain::refresh::target_binding::MvTargetBinding;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
-use novarocks_spi::connector::MvStorageObservationPort;
-use novarocks_spi::connector::{ConnectorControlResolver, ConnectorError, ConnectorRequestContext};
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_sql::semantic::ObjectName;
 use novarocks_types::naming::{TableIdentity, normalize_identifier};
@@ -86,94 +82,14 @@ pub fn resolve_refresh_mv_target(
     })
 }
 
-/// Loads the sealed target binding used by one Iceberg MV refresh attempt.
-///
-/// This capability deliberately receives only the two admitted ports, the
-/// normalized domain target, and the request context.  It does not depend on
-/// the aggregate refresh source or query assembly state.
-pub fn load_iceberg_mv_target_binding(
-    connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
-    target: &IcebergMvTarget,
-    connector_context: &ConnectorRequestContext,
-) -> Result<MvTargetBinding, String> {
-    load_mv_target_binding_with_ports(
-        connector_control,
-        storage_observation,
-        &TableIdentity {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        },
-        connector_context,
-    )
-}
-
-/// Typed counterpart used by the background refresh path. A caller must map
-/// the returned connector category to its retry policy instead of inferring
-/// one from text after it has crossed the preparation boundary.
-pub(crate) fn load_iceberg_mv_target_binding_typed(
-    connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
-    target: &IcebergMvTarget,
-    connector_context: &ConnectorRequestContext,
-    #[cfg(novarocks_dev_controls)] controls: Option<&crate::mv::test_controls::MvTestControls>,
-) -> Result<MvTargetBinding, ConnectorError> {
-    #[cfg(novarocks_dev_controls)]
-    if let Some(controls) = controls
-        && controls
-            .transient_preparation(&target.catalog, &target.namespace, &target.table)
-            .map_err(|error| {
-                ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-                    error,
-                )
-            })?
-    {
-        return Err(ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-            format!(
-                "test-injected temporary connector unavailability while preparing {}.{}.{}",
-                target.catalog, target.namespace, target.table
-            ),
-        ));
-    }
-    load_mv_target_binding_with_ports_typed(
-        connector_control,
-        storage_observation,
-        &TableIdentity {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        },
-        connector_context,
-    )
-}
-
-/// Validates that the persisted MV definition still names the target snapshot
-/// that was observed for refresh planning.
-pub fn validate_target_snapshot(
+/// Validate the original target fence using an already observed exact Current.
+/// This pure author is shared by synchronous and asynchronous observation.
+pub(crate) fn validate_target_snapshot_observed(
     target: &IcebergMvTarget,
     mv_definition: &StoredKeyedMvProjection,
     binding: &MvTargetBinding,
-    entrance: &novarocks_mv_application::management::ManagementEntrance,
-    context: &ConnectorRequestContext,
+    observed: &novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
 ) -> Result<(), String> {
-    let documents = binding
-        .lease()
-        .derive_document_storage_lease()
-        .map_err(|e| e.to_string())?;
-    let request = crate::mv::domain::staged_create::keyed_request(
-        &documents,
-        binding.identity().clone(),
-        mv_definition
-            .facts
-            .source_revision()
-            .target_object_id
-            .clone(),
-        context.clone(),
-    );
-    let (observed,_)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management(&documents,request,Default::default(),entrance).map_err(|e|e.to_string())?;
     if observed.view.current_snapshot != binding.current_snapshot_id() {
         return Err(format!(
             "MV target {}.{}.{} changed during refresh planning",
@@ -186,36 +102,6 @@ pub fn validate_target_snapshot(
         .map_err(|e| e.to_string())?;
 
     Ok(())
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn recorded_target_snapshot_id(
-    target: &IcebergMvTarget,
-    mv_definition: &StoredKeyedMvProjection,
-) -> Result<i64, String> {
-    published_target_snapshot_id(mv_definition)?.ok_or_else(|| {
-        format!(
-            "iceberg materialized view {}.{}.{} has no recorded target snapshot",
-            target.catalog, target.namespace, target.table
-        )
-    })
-}
-
-fn published_target_snapshot_id(
-    projection: &StoredKeyedMvProjection,
-) -> Result<Option<i64>, String> {
-    if projection.facts.publication().is_some() {
-        projection
-            .facts
-            .publication_snapshot()
-            .map(Some)
-            .ok_or_else(|| "published Iceberg MV output has no provider snapshot ID".to_string())
-    } else {
-        Ok(projection.facts.metadata_version().snapshot_id())
-    }
 }
 
 #[cfg(test)]
@@ -240,7 +126,7 @@ mod tests {
             facts: fixture.build().expect("projection"),
         };
 
-        assert_eq!(published_target_snapshot_id(&projection).unwrap(), Some(12));
+        assert_eq!(projection.facts.publication_snapshot(), Some(12));
     }
 
     #[test]
@@ -254,7 +140,7 @@ mod tests {
             .build()
             .expect("never published projection"),
         };
-        assert_eq!(published_target_snapshot_id(&projection).unwrap(), None);
+        assert_eq!(projection.facts.publication_snapshot(), None);
         let mut empty = ProjectionFixture::new(
             ProductMvTarget::from_parts(Some("ice"), "sales", "mv"),
             Some(11),
@@ -265,7 +151,7 @@ mod tests {
             mv_id: 1,
             facts: empty.build().unwrap(),
         };
-        assert_eq!(published_target_snapshot_id(&empty).unwrap(), Some(11));
+        assert_eq!(empty.facts.publication_snapshot(), Some(11));
     }
 
     #[test]
@@ -298,7 +184,7 @@ mod tests {
             facts: fixture.build().unwrap(),
         };
         assert!(projection.facts.never_published());
-        assert_eq!(published_target_snapshot_id(&projection).unwrap(), Some(11));
+        assert_eq!(projection.facts.metadata_version().snapshot_id(), Some(11));
         let (_, current) =
             novarocks_mv_application::persistence::keyed_documents::keyed_view_fixture(
                 Some(12),

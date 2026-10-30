@@ -510,14 +510,13 @@ mod tests {
                                 value,
                                 DataType::List(Arc::new(
                                     Field::new(item, DataType::Utf8, true).with_metadata(
-                                        [
+                                        std::collections::HashMap::<String, String>::from([
                                             (
                                                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
                                                 "uninterpreted".into(),
                                             ),
                                             ("PARQUET:field_id".into(), "19".into()),
-                                        ]
-                                        .into(),
+                                        ]),
                                     ),
                                 )),
                                 true,
@@ -768,18 +767,16 @@ mod tests {
 
     #[test]
     fn inverse_projection_never_adopts_an_annotation_or_an_equal_carrier_domain() {
-        let carrier = DataType::Struct(
-            vec![
-                Field::new("v", DataType::Utf8, true).with_metadata(
-                    [(
+        let carrier =
+            DataType::Struct(
+                vec![Field::new("v", DataType::Utf8, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
                         novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
                         "json".into(),
-                    )]
-                    .into(),
-                ),
-            ]
-            .into(),
-        );
+                    )]),
+                )]
+                .into(),
+            );
         let plain = SqlType::Struct(vec![("v".into(), SqlType::String)]);
         let json = SqlType::Struct(vec![("v".into(), SqlType::Json)]);
         let plain_binding = bind(&plain, &carrier, false);
@@ -929,8 +926,12 @@ mod projection_observer_tests {
         let name = "semantic_name_".repeat(40);
         let layout = DataType::Struct(
             vec![
-                Field::new(name.clone(), DataType::Utf8, false)
-                    .with_metadata([("provider.attribute".into(), "original bytes".into())].into()),
+                Field::new(name.clone(), DataType::Utf8, false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider.attribute".into(),
+                        "original bytes".into(),
+                    )]),
+                ),
             ]
             .into(),
         );
@@ -968,7 +969,7 @@ mod projection_observer_tests {
         let DataType::Struct(fields) = binding.data_type() else {
             panic!("execution");
         };
-        assert_eq!(fields[0].metadata().capacity(), 0);
+        assert!(fields[0].metadata().is_empty());
         assert_eq!(
             binding.value_type().child_type_at(0).unwrap().domain(),
             Some(ValueLogicalType::Json)

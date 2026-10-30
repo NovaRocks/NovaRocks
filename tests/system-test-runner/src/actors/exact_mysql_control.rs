@@ -169,7 +169,7 @@ pub struct ConnectionFacts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatementFacts {
     pub connection_id: u32,
-    pub session_epoch: u64,
+    pub session_key: u64,
     pub generation: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,7 +329,7 @@ impl Reader<'_> {
         let statement = self.option(|r| {
             Ok(StatementFacts {
                 connection_id: r.u32()?,
-                session_epoch: r.u64()?,
+                session_key: r.u64()?,
                 generation: r.u64()?,
             })
         })?;

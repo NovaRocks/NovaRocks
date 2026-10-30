@@ -133,7 +133,7 @@ fn owned_boolean_selection(
 }
 
 #[test]
-fn validated_large_boolean_update_and_merge_refuse_before_actual_request_constructor_entry() {
+fn validated_large_boolean_update_and_merge_are_not_refused_by_ast_layout_invoices() {
     for (intent, effect) in [
         (
             spi::ConnectorRowMutationIntent::Update,
@@ -151,9 +151,8 @@ fn validated_large_boolean_update_and_merge_refuse_before_actual_request_constru
         let retention =
             crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(&binding)
                 .unwrap();
-        // 65536*64*2*Expr(168 on the frozen probe target) exceeds 1008MiB.
-        // 32768 rows does NOT exceed this single-AST necessary bound: do not
-        // multiply by three here, since unknown targets can partition rows.
+        // The actual source remains small. Its old rows*width*Expr invoice
+        // does not qualify the Root; the real constructor keeps its own limits.
         let (preparation, selection, backing) =
             owned_boolean_selection(65_536, 64, intent, effect, &retention);
         let validation = crate::query_execution::row_mutation::RowMutationMatchValidator::try_new(
@@ -165,11 +164,10 @@ fn validated_large_boolean_update_and_merge_refuse_before_actual_request_constru
         let original_deadline = context.deadline();
         let request_entry = std::cell::Cell::new(false);
         let owned = selection.has_owned_sources();
-        let result =
-            before_request_owned(&preparation, selection, Some(&binding), &context, |_| {
-                request_entry.set(true);
-                "original request constructor entered"
-            });
+        let result = before_request_owned(selection, Some(&binding), &context, |_| {
+            request_entry.set(true);
+            "original request constructor entered"
+        });
         let entered = request_entry.get();
         let deadline_same = context.deadline() == original_deadline;
         drop(preparation);
@@ -182,8 +180,8 @@ fn validated_large_boolean_update_and_merge_refuse_before_actual_request_constru
         assert!(validation.is_ok());
         assert!(owned);
         assert!(backing < 16 * 1024 * 1024);
-        assert!(matches!(result, Err(NecessaryError::ResourceExhausted(_))));
-        assert!(!entered);
+        assert_eq!(result.unwrap(), "original request constructor entered");
+        assert!(entered);
         assert!(deadline_same);
         assert_eq!(final_positions, [0; 4]);
     }
@@ -207,23 +205,17 @@ fn small_signed_rewrite_and_append_reach_original_builders_without_false_refusal
     .and_then(|mut v| v.validate_selection(&fixture.selection));
     let context = connector_context_for_test();
     let original_deadline = context.deadline();
-    let rewrite = before_request(
-        &fixture.preparation,
-        &fixture.selection,
-        Some(&binding),
-        &context,
-        || {
-            build_cow_rewrite_query(
-                &fixture.selection,
-                &fixture.rows,
-                &fixture.input,
-                &fixture.route_facts,
-                &fixture.rewrite_source,
-                fixture.preparation.match_contract(),
-                &fixture.identity,
-            )
-        },
-    );
+    let rewrite = before_request(Some(&binding), &context, || {
+        build_cow_rewrite_query(
+            &fixture.selection,
+            &fixture.rows,
+            &fixture.input,
+            &fixture.route_facts,
+            &fixture.rewrite_source,
+            fixture.preparation.match_contract(),
+            &fixture.identity,
+        )
+    });
     let retention =
         crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(&binding)
             .unwrap();
@@ -287,21 +279,15 @@ fn small_signed_rewrite_and_append_reach_original_builders_without_false_refusal
             .collect::<Vec<_>>(),
     )
     .unwrap();
-    let append = before_request(
-        &append_preparation,
-        &append_selection,
-        Some(&binding),
-        &context,
-        || {
-            build_cow_append_query(
-                &append_selection,
-                &[spi::ConnectorRowMutationSelectionOrdinal::new(0)],
-                &input,
-                &route,
-                append_preparation.match_contract(),
-            )
-        },
-    );
+    let append = before_request(Some(&binding), &context, || {
+        build_cow_append_query(
+            &append_selection,
+            &[spi::ConnectorRowMutationSelectionOrdinal::new(0)],
+            &input,
+            &route,
+            append_preparation.match_contract(),
+        )
+    });
     let same_deadline = context.deadline() == original_deadline;
     // Drop actual returned ASTs and all source/route objects before final facts.
     let rewrite_ok = matches!(&rewrite, Ok(Ok(_)));
@@ -348,16 +334,10 @@ fn zero_after_delete_has_zero_necessary_cost_and_preserves_later_provider_semant
     )
     .and_then(|mut v| v.validate_selection(&selection));
     let reached = std::cell::Cell::new(false);
-    let result = before_request(
-        &preparation,
-        &selection,
-        Some(&binding),
-        &connector_context_for_test(),
-        || {
-            reached.set(true);
-            "original provider decides zero-width input"
-        },
-    );
+    let result = before_request(Some(&binding), &connector_context_for_test(), || {
+        reached.set(true);
+        "original provider decides zero-width input"
+    });
     let entered = reached.get();
     drop(selection);
     drop(preparation);
@@ -395,13 +375,7 @@ fn original_cancelled_and_expired_controls_win_before_request_and_keep_the_same_
     stop.request_stop();
     let entered = std::cell::Cell::new(false);
     let expected_cancel = cancelled.check_active().unwrap_err().kind();
-    let cancel_result = before_request(
-        &fixture.preparation,
-        &fixture.selection,
-        Some(&binding),
-        &cancelled,
-        || entered.set(true),
-    );
+    let cancel_result = before_request(Some(&binding), &cancelled, || entered.set(true));
     let expired_deadline = std::time::Instant::now();
     let expired = spi::ConnectorRequestContext::try_new(
         expired_deadline,
@@ -411,13 +385,7 @@ fn original_cancelled_and_expired_controls_win_before_request_and_keep_the_same_
     )
     .unwrap();
     let expected_expired = expired.check_active().unwrap_err().kind();
-    let expired_result = before_request(
-        &fixture.preparation,
-        &fixture.selection,
-        Some(&binding),
-        &expired,
-        || entered.set(true),
-    );
+    let expired_result = before_request(Some(&binding), &expired, || entered.set(true));
     let cancel_kind = match &cancel_result {
         Err(NecessaryError::Control(e)) => Some(e.kind()),
         _ => None,

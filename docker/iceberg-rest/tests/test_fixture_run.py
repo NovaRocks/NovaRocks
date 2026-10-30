@@ -18,6 +18,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fixture_run
+import java_rest_inputs
 import fixture_runtime
 
 
@@ -41,6 +42,236 @@ class RunTests(unittest.TestCase):
         self.manifest["runtime"]["machine"].update(control_root=str(self.root/"machine"), daemon_id="exact-daemon", version="exact-version", generation="exact-generation")
         self.write_manifest()
         return fixture_run.admit(self.env)[2]
+
+    def test_communicate_preserves_capture_and_redirects_real_child_with_original_cwd(self):
+        command = [sys.executable, '-c',
+                   'import os,sys;print(os.getcwd());print("child-error",file=sys.stderr)']
+        captured = fixture_run.communicate(command, timeout=5, capture=True, cwd=self.root)
+        self.assertEqual(captured.returncode, 0)
+        self.assertEqual(captured.stdout.decode().strip(), str(self.root.resolve()))
+        self.assertEqual(captured.stderr.decode().strip(), 'child-error')
+        with (self.root / 'child.log').open('wb') as output:
+            redirected = fixture_run.communicate(command, timeout=5, cwd=self.root,
+                stdout=output, stderr=subprocess.STDOUT)
+        self.assertEqual(redirected.returncode, 0)
+        self.assertEqual(set((self.root / 'child.log').read_text().splitlines()),
+                         {str(self.root.resolve()), 'child-error'})
+        with patch.object(fixture_run.subprocess, 'Popen') as process:
+            with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
+                fixture_run.communicate(command, timeout=5, capture=True, stdout=subprocess.PIPE)
+            process.assert_not_called()
+
+    def java_publication(self):
+        repo = self.root.resolve() / 'repo'
+        publication = repo / 'docker/iceberg-rest/runtime/current/published'
+        publication.mkdir(parents=True)
+        bom = self.root / 'bom.json'
+        bom.write_text(json.dumps({'lock_sha256':'exact-lock'}))
+        manifest = dict(self.manifest, fixture_inputs={'verified':True, 'bom':str(bom),
+                                                     'lock_sha256':'exact-lock'})
+        (publication / 'manifest.json').write_text(json.dumps(manifest))
+        values = dict(NOVA_ENV_ID='worktree-id', NOVA_ENV_REST_ENV_FILE=str(publication/'env.sh'),
+            NOVA_ENV_MANIFEST=str(publication/'manifest.json'), NOVA_ENV_RUNTIME_DIR=str(self.root),
+            NOVAROCKS_ICEBERG_REST_URI='http://fixture.invalid',
+            NOVAROCKS_ICEBERG_REST_WAREHOUSE='s3://fixture/rest', AWS_S3_ENDPOINT='http://s3.invalid',
+            AWS_S3_ACCESS_KEY_ID='fixture-key', AWS_S3_SECRET_ACCESS_KEY='fixture-secret')
+        import shlex
+        (publication/'env.sh').write_text('unset AWS_SESSION_TOKEN\n' +
+            ''.join('export '+key+'='+shlex.quote(value)+'\n' for key,value in values.items()))
+        return repo, publication
+
+    def test_java_owner_inherits_same_budget_storage_without_cleanup_rights(self):
+        repo, publication = self.java_publication()
+        with patch.dict(os.environ, {}, clear=True):
+            original = fixture_run.admit(publication/'env.sh')[2].as_dict()
+            storage = json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE'])
+            inherited = dict(os.environ, AWS_SESSION_TOKEN='foreign')
+            root = self.root.resolve()/'inherited-artifacts'
+            def sweep(*args, **kwargs):
+                self.assertFalse(root.exists())
+                self.assertEqual(kwargs['budget'].as_dict(), original)
+            with patch.object(java_rest_inputs.subprocess, 'run', return_value=subprocess.CompletedProcess([],0)), \
+                    patch.object(fixture_run, 'startup_sweep', side_effect=sweep), \
+                    patch.object(fixture_run, 'cleanup_run') as cleanup:
+                with java_rest_inputs.own_inputs(repo, root, inherited) as owner:
+                    self.assertFalse(owner.owns_run)
+                    self.assertEqual(json.loads(owner.environment['NOVA_FIXTURE_RUN_CONTEXT']), original)
+                    self.assertEqual(json.loads(owner.environment['NOVA_FIXTURE_RUN_STORAGE']), storage)
+                    self.assertNotIn('AWS_SESSION_TOKEN', owner.environment)
+                    with patch.object(fixture_run, 'communicate', return_value=subprocess.CompletedProcess([],0)) as command:
+                        self.assertEqual(owner.run(['original-command']), 0)
+                    self.assertEqual(command.call_args.kwargs['cwd'], repo)
+                    self.assertEqual(command.call_args.kwargs['environment'], owner.environment)
+                cleanup.assert_not_called()
+            result = json.loads((root/'owner-result.json').read_text())
+            self.assertEqual(result['cleanup']['disposition'], 'inherited_owner')
+            self.assertFalse(result['cleanup']['cleanup_rights'])
+
+    def test_java_owner_cleans_only_owned_success_after_command_return_and_retains_failures(self):
+        repo, publication = self.java_publication()
+        for status in (0, 7):
+            with self.subTest(status=status), patch.dict(os.environ, {}, clear=True):
+                root = self.root.resolve()/('artifacts-'+str(status))
+                def cleanup(*args, **kwargs):
+                    observed = json.loads((root/'owner-result.json').read_text())
+                    self.assertTrue(observed['command_returned'])
+                    self.assertEqual(observed['exit_code'], 0)
+                    self.assertEqual(kwargs['budget'].as_dict(),
+                                     json.loads((root/'fixture.json').read_text())['run_context'])
+                    return {'complete':True}
+                with patch.object(java_rest_inputs.subprocess, 'run', return_value=subprocess.CompletedProcess([],0)), \
+                        patch.object(fixture_run, 'startup_sweep'), \
+                        patch.object(fixture_run, 'cleanup_run', side_effect=cleanup) as cleaned:
+                    with java_rest_inputs.own_inputs(repo, root, {}) as owner:
+                        with patch.object(fixture_run, 'communicate', return_value=subprocess.CompletedProcess([],status)):
+                            self.assertEqual(owner.run(['original-command']), status)
+                    self.assertEqual(cleaned.call_count, 1 if status == 0 else 0)
+                facts = json.loads((root/'fixture.json').read_text())
+                self.assertEqual(facts['publication'], str(publication))
+                self.assertEqual(json.loads((root/'owner-result.json').read_text())['exit_code'], status)
+                for family in ('IRU5','IRU13A','IRU13B'):
+                    self.assertTrue((root/family).is_dir())
+
+    def test_java_owner_cancel_and_incomplete_cleanup_keep_original_failure_facts(self):
+        repo, publication = self.java_publication()
+        for mode in ('cancel', 'cleanup', 'collection'):
+            with self.subTest(mode=mode), patch.dict(os.environ, {}, clear=True):
+                root=self.root.resolve()/('cancel-'+mode)
+                with patch.object(java_rest_inputs.subprocess, 'run', return_value=subprocess.CompletedProcess([],0)), \
+                        patch.object(fixture_run, 'startup_sweep'), \
+                        patch.object(fixture_run, 'cleanup_run', return_value={'complete':False,'errors':['original']}) as cleanup:
+                    if mode == 'cancel':
+                        with self.assertRaises(KeyboardInterrupt):
+                            with java_rest_inputs.own_inputs(repo, root, {}) as owner:
+                                with patch.object(fixture_run, 'communicate', side_effect=KeyboardInterrupt):
+                                    owner.run(['original-command'])
+                        cleanup.assert_not_called()
+                    elif mode == 'collection':
+                        with self.assertRaisesRegex(ValueError,'native results absent'):
+                            with java_rest_inputs.own_inputs(repo, root, {}) as owner:
+                                with patch.object(fixture_run, 'communicate', return_value=subprocess.CompletedProcess([],0)):
+                                    owner.run(['original-command'])
+                                raise ValueError('native results absent')
+                        cleanup.assert_not_called()
+                    else:
+                        with self.assertRaisesRegex(ValueError,'cleanup is incomplete'):
+                            with java_rest_inputs.own_inputs(repo, root, {}) as owner:
+                                with patch.object(fixture_run, 'communicate', return_value=subprocess.CompletedProcess([],0)):
+                                    owner.run(['original-command'])
+                facts=json.loads((root/'owner-result.json').read_text())
+                self.assertEqual(facts['command_returned'],mode != 'cancel')
+                self.assertEqual(facts['cleanup']['summary'],'violation' if mode == 'cleanup' else 'unknown')
+                if mode == 'cancel':
+                    self.assertEqual(facts['interrupted'],'KeyboardInterrupt')
+                elif mode == 'collection':
+                    self.assertEqual(facts['owner_scope_error'],'ValueError')
+                    self.assertEqual(facts['exit_code'],0)
+                else:
+                    self.assertEqual(facts['cleanup']['report']['errors'],['original'])
+
+    def cloud_publication(self):
+        cloud = dict(kind="aliyun-oss", region="cn-test", bucket="fixture-bucket",
+                     role_name="fixture-role", root_prefix="development/")
+        self.manifest["env_id"] = "worktree-id"
+        record = self.manifest["runtime"]["machine"]
+        record["config"] = {"object_store": cloud, "benchmark_root": "s3://fixture-bucket/development/benchmarks"}
+        record["storage_owner"] = dict(provider="aliyun-oss", endpoint="https://s3.oss-cn-test-internal.aliyuncs.com",
+            region="cn-test", bucket="fixture-bucket", root_prefix="development/")
+        record["server_warehouses"] = {service: "s3://fixture-bucket/development/machines/exact-machine/exact-generation/" + service
+                                       for service in ("rest", "rest-mv")}
+        self.write_manifest()
+        # This broad, foreign location must never become the new run's root.
+        self.env.write_text("export NOVA_ENV_ID='worktree-id'\nexport NOVA_ENV_OBJECT_STORE_KIND='aliyun-oss'\n"
+                            "export CATALOG_WAREHOUSE_URI='s3://foreign-bucket/ancestor'\n")
+        return record
+
+    def test_cloud_new_admission_uses_exact_machine_worktree_domain_without_static_credentials(self):
+        record = self.cloud_publication()
+        with patch.dict(os.environ, {}, clear=True), patch("machine_runtime.MachineOwner") as machine:
+            values, _, budget = fixture_run.admit(self.env)
+            storage = json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"])
+            self.assertEqual("s3://fixture-bucket/development/worktrees/worktree-id/scratch/" + budget.identity.run_id,
+                             budget.identity.scope_root)
+            self.assertEqual(2, storage["schema"])
+            self.assertEqual(record["storage_owner"], storage["storage_owner"])
+            fixture_run.RunStorageScope.from_dict(storage).validate_against(budget.identity, record)
+            for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "MINIO_ROOT_USER"):
+                self.assertNotIn(key, values)
+                self.assertNotIn(key, os.environ)
+            machine.assert_not_called()
+
+    def test_cloud_inheritance_keeps_original_identity_scope_and_deadline(self):
+        self.cloud_publication()
+        with patch.dict(os.environ, {}, clear=True):
+            original = fixture_run.admit(self.env)[2]
+            storage = os.environ["NOVA_FIXTURE_RUN_STORAGE"]
+            with patch.object(fixture_run.ScratchIdentity, "create", side_effect=AssertionError("must keep original run")):
+                nested = fixture_run.admit(self.env, inherited=original.as_dict())[2]
+            self.assertEqual(original.as_dict(), nested.as_dict())
+            self.assertEqual(json.loads(storage), json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]))
+
+    def test_cloud_changed_owner_and_inherited_scope_are_rejected_before_publication(self):
+        record = self.cloud_publication()
+        with patch.dict(os.environ, {}, clear=True):
+            original = fixture_run.admit(self.env)[2]
+            context = os.environ["NOVA_FIXTURE_RUN_CONTEXT"]
+            raw = os.environ["NOVA_FIXTURE_RUN_STORAGE"]
+            record["storage_owner"]["bucket"] = "foreign-bucket"
+            self.write_manifest()
+            with self.assertRaises(fixture_runtime.RuntimeFailure):
+                fixture_run.admit(self.env, inherited=original.as_dict())
+            self.assertEqual(context, os.environ["NOVA_FIXTURE_RUN_CONTEXT"])
+            self.assertEqual(raw, os.environ["NOVA_FIXTURE_RUN_STORAGE"])
+            record["storage_owner"]["bucket"] = "fixture-bucket"
+            self.write_manifest()
+            wrong = json.loads(raw)
+            wrong["storage_owner"]["root_prefix"] = "another-prefix/"
+            os.environ["NOVA_FIXTURE_RUN_STORAGE"] = json.dumps(wrong)
+            with self.assertRaises(fixture_runtime.RuntimeFailure):
+                fixture_run.admit(self.env, inherited=original.as_dict())
+            os.environ["NOVA_FIXTURE_RUN_STORAGE"] = raw
+            record["config"]["object_store"] = None
+            self.write_manifest()
+            with patch.object(fixture_run.ScratchIdentity, "create", side_effect=AssertionError("must not create a replacement")):
+                with self.assertRaises(fixture_runtime.RuntimeFailure):
+                    fixture_run.admit(self.env, inherited=original.as_dict())
+            self.assertEqual(context, os.environ["NOVA_FIXTURE_RUN_CONTEXT"])
+            self.assertEqual(raw, os.environ["NOVA_FIXTURE_RUN_STORAGE"])
+
+    def test_cloud_configuration_is_closed_and_never_falls_back_to_minio(self):
+        import copy
+        record = self.cloud_publication()
+        valid = copy.deepcopy(record["config"]["object_store"])
+        for cloud in (None, {}, {**valid, "kind": "minio"}, {**valid, "bucket": ""},
+                      {**valid, "root_prefix": "development"}, {**valid, "access_key": "forbidden"}):
+            with self.subTest(cloud=cloud), patch.dict(os.environ, {}, clear=True):
+                record["config"]["object_store"] = cloud
+                record["config"]["minio_volume"] = "must-not-fallback"
+                self.write_manifest()
+                with self.assertRaises(fixture_runtime.RuntimeFailure):
+                    fixture_run.admit(self.env)
+                self.assertNotIn("NOVA_FIXTURE_RUN_CONTEXT", os.environ)
+                self.assertNotIn("NOVA_FIXTURE_RUN_STORAGE", os.environ)
+        record["config"] = {"minio_volume": "must-not-fallback"}
+        self.write_manifest()
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(fixture_runtime.RuntimeFailure):
+            fixture_run.admit(self.env)
+
+    def test_cloud_env_id_cannot_escape_its_exact_worktree_component(self):
+        self.cloud_publication()
+        for env_id in ("foreign-worktree", "../foreign", "worktree-id/other", ".", "..", "", "worktree-id\nforeign"):
+            import shlex
+            self.env.write_text("export NOVA_ENV_OBJECT_STORE_KIND='aliyun-oss'\nexport NOVA_ENV_ID=" + shlex.quote(env_id) + "\n")
+            with self.subTest(env_id=env_id), patch.dict(os.environ, {}, clear=True), self.assertRaises((fixture_runtime.RuntimeFailure, ValueError)):
+                fixture_run.admit(self.env)
+        self.env.write_text("export NOVA_ENV_OBJECT_STORE_KIND='aliyun-oss'\n")
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(fixture_runtime.RuntimeFailure):
+            fixture_run.admit(self.env)
+        self.env.write_text("export NOVA_ENV_ID='worktree-id'\nexport NOVA_ENV_OBJECT_STORE_KIND='aliyun-oss'\n")
+        del self.manifest["env_id"]
+        self.write_manifest()
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(fixture_runtime.RuntimeFailure):
+            fixture_run.admit(self.env)
 
     def test_storage_projection_is_fixed_and_revalidated_before_native_effects(self):
         with patch.dict(os.environ, {}, clear=True):

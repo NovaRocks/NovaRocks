@@ -137,38 +137,30 @@ impl StatisticsJobRuntime {
         let (stop, mut stop_rx) = watch::channel(false);
         let (completed, completion) = oneshot::channel();
         let worker_service = service.clone();
-        let worker_runtime = runtime.clone();
         let join = runtime.spawn(async move {
+            let mut pending = false;
             loop {
+                if *stop_rx.borrow() { break; }
+                if pending {
+                    let work = worker_service.run_one(Arc::clone(&executor), now_ms());
+                    tokio::pin!(work);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            result = &mut work => { pending = matches!(result, Ok(Some(_))); break; }
+                            _ = std::future::poll_fn(|cx|worker_service.repository.poll_exits(cx,now_ms())) => {}
+                        }
+                    }
+                    continue;
+                }
                 tokio::select! {
-                    changed = stop_rx.changed() => {
-                        if changed.is_err() || *stop_rx.borrow() {
-                            break;
-                        }
-                    }
-                    wake = wake_rx.recv() => {
-                        if wake.is_none() {
-                            break;
-                        }
-                        loop {
-                            if *stop_rx.borrow() {
-                                break;
-                            }
-                            let service = worker_service.clone();
-                            let executor = Arc::clone(&executor);
-                            let runtime = worker_runtime.clone();
-                            let result = tokio::task::spawn_blocking(move || {
-                                runtime.block_on(service.run_one(executor, now_ms()))
-                            })
-                            .await;
-                            match result {
-                                Ok(Ok(Some(_))) => continue,
-                                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
-                            }
-                        }
-                    }
+                    changed = stop_rx.changed() => { if changed.is_err() || *stop_rx.borrow() { break; } }
+                    wake = wake_rx.recv() => { if wake.is_none() { break; } pending = true; }
+                    _ = std::future::poll_fn(|cx|worker_service.repository.poll_exits(cx,now_ms())) => {}
                 }
             }
+            // The shared bank retains unresolved actual sources on process
+            // stop. Stopping this serial job selector never fabricates exit.
             let _ = completed.send(());
         });
         Self {
@@ -179,6 +171,46 @@ impl StatisticsJobRuntime {
             completion: Mutex::new(Some(completion)),
             join: Mutex::new(Some(join)),
         }
+    }
+
+    /// Install the already-paid original without consuming it on refusal.
+    /// The caller stores the returned identity before notifying either owner.
+    pub fn install_internal_job_in(
+        &self,
+        request: StatisticsJobCreate,
+        source: &mut Option<StatisticsJobAdmission>,
+    ) -> Result<(StatisticsJob, crate::StatisticsJobNotification), StatisticsRepositoryError> {
+        let _admission = self.admission.lock().map_err(|_| {
+            StatisticsRepositoryError::new(
+                crate::StatisticsRepositoryErrorKind::Conflict,
+                "statistics worker admission lock poisoned",
+            )
+        })?;
+        if *self.stop.borrow() || self.wake.is_closed() {
+            return Err(StatisticsRepositoryError::new(
+                crate::StatisticsRepositoryErrorKind::Conflict,
+                "statistics worker is unavailable",
+            ));
+        }
+        self.service
+            .repository
+            .install_internal_job_in(request, source)
+    }
+
+    /// A stopped worker does not undo an installed job or hide its identity.
+    /// The repository retains the originals while cancellation settles.
+    pub fn notify_installed_job(
+        &self,
+        id: StatisticsJobId,
+        notice: crate::StatisticsJobNotification,
+    ) {
+        // The installed original must reach its sole private worker even if
+        // an unrelated public observation waker panics below. Both calls are
+        // outside the admission/repository locks and the identity is stable.
+        if let Err(mpsc::error::TrySendError::Closed(_)) = self.wake.try_send(()) {
+            let _ = self.service.request_cancel_now(id, now_ms());
+        }
+        notice.notify();
     }
 
     pub async fn submit_admitted(
@@ -288,5 +320,248 @@ fn now_ms() -> i64 {
 impl Default for StatisticsJobService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+    use crate::{
+        StatisticsAttemptError, StatisticsColumns, StatisticsFailure, StatisticsJobConclusion,
+        StatisticsJobOriginals, StatisticsJobProgress, StatisticsJobState, StatisticsTarget,
+    };
+    use novarocks_resource_contract::SharedDependency;
+    use novarocks_workload_control::{
+        ControlStorageConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        joint_admission::{
+            JointLane, JointProgress, JointProgressDriver, JointResource as R, JointTryBegin,
+            ResponsibilityConfig,
+        },
+    };
+    use std::{
+        future::Future,
+        num::{NonZeroU64, NonZeroUsize},
+        panic::{AssertUnwindSafe, catch_unwind},
+        pin::Pin,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        task::{Context, Poll, Wake, Waker},
+        time::Duration,
+    };
+
+    // The same fixed WC substrate supplies a positive Root payload and one
+    // real query permit. This is not a Native/Provider capacity certificate.
+    fn original_control() -> (WorkloadControl, JointProgressDriver, u64) {
+        let storage = ControlStorageConfig::new(4, &[]);
+        let metadata = storage.base_charge().unwrap().get(R::MetadataBytes);
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            root_limit: 4,
+            business_limit: 4,
+            scope_records_limit: 4,
+            query_concurrency_limit: 1,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
+        let (_, driver) = control
+            .configure_responsibility(ResponsibilityConfig {
+                work_per_turn: NonZeroUsize::new(7).unwrap(),
+            })
+            .unwrap();
+        control.configure_control_storage(storage).unwrap();
+        let mut results = novarocks_workload_control::ResultCapacityConfig::V1;
+        results.all_objects_bytes[2] = 1024 * 1024;
+        control.configure_result_capacity(results).unwrap();
+        control.mark_ready().unwrap();
+        (control, driver, metadata)
+    }
+    fn drive_original(driver: &mut JointProgressDriver) {
+        for _ in 0..100000 {
+            if matches!(driver.step(), JointProgress::Idle(_)) {
+                return;
+            }
+        }
+        panic!("original notification component driver did not become idle");
+    }
+
+    struct HeldOriginal {
+        started: Mutex<Option<oneshot::Sender<StatisticsJobId>>>,
+        release: Mutex<Option<oneshot::Receiver<()>>>,
+        exited: Arc<AtomicBool>,
+    }
+    impl StatisticsAttemptExecutor for HeldOriginal {
+        fn execute<'a>(
+            &'a self,
+            job: StatisticsJob,
+            admission: StatisticsJobAdmission,
+            progress: StatisticsJobProgress,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StatisticsAttemptError>> + Send + 'a>> {
+            Box::pin(async move {
+                let originals: StatisticsJobOriginals = admission.into_originals();
+                assert!(
+                    originals
+                        .query_concurrency
+                        .as_ref()
+                        .unwrap()
+                        .is_for_scope(&originals.owner.as_ref().unwrap().scope())
+                );
+                let started = self.started.lock().unwrap().take().unwrap();
+                let release = self.release.lock().unwrap().take().unwrap();
+                started.send(job.id).unwrap();
+                release.await.unwrap();
+                // This executor mounted no background/Provider/Native source.
+                // Retire its actual originals, not a synthetic exit receipt.
+                progress.retire_unmounted(originals, now_ms()).unwrap();
+                self.exited.store(true, Ordering::SeqCst);
+                progress
+                    .finish(
+                        Err(StatisticsAttemptError::Failed(StatisticsFailure {
+                            compile_control: None,
+                            message: Arc::from(
+                                "controlled executor finished without external dispatch",
+                            ),
+                        })),
+                        now_ms(),
+                    )
+                    .unwrap();
+                Ok(())
+            })
+        }
+    }
+    struct PanicObservationWake(Arc<AtomicUsize>);
+    impl Wake for PanicObservationWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(0x5a91u32);
+        }
+    }
+
+    #[tokio::test]
+    async fn public_observation_panic_cannot_strand_the_installed_original_worker() {
+        let (control, mut driver, metadata) = original_control();
+        let root = control
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .unwrap();
+        let scope = root.owner.scope();
+        let permit = scope.admit_query().unwrap().await.unwrap();
+        let domains = scope.prepare_root_domains().unwrap();
+        let initial = domains
+            .initial_payload_source(&scope, JointLane::Custody)
+            .unwrap();
+        let JointTryBegin::Started(mut proposal) = initial
+            .try_begin(
+                NonZeroU64::new(metadata.checked_mul(4).unwrap()).unwrap(),
+                NonZeroU64::new(128).unwrap(),
+            )
+            .unwrap()
+        else {
+            panic!("original initial payload Q slot");
+        };
+        proposal
+            .push_dependency(&SharedDependency::LocalHost)
+            .unwrap();
+        let mut pending = proposal.submit().unwrap();
+        drive_original(&mut driver);
+        let mut payload = None;
+        let mut cx = Context::from_waker(Waker::noop());
+        let Poll::Ready(Ok(notification)) = pending.poll_install_in(&mut cx, &scope, &mut payload)
+        else {
+            panic!("actual original payload did not install");
+        };
+        notification.notify();
+        drop(pending);
+        drive_original(&mut driver);
+        let mut owner = Some(root.owner);
+        let mut query_permit = Some(permit);
+        let mut admission = None;
+        StatisticsJobAdmission::install_internal_in(
+            &mut owner,
+            &mut query_permit,
+            &mut payload,
+            &mut admission,
+        )
+        .unwrap();
+        let service = StatisticsJobService::new();
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let exited = Arc::new(AtomicBool::new(false));
+        let runtime = StatisticsJobRuntime::start(
+            service.clone(),
+            Arc::new(HeldOriginal {
+                started: Mutex::new(Some(started)),
+                release: Mutex::new(Some(release_rx)),
+                exited: Arc::clone(&exited),
+            }),
+            tokio::runtime::Handle::current(),
+        );
+        let (job, notice) = runtime
+            .install_internal_job_in(
+                StatisticsJobCreate {
+                    target: StatisticsTarget {
+                        catalog: Arc::from("iceberg"),
+                        namespace: Arc::from("db"),
+                        table: Arc::from("t"),
+                        object_id: Arc::from(&b"object"[..]),
+                    },
+                    columns: StatisticsColumns::All,
+                    submitted_at_ms: 1,
+                },
+                &mut admission,
+            )
+            .unwrap();
+        assert!(admission.is_none(), "the original table accepted custody");
+        let changed = Arc::clone(&service.repository.changed);
+        let mut observation = Box::pin(changed.notified());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let malicious = Waker::from(Arc::new(PanicObservationWake(Arc::clone(&calls))));
+        assert!(
+            observation
+                .as_mut()
+                .poll(&mut Context::from_waker(&malicious))
+                .is_pending()
+        );
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            runtime.notify_installed_job(job.id, notice)
+        }))
+        .expect_err("the public observation panic must propagate unchanged");
+        assert_eq!(panic.downcast_ref::<u32>(), Some(&0x5a91u32));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(observation);
+        drop(panic);
+
+        // No second submit, runtime signal, timer retry, or direct run_one.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), started_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            job.id
+        );
+        assert_eq!(control.observation().snapshot().admitted_queries, 1);
+        assert!(!exited.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        let terminal =
+            tokio::time::timeout(Duration::from_secs(1), runtime.wait_for_conclusion(job.id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            terminal.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Failed)
+        );
+        assert!(exited.load(Ordering::SeqCst));
+        assert_eq!(control.observation().snapshot().admitted_queries, 0);
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        control.close_admission();
+        drive_original(&mut driver);
+        assert!(
+            control.shutdown().is_ok(),
+            "same original WC must actually drain"
+        );
     }
 }

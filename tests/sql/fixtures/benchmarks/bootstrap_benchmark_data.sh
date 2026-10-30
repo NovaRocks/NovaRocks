@@ -57,7 +57,6 @@ suite=""
 scale=""
 resolved_dataset_file=""
 check_only=0
-rebuild=0
 ensure=0
 dry_run=0
 
@@ -71,7 +70,6 @@ Options:
   --resolved-dataset <file>  T01 resolver JSON for this exact dataset (required).
   --check                    Check READY and emit a typed result/error.
   --ensure                   Reuse READY or build only when it is absent (default).
-  --rebuild                  Rebuild even if readiness check succeeds.
   --dry-run                  Print resolved paths without generating or uploading.
   --help                     Show this help.
 EOF
@@ -113,10 +111,6 @@ parse_args() {
         ;;
       --check)
         check_only=1
-        shift
-        ;;
-      --rebuild)
-        rebuild=1
         shift
         ;;
       --ensure)
@@ -171,7 +165,7 @@ validate_suite_and_scale() {
   esac
   [[ -n "$resolved_dataset_file" ]] || die "--resolved-dataset is required"
   [[ -f "$resolved_dataset_file" ]] || die "resolved dataset is missing: $resolved_dataset_file"
-  (( check_only + rebuild + ensure <= 1 )) || die "choose at most one of --check, --ensure, or --rebuild"
+  (( check_only + ensure <= 1 )) || die "choose at most one of --check or --ensure"
 
   generator_scale="$(scale_to_generator_value "$scale")"
   [[ "$generator_scale" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid scale for $suite: $scale"
@@ -226,8 +220,29 @@ source_env() {
   : "${NOVA_ENV_COMPOSE_FILE:?missing NOVA_ENV_COMPOSE_FILE in $ENV_FILE}"
   : "${NOVA_ENV_SHARED_BENCHMARK_ROOT:?missing NOVA_ENV_SHARED_BENCHMARK_ROOT in $ENV_FILE}"
   : "${AWS_S3_ENDPOINT:?missing AWS_S3_ENDPOINT in $ENV_FILE}"
-  : "${AWS_S3_ACCESS_KEY_ID:?missing AWS_S3_ACCESS_KEY_ID in $ENV_FILE}"
-  : "${AWS_S3_SECRET_ACCESS_KEY:?missing AWS_S3_SECRET_ACCESS_KEY in $ENV_FILE}"
+  case "${NOVA_ENV_OBJECT_STORE_KIND:-minio}" in
+    minio)
+      : "${AWS_S3_ACCESS_KEY_ID:?missing AWS_S3_ACCESS_KEY_ID in $ENV_FILE}"
+      : "${AWS_S3_SECRET_ACCESS_KEY:?missing AWS_S3_SECRET_ACCESS_KEY in $ENV_FILE}"
+      ;;
+    aliyun-oss)
+      : "${NOVA_ENV_OBJECT_STORE_CONFIG:?missing immutable OSS config in $ENV_FILE}"
+      : "${NOVA_OSS_OPS_PYTHON:?missing verified OSS SDK Python in $ENV_FILE}"
+      [[ "${NOVA_OSS_ROLE_NAME:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]*$ ]] || die "invalid OSS role definition"
+      [[ "${oss_region:-}" =~ ^[a-z0-9-]+$ ]] || die "invalid OSS region definition"
+      [[ "$AWS_S3_ENDPOINT" == "https://s3.oss-$oss_region-internal.aliyuncs.com" && "${oss_path_style:-}" == false ]] || die "OSS endpoint or addressing differs from publication"
+      [[ "${NOVAROCKS_SPARK_S3_ENDPOINT:-}" == "$AWS_S3_ENDPOINT" ]] || die "OSS Spark endpoint differs from publication"
+      unset AWS_S3_ACCESS_KEY_ID AWS_S3_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+      ;;
+    *) die "unsupported fixture object-store kind" ;;
+  esac
+  local resolved_kind
+  resolved_kind="$(python3 - "$resolved_dataset_file" <<'PYBINDKIND'
+import json, sys
+print(json.load(open(sys.argv[1]))['producer_fingerprint'].get('object_store_kind', 'minio'))
+PYBINDKIND
+)" || die "invalid resolved producer definition"
+  [[ "$resolved_kind" == "${NOVA_ENV_OBJECT_STORE_KIND:-minio}" ]] || die "resolved producer and fixture storage provider differ"
 }
 
 resolve_paths() {
@@ -300,7 +315,13 @@ assert r['dataset_root'].endswith(suffix)
 print(r['dataset_root'][:-len(suffix)])
 PYROOT
 )" || die "invalid resolved dataset root"
-  expected="$(python3 "$SOURCE_ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" --workspace-root "$SOURCE_ROOT" --suite "$suite" --scale "$scale" --shared-root "$shared_root")" || die "unable to resolve fixture contract"
+  local object_store_kind
+  object_store_kind="$(python3 - "$resolved_dataset_file" <<'PYKIND'
+import json, sys
+print(json.load(open(sys.argv[1]))['producer_fingerprint'].get('object_store_kind', 'minio'))
+PYKIND
+)" || die "invalid resolved producer kind"
+  expected="$(python3 "$SOURCE_ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" --workspace-root "$SOURCE_ROOT" --suite "$suite" --scale "$scale" --shared-root "$shared_root" --object-store-kind "$object_store_kind")" || die "unable to resolve fixture contract"
   actual="$(python3 - "$resolved_dataset_file" <<'PY'
 import json, sys
 print(json.dumps(json.load(open(sys.argv[1], encoding='utf-8')), sort_keys=True, separators=(',', ':')))
@@ -435,9 +456,6 @@ download_and_verify_generator() {
 
 extract_generator_source() {
   download_and_verify_generator
-  if [[ "$rebuild" == "1" ]]; then
-    rm -rf "$source_dir"
-  fi
   if [[ -d "$source_dir" ]]; then
     return
   fi
@@ -600,20 +618,12 @@ generate_raw_files() {
   verify_raw_files
 }
 
-s3_to_mc_path() {
-  local uri="$1"
-  [[ "$uri" == s3://* ]] || die "expected s3 URI, got: $uri"
-  printf 'minio/%s' "${uri#s3://}"
-}
-
 upload_raw_files() {
-  local target_path
-  target_path="$(s3_to_mc_path "$raw_uri")"
   log "Uploading raw files to $raw_uri..."
   local object relative status
   while IFS= read -r -d '' object; do
     relative="${object#"$raw_dir"/}"
-    status="$(fixture_publication_put_conditional "$raw_uri/$relative" "$object" absent)"
+    status="$(fixture_publication_put "$raw_uri/$relative" "$object")"
     [[ "$status" == 200 || "$status" == 201 ]] || return 1
   done < <(find "$raw_dir" -type f -print0)
 }
@@ -624,7 +634,12 @@ run_spark_loader() {
   loader_tmp_dir="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" temp-dir --env-file "$ENV_FILE")" || return
   trap 'primary=$?; cleanup=0; cleanup_spark_tmp_dir '"$(printf '%q' "$loader_tmp_dir")"' || cleanup=$?; if (( primary != 0 )); then exit "$primary"; fi; exit "$cleanup"' EXIT
   local fixture_contract_in_spark="$loader_tmp_dir/fixture-contract.json"
-  local schema_arg=""
+  local schema_arg="" source_args="--object-store-kind 'minio' --s3-region 'us-east-1'"
+  local -a source_environment=()
+  if [[ "${NOVA_ENV_OBJECT_STORE_KIND:-minio}" == aliyun-oss ]]; then
+    source_args="--object-store-kind 'aliyun-oss' --s3-region '$oss_region' --s3-role-name '$NOVA_OSS_ROLE_NAME'"
+    source_environment=(-e "NOVA_OSS_ROLE_NAME=$NOVA_OSS_ROLE_NAME")
+  fi
   local spark_master="${NOVAROCKS_BENCHMARK_SPARK_MASTER:-local[2]}"
   local spark_memory="${NOVAROCKS_BENCHMARK_SPARK_MEMORY:-2g}"
   local spark_shuffle_partitions="${NOVAROCKS_BENCHMARK_SPARK_SHUFFLE_PARTITIONS:-8}"
@@ -636,7 +651,7 @@ run_spark_loader() {
     "${compose_args[@]}" cp "$schema_ddl_file" "spark:$loader_tmp_dir/schema.sql"
     schema_arg="--schema-ddl '$loader_tmp_dir/schema.sql'"
   fi
-  "${compose_args[@]}" exec -T spark /bin/bash -lc "
+  "${compose_args[@]}" exec -T "${source_environment[@]}" spark /bin/bash -lc "
     set -euo pipefail
     spark_submit_bin=\"\${SPARK_SUBMIT_BIN:-}\"
     if [[ -z \"\$spark_submit_bin\" ]]; then
@@ -664,6 +679,7 @@ run_spark_loader() {
       --warehouse '$exact_warehouse' \
       --manifest-output '$manifest_uri' \
       --s3-endpoint '${NOVAROCKS_SPARK_S3_ENDPOINT:-http://minio:9000}' \
+      $source_args \
       --generator '$generator_name' \
       --generator-version '$generator_version' \
       --fixture-contract-json '$fixture_contract_in_spark' \
@@ -709,8 +725,7 @@ new_identity() {
 }
 
 run_with_timeout() {
-  # Each writer has a unique staging prefix. The conditional READY publication
-  # below is the only shared mutation and decides the immutable winner.
+  # Each writer keeps its data in a unique staging prefix until completion.
   local started deadline child_status
   deadline="${NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS:-7200}"
   [[ "$deadline" =~ ^[1-9][0-9]*$ ]] || return 64
@@ -779,17 +794,10 @@ handle_owner_signal() {
 }
 
 publish_ready() {
-  local candidate="$1" mode="$2" observed_etag="${3:-}" status
-  status="$(fixture_publication_put_conditional "$ready_uri" "$candidate" "$mode" "$observed_etag")" || return 4
-  case "$status" in
-    200|201) return 0 ;;
-    409|412)
-      # A conditional loser can only reuse a fully valid exact winner.
-      if check_readiness; then return 10; fi
-      return 5
-      ;;
-    *) return 4 ;;
-  esac
+  # Design: ADR-0202 (docs/adr/ADR-0202-benchmark-ready-after-complete-data.md).
+  local candidate="$1" status
+  status="$(fixture_publication_put "$ready_uri" "$candidate")" || return 1
+  [[ "$status" == 200 || "$status" == 201 ]]
 }
 
 write_ready_candidate() {
@@ -823,7 +831,7 @@ main() {
   fi
 
   if [[ "$check_only" == 1 ]]; then
-    # Consume exactly the caller's published environment and immutable READY.
+    # Consume exactly the caller's published environment and observed READY.
     # A consumer never binds a runtime or starts Spark to inspect existing data.
     source_env
     NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" context --env-file "$ENV_FILE")"
@@ -849,16 +857,10 @@ main() {
   fi
   ready_etag=""
   if check_readiness; then
-    if [[ "$rebuild" != 1 ]]; then emit_result true false "$ready_etag"; exit 0; fi
-    observed_ready_etag="$ready_etag"
+    emit_result true false "$ready_etag"; exit 0
   else
     ready_status="$?"
-    if [[ "$check_only" == 1 ]]; then emit_error ready_invalid "READY is absent or invalid"; exit 1; fi
-    if [[ "$ready_status" == 2 && "$rebuild" != 1 ]]; then emit_error ready_invalid "READY exists but fails the exact fixture contract"; exit 1; fi
-    # A ReadyInvalid object still has an observed ETag.  Explicit rebuild is
-    # permitted only as If-Match against precisely that object; absence has no
-    # ETag and therefore remains an If-None-Match publication.
-    observed_ready_etag="${ready_etag:-}"
+    if [[ "$ready_status" == 2 ]]; then emit_error ready_invalid "READY exists but fails the exact fixture contract"; exit 1; fi
   fi
 
   staging_identity="$(new_identity)"
@@ -866,14 +868,12 @@ main() {
   trap cleanup_owner EXIT
   trap 'handle_owner_signal 130' INT
   trap 'handle_owner_signal 143' TERM
-  # A concurrent absent writer can finish while this process allocates its
-  # private staging prefix. Reuse the exact READY instead of coordinating via
-  # a Docker resource.
+  # Reuse data completed while this process was preparing its local inputs.
   if check_readiness; then
-    if [[ "$rebuild" != 1 ]]; then emit_result true false "$ready_etag"; exit 0; fi
+    emit_result true false "$ready_etag"; exit 0
   else
     holder_ready_status="$?"
-    if [[ "$holder_ready_status" == 2 && "$rebuild" != 1 ]]; then
+    if [[ "$holder_ready_status" == 2 ]]; then
       emit_error ready_invalid "READY exists but fails the exact fixture contract"; exit 1
     fi
   fi
@@ -882,24 +882,20 @@ main() {
   raw_uri="$staging_parent/$staging_identity/raw"
   manifest_uri="$exact_warehouse/manifest"
   spark_catalog="fixture_${fixture_contract_id:0:12}_${staging_identity//[^a-zA-Z0-9]/_}"
-  fixture_publication_curl_capable || [[ -n "${BENCHMARK_FIXTURE_STORAGE_DIR:-}" ]] || { emit_error publication_failed "curl lacks --aws-sigv4"; exit 1; }
+  fixture_publication_capable || { emit_error publication_failed "object-store publication transport is unavailable"; exit 1; }
   extract_generator_source || { emit_error writer_failed "generator setup failed"; exit 1; }
   patch_generator_source || { emit_error writer_failed "generator patch failed"; exit 1; }
   run_with_timeout generate_raw_files || { emit_error writer_failed "raw generation failed"; exit 1; }
   run_with_timeout upload_raw_files || { emit_error writer_failed "raw upload failed"; exit 1; }
   run_with_timeout run_spark_loader || { emit_error writer_failed "Spark loader failed"; exit 1; }
-  fixture_publication_head "$manifest_uri/_SUCCESS" || { emit_error ready_invalid "candidate manifest is incomplete"; exit 1; }
+  check_manifest_objects "$manifest_uri" || { emit_error ready_invalid "candidate manifest is incomplete"; exit 1; }
   candidate="$(mktemp)"; chmod 600 "$candidate"
   write_ready_candidate "$candidate"
-  if publish_ready "$candidate" "$( [[ "$rebuild" == 1 ]] && echo rebuild || echo absent )" "$observed_ready_etag"; then
+  if publish_ready "$candidate"; then
     check_readiness || { emit_error publication_failed "published READY failed direct validation"; exit 1; }
     emit_result false true "$ready_etag"; exit 0
-  else
-    publish_status="$?"
   fi
-  if [[ "$publish_status" == 10 ]] && check_readiness; then emit_result true false "$ready_etag";
-  elif [[ "$publish_status" == 5 ]]; then emit_error publication_conflict "conditional READY publication lost without a valid winner";
-  else emit_error publication_failed "conditional READY publication failed"; fi
+  emit_error publication_failed "READY publication failed"
   exit 1
 }
 

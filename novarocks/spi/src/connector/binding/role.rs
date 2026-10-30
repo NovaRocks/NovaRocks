@@ -115,31 +115,43 @@ pub struct ConnectorReadAttemptAccess {
 }
 
 impl ConnectorReadAttemptAccess {
+    pub fn requires_metadata_split_preparation(&self) -> bool {
+        self.source.requires_metadata_split_preparation()
+    }
+
     pub const fn frozen(&self) -> &ConnectorReadTableHandle {
         self.source.frozen()
     }
 
     pub fn for_attempt(
         &self,
-        request: &crate::connector::ConnectorAttemptContext,
-        generation: &crate::connector::ConnectorControlPlanningLease,
-    ) -> Result<ConnectorReadAttemptCapabilities, ConnectorError> {
-        let binding = generation.binding();
-        if binding.descriptor() != self.source.frozen().binding().descriptor()
-            || binding.catalog_handle()? != self.source.frozen().binding().catalog_handle()
-        {
-            return Err(ConnectorError::new(
-                crate::connector::ConnectorErrorKind::InvalidRequest,
-                "Connector read attempt access requires its exact Catalog generation guard",
-            ));
-        }
-        Ok(ConnectorReadAttemptCapabilities {
-            frozen: self.source.frozen().clone(),
-            runtime: self.source.for_attempt(request)?,
-            encoder: Arc::clone(&self.encoder),
+        request: crate::connector::ConnectorAttemptContext,
+        generation: crate::connector::ConnectorControlPlanningLease,
+    ) -> ConnectorReadAttemptCapabilitiesFuture {
+        let source = self.source.clone();
+        let encoder = Arc::clone(&self.encoder);
+        Box::pin(async move {
+            let binding = generation.binding();
+            if binding.descriptor() != source.frozen().binding().descriptor()
+                || binding.catalog_handle()? != source.frozen().binding().catalog_handle()
+            {
+                return Err(ConnectorError::new(
+                    crate::connector::ConnectorErrorKind::InvalidRequest,
+                    "Connector read attempt access requires its exact Catalog generation guard",
+                ));
+            }
+            let runtime = source.for_attempt(&request).await?;
+            Ok(ConnectorReadAttemptCapabilities {
+                frozen: source.frozen().clone(),
+                runtime,
+                encoder,
+            })
         })
     }
 }
+
+pub type ConnectorReadAttemptCapabilitiesFuture =
+    futures::future::BoxFuture<'static, Result<ConnectorReadAttemptCapabilities, ConnectorError>>;
 
 /// Complete request-bound read capabilities for one attempt and one exact
 /// final handle.

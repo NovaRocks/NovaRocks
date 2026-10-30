@@ -1381,7 +1381,7 @@ fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
         schema
             .slots()
             .iter()
-            .all(|slot| slot.field_ref().metadata().capacity() == 0)
+            .all(|slot| slot.field_ref().metadata().as_arc().is_none())
     );
     drop(operator);
     drop(outputs);

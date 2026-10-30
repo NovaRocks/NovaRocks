@@ -35,7 +35,6 @@ VALID_ENSURE_STATES = {"ReadyValid"}
 VALID_ERROR_CODES = {
     "ready_invalid",
     "writer_failed",
-    "publication_conflict",
     "publication_failed",
 }
 
@@ -91,19 +90,23 @@ def source_input_digests(workspace_root, producer_inputs):
     return digests
 
 
-def producer_lock_projections(workspace_root, declarations):
+def producer_lock_projections(workspace_root, declarations, *, platform=None, object_store_kind="minio"):
     """Hash producer semantics, never transport aliases or unrelated fixtures."""
     if not isinstance(declarations, dict) or not declarations:
         raise ValueError("fixture.producer_lock_projections must be a non-empty table")
+    if object_store_kind not in ("minio", "aliyun-oss"):
+        raise ValueError("unsupported benchmark object-store kind")
     result = []
     for label, declaration in sorted(declarations.items()):
         relative = Path(declaration["lock"])
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("producer lock must be a workspace relative path")
-        lock = json.loads((workspace_root / relative).read_text())
-        name = declaration["derived_image"]
+        sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "docker/fixture-inputs"))
+        from fixture_inputs import load_lock
+        name = "iceberg-spark-oss" if label == "spark" and object_store_kind == "aliyun-oss" else declaration["derived_image"]
+        lock, _ = load_lock(workspace_root / relative, platform=platform, consumer=f"derived:{name}")
         derived = lock["derived_images"][name]
-        base_names = [derived["base"]] if "base" in derived else list(derived["bases"].values())
+        base_names = list(derived["bases"].values())
         bases = [{field: lock["images"][base][field] for field in
                   ("source", "platform", "manifest_digest")} for base in base_names]
         projection = {
@@ -114,6 +117,22 @@ def producer_lock_projections(workspace_root, declarations):
                           for field in ("url", "bytes", "sha1")}}
                           for name in sorted(derived["artifacts"])],
         }
+        if object_store_kind == "aliyun-oss":
+            from fixture_inputs import definition_sha256
+            def closed_projection(selected):
+                value = lock["derived_images"][selected]
+                return {
+                    "derived_image": selected, "dockerfile": value["dockerfile"], "platform": value["platform"],
+                    "definition_sha256": definition_sha256(workspace_root, value["definition_files"]),
+                    "build_args": value.get("build_args", {}),
+                    "bases": [{"argument": argument, **{field: lock["images"][base][field] for field in ("source", "platform", "manifest_digest")}}
+                              for argument, base in sorted(value.get("bases", {}).items())],
+                    "artifacts": [{"name": artifact, **{field: lock["artifacts"][artifact][field] for field in ("url", "bytes", "sha1")}}
+                                  for artifact in sorted(value["artifacts"])],
+                    "derived_bases": [{"argument": argument, "projection": closed_projection(base)}
+                                      for argument, base in sorted(value.get("derived_bases", {}).items())],
+                }
+            projection = closed_projection(name)
         result.append({"label": label, "projection": projection})
     return result
 
@@ -130,18 +149,35 @@ def validate_producer(workspace_root, resolved, publication, actual_image, actua
     bom = json.loads(Path(manifest["fixture_inputs"]["bom"]).read_text())
     model = load_model(workspace_root / "tests/sql/fixtures/benchmarks/benchmark_tools.toml")
     declarations = model["fixture"]["producer_lock_projections"]
-    if resolved["producer_fingerprint"]["lock_projections"] != producer_lock_projections(workspace_root, declarations):
+    object_store_kind = "aliyun-oss" if catalog.get("config", {}).get("object_store", {}).get("kind") == "aliyun-oss" else "minio"
+    if resolved["producer_fingerprint"].get("object_store_kind", "minio") != object_store_kind:
+        raise ValueError("ProducerIdentityMismatch: object-store provider differs from resolved producer")
+    if resolved["producer_fingerprint"]["lock_projections"] != producer_lock_projections(workspace_root, declarations, object_store_kind=object_store_kind):
         raise ValueError("ProducerIdentityMismatch: resolver producer inputs changed")
     # The supply receipt binds a canonical lock and exact definition bytes.
     # Compare those receipts before accepting the semantic projection above.
     sys.path.insert(0, str(workspace_root / "docker/fixture-inputs"))
     from fixture_inputs import load_lock, definition_sha256
-    declaration = declarations["spark"]
-    lock, lock_hash = load_lock(workspace_root / declaration["lock"])
+    declaration = dict(declarations["spark"])
+    if object_store_kind == "aliyun-oss":
+        declaration["derived_image"] = "iceberg-spark-oss"
+    lock, lock_hash = load_lock(workspace_root / declaration["lock"],
+                                platform=bom.get("platform"), consumer="derived:" + declaration["derived_image"])
     derived = lock["derived_images"][declaration["derived_image"]]
     bom_receipt = bom["derived_images"][declaration["derived_image"]]
+    if object_store_kind == "aliyun-oss":
+        def verify_definition(name):
+            value = lock["derived_images"][name]
+            supplied = bom["derived_images"][name]
+            if (supplied["definition_sha256"] != definition_sha256(workspace_root, value["definition_files"])
+                    or supplied["platform"] != value["platform"]):
+                raise ValueError("ProducerIdentityMismatch: OSS producer dependency definition changed")
+            for base in value.get("derived_bases", {}).values():
+                verify_definition(base)
+        verify_definition(declaration["derived_image"])
     expected = {"lock_sha256": lock_hash, **bom_receipt}
-    if (receipt != expected or saved["receipt"] != bom_receipt
+    if (bom.get("schema") != 2 or bom.get("platform") != lock["platform"]
+            or receipt != expected or saved["receipt"] != bom_receipt
             or bom["lock_sha256"] != lock_hash
             or bom_receipt["definition_sha256"] != definition_sha256(workspace_root, derived["definition_files"])
             or bom_receipt["platform"] != derived["platform"]
@@ -168,7 +204,7 @@ def normalized_layouts(layouts):
     return sorted(normalized, key=lambda value: (value["suite"], value["table"]))
 
 
-def resolve_fixture(model, workspace_root, suite, scale, shared_root=None):
+def resolve_fixture(model, workspace_root, suite, scale, shared_root=None, object_store_kind="minio"):
     if suite not in ("ssb", "tpc-h", "tpc-ds"):
         raise ValueError(f"unsupported suite: {suite}")
     suite_model = model.get(suite)
@@ -212,9 +248,11 @@ def resolve_fixture(model, workspace_root, suite, scale, shared_root=None):
     producer_fingerprint = {
         "schema_version": fixture.get("schema_version"),
         "source_inputs": producer_inputs,
-        "lock_projections": producer_lock_projections(workspace_root, fixture.get("producer_lock_projections")),
+        "lock_projections": producer_lock_projections(workspace_root, fixture.get("producer_lock_projections"), object_store_kind=object_store_kind),
         "spark_runtime": runtime,
     }
+    if object_store_kind == "aliyun-oss":
+        producer_fingerprint["object_store_kind"] = object_store_kind
     contract["producer_fingerprint"] = producer_fingerprint
     contract_id = digest_bytes(canonical_json(contract).encode())[:24]
     dataset_root = f"{root}/{suite}/{normalized.lower()}/{contract_id}"
@@ -276,6 +314,7 @@ def main():
     parser.add_argument("--suite")
     parser.add_argument("--scale")
     parser.add_argument("--shared-root")
+    parser.add_argument("--object-store-kind", choices=("minio", "aliyun-oss"), default="minio")
     parser.add_argument("--validate-ensure-result", type=Path)
     parser.add_argument("--validate-error", type=Path)
     parser.add_argument("--validate-producer", type=Path)
@@ -295,7 +334,7 @@ def main():
         expected_key = None
         if args.suite:
             model = load_model(config_path)
-            expected_key = resolve_fixture(model, workspace_root, args.suite, args.scale, args.shared_root)["dataset_key"]
+            expected_key = resolve_fixture(model, workspace_root, args.suite, args.scale, args.shared_root, args.object_store_kind)["dataset_key"]
         if args.validate_ensure_result:
             validate_ensure_result(value, expected_key)
         else:
@@ -303,7 +342,7 @@ def main():
         return
     if not args.suite:
         parser.error("--suite is required when resolving a fixture")
-    resolved = resolve_fixture(load_model(config_path), workspace_root, args.suite, args.scale, args.shared_root)
+    resolved = resolve_fixture(load_model(config_path), workspace_root, args.suite, args.scale, args.shared_root, args.object_store_kind)
     print(canonical_json(resolved))
 
 

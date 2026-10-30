@@ -21,9 +21,9 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use novarocks_state_store_api::{
-    MAX_KEY_BYTES, StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
-    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
-    StateStoreProviderLifecycle,
+    MAX_KEY_BYTES, StateStore, StateStoreBlockingOriginal, StateStoreError, StateStoreErrorKind,
+    StateStoreOpenRequest, StateStoreProviderDescriptor, StateStoreProviderFactory,
+    StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
 
 use super::{SQLITE_STATE_STORE_PROVIDER_ID, SqliteStateStore};
@@ -51,6 +51,25 @@ impl StateStoreProviderFactory for SqliteStateStoreProviderFactory {
         &self.descriptor
     }
 
+    fn blocking_dependency_facts(
+        &self,
+    ) -> Option<Vec<novarocks_state_store_api::SharedDependency>> {
+        Some(vec![novarocks_state_store_api::SharedDependency::LocalHost])
+    }
+    fn blocking_source_vocabulary(
+        &self,
+    ) -> Option<novarocks_state_store_api::StateStoreBlockingSourceVocabulary> {
+        Some(super::original::vocabulary())
+    }
+    fn prepare_open_in(
+        self: Box<Self>,
+        request: StateStoreOpenRequest,
+        execution: &novarocks_state_store_api::StateStoreExecutionContext,
+        target: &mut Option<Box<dyn novarocks_state_store_api::StateStoreOriginalOpen>>,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        super::original::prepare_open_in(self.path, self.descriptor, request, execution, target)
+    }
+
     async fn open(
         self: Box<Self>,
         request: StateStoreOpenRequest,
@@ -63,19 +82,33 @@ impl StateStoreProviderFactory for SqliteStateStoreProviderFactory {
             drop(store);
             return Err(deadline_error());
         }
-        let state_store: Arc<dyn StateStore> = Arc::new(store);
-        Ok(Box::new(SqliteStateStoreProviderInstance {
-            descriptor: self.descriptor,
-            lifecycle: StateStoreProviderLifecycle::Ready,
-            state_store: Some(state_store),
-        }))
+        Ok(instance_from_store(self.descriptor, store))
     }
 }
 
 struct SqliteStateStoreProviderInstance {
     descriptor: StateStoreProviderDescriptor,
     lifecycle: StateStoreProviderLifecycle,
-    state_store: Option<Arc<dyn StateStore>>,
+    state_store: Option<Arc<SqliteStateStore>>,
+    original_close: Option<Arc<super::original::OpenOriginal>>,
+    lifetime: Option<Arc<super::SqliteInstanceLifetime>>,
+    scope: novarocks_state_store_api::InstanceScope,
+}
+
+pub(super) fn instance_from_store(
+    descriptor: StateStoreProviderDescriptor,
+    store: SqliteStateStore,
+) -> Box<dyn StateStoreProviderInstance> {
+    let lifetime = store.lifetime.clone();
+    let scope = store.attempts.scope();
+    Box::new(SqliteStateStoreProviderInstance {
+        descriptor,
+        lifecycle: StateStoreProviderLifecycle::Ready,
+        state_store: Some(Arc::new(store)),
+        original_close: None,
+        lifetime: Some(lifetime),
+        scope,
+    })
 }
 
 #[async_trait]
@@ -84,35 +117,106 @@ impl StateStoreProviderInstance for SqliteStateStoreProviderInstance {
         &self.descriptor
     }
 
+    fn blocking_dependency_facts(
+        &self,
+    ) -> Option<Vec<novarocks_state_store_api::SharedDependency>> {
+        Some(vec![novarocks_state_store_api::SharedDependency::LocalHost])
+    }
+    fn blocking_source_vocabulary(
+        &self,
+    ) -> Option<novarocks_state_store_api::StateStoreBlockingSourceVocabulary> {
+        Some(super::original::vocabulary())
+    }
+    fn blocking_instance_scope(&self) -> Option<novarocks_state_store_api::InstanceScope> {
+        Some(self.scope)
+    }
     fn lifecycle(&self) -> StateStoreProviderLifecycle {
-        self.lifecycle
+        if self
+            .original_close
+            .as_ref()
+            .is_some_and(|source| source.is_complete() && source.local_failure().is_none())
+        {
+            StateStoreProviderLifecycle::Stopped
+        } else {
+            self.lifecycle
+        }
     }
 
     fn state_store(&self) -> Option<Arc<dyn StateStore>> {
         if self.lifecycle == StateStoreProviderLifecycle::Ready {
-            self.state_store.clone()
+            self.state_store
+                .as_ref()
+                .map(|store| Arc::clone(store) as Arc<dyn StateStore>)
         } else {
             None
         }
     }
 
+    fn prepare_close_in(
+        &mut self,
+        execution: &novarocks_state_store_api::StateStoreExecutionContext,
+        target: &mut Option<Box<dyn novarocks_state_store_api::StateStoreOriginalClose>>,
+    ) -> Result<(), novarocks_state_store_api::StateStoreExecutionFailure> {
+        if let Some(source) = &self.original_close {
+            return super::original::borrow_instance_close_in(source, execution, target);
+        }
+        if self.lifecycle != StateStoreProviderLifecycle::Ready {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidRequest,
+                "SQLite instance has already entered legacy draining",
+            )
+            .into_original_failure());
+        }
+        let source = super::original::prepare_instance_close_in(
+            self.descriptor,
+            self.scope,
+            self.state_store.as_ref().unwrap().clone(),
+            self.lifetime.as_ref().unwrap().clone(),
+            execution,
+            target,
+        )?;
+        // All fallible receiving work precedes this same-owner transfer. These
+        // provider aliases cannot be the last: the installed Source owns both.
+        self.lifecycle = StateStoreProviderLifecycle::Draining;
+        self.original_close = Some(source.clone());
+        let store = self.state_store.take();
+        let lifetime = self.lifetime.take();
+        drop(store);
+        drop(lifetime);
+        source.request_close();
+        Ok(())
+    }
+
     async fn shutdown(&mut self, deadline: Instant) -> Result<(), StateStoreError> {
+        if let Some(source) = &self.original_close {
+            if source.is_complete() && source.local_failure().is_none() {
+                self.lifecycle = StateStoreProviderLifecycle::Stopped;
+                return Ok(());
+            }
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidRequest,
+                "SQLite original instance close has not actually completed",
+            ));
+        }
         if self.lifecycle == StateStoreProviderLifecycle::Stopped {
             return Ok(());
         }
         self.lifecycle = StateStoreProviderLifecycle::Draining;
-        if self.state_store.is_none() {
-            self.lifecycle = StateStoreProviderLifecycle::Stopped;
-            return Ok(());
-        }
         loop {
-            if Arc::strong_count(
-                self.state_store
-                    .as_ref()
-                    .expect("draining SQLite provider owns its store"),
-            ) == 1
+            if self
+                .state_store
+                .as_ref()
+                .is_some_and(|store| Arc::strong_count(store) == 1)
             {
                 self.state_store.take();
+            }
+            if self.state_store.is_none()
+                && self
+                    .lifetime
+                    .as_ref()
+                    .is_none_or(|lease| Arc::strong_count(lease) == 1)
+            {
+                self.lifetime.take();
                 self.lifecycle = StateStoreProviderLifecycle::Stopped;
                 return Ok(());
             }
@@ -159,6 +263,31 @@ mod tests {
         .open(request(deadline))
         .await
         .expect("open SQLite provider instance")
+    }
+
+    #[tokio::test]
+    async fn original_sqlite_dependencies_come_from_factory_and_actual_instance() {
+        let temp = TempDir::new().unwrap();
+        let factory = SqliteStateStoreProviderFactory::new(temp.path().join("selected.sqlite"));
+        let expected = factory
+            .blocking_dependency_facts()
+            .expect("actual local SQLite author");
+        assert_eq!(
+            expected,
+            vec![novarocks_state_store_api::SharedDependency::LocalHost]
+        );
+        let mut instance = Box::new(factory)
+            .open(request(Instant::now() + Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert_eq!(
+            instance.blocking_dependency_facts().as_ref(),
+            Some(&expected)
+        );
+        instance
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

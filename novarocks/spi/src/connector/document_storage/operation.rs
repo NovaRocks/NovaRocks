@@ -464,6 +464,19 @@ impl ConnectorDocumentStorageLease {
         view.validate_for(&request)?;
         Ok(view)
     }
+
+    pub async fn observe_keyed_documents_async(
+        &self,
+        request: super::KeyedDocumentObservationRequest,
+    ) -> Result<super::KeyedDocumentView, super::KeyedDocumentReadError> {
+        self.validate_keyed_request(&request)?;
+        let view = self
+            .observation()?
+            .observe_keyed_documents_async(request.clone())
+            .await?;
+        view.validate_for(&request)?;
+        Ok(view)
+    }
     pub fn observe_full_keyed_documents(
         &self,
         request: super::KeyedDocumentObservationRequest,
@@ -472,6 +485,29 @@ impl ConnectorDocumentStorageLease {
         let mut view = self
             .observation()?
             .observe_full_keyed_documents(request.clone())?;
+        view.current.validate_for(&request)?;
+        if view.token.owner() != &request.owner
+            || view.token.table() != &request.target
+            || view.token.object_id() != &request.object_id
+            || view.token.metadata_version() != &view.current.metadata_version
+        {
+            return Err(
+                invalid("full keyed observation token does not match its exact load").into(),
+            );
+        }
+        view.token.seal();
+        Ok(view)
+    }
+
+    pub async fn observe_full_keyed_documents_async(
+        &self,
+        request: super::KeyedDocumentObservationRequest,
+    ) -> Result<super::FullKeyedDocumentView, super::KeyedDocumentReadError> {
+        self.validate_keyed_request(&request)?;
+        let mut view = self
+            .observation()?
+            .observe_full_keyed_documents_async(request.clone())
+            .await?;
         view.current.validate_for(&request)?;
         if view.token.owner() != &request.owner
             || view.token.table() != &request.target
@@ -508,6 +544,17 @@ impl ConnectorDocumentStorageLease {
     ) -> Result<super::CommitConclusion, ConnectorError> {
         self.validate_keyed_request(&request)?;
         self.observation()?.resolve_keyed_commit(request, evidence)
+    }
+
+    pub async fn resolve_keyed_commit_async(
+        &self,
+        request: super::KeyedDocumentObservationRequest,
+        evidence: super::UnknownCommitEvidence,
+    ) -> Result<super::CommitConclusion, ConnectorError> {
+        self.validate_keyed_request(&request)?;
+        self.observation()?
+            .resolve_keyed_commit_async(request, evidence)
+            .await
     }
     fn validate_keyed_request(
         &self,

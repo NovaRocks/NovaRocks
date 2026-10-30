@@ -260,8 +260,12 @@ fn ndv_actual_column_metadata_contract_is_bounded_and_releases_the_actual_input(
     let fields: Fields = (0..96)
         .map(|i| {
             Arc::new(
-                Field::new(format!("original_field_{i}"), DataType::Int64, true)
-                    .with_metadata([(format!("key_{i}"), format!("value_{i}"))].into()),
+                Field::new(format!("original_field_{i}"), DataType::Int64, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        format!("key_{i}"),
+                        format!("value_{i}"),
+                    )]),
+                ),
             )
         })
         .collect();

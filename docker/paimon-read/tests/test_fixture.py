@@ -38,6 +38,36 @@ sys.modules[SPEC.name] = fixture
 SPEC.loader.exec_module(fixture)
 
 
+class WriterBomReaderTest(unittest.TestCase):
+    """Offline supply-reader coverage remains active independently of writer runs."""
+
+    def test_schema2_requires_matching_native_and_writer_platforms(self):
+        versions = fixture.load_versions()
+        value = {"schema": 2, "platform": "linux/amd64", "lock_sha256": "a" * 64,
+                 "derived_images": {"paimon-writer": {
+                     "alias": "novarocks/fixture-paimon-writer:current", "platform": "linux/amd64",
+                     "image_id": "sha256:image", "definition_sha256": "b" * 64}}}
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "bom.json"
+            path.write_text(json.dumps(value))
+            receipt = fixture.load_writer_bom(path, versions)
+            self.assertEqual(receipt["image_id"], "sha256:image")
+            for target in ("platform", "writer"):
+                with self.subTest(target=target):
+                    changed = json.loads(json.dumps(value))
+                    if target == "platform":
+                        changed["platform"] = "linux/arm64"
+                    else:
+                        changed["derived_images"]["paimon-writer"]["platform"] = "linux/arm64"
+                    path.write_text(json.dumps(changed))
+                    with self.assertRaises(fixture.FixtureError):
+                        fixture.load_writer_bom(path, versions)
+            value["schema"] = 1
+            path.write_text(json.dumps(value))
+            with self.assertRaisesRegex(fixture.FixtureError, "reprovision"):
+                fixture.load_writer_bom(path, versions)
+
+
 @unittest.skip("Paimon fixture tests are suspended pending detailed connector design")
 class FixtureContractTest(unittest.TestCase):
     def test_publication_unset_then_exports_load_without_shell_or_ambient_values(self) -> None:
@@ -159,7 +189,7 @@ class FixtureContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             bom = Path(temporary) / "bom.json"
             bom.write_text(json.dumps({
-                "lock_sha256": "a" * 64,
+                "schema": 2, "platform": "linux/amd64", "lock_sha256": "a" * 64,
                 "derived_images": {"paimon-writer": {
                     "alias": "novarocks/fixture-paimon-writer:current",
                     "platform": "linux/amd64",
@@ -566,7 +596,7 @@ access_key_secret = "test-secret"
             )
             output_dir.mkdir()
             Path(args.fixture_bom).write_text(json.dumps({
-                "lock_sha256": "a" * 64,
+                "schema": 2, "platform": "linux/amd64", "lock_sha256": "a" * 64,
                 "derived_images": {"paimon-writer": {
                     "alias": "fixture:image",
                     "platform": "linux/amd64",

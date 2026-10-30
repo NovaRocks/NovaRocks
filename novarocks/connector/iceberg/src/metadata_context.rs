@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use novarocks_spi::connector::{
-    ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
+    ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
     ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedS3CredentialLeaseRefresher,
     CredentialLoadTableDelegation, CredentialRenewalPath, MaterializationContext,
 };
@@ -41,6 +41,14 @@ use crate::loaded_table::{
     IcebergVendedS3RenewalCapability,
 };
 use crate::resources::IcebergMetadataResources;
+
+#[cfg(test)]
+fn original_classified_error((kind, message): (ConnectorErrorKind, String)) -> ConnectorError {
+    ConnectorError::new(kind, message)
+}
+fn classified_original_error(error: ConnectorError) -> (ConnectorErrorKind, String) {
+    (error.kind(), error.to_string())
+}
 
 static NEXT_ATTEMPT_METADATA_CACHE_OWNER: AtomicU64 = AtomicU64::new(1);
 
@@ -60,8 +68,9 @@ struct AttemptMetadataTableKey {
 }
 
 struct AttemptMetadataTableEntry {
-    result: Mutex<Option<Result<IcebergAttemptTableAccess, (ConnectorErrorKind, String)>>>,
+    result: Mutex<Option<Result<IcebergAttemptTableAccess, ConnectorError>>>,
     ready: Condvar,
+    async_ready: tokio::sync::Notify,
 }
 
 impl AttemptMetadataTableEntry {
@@ -69,16 +78,43 @@ impl AttemptMetadataTableEntry {
         Self {
             result: Mutex::new(None),
             ready: Condvar::new(),
+            async_ready: tokio::sync::Notify::new(),
         }
     }
 }
 
 impl AttemptMetadataTableCache {
+    #[cfg(test)]
     fn get_or_load(
         &self,
         key: AttemptMetadataTableKey,
         load: impl FnOnce() -> Result<IcebergAttemptTableAccess, (ConnectorErrorKind, String)>,
     ) -> Result<IcebergAttemptTableAccess, (ConnectorErrorKind, String)> {
+        self.get_or_load_original(key, || load().map_err(original_classified_error))
+            .map_err(|error| (error.kind(), error.message().to_owned()))
+    }
+    #[cfg(test)]
+    async fn get_or_load_async<F>(
+        &self,
+        key: AttemptMetadataTableKey,
+        load: F,
+    ) -> Result<IcebergAttemptTableAccess, (ConnectorErrorKind, String)>
+    where
+        F: std::future::Future<
+                Output = Result<IcebergAttemptTableAccess, (ConnectorErrorKind, String)>,
+            >,
+    {
+        self.get_or_load_original_async(key, async {
+            load.await.map_err(original_classified_error)
+        })
+        .await
+        .map_err(|error| (error.kind(), error.message().to_owned()))
+    }
+    fn get_or_load_original(
+        &self,
+        key: AttemptMetadataTableKey,
+        load: impl FnOnce() -> Result<IcebergAttemptTableAccess, ConnectorError>,
+    ) -> Result<IcebergAttemptTableAccess, ConnectorError> {
         let (entry, loader) = {
             let mut entries = self.entries.lock().expect("attempt metadata cache lock");
             match entries.get(&key) {
@@ -108,7 +144,9 @@ impl AttemptMetadataTableCache {
             let mut stored = entry.result.lock().expect("attempt metadata entry lock");
             debug_assert!(stored.is_none(), "attempt metadata entry completes once");
             *stored = Some(result.clone());
+            drop(stored);
             entry.ready.notify_all();
+            entry.async_ready.notify_waiters();
             return result;
         }
 
@@ -123,6 +161,105 @@ impl AttemptMetadataTableCache {
             .as_ref()
             .expect("attempt metadata entry completed")
             .clone()
+    }
+    async fn get_or_load_original_async<F>(
+        &self,
+        key: AttemptMetadataTableKey,
+        load: F,
+    ) -> Result<IcebergAttemptTableAccess, ConnectorError>
+    where
+        F: std::future::Future<Output = Result<IcebergAttemptTableAccess, ConnectorError>>,
+    {
+        let (entry, loader) = {
+            let mut entries = self.entries.lock().expect("attempt metadata cache lock");
+            match entries.get(&key) {
+                Some(entry) => (Arc::clone(entry), false),
+                None => {
+                    let entry = Arc::new(AttemptMetadataTableEntry::loading());
+                    entries.insert(key.clone(), Arc::clone(&entry));
+                    (entry, true)
+                }
+            }
+        };
+        if !loader {
+            loop {
+                let ready = entry.async_ready.notified();
+                tokio::pin!(ready);
+                ready.as_mut().enable();
+                let observed = {
+                    entry
+                        .result
+                        .lock()
+                        .expect("attempt metadata entry lock")
+                        .clone()
+                };
+                if let Some(result) = observed {
+                    return result;
+                }
+                ready.await;
+            }
+        }
+        let mut publication = AttemptMetadataLoad {
+            cache: self,
+            key,
+            entry,
+            complete: false,
+        };
+        let result = load.await;
+        if result.is_err() {
+            publication.remove_failed_entry();
+        }
+        *publication
+            .entry
+            .result
+            .lock()
+            .expect("attempt metadata entry lock") = Some(result.clone());
+        publication.complete = true;
+        publication.entry.ready.notify_all();
+        publication.entry.async_ready.notify_waiters();
+        result
+    }
+}
+
+// An async loader can be cancelled before publishing. Existing sync and async
+// waiters receive its real cancellation; a later attempt may load a new entry.
+struct AttemptMetadataLoad<'a> {
+    cache: &'a AttemptMetadataTableCache,
+    key: AttemptMetadataTableKey,
+    entry: Arc<AttemptMetadataTableEntry>,
+    complete: bool,
+}
+impl AttemptMetadataLoad<'_> {
+    fn remove_failed_entry(&self) {
+        let mut entries = self
+            .cache
+            .entries
+            .lock()
+            .expect("attempt metadata cache lock");
+        if entries
+            .get(&self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.entry))
+        {
+            entries.remove(&self.key);
+        }
+    }
+}
+impl Drop for AttemptMetadataLoad<'_> {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        self.remove_failed_entry();
+        *self
+            .entry
+            .result
+            .lock()
+            .expect("attempt metadata entry lock") = Some(Err(ConnectorError::new(
+            ConnectorErrorKind::Cancelled,
+            "Iceberg metadata loader exited before publishing its observation",
+        )));
+        self.entry.ready.notify_all();
+        self.entry.async_ready.notify_waiters();
     }
 }
 
@@ -276,6 +413,87 @@ impl IcebergMetadataContext {
         &self.table_coordination
     }
 
+    /// Pure facts of the current original generation. Actual requests may
+    /// discover further vended/configured routes and must extend the same Root
+    /// before those routes' first credential/network dispatch.
+    pub(crate) fn metadata_action_initial_dependencies(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::SharedDependency>, ConnectorError> {
+        use novarocks_spi::connector::{NetworkServiceOrigin, SharedDependency};
+        let config = self.control_state.configuration();
+        let mut dependencies = Vec::new();
+        match config.kind {
+            crate::catalog_config::IcebergCatalogKind::Rest => {
+                let uri = config.rest_uri.as_ref().ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "REST generation has no original URI",
+                    )
+                })?;
+                let selected = url::Url::parse(uri).map_err(|_| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "invalid original REST URI",
+                    )
+                })?;
+                let fact = SharedDependency::Network(
+                    NetworkServiceOrigin::from_selected_url(&selected).map_err(|_| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "REST origin exceeds dependency profile",
+                        )
+                    })?,
+                );
+                dependencies.push(fact);
+            }
+            crate::catalog_config::IcebergCatalogKind::Hadoop => {
+                dependencies.push(
+                    self.resources
+                        .planning_binding()
+                        .selected_io_dependency(&config.warehouse_uri)?,
+                );
+            }
+            crate::catalog_config::IcebergCatalogKind::Hive => {
+                // The existing catalog author permanently refuses these two
+                // mutations. This does not remove any HMS read capability.
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "Hive Metastore catalog is a read-only compatibility entry",
+                ));
+            }
+        }
+        Ok(dependencies)
+    }
+
+    pub(crate) fn read_planning_initial_dependencies(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::SharedDependency>, ConnectorError> {
+        let config = self.control_state.configuration();
+        if config.kind != crate::catalog_config::IcebergCatalogKind::Hive {
+            return self.metadata_action_initial_dependencies();
+        }
+        // Catalog configuration already selected the first real HMS address.
+        // The vendored Thrift builder consumes this identical host:port;
+        // framed/buffered codecs share this same external service domain.
+        let address = config.hms_uris.as_deref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "HMS read generation has no selected address",
+            )
+        })?;
+        let selected =
+            novarocks_spi::connector::SelectedThriftServiceOrigin::from_selected_address(address)
+                .map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "HMS selected service address exceeds the dependency contract",
+                )
+            })?;
+        Ok(vec![novarocks_spi::connector::SharedDependency::Thrift(
+            selected.into_owned(),
+        )])
+    }
+
     pub(crate) fn control_state(&self) -> &IcebergCatalogControlState {
         &self.control_state
     }
@@ -337,6 +555,132 @@ impl IcebergMetadataContext {
             Some(request_context),
         )
         .map_err(|(_, message)| message)
+    }
+
+    /// Async counterpart of the same request-local cache author. It shares the
+    /// exact entry with synchronous consumers and preserves failed-load eviction.
+    pub(crate) async fn load_table_for_request_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, String> {
+        self.load_table_classified_for_request_async(namespace, table, request)
+            .await
+            .map_err(|(_, message)| message)
+    }
+
+    /// Preserve absence and control classification at the typed read boundary.
+    pub(crate) async fn load_table_classified_for_request_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        self.load_table_original_for_request_async(namespace, table, request)
+            .await
+            .map_err(classified_original_error)
+    }
+
+    pub(crate) async fn load_table_original_for_request_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        let load = async {
+            ConnectorOperationControl::check_active(request)?;
+            let namespace = normalize_identifier(namespace).map_err(|message| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
+            })?;
+            let table = normalize_identifier(table).map_err(|message| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
+            })?;
+            let collection = request.vended_credential_lease_collection();
+            if request.fresh_catalog_observation_required()
+                || (request.vended_credential_lease_sink().is_none()
+                    && request.storage_resolver().is_some())
+            {
+                return self
+                    .observe_table_original_for_request_with_snapshots_async(
+                        &namespace,
+                        &table,
+                        request,
+                        crate::catalog::SnapshotLoading::All,
+                    )
+                    .await;
+            }
+            let cache =
+                request.request_scope_extension_or_insert_with(AttemptMetadataTableCache::default);
+            let frozen = cache
+                .get_or_load_original_async(
+                    AttemptMetadataTableKey {
+                        owner: self.attempt_metadata_cache_owner,
+                        namespace: namespace.clone(),
+                        table: table.clone(),
+                    },
+                    async {
+                        let loaded = if collection.is_none() {
+                            self.control_state
+                                .physical_table_cache()
+                                .get(&namespace, &table)
+                                .map_err(|message| {
+                                    ConnectorError::new(ConnectorErrorKind::Unavailable, message)
+                                })?
+                        } else {
+                            None
+                        };
+                        let loaded = match loaded {
+                            Some(loaded) => loaded,
+                            None => {
+                                self.observe_table_original_with_snapshots_async(
+                                    &namespace,
+                                    &table,
+                                    collection,
+                                    Some(request),
+                                    crate::catalog::SnapshotLoading::All,
+                                )
+                                .await?
+                            }
+                        };
+                        Ok(IcebergAttemptTableAccess::freeze(loaded))
+                    },
+                )
+                .await?;
+            ConnectorOperationControl::check_active(request)?;
+            frozen.reacquired_request_scoped(
+                self.resources
+                    .planning_binding()
+                    .for_request(request.clone()),
+                self.resources.catalog_runtime().iceberg_runtime().clone(),
+            )
+        };
+        load.await
+    }
+
+    pub(crate) async fn load_table_classified_async(
+        &self,
+        namespace: &str,
+        table: &str,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        let namespace = normalize_identifier(namespace).map_err(invalid_request)?;
+        let table = normalize_identifier(table).map_err(invalid_request)?;
+        if let Some(cached) = self
+            .control_state
+            .physical_table_cache()
+            .get(&namespace, &table)
+            .map_err(unavailable)?
+        {
+            return Ok(cached);
+        }
+        self.observe_table_classified_with_snapshots_async(
+            &namespace,
+            &table,
+            None,
+            None,
+            crate::catalog::SnapshotLoading::All,
+        )
+        .await
     }
 
     /// Load an explicit REST snapshot scope without allowing a partial
@@ -440,6 +784,62 @@ impl IcebergMetadataContext {
         Ok((guard, fresh))
     }
 
+    pub(crate) async fn coordinate_table_for_request_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<
+        (
+            crate::catalog::table_coordination::IcebergTableCoordinationGuard,
+            IcebergPhysicalTable,
+        ),
+        novarocks_spi::connector::ConnectorError,
+    > {
+        use novarocks_spi::connector::ConnectorError;
+        let observed = self
+            .observe_table_classified_for_request_with_snapshots_async(
+                namespace,
+                table,
+                request,
+                crate::catalog::SnapshotLoading::All,
+            )
+            .await
+            .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
+        let uuid = observed.table.metadata().uuid();
+        let guard = {
+            let _waiting = self.resources.catalog_runtime().activity().map(|owner| {
+                owner.enter(novarocks_spi::connector::CatalogActivityPhase::TableCoordination)
+            });
+            self.table_coordination.acquire(uuid, request).await?
+        };
+        let fresh = self
+            .observe_table_classified_for_request_with_snapshots_async(
+                namespace,
+                table,
+                request,
+                crate::catalog::SnapshotLoading::All,
+            )
+            .await
+            .map_err(|(kind, message)| {
+                if kind == ConnectorErrorKind::NotFound {
+                    ConnectorError::table_object_binding(
+                        novarocks_spi::connector::ConnectorTableObjectBindingFailure::Missing,
+                        message,
+                    )
+                } else {
+                    ConnectorError::new(kind, message)
+                }
+            })?;
+        if fresh.table.metadata().uuid() != uuid {
+            return Err(ConnectorError::table_object_binding(
+                novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced,
+                "Iceberg table UUID changed while waiting for catalog coordination",
+            ));
+        }
+        Ok((guard, fresh))
+    }
+
     /// Observe a mutation admission frontier without reusing planning caches.
     /// Keep the original deadline, stop view and credential collector for this attempt.
     pub(crate) fn observe_table_for_request(
@@ -505,7 +905,65 @@ impl IcebergMetadataContext {
             Some(request_context),
             snapshots,
         )?;
-        ConnectorOperationControl::check_active(request_context).map_err(control_error)?;
+        self.scope_observed_table(loaded, request_context)
+    }
+
+    pub(crate) async fn observe_table_classified_for_request_with_snapshots_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        request_context: &ConnectorRequestContext,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        self.observe_table_original_for_request_with_snapshots_async(
+            namespace,
+            table,
+            request_context,
+            snapshots,
+        )
+        .await
+        .map_err(classified_original_error)
+    }
+
+    pub(crate) async fn observe_table_original_for_request_with_snapshots_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        request_context: &ConnectorRequestContext,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        ConnectorOperationControl::check_active(request_context)?;
+        let namespace = normalize_identifier(namespace)
+            .map_err(|message| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message))?;
+        let table = normalize_identifier(table)
+            .map_err(|message| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message))?;
+        let loaded = self
+            .observe_table_original_with_snapshots_async(
+                &namespace,
+                &table,
+                request_context.vended_credential_lease_collection(),
+                Some(request_context),
+                snapshots,
+            )
+            .await?;
+        self.scope_original_observed_table(loaded, request_context)
+    }
+
+    fn scope_observed_table(
+        &self,
+        loaded: IcebergPhysicalTable,
+        request_context: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        self.scope_original_observed_table(loaded, request_context)
+            .map_err(classified_original_error)
+    }
+
+    fn scope_original_observed_table(
+        &self,
+        loaded: IcebergPhysicalTable,
+        request_context: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        ConnectorOperationControl::check_active(request_context)?;
         let renewal = loaded.attempt_access_if_vended();
         let binding = self
             .resources
@@ -515,8 +973,7 @@ impl IcebergMetadataContext {
             &loaded.table,
             binding,
             self.resources.catalog_runtime().iceberg_runtime().clone(),
-        )
-        .map_err(control_error)?;
+        )?;
         if let Some(renewal) = renewal {
             scoped = scoped.with_attempt_access(renewal);
         }
@@ -656,13 +1113,161 @@ impl IcebergMetadataContext {
                 )?;
                 seed.into_vended_s3_credential_lease_contribution()
                     .and_then(|contribution| {
-                        contribution.with_refresher(Arc::new(
-                            IcebergRestVendedS3LeaseRefresher::new(
+                        contribution.with_refresher(
+                            catalog.acquisition_owner(),
+                            Arc::new(IcebergRestVendedS3LeaseRefresher::new(
                                 catalog,
                                 self.resources.catalog_runtime().clone(),
                                 attempt_scope,
+                            )),
+                        )
+                    })
+                    .map(|contribution| contribution.with_renewal_path(announcement))
+                    .map_err(|error| (error.kind(), error.to_string()))?
+            }
+            IcebergVendedS3RenewalCapability::LoadTableDelegation(_) => {
+                frozen
+                    .validate_attempt_reacquisition(&observed, &seed)
+                    .map_err(|error| (error.kind(), error.to_string()))?;
+                self.vended_attempt_contribution(seed, ident, frozen.metadata().uuid())?
+            }
+        };
+        collection
+            .offer_vended_s3_credential_lease(contribution)
+            .map_err(|error| {
+                (
+                    error.kind(),
+                    format!(
+                        "reacquire Iceberg table {namespace}.{table}: collect vended credentials: {error}"
+                    ),
+                )
+            })?;
+        ConnectorOperationControl::check_active(request_context)
+            .map_err(|error| (error.kind(), error.to_string()))?;
+        let request_binding = self
+            .resources
+            .planning_binding()
+            .for_request(request_context.clone());
+        frozen
+            .reacquired_request_scoped(
+                request_binding,
+                self.resources.catalog_runtime().iceberg_runtime().clone(),
+            )
+            .map_err(|error| (error.kind(), error.to_string()))
+    }
+
+    pub(crate) async fn reacquire_table_access_for_request_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        access: &IcebergAttemptTableAccess,
+        request_context: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        let namespace = normalize_identifier(namespace).map_err(invalid_request)?;
+        let table = normalize_identifier(table).map_err(invalid_request)?;
+        let ident = TableIdent::from_strs([namespace.as_str(), table.as_str()])
+            .map_err(|error| invalid_request(format!("build Iceberg table identity: {error}")))?;
+        if access.identifier() != &ident {
+            return Err((
+                ConnectorErrorKind::InvalidRequest,
+                format!(
+                    "reacquire Iceberg table {namespace}.{table}: target does not match the frozen table identity"
+                ),
+            ));
+        }
+        if request_context.is_cancelled() {
+            return Err((
+                ConnectorErrorKind::Cancelled,
+                "reacquire Iceberg table access was cancelled".to_string(),
+            ));
+        }
+        if std::time::Instant::now() >= request_context.deadline() {
+            return Err((
+                ConnectorErrorKind::DeadlineExceeded,
+                "reacquire Iceberg table access deadline elapsed".to_string(),
+            ));
+        }
+        let Some(capability) = access.renewal() else {
+            let request_binding = self
+                .resources
+                .planning_binding()
+                .for_request(request_context.clone());
+            return access
+                .reacquired_request_scoped(
+                    request_binding,
+                    self.resources.catalog_runtime().iceberg_runtime().clone(),
+                )
+                .map_err(|error| (error.kind(), error.to_string()));
+        };
+        let frozen = access;
+        let collection = request_context
+            .vended_credential_lease_collection()
+            .ok_or_else(|| {
+                (
+                    ConnectorErrorKind::InvalidRequest,
+                    format!(
+                        "reacquire Iceberg table {namespace}.{table}: missing attempt credential collection"
+                    ),
+                )
+            })?;
+        let target =
+            crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
+        let owner = Arc::clone(self.novarocks_catalog());
+        let loaded = owner.load_table(target).await;
+        ConnectorOperationControl::check_active(request_context)
+            .map_err(|error| (error.kind(), error.to_string()))?;
+        let loaded = loaded.map_err(|error| {
+            (
+                error.kind(),
+                format!("reacquire Iceberg table {namespace}.{table}: {error}"),
+            )
+        })?;
+        let (materialization, access_delegation) = loaded.into_parts();
+        let seed = access_delegation.into_vended_lease_seed().ok_or_else(|| {
+            (
+                ConnectorErrorKind::Unsupported,
+                format!(
+                    "reacquire Iceberg table {namespace}.{table}: catalog did not return vended access delegation"
+                ),
+            )
+        })?;
+        let metadata_binding = self.resources.planning_binding().clone();
+        let observed = materialization
+            .materialize_for_request(metadata_binding)
+            .map_err(|error| (error.kind(), error.to_string()))?;
+        let contribution = match capability {
+            IcebergVendedS3RenewalCapability::CredentialsEndpoint(_) => {
+                let attempt_scope = frozen
+                    .validate_credentials_endpoint_attempt_acquisition(&observed, &seed)
+                    .map_err(|error| (error.kind(), error.to_string()))?;
+                let catalog = self
+                    .novarocks_catalog
+                    .vended_credential_refresh_catalog()
+                    .ok_or_else(|| {
+                        (
+                            ConnectorErrorKind::Unsupported,
+                            format!(
+                                "reacquire Iceberg table {namespace}.{table}: vended access has no REST catalog owner"
                             ),
-                        ))
+                        )
+                    })?;
+                // The same routed path a fresh observation would announce: an
+                // execution node acquiring for itself must be told it (L15).
+                let announcement = self.vended_renewal_path(
+                    &seed.renewal_capability(),
+                    &ident,
+                    frozen.metadata().uuid(),
+                )?;
+                seed.into_vended_s3_credential_lease_contribution()
+                    .and_then(|contribution| {
+                        contribution.with_refresher(
+                            catalog.acquisition_owner(),
+                            Arc::new(IcebergRestVendedS3LeaseRefresher::new(
+                                catalog,
+                                self.resources.catalog_runtime().clone(),
+                                attempt_scope,
+                            )),
+                        )
                     })
                     .map(|contribution| contribution.with_renewal_path(announcement))
                     .map_err(|error| (error.kind(), error.to_string()))?
@@ -727,19 +1332,33 @@ impl IcebergMetadataContext {
         credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
         request_context: Option<&ConnectorRequestContext>,
     ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        self.load_table_original_with_credential_lease_collection(
+            namespace,
+            table,
+            credential_lease_collection,
+            request_context,
+        )
+        .map_err(classified_original_error)
+    }
+
+    pub(crate) fn load_table_original_with_credential_lease_collection(
+        &self,
+        namespace: &str,
+        table: &str,
+        credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
+        request_context: Option<&ConnectorRequestContext>,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
         if let Some(request_context) = request_context {
-            novarocks_spi::connector::ConnectorOperationControl::check_active(request_context)
-                .map_err(|error| (error.kind(), error.to_string()))?;
+            novarocks_spi::connector::ConnectorOperationControl::check_active(request_context)?;
         }
-        let loaded = self.load_table_classified_unbound(
+        let loaded = self.load_table_original_unbound(
             namespace,
             table,
             credential_lease_collection,
             request_context,
         );
         if let Some(request_context) = request_context {
-            novarocks_spi::connector::ConnectorOperationControl::check_active(request_context)
-                .map_err(|error| (error.kind(), error.to_string()))?;
+            novarocks_spi::connector::ConnectorOperationControl::check_active(request_context)?;
         }
         let loaded = loaded?;
         let Some(request_context) = request_context else {
@@ -756,25 +1375,26 @@ impl IcebergMetadataContext {
             &loaded.table,
             binding,
             self.resources.catalog_runtime().iceberg_runtime().clone(),
-        )
-        .map_err(|error| (error.kind(), error.to_string()))?;
+        )?;
         if let Some(renewal) = renewal {
             scoped = scoped.with_attempt_access(renewal);
         }
         Ok(scoped)
     }
 
-    fn load_table_classified_unbound(
+    fn load_table_original_unbound(
         &self,
         namespace: &str,
         table: &str,
         credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
         request_context: Option<&ConnectorRequestContext>,
-    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
-        let namespace = normalize_identifier(namespace).map_err(invalid_request)?;
-        let table = normalize_identifier(table).map_err(invalid_request)?;
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        let namespace = normalize_identifier(namespace)
+            .map_err(|message| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message))?;
+        let table = normalize_identifier(table)
+            .map_err(|message| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message))?;
         let Some(request_context) = request_context else {
-            return self.load_table_classified_uncached(
+            return self.load_table_original_uncached(
                 &namespace,
                 &table,
                 credential_lease_collection,
@@ -796,7 +1416,7 @@ impl IcebergMetadataContext {
             || (request_context.vended_credential_lease_sink().is_none()
                 && request_context.storage_resolver().is_some())
         {
-            return self.observe_table_classified(
+            return self.observe_table_original(
                 &namespace,
                 &table,
                 credential_lease_collection,
@@ -805,14 +1425,14 @@ impl IcebergMetadataContext {
         }
         let cache = request_context
             .request_scope_extension_or_insert_with(AttemptMetadataTableCache::default);
-        let frozen = cache.get_or_load(
+        let frozen = cache.get_or_load_original(
             AttemptMetadataTableKey {
                 owner: self.attempt_metadata_cache_owner,
                 namespace: namespace.clone(),
                 table: table.clone(),
             },
             || {
-                self.load_table_classified_uncached(
+                self.load_table_original_uncached(
                     &namespace,
                     &table,
                     credential_lease_collection,
@@ -821,14 +1441,12 @@ impl IcebergMetadataContext {
                 .map(IcebergAttemptTableAccess::freeze)
             },
         )?;
-        frozen
-            .reacquired_request_scoped(
-                self.resources
-                    .planning_binding()
-                    .for_request(request_context.clone()),
-                self.resources.catalog_runtime().iceberg_runtime().clone(),
-            )
-            .map_err(|error| (error.kind(), error.to_string()))
+        frozen.reacquired_request_scoped(
+            self.resources
+                .planning_binding()
+                .for_request(request_context.clone()),
+            self.resources.catalog_runtime().iceberg_runtime().clone(),
+        )
     }
 
     /// Perform the one physical catalog observation for a cache miss. The
@@ -841,23 +1459,23 @@ impl IcebergMetadataContext {
     /// This is a read-side reuse. A caller whose result decides an external
     /// effect must use [`Self::observe_table_classified`] instead: the name of
     /// this one says only that it skips the *attempt* cache.
-    fn load_table_classified_uncached(
+    fn load_table_original_uncached(
         &self,
         namespace: &str,
         table: &str,
         credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
         request_context: Option<&ConnectorRequestContext>,
-    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
         if credential_lease_collection.is_none()
             && let Some(table) = self
                 .control_state
                 .physical_table_cache()
                 .get(namespace, table)
-                .map_err(unavailable)?
+                .map_err(|message| ConnectorError::new(ConnectorErrorKind::Unavailable, message))?
         {
             return Ok(table);
         }
-        self.observe_table_classified(
+        self.observe_table_original(
             namespace,
             table,
             credential_lease_collection,
@@ -873,7 +1491,23 @@ impl IcebergMetadataContext {
         credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
         request_context: Option<&ConnectorRequestContext>,
     ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
-        self.observe_table_classified_with_snapshots(
+        self.observe_table_original(
+            namespace,
+            table,
+            credential_lease_collection,
+            request_context,
+        )
+        .map_err(classified_original_error)
+    }
+
+    fn observe_table_original(
+        &self,
+        namespace: &str,
+        table: &str,
+        credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
+        request_context: Option<&ConnectorRequestContext>,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        self.observe_table_original_with_snapshots(
             namespace,
             table,
             credential_lease_collection,
@@ -890,8 +1524,30 @@ impl IcebergMetadataContext {
         request_context: Option<&ConnectorRequestContext>,
         snapshots: crate::catalog::SnapshotLoading,
     ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
-        let ident = TableIdent::from_strs([namespace, table])
-            .map_err(|error| invalid_request(format!("build Iceberg table identity: {error}")))?;
+        self.observe_table_original_with_snapshots(
+            namespace,
+            table,
+            credential_lease_collection,
+            request_context,
+            snapshots,
+        )
+        .map_err(classified_original_error)
+    }
+
+    fn observe_table_original_with_snapshots(
+        &self,
+        namespace: &str,
+        table: &str,
+        credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
+        request_context: Option<&ConnectorRequestContext>,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        let ident = TableIdent::from_strs([namespace, table]).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!("build Iceberg table identity: {error}"),
+            )
+        })?;
         let owner = Arc::clone(self.novarocks_catalog());
         let target =
             crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
@@ -903,23 +1559,102 @@ impl IcebergMetadataContext {
         let loaded = self
             .resources
             .catalog_runtime()
-            .block_on(async move {
-                match read_binding {
-                    Some(binding) => {
-                        owner
-                            .load_table_for_read_with_snapshots(target, binding, snapshots)
-                            .await
-                    }
-                    None => owner.load_table_with_snapshots(target, snapshots).await,
-                }
-            })
-            .map_err(unavailable)?
-            .map_err(|error| {
-                (
-                    error.kind(),
-                    format!("load Iceberg table {namespace}.{table}: {error}"),
-                )
-            })?;
+            .block_on(Self::read_observation(
+                owner,
+                target,
+                read_binding,
+                snapshots,
+            ))
+            .map_err(|message| ConnectorError::new(ConnectorErrorKind::Unavailable, message))??;
+        self.materialize_original_observation(
+            ident,
+            loaded,
+            (namespace, table),
+            credential_lease_collection,
+            request_context,
+            snapshots,
+        )
+    }
+
+    async fn observe_table_classified_with_snapshots_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
+        request_context: Option<&ConnectorRequestContext>,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        self.observe_table_original_with_snapshots_async(
+            namespace,
+            table,
+            credential_lease_collection,
+            request_context,
+            snapshots,
+        )
+        .await
+        .map_err(classified_original_error)
+    }
+
+    async fn observe_table_original_with_snapshots_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
+        request_context: Option<&ConnectorRequestContext>,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        let ident = TableIdent::from_strs([namespace, table]).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!("build Iceberg table identity: {error}"),
+            )
+        })?;
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target =
+            crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
+        let read_binding = request_context.map(|request| {
+            self.resources
+                .planning_binding()
+                .for_request(request.clone())
+        });
+        let loaded = Self::read_observation(owner, target, read_binding, snapshots).await?;
+        self.materialize_original_observation(
+            ident,
+            loaded,
+            (namespace, table),
+            credential_lease_collection,
+            request_context,
+            snapshots,
+        )
+    }
+
+    async fn read_observation(
+        catalog: Arc<dyn crate::catalog::NovaRocksCatalog>,
+        target: crate::catalog::CatalogTableName,
+        binding: Option<crate::access_binding::IcebergReadBinding>,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, novarocks_spi::connector::ConnectorError>
+    {
+        match binding {
+            Some(binding) => {
+                catalog
+                    .load_table_for_read_with_snapshots(target, binding, snapshots)
+                    .await
+            }
+            None => catalog.load_table_with_snapshots(target, snapshots).await,
+        }
+    }
+
+    fn materialize_original_observation(
+        &self,
+        ident: TableIdent,
+        loaded: crate::loaded_table::IcebergLoadedTable,
+        target: (&str, &str),
+        credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
+        request_context: Option<&ConnectorRequestContext>,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        let (namespace, table) = target;
         let (materialization, access_delegation) = loaded.into_parts();
         if let Some(seed) = access_delegation.into_vended_lease_seed() {
             let request_binding = request_context.map_or_else(
@@ -930,32 +1665,21 @@ impl IcebergMetadataContext {
                         .for_request(context.clone())
                 },
             );
-            let observed_table = materialization
-                .materialize_for_request(request_binding.clone())
-                .map_err(|error| (error.kind(), error.to_string()))?;
-            seed.validate_table_access(&observed_table)
-                .map_err(|error| (error.kind(), error.to_string()))?;
+            let observed_table =
+                materialization.materialize_for_request(request_binding.clone())?;
+            seed.validate_table_access(&observed_table)?;
             let attempt_access = seed.renewal_capability();
             if let Some(collection) = credential_lease_collection {
-                let contribution = self.vended_attempt_contribution(
+                let contribution = self.vended_original_attempt_contribution(
                     seed,
                     ident,
                     observed_table.metadata().uuid(),
                 )?;
-                collection
-                    .offer_vended_s3_credential_lease(contribution)
-                    .map_err(|error| {
-                        (
-                            error.kind(),
-                            format!(
-                                "load Iceberg table {namespace}.{table}: collect vended credentials: {error}"
-                            ),
-                        )
-                    })?;
+                collection.offer_vended_s3_credential_lease(contribution)?;
             } else if request_context
                 .is_some_and(|context| context.vended_credential_lease_sink().is_some())
             {
-                return Err((
+                return Err(ConnectorError::new(
                     ConnectorErrorKind::Unsupported,
                     format!(
                         "load Iceberg table {namespace}.{table}: vended REST credentials require a query-attempt lease consumer"
@@ -966,9 +1690,7 @@ impl IcebergMetadataContext {
                 IcebergPhysicalTable::new(observed_table).with_attempt_access(attempt_access)
             );
         }
-        let loaded_table = materialization
-            .into_static_table()
-            .map_err(|error| (error.kind(), error.to_string()))?;
+        let loaded_table = materialization.into_static_table()?;
         let physical = IcebergPhysicalTable::new(loaded_table);
         // The Hadoop read may have built this table with a request-bound
         // FileIO. Only its resource-free facts may enter the request cache;
@@ -978,7 +1700,7 @@ impl IcebergMetadataContext {
             self.control_state
                 .physical_table_cache()
                 .insert(namespace, table, physical.clone())
-                .map_err(unavailable)?;
+                .map_err(|message| ConnectorError::new(ConnectorErrorKind::Unavailable, message))?;
         }
         Ok(physical)
     }
@@ -992,38 +1714,44 @@ impl IcebergMetadataContext {
         table: &TableIdent,
         expected_table_uuid: uuid::Uuid,
     ) -> Result<CredentialRenewalPath, (ConnectorErrorKind, String)> {
+        self.vended_original_renewal_path(renewal, table, expected_table_uuid)
+            .map_err(classified_original_error)
+    }
+
+    pub(crate) fn vended_original_renewal_path(
+        &self,
+        renewal: &IcebergVendedS3RenewalCapability,
+        table: &TableIdent,
+        expected_table_uuid: uuid::Uuid,
+    ) -> Result<CredentialRenewalPath, ConnectorError> {
         use crate::rest_protocol::routing::{RouteTarget, route_for_lease};
         let endpoints = self
             .novarocks_catalog
             .vended_credential_refresh_catalog()
             .ok_or_else(|| {
-                (
+                ConnectorError::new(
                     ConnectorErrorKind::Unsupported,
-                    "vended REST credential acquisition has no catalog owner".to_string(),
+                    "vended REST credential acquisition has no catalog owner",
                 )
             })?;
         let binding = endpoints.established_binding().ok_or_else(|| {
-            (
+            ConnectorError::new(
                 ConnectorErrorKind::Internal,
-                "vended REST credentials were observed without an established session".to_string(),
+                "vended REST credentials were observed without an established session",
             )
         })?;
         let admission = endpoints.route_admission();
-        let refused =
-            |error: novarocks_spi::connector::ConnectorError| (error.kind(), error.to_string());
         match renewal {
             IcebergVendedS3RenewalCapability::CredentialsEndpoint(scope) => {
                 let routing = route_for_lease(
                     &binding,
                     &admission,
                     RouteTarget::CredentialsEndpoint(scope.endpoint()),
-                )
-                .map_err(refused)?;
+                )?;
                 Ok(CredentialRenewalPath::CredentialsEndpoint(routing))
             }
             IcebergVendedS3RenewalCapability::LoadTableDelegation(_) => {
-                let routing = route_for_lease(&binding, &admission, RouteTarget::LoadTable(table))
-                    .map_err(refused)?;
+                let routing = route_for_lease(&binding, &admission, RouteTarget::LoadTable(table))?;
                 let delegation = CredentialLoadTableDelegation::try_new(
                     table
                         .namespace()
@@ -1033,8 +1761,7 @@ impl IcebergMetadataContext {
                         .collect(),
                     Arc::from(table.name()),
                     Arc::from(expected_table_uuid.to_string().as_str()),
-                )
-                .map_err(refused)?;
+                )?;
                 Ok(CredentialRenewalPath::LoadTableDelegation {
                     routing,
                     table: delegation,
@@ -1052,24 +1779,34 @@ impl IcebergMetadataContext {
         novarocks_spi::connector::VendedS3CredentialLeaseContribution,
         (ConnectorErrorKind, String),
     > {
+        self.vended_original_attempt_contribution(seed, table, expected_table_uuid)
+            .map_err(classified_original_error)
+    }
+
+    fn vended_original_attempt_contribution(
+        &self,
+        seed: IcebergVendedCredentialLeaseSeed,
+        table: TableIdent,
+        expected_table_uuid: uuid::Uuid,
+    ) -> Result<novarocks_spi::connector::VendedS3CredentialLeaseContribution, ConnectorError> {
         let renewal = seed.renewal_capability();
-        let contribution = seed
-            .into_vended_s3_credential_lease_contribution()
-            .map_err(|error| (error.kind(), error.to_string()))?;
+        let contribution = seed.into_vended_s3_credential_lease_contribution()?;
         let catalog = self
             .novarocks_catalog
             .vended_credential_refresh_catalog()
             .ok_or_else(|| {
-                (
+                ConnectorError::new(
                     ConnectorErrorKind::Unsupported,
-                    "vended REST credential acquisition has no catalog owner".to_string(),
+                    "vended REST credential acquisition has no catalog owner",
                 )
             })?;
         // The announcement and the refresher are two projections of one
         // observation. They are built together so a consumer that must acquire
         // for itself is told exactly the path this coordinator would have used
         // (CAD-1 D2), on this generation's one session (D15).
-        let announcement = self.vended_renewal_path(&renewal, &table, expected_table_uuid)?;
+        let announcement =
+            self.vended_original_renewal_path(&renewal, &table, expected_table_uuid)?;
+        let acquisition_owner = catalog.acquisition_owner();
         let refresher: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher> = match renewal {
             IcebergVendedS3RenewalCapability::CredentialsEndpoint(scope) => {
                 Arc::new(IcebergRestVendedS3LeaseRefresher::new(
@@ -1089,9 +1826,8 @@ impl IcebergMetadataContext {
             }
         };
         contribution
-            .with_refresher(refresher)
+            .with_refresher(acquisition_owner, refresher)
             .map(|contribution| contribution.with_renewal_path(announcement))
-            .map_err(|error| (error.kind(), error.to_string()))
     }
 
     /// Enumerate namespaces for one request, refused as a whole when the
@@ -1111,6 +1847,27 @@ impl IcebergMetadataContext {
             .catalog_runtime()
             .block_on(async move { owner.list_namespaces_for_read(binding, bound).await })
             .map_err(|error| (ConnectorErrorKind::Unavailable, error))?
+            .map_err(|error| {
+                (
+                    error.kind(),
+                    format!("list Iceberg namespaces: {}", error.message()),
+                )
+            })
+    }
+
+    pub(crate) async fn list_namespaces_for_request_async(
+        &self,
+        request: &ConnectorRequestContext,
+        bound: novarocks_spi::connector::ConnectorListingBound,
+    ) -> Result<Vec<String>, (ConnectorErrorKind, String)> {
+        let owner = Arc::clone(self.novarocks_catalog());
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request.clone());
+        owner
+            .list_namespaces_for_read(binding, bound)
+            .await
             .map_err(|error| {
                 (
                     error.kind(),
@@ -1149,6 +1906,25 @@ impl IcebergMetadataContext {
             .map_err(|error| format!("check Iceberg namespace {namespace_label}: {error}"))
     }
 
+    pub(crate) async fn namespace_exists_for_request_async(
+        &self,
+        namespace: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<bool, String> {
+        let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
+        let namespace_label = namespace.to_string();
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request.clone());
+        owner
+            .namespace_exists_for_read(target, binding)
+            .await
+            .map_err(|error| format!("check Iceberg namespace {namespace_label}: {error}"))
+    }
+
     /// Enumerate one namespace's tables for one request, refused as a whole
     /// when the listing would exceed `bound`. The catalog's classification
     /// survives, so a bound refusal stays `ResourceExhausted`.
@@ -1171,6 +1947,35 @@ impl IcebergMetadataContext {
             .catalog_runtime()
             .block_on(async move { owner.list_tables_for_read(target, binding, bound).await })
             .map_err(|error| (ConnectorErrorKind::Unavailable, error))?
+            .map_err(|error| {
+                (
+                    error.kind(),
+                    format!(
+                        "list Iceberg tables in {namespace_label}: {}",
+                        error.message()
+                    ),
+                )
+            })
+    }
+
+    pub(crate) async fn list_tables_for_request_async(
+        &self,
+        namespace: &str,
+        request: &ConnectorRequestContext,
+        bound: novarocks_spi::connector::ConnectorListingBound,
+    ) -> Result<Vec<String>, (ConnectorErrorKind, String)> {
+        let namespace =
+            NamespaceIdent::new(normalize_identifier(namespace).map_err(invalid_request)?);
+        let namespace_label = namespace.to_string();
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request.clone());
+        owner
+            .list_tables_for_read(target, binding, bound)
+            .await
             .map_err(|error| {
                 (
                     error.kind(),
@@ -1218,6 +2023,30 @@ impl IcebergMetadataContext {
         self.resources
             .catalog_runtime()
             .block_on(async move { owner.table_exists_for_read(target, binding).await })?
+            .map_err(|error| format!("check Iceberg table {ident_label}: {error}"))
+    }
+
+    pub(crate) async fn table_exists_for_request_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<bool, String> {
+        let ident = TableIdent::new(
+            NamespaceIdent::new(normalize_identifier(namespace)?),
+            normalize_identifier(table)?,
+        );
+        let ident_label = ident.to_string();
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target =
+            crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request.clone());
+        owner
+            .table_exists_for_read(target, binding)
+            .await
             .map_err(|error| format!("check Iceberg table {ident_label}: {error}"))
     }
 }
@@ -1606,5 +2435,114 @@ mod tests {
             drop(other);
         });
         drop(guard);
+    }
+    #[tokio::test]
+    async fn cancelled_async_cache_loader_wakes_existing_waiter_and_does_not_cache_absence() {
+        let cache = AttemptMetadataTableCache::default();
+        let key = AttemptMetadataTableKey {
+            owner: 1,
+            namespace: "analytics".into(),
+            table: "created_later".into(),
+        };
+        let mut loader = Box::pin(cache.get_or_load_async(key.clone(), std::future::pending()));
+        assert!(futures::poll!(&mut loader).is_pending());
+        let mut waiter = Box::pin(cache.get_or_load_async(key.clone(), async {
+            panic!("the original active entry already owns the physical observation")
+        }));
+        assert!(futures::poll!(&mut waiter).is_pending());
+        drop(loader);
+        assert!(matches!(
+            waiter.await,
+            Err((ConnectorErrorKind::Cancelled, _))
+        ));
+        let calls = AtomicUsize::new(0);
+        let first = cache
+            .get_or_load_async(key.clone(), async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err((ConnectorErrorKind::NotFound, "target is absent".into()))
+            })
+            .await;
+        assert!(matches!(first, Err((ConnectorErrorKind::NotFound, _))));
+        let second = cache.get_or_load(key, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err((ConnectorErrorKind::NotFound, "target is absent".into()))
+        });
+        assert!(matches!(second, Err((ConnectorErrorKind::NotFound, _))));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn original_cache_waiter_receives_same_typed_cause_without_negative_caching() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use std::error::Error;
+        let cache = AttemptMetadataTableCache::default();
+        let key = AttemptMetadataTableKey {
+            owner: 17,
+            namespace: "original".into(),
+            table: "typed_failure".into(),
+        };
+        let error = ConnectorError::from_domain_static(
+            ConnectorErrorKind::Cancelled,
+            novarocks_type_contract::CompileControlError::Cancelled,
+            "original metadata control failure",
+        );
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+            .clone();
+        let fact = error.failure_fact();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let original = error.clone();
+        let mut loader = Box::pin(cache.get_or_load_original_async(key.clone(), async move {
+            gate.await.unwrap();
+            Err(original)
+        }));
+        assert!(futures::poll!(&mut loader).is_pending());
+        let mut waiter = Box::pin(cache.get_or_load_original_async(key.clone(), async {
+            panic!("the same original in-flight entry must not load twice")
+        }));
+        assert!(futures::poll!(&mut waiter).is_pending());
+        release.send(()).unwrap();
+        let first = loader.await.err().expect("original loader failure");
+        let second = waiter.await.err().expect("same original waiter failure");
+        for received in [&first, &second] {
+            assert_eq!(received.failure_fact(), fact);
+            assert_eq!(
+                received
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<SharedFailureCause>(),
+                Some(&source)
+            );
+            assert!(matches!(
+                received
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<SharedFailureCause>()
+                    .unwrap()
+                    .downcast_ref::<novarocks_type_contract::CompileControlError>(),
+                Some(novarocks_type_contract::CompileControlError::Cancelled)
+            ));
+        }
+        assert!(
+            cache.entries.lock().unwrap().is_empty(),
+            "failure is not a stale negative cache"
+        );
+        let calls = AtomicUsize::new(0);
+        let retry = cache
+            .get_or_load_original(key, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(error.clone())
+            })
+            .err()
+            .expect("same typed producer failure");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            retry.source().unwrap().downcast_ref::<SharedFailureCause>(),
+            Some(&source)
+        );
+        assert_eq!(retry.failure_fact(), fact);
     }
 }

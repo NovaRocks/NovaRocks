@@ -31,15 +31,15 @@ use novarocks_types::QueryExecutionId;
 use novarocks_workload_control::{CancellationReason, CancellationView, WorkError, WorkScope};
 use tokio::sync::{oneshot, watch};
 
-use crate::api::{BoundedRootReadPort, RetainedRootReply};
+use crate::api::{BoundedRootReadPort, ComputationReadyToken, RetainedRootReply};
 use crate::api::{NativeAttemptTerminal, NativeAttemptTopologyRequirement};
 use crate::api::{QueryExecutionError, QueryExecutionErrorKind};
 
 use super::{
-    AttemptFailureClass, LogicalConclusion, LogicalExecutionActor, LogicalExecutionActorError,
-    ReplacementQualification, RootResultObserver, RootTerminalFailure, RunningAttemptHandoffError,
-    RunningAttemptPermit,
+    LogicalConclusion, LogicalExecutionActor, LogicalExecutionActorError, ReplacementQualification,
+    RootResultObserver, RootTerminalFailure, RunningAttemptHandoffError, RunningAttemptPermit,
 };
+use novarocks_coordination_contract::{AttemptFailureClass, ResultContextWithdrawal};
 
 pub(crate) struct NativeAttemptTerminalSender {
     sender: Option<oneshot::Sender<NativeAttemptTerminal>>,
@@ -106,11 +106,13 @@ impl NativeAttemptTerminalSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RootResultFetchFailure {
     error: QueryExecutionError,
+    pre_ready_replacement: Option<crate::api::PreReadyProcessReplacementWitness>,
 }
 impl RootResultFetchFailure {
     pub fn from_input(input: crate::execution_error::ExecutionFailureInput) -> Self {
         Self {
             error: QueryExecutionError::from_execution(input),
+            pre_ready_replacement: None,
         }
     }
     pub fn input(&self) -> &crate::execution_error::ExecutionFailureInput {
@@ -118,8 +120,26 @@ impl RootResultFetchFailure {
             .execution_failure()
             .expect("typed constructor retains its original failure input")
     }
+    fn from_preparation_failure(failure: crate::api::NativeAttemptPreparationFailure) -> Self {
+        Self {
+            error: failure.error().clone(),
+            pre_ready_replacement: failure.pre_ready_replacement().cloned(),
+        }
+    }
+    pub const fn pre_ready_replacement(
+        &self,
+    ) -> Option<&crate::api::PreReadyProcessReplacementWitness> {
+        self.pre_ready_replacement.as_ref()
+    }
     pub fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
-        self.input().topology_requirement()
+        self.pre_ready_replacement.as_ref().map_or_else(
+            || self.input().topology_requirement(),
+            |witness| {
+                NativeAttemptTopologyRequirement::ExcludeProcess(
+                    witness.context().backend_process_id(),
+                )
+            },
+        )
     }
     pub fn class(&self) -> AttemptFailureClass {
         self.input().attempt_class()
@@ -190,13 +210,17 @@ impl AcceptedRootControlRequest {
         Ok(())
     }
 
-    pub fn accept(self, sender: AcceptedRootStatusSender) -> Result<(), QueryExecutionError> {
+    pub fn accept(
+        self,
+        sender: AcceptedRootStatusSender,
+        withdrawals: Vec<ResultContextWithdrawal>,
+    ) -> Result<(), QueryExecutionError> {
         if self.terminal_control_root().is_some() {
             let error = contract_error("terminal control request cannot seal success");
             let _ = self.reply.send(Err(error.clone()));
             return Err(error);
         }
-        let result = sender.seal_success();
+        let result = sender.seal_success(withdrawals);
         let _ = self.reply.send(result.clone());
         result
     }
@@ -209,7 +233,10 @@ impl AcceptedRootControlRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AcceptedRootProjection {
     Observation(Box<AcceptedRootObservation>),
-    SuccessSealed(Box<TaskStatus>),
+    SuccessSealed {
+        status: Box<TaskStatus>,
+        withdrawals: Vec<ResultContextWithdrawal>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -227,7 +254,7 @@ struct AcceptedRootObservation {
 pub enum AcceptedAttemptFailure {
     None,
     DerivedPending,
-    Authoritative(super::SelectedTaskTermination),
+    Authoritative(novarocks_coordination_contract::SelectedTaskTermination),
 }
 
 #[cfg(test)]
@@ -304,7 +331,7 @@ impl AcceptedRootStatusSender {
     pub fn publish_with_attempt_failure(
         &self,
         status: TaskStatus,
-        authoritative_attempt_failure: super::SelectedTaskTermination,
+        authoritative_attempt_failure: novarocks_coordination_contract::SelectedTaskTermination,
     ) -> Result<(), QueryExecutionError> {
         self.publish_attempt_observation(
             status,
@@ -369,7 +396,10 @@ impl AcceptedRootStatusSender {
     /// owner proved success. The carried Finished snapshot lets a watch
     /// receiver observe status and seal atomically even if it skipped the
     /// immediately preceding observation.
-    fn seal_success(self) -> Result<(), QueryExecutionError> {
+    fn seal_success(
+        self,
+        withdrawals: Vec<ResultContextWithdrawal>,
+    ) -> Result<(), QueryExecutionError> {
         let status = match self.sender.borrow().as_ref() {
             Some(AcceptedRootProjection::Observation(observation))
                 if observation.status.state() == TaskState::Finished
@@ -383,10 +413,21 @@ impl AcceptedRootStatusSender {
                 ));
             }
         };
+        if withdrawals.iter().any(|fact| {
+            fact.root() != self.root
+                || fact.activation().execution() != self.root.query_execution_id()
+                || fact.context().query_execution_id() != self.root.query_execution_id()
+                || fact.context().backend_process_id() == self.root.backend_process_id()
+        }) {
+            return Err(contract_error(
+                "root seal contains a foreign result-demand withdrawal",
+            ));
+        }
         self.sender
-            .send_replace(Some(AcceptedRootProjection::SuccessSealed(Box::new(
-                status,
-            ))));
+            .send_replace(Some(AcceptedRootProjection::SuccessSealed {
+                status: Box::new(status),
+                withdrawals,
+            }));
         Ok(())
     }
 }
@@ -478,6 +519,11 @@ pub struct ResultPumpDecision {
 }
 
 impl ResultPumpDecision {
+    pub const fn pre_ready_replacement(
+        &self,
+    ) -> Option<&crate::api::PreReadyProcessReplacementWitness> {
+        self.failure.pre_ready_replacement()
+    }
     pub fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
         self.failure.topology_requirement()
     }
@@ -495,10 +541,20 @@ impl ResultPumpDecision {
         self,
         actor: &LogicalExecutionActor,
     ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
+        let error = self.failure.error().clone();
+        self.fail_logical_with_error(actor, error).await
+    }
+
+    /// A successor preparation failed before it produced a new running
+    /// permit. The supervisor retains this exact attempt authority and
+    /// submits that actual preparation verdict as the logical terminal cause.
+    pub(crate) async fn fail_logical_with_error(
+        self,
+        actor: &LogicalExecutionActor,
+        error: QueryExecutionError,
+    ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
         let permit = self.permit;
-        let result = actor
-            .fail_attempt_with_error(permit, self.failure.error().clone())
-            .await;
+        let result = actor.fail_attempt_with_error(permit, error).await;
         drop(self.observer);
         result
     }
@@ -518,6 +574,7 @@ impl ResultPumpDecision {
                 permit,
                 class,
                 self.failure.error().clone(),
+                self.failure.pre_ready_replacement().cloned(),
                 replacement,
                 replacement_contexts,
             )
@@ -577,6 +634,7 @@ struct PumpRuntime {
     cancellation: CancellationView,
     root_finished: bool,
     success_sealed: bool,
+    result_withdrawals: Vec<ResultContextWithdrawal>,
     native_completed: bool,
     pending_root_failure: Option<TaskStatus>,
 }
@@ -606,7 +664,7 @@ impl PumpRuntime {
                 Ok(())
             }
             Ok(NativeAttemptTerminal::Failed(failure)) => Err(PumpInterruption::Decision(
-                RootResultFetchFailure::from_input(failure.input().clone()),
+                RootResultFetchFailure::from_preparation_failure(failure),
             )),
             Err(error) => Err(PumpInterruption::Decision(contract_failure(error))),
         }
@@ -620,7 +678,10 @@ impl PumpRuntime {
             AcceptedRootProjection::Observation(observation) => {
                 self.observe_status(*observation).await
             }
-            AcceptedRootProjection::SuccessSealed(status) => {
+            AcceptedRootProjection::SuccessSealed {
+                status,
+                withdrawals,
+            } => {
                 if self.pending_root_failure.is_some() || status.state() != TaskState::Finished {
                     return Err(PumpInterruption::Decision(contract_failure(
                         contract_error("invalid success seal for the accepted root status"),
@@ -636,6 +697,7 @@ impl PumpRuntime {
                         contract_error("success seal did not carry a Finished root status"),
                     )));
                 }
+                self.result_withdrawals = withdrawals;
                 self.success_sealed = true;
                 Ok(())
             }
@@ -979,12 +1041,64 @@ type DeliveryFuture<'a> =
 type ReadFuture =
     Pin<Box<dyn Future<Output = Result<RetainedRootReply, RootResultFetchFailure>> + Send>>;
 
+/// Minted only after this original pump consumed Root End, drained its
+/// real delivery/read slots and obtained its final actor success or exact Internal Ready. Moving this
+/// token out is not P retirement: the supervisor consumes it after the pump
+/// and its driver frame have returned normally.
+pub(crate) struct StreamedRowsComputedCut {
+    source: crate::admitted_query_context::StreamedComputationCutHandle,
+    _activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    _root: TaskIdentity,
+    sealing: Result<(), WorkError>,
+}
+impl StreamedRowsComputedCut {
+    pub(crate) fn is_for(
+        &self,
+        source: &crate::admitted_query_context::StreamedComputationCutHandle,
+    ) -> bool {
+        self.source.same_source(source)
+    }
+    pub(super) async fn retire_after_pump_exit(self) -> Result<(), WorkError> {
+        self.sealing.clone()?;
+        let source = self.source.clone();
+        source.retire_after_pump_exit(self).await
+    }
+}
+pub(super) struct RootPumpDecision {
+    pub(super) conclusion: LogicalConclusion,
+    pub(super) streamed_cut: Option<StreamedRowsComputedCut>,
+}
+pub(super) async fn run_streamed_root_relay(
+    permit: RunningAttemptPermit,
+    root: TaskIdentity,
+    scope: WorkScope,
+    binding: RootRelayBinding,
+    statuses: AcceptedRootStatusSource,
+    native_terminal: NativeAttemptTerminalSource,
+    root_ack: super::RootAckTailReservation,
+    streamed: Option<crate::admitted_query_context::StreamedComputationCutHandle>,
+) -> Result<RootPumpDecision, ResultPumpFailure> {
+    run_root_relay_core(
+        permit,
+        root,
+        scope,
+        binding,
+        statuses,
+        native_terminal,
+        root_ack,
+        None,
+        streamed,
+    )
+    .await
+}
+
 /// Relays one exact attempt's Backend-encoded root stream in order. The next
 /// item is read while the previous one is written; the cumulative ACK on
 /// each read is the prefix whose delivery receipts completed. Success seal
 /// follows the local End consumption proof and the root's terminal facts; it
 /// never waits for the Backend to acknowledge the final item.
 #[doc(hidden)]
+#[cfg(test)]
 pub(crate) async fn run_root_relay(
     permit: RunningAttemptPermit,
     root: TaskIdentity,
@@ -992,23 +1106,84 @@ pub(crate) async fn run_root_relay(
     binding: RootRelayBinding,
     statuses: AcceptedRootStatusSource,
     native_terminal: NativeAttemptTerminalSource,
+    root_ack: super::RootAckTailReservation,
 ) -> Result<LogicalConclusion, ResultPumpFailure> {
+    run_root_relay_core(
+        permit,
+        root,
+        scope,
+        binding,
+        statuses,
+        native_terminal,
+        root_ack,
+        None,
+        None,
+    )
+    .await
+    .map(|decision| decision.conclusion)
+}
+
+/// Relays provisional internal output while retaining the original attempt
+/// authority until the registered domain proof establishes its computation cut.
+pub(super) async fn run_internal_root_relay(
+    permit: RunningAttemptPermit,
+    root: TaskIdentity,
+    scope: WorkScope,
+    binding: RootRelayBinding,
+    statuses: AcceptedRootStatusSource,
+    native_terminal: NativeAttemptTerminalSource,
+    root_ack: super::RootAckTailReservation,
+    ready: watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
+    streamed: Option<crate::admitted_query_context::StreamedComputationCutHandle>,
+) -> Result<RootPumpDecision, ResultPumpFailure> {
+    run_root_relay_core(
+        permit,
+        root,
+        scope,
+        binding,
+        statuses,
+        native_terminal,
+        root_ack,
+        Some(ready),
+        streamed,
+    )
+    .await
+}
+
+async fn run_root_relay_core(
+    permit: RunningAttemptPermit,
+    root: TaskIdentity,
+    scope: WorkScope,
+    binding: RootRelayBinding,
+    statuses: AcceptedRootStatusSource,
+    native_terminal: NativeAttemptTerminalSource,
+    root_ack: super::RootAckTailReservation,
+    ready: Option<watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>>,
+    streamed: Option<crate::admitted_query_context::StreamedComputationCutHandle>,
+) -> Result<RootPumpDecision, ResultPumpFailure> {
     let RootRelayBinding {
         port,
         mut frontier,
         window,
         max_wait,
     } = binding;
-    if statuses.root != root
+    if streamed
+        .as_ref()
+        .is_some_and(|streamed| !streamed.is_for_scope(&scope))
+        || statuses.root != root
         || frontier.root() != root
         || permit.identity().execution() != root.query_execution_id()
         || !window.is_for_scope(&scope)
         || window.class()
-            != match frontier.kind() {
-                novarocks_result_contract::RootOutputKind::ClientRows => {
-                    novarocks_workload_control::ResultWindowClass::Client
+            != if ready.is_some() {
+                novarocks_workload_control::ResultWindowClass::Internal
+            } else {
+                match frontier.kind() {
+                    novarocks_result_contract::RootOutputKind::ClientRows => {
+                        novarocks_workload_control::ResultWindowClass::Client
+                    }
+                    _ => novarocks_workload_control::ResultWindowClass::Internal,
                 }
-                _ => novarocks_workload_control::ResultWindowClass::Internal,
             }
     {
         return Err(pump_failure(
@@ -1044,6 +1219,7 @@ pub(crate) async fn run_root_relay(
         cancellation,
         root_finished: false,
         success_sealed: false,
+        result_withdrawals: Vec::new(),
         native_completed: false,
         pending_root_failure: None,
     };
@@ -1227,9 +1403,7 @@ pub(crate) async fn run_root_relay(
         )
     {
         let ack = port.read(request, window.clone());
-        tokio::spawn(async move {
-            let _ = ack.await;
-        });
+        root_ack.start(ack);
     }
     // The local End consumption proof: every data item's delivery completed.
     if let Err(error) = runtime.observer.observe_local_root_end(root, end).await {
@@ -1240,6 +1414,30 @@ pub(crate) async fn run_root_relay(
             error,
         )
         .await);
+    }
+    if let Some(ready) = ready {
+        let activation = permit.identity();
+        return finish_internal_relay(&mut runtime, &observer_owner, permit, root, end, ready)
+            .await
+            .map(|conclusion| {
+                let streamed_cut = if conclusion == LogicalConclusion::ComputationReady {
+                    streamed.map(|source| {
+                        let sealing = source.seal_producer();
+                        StreamedRowsComputedCut {
+                            source,
+                            _activation: activation,
+                            _root: root,
+                            sealing,
+                        }
+                    })
+                } else {
+                    None
+                };
+                RootPumpDecision {
+                    conclusion,
+                    streamed_cut,
+                }
+            });
     }
     if !runtime.success_sealed {
         let seal_reply = match runtime.statuses.begin_success_seal_request() {
@@ -1272,9 +1470,152 @@ pub(crate) async fn run_root_relay(
     if let Err(interruption) = runtime.await_success_seal().await {
         return Err(bound_pump_interruption(&observer_owner, permit, interruption).await);
     }
-    match permit.finish_result_stream().await {
-        Ok(conclusion) => Ok(conclusion),
+    let activation = permit.identity();
+    match permit
+        .finish_result_stream(std::mem::take(&mut runtime.result_withdrawals))
+        .await
+    {
+        Ok(conclusion) => {
+            let streamed_cut = if conclusion == LogicalConclusion::Succeeded {
+                if let Some(source) = streamed {
+                    let sealing = source.seal_producer();
+                    Some(StreamedRowsComputedCut {
+                        source,
+                        _activation: activation,
+                        _root: root,
+                        sealing,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Ok(RootPumpDecision {
+                conclusion,
+                streamed_cut,
+            })
+        }
         Err(error) => Err(finish_handoff_failure(observer_owner, error).await),
+    }
+}
+
+fn internal_ready_accepted(
+    ready: &watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
+    activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    root: TaskIdentity,
+    end: novarocks_execution_contract::root_result::RootResultEnd,
+) -> Result<bool, RootResultFetchFailure> {
+    let Some(result) = ready.borrow().clone() else {
+        return Ok(false);
+    };
+    let token = result.map_err(contract_failure)?;
+    if token.activation() != activation || token.root() != root || token.end() != end {
+        return Err(contract_failure(contract_error(
+            "internal readiness does not match the relay activation, root or consumed End",
+        )));
+    }
+    Ok(true)
+}
+
+async fn finish_internal_relay(
+    runtime: &mut PumpRuntime,
+    observer: &RootResultObserver,
+    permit: RunningAttemptPermit,
+    root: TaskIdentity,
+    end: novarocks_execution_contract::root_result::RootResultEnd,
+    mut ready: watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
+) -> Result<LogicalConclusion, ResultPumpFailure> {
+    // The End only borrows running authority. Its real CPU receipt may fail,
+    // and the same permit must remain available to the pre-ready recovery owner.
+    let delivery = runtime
+        .await_step(permit.deliver_internal_end(root, end))
+        .await;
+    let interruption = match delivery {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => {
+            let failure = actor_failure("deliver internal root End", error);
+            Some(match actor_error_conclusion(error) {
+                Some(conclusion) => PumpInterruption::Concluded(conclusion, failure),
+                None => PumpInterruption::Decision(failure),
+            })
+        }
+        Err(interruption) => Some(interruption),
+    };
+    if let Some(interruption) = interruption {
+        return settle_internal_interruption(observer, permit, &ready, root, end, interruption)
+            .await;
+    }
+
+    loop {
+        match internal_ready_accepted(&ready, permit.identity(), root, end) {
+            Ok(true) => return Ok(LogicalConclusion::ComputationReady),
+            Err(failure) => {
+                return Err(bound_pump_failure(observer, permit, failure).await);
+            }
+            Ok(false) => {}
+        }
+        // Ready is the actor's accepted cut, so it precedes observation of a
+        // simultaneous cancellation or a status that arrived after that cut.
+        let interruption = tokio::select! {
+            biased;
+            changed = ready.changed() => {
+                if changed.is_err() {
+                    Some(PumpInterruption::Decision(contract_failure(contract_error(
+                        "internal readiness owner closed without its accepted cut",
+                    ))))
+                } else {
+                    None
+                }
+            }
+            reason = runtime.cancellation.cancelled() => {
+                Some(PumpInterruption::Cancellation(cancellation_failure(reason)))
+            }
+            terminal = runtime.native_terminal.next(), if !runtime.native_completed => {
+                runtime.observe_native_terminal(terminal).err()
+            }
+            status = runtime.statuses.next() => {
+                match status {
+                    Ok(projection) => runtime.observe_projection(projection).await.err(),
+                    Err(error) => Some(PumpInterruption::Decision(contract_failure(error))),
+                }
+            }
+        };
+        if let Some(interruption) = interruption {
+            return settle_internal_interruption(observer, permit, &ready, root, end, interruption)
+                .await;
+        }
+    }
+}
+
+async fn settle_internal_interruption(
+    observer: &RootResultObserver,
+    permit: RunningAttemptPermit,
+    ready: &watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
+    root: TaskIdentity,
+    end: novarocks_execution_contract::root_result::RootResultEnd,
+    interruption: PumpInterruption,
+) -> Result<LogicalConclusion, ResultPumpFailure> {
+    let activation = permit.identity();
+    match internal_ready_accepted(ready, activation, root, end) {
+        Ok(true) => return Ok(LogicalConclusion::ComputationReady),
+        Err(failure) => return Err(bound_pump_failure(observer, permit, failure).await),
+        Ok(false) => {}
+    }
+    let failure = bound_pump_interruption(observer, permit, interruption).await;
+    // The actor can accept Ready while the pump is awaiting its failure or
+    // cancellation disposition. That exact accepted cut remains authoritative.
+    if matches!(
+        &failure,
+        ResultPumpFailure::Concluded(concluded)
+            if concluded.conclusion() == LogicalConclusion::ComputationReady
+    ) && matches!(
+        internal_ready_accepted(ready, activation, root, end),
+        Ok(true)
+    ) {
+        Ok(LogicalConclusion::ComputationReady)
+    } else {
+        Err(failure)
     }
 }
 
@@ -1301,7 +1642,7 @@ pub fn paced_root_read(
     })
 }
 
-fn pump_failure(
+pub(crate) fn pump_failure(
     permit: RunningAttemptPermit,
     failure: RootResultFetchFailure,
 ) -> ResultPumpFailure {
@@ -1312,7 +1653,7 @@ fn pump_failure(
     })
 }
 
-fn pump_actor_failure(
+pub(super) fn pump_actor_failure(
     permit: RunningAttemptPermit,
     operation: &'static str,
     error: LogicalExecutionActorError,
@@ -1492,7 +1833,7 @@ fn relay_failure(root: TaskIdentity, error: super::RootRelayError) -> RootResult
     ))
 }
 
-fn contract_failure(error: QueryExecutionError) -> RootResultFetchFailure {
+pub(crate) fn contract_failure(error: QueryExecutionError) -> RootResultFetchFailure {
     if let Some(input) = error.execution_failure() {
         return RootResultFetchFailure::from_input(input.clone());
     }
@@ -1542,13 +1883,15 @@ fn cancellation_failure(reason: CancellationReason) -> RootResultFetchFailure {
 }
 fn classify_root_termination(
     status: &TaskStatus,
-    authoritative_attempt_failure: Option<&super::SelectedTaskTermination>,
+    authoritative_attempt_failure: Option<
+        &novarocks_coordination_contract::SelectedTaskTermination,
+    >,
 ) -> Option<RootResultFetchFailure> {
     let selected;
     let original = match authoritative_attempt_failure {
         Some(original) => original,
         None => {
-            selected = super::SelectedTaskTermination::new(
+            selected = novarocks_coordination_contract::SelectedTaskTermination::new(
                 status.identity(),
                 status.termination()?.clone(),
             );
@@ -1612,13 +1955,11 @@ mod tests {
     };
     use tokio::{runtime::Handle, sync::Notify};
 
-    use crate::{
-        api::{ExecutionOutput, ResultDelivery, ResultField, ResultSchema},
-        coordination::{
-            ExecutionEffect, LogicalExecutionActor, LogicalExecutionActorConfig,
-            spawn_logical_execution_actor,
-        },
+    use crate::api::{ExecutionOutput, ResultDelivery, ResultField, ResultSchema};
+    use crate::coordination::{
+        LogicalExecutionActor, LogicalExecutionActorConfig, spawn_logical_execution_actor,
     };
+    use novarocks_coordination_contract::ExecutionEffect;
 
     use super::*;
 
@@ -1757,7 +2098,8 @@ mod tests {
             TaskOutputFacts::default(),
         )
         .unwrap();
-        let authoritative = super::super::SelectedTaskTermination::new(origin, failure);
+        let authoritative =
+            novarocks_coordination_contract::SelectedTaskTermination::new(origin, failure);
         for (decision, identity) in [
             (classify_root_termination(&failed, None).unwrap(), root),
             (
@@ -1946,7 +2288,7 @@ mod tests {
         sender
             .publish_with_attempt_failure(
                 status,
-                super::super::SelectedTaskTermination::new(
+                novarocks_coordination_contract::SelectedTaskTermination::new(
                     root,
                     TerminationDetail::Failed(TaskFailure::new(
                         novarocks_execution_contract::failure::FailureFact::new(
@@ -2015,10 +2357,21 @@ mod tests {
             statuses,
             terminal,
         ));
-        next_segment(&mut stream).await.complete();
+        let delivery = next_segment(&mut stream).await;
+        assert!(
+            !relay.is_finished(),
+            "Finished and Native Completed do not consume local output"
+        );
+        assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
+        delivery.complete();
         let seal_request = tokio::time::timeout(Duration::from_secs(1), control.next())
             .await
             .unwrap();
+        assert!(
+            !relay.is_finished(),
+            "local End still needs the original success seal"
+        );
+        assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
         drop(sender);
         drop(seal_request);
         let error = tokio::time::timeout(Duration::from_secs(1), relay)
@@ -2042,6 +2395,127 @@ mod tests {
         }
         assert!(stream.next().await.is_err());
         drop((stream, actor, owner, window));
+    }
+
+    #[test]
+    fn a_cancelled_root_and_a_latched_failure_both_refuse_a_read_success_seal() {
+        let root = root_task(execution(100_101));
+        let failure = TaskFailure::new(
+            novarocks_execution_contract::failure::FailureFact::new(
+                novarocks_execution_contract::failure::FailureClass::Data,
+                novarocks_execution_contract::failure::FailureReason::new(
+                    std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                    std::num::NonZeroU16::new(1).unwrap(),
+                ),
+            ),
+            SafeDetail::new("original read failure").unwrap(),
+        );
+        for state in [
+            TaskState::Running,
+            TaskState::Flushing,
+            TaskState::Canceling,
+            TaskState::Canceled,
+            TaskState::Aborted,
+            TaskState::Failed,
+        ] {
+            let termination = match state {
+                TaskState::Canceling | TaskState::Canceled => Some(TerminationDetail::Canceled(
+                    novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
+                )),
+                TaskState::Aborted => Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+                TaskState::Failed => Some(TerminationDetail::Failed(failure.clone())),
+                _ => None,
+            };
+            let status = TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(1).unwrap(),
+                state,
+                termination,
+                TaskOutputFacts::new(false),
+            )
+            .unwrap();
+            let (sender, mut source) = accepted_root_status_projection(root);
+            sender
+                .publish_attempt_observation(status, AcceptedAttemptFailure::None)
+                .unwrap();
+            let error = sender.seal_success(Vec::new()).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                QueryExecutionErrorKind::InvalidRequest,
+                "{state}"
+            );
+            assert_eq!(
+                error.message(),
+                "success seal requires a Finished root and no attempt failure"
+            );
+            assert!(
+                matches!(
+                    source.try_next(),
+                    Some(AcceptedRootProjection::Observation(_))
+                ),
+                "a refused terminal never publishes a success seal"
+            );
+            assert!(
+                source.try_next().is_none(),
+                "no later success seal may follow the refusal"
+            );
+        }
+        let writer = TaskIdentity::new(
+            root.query_execution_id(),
+            StageId::new(2).unwrap(),
+            TaskId::new(2).unwrap(),
+            root.backend_process_id(),
+        );
+        for attempt_failure in [
+            AcceptedAttemptFailure::DerivedPending,
+            AcceptedAttemptFailure::Authoritative(
+                novarocks_coordination_contract::SelectedTaskTermination::new(
+                    writer,
+                    TerminationDetail::Failed(failure.clone()),
+                ),
+            ),
+        ] {
+            let (sender, mut source) = accepted_root_status_projection(root);
+            sender
+                .publish_attempt_observation(finished(root), attempt_failure)
+                .unwrap();
+            let error = sender.seal_success(Vec::new()).unwrap_err();
+            assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
+            assert_eq!(
+                error.message(),
+                "success seal requires a Finished root and no attempt failure"
+            );
+            assert!(matches!(
+                source.try_next(),
+                Some(AcceptedRootProjection::Observation(_))
+            ));
+            assert!(
+                source.try_next().is_none(),
+                "no later success seal may follow the latched failure"
+            );
+        }
+    }
+
+    #[test]
+    fn a_foreign_root_projection_cannot_supply_this_reads_success_seal() {
+        let root = root_task(execution(100_102));
+        let foreign = TaskIdentity::new(
+            root.query_execution_id(),
+            root.stage_id(),
+            root.task_id(),
+            BackendProcessId::new_v7(),
+        );
+        let (sender, mut source) = accepted_root_status_projection(root);
+        let error = sender
+            .publish_attempt_observation(finished(foreign), AcceptedAttemptFailure::None)
+            .unwrap_err();
+        assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
+        assert_eq!(error.message(), "accepted root status names another Task");
+        assert!(
+            source.try_next().is_none(),
+            "the foreign process must not advance the accepted Root"
+        );
+        assert!(sender.seal_success(Vec::new()).is_err());
     }
 
     #[tokio::test]
@@ -2107,7 +2581,7 @@ mod tests {
             sender
                 .publish_with_attempt_failure(
                     status.clone(),
-                    super::super::SelectedTaskTermination::new(
+                    novarocks_coordination_contract::SelectedTaskTermination::new(
                         root,
                         status.termination().unwrap().clone(),
                     ),
@@ -2215,7 +2689,7 @@ mod tests {
         sender
             .publish_with_attempt_failure(
                 pending,
-                super::super::SelectedTaskTermination::new(
+                novarocks_coordination_contract::SelectedTaskTermination::new(
                     root,
                     TerminationDetail::Failed(TaskFailure::new(
                         novarocks_execution_contract::failure::FailureFact::new(
@@ -2314,6 +2788,23 @@ mod tests {
         drop((stream, actor, owner, window));
     }
 
+    async fn run_root_relay(
+        permit: RunningAttemptPermit,
+        root: TaskIdentity,
+        scope: WorkScope,
+        binding: RootRelayBinding,
+        statuses: AcceptedRootStatusSource,
+        terminal: NativeAttemptTerminalSource,
+    ) -> Result<LogicalConclusion, ResultPumpFailure> {
+        let (tail_owner, tail) =
+            super::super::native_active_custody::root_ack_test_fixture(permit.identity(), root);
+        let result =
+            super::run_root_relay(permit, root, scope, binding, statuses, terminal, tail).await;
+        tail_owner.close_native();
+        tail_owner.drain().await;
+        result
+    }
+
     // ---- Backend-encoded root relay ----
 
     use novarocks_execution_contract::root_result::{
@@ -2329,12 +2820,14 @@ mod tests {
     struct ScriptedRootPort {
         requests: Mutex<Vec<RootResultRead>>,
         outcomes: Mutex<VecDeque<RootReadOutcome>>,
+        final_ack_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     }
     impl ScriptedRootPort {
         fn new(outcomes: Vec<RootReadOutcome>) -> Arc<Self> {
             Arc::new(Self {
                 requests: Mutex::new(Vec::new()),
                 outcomes: Mutex::new(outcomes.into()),
+                final_ack_gate: Mutex::new(None),
             })
         }
         fn requests(&self) -> Vec<(Option<u64>, u64)> {
@@ -2354,6 +2847,11 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<RetainedRootReply, RootResultFetchFailure>> + Send>>
         {
             self.requests.lock().unwrap().push(request.clone());
+            let final_ack_gate = if request.wanted().is_none() {
+                self.final_ack_gate.lock().unwrap().take()
+            } else {
+                None
+            };
             let outcome = self.outcomes.lock().unwrap().pop_front().unwrap_or(
                 if request.wanted().is_none() {
                     RootReadOutcome::AckOnly
@@ -2370,6 +2868,9 @@ mod tests {
             };
             let long_poll = matches!(reply.outcome, RootReadOutcome::NotReady);
             Box::pin(async move {
+                if let Some(gate) = final_ack_gate {
+                    gate.await.unwrap();
+                }
                 if long_poll {
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
@@ -2614,21 +3115,28 @@ mod tests {
             root,
             Arc::clone(&seal_port) as Arc<dyn AcceptedRootControlPort>,
         );
-        status_sender.publish(finished(root)).unwrap();
+        status_sender.publish(running(root)).unwrap();
         // A two-segment row, then a one-row segment carrying End.
         let port = ScriptedRootPort::new(vec![
             rows_data(1, &[5, 0, 0, 0, b'a', b'b'], None),
             rows_data(2, &[b'c', b'd', b'e', 1, 0, 0, 0, b'f'], Some((3, 2))),
         ]);
+        let (release_ack, ack_gate) = tokio::sync::oneshot::channel();
+        *port.final_ack_gate.lock().unwrap() = Some(ack_gate);
+        let capacity = scope.result_capacity().unwrap();
+        let (tail_owner, tail) =
+            super::super::native_active_custody::root_ack_test_fixture(permit.identity(), root);
         let (_terminal_sender, terminal_source) = native_attempt_terminal_channel();
-        let relay = tokio::spawn(run_root_relay(
+        let relay = tokio::spawn(super::run_root_relay(
             permit,
             root,
             scope,
             relay_binding(root, Arc::clone(&port), &window),
             statuses,
             terminal_source,
+            tail,
         ));
+        drop(window);
         let first = next_segment(&mut stream).await;
         assert_eq!(first.sequence(), ResultPacketSequence::new(0));
         assert_eq!(first.rows(), 0);
@@ -2648,8 +3156,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(spans, vec![(b"cde".to_vec(), true), (b"f".to_vec(), true)]);
         second.complete();
-        // Success needs the seal verdict, not a Backend final ACK.
-        seal_port.next().await.accept(status_sender).unwrap();
+        // Real local End alone cannot complete a still-running Root.
+        let seal_request = seal_port.next().await;
+        assert!(!relay.is_finished());
+        assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
+        status_sender.publish(finished(root)).unwrap();
+        // Success needs the original seal, not the pending Backend final ACK.
+        seal_request.accept(status_sender, Vec::new()).unwrap();
         let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
             panic!("local End consumption and root Finished produce EOF");
         };
@@ -2664,7 +3177,19 @@ mod tests {
             LogicalConclusion::Succeeded
         );
         assert_eq!(&port.requests()[..2], &[(Some(1), 0), (Some(2), 0)]);
-        drop((stream, actor, owner, window));
+        tail_owner.close_native();
+        assert!(
+            tail_owner.retained(),
+            "client EOF is independent of the pending original ACK"
+        );
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        release_ack.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), tail_owner.drain())
+            .await
+            .unwrap();
+        assert!(!tail_owner.retained());
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        drop((stream, actor, owner));
     }
 
     #[tokio::test]
@@ -2743,7 +3268,11 @@ mod tests {
             drop(record);
             assert!(seal_port.requests.lock().unwrap().is_empty());
             segment.complete();
-            seal_port.next().await.accept(status_sender).unwrap();
+            seal_port
+                .next()
+                .await
+                .accept(status_sender, Vec::new())
+                .unwrap();
             let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
                 panic!("end")
             };
@@ -2807,7 +3336,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        seal.accept(status_sender).unwrap();
+        seal.accept(status_sender, Vec::new()).unwrap();
         let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
             panic!("CountOnly must produce End without a data segment");
         };
@@ -2978,6 +3507,11 @@ mod tests {
                 vec![rows_data(2, &[1, 0, 0, 0, b'a'], None)],
                 RootRelayError::Sequence,
                 "sequence gap",
+            ),
+            (
+                vec![rows_data(2, &[1, 0, 0, 0, b'a'], Some((3, 1)))],
+                RootRelayError::Sequence,
+                "sequence gap carrying End",
             ),
         ] {
             let (
@@ -3172,5 +3706,67 @@ mod tests {
         // The failed item was never acknowledged as consumed.
         assert!(port.requests().iter().all(|(_, consumed)| *consumed == 0));
         drop((stream, actor, owner, window, status_sender));
+    }
+    #[tokio::test]
+    async fn native_terminal_keeps_exact_replacement_witness_through_real_root_pump() {
+        for kind in [
+            novarocks_execution_contract::OperationKind::UpdateQueryContext,
+            novarocks_execution_contract::OperationKind::CreateTask,
+        ] {
+            let (
+                Harness {
+                    control: _control,
+                    scope,
+                    actor,
+                    owner,
+                    permit,
+                    mut stream,
+                    root,
+                },
+                window,
+            ) = relay_harness(79).await;
+            let (_sender, statuses) = accepted_root_status_projection(root);
+            let port = ScriptedRootPort::new(Vec::new());
+            let context = QueryContextRef::new(
+                root.query_execution_id(),
+                novarocks_types::FrontendProcessId::new_v7(),
+                root.backend_process_id(),
+            );
+            let (input, witness, native) =
+                crate::api::pre_ready_identity_refusal_test_fixture_for_kind(context, kind);
+            let (terminal_sender, terminal) = native_attempt_terminal_channel();
+            terminal_sender.publish(NativeAttemptTerminal::Failed(native));
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_root_relay(
+                    permit,
+                    root,
+                    scope,
+                    relay_binding(root, port.clone(), &window),
+                    statuses,
+                    terminal,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            let ResultPumpFailure::DecisionPending(decision) = error else {
+                panic!("the original attempt authority must remain available");
+            };
+            assert_eq!(decision.class(), AttemptFailureClass::ContractViolation);
+            assert_eq!(decision.error().execution_failure(), Some(&input));
+            assert_eq!(decision.pre_ready_replacement(), Some(&witness));
+            assert_eq!(
+                decision.topology_requirement(),
+                NativeAttemptTopologyRequirement::ExcludeProcess(root.backend_process_id())
+            );
+            assert_eq!(
+                decision.fail_logical(&actor).await.unwrap(),
+                LogicalConclusion::Failed
+            );
+            assert!(stream.next().await.is_err());
+            assert!(port.requests().is_empty());
+            drop((stream, actor, owner, window));
+        }
     }
 }

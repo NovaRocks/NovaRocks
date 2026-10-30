@@ -162,9 +162,11 @@ pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
         || view.slots.keys().any(|slot| slot.owner == "novarocks.mv")
         || view.versions.values().any(|v| v.owner() == "novarocks.mv")
     {
+        // The Provider marker decides denial. Keep its actual negative
+        // management observation, without refreshing an unrelated Accelerator.
         readiness
-            .candidate_reader()
-            .observe_current(&documents, request)?;
+            .revoke_foreign_current_management(&view, &request.catalog_handle)
+            .map_err(|error| error.to_string())?;
         return Err(format!(
             "table {}.{}.{} is a materialized view; {}",
             target.catalog,
@@ -175,6 +177,185 @@ pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
     }
 
     Ok(())
+}
+
+/// Same exact lease/marker/LegacyFormat guard after direct physical awaits.
+pub(crate) async fn reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
+    _storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    exact_lease: &ConnectorControlPlanningLease,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    target: &TargetBackend,
+    mutation: IcebergMvUserMutation,
+    context: ConnectorRequestContext,
+) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
+    if target.provider_id.as_str() != "iceberg" {
+        return Ok(());
+    }
+
+    let instance_id = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
+        super::readiness::application_error(format!(
+            "parse Iceberg catalog identity for MV guard: {error}"
+        ))
+    })?;
+    if exact_lease.binding().descriptor().instance_id != instance_id {
+        return Err(super::readiness::application_error(
+            "MV mutation guard planning lease does not match the target connector",
+        ));
+    }
+    let context = crate::connector::context_for_planning_lease_typed(exact_lease, context)
+        .map_err(super::readiness::connector_application_error)?;
+    let identity = ConnectorTableIdentity {
+        instance_id,
+        namespace: Arc::from(target.namespace.as_str()),
+        table: Arc::from(target.table.as_str()),
+    };
+    let binding = exact_lease
+        .binding()
+        .metadata()
+        .capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
+            table: identity.clone(),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context.clone(),
+        })
+        .await
+        .map_err(super::readiness::connector_application_error)?;
+    reject_bound_iceberg_mv_table_async(
+        exact_lease,
+        readiness,
+        target,
+        mutation,
+        context,
+        identity,
+        binding,
+    )
+    .await
+}
+
+/// Same original guard algorithm, with the selected generation's governed binding CPU.
+pub(crate) async fn reject_if_iceberg_mv_table_with_governed_planning_lease_and_context_async(
+    _storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    exact_lease: &ConnectorControlPlanningLease,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    target: &TargetBackend,
+    mutation: IcebergMvUserMutation,
+    context: ConnectorRequestContext,
+    cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
+    if target.provider_id.as_str() != "iceberg" {
+        return Ok(());
+    }
+
+    let instance_id = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
+        super::readiness::application_error(format!(
+            "parse Iceberg catalog identity for MV guard: {error}"
+        ))
+    })?;
+    if exact_lease.binding().descriptor().instance_id != instance_id {
+        return Err(super::readiness::application_error(
+            "MV mutation guard planning lease does not match the target connector",
+        ));
+    }
+    let context = crate::connector::context_for_planning_lease_typed(exact_lease, context)
+        .map_err(super::readiness::connector_application_error)?;
+    let identity = ConnectorTableIdentity {
+        instance_id,
+        namespace: Arc::from(target.namespace.as_str()),
+        table: Arc::from(target.table.as_str()),
+    };
+    let (binding, _) = exact_lease
+        .binding()
+        .metadata()
+        .capture_table_object_with_snapshot_cpu(
+            ConnectorTableObjectCaptureRequest {
+                table: identity.clone(),
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                selector: ConnectorTableObjectSelector::Current,
+                context: context.clone(),
+            },
+            cpu,
+        )
+        .await
+        .map_err(super::readiness::connector_application_error)?;
+    reject_bound_iceberg_mv_table_async(
+        exact_lease,
+        readiness,
+        target,
+        mutation,
+        context,
+        identity,
+        binding,
+    )
+    .await
+}
+
+async fn reject_bound_iceberg_mv_table_async(
+    exact_lease: &ConnectorControlPlanningLease,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    target: &TargetBackend,
+    mutation: IcebergMvUserMutation,
+    context: ConnectorRequestContext,
+    identity: ConnectorTableIdentity,
+    binding: novarocks_spi::connector::ConnectorTableObjectBinding,
+) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
+    if binding.metadata.identity != identity {
+        return Err(super::readiness::application_error(
+            "connector loaded a different table while checking the MV mutation guard",
+        ));
+    }
+    let documents = exact_lease
+        .derive_document_storage_lease()
+        .map_err(super::readiness::connector_application_error)?;
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents,
+        identity,
+        binding.object_id,
+        context,
+    );
+    let view = match documents
+        .observe_keyed_documents_async(request.clone())
+        .await
+    {
+        Ok(view) => view,
+        Err(novarocks_spi::connector::document_storage::KeyedDocumentReadError::LegacyFormat {
+            key,
+        }) => {
+            return if mutation == IcebergMvUserMutation::DropTable {
+                Ok(())
+            } else {
+                Err(super::readiness::application_error(format!(
+                    "LegacyFormat: {key}; only DROP TABLE is supported"
+                )))
+            };
+        }
+        Err(novarocks_spi::connector::document_storage::KeyedDocumentReadError::Invalid(error)) => {
+            return Err(super::readiness::connector_application_error(error));
+        }
+    };
+    if view.management.is_some()
+        || view.slots.keys().any(|slot| slot.owner == "novarocks.mv")
+        || view.versions.values().any(|v| v.owner() == "novarocks.mv")
+    {
+        // Denial needs no projection install, evidence resolution or reload.
+        // Existing unsettled effects remain with their original management owner.
+        readiness.revoke_foreign_current_management(&view, &request.catalog_handle)?;
+        return Err(materialized_view_denial(target, mutation));
+    }
+
+    Ok(())
+}
+
+fn materialized_view_denial(
+    target: &TargetBackend,
+    mutation: IcebergMvUserMutation,
+) -> novarocks_query_application::session_error::QueryServiceError {
+    super::readiness::application_error(format!(
+        "table {}.{}.{} is a materialized view; {}",
+        target.catalog,
+        target.namespace,
+        target.table,
+        mutation.guidance()
+    ))
 }
 
 /// Preserve the frontend-owned MV dependency policy before a provider schema

@@ -666,7 +666,7 @@ fn compiled_series_schema_and_slice_use_actual_creator_without_retaining_program
     );
     let schema = output.chunk_schema_ref();
     assert!(schema.is_typed());
-    assert_eq!(schema.slots()[0].field_ref().metadata().capacity(), 0);
+    assert!(schema.slots()[0].field_ref().metadata().as_arc().is_none());
     drop(processor);
     drop(operator);
     assert!(tracker.current() > 0);

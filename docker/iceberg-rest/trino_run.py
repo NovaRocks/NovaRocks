@@ -78,15 +78,32 @@ def start(env_file, image, name, config_directory, backend=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("start", "exec", "stop"))
+    parser.add_argument("operation", choices=("start", "exec", "stop", "cli", "protocol", "jdbc"))
     parser.add_argument("--env-file", required=True, type=Path)
     parser.add_argument("--image")
     parser.add_argument("--name")
     parser.add_argument("--config-dir", type=Path)
     parser.add_argument("--container")
+    parser.add_argument("--evidence-dir", type=Path)
+    parser.add_argument("--metrics")
+    parser.add_argument("--source", type=Path)
+    parser.add_argument("--jdbc-jar")
     args, rest = parser.parse_known_args(argv)
     rest = rest[1:] if rest[:1] == ["--"] else rest
     runtime.install_signal_handlers()
+    if args.operation in ("cli", "jdbc"):
+        import trino_client_owner
+        if not args.image or args.evidence_dir is None:
+            raise runtime.RuntimeFailure("InvalidConfiguration", "client operation requires exact image and new evidence directory")
+        if args.operation == "cli":
+            result = trino_client_owner.cli(args.env_file, args.image, args.evidence_dir, rest, args.metrics)
+        else:
+            if args.source is None or not args.jdbc_jar:
+                raise runtime.RuntimeFailure("InvalidConfiguration", "JDBC operation requires image-local driver and saved source")
+            result = trino_client_owner.jdbc(args.env_file, args.image, args.evidence_dir, args.source, args.jdbc_jar, rest)
+        sys.stdout.buffer.write(result.stdout)
+        sys.stderr.buffer.write(result.stderr)
+        return result.returncode
     if args.operation == "start":
         print(start(args.env_file, args.image, args.name, args.config_dir))
         return 0
@@ -110,6 +127,8 @@ def main(argv=None):
         raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "Trino exec requires its exact container ID")
     if budget:
         timeout = budget.remaining_seconds(work=os.environ.get("NOVA_FIXTURE_CLEANUP_MODE") != "true")
+    if args.operation == "protocol":
+        rest = ["curl", "--silent", "--show-error", "--include", "--header", "Expect:", *rest]
     result = fixture_run.communicate(["docker", "exec", args.container, *rest], timeout=timeout,
                                     environment=runtime.controlled_environment())
     return result.returncode

@@ -29,20 +29,21 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(test)]
-use super::clock::ProcessMonotonicClock;
-#[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 
+use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::task_execution::{QueryContextRef, TaskIdentity, TaskStatus};
 use novarocks_query_application::coordination::{
-    AcceptedRootControlPort, AcceptedRootControlRequest, MonotonicInstant,
+    AcceptedRootControlPort, AcceptedRootControlRequest,
 };
 
-use super::clock::TaskProtocolClock;
+#[cfg(test)]
+use super::clock::ProcessMonotonicClock;
+use novarocks_coordination_contract::MonotonicClock;
 
 /// One immutable observation the transport published.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,55 +59,32 @@ pub trait StatusIntakeWake: std::fmt::Debug + Send + Sync {
     fn wake(&self);
 }
 
-/// Wakes a runner parked on a condition variable.
-///
-/// The coordinator's statement thread is blocking rather than async, so it
-/// parks here instead of on a `Notify` it would have to enter a runtime to
-/// await. It is a pacing aid and never a correctness condition: every wait is
-/// bounded, so a wake that is missed costs latency and nothing else.
+/// Test wake retaining the same asynchronous notification as its caller.
+/// Register before observing retained state so a racing wake is not lost.
 #[derive(Debug, Default)]
-pub struct CondvarWake {
-    woken: Mutex<bool>,
-    signal: Condvar,
+#[cfg(test)]
+pub struct TestIntakeWake {
     async_signal: tokio::sync::Notify,
 }
 
-impl CondvarWake {
+#[cfg(test)]
+impl TestIntakeWake {
     /// The same original wake also follows its owner into async residual
     /// supervision. Register before inspecting state to retain a racing wake.
     pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.async_signal.notified()
     }
-    /// Blocks until something wakes this, or `timeout` elapses.
-    ///
-    /// A wake that arrived while the caller was working is consumed here
-    /// rather than lost: without the flag, a publish between two waits would
-    /// be slept through, and on a control-plane-only turn nothing else would
-    /// arrive to end that sleep.
-    pub fn wait(&self, timeout: Duration) {
-        let mut woken = self.woken.lock().expect("task round wake lock");
-        if std::mem::take(&mut *woken) {
-            return;
-        }
-        let (mut guard, _) = self
-            .signal
-            .wait_timeout(woken, timeout)
-            .expect("task round wake condvar");
-        *guard = false;
-    }
 }
 
-impl StatusIntakeWake for CondvarWake {
+#[cfg(test)]
+impl StatusIntakeWake for TestIntakeWake {
     fn wake(&self) {
-        let mut woken = self.woken.lock().expect("task round wake lock");
-        *woken = true;
-        drop(woken);
-        self.signal.notify_all();
         self.async_signal.notify_one();
     }
 }
 
-impl std::task::Wake for CondvarWake {
+#[cfg(test)]
+impl std::task::Wake for TestIntakeWake {
     fn wake(self: Arc<Self>) {
         StatusIntakeWake::wake(self.as_ref());
     }
@@ -455,7 +433,7 @@ struct ObservationQueue {
 
 #[derive(Debug)]
 struct ObservationIntakeInner {
-    clock: Arc<dyn TaskProtocolClock>,
+    clock: Arc<dyn MonotonicClock>,
     queue: Mutex<ObservationQueue>,
     queue_capacity: usize,
     data_capacity: usize,
@@ -480,7 +458,7 @@ pub(crate) struct ObservationIntake {
 impl ObservationIntake {
     pub(crate) fn for_task_attempt(
         wake: Arc<dyn StatusIntakeWake>,
-        clock: Arc<dyn TaskProtocolClock>,
+        clock: Arc<dyn MonotonicClock>,
     ) -> Result<Self, ObservationIntakeConfigError> {
         let max_frame =
             novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES + 4096;
@@ -518,7 +496,7 @@ impl ObservationIntake {
         total_bytes: usize,
         max_frame_bytes: usize,
         wake: Arc<dyn StatusIntakeWake>,
-        clock: Arc<dyn TaskProtocolClock>,
+        clock: Arc<dyn MonotonicClock>,
     ) -> Result<Self, ObservationIntakeConfigError> {
         if queue_capacity == 0 {
             return Err(ObservationIntakeConfigError::Queue);
@@ -547,6 +525,10 @@ impl ObservationIntake {
                 wake,
             }),
         })
+    }
+
+    pub(crate) fn progress_wake(&self) -> Arc<dyn StatusIntakeWake> {
+        Arc::clone(&self.inner.wake)
     }
 
     /// Age of the oldest registered frame the serial owner has not applied.

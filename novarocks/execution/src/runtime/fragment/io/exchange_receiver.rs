@@ -102,6 +102,16 @@ pub trait ExchangeReceiverPort: Send + Sync + 'static {
         key: ExchangeReceiverKey,
         expected_senders: usize,
     ) -> Result<ExchangeReceiverHandle, crate::runtime::exchange::ExchangeFailure>;
+    /// Read only facts authored by the real input source; never infer them
+    /// from Task status, accepted End, readiness, or a missing receiver.
+    fn stream_close_facts(
+        &self,
+        key: ExchangeReceiverKey,
+        expected: &[novarocks_execution_contract::ExchangeStreamIdentity],
+    ) -> Result<
+        Vec<novarocks_execution_contract::ExchangeStreamClose>,
+        crate::runtime::exchange::ExchangeFailure,
+    >;
     fn ensure_mem_tracker(
         &self,
         key: ExchangeReceiverKey,
@@ -223,6 +233,19 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
             .get_receiver_handle(Self::key(key), expected_senders)
     }
 
+    fn stream_close_facts(
+        &self,
+        key: ExchangeReceiverKey,
+        expected: &[novarocks_execution_contract::ExchangeStreamIdentity],
+    ) -> Result<
+        Vec<novarocks_execution_contract::ExchangeStreamClose>,
+        crate::runtime::exchange::ExchangeFailure,
+    > {
+        self.runtime
+            .exchange_registry()
+            .stream_close_facts(Self::key(key), expected)
+    }
+
     fn ensure_mem_tracker(
         &self,
         key: ExchangeReceiverKey,
@@ -289,6 +312,17 @@ impl ExchangeReceiverPort for UnavailableExchangeReceiverPort {
         _key: ExchangeReceiverKey,
         _expected_senders: usize,
     ) -> Result<ExchangeReceiverHandle, crate::runtime::exchange::ExchangeFailure> {
+        Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
+    }
+
+    fn stream_close_facts(
+        &self,
+        _key: ExchangeReceiverKey,
+        _expected: &[novarocks_execution_contract::ExchangeStreamIdentity],
+    ) -> Result<
+        Vec<novarocks_execution_contract::ExchangeStreamClose>,
+        crate::runtime::exchange::ExchangeFailure,
+    > {
         Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
     }
 

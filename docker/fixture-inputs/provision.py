@@ -6,20 +6,28 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import tempfile
 import urllib.request
+from urllib.parse import urlsplit
 import uuid
 from pathlib import Path
 from typing import Any
 
 from fixture_inputs import (
     FixtureInputError,
+    derived_build_order,
     definition_sha256,
     fixture_store,
     fixture_store_lock,
     inspect_image,
     load_lock,
+    read_source_lock,
+    resolve_lock,
+    native_platform,
+    require_native_daemon,
+    read_json,
     require_relative,
     run,
     validate_artifact,
@@ -42,7 +50,7 @@ def download(url: str, output: Path) -> None:
         with urllib.request.urlopen(request, timeout=90) as response, output.open("wb") as destination:
             shutil.copyfileobj(response, destination)
     except OSError as error:
-        raise FixtureInputError(f"fixture artifact download failed: {url}") from error
+        raise FixtureInputError(f"fixture artifact download failed: {url}: {error}") from error
 
 
 def parse_image_sources(specs: list[str], image_names: set[str]) -> dict[str, str]:
@@ -68,6 +76,42 @@ def parse_image_sources(specs: list[str], image_names: set[str]) -> dict[str, st
             raise FixtureInputError(f"duplicate fixture image override: {name}")
         overrides[name] = source
     return overrides
+
+
+def parse_artifact_url_prefixes(specs: list[str] | None) -> dict[str, str]:
+    """Choose explicit HTTPS transports without changing locked content identity."""
+    overrides: dict[str, str] = {}
+    for spec in specs or []:
+        if not isinstance(spec, str):
+            raise FixtureInputError("--artifact-url-prefix must use ORIGINAL=TRANSPORT")
+        original, separator, transport = spec.partition("=")
+        if not separator:
+            raise FixtureInputError("--artifact-url-prefix must use ORIGINAL=TRANSPORT")
+        for prefix in (original, transport):
+            try:
+                parsed = urlsplit(prefix)
+                valid = (prefix.startswith("https://") and prefix.endswith("/")
+                         and bool(parsed.hostname) and parsed.port != 0
+                         and parsed.username is None and parsed.password is None
+                         and not parsed.query and not parsed.fragment
+                         and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in prefix)
+                         and not any(c in prefix for c in "?#\\"))
+            except ValueError:
+                valid = False
+            if not valid:
+                raise FixtureInputError("artifact URL prefixes require HTTPS directory URLs without userinfo, query or fragment")
+        if any(original.startswith(previous) or previous.startswith(original) for previous in overrides):
+            raise FixtureInputError("duplicate or overlapping artifact URL prefixes")
+        overrides[original] = transport
+    return overrides
+
+
+def artifact_transport_url(url: str, prefixes: dict[str, str]) -> str:
+    # Match exactly once against the locked URL, never against a rewritten URL.
+    for original, transport in prefixes.items():
+        if url.startswith(original):
+            return transport + url[len(original):]
+    return url
 
 
 def image_reference(
@@ -103,14 +147,56 @@ def prepare_images(
     return receipts
 
 
-def prepare_artifacts(lock: dict[str, Any], staging: Path) -> dict[str, dict[str, Any]]:
+def prepare_artifacts(lock: dict[str, Any], staging: Path,
+                      url_prefixes: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
     artifacts_dir = staging / "artifacts"
-    artifacts_dir.mkdir(parents=True)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
     receipts: dict[str, dict[str, Any]] = {}
     for name, item in lock["artifacts"].items():
+        transport_url = artifact_transport_url(item["url"], url_prefixes or {})
         output = artifacts_dir / name
-        download(item["url"], output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        # A failed provision keeps its own staging. Reuse a previous transfer
+        # only after validating its bytes against this exact selected input.
+        # The cache is optional and grants no BOM/READY authority.
+        cache = staging.parent / "downloads" if staging.name.startswith(".staging-") else None
+        if cache is not None:
+            algorithm = "sha256" if "sha256" in item else "sha1"
+            key = f"{algorithm}-{item[algorithm]}-{item['bytes']}"
+            cached = cache / key
+            if cached.is_file():
+                try:
+                    validate_artifact(cached, item)
+                except FixtureInputError:
+                    pass
+                else:
+                    shutil.copy2(cached, output)
+                    receipts[name] = validate_artifact(output, item)
+                    continue
+            # Earlier versions retained failed staging without a download cache.
+            # Those files are candidates only, never receipts or trusted names.
+            for candidate in sorted(staging.parent.glob(".staging-*/artifacts/" + name)):
+                if candidate == output:
+                    continue
+                try:
+                    validate_artifact(candidate, item)
+                except FixtureInputError:
+                    continue
+                shutil.copy2(candidate, output)
+                break
+            else:
+                download(transport_url, output)
+        else:
+            download(transport_url, output)
         receipts[name] = validate_artifact(output, item)
+        if cache is not None:
+            cache.mkdir(exist_ok=True)
+            algorithm = "sha256" if "sha256" in item else "sha1"
+            destination = cache / f"{algorithm}-{item[algorithm]}-{item['bytes']}"
+            temporary = cache / (".download-" + uuid.uuid4().hex)
+            shutil.copy2(output, temporary)
+            validate_artifact(temporary, item)
+            temporary.replace(destination)
     return receipts
 
 
@@ -165,13 +251,46 @@ def build_context(
     return out
 
 
-def build_derived_images(lock: dict[str, Any], repo_root: Path, staging: Path, lock_sha: str) -> dict[str, dict[str, str]]:
+def artifact_url_prefix_build_args(item: dict[str, Any], url_prefixes: dict[str, str] | None) -> list[str]:
+    """Only an explicitly declared recipe may consume acquisition transports."""
+    argument = item.get("artifact_url_prefix_build_arg")
+    if argument is None:
+        return []
+    payload = json.dumps(url_prefixes or {}, sort_keys=True, separators=(",", ":"))
+    return ["--build-arg", f"{argument}={payload}"]
+
+
+def build_derived_images(lock: dict[str, Any], repo_root: Path, staging: Path, lock_sha: str,
+                         *, url_prefixes: dict[str, str] | None = None) -> dict[str, dict[str, str]]:
     receipts: dict[str, dict[str, str]] = {}
-    for name, item in lock["derived_images"].items():
+    available = dict(lock.get("_verified_derived_images", {}))
+    names = set(lock.get("_build_names", lock["derived_images"]))
+    for name in derived_build_order(lock):
+        if name not in names:
+            continue
+        item = lock["derived_images"][name]
         context = build_context(lock, name, repo_root, staging / "artifacts", staging / "build-contexts" / name)
         definition = definition_sha256(repo_root, item["definition_files"])
         build_args = [argument for key, base in item["bases"].items()
                       for argument in ("--build-arg", f"{key}={lock['images'][base]['alias']}")]
+        for key, base in item.get("derived_bases", {}).items():
+            if base not in available:
+                raise FixtureInputError(f"fixture derived base has no verified image: {name}/{base}")
+            image_id = available[base]["image_id"]
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+                raise FixtureInputError(f"fixture derived base has an invalid image ID: {name}/{base}")
+            # BuildKit parses a raw sha256:ID as a repository/tag. Give the
+            # already verified local image a content-addressed Docker name.
+            reference = "novarocks/fixture-build-base:" + image_id.removeprefix("sha256:")
+            run(["docker", "tag", image_id, reference])
+            info = inspect_image(reference)
+            verify_image(info, lock["derived_images"][base], derived=True)
+            if info.get("Id") != image_id:
+                raise FixtureInputError(f"fixture derived base tag differs from its verified image: {name}/{base}")
+            build_args.extend(["--build-arg", f"{key}={reference}"])
+        for key, value in item.get("build_args", {}).items():
+            build_args.extend(["--build-arg", f"{key}={value}"])
+        build_args.extend(artifact_url_prefix_build_args(item, url_prefixes))
         iidfile = context.parent / f"{name}.iid"
         run([
             "docker", "build", "--platform", item["platform"],
@@ -191,20 +310,26 @@ def build_derived_images(lock: dict[str, Any], repo_root: Path, staging: Path, l
         if info.get("Id") != image_id:
             raise FixtureInputError(f"fixture build image ID mismatch: {name}")
         receipts[name] = {"alias": item["alias"], "platform": item["platform"], "definition_sha256": definition, "image_id": image_id}
+        available[name] = receipts[name]
     return receipts
 
 
 def context_only(
     repo_root: Path, lock_path: Path, name: str, out: Path,
     image_source_specs: list[str], pull_timeout_seconds: int,
+    platform: str | None = None, *, artifact_url_prefix_specs: list[str] | None = None,
 ) -> Path:
     """Prepare one build context without reading or publishing the fixture store."""
     if pull_timeout_seconds < 1:
         raise FixtureInputError("--docker-pull-timeout-seconds must be a positive integer")
-    lock, _ = load_lock(lock_path)
+    url_prefixes = parse_artifact_url_prefixes(artifact_url_prefix_specs)
+    lock, _ = load_lock(lock_path, platform=platform, consumer=f"derived:{name}")
+    require_native_daemon(lock["platform"])
     item = lock["derived_images"].get(name)
     if item is None:
         raise FixtureInputError(f"unknown fixture derived image: {name}")
+    if item.get("derived_bases"):
+        raise FixtureInputError("context-only with derived bases is unsupported; use explicit fixture provision")
     selected = {
         "images": {base: lock["images"][base] for base in item["bases"].values()},
         "artifacts": {artifact: lock["artifacts"][artifact] for artifact in item["artifacts"]},
@@ -213,11 +338,46 @@ def context_only(
     with tempfile.TemporaryDirectory(prefix="novarocks-fixture-context-") as temporary:
         staging = Path(temporary)
         prepare_images(selected, image_sources, pull_timeout_seconds)
-        prepare_artifacts(selected, staging)
+        if url_prefixes:
+            prepare_artifacts(selected, staging, url_prefixes)
+        else:
+            prepare_artifacts(selected, staging)
         definition_sha256(repo_root, item["definition_files"])
         build_context(lock, name, repo_root, staging / "artifacts", out)
     print(out)
     return out
+
+
+def retained_inputs(store: Path, repo_root: Path, source: dict[str, Any],
+                    platform: str, lock_sha: str) -> tuple[dict[str, Any], Path | None]:
+    """Retain only independently reverified closures from this lock/platform."""
+    from verify import verify_contents
+    retained: dict[str, Any] = {kind: {} for kind in ("images", "artifacts", "derived_images", "python_environments")}
+    try:
+        bom = read_json(store / "bom.json")
+        if ((store / "READY").read_text().strip() != f"sha256:{lock_sha}"
+                or bom.get("schema") != 2 or bom.get("lock_sha256") != lock_sha
+                or bom.get("platform") != platform):
+            return retained, None
+        directory = store / require_relative(str(bom.get("artifact_dir", "")))
+    except (FixtureInputError, OSError):
+        return retained, None
+    for kind, prefix in (("images", "image"), ("artifacts", "artifact"), ("derived_images", "derived"), ("python_environments", "python")):
+        entries = bom.get(kind, {})
+        if not isinstance(entries, dict):
+            continue
+        for name in entries:
+            if name not in source.get(kind, {}):
+                continue
+            try:
+                closure, _ = resolve_lock(source, platform, consumer=f"{prefix}:{name}")
+                verify_contents(store, repo_root, closure, lock_sha, bom)
+            except FixtureInputError:
+                continue
+            for category in retained:
+                for dependency in closure[category]:
+                    retained[category][dependency] = bom[category][dependency]
+    return retained, directory
 
 
 def provision(
@@ -226,39 +386,74 @@ def provision(
     lock_path: Path,
     image_source_specs: list[str],
     pull_timeout_seconds: int,
+    *, consumer: str = "all", platform: str | None = None,
+    artifact_url_prefix_specs: list[str] | None = None,
 ) -> Path:
     if pull_timeout_seconds < 1:
         raise FixtureInputError("--docker-pull-timeout-seconds must be a positive integer")
-    lock, lock_sha = load_lock(lock_path)
-    image_sources = parse_image_sources(image_source_specs, set(lock["images"]))
+    url_prefixes = parse_artifact_url_prefixes(artifact_url_prefix_specs)
+    source = read_source_lock(lock_path)
+    lock, lock_sha = resolve_lock(source, platform or native_platform(), consumer=consumer)
+    # Missing variants and unsupported consumers fail before touching Docker/store.
+    image_sources = parse_image_sources(image_source_specs, set(source["images"]))
+    require_native_daemon(lock["platform"])
     store.mkdir(parents=True, exist_ok=True)
     with fixture_store_lock(store, exclusive=True, create=True):
+        retained, previous_artifacts = retained_inputs(store, repo_root, source, lock["platform"], lock_sha)
+        if all(set(lock.get(kind, {})).issubset(retained[kind]) for kind in retained):
+            print(store / "bom.json")
+            return store / "bom.json"
         staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=store))
         try:
-            images = prepare_images(lock, image_sources, pull_timeout_seconds)
-            artifacts = prepare_artifacts(lock, staging)
-            derived = build_derived_images(lock, repo_root, staging, lock_sha)
-            # Only successful builds enter the mutable publication segment.
-            # A crash here can still require a new provision to repair aliases.
-            for receipt in derived.values():
+            artifacts_dir = staging / "artifacts"
+            artifacts_dir.mkdir()
+            for name in retained["artifacts"]:
+                assert previous_artifacts is not None
+                target = artifacts_dir / require_relative(name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(previous_artifacts / require_relative(name), target)
+                validate_artifact(artifacts_dir / name, source["artifacts"][name])
+            missing = {**lock, **{kind: {name: item for name, item in lock.get(kind, {}).items()
+                                              if name not in retained[kind]}
+                                 for kind in retained}}
+            images = {**retained["images"], **prepare_images(missing, image_sources, pull_timeout_seconds)}
+            prepared_artifacts = (prepare_artifacts(missing, staging, url_prefixes) if url_prefixes
+                                  else prepare_artifacts(missing, staging))
+            artifacts = {**retained["artifacts"], **prepared_artifacts}
+            # Recipes still need their complete base declarations; only builders
+            # selected below are new, while verified retained bases stay installed.
+            build_lock = {**lock, "_build_names": list(missing["derived_images"]),
+                          "_verified_derived_images": retained["derived_images"]}
+            prepared_derived = (build_derived_images(build_lock, repo_root, staging, lock_sha, url_prefixes=url_prefixes)
+                                if url_prefixes else build_derived_images(build_lock, repo_root, staging, lock_sha))
+            derived = {**retained["derived_images"], **prepared_derived}
+            for name in missing["derived_images"]:
+                receipt = derived[name]
                 run(["docker", "tag", receipt["image_id"], receipt["alias"]])
             generation = f"generation-{uuid.uuid4().hex}"
+            from python_environment import prepare_environments
+            python_environments = {**retained["python_environments"],
+                                   **prepare_environments(missing, repo_root, staging, generation)}
             generations = store / "generations"
             generations.mkdir(exist_ok=True)
             staging.replace(generations / generation)
             bom = {
-                "schema": 1,
+                "schema": 2,
+                "platform": lock["platform"],
                 "lock_sha256": lock_sha,
                 "artifact_dir": f"generations/{generation}/artifacts",
                 "images": images,
                 "artifacts": artifacts,
                 "derived_images": derived,
+                "python_environments": python_environments,
             }
             atomic_json(store / "bom.json", bom)
-            (store / "READY").write_text(f"sha256:{lock_sha}\n")
+            ready = store / f".READY.tmp-{os.getpid()}"
+            ready.write_text(f"sha256:{lock_sha}\n")
+            ready.replace(store / "READY")
         except Exception:
-            # A failed staging directory has no READY/BOM reachability. Retain it
-            # for diagnosis instead of deleting a store another provision may use.
+            # Failed staging/generations are unreachable or fail verification;
+            # retain them for diagnosis rather than deleting another attempt.
             raise
     print(store / "bom.json")
     return store / "bom.json"
@@ -269,6 +464,8 @@ def main() -> int:
     parser.add_argument("--store")
     parser.add_argument("--repo-root", default=SCRIPT_DIR.parents[1])
     parser.add_argument("--lock", default=SCRIPT_DIR / "lock.json")
+    parser.add_argument("--platform", help="explicit native target, checked against host and Docker daemon")
+    parser.add_argument("--consumer", choices=("all", "iceberg-rest", "iceberg-rest-oss", "object-store"), default="all")
     parser.add_argument("--context-only", metavar="NAME", help="prepare one derived image context without publishing a BOM")
     parser.add_argument("--out", type=Path, metavar="DIR", help="empty output directory for --context-only")
     parser.add_argument(
@@ -277,6 +474,10 @@ def main() -> int:
         default=[],
         metavar="LOGICAL_NAME=TRANSPORT_REPOSITORY",
         help="fetch one locked image through an explicit mirror without changing its digest",
+    )
+    parser.add_argument(
+        "--artifact-url-prefix", action="append", default=[], metavar="ORIGINAL=TRANSPORT",
+        help="rewrite a locked artifact HTTPS URL prefix for transport; repeat for distinct prefixes",
     )
     parser.add_argument(
         "--docker-pull-timeout-seconds",
@@ -292,7 +493,8 @@ def main() -> int:
             context_only(
                 Path(args.repo_root).resolve(), Path(args.lock).resolve(),
                 args.context_only, args.out.resolve(), args.image_source,
-                args.docker_pull_timeout_seconds,
+                args.docker_pull_timeout_seconds, args.platform,
+                artifact_url_prefix_specs=args.artifact_url_prefix,
             )
             return 0
         provision(
@@ -300,7 +502,8 @@ def main() -> int:
             Path(args.repo_root).resolve(),
             Path(args.lock).resolve(),
             args.image_source,
-            args.docker_pull_timeout_seconds,
+            args.docker_pull_timeout_seconds, consumer=args.consumer, platform=args.platform,
+            artifact_url_prefix_specs=args.artifact_url_prefix,
         )
     except FixtureInputError as error:
         print(f"PROVISION FAILED: {error}")

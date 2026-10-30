@@ -396,40 +396,6 @@ impl ClusterBackendService {
         service
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_captured_targets_for_test(targets: &[LiveBackendTarget]) -> Self {
-        let service = Self::new_transient_for_test(1);
-        let mut state = service.state.lock().unwrap();
-        for target in targets {
-            let process_id = target.process_id().expect("captured process id");
-            let endpoint = target.endpoint().expect("captured endpoint");
-            state.endpoint_owners.insert(endpoint.clone(), process_id);
-            state.processes.insert(
-                process_id,
-                BackendFacts {
-                    descriptor: target.descriptor().clone(),
-                    announce_lease_valid: true,
-                    announce_lease_expires_at: std::time::Instant::now()
-                        + service.announce_lease_ttl,
-                    last_announce_ms: now_ms(),
-                    exact_identity_verified: true,
-                    reported_state: BackendReportedState::Running,
-                    compatibility: Compatibility::Compatible,
-                    endpoint_owned: true,
-                    superseded: false,
-                    num_cores: 0,
-                    admission_epoch_capability: Some(target.admission_epoch_capability()),
-                    last_heartbeat_ms: 0,
-                    missed_heartbeats: 0,
-                    scheduled_fragments: 0,
-                    last_err: None,
-                },
-            );
-        }
-        drop(state);
-        service
-    }
-
     /// Announce establishes a lease and a pending candidate, never eligibility.
     pub(crate) fn record_announce(
         &self,

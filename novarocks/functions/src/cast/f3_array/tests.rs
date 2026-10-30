@@ -1145,7 +1145,7 @@ fn p05_list_and_large_list_retag_keep_offsets_nulls_and_metadata_independently()
             };
             assert_eq!(field.name(), "item");
             assert!(field.is_nullable());
-            assert_eq!(field.metadata().capacity(), 0);
+            assert!(field.metadata().as_arc().is_none());
             let original_field = match &target {
                 DataType::List(field) | DataType::LargeList(field) => field,
                 _ => unreachable!(),
@@ -1267,7 +1267,11 @@ fn p05_struct_parent_null_and_metadata_follow_actual_by_name_permutation() {
                 .collect::<Vec<_>>(),
             vec!["b", "a"]
         );
-        assert!(fields.iter().all(|field| field.metadata().capacity() == 0));
+        assert!(
+            fields
+                .iter()
+                .all(|field| field.metadata().as_arc().is_none())
+        );
         let DataType::Struct(original_fields) = &target else {
             unreachable!()
         };
@@ -1800,5 +1804,635 @@ fn utf8_offset_widening_preserves_exact_successful_null_obligation() {
             ),
             Err(KernelFailure::InvalidProgram(_))
         ));
+    }
+}
+
+#[test]
+fn large_date_text_selected_cast_keeps_original_raw_calendar_domain() {
+    let source: ArrayRef = Arc::new(arrow_array::LargeStringArray::from(vec![
+        Some("1970-01-01"),
+        Some(" 1970-01-01 "),
+        Some("+5881580-07-11"),
+        None,
+    ]));
+    for (policy, allow) in p05_modes() {
+        let r = recipe(DataType::LargeUtf8, DataType::Date32, policy, allow);
+        let result = output(&r, &source, Selection::all(4));
+        let values = result
+            .values()
+            .as_any()
+            .downcast_ref::<arrow_array::Date32Array>()
+            .unwrap();
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            vec![Some(0), None, None, None]
+        );
+    }
+}
+
+#[test]
+fn large_raw_numeric_text_preserves_strict_boundaries_for_every_admitted_primitive() {
+    let input = Arc::new(LargeStringArray::from(vec![
+        Some("7"),
+        Some("+7"),
+        Some("-0"),
+        Some(" 7"),
+        Some("7 "),
+        Some("\t7"),
+        Some("7\n"),
+        Some("\u{a0}7"),
+        Some("7\u{2003}"),
+        Some("\u{85}7"),
+        Some("7\u{3000}"),
+        Some("\u{feff}7"),
+        Some("7\0"),
+        Some(""),
+        None,
+    ])) as ArrayRef;
+    for target in [
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::UInt8,
+        DataType::UInt16,
+        DataType::UInt32,
+        DataType::UInt64,
+        DataType::Float32,
+        DataType::Float64,
+    ] {
+        let r = recipe(
+            DataType::LargeUtf8,
+            target.clone(),
+            DecimalOverflowPolicy::OutputNull,
+            false,
+        );
+        let actual = output(&r, &input, Selection::all(input.len()));
+        assert!(actual.errors().is_empty());
+        assert_eq!(actual.values().len(), 15);
+        for row in 0..15 {
+            assert_eq!(
+                actual.values().is_null(row),
+                row >= 3,
+                "{target:?} row {row}"
+            );
+        }
+        macro_rules! values {
+            ($array:ty, $seven:expr, $zero:expr) => {{
+                let array = actual.values().as_any().downcast_ref::<$array>().unwrap();
+                assert_eq!(array.value(0), $seven);
+                assert_eq!(array.value(1), $seven);
+                assert_eq!(array.value(2), $zero);
+            }};
+        }
+        match target {
+            DataType::Int8 => values!(Int8Array, 7, 0),
+            DataType::Int16 => values!(Int16Array, 7, 0),
+            DataType::Int32 => values!(Int32Array, 7, 0),
+            DataType::Int64 => values!(Int64Array, 7, 0),
+            DataType::UInt8 => values!(UInt8Array, 7, 0),
+            DataType::UInt16 => values!(UInt16Array, 7, 0),
+            DataType::UInt32 => values!(UInt32Array, 7, 0),
+            DataType::UInt64 => values!(UInt64Array, 7, 0),
+            DataType::Float32 => values!(Float32Array, 7.0, -0.0),
+            DataType::Float64 => values!(Float64Array, 7.0, -0.0),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn raw_decimal_text_retains_unicode_trim_rounding_blank_and_exponent_rejection() {
+    let input = Arc::new(LargeStringArray::from(vec![
+        Some("\u{a0}1.25\u{2003}"),
+        Some("-1.255"),
+        Some("1.255"),
+        Some("1e2"),
+        Some(""),
+        Some("\u{3000}"),
+        Some("999.995"),
+        None,
+    ])) as ArrayRef;
+    for target in [DataType::Decimal128(5, 2), DataType::Decimal256(5, 2)] {
+        let r = recipe(
+            DataType::LargeUtf8,
+            target.clone(),
+            DecimalOverflowPolicy::OutputNull,
+            false,
+        );
+        let actual = output(&r, &input, Selection::all(8));
+        assert!(actual.errors().is_empty());
+        let expected = vec![
+            Some(125_i128),
+            Some(-126),
+            Some(126),
+            None,
+            Some(0),
+            Some(0),
+            None,
+            None,
+        ];
+        match target {
+            DataType::Decimal128(..) => assert_eq!(
+                actual
+                    .values()
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                expected
+            ),
+            DataType::Decimal256(..) => assert_eq!(
+                actual
+                    .values()
+                    .as_any()
+                    .downcast_ref::<Decimal256Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                expected
+                    .into_iter()
+                    .map(|v| v.map(i256::from_i128))
+                    .collect::<Vec<_>>()
+            ),
+            _ => unreachable!(),
+        }
+    }
+    // Utf8 -> Decimal256 is also an installed raw array profile.
+    let input = Arc::new(StringArray::from(vec![
+        Some("\u{a0}1.25\u{2003}"),
+        Some("1e2"),
+    ])) as ArrayRef;
+    let r = recipe(
+        DataType::Utf8,
+        DataType::Decimal256(5, 2),
+        DecimalOverflowPolicy::OutputNull,
+        false,
+    );
+    let actual = output(&r, &input, Selection::all(2));
+    assert_eq!(
+        actual
+            .values()
+            .as_any()
+            .downcast_ref::<Decimal256Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(i256::from_i128(125)), None]
+    );
+}
+
+#[test]
+fn raw_decimal_negative_scale_remains_outer_even_for_null_source() {
+    let input = Arc::new(LargeStringArray::from(vec![None::<&str>])) as ArrayRef;
+    for target in [DataType::Decimal128(5, -1), DataType::Decimal256(5, -1)] {
+        let r = recipe(
+            DataType::LargeUtf8,
+            target,
+            DecimalOverflowPolicy::OutputNull,
+            false,
+        );
+        let failure = r
+            .evaluate_selected_array(
+                EvaluatedArgument::Column(&input),
+                Selection::all(1),
+                &[],
+                &Control,
+            )
+            .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("Cannot cast string to decimal with negative scale -1")
+        );
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        let mut cause = std::error::Error::source(&failure);
+        let mut owned = false;
+        while let Some(source) = cause {
+            owned |= source.is::<crate::math_numeric::RawNumericCastFailure>();
+            assert!(!source.is::<arrow_schema::ArrowError>());
+            cause = source.source();
+        }
+        assert!(owned);
+    }
+}
+
+fn checked_time_input(ty: &DataType, values: Vec<Option<i64>>) -> ArrayRef {
+    use arrow_array::*;
+    match ty {
+        DataType::Time32(TimeUnit::Second) => Arc::new(Time32SecondArray::from(
+            values
+                .into_iter()
+                .map(|v| v.map(|v| i32::try_from(v).unwrap()))
+                .collect::<Vec<_>>(),
+        )),
+        DataType::Time32(TimeUnit::Millisecond) => Arc::new(Time32MillisecondArray::from(
+            values
+                .into_iter()
+                .map(|v| v.map(|v| i32::try_from(v).unwrap()))
+                .collect::<Vec<_>>(),
+        )),
+        DataType::Time64(TimeUnit::Microsecond) => Arc::new(Time64MicrosecondArray::from(values)),
+        DataType::Time64(TimeUnit::Nanosecond) => Arc::new(Time64NanosecondArray::from(values)),
+        _ => panic!("test requires an exact TIME carrier"),
+    }
+}
+fn checked_time_values(array: &ArrayRef) -> Vec<Option<i64>> {
+    use arrow_array::*;
+    match array.data_type() {
+        DataType::Time32(TimeUnit::Second) => array
+            .as_any()
+            .downcast_ref::<Time32SecondArray>()
+            .unwrap()
+            .iter()
+            .map(|v| v.map(i64::from))
+            .collect(),
+        DataType::Time32(TimeUnit::Millisecond) => array
+            .as_any()
+            .downcast_ref::<Time32MillisecondArray>()
+            .unwrap()
+            .iter()
+            .map(|v| v.map(i64::from))
+            .collect(),
+        DataType::Time64(TimeUnit::Microsecond) => array
+            .as_any()
+            .downcast_ref::<Time64MicrosecondArray>()
+            .unwrap()
+            .iter()
+            .collect(),
+        DataType::Time64(TimeUnit::Nanosecond) => array
+            .as_any()
+            .downcast_ref::<Time64NanosecondArray>()
+            .unwrap()
+            .iter()
+            .collect(),
+        _ => panic!("test requires an exact TIME carrier"),
+    }
+}
+fn checked_time_types() -> [DataType; 4] {
+    [
+        DataType::Time32(TimeUnit::Second),
+        DataType::Time32(TimeUnit::Millisecond),
+        DataType::Time64(TimeUnit::Microsecond),
+        DataType::Time64(TimeUnit::Nanosecond),
+    ]
+}
+#[test]
+fn checked_time_all_unit_pairs_keep_negative_duration_truncation_and_null() {
+    let types = checked_time_types();
+    let durations = [90_000, 90_000_000, 90_000_000_000, 90_000_000_000_000];
+    // Independent literal counts for one source tick in each target unit.
+    let one = [
+        [1, 1_000, 1_000_000, 1_000_000_000],
+        [0, 1, 1_000, 1_000_000],
+        [0, 0, 1, 1_000],
+        [0, 0, 0, 1],
+    ];
+    for (i, source) in types.iter().enumerate() {
+        let input = checked_time_input(
+            source,
+            vec![
+                Some(durations[i]),
+                Some(-durations[i]),
+                Some(1),
+                Some(-1),
+                None,
+            ],
+        );
+        for (j, target) in types.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            for policy in [
+                DecimalOverflowPolicy::OutputNull,
+                DecimalOverflowPolicy::ReportError,
+            ] {
+                for allow in [false, true] {
+                    let r = recipe(source.clone(), target.clone(), policy, allow);
+                    let actual = output(&r, &input, Selection::all(5));
+                    assert_eq!(
+                        checked_time_values(actual.values()),
+                        vec![
+                            Some(durations[j]),
+                            Some(-durations[j]),
+                            Some(one[i][j]),
+                            Some(-one[i][j]),
+                            None
+                        ],
+                        "{source:?}->{target:?}"
+                    );
+                    assert!(actual.errors().is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn checked_time_width_edges_follow_allow_and_retain_real_numeric_sources() {
+    let types = checked_time_types();
+    // (source, target, positive in-range, positive overflow, negative in-range,
+    // negative overflow, positive output, negative output). No SDK creates these.
+    type TimeWidthBoundaryCase = (usize, usize, i64, i64, i64, i64, i64, i64);
+    let cases: [TimeWidthBoundaryCase; 6] = [
+        (
+            0,
+            1,
+            2_147_483,
+            2_147_484,
+            -2_147_483,
+            -2_147_484,
+            2_147_483_000,
+            -2_147_483_000,
+        ),
+        (
+            2,
+            0,
+            2_147_483_647_999_999,
+            2_147_483_648_000_000,
+            -2_147_483_648_999_999,
+            -2_147_483_649_000_000,
+            2_147_483_647,
+            -2_147_483_648,
+        ),
+        (
+            2,
+            1,
+            2_147_483_647_999,
+            2_147_483_648_000,
+            -2_147_483_648_999,
+            -2_147_483_649_000,
+            2_147_483_647,
+            -2_147_483_648,
+        ),
+        (
+            3,
+            0,
+            2_147_483_647_999_999_999,
+            2_147_483_648_000_000_000,
+            -2_147_483_648_999_999_999,
+            -2_147_483_649_000_000_000,
+            2_147_483_647,
+            -2_147_483_648,
+        ),
+        (
+            3,
+            1,
+            2_147_483_647_999_999,
+            2_147_483_648_000_000,
+            -2_147_483_648_999_999,
+            -2_147_483_649_000_000,
+            2_147_483_647,
+            -2_147_483_648,
+        ),
+        (
+            2,
+            3,
+            9_223_372_036_854_775,
+            9_223_372_036_854_776,
+            -9_223_372_036_854_775,
+            -9_223_372_036_854_776,
+            9_223_372_036_854_775_000,
+            -9_223_372_036_854_775_000,
+        ),
+    ];
+    for (i, j, pos, over, neg, under, positive, negative) in cases {
+        let input = checked_time_input(
+            &types[i],
+            vec![
+                Some(pos),
+                Some(over),
+                Some(neg),
+                Some(under),
+                None,
+                Some(if i == 0 {
+                    i64::from(i32::MAX)
+                } else {
+                    i64::MAX
+                }),
+                Some(if i == 0 {
+                    i64::from(i32::MIN)
+                } else {
+                    i64::MIN
+                }),
+            ],
+        );
+        for policy in [
+            DecimalOverflowPolicy::OutputNull,
+            DecimalOverflowPolicy::ReportError,
+        ] {
+            for allow in [false, true] {
+                let r = recipe(types[i].clone(), types[j].clone(), policy, allow);
+                let actual = output(&r, &input, Selection::all(7));
+                assert_eq!(
+                    checked_time_values(actual.values()),
+                    vec![Some(positive), None, Some(negative), None, None, None, None]
+                );
+                assert_eq!(
+                    actual
+                        .errors()
+                        .iter()
+                        .map(RowDataError::selected_ordinal)
+                        .collect::<Vec<_>>(),
+                    if allow { vec![1, 3, 5, 6] } else { vec![] }
+                );
+                for error in actual.errors() {
+                    use novarocks_failure_contract::FailureProjection;
+                    assert_eq!(
+                        error.projected_fact(),
+                        crate::DataFailureReason::NumericOutOfRange.failure_fact()
+                    );
+                    let mut cause = std::error::Error::source(error);
+                    let (mut temporal, mut numeric) = (false, false);
+                    while let Some(source) = cause {
+                        temporal |= source.is::<crate::temporal_carrier::TemporalCastFailure>();
+                        numeric |= source.is::<std::num::TryFromIntError>();
+                        assert!(!source.is::<arrow_schema::ArrowError>());
+                        cause = source.source();
+                    }
+                    assert!(temporal && numeric);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn checked_time_demand_keeps_hidden_nulls_inherited_errors_and_scalar_addresses() {
+    let from = DataType::Time64(TimeUnit::Microsecond);
+    let to = DataType::Time64(TimeUnit::Nanosecond);
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
+    ] {
+        for allow in [false, true] {
+            let r = recipe(from.clone(), to.clone(), policy, allow);
+            let input = checked_time_input(&from, vec![Some(i64::MAX), Some(-90_000_000_000)]);
+            let rows = [1];
+            let selection = Selection::try_sparse(2, &rows).unwrap();
+            let actual = output(&r, &input, selection);
+            assert_eq!(
+                checked_time_values(actual.values()),
+                vec![Some(-90_000_000_000_000)]
+            );
+            assert!(actual.errors().is_empty());
+            let data = input
+                .to_data()
+                .into_builder()
+                .nulls(Some(arrow_buffer::NullBuffer::from(vec![false, true])))
+                .build()
+                .unwrap();
+            let hidden_null = arrow_array::make_array(data);
+            let actual = output(&r, &hidden_null, Selection::all(2));
+            assert_eq!(
+                checked_time_values(actual.values()),
+                vec![None, Some(-90_000_000_000_000)]
+            );
+            assert!(actual.errors().is_empty());
+            let inherited = [RowDataError::new(0, "original inherited TIME refusal")];
+            let original = SelectedValues::try_new(
+                Selection::all(2),
+                &from,
+                hidden_null.clone(),
+                inherited.to_vec().into_boxed_slice(),
+            )
+            .unwrap();
+            let actual = r
+                .evaluate_selected_array(
+                    EvaluatedArgument::SelectedColumn(&original),
+                    original.selection(),
+                    original.errors(),
+                    &Control,
+                )
+                .unwrap();
+            assert_eq!(actual.errors(), &inherited);
+            assert_eq!(
+                checked_time_values(actual.values()),
+                vec![None, Some(-90_000_000_000_000)]
+            );
+            let scalar = input.slice(0, 1);
+            let actual = r
+                .evaluate_selected_array(
+                    EvaluatedArgument::Scalar(&scalar),
+                    Selection::all(3),
+                    &[],
+                    &Control,
+                )
+                .unwrap();
+            assert_eq!(checked_time_values(actual.values()), vec![None, None, None]);
+            assert_eq!(
+                actual
+                    .errors()
+                    .iter()
+                    .map(RowDataError::selected_ordinal)
+                    .collect::<Vec<_>>(),
+                if allow { vec![0, 1, 2] } else { vec![] }
+            );
+            let nonnull_source = PreparedCastRecipe::try_new(
+                CastOperation::Carrier,
+                &FunctionValueType::new(from.clone(), false),
+                &FunctionValueType::new(to.clone(), true),
+                policy,
+                allow,
+                &Control,
+            )
+            .unwrap();
+            let null = checked_time_input(&from, vec![None]);
+            let failure = nonnull_source
+                .evaluate_selected_array(
+                    EvaluatedArgument::Column(&null),
+                    Selection::all(1),
+                    &[],
+                    &Control,
+                )
+                .unwrap_err();
+            assert!(
+                failure
+                    .to_string()
+                    .contains("non-null selected CAST source contains NULL")
+            );
+            // The original conservative output-nullability admission is unchanged.
+            let failure = PreparedCastRecipe::try_new(
+                CastOperation::Carrier,
+                &FunctionValueType::new(from.clone(), false),
+                &FunctionValueType::new(to.clone(), false),
+                policy,
+                allow,
+                &Control,
+            )
+            .unwrap_err();
+            assert!(matches!(failure, CastPrepareError::TypeMismatch));
+        }
+    }
+}
+
+#[test]
+fn checked_time_control_refusal_has_no_followup_callbacks() {
+    use std::sync::Mutex;
+    struct Stop {
+        calls: Mutex<usize>,
+        at: Option<usize>,
+    }
+    impl KernelEvaluationControl for Stop {
+        fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+            assert!(units <= 256);
+            let mut calls = self.calls.lock().unwrap();
+            let at = *calls;
+            if let Some(stop) = self.at {
+                assert!(at <= stop, "callback after TIME refusal");
+            }
+            *calls += 1;
+            if self.at == Some(at) {
+                Err(KernelFailure::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("TIME CAST never waits")
+        }
+    }
+    let r = recipe(
+        DataType::Time64(TimeUnit::Microsecond),
+        DataType::Time64(TimeUnit::Nanosecond),
+        DecimalOverflowPolicy::ReportError,
+        true,
+    );
+    let input = checked_time_input(
+        &DataType::Time64(TimeUnit::Microsecond),
+        vec![Some(i64::MAX)],
+    );
+    let baseline = Stop {
+        calls: Mutex::new(0),
+        at: None,
+    };
+    let actual = r
+        .evaluate_selected_array(
+            EvaluatedArgument::Column(&input),
+            Selection::all(1),
+            &[],
+            &baseline,
+        )
+        .unwrap();
+    assert_eq!(actual.errors().len(), 1);
+    let count = *baseline.calls.lock().unwrap();
+    assert!(count > 0);
+    for at in 0..count {
+        let stop = Stop {
+            calls: Mutex::new(0),
+            at: Some(at),
+        };
+        let failure = r
+            .evaluate_selected_array(
+                EvaluatedArgument::Column(&input),
+                Selection::all(1),
+                &[],
+                &stop,
+            )
+            .unwrap_err();
+        assert_eq!(failure, KernelFailure::Cancelled);
+        assert_eq!(*stop.calls.lock().unwrap(), at + 1);
     }
 }

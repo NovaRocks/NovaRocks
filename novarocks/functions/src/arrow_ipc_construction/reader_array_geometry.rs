@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Pinned Arrow58.4 RecordBatchDecoder public array/header construction.
-//! The original array decoder and payload operations remain unchanged. This
-//! model reads only the already constructed, verified source schema and the
+//! Pinned Arrow60.1.0 RecordBatchDecoder public array/header construction.
+//! This model reads only the already constructed, verified source schema and the
 //! borrowed record metadata; it never authors execution semantics.
 use super::reader_geometry::ReaderStructureFailure;
 use arrow_array::types::*;

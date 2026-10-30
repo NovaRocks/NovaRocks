@@ -116,7 +116,7 @@ impl RetainedRootReply {
     pub fn outcome(&self) -> RootReplyView<'_> {
         match &self.response {
             RootReadResponse::Deferred(deferred) => RootReplyView::Deferred(deferred.reason()),
-            RootReadResponse::Refused(refused) => RootReplyView::Refused(refused),
+            RootReadResponse::Refused(refused) => RootReplyView::Refused(refused.as_ref()),
             RootReadResponse::Reply(reply) => match &reply.outcome {
                 RootReadOutcome::AckOnly => RootReplyView::AckOnly,
                 RootReadOutcome::NotReady => RootReplyView::NotReady,

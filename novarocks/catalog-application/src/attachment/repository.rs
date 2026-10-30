@@ -19,18 +19,23 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
+use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
     CatalogNonSecretProperty, ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
-    MAX_CATALOG_NON_SECRET_PROPERTIES, StaticCredentialReference,
+    MAX_CATALOG_NON_SECRET_PROPERTIES, NodeLocalCredentialReference, StaticCredentialReference,
     canonicalize_catalog_credential_bindings,
 };
 use novarocks_state_store_api::{
-    AttemptOutcome, Direction, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
-    StateStoreError, StateStoreErrorKind, VersionToken,
+    AttemptOutcome, CommitObservation, CommitReceipt, Direction, Key, KeyRange,
+    OriginalReadTransaction, OriginalWriteTransaction, Precondition, RangePage, RangeRequest,
+    ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
+    StateStoreExecutionContext, StateStoreOriginalUnsupported, VersionToken, WriteTransaction,
 };
 use novarocks_state_store_runtime::{
-    DurableRecordError, DurableRecordStore, RunFailure, StateStoreRunPolicy, run_side_effect_free,
+    DurableRecordError, DurableRecordStore, EncodedRecord, RunFailure, RunSuccess,
+    StateStoreRunPolicy, run_side_effect_free, run_side_effect_free_in,
+    run_side_effect_free_in_receiving,
 };
 use uuid::Uuid;
 
@@ -83,32 +88,304 @@ pub enum CatalogAttachmentErrorKind {
     CommitUnknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct CatalogAttachmentError {
     kind: CatalogAttachmentErrorKind,
     message: String,
+    source: Option<SharedFailureCause>,
+    commit_observation: Option<CommitObservation>,
+    committed_receipt: Option<CommitReceipt>,
+    // The original commit refusal survives a later adjudication/read failure.
+    commit_failure: Option<SharedFailureCause>,
+}
+
+/// Move the original failure and publication evidence into the caller's stable
+/// receiving slot. No field reconstructs an attempt or provider cause.
+pub struct CatalogAttachmentFailureParts {
+    pub kind: CatalogAttachmentErrorKind,
+    pub message: String,
+    pub source: Option<SharedFailureCause>,
+    pub commit_observation: Option<CommitObservation>,
+    pub committed_receipt: Option<CommitReceipt>,
+    pub commit_failure: Option<SharedFailureCause>,
 }
 
 impl CatalogAttachmentError {
-    pub fn kind(&self) -> CatalogAttachmentErrorKind {
+    pub const fn kind(&self) -> CatalogAttachmentErrorKind {
         self.kind
     }
-
+    pub fn source_failure(&self) -> Option<&SharedFailureCause> {
+        self.source.as_ref()
+    }
+    pub fn commit_observation(&self) -> Option<&CommitObservation> {
+        self.commit_observation.as_ref()
+    }
+    pub fn committed_receipt(&self) -> Option<&CommitReceipt> {
+        self.committed_receipt.as_ref()
+    }
+    pub fn commit_failure(&self) -> Option<&SharedFailureCause> {
+        self.commit_failure.as_ref()
+    }
+    pub fn into_parts(self) -> CatalogAttachmentFailureParts {
+        CatalogAttachmentFailureParts {
+            kind: self.kind,
+            message: self.message,
+            source: self.source,
+            commit_observation: self.commit_observation,
+            committed_receipt: self.committed_receipt,
+            commit_failure: self.commit_failure,
+        }
+    }
     fn new(kind: CatalogAttachmentErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
+            source: None,
+            commit_observation: None,
+            committed_receipt: None,
+            commit_failure: None,
         }
     }
+    fn with_source(mut self, source: SharedFailureCause) -> Self {
+        self.source = Some(source);
+        self
+    }
+    fn with_unknown(mut self, observation: CommitObservation, failure: SharedFailureCause) -> Self {
+        self.commit_observation = Some(observation);
+        self.commit_failure = Some(failure);
+        self
+    }
+    fn with_committed(mut self, receipt: CommitReceipt) -> Self {
+        self.committed_receipt = Some(receipt);
+        self
+    }
 }
-
+impl PartialEq for CatalogAttachmentError {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.message == other.message
+            && self.source == other.source
+            && self.commit_observation.as_ref().map(CommitObservation::id)
+                == other.commit_observation.as_ref().map(CommitObservation::id)
+            && self.committed_receipt == other.committed_receipt
+            && self.commit_failure == other.commit_failure
+    }
+}
+impl Eq for CatalogAttachmentError {}
 impl fmt::Display for CatalogAttachmentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
     }
 }
+impl std::error::Error for CatalogAttachmentError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|cause| cause as &dyn std::error::Error)
+    }
+}
+impl FailureProjection for CatalogAttachmentError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass as C, FailureFact, FailureReason, domain};
+        if let Some(source) = &self.source {
+            return source.failure_fact();
+        }
+        // These are the Catalog application's existing metadata projections.
+        let (class, code) = match self.kind {
+            CatalogAttachmentErrorKind::InvalidRequest => (C::Data, 900),
+            CatalogAttachmentErrorKind::NotFound => (C::Dependency, 901),
+            CatalogAttachmentErrorKind::AlreadyExists => (C::Data, 902),
+            CatalogAttachmentErrorKind::Conflict => (C::Dependency, 903),
+            CatalogAttachmentErrorKind::Unavailable | CatalogAttachmentErrorKind::CommitUnknown => {
+                (C::Dependency, 904)
+            }
+            CatalogAttachmentErrorKind::Corruption => (C::Unexpected, 905),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::METADATA, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
 
-impl std::error::Error for CatalogAttachmentError {}
+// Request-local API selection. Original never calls a legacy transaction or
+// evidence method; neither mode owns a new runtime, Root, or retry algorithm.
+#[derive(Clone, Copy)]
+enum RequestMode<'a> {
+    Legacy,
+    Original(&'a StateStoreExecutionContext),
+}
+enum ReadView {
+    Legacy(Box<dyn ReadTransaction>),
+    Original(Box<dyn OriginalReadTransaction>),
+}
+impl ReadView {
+    async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, SharedFailureCause> {
+        match self {
+            Self::Legacy(tx) => tx
+                .get(key)
+                .await
+                .map_err(StateStoreError::into_original_failure),
+            Self::Original(tx) => tx.get_in(key).await,
+        }
+    }
+    async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, SharedFailureCause> {
+        match self {
+            Self::Legacy(tx) => tx
+                .range(request)
+                .await
+                .map_err(StateStoreError::into_original_failure),
+            Self::Original(tx) => tx.range_in(request).await,
+        }
+    }
+    async fn close(self) -> Result<(), SharedFailureCause> {
+        match self {
+            Self::Legacy(tx) => tx
+                .abort()
+                .await
+                .map_err(StateStoreError::into_original_failure),
+            Self::Original(mut tx) => tx.close_in().await,
+        }
+    }
+}
+#[derive(Clone)]
+enum Mutation {
+    Create { key: Key, value: EncodedRecord },
+    Drop { key: Key, version: VersionToken },
+}
+impl Mutation {
+    async fn legacy(
+        self,
+        durable: DurableRecordStore,
+        tx: &mut dyn WriteTransaction,
+    ) -> Result<(), StateStoreError> {
+        match self {
+            Self::Create { key, value } => {
+                durable
+                    .put_record(tx, key, value, Precondition::Absent)
+                    .await
+            }
+            Self::Drop { key, version } => tx.delete(key, Precondition::Version(version)).await,
+        }
+    }
+    async fn original(
+        self,
+        durable: DurableRecordStore,
+        tx: &mut dyn OriginalWriteTransaction,
+    ) -> Result<(), SharedFailureCause> {
+        match self {
+            Self::Create { key, value } => {
+                durable
+                    .put_encoded_in(tx, key, value, Precondition::Absent)
+                    .await
+            }
+            Self::Drop { key, version } => tx.delete_in(key, Precondition::Version(version)).await,
+        }
+    }
+}
+impl RequestMode<'_> {
+    async fn read(self, store: &dyn StateStore) -> Result<ReadView, SharedFailureCause> {
+        match self {
+            Self::Legacy => store
+                .begin_read()
+                .await
+                .map(ReadView::Legacy)
+                .map_err(StateStoreError::into_original_failure),
+            Self::Original(execution) => store
+                .begin_original_read_in(execution)
+                .await
+                .map(ReadView::Original),
+        }
+    }
+    async fn write(
+        self,
+        repository: &CatalogAttachmentRepository,
+        purpose: &str,
+        mutation: Mutation,
+        receiving: Option<&crate::CatalogMutationReceipt>,
+    ) -> Result<RunSuccess<()>, RunFailure<SharedFailureCause>> {
+        match self {
+            Self::Legacy => run_side_effect_free(
+                repository.store.as_ref(),
+                repository.metrics.as_ref(),
+                repository.policy,
+                purpose,
+                |tx| {
+                    let mutation = mutation.clone();
+                    let durable = repository.durable.clone();
+                    Box::pin(async move { mutation.legacy(durable, tx).await })
+                },
+            )
+            .await
+            .map_err(shared_run_failure),
+            Self::Original(execution) => {
+                if let Some(receiving) = receiving {
+                    return run_side_effect_free_in_receiving(
+                        repository.store.as_ref(),
+                        repository.metrics.as_ref(),
+                        repository.policy,
+                        purpose,
+                        execution,
+                        receiving,
+                        |tx| {
+                            let mutation = mutation.clone();
+                            let durable = repository.durable.clone();
+                            Box::pin(async move { mutation.original(durable, tx).await })
+                        },
+                    )
+                    .await;
+                }
+                run_side_effect_free_in(
+                    repository.store.as_ref(),
+                    repository.metrics.as_ref(),
+                    repository.policy,
+                    purpose,
+                    execution,
+                    |tx| {
+                        let mutation = mutation.clone();
+                        let durable = repository.durable.clone();
+                        Box::pin(async move { mutation.original(durable, tx).await })
+                    },
+                )
+                .await
+            }
+        }
+    }
+    async fn outcome(
+        self,
+        observation: &CommitObservation,
+    ) -> Result<AttemptOutcome, SharedFailureCause> {
+        match self {
+            Self::Legacy => observation
+                .outcome()
+                .await
+                .map_err(StateStoreError::into_original_failure),
+            Self::Original(execution) => observation.outcome_in(execution).await,
+        }
+    }
+}
+fn shared_run_failure(failure: RunFailure) -> RunFailure<SharedFailureCause> {
+    match failure {
+        RunFailure::Begin(error) => RunFailure::Begin(error.into_original_failure()),
+        RunFailure::Operation(error) => RunFailure::Operation(error.into_original_failure()),
+        RunFailure::RetryExhausted(error) => {
+            RunFailure::RetryExhausted(error.into_original_failure())
+        }
+        RunFailure::DefiniteFailure(error) => {
+            RunFailure::DefiniteFailure(error.into_original_failure())
+        }
+        RunFailure::CommitUnknown { observation, error } => RunFailure::CommitUnknown {
+            observation,
+            error: error.into_original_failure(),
+        },
+        RunFailure::DeadlineExceeded => RunFailure::DeadlineExceeded,
+    }
+}
+fn store_kind(error: &SharedFailureCause) -> Option<StateStoreErrorKind> {
+    error
+        .downcast_ref::<StateStoreError>()
+        .map(StateStoreError::kind)
+}
 
 // Design: ADR-0115 (docs/adr/ADR-0115-catalog-desired-state-source-modes.md)
 #[derive(Clone)]
@@ -128,6 +405,20 @@ impl CatalogAttachmentRepository {
         store: Arc<dyn StateStore>,
         policy: StateStoreRunPolicy,
     ) -> Result<Self, CatalogAttachmentError> {
+        Self::open_with(store, policy, RequestMode::Legacy).await
+    }
+    pub async fn open_in(
+        store: Arc<dyn StateStore>,
+        policy: StateStoreRunPolicy,
+        execution: &StateStoreExecutionContext,
+    ) -> Result<Self, CatalogAttachmentError> {
+        Self::open_with(store, policy, RequestMode::Original(execution)).await
+    }
+    async fn open_with(
+        store: Arc<dyn StateStore>,
+        policy: StateStoreRunPolicy,
+        mode: RequestMode<'_>,
+    ) -> Result<Self, CatalogAttachmentError> {
         let repository = Self {
             durable: DurableRecordStore::new(Arc::clone(&store)),
             metrics: Arc::new(CatalogAttachmentMetrics::default()),
@@ -135,7 +426,9 @@ impl CatalogAttachmentRepository {
             policy,
             wakeup: Arc::new(CatalogAttachmentWakeup::new()),
         };
-        repository.list().await?;
+        repository
+            .list_with(DEFAULT_ATTACHMENT_SCAN_PAGE_SIZE, mode)
+            .await?;
         Ok(repository)
     }
 
@@ -157,16 +450,42 @@ impl CatalogAttachmentRepository {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<Option<CatalogAttachmentVersioned>, CatalogAttachmentError> {
+        self.get_with(instance_id, RequestMode::Legacy).await
+    }
+    pub async fn get_in(
+        &self,
+        instance_id: &ConnectorInstanceId,
+        execution: &StateStoreExecutionContext,
+    ) -> Result<Option<CatalogAttachmentVersioned>, CatalogAttachmentError> {
+        self.get_with(instance_id, RequestMode::Original(execution))
+            .await
+    }
+    async fn get_with(
+        &self,
+        instance_id: &ConnectorInstanceId,
+        mode: RequestMode<'_>,
+    ) -> Result<Option<CatalogAttachmentVersioned>, CatalogAttachmentError> {
         let key = attachment_key(instance_id).map_err(invalid)?;
-        let mut transaction = self.store.begin_read().await.map_err(store)?;
-        let record = transaction.get(&key).await.map_err(store)?;
-        transaction.abort().await.map_err(store)?;
+        let mut transaction = mode.read(self.store.as_ref()).await.map_err(store_source)?;
+        let record = transaction.get(&key).await.map_err(store_source)?;
+        transaction.close().await.map_err(store_source)?;
         record.map(decode_record).transpose()
     }
 
     pub async fn list(&self) -> Result<Vec<CatalogAttachmentVersioned>, CatalogAttachmentError> {
         self.list_with_page_size(DEFAULT_ATTACHMENT_SCAN_PAGE_SIZE)
             .await
+    }
+
+    pub async fn list_in(
+        &self,
+        execution: &StateStoreExecutionContext,
+    ) -> Result<Vec<CatalogAttachmentVersioned>, CatalogAttachmentError> {
+        self.list_with(
+            DEFAULT_ATTACHMENT_SCAN_PAGE_SIZE,
+            RequestMode::Original(execution),
+        )
+        .await
     }
 
     /// Enumerates the complete attachment prefix, or fails.
@@ -183,6 +502,21 @@ impl CatalogAttachmentRepository {
         &self,
         page_size: usize,
     ) -> Result<Vec<CatalogAttachmentVersioned>, CatalogAttachmentError> {
+        self.list_with(page_size, RequestMode::Legacy).await
+    }
+    pub async fn list_with_page_size_in(
+        &self,
+        page_size: usize,
+        execution: &StateStoreExecutionContext,
+    ) -> Result<Vec<CatalogAttachmentVersioned>, CatalogAttachmentError> {
+        self.list_with(page_size, RequestMode::Original(execution))
+            .await
+    }
+    async fn list_with(
+        &self,
+        page_size: usize,
+        mode: RequestMode<'_>,
+    ) -> Result<Vec<CatalogAttachmentVersioned>, CatalogAttachmentError> {
         if page_size == 0 || page_size > self.store.limits().max_page_size {
             return Err(CatalogAttachmentError::new(
                 CatalogAttachmentErrorKind::InvalidRequest,
@@ -191,7 +525,7 @@ impl CatalogAttachmentRepository {
         }
         let prefix = attachment_prefix().map_err(invalid)?;
         let range = KeyRange::for_prefix(prefix).map_err(store)?;
-        let mut transaction = self.store.begin_read().await.map_err(store)?;
+        let mut transaction = mode.read(self.store.as_ref()).await.map_err(store_source)?;
         let mut request = RangeRequest {
             range,
             direction: Direction::Forward,
@@ -200,7 +534,7 @@ impl CatalogAttachmentRepository {
         };
         let mut attachments = Vec::new();
         loop {
-            let page = transaction.range(&request).await.map_err(store)?;
+            let page = transaction.range(&request).await.map_err(store_source)?;
             attachments.extend(
                 page.records
                     .into_iter()
@@ -212,7 +546,7 @@ impl CatalogAttachmentRepository {
             };
             request.continuation = Some(continuation);
         }
-        transaction.abort().await.map_err(store)?;
+        transaction.close().await.map_err(store_source)?;
         attachments.sort_by(|left, right| {
             left.attachment
                 .instance_id
@@ -236,76 +570,125 @@ impl CatalogAttachmentRepository {
         &self,
         attachment: CatalogAttachment,
     ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
+        self.create_with(attachment, RequestMode::Legacy, None)
+            .await
+    }
+    pub async fn create_in(
+        &self,
+        attachment: CatalogAttachment,
+        execution: &StateStoreExecutionContext,
+    ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
+        self.create_with(attachment, RequestMode::Original(execution), None)
+            .await
+    }
+    /// Record the same input and durable facts before matching I/O or wakeup.
+    pub async fn create_in_receiving(
+        &self,
+        attachment: CatalogAttachment,
+        execution: &StateStoreExecutionContext,
+        receiving: &crate::CatalogMutationReceipt,
+    ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
+        self.create_with(
+            attachment,
+            RequestMode::Original(execution),
+            Some(receiving),
+        )
+        .await
+    }
+    async fn create_with(
+        &self,
+        attachment: CatalogAttachment,
+        mode: RequestMode<'_>,
+        receiving: Option<&crate::CatalogMutationReceipt>,
+    ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
         validate_attachment(&attachment)?;
+        if let Some(receiving) = receiving {
+            receiving
+                .begin_create(&attachment)
+                .map_err(receiving_error)?;
+        }
         let key = attachment_key(&attachment.instance_id).map_err(invalid)?;
         let value = encode(&self.durable, &stored_from(&attachment)).map_err(durable_record)?;
+        let mutation = Mutation::Create { key, value };
         let mut replays = 0_usize;
         loop {
-            let outcome = run_side_effect_free(
-                self.store.as_ref(),
-                self.metrics.as_ref(),
-                self.policy,
-                "create catalog attachment",
-                |transaction| {
-                    let key = key.clone();
-                    let value = value.clone();
-                    let durable = self.durable.clone();
-                    Box::pin(async move {
-                        durable
-                            .put_record(transaction, key, value, Precondition::Absent)
-                            .await?;
-                        Ok(())
-                    })
-                },
-            )
-            .await;
-            let unresolved = match outcome {
-                Ok(_) => return self.committed_create(&attachment).await,
+            let (observation, unresolved) = match mode
+                .write(
+                    self,
+                    "create catalog attachment",
+                    mutation.clone(),
+                    receiving,
+                )
+                .await
+            {
+                Ok(success) => {
+                    return self
+                        .committed_create(&attachment, success.receipt, mode, receiving)
+                        .await;
+                }
                 Err(RunFailure::Operation(error) | RunFailure::RetryExhausted(error))
-                    if error.kind() == StateStoreErrorKind::PreconditionFailed =>
+                    if store_kind(&error) == Some(StateStoreErrorKind::PreconditionFailed) =>
                 {
                     return Err(CatalogAttachmentError::new(
                         CatalogAttachmentErrorKind::AlreadyExists,
                         "catalog attachment already exists",
-                    ));
+                    )
+                    .with_source(error));
                 }
                 Err(RunFailure::CommitUnknown { observation, error }) => {
-                    match observation.outcome().await.map_err(store)? {
-                        AttemptOutcome::Committed(_) => {
-                            return self.committed_create(&attachment).await;
+                    if let Some(receiving) = receiving {
+                        receiving
+                            .record_unknown(&observation, &error)
+                            .map_err(receiving_error)?;
+                    }
+                    let outcome = match mode.outcome(&observation).await {
+                        Ok(outcome) => outcome,
+                        Err(failure) => {
+                            return Err(store_source(failure).with_unknown(observation, error));
+                        }
+                    };
+                    match outcome {
+                        AttemptOutcome::Committed(receipt) => {
+                            return self
+                                .committed_create(&attachment, receipt, mode, receiving)
+                                .await;
                         }
                         AttemptOutcome::NotCommitted => {
+                            if let Some(receiving) = receiving {
+                                receiving
+                                    .record_not_committed(&observation)
+                                    .map_err(receiving_error)?;
+                            }
                             if replays >= MAX_PROVEN_UNCOMMITTED_REPLAYS {
-                                return Err(CatalogAttachmentError::new(
-                                    // Proven not to have landed, so this is an
-                                    // availability answer, not an unknown one.
-                                    CatalogAttachmentErrorKind::Unavailable,
-                                    format!(
-                                        "create catalog attachment kept losing its commit \
-                                         response and is proven not to have committed: {error}"
-                                    ),
-                                ));
+                                return Err(CatalogAttachmentError::new(CatalogAttachmentErrorKind::Unavailable,
+                                    format!("create catalog attachment kept losing its commit response and is proven not to have committed: {error}"))
+                                    .with_source(error));
                             }
                             replays += 1;
                             continue;
                         }
-                        AttemptOutcome::Unresolved => error,
+                        AttemptOutcome::Unresolved => (observation, error),
                     }
                 }
                 Err(error) => return Err(run_failure("create catalog attachment", error)),
             };
-            // Nothing can be proven about the attempt, so the authoritative
-            // record is the last word. Our exact identity being there means the
-            // write did land: nobody else could have minted it.
-            return match self.matching(&attachment).await? {
-                Some(found) => {
+            // Read the authoritative record under the same original Context.
+            // A failed read keeps the exact unresolved observation for its owner.
+            return match self.matching(&attachment, mode).await {
+                Ok(Some(found)) => {
+                    if let Some(receiving) = receiving {
+                        receiving.confirm_created(&found).map_err(receiving_error)?;
+                    }
                     self.wakeup.publish();
                     Ok(found)
                 }
-                None => Err(CatalogAttachmentError::new(
+                Ok(None) => Err(CatalogAttachmentError::new(
                     CatalogAttachmentErrorKind::CommitUnknown,
                     format!("create catalog attachment commit outcome is unknown: {unresolved}"),
-                )),
+                )
+                .with_source(unresolved.clone())
+                .with_unknown(observation, unresolved)),
+                Err(failure) => Err(failure.with_unknown(observation, unresolved)),
             };
         }
     }
@@ -322,82 +705,136 @@ impl CatalogAttachmentRepository {
         &self,
         expected: CatalogAttachmentVersioned,
     ) -> Result<(), CatalogAttachmentError> {
+        self.drop_with(expected, RequestMode::Legacy, None).await
+    }
+    pub async fn drop_exact_in(
+        &self,
+        expected: CatalogAttachmentVersioned,
+        execution: &StateStoreExecutionContext,
+    ) -> Result<(), CatalogAttachmentError> {
+        self.drop_with(expected, RequestMode::Original(execution), None)
+            .await
+    }
+    pub async fn drop_exact_in_receiving(
+        &self,
+        expected: CatalogAttachmentVersioned,
+        execution: &StateStoreExecutionContext,
+        receiving: &crate::CatalogMutationReceipt,
+    ) -> Result<(), CatalogAttachmentError> {
+        self.drop_with(expected, RequestMode::Original(execution), Some(receiving))
+            .await
+    }
+    async fn drop_with(
+        &self,
+        expected: CatalogAttachmentVersioned,
+        mode: RequestMode<'_>,
+        receiving: Option<&crate::CatalogMutationReceipt>,
+    ) -> Result<(), CatalogAttachmentError> {
+        if let Some(receiving) = receiving {
+            receiving.begin_drop(&expected).map_err(receiving_error)?;
+        }
         let key = attachment_key(&expected.attachment.instance_id).map_err(invalid)?;
+        let mutation = Mutation::Drop {
+            key,
+            version: expected.version.clone(),
+        };
         let mut replays = 0_usize;
         loop {
-            let outcome = run_side_effect_free(
-                self.store.as_ref(),
-                self.metrics.as_ref(),
-                self.policy,
-                "drop catalog attachment",
-                |transaction| {
-                    let key = key.clone();
-                    let version = expected.version.clone();
-                    Box::pin(async move {
-                        transaction
-                            .delete(key, Precondition::Version(version))
-                            .await?;
-                        Ok(())
-                    })
-                },
-            )
-            .await;
-            let unresolved = match outcome {
-                Ok(_) => {
+            let (observation, unresolved) = match mode
+                .write(self, "drop catalog attachment", mutation.clone(), receiving)
+                .await
+            {
+                Ok(success) => {
+                    if let Some(receiving) = receiving {
+                        receiving
+                            .record_committed(&success.receipt)
+                            .map_err(receiving_error)?;
+                        receiving
+                            .confirm_deleted(&expected)
+                            .map_err(receiving_error)?;
+                    }
                     self.wakeup.publish();
                     return Ok(());
                 }
                 Err(RunFailure::Operation(error) | RunFailure::RetryExhausted(error))
                     if matches!(
-                        error.kind(),
-                        StateStoreErrorKind::PreconditionFailed | StateStoreErrorKind::Conflict
+                        store_kind(&error),
+                        Some(
+                            StateStoreErrorKind::PreconditionFailed | StateStoreErrorKind::Conflict
+                        )
                     ) =>
                 {
                     return Err(CatalogAttachmentError::new(
                         CatalogAttachmentErrorKind::Conflict,
                         "catalog attachment changed before drop",
-                    ));
+                    )
+                    .with_source(error));
                 }
                 Err(RunFailure::CommitUnknown { observation, error }) => {
-                    match observation.outcome().await.map_err(store)? {
-                        AttemptOutcome::Committed(_) => {
+                    if let Some(receiving) = receiving {
+                        receiving
+                            .record_unknown(&observation, &error)
+                            .map_err(receiving_error)?;
+                    }
+                    let outcome = match mode.outcome(&observation).await {
+                        Ok(outcome) => outcome,
+                        Err(failure) => {
+                            return Err(store_source(failure).with_unknown(observation, error));
+                        }
+                    };
+                    match outcome {
+                        AttemptOutcome::Committed(receipt) => {
+                            if let Some(receiving) = receiving {
+                                receiving
+                                    .record_committed(&receipt)
+                                    .map_err(receiving_error)?;
+                                receiving
+                                    .confirm_deleted(&expected)
+                                    .map_err(receiving_error)?;
+                            }
                             self.wakeup.publish();
                             return Ok(());
                         }
                         AttemptOutcome::NotCommitted => {
+                            if let Some(receiving) = receiving {
+                                receiving
+                                    .record_not_committed(&observation)
+                                    .map_err(receiving_error)?;
+                            }
                             if replays >= MAX_PROVEN_UNCOMMITTED_REPLAYS {
-                                return Err(CatalogAttachmentError::new(
-                                    CatalogAttachmentErrorKind::Unavailable,
-                                    format!(
-                                        "drop catalog attachment kept losing its commit response \
-                                         and is proven not to have committed: {error}"
-                                    ),
-                                ));
+                                return Err(CatalogAttachmentError::new(CatalogAttachmentErrorKind::Unavailable,
+                                    format!("drop catalog attachment kept losing its commit response and is proven not to have committed: {error}"))
+                                    .with_source(error));
                             }
                             replays += 1;
                             continue;
                         }
-                        AttemptOutcome::Unresolved => error,
+                        AttemptOutcome::Unresolved => (observation, error),
                     }
                 }
                 Err(error) => return Err(run_failure("drop catalog attachment", error)),
             };
-            // Undecidable: fall back on the authoritative record. The exact
-            // identity still being present is the only reading under which the
-            // delete demonstrably did not happen.
-            return match self.get(&expected.attachment.instance_id).await? {
-                Some(current)
+            return match self.get_with(&expected.attachment.instance_id, mode).await {
+                Ok(Some(current))
                     if current.attachment.attachment_id == expected.attachment.attachment_id =>
                 {
                     Err(CatalogAttachmentError::new(
                         CatalogAttachmentErrorKind::CommitUnknown,
                         format!("drop catalog attachment commit outcome is unknown: {unresolved}"),
-                    ))
+                    )
+                    .with_source(unresolved.clone())
+                    .with_unknown(observation, unresolved))
                 }
-                _ => {
+                Ok(_) => {
+                    if let Some(receiving) = receiving {
+                        receiving
+                            .confirm_deleted(&expected)
+                            .map_err(receiving_error)?;
+                    }
                     self.wakeup.publish();
                     Ok(())
                 }
+                Err(failure) => Err(failure.with_unknown(observation, unresolved)),
             };
         }
     }
@@ -430,28 +867,64 @@ impl CatalogAttachmentRepository {
         instance_id: &ConnectorInstanceId,
         page_size: usize,
     ) -> Result<(), CatalogAttachmentError> {
-        match reader
-            .observe_references(self.store.as_ref(), instance_id, page_size)
+        self.observe_references_with(reader, instance_id, page_size, RequestMode::Legacy)
             .await
-        {
+    }
+    pub async fn observe_references_before_drop_in(
+        &self,
+        reader: &dyn CatalogReferenceReader,
+        instance_id: &ConnectorInstanceId,
+        page_size: usize,
+        execution: &StateStoreExecutionContext,
+    ) -> Result<(), CatalogAttachmentError> {
+        self.observe_references_with(
+            reader,
+            instance_id,
+            page_size,
+            RequestMode::Original(execution),
+        )
+        .await
+    }
+    async fn observe_references_with(
+        &self,
+        reader: &dyn CatalogReferenceReader,
+        instance_id: &ConnectorInstanceId,
+        page_size: usize,
+        mode: RequestMode<'_>,
+    ) -> Result<(), CatalogAttachmentError> {
+        let observed = match mode {
+            RequestMode::Legacy => reader
+                .observe_references(self.store.as_ref(), instance_id, page_size)
+                .await
+                .map_err(|error| {
+                    CatalogAttachmentError::new(CatalogAttachmentErrorKind::Unavailable, error)
+                }),
+            RequestMode::Original(execution) => reader
+                .observe_references_in(self.store.as_ref(), instance_id, page_size, execution)
+                .await
+                .map_err(store_source),
+        };
+        match observed {
             Ok(None) => Ok(()),
             Ok(Some(reference_description)) => Err(CatalogAttachmentError::new(
                 CatalogAttachmentErrorKind::Conflict,
                 format!(
-                    "catalog {} still has {reference_description}; \
-                     this is a best-effort operational check, not a cross-system \
-                     serializability guarantee: drop the referencing materialized \
-                     views before dropping the catalog",
-                    instance_id.as_str(),
+                    "catalog {} still has {reference_description}; this is a best-effort operational check, not a cross-system serializability guarantee: drop the referencing materialized views before dropping the catalog",
+                    instance_id.as_str()
                 ),
             )),
+            // Missing the selected original capability is not an unreadable
+            // accelerator. Refuse explicitly instead of hiding a migration gap.
+            Err(error)
+                if error.source_failure().is_some_and(|source| {
+                    source.failure_fact() == StateStoreOriginalUnsupported.failure_fact()
+                }) =>
+            {
+                Err(error)
+            }
             Err(error) => {
-                tracing::warn!(
-                    %error,
-                    catalog = instance_id.as_str(),
-                    "catalog reference check could not read its observation; \
-                     the catalog drop proceeds without an observation",
-                );
+                tracing::warn!(%error, catalog = instance_id.as_str(),
+                    "catalog reference check could not read its observation; the catalog drop proceeds without an observation");
                 Ok(())
             }
         }
@@ -467,8 +940,24 @@ impl CatalogAttachmentRepository {
     async fn committed_create(
         &self,
         attachment: &CatalogAttachment,
+        receipt: CommitReceipt,
+        mode: RequestMode<'_>,
+        receiving: Option<&crate::CatalogMutationReceipt>,
     ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
-        let created = self.require_matching(attachment).await?;
+        if let Some(receiving) = receiving {
+            receiving
+                .record_committed(&receipt)
+                .map_err(receiving_error)?;
+        }
+        let created = self
+            .require_matching(attachment, mode)
+            .await
+            .map_err(|failure| failure.with_committed(receipt))?;
+        if let Some(receiving) = receiving {
+            receiving
+                .confirm_created(&created)
+                .map_err(receiving_error)?;
+        }
         self.wakeup.publish();
         Ok(created)
     }
@@ -476,9 +965,10 @@ impl CatalogAttachmentRepository {
     async fn matching(
         &self,
         expected: &CatalogAttachment,
+        mode: RequestMode<'_>,
     ) -> Result<Option<CatalogAttachmentVersioned>, CatalogAttachmentError> {
         Ok(self
-            .get(&expected.instance_id)
+            .get_with(&expected.instance_id, mode)
             .await?
             .filter(|current| current.attachment.attachment_id == expected.attachment_id))
     }
@@ -486,8 +976,9 @@ impl CatalogAttachmentRepository {
     async fn require_matching(
         &self,
         expected: &CatalogAttachment,
+        mode: RequestMode<'_>,
     ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
-        self.matching(expected).await?.ok_or_else(|| {
+        self.matching(expected, mode).await?.ok_or_else(|| {
             CatalogAttachmentError::new(
                 CatalogAttachmentErrorKind::CommitUnknown,
                 "catalog attachment commit resolved but authoritative record does not match",
@@ -654,6 +1145,11 @@ fn stored_binding_from(binding: &CatalogCredentialBinding) -> StoredCredentialBi
             Some(reference.generation().to_string()),
         ),
         CatalogCredentialMode::Vended => ("vended", None, None),
+        CatalogCredentialMode::NodeLocal(reference) => (
+            "node-local",
+            Some(reference.name().to_string()),
+            Some(reference.generation().to_string()),
+        ),
     };
     StoredCredentialBinding {
         purpose: match binding.purpose() {
@@ -705,6 +1201,19 @@ fn binding_from_stored(
                     .map_err(|error| corruption(error.to_string()))?,
             )
         }
+        "node-local" => {
+            let name = stored
+                .name
+                .as_deref()
+                .ok_or_else(|| corruption("node-local catalog credential binding requires name"))?;
+            let generation = stored.generation.as_deref().ok_or_else(|| {
+                corruption("node-local catalog credential binding requires generation")
+            })?;
+            CatalogCredentialMode::NodeLocal(
+                NodeLocalCredentialReference::try_new(name, generation)
+                    .map_err(|error| corruption(error.to_string()))?,
+            )
+        }
         "vended" => {
             if stored.name.is_some() || stored.generation.is_some() {
                 return Err(corruption(
@@ -741,23 +1250,47 @@ fn durable_record(error: DurableRecordError) -> CatalogAttachmentError {
 }
 
 fn store(error: StateStoreError) -> CatalogAttachmentError {
-    CatalogAttachmentError::new(CatalogAttachmentErrorKind::Unavailable, error.to_string())
+    store_source(error.into_original_failure())
 }
-
-fn run_failure(context: &str, failure: RunFailure) -> CatalogAttachmentError {
-    let (kind, message) = match failure {
-        RunFailure::Operation(error) if error.kind() == StateStoreErrorKind::PreconditionFailed => {
-            (CatalogAttachmentErrorKind::Conflict, error.to_string())
+fn store_source(error: SharedFailureCause) -> CatalogAttachmentError {
+    CatalogAttachmentError::new(CatalogAttachmentErrorKind::Unavailable, error.to_string())
+        .with_source(error)
+}
+fn run_failure(context: &str, failure: RunFailure<SharedFailureCause>) -> CatalogAttachmentError {
+    match failure {
+        RunFailure::CommitUnknown { observation, error } => CatalogAttachmentError::new(
+            CatalogAttachmentErrorKind::CommitUnknown,
+            format!("{context}: {error}"),
+        )
+        .with_source(error.clone())
+        .with_unknown(observation, error),
+        RunFailure::Operation(error)
+            if store_kind(&error) == Some(StateStoreErrorKind::PreconditionFailed) =>
+        {
+            CatalogAttachmentError::new(
+                CatalogAttachmentErrorKind::Conflict,
+                format!("{context}: {error}"),
+            )
+            .with_source(error)
         }
-        RunFailure::CommitUnknown { error, .. } => {
-            (CatalogAttachmentErrorKind::CommitUnknown, error.to_string())
+        failure => {
+            let message = format!("{context}: {failure:?}");
+            let source = match failure {
+                RunFailure::Begin(error)
+                | RunFailure::Operation(error)
+                | RunFailure::RetryExhausted(error)
+                | RunFailure::DefiniteFailure(error) => error,
+                RunFailure::DeadlineExceeded => StateStoreError::new(
+                    StateStoreErrorKind::DeadlineExceeded,
+                    "catalog attachment operation deadline exceeded",
+                )
+                .into_original_failure(),
+                RunFailure::CommitUnknown { .. } => unreachable!("handled above"),
+            };
+            CatalogAttachmentError::new(CatalogAttachmentErrorKind::Unavailable, message)
+                .with_source(source)
         }
-        error => (
-            CatalogAttachmentErrorKind::Unavailable,
-            format!("{error:?}"),
-        ),
-    };
-    CatalogAttachmentError::new(kind, format!("{context}: {message}"))
+    }
 }
 
 #[cfg(test)]
@@ -772,6 +1305,26 @@ mod tests {
     use novarocks_state_store_testkit::testing::InMemoryStateStore;
 
     use super::*;
+
+    #[test]
+    fn node_local_source_reference_survives_attachment_storage() {
+        let binding = CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::ObjectStoreData,
+            CredentialConsumerRole::Backend,
+            CatalogCredentialMode::NodeLocal(
+                NodeLocalCredentialReference::try_new("worker-source", "blue").unwrap(),
+            ),
+        )
+        .unwrap();
+        let stored = stored_binding_from(&binding);
+        assert_eq!(stored.mode, "node-local");
+        assert_eq!(stored.name.as_deref(), Some("worker-source"));
+        assert_eq!(stored.generation.as_deref(), Some("blue"));
+        assert_eq!(binding_from_stored(stored).unwrap(), binding);
+        let mut invalid = stored_binding_from(&binding);
+        invalid.purpose = "data-credential-vending".into();
+        assert!(binding_from_stored(invalid).is_err());
+    }
 
     /// Test-only composition adapter. Product provider construction remains
     /// outside Catalog; these tests need only a contract-conforming store with
@@ -1405,5 +1958,24 @@ mod tests {
         host.shutdown(Instant::now() + Duration::from_secs(5))
             .await
             .expect("shutdown SQLite StateStore");
+    }
+}
+
+#[cfg(test)]
+#[path = "repository/original_tests.rs"]
+mod original_tests;
+
+fn receiving_error(error: crate::CatalogApplicationError) -> CatalogAttachmentError {
+    CatalogAttachmentError::new(
+        CatalogAttachmentErrorKind::Conflict,
+        "catalog stable mutation receiving refused",
+    )
+    .with_source(SharedFailureCause::new(error))
+}
+
+#[cfg(test)]
+impl CatalogAttachmentRepository {
+    pub(crate) fn original_read_fixture() -> original_tests::OriginalReadFixture {
+        original_tests::read_fixture()
     }
 }

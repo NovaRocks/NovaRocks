@@ -189,7 +189,10 @@ fn matrices() -> [(ArrayRef, ArrayRef); 3] {
 fn pool(array: &ArrayRef, source: FunctionValueType) -> ConstantPool {
     ConstantPool::try_new(
         Arc::new(source.try_to_field("original").unwrap().with_metadata(
-            [("source-note".into(), "selected date-only difference".into())].into(),
+            std::collections::HashMap::<String, String>::from([(
+                "source-note".into(),
+                "selected date-only difference".into(),
+            )]),
         )),
         source,
         array.to_data(),

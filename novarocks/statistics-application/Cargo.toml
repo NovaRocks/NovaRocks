@@ -27,12 +27,16 @@ workspace = true
 [features]
 
 [dependencies]
+novarocks-failure-contract.workspace = true
 novarocks-failpoint = { workspace = true }
 novarocks-type-contract.workspace = true
 novarocks-query-application.workspace = true
 novarocks-workload-control.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 uuid.workspace = true
+
+[dev-dependencies]
+novarocks-resource-contract.workspace = true
 
 [package.metadata.novarocks.test]
 runtime-inputs = []

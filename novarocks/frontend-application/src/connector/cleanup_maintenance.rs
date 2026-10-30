@@ -55,6 +55,10 @@ pub struct CleanupMaintenanceSession {
 }
 
 impl CleanupMaintenanceSession {
+    pub(crate) fn require_scanned_object_gc(&self) -> Result<(), ConnectorError> {
+        self.lease.scan_gc_safety().require_scanned_object_gc()
+    }
+
     /// Acquire one current cleanup capability, strictly load the table on that
     /// lease, and freeze its one provider plan. This is the sole planning path.
     pub fn plan(

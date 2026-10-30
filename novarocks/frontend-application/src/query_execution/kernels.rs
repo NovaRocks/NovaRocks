@@ -28,8 +28,6 @@ use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::package_freeze::CompiledPackageCarrier;
-use crate::query_execution::service::QueryExecutionService;
-use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_query_application::api::BackendTopologyService;
@@ -55,7 +53,6 @@ pub struct QueryPreparationKernel {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<ConnectorControlHost>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
-    query_execution: QueryExecutionService,
     backend_topology: BackendTopologyService,
 }
 
@@ -100,10 +97,6 @@ impl SystemTableQueryKernel {
 }
 
 impl QueryPreparationKernel {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "This kernel constructor binds distinct query, connector, and execution owners; a second configuration aggregate would duplicate the validated kernel contract."
-    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -111,7 +104,6 @@ impl QueryPreparationKernel {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<ConnectorControlHost>,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
-        query_execution: QueryExecutionService,
         backend_topology: BackendTopologyService,
         _exchange_port: u16,
         constant_policy: novarocks_functions::ConstantPolicy,
@@ -126,7 +118,6 @@ impl QueryPreparationKernel {
             connector_control,
             typed_connector_control,
             unified_statistics,
-            query_execution,
             backend_topology,
         }
     }
@@ -166,10 +157,6 @@ impl QueryPreparationKernel {
         &self.unified_statistics
     }
 
-    pub(crate) fn query_execution(&self) -> &QueryExecutionService {
-        &self.query_execution
-    }
-
     #[allow(
         dead_code,
         reason = "Retained for query-preparation callers that require the admitted topology service."
@@ -195,10 +182,13 @@ pub struct DmlExecutionKernel {
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-    query_execution: QueryExecutionService,
     connector_runtime: Option<tokio::runtime::Handle>,
     lake_publication_runtime_policy:
         Option<novarocks_query_application::publication::LakePublicationRuntimePolicy>,
+    write_runtime: Option<(
+        crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        crate::native::data_runtime::FrontendDataRuntime,
+    )>,
 }
 
 /// Immutable SQL planning authorities shared by every DML statement.
@@ -235,7 +225,6 @@ impl DmlExecutionKernel {
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-        query_execution: QueryExecutionService,
     ) -> Self {
         let DmlPlanningServices {
             functions,
@@ -254,10 +243,51 @@ impl DmlExecutionKernel {
             unified_statistics,
             mv_storage_observation,
             mv_readiness,
-            query_execution,
             connector_runtime: None,
+            write_runtime: None,
             lake_publication_runtime_policy: None,
         }
+    }
+
+    /// Original role-owned handles, installed before any INSERT action.
+    pub(crate) fn with_write_runtime(
+        mut self,
+        blocking: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        data: crate::native::data_runtime::FrontendDataRuntime,
+    ) -> Self {
+        self.write_runtime = Some((blocking, data));
+        self
+    }
+
+    pub(crate) fn write_runtime(
+        &self,
+    ) -> Result<
+        &(
+            crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+            crate::native::data_runtime::FrontendDataRuntime,
+        ),
+        String,
+    > {
+        self.write_runtime
+            .as_ref()
+            .ok_or_else(|| "INSERT original execution handles are not installed".to_owned())
+    }
+
+    pub(crate) fn completion_fact_owners(
+        &self,
+    ) -> Result<crate::query_execution::completion_facts::CompletionFactOwners, String> {
+        let (blocking, _) = self.write_runtime()?;
+        Ok(
+            crate::query_execution::completion_facts::CompletionFactOwners::new(
+                Arc::clone(&self.catalog_service),
+                self.catalog_application.clone(),
+                Arc::clone(&self.typed_connector_control),
+                Arc::clone(&self.unified_statistics),
+                self.mv_readiness.candidate_reader().clone(),
+                Arc::clone(&self.mv_storage_observation),
+                blocking.clone(),
+            ),
+        )
     }
 
     pub(crate) fn with_connector_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
@@ -332,10 +362,6 @@ impl DmlExecutionKernel {
         &self.mv_readiness
     }
 
-    pub(crate) fn query_execution(&self) -> &QueryExecutionService {
-        &self.query_execution
-    }
-
     pub(crate) fn lake_publication_runtime_policy(
         &self,
     ) -> Option<novarocks_query_application::publication::LakePublicationRuntimePolicy> {
@@ -400,6 +426,8 @@ impl ViewExecutionKernel {
 /// Table-maintenance command dependencies.
 #[derive(Clone)]
 pub struct MaintenanceExecutionKernel {
+    state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
+    rewrite_runtime: Option<MaintenanceRewriteRuntime>,
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     static_plan_carrier: CompiledPackageCarrier,
@@ -409,15 +437,24 @@ pub struct MaintenanceExecutionKernel {
     typed_connector_control: Arc<ConnectorControlHost>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-    query_execution: QueryExecutionService,
     service: Arc<dyn TableMaintenanceService>,
 }
 
+/// The exact existing host leaves used by one maintenance Action. This owns
+/// neither a new Root nor a runtime, and exposes no caller-selected CPU work.
+#[derive(Clone)]
+pub(crate) struct MaintenanceRewriteRuntime {
+    pub(crate) client: novarocks_query_application::api::QueryExecutionClient,
+    pub(crate) launcher:
+        Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
+    pub(crate) completion: crate::query_execution::completion_facts::CompletionFactOwners,
+    pub(crate) execution: (
+        crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        crate::native::data_runtime::FrontendDataRuntime,
+    ),
+}
+
 impl MaintenanceExecutionKernel {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "This kernel constructor binds distinct query, connector, and execution owners; a second configuration aggregate would duplicate the validated kernel contract."
-    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -426,12 +463,13 @@ impl MaintenanceExecutionKernel {
         typed_connector_control: Arc<ConnectorControlHost>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-        query_execution: QueryExecutionService,
         service: Arc<dyn TableMaintenanceService>,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
         Self {
+            state_store: None,
+            rewrite_runtime: None,
             constant_policy,
             functions,
             static_plan_carrier,
@@ -441,9 +479,38 @@ impl MaintenanceExecutionKernel {
             typed_connector_control,
             mv_storage_observation,
             mv_readiness,
-            query_execution,
             service,
         }
+    }
+
+    pub(crate) fn with_state_store_original(
+        mut self,
+        binding: Option<crate::state_store::execution::StateStoreOriginalBinding>,
+    ) -> Self {
+        self.state_store = binding;
+        self
+    }
+    pub(crate) fn state_store_original(
+        &self,
+    ) -> Result<
+        &crate::state_store::execution::StateStoreOriginalBinding,
+        novarocks_state_store_api::StateStoreOriginalUnsupported,
+    > {
+        self.state_store
+            .as_ref()
+            .ok_or(novarocks_state_store_api::StateStoreOriginalUnsupported)
+    }
+
+    pub(crate) fn with_rewrite_runtime(mut self, original: MaintenanceRewriteRuntime) -> Self {
+        self.rewrite_runtime = Some(original);
+        self
+    }
+    pub(crate) fn rewrite_runtime(
+        &self,
+    ) -> Result<&MaintenanceRewriteRuntime, novarocks_workload_control::WorkError> {
+        self.rewrite_runtime
+            .as_ref()
+            .ok_or(novarocks_workload_control::WorkError::NotReady)
     }
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
@@ -478,10 +545,6 @@ impl MaintenanceExecutionKernel {
 
     pub(crate) fn mv_readiness(&self) -> &Arc<MvReadinessPort> {
         &self.mv_readiness
-    }
-
-    pub(crate) fn query_execution(&self) -> &QueryExecutionService {
-        &self.query_execution
     }
 
     pub(crate) fn service(&self) -> &Arc<dyn TableMaintenanceService> {
@@ -519,7 +582,6 @@ pub struct SessionCatalogResolver {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    connector_blocking_io: ConnectorBlockingIoSupervisor,
 }
 
 impl SessionCatalogResolver {
@@ -527,13 +589,11 @@ impl SessionCatalogResolver {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        connector_blocking_io: ConnectorBlockingIoSupervisor,
     ) -> Self {
         Self {
             catalog_service,
             catalog_application,
             connector_control,
-            connector_blocking_io,
         }
     }
 }
@@ -586,41 +646,24 @@ impl SessionCatalogPort for SessionCatalogResolver {
     async fn external_namespace_exists(
         &self,
         request: novarocks_spi::connector::ConnectorRequestContext,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        _capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
         catalog_name: &str,
         namespace_name: &str,
     ) -> Result<bool, QueryServiceError> {
-        let connector_control = Arc::clone(&self.connector_control);
-        let catalog_name = catalog_name.to_owned();
-        let namespace_name = namespace_name.to_owned();
-        self.connector_blocking_io
-            .spawn_admitted(capacity.scope(), &capacity.window_alias(), move || {
-                crate::connector::validate_request_context(&request)?;
-                crate::connector::metadata_namespace_exists(
-                    connector_control.as_ref(),
-                    request,
-                    &catalog_name,
-                    &namespace_name,
-                )
-            })
-            .map_err(|error| {
-                QueryServiceError::new(QueryServiceErrorKind::Unavailable, error.to_string())
-            })?
-            .finish()
-            .await
-            .map_err(|error| {
-                QueryServiceError::new(
-                    QueryServiceErrorKind::Internal,
-                    self.connector_blocking_io.present_and_retire_failure(error),
-                )
-            })?
-            .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::Internal, error))
+        crate::connector::metadata_namespace_exists_async(
+            self.connector_control.as_ref(),
+            request,
+            catalog_name,
+            namespace_name,
+        )
+        .await
+        .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::Internal, error))
     }
 }
 
 #[cfg(test)]
 mod session_catalog_tests {
-    use std::sync::{Arc, mpsc};
+    use std::sync::Arc;
 
     use novarocks_query_application::session_error::QueryServiceErrorKind;
     use novarocks_query_application::sql::catalog::SessionCatalogPort;
@@ -633,9 +676,6 @@ mod session_catalog_tests {
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
-            crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
-                tokio::runtime::Handle::current(),
-            ),
         )
     }
 
@@ -662,19 +702,10 @@ mod session_catalog_tests {
 
     #[tokio::test]
     async fn cancelled_external_namespace_lookup_stops_before_provider_call() {
-        let supervisor = crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
-            tokio::runtime::Handle::current(),
-        );
-        let (release, released) = mpsc::channel();
-        let held = supervisor.spawn_ordinary(move || {
-            released.recv().expect("release held call");
-        });
-
         let resolver = SessionCatalogResolver::new(
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
-            supervisor,
         );
         let cancellation = novarocks_spi::connector::ConnectorStopOwner::new();
         let request = crate::connector::connector_request_context(None, cancellation.view())
@@ -690,8 +721,6 @@ mod session_catalog_tests {
             .external_namespace_exists(request, &capacity, "warehouse", "analytics")
             .await
             .expect_err("cancelled request must not reach the provider");
-        release.send(()).expect("release held call");
-        held.finish().await.expect("held call completes");
         drop(capacity);
         root.owner.complete();
         root.business.release();

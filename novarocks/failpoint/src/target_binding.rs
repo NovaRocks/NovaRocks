@@ -26,6 +26,66 @@ use std::io::{self, Write};
 use std::path::Path;
 
 const MAX_BINDING_BYTES: usize = 4096;
+
+// Both typed writers validate and serialize their own envelope before this I/O.
+fn publish_private_record(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // Publish complete bytes without replacing an existing immutable record.
+    // A reader may observe the canonical path while this publisher is writing.
+    static NEXT_STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let staging = path.with_extension(format!(
+        "private-record-{}-{}",
+        std::process::id(),
+        NEXT_STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut file = options.open(&staging)?;
+    let publication = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::hard_link(&staging, path));
+    drop(file);
+    let cleanup = std::fs::remove_file(&staging);
+    publication?;
+    cleanup
+}
+#[cfg(novarocks_dev_controls)]
+fn read_private_record(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_BINDING_BYTES as u64 {
+        return Err(invalid(
+            "exact statement binding must be a bounded private file",
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        if metadata.mode() & 0o077 != 0 {
+            return Err(invalid("exact statement binding is not private"));
+        }
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid("exact statement binding is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BINDING_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BINDING_BYTES {
+        return Err(invalid("exact statement binding exceeds byte bound"));
+    }
+    Ok(bytes)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatementExecutionBinding {
@@ -98,50 +158,73 @@ impl StatementExecutionBinding {
         if bytes.len() > MAX_BINDING_BYTES {
             return Err(invalid("exact statement binding exceeds byte bound"));
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()
+        publish_private_record(path, &bytes)
     }
     #[cfg(novarocks_dev_controls)]
     pub fn read_private(path: &Path) -> io::Result<Self> {
-        use std::io::Read;
-        let metadata = std::fs::symlink_metadata(path)?;
-        if !metadata.is_file() || metadata.len() > MAX_BINDING_BYTES as u64 {
-            return Err(invalid(
-                "exact statement binding must be a bounded private file",
-            ));
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-            if metadata.mode() & 0o077 != 0 {
-                return Err(invalid("exact statement binding is not private"));
-            }
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let file = options.open(path)?;
-        if !file.metadata()?.is_file() {
-            return Err(invalid("exact statement binding is not a regular file"));
-        }
-        let mut bytes = Vec::new();
-        file.take(MAX_BINDING_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > MAX_BINDING_BYTES {
-            return Err(invalid("exact statement binding exceeds byte bound"));
-        }
+        let bytes = read_private_record(path)?;
         let binding: Self = serde_json::from_slice(&bytes)
             .map_err(|_| invalid("invalid exact statement binding"))?;
         binding.validate()?;
         Ok(binding)
+    }
+}
+
+/// Narrowing evidence from the FE's original frozen writer manifest.
+/// This record grants no action; the role must still claim its exact grant.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatementTaskBinding {
+    pub statement: StatementExecutionBinding,
+    pub stage_id: u32,
+    pub task_id: u32,
+    pub remote_destination_process_id: String,
+}
+impl StatementTaskBinding {
+    pub fn new(
+        statement: StatementExecutionBinding,
+        stage: novarocks_types::StageId,
+        task: novarocks_types::TaskId,
+        remote_destination: BackendProcessId,
+    ) -> io::Result<Self> {
+        let selected = Self {
+            statement,
+            stage_id: stage.get(),
+            task_id: task.get(),
+            remote_destination_process_id: remote_destination.to_string(),
+        };
+        selected.validate()?;
+        Ok(selected)
+    }
+    fn validate(&self) -> io::Result<()> {
+        self.statement.validate()?;
+        novarocks_types::StageId::new(self.stage_id)
+            .map_err(|_| invalid("invalid selected stage"))?;
+        novarocks_types::TaskId::new(self.task_id).map_err(|_| invalid("invalid selected task"))?;
+        let destination: BackendProcessId = self
+            .remote_destination_process_id
+            .parse()
+            .map_err(|_| invalid("invalid selected remote destination"))?;
+        if destination == self.statement.process()? {
+            return Err(invalid("selected writer destination is not remote"));
+        }
+        Ok(())
+    }
+    pub fn write_private(&self, path: &Path) -> io::Result<()> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|_| invalid("encode exact Task binding"))?;
+        if bytes.len() > MAX_BINDING_BYTES {
+            return Err(invalid("exact Task binding exceeds byte bound"));
+        }
+        publish_private_record(path, &bytes)
+    }
+    #[cfg(novarocks_dev_controls)]
+    pub fn read_private(path: &Path) -> io::Result<Self> {
+        let bytes = read_private_record(path)?;
+        let selected: Self =
+            serde_json::from_slice(&bytes).map_err(|_| invalid("invalid exact Task binding"))?;
+        selected.validate()?;
+        Ok(selected)
     }
 }
 
@@ -193,6 +276,124 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn concurrent_publication_is_complete_private_and_never_clobbers() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::sync::Barrier;
+
+        let root = std::env::temp_dir().join(format!(
+            "g2-target-concurrent-{}",
+            BackendProcessId::new_v7()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let path = root.join("binding.json");
+        let execution =
+            QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(3).unwrap()).unwrap();
+        let first = StatementExecutionBinding::new(
+            "first-session".into(),
+            "first-statement".into(),
+            0,
+            BackendProcessId::new_v7(),
+            execution,
+        )
+        .unwrap();
+        let second = StatementExecutionBinding::new(
+            "second-session".into(),
+            "second-statement".into(),
+            0,
+            BackendProcessId::new_v7(),
+            execution,
+        )
+        .unwrap();
+        assert_eq!(
+            StatementExecutionBinding::read_private(&path)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let start = Barrier::new(3);
+        std::thread::scope(|scope| {
+            let one = scope.spawn(|| {
+                start.wait();
+                first.write_private(&path)
+            });
+            let two = scope.spawn(|| {
+                start.wait();
+                second.write_private(&path)
+            });
+            start.wait();
+            // Observe actual publication; incomplete JSON is never retried.
+            while !one.is_finished() || !two.is_finished() {
+                match StatementExecutionBinding::read_private(&path) {
+                    Ok(binding) => assert!(binding == first || binding == second),
+                    Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+                }
+                std::thread::yield_now();
+            }
+            let outcomes = [one.join().unwrap(), two.join().unwrap()];
+            assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+            let loser = outcomes
+                .iter()
+                .find_map(|result| result.as_ref().err())
+                .unwrap();
+            assert_eq!(loser.kind(), io::ErrorKind::AlreadyExists);
+        });
+        let winner = StatementExecutionBinding::read_private(&path).unwrap();
+        assert!(winner == first || winner == second);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert!(first.write_private(&path).is_err());
+        assert_eq!(
+            StatementExecutionBinding::read_private(&path).unwrap(),
+            winner
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_task_record_is_private_exact_and_requires_a_remote_destination() {
+        let root =
+            std::env::temp_dir().join(format!("g2-selected-task-{}", BackendProcessId::new_v7()));
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let path = root.join("selected.task.json");
+        let process = BackendProcessId::new_v7();
+        let statement = StatementExecutionBinding::new(
+            "selected-session".into(),
+            "selected-statement".into(),
+            2,
+            process,
+            QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(1).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let stage = novarocks_types::StageId::new(3).unwrap();
+        let task = novarocks_types::TaskId::new(4).unwrap();
+        assert!(StatementTaskBinding::new(statement.clone(), stage, task, process).is_err());
+        let selected =
+            StatementTaskBinding::new(statement, stage, task, BackendProcessId::new_v7()).unwrap();
+        selected.write_private(&path).unwrap();
+        assert_eq!(StatementTaskBinding::read_private(&path).unwrap(), selected);
+        assert!(selected.write_private(&path).is_err());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let mut wrong = selected.clone();
+        wrong.task_id = 0;
+        assert!(wrong.write_private(&root.join("invalid.json")).is_err());
+        assert_eq!(StatementTaskBinding::read_private(&path).unwrap(), selected);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn malformed_or_foreign_fields_never_turn_into_a_valid_exact_target() {
         let binding = StatementExecutionBinding::new(
             "session".into(),
@@ -226,7 +427,7 @@ pub struct StatementWorkNomination {
     pub statement_run_token: String,
     pub frontend_process_id: String,
     pub connection_id: u32,
-    pub session_epoch: u64,
+    pub session_key: u64,
     pub statement_generation: u64,
 }
 impl StatementWorkNomination {
@@ -246,7 +447,7 @@ impl StatementWorkNomination {
         if !identifier(&self.target_session_id)
             || !identifier(&self.statement_run_token)
             || self.connection_id == 0
-            || self.session_epoch == 0
+            || self.session_key == 0
             || self.statement_generation == 0
         {
             return Err(invalid("invalid exact statement work nomination"));
@@ -265,7 +466,7 @@ pub struct StatementInputNomination {
     pub statement_run_token: String,
     pub frontend_process_id: String,
     pub connection_id: u32,
-    pub session_epoch: u64,
+    pub session_key: u64,
     pub sql_sha256: [u8; 32],
 }
 impl StatementInputNomination {
@@ -286,7 +487,7 @@ impl StatementInputNomination {
             || !identifier(&self.target_launch_id)
             || !identifier(&self.statement_run_token)
             || self.connection_id == 0
-            || self.session_epoch == 0
+            || self.session_key == 0
         {
             return Err(invalid("invalid exact statement input nomination"));
         }
@@ -302,7 +503,7 @@ impl StatementInputNomination {
             || self.statement_run_token != statement.statement_run_token
             || self.frontend_process_id != statement.frontend_process_id
             || self.connection_id != statement.connection_id
-            || self.session_epoch != statement.session_epoch
+            || self.session_key != statement.session_key
         {
             return Err(invalid(
                 "actual statement does not extend its exact input nomination",
@@ -374,16 +575,7 @@ impl RoleProcessReceipt {
         if bytes.len() > MAX_BINDING_BYTES {
             return Err(invalid("authenticated role receipt exceeds its bound"));
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()
+        publish_private_record(path, &bytes)
     }
     pub fn read_private(path: &Path) -> io::Result<Self> {
         use std::io::Read;
@@ -450,6 +642,34 @@ mod role_receipt_tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn authenticated_role_receipt_publication_never_replaces_the_original() {
+        let root = PrivateRoot::new();
+        let path = root.0.join("process.json");
+        let first = RoleProcessReceipt {
+            schema_version: 1,
+            session_id: "ordinary-runner-session".into(),
+            launch_id: "original-backend-launch".into(),
+            role: SessionRole::Be,
+            process_id: novarocks_types::BackendProcessId::new_v7().to_string(),
+        };
+        let replacement = RoleProcessReceipt {
+            process_id: novarocks_types::BackendProcessId::new_v7().to_string(),
+            ..first.clone()
+        };
+        first.write_private(&path).unwrap();
+        assert_eq!(
+            replacement.write_private(&path).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(RoleProcessReceipt::read_private(&path).unwrap(), first);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 1);
     }
 
     #[test]

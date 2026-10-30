@@ -312,12 +312,12 @@ fn completed_law<T, O: OwnedCopy>(
 }
 
 fn preflight_metadata_validation<O: OwnedCopy>(
-    metadata: &std::collections::HashMap<String, String>,
+    metadata: &arrow_schema::Metadata,
     context: &mut O,
 ) -> Result<(), O::Error> {
-    // Raw iteration covers retained deleted buckets. Its truthful source upper
-    // also bounds the closed logical-label probe and byte comparisons; no
-    // allocation geometry is inferred from this work contribution.
+    // Metadata iteration follows Arrow 60's BTree cursor. Logical-label
+    // probing and byte comparisons retain their separate opaque work quote;
+    // this observation does not grant the source's retained backing.
     context.metadata_iteration(metadata.len(), 1)?;
     context.work(context.add(context.mul(metadata.len(), 128)?, 128)?)
 }
@@ -432,7 +432,53 @@ impl SchemaBudget {
         }
         Ok(())
     }
-    fn metadata(
+    fn metadata(&mut self, metadata: &arrow_schema::Metadata) -> Result<(), ConnectorError> {
+        use novarocks_type_contract::*;
+        if metadata.len() > MAX_ARROW_FIELD_METADATA_ENTRIES {
+            return Err(exhausted());
+        }
+        let mut text = 0usize;
+        for (key, value) in metadata {
+            if key.len() > MAX_ARROW_FIELD_METADATA_KEY_BYTES
+                || value.len() > MAX_ARROW_FIELD_METADATA_VALUE_BYTES
+            {
+                return Err(exhausted());
+            }
+            text = text
+                .checked_add(key.len())
+                .and_then(|n| n.checked_add(value.len()))
+                .ok_or_else(exhausted)?;
+        }
+        if text > MAX_ARROW_FIELD_METADATA_BYTES {
+            return Err(exhausted());
+        }
+        // A conservative collection charge, separate from E02's generated
+        // decode/compile resource model. Owned backing cannot retain source capacity.
+        let backing =
+            novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
+                metadata.len(),
+            )
+            .map_err(|_| exhausted())?;
+        self.add(text.checked_add(backing).ok_or_else(exhausted)?)
+    }
+    fn field(&mut self, field: &Field) -> Result<(), ConnectorError> {
+        if field.name().len() > novarocks_type_contract::MAX_ARROW_FIELD_NAME_BYTES {
+            return Err(exhausted());
+        }
+        self.add(
+            std::mem::size_of::<Field>() + field.name().len() + 4 * std::mem::size_of::<usize>(),
+        )?;
+        self.metadata(field.metadata())
+    }
+    fn metadata_observed<O: OwnedCopy>(
+        &mut self,
+        metadata: &arrow_schema::Metadata,
+        context: &mut O,
+    ) -> Result<(), O::Error> {
+        preflight_metadata_validation(metadata, context)?;
+        completed_law(self.metadata(metadata), context)
+    }
+    fn attributes(
         &mut self,
         metadata: &std::collections::HashMap<String, String>,
     ) -> Result<(), ConnectorError> {
@@ -463,24 +509,7 @@ impl SchemaBudget {
                 * (2 * std::mem::size_of::<String>() + std::mem::size_of::<usize>()),
         )
     }
-    fn field(&mut self, field: &Field) -> Result<(), ConnectorError> {
-        if field.name().len() > novarocks_type_contract::MAX_ARROW_FIELD_NAME_BYTES {
-            return Err(exhausted());
-        }
-        self.add(
-            std::mem::size_of::<Field>() + field.name().len() + 4 * std::mem::size_of::<usize>(),
-        )?;
-        self.metadata(field.metadata())
-    }
-    fn metadata_observed<O: OwnedCopy>(
-        &mut self,
-        metadata: &std::collections::HashMap<String, String>,
-        context: &mut O,
-    ) -> Result<(), O::Error> {
-        preflight_metadata_validation(metadata, context)?;
-        completed_law(self.metadata(metadata), context)
-    }
-    fn metadata_with_bound_observed<O: OwnedCopy>(
+    fn attributes_with_bound_observed<O: OwnedCopy>(
         &mut self,
         metadata: &std::collections::HashMap<String, String>,
         source_work_bound: Option<usize>,
@@ -488,7 +517,7 @@ impl SchemaBudget {
     ) -> Result<(), O::Error> {
         context.metadata_iteration_with_bound(metadata.len(), 1, source_work_bound)?;
         context.work(context.add(context.mul(metadata.len(), 128)?, 128)?)?;
-        completed_law(self.metadata(metadata), context)
+        completed_law(self.attributes(metadata), context)
     }
     fn field_observed<O: OwnedCopy>(
         &mut self,
@@ -697,13 +726,14 @@ pub(crate) mod tests {
             .kind(),
             ConnectorErrorKind::InvalidRequest
         );
-        let child = Field::new("item", DataType::Utf8, true).with_metadata(
-            [(
+        let child =
+            Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
                 "unknown".into(),
-            )]
-            .into(),
-        );
+            )]));
         assert_eq!(
             physical_schema(Schema::new(vec![Field::new(
                 "v",
@@ -720,8 +750,12 @@ pub(crate) mod tests {
     fn aggregate_schema_retention_accepts_exact_limit_and_refuses_one_extra_byte() {
         let mut fields = (0..MAX_CONNECTOR_RECIPE_COLUMNS)
             .map(|index| {
-                Field::new(format!("v{index}"), DataType::Int64, false)
-                    .with_metadata([("k".into(), String::new())].into())
+                Field::new(format!("v{index}"), DataType::Int64, false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "k".into(),
+                        String::new(),
+                    )]),
+                )
             })
             .collect::<Vec<_>>();
         let baseline = physical_schema(Schema::new(fields.clone())).unwrap();
@@ -729,9 +763,13 @@ pub(crate) mod tests {
         for field in &mut fields {
             let value_bytes =
                 remaining.min(novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES);
-            *field = field
-                .clone()
-                .with_metadata([("k".into(), "x".repeat(value_bytes))].into());
+            *field =
+                field
+                    .clone()
+                    .with_metadata(std::collections::HashMap::<String, String>::from([(
+                        "k".into(),
+                        "x".repeat(value_bytes),
+                    )]));
             remaining -= value_bytes;
         }
         assert_eq!(
@@ -744,7 +782,10 @@ pub(crate) mod tests {
         assert!(last.metadata()["k"].is_empty());
         *last = last
             .clone()
-            .with_metadata([("k".into(), "x".into())].into());
+            .with_metadata(std::collections::HashMap::<String, String>::from([(
+                "k".into(),
+                "x".into(),
+            )]));
         assert_eq!(
             physical_schema(Schema::new(fields)).unwrap_err().kind(),
             ConnectorErrorKind::ResourceExhausted
@@ -753,14 +794,24 @@ pub(crate) mod tests {
     #[test]
     fn public_schema_preserves_full_physical_and_explicit_logical_identity() {
         let mut metadata = std::collections::HashMap::with_capacity(10_000);
-        metadata.insert("provider".into(), "value".into());
+        let mut value = String::with_capacity(10_000);
+        value.push_str("value");
+        metadata.insert("provider".into(), value);
         let field = Field::new("json", DataType::Utf8, true).with_metadata(metadata.clone());
         let schema = Schema::new_with_metadata(vec![field], metadata);
         let facts =
             ConnectorReadPublicFacts::try_new(source(), None, schema, vec![ValueLogicalType::Json])
                 .unwrap();
-        assert!(facts.schema().metadata().capacity() < 10);
-        assert!(facts.schema().fields()[0].metadata().capacity() < 10);
+        assert_eq!(facts.schema().metadata().len(), 1);
+        assert_eq!(
+            facts.schema().metadata()["provider"].capacity(),
+            "value".len()
+        );
+        assert_eq!(facts.schema().fields()[0].metadata().len(), 1);
+        assert_eq!(
+            facts.schema().fields()[0].metadata()["provider"].capacity(),
+            "value".len()
+        );
         assert!(
             facts.matches_value_type(
                 0,
@@ -773,13 +824,14 @@ pub(crate) mod tests {
             )
         );
         assert!(!facts.matches_value_type(0, &FunctionValueType::new(DataType::Utf8, true)));
-        let field = Field::new("v", DataType::Utf8, true).with_metadata(
-            [(
+        let field =
+            Field::new("v", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
                 "json".into(),
-            )]
-            .into(),
-        );
+            )]));
         assert!(
             ConnectorReadPublicFacts::try_new(
                 source(),
@@ -817,8 +869,14 @@ pub(crate) mod tests {
             (MAX_ARROW_FIELD_METADATA_VALUE_BYTES, true),
             (MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1, false),
         ] {
-            let field = Field::new("v", DataType::Int64, false)
-                .with_metadata([("key".into(), "x".repeat(value_len))].into());
+            let field =
+                Field::new("v", DataType::Int64, false).with_metadata(std::collections::HashMap::<
+                    String,
+                    String,
+                >::from([(
+                    "key".into(),
+                    "x".repeat(value_len),
+                )]));
             assert_eq!(
                 ConnectorReadPublicFacts::try_new(
                     source(),
@@ -834,7 +892,8 @@ pub(crate) mod tests {
             (MAX_ARROW_FIELD_METADATA_ENTRIES, true),
             (MAX_ARROW_FIELD_METADATA_ENTRIES + 1, false),
         ] {
-            let metadata = (0..count).map(|i| (format!("k{i}"), "v".into())).collect();
+            let metadata: std::collections::HashMap<String, String> =
+                (0..count).map(|i| (format!("k{i}"), "v".into())).collect();
             let field = Field::new("v", DataType::Int64, false).with_metadata(metadata);
             assert_eq!(
                 ConnectorReadPublicFacts::try_new(

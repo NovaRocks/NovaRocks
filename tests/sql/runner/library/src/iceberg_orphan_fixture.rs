@@ -22,14 +22,18 @@
 //! object through OpenDAL. This keeps object-store credentials out of server
 //! state and makes the post-cleanup assertion test the same physical object.
 
-use anyhow::{Context, Result, bail};
-use opendal::Operator;
 use std::env;
+use std::sync::Arc;
+
+use anyhow::{Context, Result, bail};
+use novarocks_fs::{FileCancellation, FileErrorKind, FileIdentity, FsAccessHandle};
+
+use crate::fixture_object_store::FixtureObjectStore;
 
 #[derive(Clone, Debug)]
 pub(crate) struct OrphanFixture {
-    operator: Operator,
-    path: String,
+    access: FsAccessHandle,
+    _storage: Arc<FixtureObjectStore>,
     location: String,
 }
 
@@ -67,29 +71,36 @@ pub(crate) fn install(table: &str) -> Result<OrphanFixture> {
     let (bucket, prefix) = parse_s3_location(&location)?;
     let access_key = required_env("AWS_S3_ACCESS_KEY_ID")?;
     let secret_key = required_env("AWS_S3_SECRET_ACCESS_KEY")?;
-    let operator = Operator::new(
-        opendal::services::S3::default()
-            .endpoint(&endpoint)
-            .bucket(bucket)
-            .region("us-east-1")
-            .access_key_id(&access_key)
-            .secret_access_key(&secret_key),
-    )
-    .context("create MinIO OpenDAL fixture operator")?
-    .finish();
+    let storage = Arc::new(
+        FixtureObjectStore::new(endpoint, access_key, secret_key)
+            .context("create MinIO FS fixture storage")?,
+    );
     let path = format!(
         "{}/data/novarocks-orphan-fixture-{}-{}.bin",
         prefix.trim_end_matches('/'),
         namespace,
         table_name
     );
-    runtime()?
-        .block_on(operator.write(&path, "novarocks orphan fixture\n"))
+    let location = format!("s3://{bucket}/{path}");
+    let access = runtime()?
+        .block_on(async {
+            let cancellation = FileCancellation::new();
+            let access = storage.resolve(&location, &cancellation).await?;
+            storage
+                .overwrite(
+                    &access,
+                    &location,
+                    "novarocks orphan fixture\n",
+                    &cancellation,
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(access)
+        })
         .with_context(|| format!("write MinIO orphan fixture {path}"))?;
     Ok(OrphanFixture {
-        operator,
-        location: format!("s3://{bucket}/{path}"),
-        path,
+        access,
+        _storage: storage,
+        location,
     })
 }
 
@@ -99,9 +110,13 @@ impl OrphanFixture {
     }
 
     pub(crate) fn assert_absent(&self) -> Result<()> {
-        match runtime()?.block_on(self.operator.stat(&self.path)) {
+        let file = self
+            .access
+            .bind_location(&self.location, FileIdentity::new(&self.location, 0, None))?;
+        let cancellation = FileCancellation::new();
+        match runtime()?.block_on(file.stat(&cancellation)) {
             Ok(_) => bail!("orphan fixture object remains at {}", self.location),
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => Ok(()),
+            Err(error) if error.kind() == FileErrorKind::NotFound => Ok(()),
             Err(error) => Err(error).with_context(|| {
                 format!("stat MinIO orphan fixture after cleanup {}", self.location)
             }),

@@ -159,6 +159,17 @@ pub type FileU64Future = Pin<Box<dyn Future<Output = FileResult<u64>> + Send + '
 pub trait FileIoRuntime: Send + Sync {
     fn block_on_bytes(&self, future: FileBytesFuture) -> FileResult<Bytes>;
     fn block_on_u64(&self, future: FileU64Future) -> FileResult<u64>;
+    /// Execute on the same composed runtime as file I/O, without creating a
+    /// process-global or fallback runtime for a node-local credential source.
+    fn block_on_authority_material(
+        &self,
+        _future: futures::future::BoxFuture<
+            'static,
+            Result<crate::AuthorityMaterial, crate::AcquisitionFailure>,
+        >,
+    ) -> Result<crate::AuthorityMaterial, crate::AcquisitionFailure> {
+        Err(crate::AcquisitionFailure::NoRenewalCapability)
+    }
 }
 
 pub trait FileTaskSpawner: Send + Sync {
@@ -266,6 +277,17 @@ impl FileIoRuntime for TokioFileIoRuntime {
 
     fn block_on_u64(&self, future: FileU64Future) -> FileResult<u64> {
         block_on(&self.handle, future)?
+    }
+
+    fn block_on_authority_material(
+        &self,
+        future: futures::future::BoxFuture<
+            'static,
+            Result<crate::AuthorityMaterial, crate::AcquisitionFailure>,
+        >,
+    ) -> Result<crate::AuthorityMaterial, crate::AcquisitionFailure> {
+        block_on(&self.handle, future)
+            .map_err(|error| crate::AcquisitionFailure::Transient(error.to_string()))?
     }
 }
 

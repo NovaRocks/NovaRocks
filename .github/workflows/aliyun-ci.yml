@@ -1,0 +1,197 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Aliyun Rust CI
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Complete repository commit SHA
+        required: true
+        type: string
+      image_id:
+        description: Registered image ID (empty uses ALIYUN_CI_IMAGE_ID)
+        type: string
+      mode:
+        description: Workload
+        type: choice
+        options: [rust, probe]
+        default: rust
+      drill_skip_teardown:
+        description: Probe-only cloud auto-release drill
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: aliyun-ci-worker
+  cancel-in-progress: false
+  queue: max
+jobs:
+  start:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: aliyun-ci
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      instance_id: ${{ steps.start.outputs.instance_id }}
+      label: ${{ steps.start.outputs.label }}
+      deadline: ${{ steps.start.outputs.deadline }}
+      image_id: ${{ steps.start.outputs.image_id }}
+      plan: ${{ steps.start.outputs.plan }}
+      test_timeout_minutes: ${{ steps.start.outputs.test_timeout_minutes }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app
+        with:
+          app-id: ${{ vars.ALIYUN_CI_APP_ID }}
+          private-key: ${{ secrets.ALIYUN_CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - name: Record conservative STS validity bound
+        run: echo "ALIYUN_CI_STS_NOT_AFTER=$(date -u -d '+12 hours' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6 # v1
+        with:
+          role-to-assume: ${{ vars.ALIYUN_CI_ROLE_ARN }}
+          oidc-provider-arn: ${{ vars.ALIYUN_CI_OIDC_PROVIDER_ARN }}
+          audience: sts.aliyuncs.com
+          role-session-expiration: 43200
+      - name: Install locked platform tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/platform"
+          "$RUNNER_TEMP/platform/bin/pip" install --require-hashes -r tools/ci/aliyun_ci/requirements.lock
+      - name: Allocate exact one-run worker
+        id: start
+        working-directory: tools/ci
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          CONFIG_JSON: ${{ vars.ALIYUN_CI_CONFIG_JSON }}
+          SOURCE_SHA: ${{ inputs.sha }}
+          REQUEST_IMAGE_ID: ${{ inputs.image_id }}
+          DEFAULT_IMAGE_ID: ${{ vars.ALIYUN_CI_IMAGE_ID }}
+          MODE: ${{ inputs.mode }}
+          SKIP_TEARDOWN: ${{ inputs.drill_skip_teardown }}
+        run: |
+          if [[ "$SKIP_TEARDOWN" == true && "$MODE" != probe ]]; then
+            echo 'Skipping teardown is allowed only for probe drills.' >&2
+            exit 2
+          fi
+          printf '%s\n' "$CONFIG_JSON" > "$RUNNER_TEMP/config.json"
+          image_id="${REQUEST_IMAGE_ID:-$DEFAULT_IMAGE_ID}"
+          "$RUNNER_TEMP/platform/bin/python" -m aliyun_ci --config "$RUNNER_TEMP/config.json" --output "$RUNNER_TEMP/start.json" start \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --sha "$SOURCE_SHA" --image-id "$image_id" --mode "$MODE"
+  test:
+    needs: start
+    runs-on: ${{ needs.start.outputs.label }}
+    timeout-minutes: ${{ fromJSON(needs.start.outputs.test_timeout_minutes) }}
+    permissions:
+      contents: read
+    outputs:
+      tools_check: ${{ steps.check.outputs.tools_check }}
+    env:
+      ATTEMPT: /var/lib/novarocks-ci/attempt
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - name: Check target SHA tools without repair
+        id: check
+        run: |
+          set +e
+          tools/dev/linux-env.sh check --user runner --tools-only \
+            --profile tools/dev/profiles/aliyun-ubuntu26-amd64-tools.json > "$ATTEMPT/tools-check.json" 2> "$ATTEMPT/tools-check.stderr"
+          code=$?
+          if [[ "$code" == 0 ]]; then echo 'tools_check=true' >> "$GITHUB_OUTPUT"; else echo 'tools_check=false' >> "$GITHUB_OUTPUT"; fi
+          printf '{"exit_code":%s}\n' "$code" > "$ATTEMPT/tools-check-result.json"
+          git rev-parse HEAD > "$ATTEMPT/source-sha"
+          exit "$code"
+      - name: Run complete native Rust batch
+        id: rust
+        if: inputs.mode == 'rust'
+        run: |
+          exec /opt/novarocks-ci/aliyun_ci/instance/run-rust.sh "$ATTEMPT"
+      - name: Run bounded cancellation probe
+        if: inputs.mode == 'probe'
+        run: |
+          exec python3 -c 'import os,pathlib,signal,time; pathlib.Path(os.environ["ATTEMPT"],"batch.pid").write_text(str(os.getpid())+"\n"); signal.signal(signal.SIGINT,lambda *_:exit(130)); signal.signal(signal.SIGTERM,lambda *_:exit(143)); time.sleep(120)'
+      - name: Upload final attempt and diagnostics
+        if: always()
+        working-directory: /opt/novarocks-ci
+        run: |
+          venv/bin/python -m aliyun_ci.handoff pack-upload --attempt "$ATTEMPT" --kind final \
+            --diagnostic runner=/var/lib/novarocks-ci/runner/agent/_diag \
+            --diagnostic bootstrap=/var/log/novarocks-ci/bootstrap.log
+  teardown:
+    if: always() && github.ref == 'refs/heads/main' && !(inputs.mode == 'probe' && inputs.drill_skip_teardown && needs.start.result == 'success')
+    needs: [start, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: aliyun-ci
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app
+        with:
+          app-id: ${{ vars.ALIYUN_CI_APP_ID }}
+          private-key: ${{ secrets.ALIYUN_CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - name: Record conservative STS validity bound
+        run: echo "ALIYUN_CI_STS_NOT_AFTER=$(date -u -d '+12 hours' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6 # v1
+        with:
+          role-to-assume: ${{ vars.ALIYUN_CI_ROLE_ARN }}
+          oidc-provider-arn: ${{ vars.ALIYUN_CI_OIDC_PROVIDER_ARN }}
+          audience: sts.aliyuncs.com
+          role-session-expiration: 43200
+      - name: Release compute and verify durable handoff
+        working-directory: tools/ci
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          CONFIG_JSON: ${{ vars.ALIYUN_CI_CONFIG_JSON }}
+          START_PLAN: ${{ needs.start.outputs.plan }}
+          TOOLS_CHECK: ${{ needs.test.outputs.tools_check }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/platform"
+          "$RUNNER_TEMP/platform/bin/pip" install --require-hashes -r aliyun_ci/requirements.lock
+          printf '%s\n' "$CONFIG_JSON" > "$RUNNER_TEMP/config.json"
+          args=()
+          if [[ -n "$START_PLAN" ]]; then
+            printf '%s\n' "$START_PLAN" > "$RUNNER_TEMP/plan.json"
+            args+=(--plan "$RUNNER_TEMP/plan.json")
+          fi
+          if [[ -n "$TOOLS_CHECK" ]]; then args+=(--tools-check "$TOOLS_CHECK"); fi
+          "$RUNNER_TEMP/platform/bin/python" -m aliyun_ci --config "$RUNNER_TEMP/config.json" --output "$RUNNER_TEMP/summary.json" teardown \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" "${args[@]}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: aliyun-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/summary.json
+          if-no-files-found: warn
+          retention-days: 90

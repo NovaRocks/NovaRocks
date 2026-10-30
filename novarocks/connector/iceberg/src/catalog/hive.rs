@@ -37,6 +37,8 @@ use super::{CatalogNamespaceName, CatalogTableName, NovaRocksCatalog};
 #[derive(Debug)]
 pub(super) struct NovaRocksHiveCatalog {
     delegate: CatalogDelegate,
+    client: Arc<crate::iceberg_catalog_hms::HmsCatalog>,
+    selected: novarocks_spi::connector::ThriftServiceOrigin,
 }
 
 impl NovaRocksHiveCatalog {
@@ -65,9 +67,14 @@ impl NovaRocksHiveCatalog {
     }
 
     /// Wrap a client the generation already built.
-    pub(super) fn adopt(client: Arc<dyn crate::iceberg::Catalog>) -> Self {
+    pub(super) fn adopt(
+        client: Arc<crate::iceberg_catalog_hms::HmsCatalog>,
+        selected: novarocks_spi::connector::ThriftServiceOrigin,
+    ) -> Self {
         Self {
-            delegate: CatalogDelegate::new(client),
+            delegate: CatalogDelegate::new(client.clone()),
+            client,
+            selected,
         }
     }
 }
@@ -159,6 +166,11 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
                 "external catalog listing requires an admitted request context",
             )
         })?;
+        let _phase = context
+            .admit_selected_io(novarocks_spi::connector::SharedDependency::Thrift(
+                self.selected.clone(),
+            ))
+            .await?;
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
         if let Some(observer) = self.delegate.listing.active_observer() {
             let target = None;
@@ -198,6 +210,11 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
                 "external catalog listing requires an admitted request context",
             )
         })?;
+        let _phase = context
+            .admit_selected_io(novarocks_spi::connector::SharedDependency::Thrift(
+                self.selected.clone(),
+            ))
+            .await?;
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
         if let Some(observer) = self.delegate.listing.active_observer() {
             use sha2::Digest;
@@ -255,6 +272,72 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         self.delegate.table_exists(&table).await
     }
 
+    async fn namespace_exists_for_read(
+        &self,
+        namespace: CatalogNamespaceName,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<bool, ConnectorError> {
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "HMS read requires its original request context",
+            )
+        })?;
+        let _phase = context
+            .admit_selected_io(novarocks_spi::connector::SharedDependency::Thrift(
+                self.selected.clone(),
+            ))
+            .await?;
+        self.delegate.namespace_exists(&namespace).await
+    }
+    async fn table_exists_for_read(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<bool, ConnectorError> {
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "HMS read requires its original request context",
+            )
+        })?;
+        let _phase = context
+            .admit_selected_io(novarocks_spi::connector::SharedDependency::Thrift(
+                self.selected.clone(),
+            ))
+            .await?;
+        self.delegate.table_exists(&table).await
+    }
+    async fn load_table_for_read(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        let context = binding.request_context().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "HMS read requires its original request context",
+            )
+        })?;
+        let _phase = context
+            .admit_selected_io(novarocks_spi::connector::SharedDependency::Thrift(
+                self.selected.clone(),
+            ))
+            .await?;
+        let ident = super::delegate::table_ident(&table)?;
+        // Same Thrift owner; only the metadata FileIO borrows this exact
+        // request's original FS/vended gate instead of the generation's view.
+        let io = crate::fs_io::build_file_io_for_location("", binding);
+        let table = self
+            .client
+            .load_table_with_file_io(&ident, &io)
+            .await
+            .map_err(|e| super::error::map_read_error(&e))?;
+        Ok(crate::loaded_table::IcebergLoadedTable::new(
+            table,
+            crate::loaded_table::IcebergAccessDelegation::static_binding(),
+        ))
+    }
     async fn load_table(
         &self,
         table: CatalogTableName,

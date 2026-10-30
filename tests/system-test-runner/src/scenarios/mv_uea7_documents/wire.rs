@@ -591,6 +591,36 @@ impl Graph {
         );
         Ok((d, l))
     }
+    /// Independent decoding of the original publication inputs for Native
+    /// window tests; this never imports the product document/revision codec.
+    pub fn record_snapshot_watermarks(&self, p: &Record) -> Result<Vec<Option<i64>>> {
+        let binding = p.binding.as_ref().context("MV publication missing B")?;
+        let (definition, _) = self.closure(binding)?;
+        let bytes = self.versions[binding].bytes()?;
+        let bounds = binding_bounds(&bytes)?;
+        let descriptors = proto_fields(&bytes)?;
+        for (_, descriptor) in descriptors.iter().skip(1) {
+            let fields = proto_fields(descriptor)?;
+            ensure!(
+                fields.len() == 4
+                    && std::str::from_utf8(&fields[0].1)? == "iceberg"
+                    && std::str::from_utf8(&fields[1].1)? == "connector-snapshot-id"
+                    && scalar(&fields[2].1) == 1
+                    && scalar(&fields[3].1) == 9,
+                "Native window oracle requires the exact Iceberg snapshot format declaration"
+            );
+        }
+        let (_, values) = publication_payload_parts(
+            &p.payload,
+            occurrence_count(&self.versions[&definition].bytes()?)?,
+            &bounds,
+        )?;
+        values
+            .iter()
+            .map(|value| decode_snapshot_watermark(value))
+            .collect()
+    }
+
     pub fn record_logical_rows(&self, p: &Record) -> Result<Option<u64>> {
         let b = p.binding.as_ref().context("MV publication missing B")?;
         let (d, _) = self.closure(b)?;
@@ -753,6 +783,25 @@ pub(in crate::scenarios) fn validate_payload(
     count: usize,
     bounds: &[usize],
 ) -> Result<Option<u64>> {
+    publication_payload_parts(bytes, count, bounds).map(|(rows, _)| rows)
+}
+
+fn decode_snapshot_watermark(value: &[u8]) -> Result<Option<i64>> {
+    match value {
+        [0] => Ok(None),
+        [1, bytes @ ..] if bytes.len() == 8 => {
+            let id = i64::from_be_bytes(bytes.try_into()?);
+            Ok(Some(id))
+        }
+        _ => bail!("invalid publication snapshot watermark tag or width"),
+    }
+}
+
+fn publication_payload_parts(
+    bytes: &[u8],
+    count: usize,
+    bounds: &[usize],
+) -> Result<(Option<u64>, Vec<Vec<u8>>)> {
     ensure!(bytes.len() >= 28 && bytes[0] == 1, "invalid P header");
     let frozen = i64::from_be_bytes(bytes[17..25].try_into()?);
     ensure!(frozen >= 0, "negative P frozen time");
@@ -773,6 +822,7 @@ pub(in crate::scenarios) fn validate_payload(
         n == count && n == bounds.len(),
         "P occurrence count differs from D/B"
     );
+    let mut values = Vec::with_capacity(count);
     for bound in bounds {
         ensure!(bytes.len() >= p + 2, "truncated P value length");
         let len = u16::from_be_bytes(bytes[p..p + 2].try_into()?) as usize;
@@ -781,16 +831,45 @@ pub(in crate::scenarios) fn validate_payload(
             len <= *bound && len <= 256,
             "P value exceeds declared maximum"
         );
-        p = p.checked_add(len).context("P length overflow")?;
-        ensure!(p <= bytes.len(), "truncated P value");
+        let end = p.checked_add(len).context("P length overflow")?;
+        values.push(bytes.get(p..end).context("truncated P value")?.to_vec());
+        p = end;
     }
     ensure!(p == bytes.len(), "trailing P bytes");
-    Ok(logical_rows)
+    Ok((logical_rows, values))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn publication_snapshot_watermark_has_exact_tag_width_and_none() {
+        assert_eq!(decode_snapshot_watermark(&[0]).unwrap(), None);
+        let mut value = vec![1];
+        value.extend_from_slice(&42i64.to_be_bytes());
+        assert_eq!(decode_snapshot_watermark(&value).unwrap(), Some(42));
+        let mut signed = vec![1];
+        signed.extend_from_slice(&i64::MIN.to_be_bytes());
+        assert_eq!(decode_snapshot_watermark(&signed).unwrap(), Some(i64::MIN));
+        for invalid in [vec![], vec![0, 0], vec![1], vec![2]] {
+            assert!(decode_snapshot_watermark(&invalid).is_err());
+        }
+        let mut p = vec![1];
+        p.extend_from_slice(&[0; 16]);
+        p.extend_from_slice(&0i64.to_be_bytes());
+        p.push(0);
+        p.extend_from_slice(&1u16.to_be_bytes());
+        p.extend_from_slice(&9u16.to_be_bytes());
+        p.extend_from_slice(&value);
+        assert_eq!(
+            publication_payload_parts(&p, 1, &[9]).unwrap().1,
+            vec![value]
+        );
+        assert!(publication_payload_parts(&p, 2, &[9, 9]).is_err());
+        p.push(0);
+        assert!(publication_payload_parts(&p, 1, &[9]).is_err());
+    }
+
     fn bytes(hex: &str) -> Vec<u8> {
         (0..hex.len())
             .step_by(2)

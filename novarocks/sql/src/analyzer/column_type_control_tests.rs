@@ -135,8 +135,12 @@ fn column_type_source_domains_and_scope_keep_complete_authored_fields() {
         }
     }
 
-    let item = Field::new("provider_item", DataType::Utf8, false)
-        .with_metadata([("provider".into(), "kept-exactly".into())].into());
+    let item = Field::new("provider_item", DataType::Utf8, false).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "provider".into(),
+            "kept-exactly".into(),
+        )]),
+    );
     let source = column(
         DataType::LargeList(Arc::new(item)),
         Some(SqlType::Array(Box::new(SqlType::Json))),
@@ -148,7 +152,7 @@ fn column_type_source_domains_and_scope_keep_complete_authored_fields() {
     };
     assert_eq!(item.name(), "item");
     assert!(!item.is_nullable());
-    assert_eq!(item.metadata().capacity(), 0);
+    assert!(item.metadata().as_arc().is_none());
     assert_eq!(
         result.child_at(0).unwrap().logical_type(),
         ValueLogicalType::Json
@@ -234,7 +238,10 @@ fn column_type_wide_real_fields_observe_quantum_and_original_control_prefixes() 
         (0..320)
             .map(|index| {
                 Field::new(format!("source_{index}"), DataType::Int64, index % 2 == 0)
-                    .with_metadata([("provider".into(), format!("field-{index}"))].into())
+                    .with_metadata(std::collections::HashMap::<String, String>::from([(
+                        "provider".into(),
+                        format!("field-{index}"),
+                    )]))
             })
             .collect::<Vec<_>>(),
     );
@@ -249,7 +256,7 @@ fn column_type_wide_real_fields_observe_quantum_and_original_control_prefixes() 
         assert_eq!(actual.name(), source.name());
         assert_eq!(actual.data_type(), source.data_type());
         assert_eq!(actual.is_nullable(), source.is_nullable());
-        assert_eq!(actual.metadata().capacity(), 0);
+        assert!(actual.metadata().as_arc().is_none());
         assert!(source.metadata().contains_key("provider"));
     }
     assert_eq!(value.logical_type(), ValueLogicalType::Physical);

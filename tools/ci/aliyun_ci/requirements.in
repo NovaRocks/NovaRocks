@@ -1,0 +1,7 @@
+# Official Alibaba Cloud clients. No patched or vendored dependencies.
+alibabacloud-credentials==1.0.12
+alibabacloud-ecs20140526==7.11.8
+alibabacloud-oos20190601==3.7.0
+alibabacloud-ros20190910==3.7.0
+alibabacloud-sts20150401==1.2.0
+alibabacloud-oss-v2==1.4.1

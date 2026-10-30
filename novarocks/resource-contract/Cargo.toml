@@ -1,0 +1,15 @@
+[package]
+name = "novarocks-resource-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+url.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

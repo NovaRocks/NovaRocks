@@ -11,6 +11,7 @@ workspace = true
 doctest = false
 
 [dependencies]
+novarocks-resource-contract.workspace = true
 novarocks-failure-contract.workspace = true
 async-trait.workspace = true
 arrow.workspace = true

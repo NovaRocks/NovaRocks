@@ -29,7 +29,7 @@ use arrow_buffer::Buffer;
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
 
-// Arrow 58.2 MutableBuffer rounds every requested capacity to 64 bytes.
+// Arrow 60.0 MutableBuffer rounds every requested capacity to 64 bytes.
 pub(super) fn rounded_capacity(bytes: usize) -> Result<usize, CopyError> {
     let blocks = add(bytes / 64, usize::from(!bytes.is_multiple_of(64)))?;
     buffer_extent(blocks, 64)?;
@@ -41,18 +41,26 @@ pub(super) fn rounded_capacity(bytes: usize) -> Result<usize, CopyError> {
 struct ByteBufferExtent {
     len: usize,
     capacity: usize,
+    exact_interleave: bool,
 }
 impl ByteBufferExtent {
-    fn new(capacity: usize) -> Result<Self, CopyError> {
+    fn new(capacity: usize, exact_interleave: bool) -> Result<Self, CopyError> {
         Ok(Self {
             len: 0,
-            capacity: rounded_capacity(capacity)?,
+            capacity: if exact_interleave {
+                0
+            } else {
+                rounded_capacity(capacity)?
+            },
+            exact_interleave,
         })
     }
     fn extend(&mut self, bytes: usize, large: bool) -> Result<(), CopyError> {
         let required = add(self.len, bytes)?;
         byte_interleave_payload_extent(required, large)?;
-        if required > self.capacity {
+        if self.exact_interleave {
+            buffer_extent(required, 1)?;
+        } else if required > self.capacity {
             let capacity = rounded_capacity(required)?.max(mul(self.capacity, 2)?);
             buffer_extent(capacity, 1)?;
             self.capacity = capacity;
@@ -94,11 +102,12 @@ fn byte_payload<T: ByteArrayType>(
     truthy: &dyn Array,
     falsy: &dyn Array,
     large: bool,
+    exact_interleave: bool,
     work: &mut CopyObservation<'_>,
 ) -> Result<(), CopyError> {
     let truthy: &GenericByteArray<T> = downcast(truthy)?;
     let falsy: &GenericByteArray<T> = downcast(falsy)?;
-    let mut buffer = ByteBufferExtent::new(truthy.len())?;
+    let mut buffer = ByteBufferExtent::new(truthy.len(), exact_interleave)?;
     let mut start = 0;
     let mut previous = None;
     // This is the actual mask walk. NULL mask bits select falsy, even if their
@@ -141,6 +150,25 @@ fn extend_byte_span<T: ByteArrayType>(
             .ok_or(CopyError::Invalid("copy source offsets are not monotonic"))?,
         large,
     )
+}
+
+// Matches Arrow 60's source dispatch for two non-scalar Datum arrays. The
+// cleaned nullable mask chooses falsy at NULL rows; no source value is cast.
+fn uses_interleave(mask: &BooleanArray, work: &mut CopyObservation<'_>) -> Result<bool, CopyError> {
+    if mask.len() < 1024 {
+        return Ok(false);
+    }
+    let mut runs = 0usize;
+    let mut previous = false;
+    for row in 0..mask.len() {
+        let current = mask.is_valid(row) && mask.value(row);
+        if current && !previous {
+            runs = add(runs, 1)?;
+        }
+        previous = current;
+        work.step()?;
+    }
+    Ok(runs > mask.len() / 8)
 }
 
 /// Preflight Arrow zip for two ordinary arrays, not scalar Datum fast paths.
@@ -189,14 +217,38 @@ pub fn preflight_zip(
         buffer_extent(2, size_of::<Buffer>())?;
         buffer_extent(2, size_of::<&ArrayData>())?;
         work.step()?;
+        let exact_interleave = uses_interleave(mask, &mut work)?;
+        if exact_interleave {
+            // Arrow's mask iterator collects this exact pair Vec before its
+            // ordinary interleave author. It is distinct from copied payload.
+            buffer_extent(mask.len(), size_of::<(usize, usize)>())?;
+        }
         match ty {
-            DataType::Utf8 => byte_payload::<Utf8Type>(mask, truthy, falsy, false, &mut work)?,
-            DataType::Binary => byte_payload::<BinaryType>(mask, truthy, falsy, false, &mut work)?,
+            DataType::Utf8 => {
+                byte_payload::<Utf8Type>(mask, truthy, falsy, false, exact_interleave, &mut work)?
+            }
+            DataType::Binary => {
+                byte_payload::<BinaryType>(mask, truthy, falsy, false, exact_interleave, &mut work)?
+            }
             DataType::LargeUtf8 => {
-                byte_payload::<LargeUtf8Type>(mask, truthy, falsy, true, &mut work)?;
+                byte_payload::<LargeUtf8Type>(
+                    mask,
+                    truthy,
+                    falsy,
+                    true,
+                    exact_interleave,
+                    &mut work,
+                )?;
             }
             DataType::LargeBinary => {
-                byte_payload::<LargeBinaryType>(mask, truthy, falsy, true, &mut work)?;
+                byte_payload::<LargeBinaryType>(
+                    mask,
+                    truthy,
+                    falsy,
+                    true,
+                    exact_interleave,
+                    &mut work,
+                )?;
             }
             _ => {}
         }
@@ -206,7 +258,9 @@ pub fn preflight_zip(
         work.boundary()?;
         let truthy_data = truthy.to_data();
         work.boundary()?;
-        mutable_capacity(&truthy_data, truthy.len(), &mut work)?;
+        if !exact_interleave {
+            mutable_capacity(&truthy_data, truthy.len(), &mut work)?;
+        }
         // Flat sources have no constructor children or combined dictionaries.
         // The second source contributes to selected payload, not a second hint.
         let same_data = work.exact_types(truthy_data.data_type(), falsy_data.data_type())?;

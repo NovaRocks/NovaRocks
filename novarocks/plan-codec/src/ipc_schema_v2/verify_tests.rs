@@ -263,7 +263,8 @@ fn actual_encoder_messages_verify_complete_fields_and_exact_timezone_presence() 
             verify(&bytes, &expected, &Control::good()).unwrap();
             // Only successfully verified metadata enters Arrow schema conversion.
             let message = ipc::root_as_message(&bytes).unwrap();
-            let actual = ipc::convert::fb_to_schema(message.header_as_schema().unwrap());
+            let actual =
+                ipc::convert::try_fb_to_schema(message.header_as_schema().unwrap()).unwrap();
             assert!(arrow_fields_exact(&expected, actual.field(0)));
         }
     }
@@ -722,7 +723,9 @@ fn independent_field_metadata_is_unordered_but_complete_unique_and_exact() {
     let message = ipc::root_as_message(&bytes).unwrap();
     assert!(arrow_fields_exact(
         &expected,
-        ipc::convert::fb_to_schema(message.header_as_schema().unwrap()).field(0)
+        ipc::convert::try_fb_to_schema(message.header_as_schema().unwrap())
+            .unwrap()
+            .field(0)
     ));
     for pairs in [
         vec![(None, Some("1")), (Some("b"), Some("2"))],
@@ -933,7 +936,7 @@ fn accepted_type_depth_64_uses_actual_schema_table_depth_67() {
     let leaf = selected.type_as_int().unwrap();
     assert_eq!(leaf.bitWidth(), 64);
     assert!(leaf.is_signed());
-    let decoded = ipc::convert::fb_to_schema(schema);
+    let decoded = ipc::convert::try_fb_to_schema(schema).unwrap();
     assert!(arrow_fields_exact(&expected, decoded.field(0)));
 
     let too_shallow = VerifierOptions {
@@ -1029,7 +1032,7 @@ fn excessive_verifier_depth_and_independent_deep_metadata_refuse_before_conversi
         &baseline,
         0..baseline.len(),
     );
-    // Intentionally do not call fb_to_schema on rejected raw metadata.
+    // Intentionally do not call try_fb_to_schema on rejected raw metadata.
 }
 
 #[test]
@@ -1068,7 +1071,7 @@ fn present_empty_schema_message_metadata_and_features_have_no_properties() {
     let schema = message.header_as_schema().unwrap();
     assert_eq!(schema.custom_metadata().unwrap().len(), 0);
     assert_eq!(schema.features().unwrap().len(), 0);
-    let actual = ipc::convert::fb_to_schema(schema);
+    let actual = ipc::convert::try_fb_to_schema(schema).unwrap();
     assert!(arrow_fields_exact(&expected, actual.field(0)));
     let baseline = control.trace();
     assert_prefixes(

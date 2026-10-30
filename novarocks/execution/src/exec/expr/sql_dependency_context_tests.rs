@@ -49,6 +49,7 @@ fn statement() -> StatementAdmissionContext {
         QueryCancellationSource::new().view(),
         SessionOptimizerSettings::default(),
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        novarocks_result_contract::ClientPresentationFamily::MysqlText,
     )
 }
 
@@ -72,6 +73,7 @@ fn sql_dependency_context_default_admission_and_round_have_no_observer() {
         QueryCancellationSource::new().view(),
         SessionOptimizerSettings::default(),
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        novarocks_result_contract::ClientPresentationFamily::MysqlText,
     ));
     assert!(request.execution().fold_dependency_observer().is_none());
 }

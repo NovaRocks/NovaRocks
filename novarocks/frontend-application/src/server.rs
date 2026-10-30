@@ -71,18 +71,25 @@ struct FrontendBackgroundMaintenanceAttemptFactory {
 }
 
 impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {
-    fn begin_automatic_maintenance_attempt(
+    fn begin_original_root_maintenance_attempt(
         &self,
-        capacity: Option<
-            &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-        >,
+        owner: &novarocks_workload_control::WorkOwner,
     ) -> Result<BackgroundMaintenanceAttempt, String> {
+        core_capabilities::original_background_maintenance_attempt(
+            self.role,
+            self.topology.clone(),
+            self.runtime_policy.max_attempt_duration(),
+            &self.runtime,
+            owner,
+        )
+    }
+
+    fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String> {
         core_capabilities::background_maintenance_attempt(
             self.role,
             self.topology.clone(),
             self.runtime_policy.max_attempt_duration(),
             &self.runtime,
-            capacity,
         )
     }
 }
@@ -150,6 +157,7 @@ pub struct FrontendServingConfig {
     /// Upper bound for terminal resource cleanup after graceful/deadline drain.
     pub frontend_cleanup_timeout: Duration,
     pub mysql_listener: ResolvedMysqlListenerSettings,
+    pub trino_listener: novarocks_trino_adapter::TrinoListenerSettings,
     pub native_trust: Arc<NativeTrust>,
     pub native_transport: FrontendNativeTransport,
     pub native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
@@ -174,8 +182,9 @@ struct FrontendRoleProducts {
     connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     query_control: novarocks_query_application::session_control::QueryControlService,
-    query_execution: crate::query_execution::service::QueryExecutionService,
-    logical_read_launcher: Arc<dyn crate::query_execution::logical_read::LogicalReadLauncher>,
+    logical_execution_launcher:
+        Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
+    mv_execution_services: crate::query::mv_action::MvExecutionServices,
     topology: novarocks_query_application::api::BackendTopologyService,
     role: novarocks_types::ClusterRole,
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
@@ -223,7 +232,7 @@ impl FrontendRoleProducts {
                         .expect("serving MV product owns document-management authority"),
                     self.constant_policy,
                 ),
-                Arc::clone(&self.maintenance_engine),
+                self.mv_execution_services.clone(),
             ))
             .map_err(|error| {
                 FrontendApplicationError::server(format!(
@@ -285,12 +294,12 @@ impl FrontendRoleProducts {
     }
 }
 
-/// Opens the frontend services once for an externally composed server.
-pub async fn open_frontend_application_for_server(
+/// Synchronously installs the original process owner before borrowed bootstrap.
+pub fn prepare_frontend_application_for_server(
     config: &FrontendApplicationOpenConfig,
     data_runtime: Handle,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
-    FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+    FrontendApplicationHost::prepare_with_role_factories_and_state_store_registry(
         config.state_store_input.clone(),
         &config.state_store_provider_registry,
         config.execution.clone(),
@@ -300,7 +309,25 @@ pub async fn open_frontend_application_for_server(
         Arc::clone(&config.native_trust),
         config.native_transport.clone(),
     )
-    .await
+}
+
+/// Convenience borrower; an error leaves the same Host in receiving.
+pub async fn open_frontend_application_for_server(
+    receiving: &mut Option<FrontendApplicationHost>,
+    config: &FrontendApplicationOpenConfig,
+    data_runtime: Handle,
+) -> Result<FrontendApplicationHost, FrontendApplicationError> {
+    if receiving.is_some() {
+        return Err(FrontendApplicationError::server(
+            "frontend Host receiving slot is occupied",
+        ));
+    }
+    *receiving = Some(prepare_frontend_application_for_server(
+        config,
+        data_runtime,
+    )?);
+    receiving.as_mut().unwrap().open_prepared().await?;
+    Ok(receiving.take().expect("normal original Host handoff"))
 }
 
 /// Complete the one Frontend-owned startup graph and return a ready SQL
@@ -322,11 +349,15 @@ async fn build_frontend_role_products(
     // Constructor-supplied, exactly once: query preparation receives the
     // registry here and never resolves it from the host at request time.
     let typed_connector_control = host.typed_connector_control();
-    let query_application_control =
-        Arc::new(novarocks_query_application::query_control::QueryApplicationControl::default());
+    let query_application_control = Arc::new(
+        novarocks_query_application::query_control::QueryApplicationControl::new(
+            host.frontend_process_id(),
+        ),
+    );
     let query_control = novarocks_query_application::session_control::QueryControlService::new(
         query_application_control.clone(),
     );
+    host.install_statement_control(query_control.clone())?;
     #[cfg(novarocks_dev_controls)]
     if let Some(owner) = host
         .test_session
@@ -341,8 +372,7 @@ async fn build_frontend_role_products(
             }))
             .map_err(FrontendApplicationError::server)?;
     }
-    let query_execution = host.build_query_execution_service()?;
-    let logical_read_launcher = host.build_logical_read_launcher();
+    let logical_execution_launcher = host.build_logical_execution_launcher();
     let topology = host.backend_topology_port();
     let role = host.execution_role();
     let mv_repository = host.take_mv_repository_for_role_product_construction()?;
@@ -428,7 +458,6 @@ async fn build_frontend_role_products(
             Arc::clone(&connector_control),
             Arc::clone(&typed_connector_control),
             Arc::clone(&unified_statistics),
-            query_execution.clone(),
             topology.clone(),
             exchange_port,
             Arc::clone(&mv_readiness),
@@ -443,14 +472,11 @@ async fn build_frontend_role_products(
     let mv_service = Arc::new(
         crate::mv::FrontendMvProductAdapter::with_refresh_dependencies(
             Arc::clone(&mv_readiness),
-            query_execution.clone(),
-            Arc::clone(&connector_control),
             mv_activation,
             role,
             topology.clone(),
             Arc::clone(&mv_product_service),
             host.mv_maintenance_config(),
-            Arc::clone(&maintenance_service),
             host.optimizer_query_mem_limit_bytes(),
             host.lake_publication_runtime_policy()
                 .max_attempt_duration(),
@@ -492,12 +518,30 @@ async fn build_frontend_role_products(
         Arc::clone(&typed_connector_control),
         Arc::clone(&mv_storage_observation),
         Arc::clone(&mv_readiness),
-        query_execution.clone(),
         Arc::clone(&maintenance_service),
         Handle::current(),
         host.constant_policy(),
         host.static_plan_carrier(),
-    );
+    )
+    .with_state_store_original(host.state_store_original_binding())
+    .with_rewrite_runtime(crate::query_execution::kernels::MaintenanceRewriteRuntime {
+        client: host.logical_execution_client(),
+        launcher: logical_execution_launcher.clone(),
+        completion: crate::query_execution::completion_facts::CompletionFactOwners::new(
+            catalog_service.clone(),
+            Some(catalog_application.clone()),
+            typed_connector_control.clone(),
+            unified_statistics.clone(),
+            mv_candidate_reader.clone(),
+            mv_storage_observation.clone(),
+            host.connector_blocking_io_supervisor(),
+        ),
+        execution: (
+            host.connector_blocking_io_supervisor(),
+            host.write_data_runtime(),
+        ),
+    });
+
     let maintenance_engine = core_capabilities::background_maintenance_engine(
         maintenance_ports.clone(),
         Arc::new(FrontendBackgroundMaintenanceAttemptFactory {
@@ -522,25 +566,36 @@ async fn build_frontend_role_products(
                     host.workload_root_admission(),
                 ),
             ),
-            crate::statistics_jobs::service::table_statistics_reader_for_role(Arc::clone(
-                &statistics_connector_control,
-            )),
-            core_capabilities::statistics_three_phase_attempt_executor(
+            core_capabilities::statistics_attempt_executor(
                 core_capabilities::StatisticsAttemptExecutorPorts::new(
                     role,
                     statistics_connector_control,
                     Arc::clone(&typed_connector_control),
                     topology.clone(),
-                    query_execution.clone(),
+                    host.logical_execution_client(),
+                    logical_execution_launcher.clone(),
+                    crate::query_execution::completion_facts::CompletionFactOwners::new(
+                        catalog_service.clone(),
+                        Some(catalog_application.clone()),
+                        typed_connector_control.clone(),
+                        unified_statistics.clone(),
+                        mv_candidate_reader.clone(),
+                        mv_storage_observation.clone(),
+                        host.connector_blocking_io_supervisor(),
+                    ),
+                    (
+                        host.connector_blocking_io_supervisor(),
+                        host.write_data_runtime(),
+                    ),
                     Arc::clone(&function_catalog),
-                    host.lake_publication_runtime_policy()
-                        .max_attempt_duration(),
+                    host.lake_publication_runtime_policy(),
                     Handle::current(),
                     host.constant_policy(),
                     host.static_plan_carrier(),
                 ),
             ),
             Handle::current(),
+            host.connector_blocking_io_supervisor(),
         ),
     );
     // No fallible product construction follows these transfers. Keeping them
@@ -548,7 +603,27 @@ async fn build_frontend_role_products(
     // cleanup path, while a serving role owns the catalog lifecycle and its
     // MV product.
     let catalog_runtime = host.take_catalog_role_runtime()?;
+    let mv_execution_services = crate::query::mv_action::MvExecutionServices {
+        client: host.logical_execution_client(),
+        launcher: logical_execution_launcher.clone(),
+        completion: crate::query_execution::completion_facts::CompletionFactOwners::new(
+            catalog_service.clone(),
+            Some(catalog_application.clone()),
+            typed_connector_control.clone(),
+            unified_statistics.clone(),
+            mv_candidate_reader.clone(),
+            mv_storage_observation.clone(),
+            host.connector_blocking_io_supervisor(),
+        ),
+        connector_control: typed_connector_control.clone(),
+        blocking: host.connector_blocking_io_supervisor(),
+        data: host.write_data_runtime(),
+        state_store: host.state_store_original_binding(),
+        #[cfg(novarocks_dev_controls)]
+        controls: mv_readiness.test_controls_owner(),
+    };
     Ok(FrontendRoleProducts {
+        mv_execution_services,
         catalog_runtime,
         catalog_service,
         unified_statistics,
@@ -558,8 +633,7 @@ async fn build_frontend_role_products(
         connector_control,
         typed_connector_control,
         query_control,
-        query_execution,
-        logical_read_launcher,
+        logical_execution_launcher,
         topology,
         role,
         view_service,
@@ -593,7 +667,6 @@ fn build_frontend_query_session_factory_from_role_products(
     let function_catalog = Arc::clone(&products.function_catalog);
     let connector_control = Arc::clone(&products.connector_control);
     let typed_connector_control = Arc::clone(&products.typed_connector_control);
-    let query_execution = products.query_execution.clone();
     let topology = products.topology.clone();
     let role = products.role;
     let view_service = Arc::clone(&products.view_service);
@@ -614,7 +687,6 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&connector_control),
             Arc::clone(&typed_connector_control),
             Arc::clone(&unified_statistics),
-            query_execution.clone(),
             topology.clone(),
             exchange_port,
             view_service.clone(),
@@ -631,7 +703,6 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
-            host.connector_blocking_io_supervisor(),
         ));
     let catalog_command_executor =
         core_capabilities::catalog_command_executor(core_capabilities::CatalogCommandPorts::new(
@@ -678,7 +749,8 @@ fn build_frontend_query_session_factory_from_role_products(
             products.mv_product_service.management_continuation(),
             host.mv_management_audit_sink(),
             host.constant_policy(),
-        ));
+        ))
+        .with_execution_services(products.mv_execution_services.clone());
     let mv_command_consumer: Arc<
         dyn novarocks_query_application::api::MaterializedViewCommandConsumer,
     > = Arc::new(crate::mv::command::FrontendMvCommandConsumer::new(
@@ -696,22 +768,32 @@ fn build_frontend_query_session_factory_from_role_products(
         maintenance_command_executor,
         maintenance_read_command_executor,
         host.query_blocking_executor(),
+        host.state_store_original_binding(),
+        #[cfg(novarocks_dev_controls)]
+        host.test_session
+            .as_ref()
+            .and_then(|session| session.statement.clone()),
     );
-    let dml_engines = core_capabilities::dml_engines(core_capabilities::DmlEnginePorts::new(
-        function_catalog,
-        Arc::clone(&catalog_service),
-        Some(catalog_application),
-        connector_control,
-        typed_connector_control,
-        unified_statistics,
-        mv_storage_observation,
-        Arc::clone(&mv_readiness),
-        query_execution.clone(),
-        Handle::current(),
-        host.lake_publication_runtime_policy(),
-        host.constant_policy(),
-        host.static_plan_carrier(),
-    ));
+    let dml_engines = core_capabilities::dml_engines(
+        core_capabilities::DmlEnginePorts::new(
+            function_catalog,
+            Arc::clone(&catalog_service),
+            Some(catalog_application),
+            connector_control,
+            typed_connector_control,
+            unified_statistics,
+            mv_storage_observation,
+            Arc::clone(&mv_readiness),
+            Handle::current(),
+            host.lake_publication_runtime_policy(),
+            host.constant_policy(),
+            host.static_plan_carrier(),
+        )
+        .with_write_runtime(
+            host.connector_blocking_io_supervisor(),
+            host.write_data_runtime(),
+        ),
+    );
     let query_service = crate::query::FrontendQueryService::new(
         session_catalog_resolver,
         query_compiler,
@@ -722,8 +804,7 @@ fn build_frontend_query_session_factory_from_role_products(
         mv_command_executor,
         products.query_control.clone(),
         client_connection_control,
-        query_execution,
-        Arc::clone(&products.logical_read_launcher),
+        Arc::clone(&products.logical_execution_launcher),
         host.workload_root_admission(),
         role,
         topology,
@@ -734,12 +815,12 @@ fn build_frontend_query_session_factory_from_role_products(
         dml_engines.add_files,
         dml_engines.ctas,
         dml_engines.truncate,
-        host.query_cpu_executor(),
         host.query_blocking_executor(),
         host.optimizer_query_mem_limit_bytes(),
         host.lake_publication_runtime_policy(),
         host.serving_lifecycle().admission(),
-    );
+    )
+    .with_state_store_original(host.state_store_original_binding());
     #[cfg(novarocks_dev_controls)]
     let query_service = query_service.with_statement_observation(
         host.test_session
@@ -857,6 +938,7 @@ pub async fn shutdown_frontend_application_to_convergence(
 /// Frontend-owned management listener construction. The Server role runner
 /// owns when this listener starts, receives failures, and is torn down.
 pub struct FrontendManagementServer {
+    metrics_registry: Arc<crate::metrics::FrontendMetricsRegistry>,
     serving_reader: Arc<LateBoundFrontendServingSnapshotReader>,
     island_reader: Arc<crate::topology::LateBoundBackendIslandSnapshotReader>,
     convergence_reader: Arc<crate::metrics::LateBoundQueryLifecycleConvergenceReader>,
@@ -914,6 +996,7 @@ pub fn start_frontend_management_server(
     )
     .map_err(FrontendApplicationError::server)?;
     Ok(FrontendManagementServer {
+        metrics_registry,
         serving_reader,
         island_reader,
         convergence_reader,
@@ -1053,17 +1136,21 @@ where
             );
         }
     };
-    let server_result = run_mysql_with_listener_supervision(
+    let server_result = run_client_listeners_with_supervision(
         #[cfg(any(
             feature = "mem-1-m07-exact-mysql-write",
             feature = "mem-1-m07-root-observation",
             feature = "mem-1-m07-closing-pressure"
         ))]
         Arc::clone(&config.native_trust),
-        config.mysql_listener,
-        config.server_version,
-        session_factory,
-        client_connections,
+        ClientListenerInputs {
+            mysql_listener: config.mysql_listener,
+            trino_listener: config.trino_listener,
+            server_version: config.server_version,
+            session_factory,
+            query_control: products.query_control.clone(),
+            client_connections,
+        },
         shutdown,
         &mut report_server,
         management_server,
@@ -1086,17 +1173,23 @@ where
     )
 }
 
-async fn run_mysql_with_listener_supervision<F>(
+struct ClientListenerInputs {
+    mysql_listener: ResolvedMysqlListenerSettings,
+    trino_listener: novarocks_trino_adapter::TrinoListenerSettings,
+    server_version: String,
+    session_factory: Arc<dyn QuerySessionFactory>,
+    query_control: novarocks_query_application::session_control::QueryControlService,
+    client_connections: Arc<MysqlClientConnectionRegistry>,
+}
+
+async fn run_client_listeners_with_supervision<F>(
     #[cfg(any(
         feature = "mem-1-m07-exact-mysql-write",
         feature = "mem-1-m07-root-observation",
         feature = "mem-1-m07-closing-pressure"
     ))]
     native_trust: Arc<NativeTrust>,
-    mysql_listener: ResolvedMysqlListenerSettings,
-    server_version: String,
-    session_factory: Arc<dyn QuerySessionFactory>,
-    client_connections: Arc<MysqlClientConnectionRegistry>,
+    listeners: ClientListenerInputs,
     shutdown: F,
     report_server: &mut crate::native::report_server::FrontendReportServerHandle,
     management_server: &mut FrontendManagementServer,
@@ -1107,6 +1200,27 @@ async fn run_mysql_with_listener_supervision<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    let ClientListenerInputs {
+        mysql_listener,
+        trino_listener,
+        server_version,
+        session_factory,
+        query_control,
+        client_connections,
+    } = listeners;
+    let mut trino_server = novarocks_trino_adapter::TrinoServerHandle::bind(
+        &trino_listener,
+        server_version.clone(),
+        host.serving_lifecycle().admission(),
+        Arc::clone(&session_factory),
+        query_control,
+    )
+    .await
+    .map_err(FrontendApplicationError::server)?;
+    let trino_port = trino_server.bound_addr().port();
+    let result = async {
+    management_server.metrics_registry.install_trino(&trino_server.observation())
+        .map_err(FrontendApplicationError::server)?;
     #[cfg(feature = "mem-1-m07-root-observation")]
     let _root_observation_claim = root_observation_identity::emit(
         &native_trust,
@@ -1147,8 +1261,10 @@ where
                 host,
                 drain_timeout,
                 cleanup_timeout,
+            &mut trino_server,
             )
             .await;
+
         }
         other => other,
     };
@@ -1167,8 +1283,10 @@ where
             host,
             drain_timeout,
             cleanup_timeout,
+            &mut trino_server,
         )
         .await;
+
     }
     let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
     let (finalize_tx, finalize_rx) = tokio::sync::watch::channel(false);
@@ -1189,7 +1307,7 @@ where
             wait_for_signal(drain_rx),
             wait_for_signal(finalize_rx),
             cleanup_timeout,
-            move |bound_addr| emit_frontend_mysql_ready(bound_addr, &ready_user),
+            move |bound_addr| emit_frontend_mysql_ready(bound_addr, &ready_user, trino_port),
         );
     tokio::pin!(mysql_server);
 
@@ -1197,6 +1315,7 @@ where
         result = &mut mysql_server => result.map_err(FrontendApplicationError::server),
         _ = shutdown => {
             host.begin_serving_drain(drain_timeout);
+            trino_server.begin_drain();
             let _ = drain_tx.send(true);
             let graceful = tokio::time::timeout(
                 drain_timeout,
@@ -1222,8 +1341,9 @@ where
             let _ = finalize_tx.send(true);
             mysql_server.await.map_err(FrontendApplicationError::server)
         }
-        error = wait_for_frontend_listener_failure(report_server, management_server) => {
+        error = wait_for_frontend_listener_failure(report_server, management_server, &mut trino_server, host) => {
             host.begin_serving_drain(drain_timeout);
+            trino_server.begin_drain();
             let _ = drain_tx.send(true);
             host.cancel_governed_work_at_drain_deadline();
             session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
@@ -1238,9 +1358,18 @@ where
             }
         }
     }
+    }.await;
+    trino_server.finalize();
+    combine_server_and_shutdown(
+        result,
+        trino_server
+            .wait_stopped()
+            .await
+            .map_err(FrontendApplicationError::server),
+    )
 }
 
-fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str) {
+fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str, trino_port: u16) {
     info!(
         "standalone mysql server listening on {} (user={}, db={})",
         bind_addr, user, DEFAULT_DATABASE
@@ -1250,17 +1379,26 @@ fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str) {
     // mysql port alone cannot distinguish a freshly-bound server from a
     // pre-existing process that already owned the port.
     println!(
-        "NOVAROCKS_READY mysql_port={} pid={}",
+        "NOVAROCKS_READY mysql_port={} pid={} trino_port={}",
         bind_addr.port(),
-        std::process::id()
+        std::process::id(),
+        trino_port
     );
 }
 
 async fn wait_for_frontend_listener_failure(
     report_server: &mut crate::native::report_server::FrontendReportServerHandle,
     management_server: &mut FrontendManagementServer,
+    trino_server: &mut novarocks_trino_adapter::TrinoServerHandle,
+    host: &FrontendApplicationHost,
 ) -> String {
     loop {
+        if let Some(error) = trino_server.poll_failure() {
+            return error;
+        }
+        if host.workload_progress_has_failed() {
+            return "frontend governed role service failed or exited unexpectedly".to_string();
+        }
         match report_server.poll_failure() {
             Ok(Some(error)) => return format!("frontend report listener failed: {error}"),
             Ok(None) => {}
@@ -1498,10 +1636,15 @@ mod tests {
 
     fn settle_governed_completion(statement: QuerySessionStatement) {
         let (result, terminal) = statement.into_parts();
+        if let StatementResult::GovernedError(result) = result {
+            let (error, _protocol) = result.into_parts();
+            panic!("statement returned an error before terminal OK: {error:?}");
+        }
         let StatementResult::GovernedCompletion(result) = result else {
             panic!("successful statement must retain its owner through terminal OK");
         };
-        let mut protocol = result.into_protocol();
+        let (completion, mut protocol) = result.into_parts();
+        assert_eq!(completion.affected_rows(), 0);
         let _ = protocol.seal_success_visibility();
         let _ = protocol.complete();
         terminal.complete();
@@ -1660,7 +1803,9 @@ mod tests {
     async fn cp2_production_composition_owns_catalog_ddl_through_the_state_store_attachment() {
         let state_store = test_state_store_input("cp2-cutover");
         let registry = test_state_store_registry();
+        let mut host_receiving_9 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_9,
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -1775,7 +1920,9 @@ mod tests {
     async fn frontend_report_endpoint_binds_loopback_without_core_transport_facade() {
         let state_store = test_state_store_input("frontend-report-listener");
         let registry = test_state_store_registry();
+        let mut host_receiving_8 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_8,
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -1824,7 +1971,9 @@ mod tests {
     async fn sqlx2_application_frontend_services_inject_statistics_application_port() {
         let state_store = test_state_store_input("statistics-application-port");
         let registry = test_state_store_registry();
+        let mut host_receiving_7 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_7,
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -1879,7 +2028,9 @@ mod tests {
     async fn role_products_inject_their_unique_mv_product_into_the_frontend_adapter() {
         let state_store = test_state_store_input("mv-product-role-composition");
         let registry = test_state_store_registry();
+        let mut host_receiving_6 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_6,
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -1993,7 +2144,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn production_shutdown_has_a_finite_process_exit_boundary() {
         let registry = test_state_store_registry();
+        let mut host_receiving_5 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_5,
             Some(test_state_store_input("server-bounded-shutdown-owner")),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -2010,7 +2163,29 @@ mod tests {
         )
         .await
         .expect("open frontend application host");
+        host.install_statement_control_for_test();
+        let serving = host.serving_snapshot_reader();
+        assert!(!serving.frontend_serving_snapshot().base_ready());
+        host.mark_workload_ready()
+            .expect("open internal governed startup work");
+        let snapshot = serving.frontend_serving_snapshot();
+        assert_eq!(
+            snapshot.serving_state,
+            novarocks_query_application::serving_admission::FrontendServingState::Starting
+        );
+        assert!(
+            !snapshot.base_ready(),
+            "internal authority cannot expose public readiness"
+        );
+        let management = host
+            .workload_root_admission()
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .expect("mandatory startup may use a real Management Root");
+        drop(management.business);
+        management.owner.complete_after_terminal_cancel_settled();
         host.mark_ready().expect("mark frontend host ready");
+        assert!(serving.frontend_serving_snapshot().base_ready());
+        drop(serving);
         let work = host
             .workload_root_admission()
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -2042,7 +2217,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serving_drain_refuses_new_governed_roots() {
         let registry = test_state_store_registry();
+        let mut host_receiving_4 = None;
         let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            &mut host_receiving_4,
             Some(test_state_store_input("server-drain-closes-root-admission")),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -2059,6 +2236,7 @@ mod tests {
         )
         .await
         .expect("open frontend application host");
+        host.install_statement_control_for_test();
         host.mark_ready().expect("mark frontend host ready");
 
         let active = host
@@ -2235,6 +2413,31 @@ mod tests {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
+        fn complete_empty_provider_execution_config() -> Result<FrontendExecutionConfig> {
+            // Same frozen ingress author used by the actual session/control
+            // service; no test-owned listener quota or session registry.
+            let mysql = novarocks_mysql_adapter::frozen_mysql_startup_parameters()
+                .map_err(anyhow::Error::msg)?;
+            let ingress = crate::native_workload::FrontendStatementIngress {
+                ordinary_connections: NonZeroUsize::new(mysql.ordinary_positions)
+                    .ok_or_else(|| anyhow!("ordinary MySQL positions must be nonzero"))?,
+                control_connections: NonZeroUsize::new(mysql.control_positions)
+                    .ok_or_else(|| anyhow!("control MySQL positions must be nonzero"))?,
+                ordinary_command_bytes: NonZeroUsize::new(mysql.ordinary.limits.command_bytes)
+                    .ok_or_else(|| anyhow!("ordinary MySQL command bound must be nonzero"))?,
+                control_command_bytes: NonZeroUsize::new(mysql.control.limits.command_bytes)
+                    .ok_or_else(|| anyhow!("control MySQL command bound must be nonzero"))?,
+            };
+            FrontendExecutionConfig::new_for_test(
+                NonZeroUsize::new(1).unwrap(),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
+                crate::application::test_constant_policy(),
+            )
+            .try_with_empty_provider_read_profile_for_test(ingress)
+            .map_err(anyhow::Error::new)
+        }
+
         fn arm_real_entry(
             owner: &crate::preparation_diagnostics::StatementObservationOwner,
             token: &str,
@@ -2294,7 +2497,8 @@ mod tests {
                     "query timeout SET did not return its governed completion"
                 ));
             };
-            let mut protocol = result.into_protocol();
+            let (completion, mut protocol) = result.into_parts();
+            ensure!(completion.affected_rows() == 0, "SET has no affected rows");
             let seal = protocol.seal_success_visibility();
             let finish = protocol.complete();
             terminal.complete();
@@ -2320,6 +2524,7 @@ mod tests {
         }
 
         async fn run_unbound_entry_case(rearm: bool) -> Result<()> {
+            let execution_config = complete_empty_provider_execution_config()?;
             let directory = tempfile::Builder::new()
                 .prefix("g2-real-entry-")
                 .tempdir_in("/tmp")?;
@@ -2359,17 +2564,13 @@ mod tests {
             let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe)?;
             let mut runner = RunnerSession::start(declaration)?;
             let registry = test_state_store_registry();
+            let mut host_receiving_3 = None;
             let opened =
                 FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+                    &mut host_receiving_3,
                     Some(test_state_store_input("g2-real-entry")),
                     &registry,
-                    FrontendExecutionConfig::new_for_test(
-                        NonZeroUsize::new(1).unwrap(),
-                        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-                        builtin_function_catalog(),
-                        crate::application::test_constant_policy(),
-                    )
-                    .with_test_session(
+                    execution_config.with_test_session(
                         crate::test_session::FrontendTestSessionConfig::new(prepared),
                     ),
                     frontend_backend_open_config(),
@@ -2524,6 +2725,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn real_entry_finite_input_survives_unbound_drain_and_bound_successors() -> Result<()>
         {
+            let execution_config = complete_empty_provider_execution_config()?;
             let directory = tempfile::Builder::new()
                 .prefix("g2-real-entry-")
                 .tempdir_in("/tmp")?;
@@ -2562,17 +2764,13 @@ mod tests {
             let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe)?;
             let mut runner = RunnerSession::start(declaration)?;
             let registry = test_state_store_registry();
+            let mut host_receiving_2 = None;
             let opened =
                 FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+                    &mut host_receiving_2,
                     Some(test_state_store_input("g2-real-entry")),
                     &registry,
-                    FrontendExecutionConfig::new_for_test(
-                        NonZeroUsize::new(1).unwrap(),
-                        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-                        builtin_function_catalog(),
-                        crate::application::test_constant_policy(),
-                    )
-                    .with_test_session(
+                    execution_config.with_test_session(
                         crate::test_session::FrontendTestSessionConfig::new(prepared),
                     ),
                     frontend_backend_open_config(),

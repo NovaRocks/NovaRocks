@@ -318,7 +318,7 @@ mod tests {
             .materialized_schema_observed(u32::MAX, &mut work)
             .unwrap()
             .unwrap();
-        assert_eq!(paired.schema().metadata().capacity(), 0);
+        assert!(paired.schema().metadata().as_arc().is_none());
         assert!(
             paired
                 .metadata_origin()
@@ -366,7 +366,7 @@ mod tests {
         let paired = &owned.definitions()[0].1;
         let fields = paired.schema().fields();
         assert!(Arc::ptr_eq(&fields[0], &fields[1]));
-        assert_eq!(fields[0].metadata().capacity(), 0);
+        assert!(fields[0].metadata().as_arc().is_none());
         assert_eq!(
             original_source_field.metadata()["provider.attribute"],
             "original value"

@@ -54,3 +54,5 @@ pub mod hash_eq;
 pub mod compact;
 
 pub mod hydrate;
+
+pub mod batch;

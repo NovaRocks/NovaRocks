@@ -17,9 +17,8 @@
 
 //! The frontend owners of the native task protocol.
 //!
-//! The neutral domain in `novarocks_execution::task_execution` owns the
-//! values and every pure classification over them. This module owns the
-//! frontend's runtime state machines built on top of it: the stage and task
+//! Coordination Contract owns the facts actually shared with Query Application.
+//! This module owns Task-local classifications and the frontend runtime owners: the stage and task
 //! graph derived from the frozen static schedule, one `RemoteTask` per task,
 //! one `StageExecution` per stage, one `QueryContextOwner` per query context,
 //! a bounded and fair per-backend dispatcher, and a status intake with a
@@ -30,26 +29,33 @@
 //! transport owner implements, which is also what makes every behaviour here
 //! testable without a wire.
 //!
-//! Nothing in this module is routed into production yet. The existing
-//! coordinator keeps owning distributed query execution untouched.
-// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
+// Design: ADR-0161 (docs/adr/ADR-0161-pure-local-programs-and-supervised-task-lifecycle.md)
 
 pub(crate) mod abort_effect;
 pub(crate) mod actor_gate;
 pub(crate) mod attempt_convergence;
+pub(crate) mod attempt_pumps;
 pub(crate) mod blocking_io;
 pub(crate) mod clock;
 pub(crate) mod completion;
+pub(crate) mod completion_facts;
+pub(crate) mod conclusion;
 pub(crate) mod context_convergence;
 pub(crate) mod context_owner;
+pub(crate) mod context_state;
 pub(crate) mod creation;
 pub(crate) mod dispatch;
+pub(crate) mod domain_tracker;
 pub(crate) mod error;
 pub(crate) mod execution;
 pub(crate) mod feedback_pump;
 pub(crate) mod graph;
 pub(crate) mod intent;
+pub(crate) mod lease;
 pub(crate) mod manifest_round;
+pub(crate) mod operation;
+pub(crate) mod profile_diagnostics;
+pub(crate) mod protocol_facts;
 pub(crate) mod remote_task;
 pub(crate) mod round;
 pub(crate) mod sources;
@@ -57,7 +63,7 @@ mod split_domain;
 pub(crate) mod split_transport;
 pub(crate) mod stage;
 pub(crate) mod status_intake;
-pub(crate) mod termination;
+pub(crate) mod status_validation;
 
 #[cfg(test)]
 pub(crate) mod tests;

@@ -177,7 +177,7 @@ impl RuntimeKernelControl {
             let _ = self.observed_stop.set(error);
         }
     }
-    fn project_required_failure(&self, failure: ExecutionFailure) -> ExecutionFailure {
+    pub(crate) fn project_required_failure(&self, failure: ExecutionFailure) -> ExecutionFailure {
         if matches!(
             failure.cause(),
             crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::Cancelled)

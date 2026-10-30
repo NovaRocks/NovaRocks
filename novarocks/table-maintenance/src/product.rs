@@ -76,20 +76,104 @@ pub struct RewriteReceiptFacts {
 }
 
 /// Provider commit fact after a rewrite dispatch.
+/// A local diagnostic or one immutable originating failure, never a reclassification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RewriteFailure {
+    message: String,
+    cause: Option<novarocks_failure_contract::SharedFailureCause>,
+}
+impl RewriteFailure {
+    pub fn from_cause(cause: novarocks_failure_contract::SharedFailureCause) -> Self {
+        Self {
+            message: cause.detail().to_owned(),
+            cause: Some(cause),
+        }
+    }
+    pub fn cause(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.cause.as_ref()
+    }
+    pub fn with_message(mut self, message: String) -> Self {
+        self.message = message;
+        self
+    }
+    pub fn into_terminal(self, make: fn(String) -> TerminalError) -> TerminalError {
+        make(self.message).with_failure_cause(self.cause)
+    }
+}
+impl From<String> for RewriteFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            cause: None,
+        }
+    }
+}
+impl From<&str> for RewriteFailure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+impl std::fmt::Display for RewriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for RewriteFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause
+            .as_ref()
+            .map(|cause| cause as &dyn std::error::Error)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RewriteCommit {
-    KnownCommitted { finalization_failed: Option<String> },
-    KnownUncommitted { failure: String },
-    CommitUnknown { failure: String },
+    KnownCommitted {
+        effect: novarocks_coordination_contract::ExecutionEffect,
+        finalization_failed: Option<RewriteFailure>,
+    },
+    KnownUncommitted {
+        failure: RewriteFailure,
+    },
+    CommitUnknown {
+        failure: RewriteFailure,
+    },
 }
+
+/// Actual abort frontier. The Source keeps the canonical NeededReady and
+/// cleanup responsibility; this is only its neutral effect projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RewriteAbort {
+    KnownUncommitted,
+    KnownCommitted {
+        effect: novarocks_coordination_contract::ExecutionEffect,
+    },
+    CommitUnknown {
+        failure: RewriteFailure,
+    },
+}
+
+/// Borrowed original operation; the caller retains the source until actual exit.
+pub type MaintenanceFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Opaque provider/native session for one product-owned rewrite transition.
 pub trait DistributedRewriteSession: Send {
     fn plan_facts(&self) -> RewritePlanFacts;
-    fn execute_cohort(&mut self, ordinal: usize) -> Result<(), TerminalError>;
-    fn commit(&mut self) -> Result<RewriteCommit, String>;
-    fn finalize_committed(&mut self) -> Result<RewriteReceiptFacts, String>;
-    fn abort(&mut self, reason: String) -> Result<(), String>;
+    fn execute_cohort<'a>(
+        &'a mut self,
+        ordinal: usize,
+    ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>>;
+    fn commit<'a>(
+        &'a mut self,
+    ) -> crate::product::MaintenanceFuture<'a, Result<RewriteCommit, RewriteFailure>>;
+    fn finalize_committed<'a>(
+        &'a mut self,
+    ) -> crate::product::MaintenanceFuture<'a, Result<RewriteReceiptFacts, RewriteFailure>>;
+    fn abort<'a>(
+        &'a mut self,
+        reason: String,
+    ) -> crate::product::MaintenanceFuture<'a, Result<RewriteAbort, RewriteFailure>>;
 }
 
 /// One owned-ref fact eligible for the GC first-observation safety window.
@@ -112,6 +196,7 @@ pub enum CleanupCandidate {
 /// that fact maps to a statement failure and whether retry is safe.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CleanupTerminal {
+    NoOp { locations: Vec<String> },
     KnownCommitted { locations: Vec<String> },
     KnownUncommitted { failure: String },
     CommitUnknown { failure: String },
@@ -120,9 +205,19 @@ pub enum CleanupTerminal {
 
 /// Opaque provider session for one cleanup operation.
 pub trait CleanupSession: Send {
+    /// Current reachability and safe_gc_age never authorize a scanned-object
+    /// deletion. The real Provider must supply its checked safety capability.
+    fn require_scanned_object_gc(&self) -> Result<(), String> {
+        Err("scanned orphan cleanup is unsupported without Provider writer-fencing, Unknown/unreceived and restart safety evidence".to_string())
+    }
     fn candidates(&self) -> &[CleanupCandidate];
-    fn select_owned_refs(&mut self, candidate_indexes: &[usize]) -> Result<(), String>;
-    fn execute(&mut self) -> Result<CleanupTerminal, String>;
+    fn select_owned_refs<'a>(
+        &'a mut self,
+        candidate_indexes: &'a [usize],
+    ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>>;
+    fn execute<'a>(
+        &'a mut self,
+    ) -> crate::product::MaintenanceFuture<'a, Result<CleanupTerminal, TerminalError>>;
 }
 
 /// The only adapter surface needed by the table-maintenance product.
@@ -130,50 +225,74 @@ pub trait CleanupSession: Send {
 /// Implementations may own provider leases, Native encoders, and query clients,
 /// but return only typed effect facts.  They do not own activity gates, GC
 /// maturity, worker lifecycle, or commit terminal interpretation.
-pub trait TableMaintenanceEffectPort {
-    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String>;
-    fn execute_metadata(
-        &self,
+pub trait TableMaintenanceEffectPort: Sync {
+    /// Observe the owned-ref safety window through this effect owner's actual
+    /// execution context. The Product alone decides which indexes are mature.
+    fn observe_cleanup_owned_ref<'a>(
+        &'a self,
+        observations: &'a GcOwnedRefObservationAccelerator,
+        observation: GcOwnedRefObservation,
+        now_ms: i64,
+        safe_gc_age_ms: i64,
+    ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>>;
+
+    fn reject_user_action_on_mv<'a>(
+        &'a self,
+        target: &'a MaintenanceTarget,
+    ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>>;
+    fn execute_metadata<'a>(
+        &'a self,
         request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, String>;
+    ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>;
     /// Executes one automatic metadata effect using the caller-frozen identity.
     /// Adapters must report the provider's actual terminal classification.
     /// Success is `KnownCommitted` only when the provider proves a commit;
     /// an effect-free action is `NoOpWithoutCommit`.
     /// A failure before effect dispatch uses `PreDispatchFailed`; a possibly
     /// dispatched effect must never be represented by that state.
-    fn execute_metadata_with_id(
-        &self,
+    fn execute_metadata_with_id<'a>(
+        &'a self,
         _request: MaintenanceActionRequest,
         _effect_id: MaintenanceEffectId,
-    ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
-        Err(TerminalError::pre_dispatch_failed(
-            "automatic maintenance metadata effect identity is unsupported",
-        ))
+    ) -> crate::product::MaintenanceFuture<'a, Result<AutomaticMaintenanceOutcome, TerminalError>>
+    {
+        Box::pin(async move {
+            Err(TerminalError::pre_dispatch_failed(
+                "automatic maintenance metadata effect identity is unsupported",
+            ))
+        })
     }
     fn begin_rewrite<'a>(
         &'a self,
-        target: &MaintenanceTarget,
+        target: &'a MaintenanceTarget,
         intent: RewriteIntent,
-    ) -> Result<Box<dyn DistributedRewriteSession + 'a>, String>;
+    ) -> crate::product::MaintenanceFuture<
+        'a,
+        Result<Box<dyn DistributedRewriteSession + 'a>, String>,
+    >;
     /// Plans one automatic distributed rewrite with the caller-frozen identity.
     /// Any failure after possible provider dispatch needs its true terminal
     /// classification, including `CommitUnknown` when commitment is uncertain.
     fn begin_rewrite_with_id<'a>(
         &'a self,
-        _target: &MaintenanceTarget,
+        _target: &'a MaintenanceTarget,
         _intent: RewriteIntent,
         _effect_id: MaintenanceEffectId,
-    ) -> Result<Box<dyn DistributedRewriteSession + 'a>, TerminalError> {
-        Err(TerminalError::pre_dispatch_failed(
-            "automatic maintenance rewrite effect identity is unsupported",
-        ))
+    ) -> crate::product::MaintenanceFuture<
+        'a,
+        Result<Box<dyn DistributedRewriteSession + 'a>, TerminalError>,
+    > {
+        Box::pin(async move {
+            Err(TerminalError::pre_dispatch_failed(
+                "automatic maintenance rewrite effect identity is unsupported",
+            ))
+        })
     }
     fn begin_cleanup<'a>(
         &'a self,
-        target: &MaintenanceTarget,
+        target: &'a MaintenanceTarget,
         older_than_ms: i64,
-    ) -> Result<Box<dyn CleanupSession + 'a>, String>;
+    ) -> crate::product::MaintenanceFuture<'a, Result<Box<dyn CleanupSession + 'a>, TerminalError>>;
 }
 
 /// Single process-local business owner for every table-maintenance operation.
@@ -290,7 +409,7 @@ impl TableMaintenanceProduct {
         effects: &P,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, TerminalError> {
-        effects.reject_user_action_on_mv(request.target())?;
+        effects.reject_user_action_on_mv(request.target()).await?;
         self.execute_action(effects, request).await
     }
 
@@ -312,6 +431,7 @@ impl TableMaintenanceProduct {
                     &target,
                     RewriteIntent::DataFiles { rewrite_all: true },
                 )
+                .await
             }
             MaintenanceActionRequest::RewritePositionDeleteFiles {
                 target,
@@ -326,14 +446,12 @@ impl TableMaintenanceProduct {
                     &target,
                     rewrite_position_delete_intent(&options, where_clause.as_deref())?,
                 )
+                .await
             }
             MaintenanceActionRequest::RemoveOrphanFiles {
                 target,
                 older_than_ms,
-            } => self
-                .execute_cleanup(effects, target, older_than_ms)
-                .await
-                .map_err(TerminalError::from),
+            } => self.execute_cleanup(effects, target, older_than_ms).await,
             request => {
                 let target = request.target().clone();
                 let _permit = self
@@ -341,6 +459,7 @@ impl TableMaintenanceProduct {
                     .map_err(|error| error.to_string())?;
                 effects
                     .execute_metadata(request)
+                    .await
                     .map_err(TerminalError::from)
             }
         }
@@ -361,6 +480,7 @@ impl TableMaintenanceProduct {
                     .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| TerminalError::pre_dispatch_failed(error.to_string()))?;
                 self.execute_automatic_rewrite_terminal(effects, &target, effect_id)
+                    .await
             }
             MaintenanceActionRequest::RewritePositionDeleteFiles {
                 target,
@@ -372,12 +492,14 @@ impl TableMaintenanceProduct {
                 let _permit = self
                     .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| TerminalError::pre_dispatch_failed(error.to_string()))?;
-                let session = effects.begin_rewrite_with_id(&target, intent.clone(), effect_id)?;
-                Self::run_rewrite_session_terminal(session, intent)
+                let session = effects
+                    .begin_rewrite_with_id(&target, intent.clone(), effect_id)
+                    .await?;
+                Self::run_rewrite_session_terminal(session, intent).await
             }
             MaintenanceActionRequest::RemoveOrphanFiles { .. } => {
                 Err(TerminalError::pre_dispatch_failed(
-                    "automatic orphan cleanup has no effect identity terminal port",
+                    "automatic scanned orphan cleanup is unsupported: Provider safety evidence and an effect identity terminal port are unavailable",
                 ))
             }
             request => {
@@ -385,7 +507,7 @@ impl TableMaintenanceProduct {
                 let _permit = self
                     .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| TerminalError::pre_dispatch_failed(error.to_string()))?;
-                effects.execute_metadata_with_id(request, effect_id)
+                effects.execute_metadata_with_id(request, effect_id).await
             }
         }
     }
@@ -393,18 +515,20 @@ impl TableMaintenanceProduct {
     /// Executes an automatic OPTIMIZE rewrite while its job already owns the
     /// target activity permit. The job, not this method, releases that permit
     /// after its exact terminal is recorded.
-    pub fn execute_automatic_rewrite_terminal<P: TableMaintenanceEffectPort + ?Sized>(
+    pub async fn execute_automatic_rewrite_terminal<P: TableMaintenanceEffectPort + ?Sized>(
         &self,
         effects: &P,
         target: &MaintenanceTarget,
         effect_id: MaintenanceEffectId,
     ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
         let intent = RewriteIntent::DataFiles { rewrite_all: true };
-        let session = effects.begin_rewrite_with_id(target, intent.clone(), effect_id)?;
-        Self::run_rewrite_session_terminal(session, intent)
+        let session = effects
+            .begin_rewrite_with_id(target, intent.clone(), effect_id)
+            .await?;
+        Self::run_rewrite_session_terminal(session, intent).await
     }
 
-    pub fn execute_rewrite_terminal<P: TableMaintenanceEffectPort + ?Sized>(
+    pub async fn execute_rewrite_terminal<P: TableMaintenanceEffectPort + ?Sized>(
         &self,
         effects: &P,
         target: &MaintenanceTarget,
@@ -412,12 +536,14 @@ impl TableMaintenanceProduct {
     ) -> Result<MaintenanceActionOutcome, TerminalError> {
         let session = effects
             .begin_rewrite(target, intent.clone())
+            .await
             .map_err(TerminalError::failed)?;
         Self::run_rewrite_session_terminal(session, intent)
+            .await
             .map(AutomaticMaintenanceOutcome::into_action_outcome)
     }
 
-    fn run_rewrite_session_terminal(
+    async fn run_rewrite_session_terminal(
         mut session: Box<dyn DistributedRewriteSession + '_>,
         intent: RewriteIntent,
     ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
@@ -436,39 +562,60 @@ impl TableMaintenanceProduct {
                 .map_err(TerminalError::pre_dispatch_failed);
         }
         for ordinal in 0..plan.cohort_count {
-            if let Err(error) = session.execute_cohort(ordinal) {
-                return abort_rewrite_terminal(session.as_mut(), error);
+            if let Err(error) = session.execute_cohort(ordinal).await {
+                return abort_rewrite_terminal(session.as_mut(), error).await;
             }
         }
         // A plain error cannot prove that a dispatched provider commit was
         // unapplied. Only a typed KnownUncommitted receipt grants that fact.
-        match session.commit().map_err(TerminalError::commit_unknown)? {
+        match session
+            .commit()
+            .await
+            .map_err(|failure| failure.into_terminal(TerminalError::commit_unknown))?
+        {
             RewriteCommit::KnownCommitted {
+                effect,
                 finalization_failed: Some(error),
-            } => Err(TerminalError::known_committed_finalization_failed(format!(
-                "distributed optimize committed but finalization failed: {error}"
-            ))),
+            } => {
+                let message =
+                    format!("distributed optimize committed but finalization failed: {error}");
+                Err(error
+                    .with_message(message)
+                    .into_terminal(TerminalError::known_committed_finalization_failed)
+                    .with_effect(effect))
+            }
             RewriteCommit::KnownCommitted {
+                effect,
                 finalization_failed: None,
             } => rewrite_outcome(
                 intent,
-                Some(
-                    session
-                        .finalize_committed()
-                        .map_err(TerminalError::known_committed_finalization_failed)?,
-                ),
+                Some(session.finalize_committed().await.map_err(|e| {
+                    e.into_terminal(TerminalError::known_committed_finalization_failed)
+                        .with_effect(effect)
+                })?),
                 plan,
             )
-            .map(AutomaticMaintenanceOutcome::KnownCommitted)
-            .map_err(TerminalError::known_committed_finalization_failed),
+            .map(|outcome| match effect {
+                novarocks_coordination_contract::ExecutionEffect::External => {
+                    AutomaticMaintenanceOutcome::KnownCommitted(outcome)
+                }
+                novarocks_coordination_contract::ExecutionEffect::None => {
+                    AutomaticMaintenanceOutcome::NoOpWithoutCommit(outcome)
+                }
+            })
+            .map_err(|e| TerminalError::known_committed_finalization_failed(e).with_effect(effect)),
             RewriteCommit::KnownUncommitted { failure } => {
                 let message = format!("distributed rewrite commit was not applied: {failure}");
-                abort_rewrite_known_uncommitted(session.as_mut(), message)
+                abort_rewrite_known_uncommitted(session.as_mut(), failure.with_message(message))
+                    .await
             }
             RewriteCommit::CommitUnknown { failure } => {
-                Err(TerminalError::commit_unknown(format!(
+                let message = format!(
                     "distributed rewrite commit outcome is unknown: {failure}; do not retry automatically"
-                )))
+                );
+                Err(failure
+                    .with_message(message)
+                    .into_terminal(TerminalError::commit_unknown))
             }
         }
     }
@@ -478,12 +625,13 @@ impl TableMaintenanceProduct {
         effects: &P,
         target: MaintenanceTarget,
         older_than_ms: i64,
-    ) -> Result<MaintenanceActionOutcome, String> {
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
         let _permit = self
             .acquire_activity(&target, MaintenanceActivityFamily::Cleanup)
             .map_err(|error| error.to_string())?;
+        // This is only the owned-ref maturity policy, never a scan capability.
         let (now_ms, safe_gc_age_ms) = self.gc_timing(older_than_ms)?;
-        let mut session = effects.begin_cleanup(&target, older_than_ms)?;
+        let mut session = effects.begin_cleanup(&target, older_than_ms).await?;
         let candidates = session.candidates();
         let has_owned = candidates
             .iter()
@@ -492,7 +640,12 @@ impl TableMaintenanceProduct {
             .iter()
             .any(|candidate| matches!(candidate, CleanupCandidate::Object));
         if has_owned && has_objects {
-            return Err("cleanup discovery mixed owned-ref and object candidates".to_string());
+            return Err(TerminalError::pre_dispatch_failed(
+                "cleanup discovery mixed owned-ref and object candidates",
+            ));
+        }
+        if has_objects {
+            session.require_scanned_object_gc()?;
         }
         if has_owned {
             let observations = self.observations.as_ref().ok_or_else(|| {
@@ -500,29 +653,34 @@ impl TableMaintenanceProduct {
                     .to_string()
             })?;
             let indexes =
-                mature_owned_ref_indexes(observations, candidates, now_ms, safe_gc_age_ms).await?;
+                mature_owned_ref_indexes(effects, observations, candidates, now_ms, safe_gc_age_ms)
+                    .await?;
             if indexes.is_empty() {
                 return Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
                     orphan_file_locations: Vec::new(),
                 });
             }
-            session.select_owned_refs(&indexes)?;
+            session.select_owned_refs(&indexes).await?;
         }
-        match session.execute()? {
-            CleanupTerminal::KnownCommitted { locations } => {
+        match session.execute().await? {
+            CleanupTerminal::NoOp { locations } | CleanupTerminal::KnownCommitted { locations } => {
                 Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
                     orphan_file_locations: locations,
                 })
             }
-            CleanupTerminal::KnownUncommitted { failure } => {
-                Err(format!("orphan cleanup was not applied: {failure}"))
+            CleanupTerminal::KnownUncommitted { failure } => Err(TerminalError::known_uncommitted(
+                format!("orphan cleanup was not applied: {failure}"),
+            )),
+            CleanupTerminal::CommitUnknown { failure } => {
+                Err(TerminalError::commit_unknown(format!(
+                    "orphan cleanup dispatch outcome is unknown: {failure}; do not retry automatically"
+                )))
             }
-            CleanupTerminal::CommitUnknown { failure } => Err(format!(
-                "orphan cleanup dispatch outcome is unknown: {failure}; do not retry automatically"
-            )),
-            CleanupTerminal::KnownCommittedFinalizationFailed { failure } => Err(format!(
-                "orphan cleanup committed but finalization failed: {failure}"
-            )),
+            CleanupTerminal::KnownCommittedFinalizationFailed { failure } => {
+                Err(TerminalError::known_committed_finalization_failed(format!(
+                    "orphan cleanup committed but finalization failed: {failure}"
+                )))
+            }
         }
     }
 
@@ -546,12 +704,13 @@ impl TableMaintenanceProduct {
     }
 }
 
-async fn mature_owned_ref_indexes(
+async fn mature_owned_ref_indexes<P: TableMaintenanceEffectPort + ?Sized>(
+    effects: &P,
     observations: &GcOwnedRefObservationAccelerator,
     candidates: &[CleanupCandidate],
     now_ms: i64,
     safe_gc_age_ms: i64,
-) -> Result<Vec<usize>, String> {
+) -> Result<Vec<usize>, TerminalError> {
     let mut indexes = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
         let CleanupCandidate::OwnedRef(candidate) = candidate else {
@@ -567,10 +726,9 @@ async fn mature_owned_ref_indexes(
         )
         .map_err(|error| format!("build GC owned-ref observation failed: {error}"))?;
         if matches!(
-            observations
-                .observe(observation, now_ms, safe_gc_age_ms)
-                .await
-                .map_err(|error| format!("record GC owned-ref observation failed: {error}"))?,
+            effects
+                .observe_cleanup_owned_ref(observations, observation, now_ms, safe_gc_age_ms)
+                .await?,
             GcOwnedRefObservationDecision::Mature { .. }
         ) {
             indexes.push(index);
@@ -579,31 +737,75 @@ async fn mature_owned_ref_indexes(
     Ok(indexes)
 }
 
-fn abort_rewrite_terminal(
+async fn abort_rewrite_terminal(
     session: &mut dyn DistributedRewriteSession,
     error: TerminalError,
 ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
-    match session.abort(error.message.clone()) {
-        Ok(()) => Err(TerminalError::known_uncommitted(error.message)
+    let outcome = session.abort(error.message.clone()).await;
+    match outcome {
+        Ok(RewriteAbort::KnownUncommitted) => Err(TerminalError::known_uncommitted(error.message)
             .with_compile_control(error.compile_control)
-            .with_execution_failure(error.execution_failure)),
-        Err(abort) => Err(TerminalError::commit_unknown(format!(
-            "{error}; distributed rewrite abort failed: {abort}"
-        ))
-        .with_compile_control(error.compile_control)
-        .with_execution_failure(error.execution_failure)),
+            .with_execution_failure(error.execution_failure)
+            .with_failure_cause(error.failure_cause)),
+        Ok(RewriteAbort::KnownCommitted { effect }) => {
+            // Publication cannot rewrite the original computation cause into a
+            // necessary-finalization failure. Preserve the task/control cause.
+            let mut error = error.with_effect(effect);
+            if error.state == MaintenanceJobState::PreDispatchFailed {
+                error.state = MaintenanceJobState::Failed;
+            }
+            Err(error)
+        }
+        Ok(RewriteAbort::CommitUnknown { failure }) | Err(failure) => {
+            use novarocks_failure_contract::{FailureEvidence, FailureProjection};
+            let message = format!("{error}; distributed rewrite abort remains unknown: {failure}");
+            let refine = failure.cause().is_some_and(|cause| {
+                error.selected_failure_fact().is_none_or(|fact| {
+                    fact.evidence() == FailureEvidence::StopObservation
+                        && cause.failure_fact().evidence() == FailureEvidence::Originating
+                })
+            });
+            if refine {
+                Err(failure
+                    .with_message(message)
+                    .into_terminal(TerminalError::commit_unknown))
+            } else {
+                Err(TerminalError::commit_unknown(message)
+                    .with_compile_control(error.compile_control)
+                    .with_execution_failure(error.execution_failure)
+                    .with_failure_cause(error.failure_cause))
+            }
+        }
     }
 }
 
-fn abort_rewrite_known_uncommitted(
+async fn abort_rewrite_known_uncommitted(
     session: &mut dyn DistributedRewriteSession,
-    error: String,
+    error: RewriteFailure,
 ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
-    match session.abort(error.clone()) {
-        Ok(()) => Err(TerminalError::known_uncommitted(error)),
-        Err(abort) => Err(TerminalError::known_uncommitted(format!(
-            "{error}; distributed rewrite abort failed: {abort}"
-        ))),
+    // The same operation already proved KnownUncommitted. A failed cleanup
+    // observation cannot revoke that positive publication fact.
+    let abort = session.abort(error.to_string()).await;
+    match abort {
+        Ok(RewriteAbort::KnownUncommitted) => {
+            Err(error.into_terminal(TerminalError::known_uncommitted))
+        }
+        Ok(RewriteAbort::KnownCommitted { effect }) => {
+            let message = format!(
+                "{error}; same rewrite abort contradicts its proven KnownUncommitted frontier"
+            );
+            Err(error
+                .with_message(message)
+                .into_terminal(TerminalError::failed)
+                .with_effect(effect))
+        }
+        Ok(RewriteAbort::CommitUnknown { failure }) | Err(failure) => {
+            let message =
+                format!("{error}; original uncommitted cleanup remains pending: {failure}");
+            Err(error
+                .with_message(message)
+                .into_terminal(TerminalError::known_uncommitted))
+        }
     }
 }
 
@@ -667,7 +869,7 @@ fn rewrite_outcome(
     }
 }
 
-fn rewrite_position_delete_intent(
+pub fn rewrite_position_delete_intent(
     options: &std::collections::BTreeMap<String, String>,
     where_clause: Option<&str>,
 ) -> Result<RewriteIntent, String> {
@@ -757,53 +959,88 @@ mod tests {
             }
         }
 
-        fn execute_cohort(&mut self, _ordinal: usize) -> Result<(), TerminalError> {
-            Ok(())
+        fn execute_cohort<'a>(
+            &'a mut self,
+            _ordinal: usize,
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
+            Box::pin(async move { Ok(()) })
         }
 
-        fn commit(&mut self) -> Result<RewriteCommit, String> {
-            Ok(self.commit.clone())
+        fn commit<'a>(
+            &'a mut self,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteCommit, RewriteFailure>> {
+            Box::pin(async move { Ok(self.commit.clone()) })
         }
 
-        fn finalize_committed(&mut self) -> Result<RewriteReceiptFacts, String> {
-            Ok(RewriteReceiptFacts::default())
+        fn finalize_committed<'a>(
+            &'a mut self,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteReceiptFacts, RewriteFailure>>
+        {
+            Box::pin(async move { Ok(RewriteReceiptFacts::default()) })
         }
 
-        fn abort(&mut self, _reason: String) -> Result<(), String> {
-            self.aborted = true;
-            Ok(())
+        fn abort<'a>(
+            &'a mut self,
+            _reason: String,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteAbort, RewriteFailure>> {
+            Box::pin(async move {
+                self.aborted = true;
+                Ok(RewriteAbort::KnownUncommitted)
+            })
         }
     }
 
     impl TableMaintenanceEffectPort for FixedRewritePort {
-        fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
-            Ok(())
+        fn observe_cleanup_owned_ref<'a>(
+            &'a self,
+            _: &'a GcOwnedRefObservationAccelerator,
+            _: GcOwnedRefObservation,
+            _: i64,
+            _: i64,
+        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
+            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
+        }
+        fn reject_user_action_on_mv<'a>(
+            &'a self,
+            _target: &'a MaintenanceTarget,
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
+            Box::pin(async move { Ok(()) })
         }
 
-        fn execute_metadata(
-            &self,
+        fn execute_metadata<'a>(
+            &'a self,
             _request: MaintenanceActionRequest,
-        ) -> Result<MaintenanceActionOutcome, String> {
-            unreachable!("rewrite test never executes metadata")
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        {
+            Box::pin(async move { unreachable!("rewrite test never executes metadata") })
         }
 
         fn begin_rewrite<'a>(
             &'a self,
-            _target: &MaintenanceTarget,
+            _target: &'a MaintenanceTarget,
             _intent: RewriteIntent,
-        ) -> Result<Box<dyn DistributedRewriteSession + 'a>, String> {
-            Ok(Box::new(FixedRewriteSession {
-                commit: self.commit.clone(),
-                aborted: false,
-            }))
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn DistributedRewriteSession + 'a>, String>,
+        > {
+            Box::pin(async move {
+                Ok(Box::new(FixedRewriteSession {
+                    commit: self.commit.clone(),
+                    aborted: false,
+                })
+                    as Box<dyn DistributedRewriteSession + 'a>)
+            })
         }
 
         fn begin_cleanup<'a>(
             &'a self,
-            _target: &MaintenanceTarget,
+            _target: &'a MaintenanceTarget,
             _older_than_ms: i64,
-        ) -> Result<Box<dyn CleanupSession + 'a>, String> {
-            unreachable!("rewrite test never starts cleanup")
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
+        > {
+            Box::pin(async move { unreachable!("rewrite test never starts cleanup") })
         }
     }
 
@@ -818,8 +1055,8 @@ mod tests {
     struct AutomaticPort {
         seen: Mutex<Vec<MaintenanceEffectId>>,
         metadata: Result<AutomaticMaintenanceOutcome, TerminalError>,
-        commit: Result<RewriteCommit, String>,
-        finalization: Result<RewriteReceiptFacts, String>,
+        commit: Result<RewriteCommit, RewriteFailure>,
+        finalization: Result<RewriteReceiptFacts, RewriteFailure>,
         noop: bool,
     }
 
@@ -834,6 +1071,7 @@ mod tests {
                     },
                 )),
                 commit: Ok(RewriteCommit::KnownCommitted {
+                    effect: novarocks_coordination_contract::ExecutionEffect::External,
                     finalization_failed: None,
                 }),
                 finalization: Ok(RewriteReceiptFacts::default()),
@@ -850,8 +1088,8 @@ mod tests {
     }
 
     struct AutomaticSession {
-        commit: Result<RewriteCommit, String>,
-        finalization: Result<RewriteReceiptFacts, String>,
+        commit: Result<RewriteCommit, RewriteFailure>,
+        finalization: Result<RewriteReceiptFacts, RewriteFailure>,
         noop: bool,
     }
 
@@ -864,78 +1102,121 @@ mod tests {
             }
         }
 
-        fn execute_cohort(&mut self, _ordinal: usize) -> Result<(), TerminalError> {
-            Ok(())
+        fn execute_cohort<'a>(
+            &'a mut self,
+            _ordinal: usize,
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
+            Box::pin(async move { Ok(()) })
         }
 
-        fn commit(&mut self) -> Result<RewriteCommit, String> {
-            self.commit.clone()
+        fn commit<'a>(
+            &'a mut self,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteCommit, RewriteFailure>> {
+            Box::pin(async move { self.commit.clone() })
         }
 
-        fn finalize_committed(&mut self) -> Result<RewriteReceiptFacts, String> {
-            self.finalization.clone()
+        fn finalize_committed<'a>(
+            &'a mut self,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteReceiptFacts, RewriteFailure>>
+        {
+            Box::pin(async move { self.finalization.clone() })
         }
 
-        fn abort(&mut self, _reason: String) -> Result<(), String> {
-            Ok(())
+        fn abort<'a>(
+            &'a mut self,
+            _reason: String,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteAbort, RewriteFailure>> {
+            Box::pin(async move { Ok(RewriteAbort::KnownUncommitted) })
         }
     }
 
     impl TableMaintenanceEffectPort for AutomaticPort {
-        fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
-            Ok(())
+        fn observe_cleanup_owned_ref<'a>(
+            &'a self,
+            _: &'a GcOwnedRefObservationAccelerator,
+            _: GcOwnedRefObservation,
+            _: i64,
+            _: i64,
+        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
+            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
+        }
+        fn reject_user_action_on_mv<'a>(
+            &'a self,
+            _target: &'a MaintenanceTarget,
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
+            Box::pin(async move { Ok(()) })
         }
 
-        fn execute_metadata(
-            &self,
+        fn execute_metadata<'a>(
+            &'a self,
             _request: MaintenanceActionRequest,
-        ) -> Result<MaintenanceActionOutcome, String> {
-            unreachable!("automatic action must not use the user metadata port")
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        {
+            Box::pin(
+                async move { unreachable!("automatic action must not use the user metadata port") },
+            )
         }
 
-        fn execute_metadata_with_id(
-            &self,
+        fn execute_metadata_with_id<'a>(
+            &'a self,
             _request: MaintenanceActionRequest,
             effect_id: MaintenanceEffectId,
-        ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
-            self.seen
-                .lock()
-                .expect("test recorder is not poisoned")
-                .push(effect_id);
-            self.metadata.clone()
+        ) -> crate::product::MaintenanceFuture<'a, Result<AutomaticMaintenanceOutcome, TerminalError>>
+        {
+            Box::pin(async move {
+                self.seen
+                    .lock()
+                    .expect("test recorder is not poisoned")
+                    .push(effect_id);
+                self.metadata.clone()
+            })
         }
 
         fn begin_rewrite<'a>(
             &'a self,
-            _target: &MaintenanceTarget,
+            _target: &'a MaintenanceTarget,
             _intent: RewriteIntent,
-        ) -> Result<Box<dyn DistributedRewriteSession + 'a>, String> {
-            unreachable!("automatic action must not use the user rewrite port")
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn DistributedRewriteSession + 'a>, String>,
+        > {
+            Box::pin(
+                async move { unreachable!("automatic action must not use the user rewrite port") },
+            )
         }
 
         fn begin_rewrite_with_id<'a>(
             &'a self,
-            _target: &MaintenanceTarget,
+            _target: &'a MaintenanceTarget,
             _intent: RewriteIntent,
             effect_id: MaintenanceEffectId,
-        ) -> Result<Box<dyn DistributedRewriteSession + 'a>, TerminalError> {
-            self.seen
-                .lock()
-                .expect("test recorder is not poisoned")
-                .push(effect_id);
-            Ok(Box::new(AutomaticSession {
-                commit: self.commit.clone(),
-                finalization: self.finalization.clone(),
-                noop: self.noop,
-            }))
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn DistributedRewriteSession + 'a>, TerminalError>,
+        > {
+            Box::pin(async move {
+                self.seen
+                    .lock()
+                    .expect("test recorder is not poisoned")
+                    .push(effect_id);
+                Ok(Box::new(AutomaticSession {
+                    commit: self.commit.clone(),
+                    finalization: self.finalization.clone(),
+                    noop: self.noop,
+                })
+                    as Box<dyn DistributedRewriteSession + 'a>)
+            })
         }
 
         fn begin_cleanup<'a>(
             &'a self,
-            _target: &MaintenanceTarget,
+            _target: &'a MaintenanceTarget,
             _older_than_ms: i64,
-        ) -> Result<Box<dyn CleanupSession + 'a>, String> {
-            unreachable!("automatic action must not use cleanup")
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
+        > {
+            Box::pin(async move { unreachable!("automatic action must not use cleanup") })
         }
     }
 
@@ -1001,23 +1282,24 @@ mod tests {
         let cases = [
             (
                 Ok(RewriteCommit::KnownUncommitted {
-                    failure: "conflict".to_string(),
+                    failure: "conflict".into(),
                 }),
                 MaintenanceJobState::KnownUncommitted,
             ),
             (
                 Ok(RewriteCommit::CommitUnknown {
-                    failure: "receipt lost".to_string(),
+                    failure: "receipt lost".into(),
                 }),
                 MaintenanceJobState::CommitUnknown,
             ),
             (
-                Err("opaque dispatch failure".to_string()),
+                Err("opaque dispatch failure".into()),
                 MaintenanceJobState::CommitUnknown,
             ),
             (
                 Ok(RewriteCommit::KnownCommitted {
-                    finalization_failed: Some("finalize failed".to_string()),
+                    effect: novarocks_coordination_contract::ExecutionEffect::External,
+                    finalization_failed: Some("finalize failed".into()),
                 }),
                 MaintenanceJobState::KnownCommittedFinalizationFailed,
             ),
@@ -1036,7 +1318,7 @@ mod tests {
         }
 
         let port = AutomaticPort {
-            finalization: Err("projection unavailable".to_string()),
+            finalization: Err("projection unavailable".into()),
             ..AutomaticPort::new()
         };
         let error = product
@@ -1114,6 +1396,7 @@ mod tests {
             .execute_automatic_action(
                 &FixedRewritePort {
                     commit: RewriteCommit::KnownCommitted {
+                        effect: novarocks_coordination_contract::ExecutionEffect::External,
                         finalization_failed: None,
                     },
                 },
@@ -1132,7 +1415,7 @@ mod tests {
         let id = MaintenanceEffectId::from_bytes([14; 16]);
         let port = AutomaticPort {
             noop: true,
-            commit: Err("no-op must not dispatch a commit".to_string()),
+            commit: Err("no-op must not dispatch a commit".into()),
             ..AutomaticPort::new()
         };
         let outcome = product
@@ -1156,11 +1439,11 @@ mod tests {
         assert_eq!(port.seen(), vec![id]);
     }
 
-    #[test]
-    fn position_delete_noop_reports_known_zero_without_a_commit() {
+    #[tokio::test]
+    async fn position_delete_noop_reports_known_zero_without_a_commit() {
         let session = Box::new(AutomaticSession {
-            commit: Err("no-op must not dispatch a commit".to_string()),
-            finalization: Err("no-op must not finalize a commit".to_string()),
+            commit: Err("no-op must not dispatch a commit".into()),
+            finalization: Err("no-op must not finalize a commit".into()),
             noop: true,
         });
         let outcome = TableMaintenanceProduct::run_rewrite_session_terminal(
@@ -1170,6 +1453,7 @@ mod tests {
                 min_input_files: None,
             },
         )
+        .await
         .expect("no-op is a successful terminal without a commit");
         let AutomaticMaintenanceOutcome::NoOpWithoutCommit(
             MaintenanceActionOutcome::RewritePositionDeleteFiles {
@@ -1185,8 +1469,8 @@ mod tests {
         assert_eq!(added_delete_files_count, Some(0));
     }
 
-    #[test]
-    fn rewrite_unknown_output_is_not_converted_to_zero() {
+    #[tokio::test]
+    async fn rewrite_unknown_output_is_not_converted_to_zero() {
         let outcome = rewrite_outcome(
             RewriteIntent::DataFiles { rewrite_all: true },
             Some(RewriteReceiptFacts {
@@ -1216,44 +1500,47 @@ mod tests {
         assert_eq!(output_record_count, None);
     }
 
-    #[test]
-    fn position_delete_options_reject_zero_minimum() {
+    #[tokio::test]
+    async fn position_delete_options_reject_zero_minimum() {
         let mut options = std::collections::BTreeMap::new();
         options.insert("min-input-files".to_string(), "0".to_string());
         assert!(rewrite_position_delete_intent(&options, None).is_err());
     }
 
-    #[test]
-    fn rewrite_commit_unknown_is_a_product_terminal_not_a_retry() {
+    #[tokio::test]
+    async fn rewrite_commit_unknown_is_a_product_terminal_not_a_retry() {
         let product = TableMaintenanceProduct::new(None);
         let error = product
             .execute_rewrite_terminal(
                 &FixedRewritePort {
                     commit: RewriteCommit::CommitUnknown {
-                        failure: "receipt lost".to_string(),
+                        failure: "receipt lost".into(),
                     },
                 },
                 &target(),
                 RewriteIntent::DataFiles { rewrite_all: true },
             )
+            .await
             .expect_err("unknown commit cannot be reported as success");
         assert_eq!(error.state, MaintenanceJobState::CommitUnknown);
         assert!(error.message.contains("do not retry automatically"));
     }
 
-    #[test]
-    fn known_committed_finalization_failure_keeps_its_terminal_fact() {
+    #[tokio::test]
+    async fn known_committed_finalization_failure_keeps_its_terminal_fact() {
         let product = TableMaintenanceProduct::new(None);
         let error = product
             .execute_rewrite_terminal(
                 &FixedRewritePort {
                     commit: RewriteCommit::KnownCommitted {
-                        finalization_failed: Some("projection unavailable".to_string()),
+                        effect: novarocks_coordination_contract::ExecutionEffect::External,
+                        finalization_failed: Some("projection unavailable".into()),
                     },
                 },
                 &target(),
                 RewriteIntent::DataFiles { rewrite_all: true },
             )
+            .await
             .expect_err("known committed finalization failure is not plain failure");
         assert_eq!(
             error.state,
@@ -1277,31 +1564,46 @@ mod tests {
                 input_bytes: 1,
             }
         }
-        fn execute_cohort(&mut self, ordinal: usize) -> Result<(), TerminalError> {
-            assert_eq!(ordinal, 0);
-            self.calls.lock().unwrap().push("cohort");
-            Err(TerminalError::from_compile_control(self.control.clone())
-                .with_execution_failure(self.execution_failure.clone()))
+        fn execute_cohort<'a>(
+            &'a mut self,
+            ordinal: usize,
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
+            Box::pin(async move {
+                assert_eq!(ordinal, 0);
+                self.calls.lock().unwrap().push("cohort");
+                Err(TerminalError::from_compile_control(self.control.clone())
+                    .with_execution_failure(self.execution_failure.clone()))
+            })
         }
-        fn commit(&mut self) -> Result<RewriteCommit, String> {
-            panic!("a compilation failure must not commit")
+        fn commit<'a>(
+            &'a mut self,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteCommit, RewriteFailure>> {
+            Box::pin(async move { panic!("a compilation failure must not commit") })
         }
-        fn finalize_committed(&mut self) -> Result<RewriteReceiptFacts, String> {
-            panic!("a compilation failure must not finalize")
+        fn finalize_committed<'a>(
+            &'a mut self,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteReceiptFacts, RewriteFailure>>
+        {
+            Box::pin(async move { panic!("a compilation failure must not finalize") })
         }
-        fn abort(&mut self, reason: String) -> Result<(), String> {
-            assert_eq!(reason, self.control.to_string());
-            self.calls.lock().unwrap().push("abort");
-            if self.abort_fails {
-                Err("lost abort reply".into())
-            } else {
-                Ok(())
-            }
+        fn abort<'a>(
+            &'a mut self,
+            reason: String,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteAbort, RewriteFailure>> {
+            Box::pin(async move {
+                assert_eq!(reason, self.control.to_string());
+                self.calls.lock().unwrap().push("abort");
+                if self.abort_fails {
+                    Err("lost abort reply".into())
+                } else {
+                    Ok(RewriteAbort::KnownUncommitted)
+                }
+            })
         }
     }
 
-    #[test]
-    fn cohort_compilation_failure_aborts_once_and_retains_cause_and_disposition() {
+    #[tokio::test]
+    async fn cohort_compilation_failure_aborts_once_and_retains_cause_and_disposition() {
         use novarocks_type_contract::CompileControlError;
         for control in [
             CompileControlError::Cancelled,
@@ -1320,6 +1622,7 @@ mod tests {
                     Box::new(session),
                     RewriteIntent::DataFiles { rewrite_all: true },
                 )
+                .await
                 .unwrap_err();
                 assert_eq!(failure.compile_control, Some(control.clone()));
                 assert_eq!(
@@ -1335,8 +1638,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cohort_selected_failure_survives_abort_without_changing_publication_state_or_tail() {
+    #[tokio::test]
+    async fn cohort_selected_failure_survives_abort_without_changing_publication_state_or_tail() {
         let input =
             novarocks_query_application::session_error::QueryServiceError::from_compile_control(
                 novarocks_type_contract::CompileControlError::ResourceExhausted,
@@ -1356,6 +1659,7 @@ mod tests {
                 Box::new(session),
                 RewriteIntent::DataFiles { rewrite_all: true },
             )
+            .await
             .unwrap_err();
             assert_eq!(failure.execution_failure, Some(input.clone()));
             assert_eq!(
@@ -1378,8 +1682,8 @@ mod tests {
         noop: bool,
         cohort_fails: bool,
         abort_fails: bool,
-        commit: Result<RewriteCommit, String>,
-        finalization: Result<RewriteReceiptFacts, String>,
+        commit: Result<RewriteCommit, RewriteFailure>,
+        finalization: Result<RewriteReceiptFacts, RewriteFailure>,
     }
 
     struct ReleaseRewriteSession {
@@ -1388,8 +1692,8 @@ mod tests {
         noop: bool,
         cohort_fails: bool,
         abort_fails: bool,
-        commit: Result<RewriteCommit, String>,
-        finalization: Result<RewriteReceiptFacts, String>,
+        commit: Result<RewriteCommit, RewriteFailure>,
+        finalization: Result<RewriteReceiptFacts, RewriteFailure>,
     }
 
     impl DistributedRewriteSession for ReleaseRewriteSession {
@@ -1402,75 +1706,116 @@ mod tests {
             }
         }
 
-        fn execute_cohort(&mut self, ordinal: usize) -> Result<(), TerminalError> {
-            assert_eq!(ordinal, 0);
-            self.calls.lock().unwrap().push("cohort");
-            if self.cohort_fails {
-                Err(TerminalError::failed("cohort failed"))
-            } else {
-                Ok(())
-            }
+        fn execute_cohort<'a>(
+            &'a mut self,
+            ordinal: usize,
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
+            Box::pin(async move {
+                assert_eq!(ordinal, 0);
+                self.calls.lock().unwrap().push("cohort");
+                if self.cohort_fails {
+                    Err(TerminalError::failed("cohort failed"))
+                } else {
+                    Ok(())
+                }
+            })
         }
 
-        fn commit(&mut self) -> Result<RewriteCommit, String> {
-            self.calls.lock().unwrap().push("commit");
-            self.commit.clone()
+        fn commit<'a>(
+            &'a mut self,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteCommit, RewriteFailure>> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("commit");
+                self.commit.clone()
+            })
         }
 
-        fn finalize_committed(&mut self) -> Result<RewriteReceiptFacts, String> {
-            self.calls.lock().unwrap().push("finalize");
-            self.finalization.clone()
+        fn finalize_committed<'a>(
+            &'a mut self,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteReceiptFacts, RewriteFailure>>
+        {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("finalize");
+                self.finalization.clone()
+            })
         }
 
-        fn abort(&mut self, _reason: String) -> Result<(), String> {
-            self.calls.lock().unwrap().push("abort");
-            if self.abort_fails {
-                Err("abort reply lost".to_string())
-            } else {
-                Ok(())
-            }
+        fn abort<'a>(
+            &'a mut self,
+            _reason: String,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteAbort, RewriteFailure>> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("abort");
+                if self.abort_fails {
+                    Err("abort reply lost".into())
+                } else {
+                    Ok(RewriteAbort::KnownUncommitted)
+                }
+            })
         }
     }
 
     impl TableMaintenanceEffectPort for ReleaseRewritePort {
-        fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
-            Ok(())
+        fn observe_cleanup_owned_ref<'a>(
+            &'a self,
+            _: &'a GcOwnedRefObservationAccelerator,
+            _: GcOwnedRefObservation,
+            _: i64,
+            _: i64,
+        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
+            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
+        }
+        fn reject_user_action_on_mv<'a>(
+            &'a self,
+            _target: &'a MaintenanceTarget,
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
+            Box::pin(async move { Ok(()) })
         }
 
-        fn execute_metadata(
-            &self,
+        fn execute_metadata<'a>(
+            &'a self,
             _request: MaintenanceActionRequest,
-        ) -> Result<MaintenanceActionOutcome, String> {
-            unreachable!("release test never executes metadata")
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        {
+            Box::pin(async move { unreachable!("release test never executes metadata") })
         }
 
         fn begin_rewrite<'a>(
             &'a self,
-            _target: &MaintenanceTarget,
+            _target: &'a MaintenanceTarget,
             _intent: RewriteIntent,
-        ) -> Result<Box<dyn DistributedRewriteSession + 'a>, String> {
-            Ok(Box::new(ReleaseRewriteSession {
-                _content: self.content.lock().unwrap().take().expect("begin once"),
-                calls: self.calls.clone(),
-                noop: self.noop,
-                cohort_fails: self.cohort_fails,
-                abort_fails: self.abort_fails,
-                commit: self.commit.clone(),
-                finalization: self.finalization.clone(),
-            }))
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn DistributedRewriteSession + 'a>, String>,
+        > {
+            Box::pin(async move {
+                Ok(Box::new(ReleaseRewriteSession {
+                    _content: self.content.lock().unwrap().take().expect("begin once"),
+                    calls: self.calls.clone(),
+                    noop: self.noop,
+                    cohort_fails: self.cohort_fails,
+                    abort_fails: self.abort_fails,
+                    commit: self.commit.clone(),
+                    finalization: self.finalization.clone(),
+                })
+                    as Box<dyn DistributedRewriteSession + 'a>)
+            })
         }
 
         fn begin_cleanup<'a>(
             &'a self,
-            _target: &MaintenanceTarget,
+            _target: &'a MaintenanceTarget,
             _older_than_ms: i64,
-        ) -> Result<Box<dyn CleanupSession + 'a>, String> {
-            unreachable!("rewrite release test never starts cleanup")
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
+        > {
+            Box::pin(async move { unreachable!("rewrite release test never starts cleanup") })
         }
     }
 
-    #[test]
-    fn rewrite_terminal_paths_release_attempt_content() {
+    #[tokio::test]
+    async fn rewrite_terminal_paths_release_attempt_content() {
         let cases = [
             ("noop", None, vec!["plan"]),
             (
@@ -1535,24 +1880,26 @@ mod tests {
                 cohort_fails: name.starts_with("cohort"),
                 abort_fails: name.ends_with("abort failure"),
                 commit: match name {
-                    "commit error" => Err("commit reply lost".to_string()),
+                    "commit error" => Err("commit reply lost".into()),
                     "provider finalization failure" => Ok(RewriteCommit::KnownCommitted {
-                        finalization_failed: Some("provider finalize failed".to_string()),
+                        effect: novarocks_coordination_contract::ExecutionEffect::External,
+                        finalization_failed: Some("provider finalize failed".into()),
                     }),
                     "uncommitted" | "uncommitted abort failure" => {
                         Ok(RewriteCommit::KnownUncommitted {
-                            failure: "conflict".to_string(),
+                            failure: "conflict".into(),
                         })
                     }
                     "unknown" => Ok(RewriteCommit::CommitUnknown {
-                        failure: "receipt lost".to_string(),
+                        failure: "receipt lost".into(),
                     }),
                     _ => Ok(RewriteCommit::KnownCommitted {
+                        effect: novarocks_coordination_contract::ExecutionEffect::External,
                         finalization_failed: None,
                     }),
                 },
                 finalization: if name == "finalize error" {
-                    Err("projection unavailable".to_string())
+                    Err("projection unavailable".into())
                 } else {
                     Ok(RewriteReceiptFacts {
                         input_data_files: if name == "receipt projection error" {
@@ -1565,11 +1912,13 @@ mod tests {
                 },
             };
             assert!(weak.upgrade().is_some(), "{name}: fixture owns content");
-            let result = product.execute_rewrite_terminal(
-                &port,
-                &target(),
-                RewriteIntent::DataFiles { rewrite_all: true },
-            );
+            let result = product
+                .execute_rewrite_terminal(
+                    &port,
+                    &target(),
+                    RewriteIntent::DataFiles { rewrite_all: true },
+                )
+                .await;
             assert_eq!(
                 result.as_ref().err().map(|error| error.state),
                 expected_state,
@@ -1587,60 +1936,95 @@ mod tests {
     struct ReleaseCleanupPort {
         content: Mutex<Option<Arc<()>>>,
         executed: Arc<Mutex<bool>>,
-        terminal: Result<CleanupTerminal, String>,
+        terminal: Result<CleanupTerminal, TerminalError>,
+        object_candidates: bool,
     }
 
     struct ReleaseCleanupSession {
         _content: Arc<()>,
         executed: Arc<Mutex<bool>>,
-        terminal: Result<CleanupTerminal, String>,
+        terminal: Result<CleanupTerminal, TerminalError>,
+        object_candidates: bool,
     }
 
     impl CleanupSession for ReleaseCleanupSession {
         fn candidates(&self) -> &[CleanupCandidate] {
-            &[CleanupCandidate::Object]
+            if self.object_candidates {
+                &[CleanupCandidate::Object]
+            } else {
+                &[]
+            }
         }
 
-        fn select_owned_refs(&mut self, _candidate_indexes: &[usize]) -> Result<(), String> {
-            unreachable!("object cleanup has no owned refs")
+        fn select_owned_refs<'a>(
+            &'a mut self,
+            _candidate_indexes: &'a [usize],
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
+            Box::pin(async move { unreachable!("object cleanup has no owned refs") })
         }
 
-        fn execute(&mut self) -> Result<CleanupTerminal, String> {
-            *self.executed.lock().unwrap() = true;
-            self.terminal.clone()
+        fn execute<'a>(
+            &'a mut self,
+        ) -> crate::product::MaintenanceFuture<'a, Result<CleanupTerminal, TerminalError>> {
+            Box::pin(async move {
+                *self.executed.lock().unwrap() = true;
+                self.terminal.clone()
+            })
         }
     }
 
     impl TableMaintenanceEffectPort for ReleaseCleanupPort {
-        fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
-            Ok(())
+        fn observe_cleanup_owned_ref<'a>(
+            &'a self,
+            _: &'a GcOwnedRefObservationAccelerator,
+            _: GcOwnedRefObservation,
+            _: i64,
+            _: i64,
+        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
+            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
+        }
+        fn reject_user_action_on_mv<'a>(
+            &'a self,
+            _target: &'a MaintenanceTarget,
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
+            Box::pin(async move { Ok(()) })
         }
 
-        fn execute_metadata(
-            &self,
+        fn execute_metadata<'a>(
+            &'a self,
             _request: MaintenanceActionRequest,
-        ) -> Result<MaintenanceActionOutcome, String> {
-            unreachable!("cleanup release test never executes metadata")
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        {
+            Box::pin(async move { unreachable!("cleanup release test never executes metadata") })
         }
 
         fn begin_rewrite<'a>(
             &'a self,
-            _target: &MaintenanceTarget,
+            _target: &'a MaintenanceTarget,
             _intent: RewriteIntent,
-        ) -> Result<Box<dyn DistributedRewriteSession + 'a>, String> {
-            unreachable!("cleanup release test never starts rewrite")
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn DistributedRewriteSession + 'a>, String>,
+        > {
+            Box::pin(async move { unreachable!("cleanup release test never starts rewrite") })
         }
 
         fn begin_cleanup<'a>(
             &'a self,
-            _target: &MaintenanceTarget,
+            _target: &'a MaintenanceTarget,
             _older_than_ms: i64,
-        ) -> Result<Box<dyn CleanupSession + 'a>, String> {
-            Ok(Box::new(ReleaseCleanupSession {
-                _content: self.content.lock().unwrap().take().expect("begin once"),
-                executed: self.executed.clone(),
-                terminal: self.terminal.clone(),
-            }))
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
+        > {
+            Box::pin(async move {
+                Ok(Box::new(ReleaseCleanupSession {
+                    _content: self.content.lock().unwrap().take().expect("begin once"),
+                    executed: self.executed.clone(),
+                    terminal: self.terminal.clone(),
+                    object_candidates: self.object_candidates,
+                }) as Box<dyn CleanupSession + 'a>)
+            })
         }
     }
 
@@ -1648,30 +2032,38 @@ mod tests {
     async fn cleanup_terminal_paths_release_attempt_content() {
         let cases = [
             (
-                Ok(CleanupTerminal::KnownCommitted {
-                    locations: vec!["orphan.parquet".to_string()],
+                Ok(CleanupTerminal::NoOp {
+                    locations: Vec::new(),
                 }),
                 None,
             ),
             (
-                Err("cleanup execution failed".to_string()),
+                Ok(CleanupTerminal::KnownCommitted {
+                    locations: Vec::new(),
+                }),
+                None,
+            ),
+            (
+                Err(TerminalError::pre_dispatch_failed(
+                    "cleanup execution failed",
+                )),
                 Some("cleanup execution failed"),
             ),
             (
                 Ok(CleanupTerminal::KnownUncommitted {
-                    failure: "conflict".to_string(),
+                    failure: "conflict".into(),
                 }),
                 Some("orphan cleanup was not applied"),
             ),
             (
                 Ok(CleanupTerminal::CommitUnknown {
-                    failure: "receipt lost".to_string(),
+                    failure: "receipt lost".into(),
                 }),
                 Some("orphan cleanup dispatch outcome is unknown"),
             ),
             (
                 Ok(CleanupTerminal::KnownCommittedFinalizationFailed {
-                    failure: "projection unavailable".to_string(),
+                    failure: "projection unavailable".into(),
                 }),
                 Some("orphan cleanup committed but finalization failed"),
             ),
@@ -1684,6 +2076,7 @@ mod tests {
                 content: Mutex::new(Some(content)),
                 executed: Arc::new(Mutex::new(false)),
                 terminal,
+                object_candidates: false,
             };
             assert!(weak.upgrade().is_some(), "fixture owns content");
             let result = product
@@ -1706,7 +2099,7 @@ mod tests {
                 None => assert!(matches!(
                     result.as_ref().expect("cleanup committed"),
                     MaintenanceActionOutcome::RemoveOrphanFiles { orphan_file_locations }
-                        if orphan_file_locations == &["orphan.parquet".to_string()]
+                        if orphan_file_locations.is_empty()
                 )),
             }
             assert!(*port.executed.lock().unwrap(), "cleanup reached dispatch");
@@ -1717,4 +2110,294 @@ mod tests {
             );
         }
     }
+    #[derive(Debug)]
+    struct CleanupOrigin;
+    impl std::fmt::Display for CleanupOrigin {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original cleanup domain refusal")
+        }
+    }
+    impl std::error::Error for CleanupOrigin {}
+    impl novarocks_failure_contract::FailureProjection for CleanupOrigin {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            use novarocks_failure_contract::*;
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(31).unwrap()),
+            )
+        }
+    }
+    #[tokio::test]
+    async fn cleanup_product_preserves_original_cause_fact_and_effect() {
+        use novarocks_coordination_contract::ExecutionEffect;
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        let product = TableMaintenanceProduct::new(None).with_safe_gc_age(Duration::ZERO);
+        for state in [
+            MaintenanceJobState::KnownUncommitted,
+            MaintenanceJobState::CommitUnknown,
+            MaintenanceJobState::KnownCommittedFinalizationFailed,
+        ] {
+            let cause =
+                SharedFailureCause::from_static_detail(CleanupOrigin, "original cleanup refusal");
+            let original = match state {
+                MaintenanceJobState::KnownUncommitted => {
+                    TerminalError::known_uncommitted("original")
+                }
+                MaintenanceJobState::CommitUnknown => TerminalError::commit_unknown("original"),
+                _ => TerminalError::known_committed_finalization_failed("original"),
+            }
+            .with_failure_cause(Some(cause.clone()));
+            let expected_effect = original.effect;
+            let port = ReleaseCleanupPort {
+                content: Mutex::new(Some(Arc::new(()))),
+                executed: Arc::new(Mutex::new(false)),
+                terminal: Err(original),
+                object_candidates: false,
+            };
+            let actual = product
+                .execute_action(
+                    &port,
+                    MaintenanceActionRequest::RemoveOrphanFiles {
+                        target: target(),
+                        older_than_ms: 1,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(actual.state, state);
+            assert_eq!(actual.failure_cause.as_ref(), Some(&cause));
+            assert_eq!(actual.selected_failure_fact(), Some(cause.failure_fact()));
+            assert_eq!(actual.effect, expected_effect);
+            if state == MaintenanceJobState::KnownCommittedFinalizationFailed {
+                assert_eq!(actual.effect, Some(ExecutionEffect::External));
+            }
+            assert!(*port.executed.lock().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn unproven_object_cleanup_never_executes_even_with_safe_age() {
+        let product = TableMaintenanceProduct::new(None).with_safe_gc_age(Duration::ZERO);
+        let content = Arc::new(());
+        let weak = Arc::downgrade(&content);
+        let port = ReleaseCleanupPort {
+            content: Mutex::new(Some(content)),
+            executed: Arc::new(Mutex::new(false)),
+            terminal: Ok(CleanupTerminal::KnownCommitted {
+                locations: Vec::new(),
+            }),
+            object_candidates: true,
+        };
+        let error = product
+            .execute_action(
+                &port,
+                MaintenanceActionRequest::RemoveOrphanFiles {
+                    target: target(),
+                    older_than_ms: 1,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("scanned orphan cleanup is unsupported")
+        );
+        assert!(!*port.executed.lock().unwrap());
+        assert!(port.content.lock().unwrap().is_none());
+        assert!(
+            weak.upgrade().is_none(),
+            "refusal releases only the empty local test session"
+        );
+        let automatic = ReleaseCleanupPort {
+            content: Mutex::new(Some(Arc::new(()))),
+            executed: Arc::new(Mutex::new(false)),
+            terminal: Ok(CleanupTerminal::KnownCommitted {
+                locations: Vec::new(),
+            }),
+            object_candidates: true,
+        };
+        assert!(
+            product
+                .execute_automatic_action(
+                    &automatic,
+                    MaintenanceActionRequest::RemoveOrphanFiles {
+                        target: target(),
+                        older_than_ms: 1,
+                    },
+                    MaintenanceEffectId::from_bytes([6; 16])
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            automatic.content.lock().unwrap().is_some(),
+            "automatic entry must not begin discovery"
+        );
+        assert!(!*automatic.executed.lock().unwrap());
+    }
 }
+
+#[cfg(test)]
+mod async_metadata_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct GatedMetadata {
+        entered: AtomicBool,
+        release: tokio::sync::Notify,
+    }
+    impl TableMaintenanceEffectPort for GatedMetadata {
+        fn observe_cleanup_owned_ref<'a>(
+            &'a self,
+            _: &'a GcOwnedRefObservationAccelerator,
+            _: GcOwnedRefObservation,
+            _: i64,
+            _: i64,
+        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
+            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
+        }
+        fn reject_user_action_on_mv<'a>(
+            &'a self,
+            _: &'a MaintenanceTarget,
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
+            Box::pin(async move { Ok(()) })
+        }
+        fn execute_metadata<'a>(
+            &'a self,
+            _: MaintenanceActionRequest,
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        {
+            Box::pin(async move {
+                self.entered.store(true, Ordering::SeqCst);
+                self.release.notified().await;
+                Ok(MaintenanceActionOutcome::ExpireSnapshots {
+                    deleted_data_files_count: None,
+                    deleted_position_delete_files_count: None,
+                    deleted_equality_delete_files_count: None,
+                    deleted_manifest_files_count: None,
+                    deleted_manifest_lists_count: None,
+                    deleted_statistics_files_count: None,
+                })
+            })
+        }
+        fn begin_rewrite<'a>(
+            &'a self,
+            _: &'a MaintenanceTarget,
+            _: RewriteIntent,
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn DistributedRewriteSession + 'a>, String>,
+        > {
+            Box::pin(async move { panic!("metadata cannot enter rewrite") })
+        }
+        fn begin_cleanup<'a>(
+            &'a self,
+            _: &'a MaintenanceTarget,
+            _: i64,
+        ) -> crate::product::MaintenanceFuture<
+            'a,
+            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
+        > {
+            Box::pin(async move { panic!("metadata cannot enter cleanup") })
+        }
+    }
+    #[tokio::test]
+    async fn original_product_keeps_target_activity_across_actual_metadata_wait() {
+        let product = TableMaintenanceProduct::new(None);
+        let target = MaintenanceTarget {
+            catalog: "ice.main".into(),
+            namespace: "db".into(),
+            table: "orders".into(),
+        };
+        let port = Arc::new(GatedMetadata {
+            entered: AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut wait = Box::pin(product.execute_action(
+            port.as_ref(),
+            MaintenanceActionRequest::ExpireSnapshots {
+                target: target.clone(),
+                older_than_ms: Some(1),
+                retain_last: None,
+            },
+        ));
+        use std::future::Future;
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert!(port.entered.load(Ordering::SeqCst));
+        assert!(
+            product
+                .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
+                .is_err()
+        );
+        port.release.notify_one();
+        assert!(wait.await.is_ok());
+        assert!(
+            product
+                .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
+                .is_ok()
+        );
+    }
+    struct LateEffectSession {
+        effect: novarocks_coordination_contract::ExecutionEffect,
+    }
+    impl DistributedRewriteSession for LateEffectSession {
+        fn plan_facts(&self) -> RewritePlanFacts {
+            RewritePlanFacts {
+                noop: false,
+                cohort_count: 1,
+                input_bytes: 1,
+            }
+        }
+        fn execute_cohort<'a>(
+            &'a mut self,
+            _: usize,
+        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
+            Box::pin(async move { Err(TerminalError::failed("original Task failure")) })
+        }
+        fn commit<'a>(
+            &'a mut self,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteCommit, RewriteFailure>> {
+            Box::pin(async move { panic!("cohort failure cannot publish a second commit") })
+        }
+        fn finalize_committed<'a>(
+            &'a mut self,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteReceiptFacts, RewriteFailure>>
+        {
+            Box::pin(async move { panic!("Task failure is not a necessary-finalization failure") })
+        }
+        fn abort<'a>(
+            &'a mut self,
+            _: String,
+        ) -> crate::product::MaintenanceFuture<'a, Result<RewriteAbort, RewriteFailure>> {
+            Box::pin(async move {
+                Ok(RewriteAbort::KnownCommitted {
+                    effect: self.effect,
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn late_actual_effect_keeps_original_task_cause_and_distinguishes_noop() {
+        use novarocks_coordination_contract::ExecutionEffect;
+        for effect in [ExecutionEffect::External, ExecutionEffect::None] {
+            let error = TableMaintenanceProduct::run_rewrite_session_terminal(
+                Box::new(LateEffectSession { effect }),
+                RewriteIntent::DataFiles { rewrite_all: true },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.state, MaintenanceJobState::Failed);
+            assert_eq!(error.message, "original Task failure");
+            assert_eq!(error.effect, Some(effect));
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "product/gc_original_tests.rs"]
+mod gc_original_tests;

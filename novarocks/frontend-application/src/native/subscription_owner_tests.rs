@@ -18,7 +18,9 @@
 //! Original Tokio task/cause retirement component regressions.
 use super::*;
 use crate::task_execution::status_intake::{ObservationIntake, StatusIntakeWake};
-use novarocks_workload_control::{RootWork, WorkloadConfig, WorkloadControl};
+use novarocks_workload_control::{
+    RootWork, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+};
 use std::sync::{
     Condvar,
     atomic::{AtomicBool, Ordering},
@@ -26,6 +28,9 @@ use std::sync::{
 use std::time::Duration;
 
 fn work(limit: usize) -> (WorkloadControl, RootWork) {
+    work_class(limit, WorkClass::Query)
+}
+fn work_class(limit: usize, class: WorkClass) -> (WorkloadControl, RootWork) {
     let control = WorkloadControl::try_new_counted(WorkloadConfig {
         scope_records_limit: limit,
         root_limit: 1,
@@ -35,9 +40,7 @@ fn work(limit: usize) -> (WorkloadControl, RootWork) {
     .unwrap()
     .owner;
     control.mark_ready().unwrap();
-    let root = control
-        .try_begin_root(WorkRequest::new(WorkClass::Query))
-        .unwrap();
+    let root = control.try_begin_root(WorkRequest::new(class)).unwrap();
     (control, root)
 }
 fn finish_work(control: WorkloadControl, root: RootWork) {
@@ -129,6 +132,34 @@ impl Drop for RawPayload {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_subscription_responsibility_keeps_the_original_workload_class() {
+    for class in [
+        WorkClass::Query,
+        WorkClass::MaterializedView,
+        WorkClass::Statistics,
+        WorkClass::TableMaintenance,
+        WorkClass::Management,
+    ] {
+        let (control, root) = work_class(2, class);
+        let (mut owner, port) = owner(2);
+        let reserved = port.reserve(&root.owner.scope(), None, None).unwrap();
+        let snapshot = control.snapshot();
+        let child = snapshot
+            .scopes
+            .iter()
+            .find(|s| s.parent == Some(root.owner.scope().id()))
+            .unwrap();
+        assert_eq!(child.class, class);
+        drop(reserved);
+        let actual = owner
+            .drain_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        finish_work(control, root);
+        assert_eq!(actual, DrainObservation::Joined);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_reservation_drop_releases_only_unstarted_original_child() {
     let (control, root) = work(2);
     let (mut owner, port) = owner(2);
@@ -153,18 +184,35 @@ async fn empty_reservation_drop_releases_only_unstarted_original_child() {
 async fn requested_stop_joins_same_original_handle_before_child_completion() {
     let (control, root) = work(2);
     let (mut owner, port) = owner(2);
+    let (entered, original_entered) = tokio::sync::oneshot::channel();
     let lease = port
         .reserve(&root.owner.scope(), None, None)
         .unwrap()
-        .start(std::future::pending())
+        .start(async move {
+            entered.send(tokio::task::id()).unwrap();
+            std::future::pending::<()>().await;
+        })
         .unwrap();
-    let id = {
+    let original_id = tokio::time::timeout(Duration::from_secs(2), original_entered)
+        .await
+        .expect("the original subscription task must actually enter")
+        .unwrap();
+    let mut joined_id = None;
+    until(|| {
         let state = owner.core.state.lock().unwrap();
         match &state.records[lease.index].as_ref().unwrap().state {
-            OriginalState::Running(handle) => handle.id(),
-            _ => unreachable!(),
+            OriginalState::Running(handle) => {
+                joined_id = Some(handle.id());
+                true
+            }
+            // The reaper lends this SAME handle outside Core for each poll.
+            // Its temporary phase is not a terminal or a replacement task.
+            OriginalState::Polling => false,
+            _ => panic!("the entered pending original cannot retire before stop"),
         }
-    };
+    })
+    .await;
+    assert_eq!(joined_id, Some(original_id));
     lease.stop();
     drop(lease);
     let actual = owner
@@ -184,7 +232,6 @@ async fn requested_stop_joins_same_original_handle_before_child_completion() {
             .iter()
             .all(Option::is_none)
     );
-    let _actual_original_id = id;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -311,29 +358,69 @@ async fn original_panic_payload_destructor_is_actually_retired_before_scope_rele
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_lease_drop_cannot_abort_recycled_original_position() {
+    struct ReadyTracked(Arc<AtomicBool>);
+    impl Future for ReadyTracked {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> {
+            Poll::Ready(())
+        }
+    }
+    impl Drop for ReadyTracked {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     let (control, root) = work(2);
     let (mut owner, port) = owner(2);
-    let stale = port
-        .reserve(&root.owner.scope(), None, None)
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let reservation = port.reserve(&root.owner.scope(), None, None).unwrap();
+    let retained_backing = {
+        let state = owner.core.state.lock().unwrap();
+        Arc::clone(&state.records[reservation.index].as_ref().unwrap().backing)
+    };
+    let original_scope = retained_backing
+        .owner
+        .lock()
         .unwrap()
-        .start(async {})
+        .as_ref()
+        .unwrap()
+        .scope();
+    let future_destroyed = Arc::new(AtomicBool::new(false));
+    let stale = reservation
+        .start(ReadyTracked(Arc::clone(&future_destroyed)))
         .unwrap();
-    until(|| {
-        owner
-            .core
-            .state
-            .lock()
-            .unwrap()
-            .records
-            .iter()
-            .all(Option::is_none)
+    tokio::time::timeout_at(deadline.into(), async {
+        while owner.core.state.lock().unwrap().records[stale.index].is_some() {
+            tokio::task::yield_now().await;
+        }
     })
-    .await;
+    .await
+    .unwrap();
+    // A free role record does not release another owner's WorkScope. Retain
+    // the last real backing alias to make that interval deterministic.
+    let future_really_destroyed = future_destroyed.load(Ordering::Acquire);
+    let original_retired = retained_backing.retired.load(Ordering::Acquire);
+    let scope_still_registered = original_scope.check().is_ok();
+    let refused_before_actual_release = matches!(
+        port.reserve(&root.owner.scope(), None, None),
+        Err(RegistrationError::Work(WorkError::Capacity(
+            "scope records"
+        )))
+    );
+    drop(retained_backing);
+    tokio::time::timeout_at(deadline.into(), original_scope.wait_released())
+        .await
+        .unwrap();
+    let scope_really_released = matches!(original_scope.check(), Err(WorkError::Released));
+    // Reserve once after the actual authority reports release; do not retry
+    // capacity failures or infer this fact from the role-record vacancy.
     let live = port
         .reserve(&root.owner.scope(), None, None)
         .unwrap()
         .start(std::future::pending())
         .unwrap();
+    let reused_original_position = live.index == stale.index;
     let old_generation = stale.generation;
     let new_generation = live.generation;
     drop(stale);
@@ -342,11 +429,15 @@ async fn stale_lease_drop_cannot_abort_recycled_original_position() {
         .unwrap()
         .stop_requested;
     live.stop();
-    let actual = owner
-        .drain_until(Instant::now() + Duration::from_secs(2))
-        .await;
+    let actual = owner.drain_until(deadline).await;
     drop(live);
     finish_work(control, root);
+    assert!(future_really_destroyed);
+    assert!(original_retired);
+    assert!(scope_still_registered);
+    assert!(refused_before_actual_release);
+    assert!(scope_really_released);
+    assert!(reused_original_position);
     assert_ne!(old_generation, new_generation);
     assert!(!requested);
     assert_eq!(actual, DrainObservation::Joined);

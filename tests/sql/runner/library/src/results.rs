@@ -624,8 +624,7 @@ pub fn normalize_explain_timing_rows(rows: &[Vec<String>]) -> Vec<Vec<String>> {
 }
 
 pub fn step_allows_missing_expected_result(step: &SqlStep) -> bool {
-    step.meta.expect_error.is_some()
-        || step.meta.expect_error_code.is_some()
+    step.meta.has_error_expectation()
         || step.meta.skip_result_check
         || step.meta.query_stats_contract.is_some()
         || !step.meta.result_contains.is_empty()
@@ -933,6 +932,44 @@ mod expected_error_code_result_classification_tests {
         });
 
         assert!(!step_requires_recorded_result(&step));
+    }
+
+    #[test]
+    fn sql_error_assertions_allow_missing_recorded_results() {
+        for meta in [
+            QueryMeta {
+                expect_sql_code: Some("query.execution.unsupported".to_string()),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                expect_sql_phase: Some(crate::sql_error_codes::SqlErrorPhase::Execution),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                expect_error_at: Some(SqlErrorLocation { line: 2, column: 3 }),
+                ..QueryMeta::default()
+            },
+        ] {
+            let step = step_with_meta(meta);
+
+            assert!(step.meta.has_error_expectation());
+            assert!(step_allows_missing_expected_result(&step));
+            assert!(!step_requires_recorded_result(&step));
+        }
+    }
+
+    #[test]
+    fn error_tier_alone_does_not_waive_a_recorded_result() {
+        for tier in [SqlErrorTier::Drift, SqlErrorTier::Target] {
+            let step = step_with_meta(QueryMeta {
+                expect_error_tier: Some(tier),
+                ..QueryMeta::default()
+            });
+
+            assert!(!step.meta.has_error_expectation());
+            assert!(!step_allows_missing_expected_result(&step));
+            assert!(step_requires_recorded_result(&step));
+        }
     }
 
     #[test]

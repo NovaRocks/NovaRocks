@@ -78,6 +78,7 @@ impl ResultField {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResultSchema {
     fields: Arc<[ResultField]>,
+    client_render: Option<Arc<novarocks_result_contract::ClientRenderSchema>>,
 }
 
 /// Fully materialized immediate query output owned by the query application.
@@ -233,7 +234,21 @@ impl ResultSchema {
     pub fn new(fields: impl Into<Arc<[ResultField]>>) -> Self {
         Self {
             fields: fields.into(),
+            client_render: None,
         }
+    }
+
+    /// Preserve the completed root's original presentation declaration.
+    pub(crate) fn with_client_render(
+        mut self,
+        schema: novarocks_result_contract::ClientRenderSchema,
+    ) -> Self {
+        self.client_render = Some(Arc::new(schema));
+        self
+    }
+
+    pub fn client_render(&self) -> Option<&novarocks_result_contract::ClientRenderSchema> {
+        self.client_render.as_deref()
     }
 
     pub fn fields(&self) -> &[ResultField] {
@@ -261,12 +276,12 @@ pub(crate) enum ResultDeliveryDisposition {
 
 pub(crate) type ResultDeliveryReceipt = oneshot::Receiver<ResultDeliveryDisposition>;
 
-struct DeliverySignal {
+pub(crate) struct DeliverySignal {
     sender: Option<oneshot::Sender<ResultDeliveryDisposition>>,
 }
 
 impl DeliverySignal {
-    fn channel() -> (Self, ResultDeliveryReceipt) {
+    pub(crate) fn channel() -> (Self, ResultDeliveryReceipt) {
         let (sender, receiver) = oneshot::channel();
         (
             Self {
@@ -276,7 +291,7 @@ impl DeliverySignal {
         )
     }
 
-    fn finish(&mut self, disposition: ResultDeliveryDisposition) {
+    pub(crate) fn finish(&mut self, disposition: ResultDeliveryDisposition) {
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(disposition);
         }
@@ -445,6 +460,23 @@ pub struct RootSegmentDelivery {
 }
 
 impl RootSegmentDelivery {
+    pub(crate) fn into_internal_parts(
+        mut self,
+    ) -> (
+        Arc<RetainedRootReply>,
+        DeliverySignal,
+        Option<super::RootRelayResidentWindow>,
+    ) {
+        let reply = self
+            .reply
+            .take()
+            .expect("an internal segment owns its original reply");
+        let signal = DeliverySignal {
+            sender: self.signal.sender.take(),
+        };
+        (reply, signal, self.resident_window.take())
+    }
+
     /// Original fallback delivery identity; no reply/guard/body alias is returned.
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     pub fn data_scalars(&self) -> Option<super::RootDataScalars> {
@@ -618,12 +650,19 @@ impl ResultFailureView {
 /// visibility remain exclusively in the logical execution actor. This value
 /// only reserves queue capacity and synchronously transfers an already
 /// authorized delivery into that slot.
-#[derive(Clone)]
-pub(crate) struct QueryResultTransport {
-    sender: mpsc::Sender<StreamMessage>,
+pub(crate) struct QueryResultTransport<T = ResultDelivery> {
+    sender: mpsc::Sender<T>,
 }
 
-impl std::fmt::Debug for QueryResultTransport {
+impl<T> Clone for QueryResultTransport<T> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for QueryResultTransport<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("QueryResultTransport")
@@ -633,12 +672,17 @@ impl std::fmt::Debug for QueryResultTransport {
     }
 }
 
-pub(crate) struct ResultQueuePermit {
-    permit: mpsc::OwnedPermit<StreamMessage>,
+pub(crate) struct ResultQueuePermit<T = ResultDelivery> {
+    permit: mpsc::OwnedPermit<T>,
 }
 
-impl QueryResultTransport {
-    pub(crate) async fn reserve_owned(&self) -> Result<ResultQueuePermit, QueryExecutionError> {
+impl<T> QueryResultTransport<T> {
+    pub(crate) fn channel(capacity: std::num::NonZeroUsize) -> (Self, mpsc::Receiver<T>) {
+        let (sender, receiver) = mpsc::channel(capacity.get());
+        (Self { sender }, receiver)
+    }
+
+    pub(crate) async fn reserve_owned(&self) -> Result<ResultQueuePermit<T>, QueryExecutionError> {
         self.sender
             .clone()
             .reserve_owned()
@@ -647,7 +691,7 @@ impl QueryResultTransport {
             .map_err(|_| ResultOwnerObservation::ConsumerClosed.into_error())
     }
 
-    pub(crate) fn enqueue(&self, permit: ResultQueuePermit, delivery: ResultDelivery) {
+    pub(crate) fn enqueue(&self, permit: ResultQueuePermit<T>, delivery: T) {
         permit.permit.send(delivery);
     }
 
@@ -783,7 +827,7 @@ fn client_body_error(error: novarocks_result_contract::ClientBodyError) -> Query
 
 /// These local channel observations grant no Task, Backend or physical-exit proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResultOwnerObservation {
+pub(crate) enum ResultOwnerObservation {
     FailureOwnerClosed,
     ConsumerClosed,
     QueueClosedBeforeEnd,
@@ -803,7 +847,7 @@ impl novarocks_execution_contract::failure::FailureProjection for ResultOwnerObs
     }
 }
 impl ResultOwnerObservation {
-    fn into_error(self) -> QueryExecutionError {
+    pub(crate) fn into_error(self) -> QueryExecutionError {
         use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
         use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
         let detail = match self {
@@ -1369,7 +1413,8 @@ mod tests {
 
     #[tokio::test]
     async fn queue_and_consumer_closure_are_distinct_local_stop_observations() {
-        use crate::{coordination::AttemptFailureClass, execution_error::ExecutionFailureSite};
+        use crate::execution_error::ExecutionFailureSite;
+        use novarocks_coordination_contract::AttemptFailureClass;
         use novarocks_execution_contract::failure::{FailureClass, FailureEvidence};
         let id = execution_id(6);
         let (transport, schema_receipt, failure_sender, mut stream) =

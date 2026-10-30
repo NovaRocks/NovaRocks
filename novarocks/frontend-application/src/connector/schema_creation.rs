@@ -43,21 +43,23 @@ pub(crate) fn with_schema_creation<T>(
     with_original_control(context.original_operation_control(), author)
 }
 
+fn observe_schema_control(
+    control: &ConnectorOperationControlView,
+) -> Result<(), CompileControlError> {
+    control.check_active().map_err(|cause| match cause.kind() {
+        ConnectorErrorKind::Cancelled => CompileControlError::Cancelled,
+        ConnectorErrorKind::DeadlineExceeded => CompileControlError::DeadlineExceeded,
+        _ => unreachable!("operation control exposed a non-control failure"),
+    })
+}
+
 fn with_original_control<T>(
     control: ConnectorOperationControlView,
     author: impl FnOnce(
         &mut ConnectorReadSchemaCreation<'_>,
     ) -> Result<T, PureProviderCompileError<ConnectorError>>,
 ) -> Result<T, PureProviderCompileError<ConnectorError>> {
-    let observe = || {
-        control.check_active().map_err(|cause| match cause.kind() {
-            ConnectorErrorKind::Cancelled => CompileControlError::Cancelled,
-            ConnectorErrorKind::DeadlineExceeded => CompileControlError::DeadlineExceeded,
-            // This view exposes only the original stop and deadline. It has
-            // no capacity or other failure-producing operation.
-            _ => unreachable!("operation control exposed a non-control failure"),
-        })
-    };
+    let observe = || observe_schema_control(&control);
     observe()?;
     let mut construction = |_: Layout| observe();
     let mut work = |_: usize| observe();
@@ -95,13 +97,19 @@ impl<T: ConnectorMetadata + ?Sized> FrontendSchemaLoad for T {
     }
 }
 
-pub(crate) fn load_write_table(
-    lease: &novarocks_spi::connector::ConnectorWriteLease,
+/// The async control path awaits only provider I/O. Synchronous creation
+/// observers are installed afterwards, at the same original schema author.
+pub(crate) async fn load_frontend_table_async(
+    metadata: &dyn ConnectorMetadata,
     request: ConnectorTableRequest,
 ) -> Result<ConnectorTableMetadata, ConnectorError> {
     let control = request.context.original_operation_control();
-    with_original_control(control, |creation| lease.load_table(request, creation))
-        .map_err(connector_schema_error)
+    observe_schema_control(&control).map_err(ConnectorError::compile_interruption)?;
+    let preparation = metadata.prepare_table(request).await?;
+    with_original_control(control, |creation| {
+        metadata.create_prepared_table(preparation, creation)
+    })
+    .map_err(connector_schema_error)
 }
 
 /// Project a typed preparation refusal at an existing ConnectorError boundary.
@@ -214,5 +222,117 @@ mod tests {
             failure,
             PureProviderCompileError::Control(CompileControlError::Cancelled,)
         ));
+    }
+    struct AsyncTableMetadata {
+        owner: novarocks_spi::connector::ConnectorInstanceId,
+        release: tokio::sync::Notify,
+        prepared: std::sync::atomic::AtomicUsize,
+        created: std::sync::atomic::AtomicUsize,
+    }
+    impl ConnectorMetadata for AsyncTableMetadata {
+        fn instance_id(&self) -> &novarocks_spi::connector::ConnectorInstanceId {
+            &self.owner
+        }
+        fn namespace_exists(
+            &self,
+            _: novarocks_spi::connector::ConnectorNamespaceRequest,
+        ) -> Result<bool, ConnectorError> {
+            unreachable!("not used by table load")
+        }
+        fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            unreachable!("not used by table load")
+        }
+        fn list_tables(
+            &self,
+            _: novarocks_spi::connector::ConnectorListTablesRequest,
+        ) -> Result<Vec<novarocks_spi::connector::ConnectorTableIdentity>, ConnectorError> {
+            unreachable!("not used by table load")
+        }
+        fn load_table(
+            &self,
+            _: ConnectorTableRequest,
+            _: &mut ConnectorReadSchemaCreation<'_>,
+        ) -> Result<ConnectorTableMetadata, PureProviderCompileError<ConnectorError>> {
+            panic!("async table preparation must not call the legacy joining load")
+        }
+        fn prepare_table(
+            &self,
+            request: ConnectorTableRequest,
+        ) -> novarocks_spi::connector::ConnectorTablePreparationFuture<'_> {
+            Box::pin(async move {
+                self.prepared
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.release.notified().await;
+                Ok(novarocks_spi::connector::ConnectorTablePreparation::new(
+                    self.owner.clone(),
+                    request.table,
+                ))
+            })
+        }
+        fn create_prepared_table(
+            &self,
+            preparation: novarocks_spi::connector::ConnectorTablePreparation,
+            creation: &mut ConnectorReadSchemaCreation<'_>,
+        ) -> Result<ConnectorTableMetadata, PureProviderCompileError<ConnectorError>> {
+            let identity = preparation
+                .into_facts::<novarocks_spi::connector::ConnectorTableIdentity>(&self.owner)?;
+            self.created
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            declared_test_metadata_with_creation(
+                novarocks_spi::connector::ConnectorTableMetadataHeader {
+                    identity,
+                    planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+                    definition_facts:
+                        novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
+                    version: None,
+                    statistics_data_version: None,
+                    table: novarocks_spi::connector::ConnectorTableHandle::try_new(
+                        self.owner.clone(),
+                        bytes::Bytes::from_static(b"same observed table"),
+                    )?,
+                },
+                std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+                Vec::new(),
+                creation,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn async_load_waits_for_observation_before_installing_sync_creation() {
+        use futures::FutureExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let owner = novarocks_spi::connector::ConnectorInstanceId::parse("two-phase").unwrap();
+        let provider = AsyncTableMetadata {
+            owner: owner.clone(),
+            release: tokio::sync::Notify::new(),
+            prepared: AtomicUsize::new(0),
+            created: AtomicUsize::new(0),
+        };
+        let identity = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: owner,
+            namespace: "db".into(),
+            table: "t".into(),
+        };
+        let request = ConnectorTableRequest {
+            table: identity.clone(),
+            resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            context: crate::connector::connector_request_context(
+                None,
+                ConnectorStopOwner::new().view(),
+            )
+            .unwrap(),
+        };
+        let mut load = Box::pin(load_frontend_table_async(&provider, request));
+        fn assert_send<T: Send>(_: &T) {}
+        assert_send(&load);
+        assert!(load.as_mut().now_or_never().is_none());
+        assert_eq!(provider.prepared.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.created.load(Ordering::SeqCst), 0);
+        provider.release.notify_one();
+        let table = load.await.unwrap();
+        assert_eq!(table.identity, identity);
+        assert_eq!(table.table.payload().as_ref(), b"same observed table");
+        assert_eq!(provider.created.load(Ordering::SeqCst), 1);
     }
 }

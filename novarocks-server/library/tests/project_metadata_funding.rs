@@ -368,10 +368,10 @@ fn project_original_compile_and_schema_aliases_keep_tagged_origin_to_cross_threa
                 .value_binding_at(0),
             Some(ty.typed_binding()),
         );
-        assert_eq!(first.metadata().capacity(), 0);
+        assert!(first.metadata().as_arc().is_none());
         if let DataType::Struct(children) = first.data_type() {
             for child in children {
-                assert_eq!(child.metadata().capacity(), 0);
+                assert!(child.metadata().as_arc().is_none());
             }
         }
         let PreparedProjectMetadataForTest {

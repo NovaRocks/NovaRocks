@@ -1,6 +1,6 @@
 ---
 name: workbench
-description: "Route engineering work through explicit stages, and maintain a durable engineering knowledge base. Development half: explain concepts read-only, discuss the problem, write an accepted spec, persist and approve an implementation plan, execute under a persistent goal, verify, then publish and archive only when separately authorized. Knowledge half: capture reproducible customer scenarios, first-hand debugging cases, and architecture decision records; look them up by symptom when a problem recurs. Use when the user asks to understand, start, continue, or drive a development task, when the correct stage is unclear, or when engineering knowledge should be recorded or retrieved."
+description: "Route engineering work through explicit stages, and maintain a durable engineering knowledge base. Development half: explain concepts read-only, discuss the problem, review the direction of a spec or plan read-only, write an accepted spec, persist and approve an implementation plan, execute under a persistent goal, verify, then publish and archive only when separately authorized. Knowledge half: capture reproducible customer scenarios, first-hand debugging cases, and architecture decision records; look them up by symptom when a problem recurs. Use when the user asks to understand, start, continue, or drive a development task, when the correct stage is unclear, or when engineering knowledge should be recorded or retrieved."
 ---
 
 # Workbench
@@ -36,6 +36,8 @@ description: "Route engineering work through explicit stages, and maintain a dur
 
 设计与测试以支持契约为边界：区分预期内失败和非预期缺陷，后者直接拒绝、报错，实际 bug 修复根因，避免特殊兼容与额外测试矩阵。
 判断方法与测试范围分别见 `references/workflow-contract.md` 第 2.1、8.4 节。
+方案取舍以长期路线为准：现有资产不是保留理由，对齐业界做法，不新增第三方补丁，新增硬上限必须写明依据；见同一
+contract 第 2.2 节。
 
 新增或实质扩展测试与验收材料时消费同一 contract 第 8.5–8.7 节：准入、采集与判断分工、最小证据和尝试保留。
 各阶段按适用 `AGENTS.md` 读取项目快照与材料约定；不另设逐例表单、runner 判据解析或人工门。
@@ -46,6 +48,7 @@ description: "Route engineering work through explicit stages, and maintain a dur
 |---|---|
 | 主要目标是从基础理解技术概念、内部机制、代码 / 架构 / plan 变化或数据流 | `$dev-workflow-explain-technical-concept` |
 | 问题、边界或方案尚未讨论清楚 | `$dev-workflow-discuss-design` |
+| 要评审、挑战或讨论某份 spec / umbrella / plan 的方向与思路（含修订后的后续轮次） | `$dev-workflow-review-spec-plan` |
 | 设计已明确接受，但尚无 spec | `$dev-workflow-write-spec` |
 | 多子任务 arc：要写或修订 umbrella 的整体路线（“umbrella plan”） | `$dev-workflow-write-spec`（路线写在 umbrella 内，不另建 plan） |
 | Umbrella 已接受，推进下一个子任务 | spec 仍是骨架：`$dev-workflow-write-spec` 细化；已细化：`$dev-workflow-plan` |
@@ -58,6 +61,8 @@ description: "Route engineering work through explicit stages, and maintain a dur
 如果用户显式指定某个阶段，直接进入该阶段；不要强迫完整重走前序流程，但必须检查该阶段所需输入是否存在。
 “完成了吗”“当前状态如何”等状态询问属于只读状态报告，不进入 finish，也不构成 commit、push、PR 或归档授权。
 技术讲解是可以从任意阶段进入的只读旁路，不改变 spec、plan、goal 或发布状态；讲解完成后返回原阶段。
+方向评审同样是只读旁路：只产出意见，不构成设计接受或计划批准；采纳的意见经 write-spec / plan 修订，推翻已接受
+方向的意见回到讨论阶段。
 知识操作同样是可以从任意阶段进入的旁路：`$ops-lookup` 只读；`$ops-capture` 只写 `DOC_ROOT/ops/`
 （以及项目自维护的 ADR 目录），二者都不改变当前开发阶段的状态。
 
@@ -110,6 +115,7 @@ verified --用户另行明确授权发布--> PR + archive
 
 - 技术讲解保持只读，先交付用户请求的解释；不得把理解请求当成 spec、plan 或实现授权。
 - 讨论阶段保持只读。
+- 方向评审保持只读，意见留在对话中；不改被评审文档，不改变其 `design_status` 或 plan `status`。
 - spec 阶段只写设计文档，不写 plan 或代码。
 - plan 阶段只规划，不实现。
 - execute 阶段实现与验证，可创建本地检查点 commit，但明确禁止 push 和 PR。

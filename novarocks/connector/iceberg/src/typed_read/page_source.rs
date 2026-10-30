@@ -2590,12 +2590,12 @@ mod tests {
             Field::new("id", DataType::Int64, false).with_metadata(
                 [(PARQUET_FIELD_ID_META_KEY.to_owned(), "1".to_owned())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
             Field::new("region", DataType::Utf8, true).with_metadata(
                 [(PARQUET_FIELD_ID_META_KEY.to_owned(), "2".to_owned())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         ]))
     }
@@ -2679,7 +2679,7 @@ mod tests {
             field.with_metadata(
                 [(PARQUET_FIELD_ID_META_KEY.to_owned(), field_id.to_string())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             )
         }
         Arc::new(ArrowSchema::new(vec![
@@ -3884,7 +3884,7 @@ mod tests {
             Field::new("region", DataType::Utf8, true).with_metadata(
                 [(PARQUET_FIELD_ID_META_KEY.to_owned(), "2".to_owned())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         ]));
         let batch = RecordBatch::try_new(

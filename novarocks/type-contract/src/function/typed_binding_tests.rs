@@ -72,8 +72,12 @@ fn nullable_projection_changes_only_selected_root() {
 #[test]
 fn declared_layout_constructor_does_not_read_nested_annotations() {
     let source = DataType::List(Arc::new(
-        Field::new("provider_item", DataType::Utf8, true)
-            .with_metadata([(crate::NR_LOGICAL_TYPE_KEY.into(), "unknown-tag".into())].into()),
+        Field::new("provider_item", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                crate::NR_LOGICAL_TYPE_KEY.into(),
+                "unknown-tag".into(),
+            )]),
+        ),
     ));
     let physical =
         FunctionValueType::try_with_logical_type(source, false, ValueLogicalType::Physical)

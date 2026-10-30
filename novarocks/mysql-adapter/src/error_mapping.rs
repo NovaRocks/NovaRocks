@@ -52,6 +52,7 @@ pub fn error_kind_for_domain_code(code: &str) -> Option<ErrorKind> {
         | "sql.admit.persisted_definition_semantics_unsupported"
         | "sql.admit.session_global_scope_unsupported"
         | "sql.admit.session_transaction_unsupported"
+        | "sql.admit.client_type_unsupported"
         | "sql.analyze.unsupported_expression"
         | "sql.analyze.unavailable_implementation"
         | "sql.analyze.unsupported_query_shape" => ErrorKind::ER_NOT_SUPPORTED_YET,

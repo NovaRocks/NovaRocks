@@ -114,6 +114,10 @@ fn run_frontend(
     memory_authority: Arc<MemoryAuthority>,
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
+    let filesystem = composition::compose_connector_file_planning_resources(
+        &role.config,
+        runtime.handle().clone(),
+    )?;
     let frontend = composition::compose_frontend_role_config(
         &role.config,
         build,
@@ -125,13 +129,18 @@ fn run_frontend(
         provider_manifest,
         memory_authority,
         runtime.handle().clone(),
+        filesystem,
         #[cfg(novarocks_dev_controls)]
         role.test_session.clone(),
     )?;
+    // The synchronous process aggregate owns Host before its borrowed role F.
+    let mut frontend_owner = {
+        let _entered = runtime.enter();
+        crate::roles::frontend::FrontendRoleOwner::prepare(frontend, runtime.handle().clone())?
+    };
     runtime
         .block_on(crate::roles::frontend::run_until_shutdown(
-            frontend,
-            runtime.handle().clone(),
+            &mut frontend_owner,
             termination_signal(),
         ))
         .map_err(|error| anyhow::anyhow!("role=fe: {error}"))
@@ -150,6 +159,10 @@ fn run_backend(
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&role.config);
+    let filesystem = composition::compose_connector_file_planning_resources(
+        &role.config,
+        runtime.handle().clone(),
+    )?;
     let scan_io = ScanIoRuntime::start(&role.config.runtime)?;
     let backend = match composition::compose_backend_server_config(
         &role.config,
@@ -161,6 +174,7 @@ fn run_backend(
         provider_manifest,
         memory_authority,
         runtime.handle().clone(),
+        filesystem,
         &scan_io.services(),
         #[cfg(novarocks_dev_controls)]
         role.test_session.clone(),
@@ -219,6 +233,10 @@ async fn run_all_in_one(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&be.config);
+    let fe_filesystem =
+        composition::compose_connector_file_planning_resources(&fe.config, runtime.clone())?;
+    let be_filesystem =
+        composition::compose_connector_file_planning_resources(&be.config, runtime.clone())?;
     let frontend = composition::compose_frontend_role_config(
         &fe.config,
         build,
@@ -231,6 +249,7 @@ async fn run_all_in_one(
         // Both roles consume the same authority: one OS process, one bound.
         Arc::clone(&memory_authority),
         runtime.clone(),
+        fe_filesystem,
         #[cfg(novarocks_dev_controls)]
         fe.test_session.clone(),
     )?;
@@ -245,6 +264,7 @@ async fn run_all_in_one(
         provider_manifest,
         memory_authority,
         runtime.clone(),
+        be_filesystem,
         &scan_io.services(),
         #[cfg(novarocks_dev_controls)]
         be.test_session.clone(),
@@ -263,11 +283,18 @@ async fn run_all_in_one(
     let backend_scan_io = scan_io.services();
     let (frontend_stop_tx, frontend_stop_rx) = tokio::sync::watch::channel(false);
     let (backend_stop_tx, backend_stop_rx) = tokio::sync::watch::channel(false);
-    let frontend_runtime = runtime.clone();
-    let frontend_run = async move {
+    let mut frontend_owner =
+        match crate::roles::frontend::FrontendRoleOwner::prepare(frontend, runtime.clone()) {
+            Ok(owner) => owner,
+            Err(error) => {
+                scan_io.shutdown().await?;
+                return Err(error.into());
+            }
+        };
+    // Owner stays in this existing process aggregate, outside the role F.
+    let frontend_run = async {
         crate::roles::frontend::run_until_shutdown(
-            frontend,
-            frontend_runtime,
+            &mut frontend_owner,
             wait_for_stop(frontend_stop_rx),
         )
         .await

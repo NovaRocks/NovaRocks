@@ -501,6 +501,39 @@ pub fn materialize_connector_read_table(
     })
 }
 
+/// Project an admitted query-local overlay into the local SQL namespace.
+/// The analyzer and planner share this logical relation name. The original
+/// request binding still restores the exact Provider identity and frozen read;
+/// neither the binding nor the scan kind/selector changes with the local name.
+/// It cannot substitute a different table or namespace behind that lookup.
+pub fn project_query_local_overlay_name(
+    mut materialization: crate::catalog::ResolvedAnalyzerTable,
+    namespace: &str,
+    table: &str,
+) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+    let identity = &materialization.catalog.identity;
+    if !identity.namespace.eq_ignore_ascii_case(namespace)
+        || !identity.table.eq_ignore_ascii_case(table)
+    {
+        return Err(format!(
+            "query-local overlay `{}` does not match `default_catalog.{namespace}.{table}`",
+            identity.fqn()
+        ));
+    }
+    let crate::planner::table::ScanSource::Sql(source) = &mut materialization.planner.source;
+    if source.table.catalog != identity.catalog
+        || source.table.namespace != identity.namespace
+        || source.table.table != identity.table
+    {
+        return Err("query-local overlay carries a different planner source identity".to_string());
+    }
+    // Project both SQL identity carriers together; the physical binding store
+    // retains the unchanged original materialization behind this same token.
+    source.table.catalog = "default_catalog".to_string();
+    materialization.catalog.identity.catalog = "default_catalog".to_string();
+    Ok(materialization)
+}
+
 /// Attach one application-reserved token to a local SQL relation.
 ///
 /// Local catalog relations have no connector authority, but their scan source
@@ -995,6 +1028,52 @@ mod tests {
             .expect("local materialization carries the replacement token");
         assert!(validate_materialization_binding(&local, original).is_err());
         assert_eq!(materialization_identity_facts(&local), identity);
+    }
+
+    #[test]
+    fn query_local_overlay_name_keeps_the_original_binding_and_scan_contract() {
+        let mut allocator = test_binding_allocator();
+        let binding = allocator.allocate().unwrap();
+        let original = connector_read_materialization(binding);
+        let projected = project_query_local_overlay_name(original.clone(), "ANALYTICS", "OrDeRs")
+            .expect("same relation in the query-local SQL catalog");
+        assert_eq!(
+            materialization_identity_facts(&projected).fqn(),
+            "default_catalog.analytics.orders"
+        );
+        assert_eq!(
+            materialization_identity_facts(&original).fqn(),
+            "ice.analytics.orders"
+        );
+        let (
+            crate::planner::table::ScanSource::Sql(projected_source),
+            crate::planner::table::ScanSource::Sql(original_source),
+        ) = (&projected.planner.source, &original.planner.source);
+        let mut expected_source = original_source.clone();
+        expected_source.table.catalog = "default_catalog".to_string();
+        assert_eq!(projected_source, &expected_source);
+        assert_eq!(projected.planner.name, original.planner.name);
+        assert_eq!(projected.catalog.columns, original.catalog.columns);
+        assert_eq!(table_binding_id(&projected), binding);
+    }
+
+    #[test]
+    fn query_local_overlay_name_refuses_a_different_relation() {
+        let mut allocator = test_binding_allocator();
+        let binding = allocator.allocate().unwrap();
+        let original = connector_read_materialization(binding);
+        assert!(project_query_local_overlay_name(original.clone(), "other", "orders").is_err());
+        assert!(project_query_local_overlay_name(original, "analytics", "customers").is_err());
+    }
+
+    #[test]
+    fn query_local_overlay_name_does_not_hide_a_mismatched_planner_source() {
+        let mut allocator = test_binding_allocator();
+        let binding = allocator.allocate().unwrap();
+        let mut original = connector_read_materialization(binding);
+        let crate::planner::table::ScanSource::Sql(source) = &mut original.planner.source;
+        source.table.catalog = "other".to_string();
+        assert!(project_query_local_overlay_name(original, "analytics", "orders").is_err());
     }
 
     #[test]

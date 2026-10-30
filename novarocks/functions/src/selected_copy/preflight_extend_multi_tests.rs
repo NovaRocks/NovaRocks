@@ -40,10 +40,12 @@ fn observed_copy(sources: &[ArrayRef], segments: &[ExtendSegment], capacity: usi
     for segment in segments {
         for _ in 0..segment.repeats {
             if segment.len != 0 {
-                mutable.extend(segment.source, segment.start, segment.start + segment.len);
+                mutable
+                    .try_extend(segment.source, segment.start, segment.start + segment.len)
+                    .unwrap();
             }
             if segment.nulls != 0 {
-                mutable.extend_nulls(segment.nulls);
+                mutable.try_extend_nulls(segment.nulls).unwrap();
             }
         }
     }
@@ -92,7 +94,10 @@ fn multi_extend_actual_nested_offsets_and_struct_field_metadata_match_arrow_conc
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             true,
         )
-        .with_metadata([("origin".to_string(), "frozen-field".to_string())].into()),
+        .with_metadata(std::collections::HashMap::<String, String>::from([(
+            "origin".to_string(),
+            "frozen-field".to_string(),
+        )])),
     );
     let fields: arrow_schema::Fields = vec![field.clone()].into();
     let a = list(
@@ -181,20 +186,26 @@ fn multi_extend_dictionary_constructor_tracks_actual_ptr_eq_and_full_unused_doma
         Err(CopyError::Extent(_))
     ));
     let data = [first.to_data(), second.to_data()];
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        MutableArrayData::new(data.iter().collect(), false, 0)
-    }))
-    .err()
-    .unwrap();
-    let message = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .unwrap();
-    assert_eq!(
-        message,
-        "MutableArrayData::new is infallible: DictionaryKeyOverflowError"
-    );
+    // The existing first-party extent admission above stays unchanged. The
+    // SDK now accepts all 128 i8 dictionary values (last index 127), so this
+    // historical boundary is no longer an actual SDK constructor error.
+    let constructed = MutableArrayData::try_new(data.iter().collect(), false, 0)
+        .unwrap()
+        .freeze();
+    assert_eq!(constructed.len(), 0);
+    assert_eq!(constructed.child_data()[0].len(), 128);
+
+    // Keep an actual SDK failure oracle at the first unrepresentable index.
+    let overflow = dictionary(Arc::new(StringArray::from(vec!["second"; 65])), vec![0]);
+    assert!(matches!(
+        preflight_extend_multi(&[first.as_ref(), overflow.as_ref()], &[], 0, |_| Ok(())),
+        Err(CopyError::Extent(_))
+    ));
+    let data = [first.to_data(), overflow.to_data()];
+    assert!(matches!(
+        MutableArrayData::try_new(data.iter().collect(), false, 0),
+        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError)
+    ));
 }
 #[test]
 fn multi_extend_view_constructor_remaps_actual_source_variadic_buffers() {
@@ -464,8 +475,13 @@ fn multi_extend_real_map_fixed_list_and_dense_sparse_union_match_original_concat
 fn multi_extend_frozen_field_metadata_refusal_and_actual_owned_shape_work_over_256() {
     let a: ArrayRef = Arc::new(StructArray::new(
         vec![Arc::new(
-            Field::new("item", DataType::Int16, false)
-                .with_metadata([("identity".to_string(), "first".to_string())].into()),
+            Field::new("item", DataType::Int16, false).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                "identity".to_string(),
+                "first".to_string(),
+            )])),
         )]
         .into(),
         vec![Arc::new(Int16Array::from(vec![1]))],
@@ -473,8 +489,13 @@ fn multi_extend_frozen_field_metadata_refusal_and_actual_owned_shape_work_over_2
     ));
     let b: ArrayRef = Arc::new(StructArray::new(
         vec![Arc::new(
-            Field::new("item", DataType::Int16, false)
-                .with_metadata([("identity".to_string(), "second".to_string())].into()),
+            Field::new("item", DataType::Int16, false).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                "identity".to_string(),
+                "second".to_string(),
+            )])),
         )]
         .into(),
         vec![Arc::new(Int16Array::from(vec![2]))],
@@ -514,4 +535,62 @@ fn multi_extend_frozen_field_metadata_refusal_and_actual_owned_shape_work_over_2
             .num_columns(),
         320
     );
+}
+
+#[test]
+fn multi_extend_union_padding_selects_first_nullable_field_and_sliced_sparse_rows() {
+    for dense in [false, true] {
+        let fields = arrow_schema::UnionFields::try_new(
+            [5, 99],
+            [
+                Field::new("required", DataType::Int64, false),
+                Field::new("nullable", DataType::Utf8, true),
+            ],
+        )
+        .unwrap();
+        let source: ArrayRef = Arc::new(
+            UnionArray::try_new(
+                fields,
+                vec![5_i8, 99, 5].into(),
+                dense.then(|| vec![0_i32, 0, 1].into()),
+                if dense {
+                    vec![
+                        Arc::new(arrow_array::Int64Array::from(vec![11, 22])),
+                        Arc::new(StringArray::from(vec!["selected"])),
+                    ]
+                } else {
+                    vec![
+                        Arc::new(arrow_array::Int64Array::from(vec![11, 0, 22])),
+                        Arc::new(StringArray::from(vec!["hidden", "selected", "unused"])),
+                    ]
+                },
+            )
+            .unwrap(),
+        );
+        let source = source.slice(1, 2);
+        let output = observed_copy(
+            &[source],
+            &[ExtendSegment {
+                nulls: 2,
+                ..segment(0, 0, 2)
+            }],
+            0,
+        );
+        let union = output.as_any().downcast_ref::<UnionArray>().unwrap();
+        assert_eq!(union.type_ids().as_ref(), &[99_i8, 5, 99, 99]);
+        let strings = union
+            .child(99)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(strings.value(union.value_offset(0)), "selected");
+        assert!(strings.is_null(union.value_offset(2)));
+        assert!(strings.is_null(union.value_offset(3)));
+        let ints = union
+            .child(5)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        assert_eq!(ints.value(union.value_offset(1)), 22);
+    }
 }

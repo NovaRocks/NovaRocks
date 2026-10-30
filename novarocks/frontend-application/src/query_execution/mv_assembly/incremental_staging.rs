@@ -17,40 +17,23 @@
 
 //! Production binding for frontend-owned incremental MV refresh writes.
 
-use std::sync::Arc;
-
-use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
+use novarocks_spi::connector::ConnectorControlPlanningLease;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use crate::query_execution::kernels::QueryPreparationKernel;
-use crate::query_execution::mv_assembly::iceberg_activation::{
-    begin_incremental_connector_write_session, release_mv_write_session_without_commit,
-};
-use crate::query_execution::mv_assembly::refresh_artifact::{
-    MvIncrementalExecutionArtifact, MvIncrementalWriteRequest, PreparedMvIncrementalWrite,
-};
-use crate::query_execution::mv_native_write::{
-    PreparedMvNativeWriteAssembly, prepare_completed_mv_write,
-};
 use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::write_session::ConnectorWriteSession;
-use novarocks_mv_application::product::{
-    MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
-};
-use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RewriteMergeRefreshEvidence {
+pub(crate) enum RewriteMergeRefreshEvidence {
     None,
     Aggregate,
     JoinAggregate,
     BranchUnionAggregate,
 }
 
-fn sql_imv_planning_input_from_rewrite(
+pub(crate) fn sql_imv_planning_input_from_rewrite(
     rewrite: &crate::mv::domain::rewrite::context::IcebergMvRewriteContext,
     target_binding: novarocks_sql::binding::SqlTableBindingId,
     evidence: RewriteMergeRefreshEvidence,
@@ -110,7 +93,7 @@ fn change_stream_routed_targets(
 }
 
 /// Project the session's sealed branches into the routes SQL compiles against.
-fn incremental_change_stream_routes(
+pub(crate) fn incremental_change_stream_routes(
     write_session: &ConnectorWriteSession,
     target: &crate::catalog_application::resolver::TargetBackend,
     target_bindings: &QueryTableBindingStore,
@@ -169,7 +152,7 @@ fn incremental_change_stream_routes(
     Ok(routes)
 }
 
-fn incremental_change_stream_statistics_targets(
+pub(crate) fn incremental_change_stream_statistics_targets(
     write_session: &ConnectorWriteSession,
 ) -> Result<Vec<novarocks_sql::planning::dml::DmlChangeStreamStatisticsTarget>, String> {
     write_session
@@ -187,318 +170,6 @@ fn incremental_change_stream_statistics_targets(
             )
         })
         .collect()
-}
-
-/// Activate a value-only incremental refresh artifact after frontend intent
-/// persistence and exact-lease admission. Core rebuilds only provider-private
-/// scan and writer facts here; it returns a sealed native-assembly carrier and
-/// never advances MV metadata or executes an external commit.
-pub(crate) fn bind_prepared_mv_incremental_staging(
-    query_kernel: &QueryPreparationKernel,
-    ports: &IcebergMvCorePorts,
-    prepared: PreparedMvIncrementalWrite,
-    planning_lease: &ConnectorControlPlanningLease,
-    exact_lease: &ConnectorWriteLease,
-    execution: &QueryExecutionContext,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
-    let (request, facts, mode, evidence, execution_artifact, publication_intent) =
-        prepared.into_parts();
-    if !exact_lease.matches_provider_binding_key(&request.observed_binding) {
-        return Err("MV incremental write lease drifted from prepared binding"
-            .to_string()
-            .into());
-    }
-    let refresh_rewrite = crate::query_execution::mv_assembly::first_refresh_staging::rebuild_frozen_mv_rewrite_context(
-        ports,
-        request.expected_target_snapshot_id,
-        &request.target_catalog,
-        &request.target_namespace,
-        &request.target_name,
-        &facts,
-        planning_lease,
-        &connector_context,
-    )?;
-    // The physical write schema the target's own binding produced, which is the
-    // same fact a first refresh signs its data input from.
-    let target_write_fields = &refresh_rewrite.target_write_fields;
-    // The session is opened before the plan is compiled because the plan's
-    // writer nodes carry the recipes it seals: a plan and the session that
-    // sealed it must not be separable.
-    let write_session = begin_incremental_connector_write_session(
-        &request,
-        request.target_table(),
-        &publication_intent,
-        mode,
-        target_write_fields,
-        connector_context.clone(),
-        exact_lease,
-        planning_lease,
-        query_kernel.typed_connector_control(),
-    )?;
-    match bind_incremental_write_dataflow(
-        query_kernel,
-        ports,
-        &request,
-        &refresh_rewrite,
-        &facts.affected_partitions,
-        mode,
-        evidence,
-        execution_artifact,
-        planning_lease,
-        execution,
-        &connector_context,
-        &write_session,
-    ) {
-        Ok(assembly) => Ok(assembly),
-        Err(error) => {
-            release_mv_write_session_without_commit(&write_session, &connector_context);
-            Err(error)
-        }
-    }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Binding an incremental dataflow needs each independently frozen rewrite, target, and session fact."
-)]
-fn bind_incremental_write_dataflow(
-    query_kernel: &QueryPreparationKernel,
-    ports: &IcebergMvCorePorts,
-    request: &MvIncrementalWriteRequest,
-    refresh_rewrite: &Arc<crate::mv::domain::rewrite::context::IcebergMvRewriteContext>,
-    affected_partitions: &crate::mv::domain::model::AffectedTargetPartitions,
-    mode: MvIncrementalWriteMode,
-    evidence: MvIncrementalRewriteEvidence,
-    execution_artifact: MvIncrementalExecutionArtifact,
-    planning_lease: &ConnectorControlPlanningLease,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: &Arc<ConnectorWriteSession>,
-) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
-    let target = crate::catalog_application::resolver::TargetBackend {
-        provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-            .expect("static Iceberg provider ID"),
-        catalog: request.target_catalog.clone(),
-        namespace: request.target_namespace.clone(),
-        table: request.target_name.clone(),
-    };
-    let target_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding = crate::query_execution::mv_assembly::query_local_bindings::bind_imv_target_query_table_in_store_from_rewrite(
-        refresh_rewrite,
-        &target_bindings,
-        planning_lease,
-        connector_context,
-        Some(affected_partitions),
-    )?;
-    // The recipes are sealed once, here, and travel with the plan they were
-    // sealed for, so an encode can never pair one round's plan with another's
-    // session.
-    let _sealed_write_targets = write_session
-        .seal_write_targets()
-        .map_err(|error| format!("seal MV incremental write targets: {error}"))?;
-    let sealed_change_stream_routes = incremental_change_stream_routes(
-        write_session,
-        &target,
-        target_bindings.as_ref(),
-        planning_lease,
-    )?;
-    let sealed_statistics_targets = incremental_change_stream_statistics_targets(write_session)?;
-    let rewrite_evidence = match evidence {
-        MvIncrementalRewriteEvidence::None => RewriteMergeRefreshEvidence::None,
-        MvIncrementalRewriteEvidence::Aggregate => RewriteMergeRefreshEvidence::Aggregate,
-        MvIncrementalRewriteEvidence::JoinAggregate => RewriteMergeRefreshEvidence::JoinAggregate,
-        MvIncrementalRewriteEvidence::BranchUnionAggregate => {
-            RewriteMergeRefreshEvidence::BranchUnionAggregate
-        }
-    };
-    match execution_artifact {
-        MvIncrementalExecutionArtifact::CanonicalQuery => {
-            let imv_rewrite_input = sql_imv_planning_input_from_rewrite(
-                refresh_rewrite,
-                target_binding,
-                rewrite_evidence,
-            )?;
-            let catalog_service_snapshot =
-                crate::catalog_application::query_catalog::catalog_service_snapshot(query_kernel);
-            let base_overlays = crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs(
-                ports.connector_control(),
-                connector_context,
-                refresh_rewrite,
-            )?;
-            let analyzer_catalog = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
-                None,
-                &catalog_service_snapshot,
-                Arc::clone(&target_bindings),
-                crate::catalog_application::query_materializer::iceberg_table_binding_loader(
-                    query_kernel.connector_control().as_ref(),
-                    connector_context.clone(),
-                ),
-                base_overlays,
-            );
-            let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
-            let write_mode = match mode {
-                MvIncrementalWriteMode::FastAppend => {
-                    novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::FastAppend
-                }
-                MvIncrementalWriteMode::RowDelta => {
-                    novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta
-                }
-            };
-            let compile_control =
-                crate::query_execution::planning::sql_compile_control_from_execution(execution);
-            let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_mv_incremental_refresh_change_stream(
-                novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalRefreshAnalyzeContext {
-                    canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
-                    imv_rewrite: imv_rewrite_input,
-                    write_mode,
-                    routes: sealed_change_stream_routes,
-                    current_catalog: None,
-                    current_database: refresh_rewrite.current_database.clone(),
-                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
-                    catalog: &catalog,
-                    functions: query_kernel.function_catalog().as_ref(),
-                    constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
-                    constant_policy: query_kernel.constant_policy(),
-                    control: compile_control.clone(),
-                },
-            )?;
-            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-                query_kernel,
-                analyzer_catalog.query_table_bindings(),
-                connector_context,
-            )?;
-            let finish_control = compile_control.clone();
-            let (completion, needs) = novarocks_sql::planning::mv::first_refresh::begin_final_mv_incremental_refresh_change_stream(
-                analyzed,
-                &statistics,
-                compile_control,
-                sealed_statistics_targets,
-                // Every writer is an ordinary dataflow node whose rows gather
-                // into one Root finish fragment; the session, not a terminal
-                // sink, owns the commit.
-                novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
-            )?;
-            prepare_completed_mv_write(
-                query_kernel,
-                execution,
-                target_bindings.as_ref(),
-                connector_context,
-                Arc::clone(write_session),
-                needs,
-                |version, dop, reads, targets| {
-                    completion
-                        .finish(
-                            novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
-                                novarocks_sql::planning::dml::DmlFinalPlanContext::new(
-                                    version, dop, reads,
-                                ),
-                                targets,
-                            ),
-                            &finish_control,
-                        )
-                        .map(|completed| completed.into_parts().0)
-                },
-                &finish_control,
-            )
-        }
-        MvIncrementalExecutionArtifact::JoinLogical {
-            mode: join_execution_mode,
-        } => {
-            let join_mode = match join_execution_mode {
-                MvIncrementalJoinMode::AppendOnly => {
-                    novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshMode::AppendOnly
-                }
-                MvIncrementalJoinMode::Coalesce => {
-                    novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshMode::Coalesce
-                }
-            };
-            let write_mode = match mode {
-                MvIncrementalWriteMode::FastAppend => {
-                    novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::FastAppend
-                }
-                MvIncrementalWriteMode::RowDelta => {
-                    novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta
-                }
-            };
-            let base_overlays = crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs(
-                ports.connector_control(),
-                connector_context,
-                refresh_rewrite,
-            )?;
-            let catalog_service_snapshot =
-                crate::catalog_application::query_catalog::catalog_service_snapshot(query_kernel);
-            let analyzer_catalog = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
-                None,
-                &catalog_service_snapshot,
-                Arc::clone(&target_bindings),
-                crate::catalog_application::query_materializer::iceberg_table_binding_loader(
-                    query_kernel.connector_control().as_ref(),
-                    connector_context.clone(),
-                ),
-                base_overlays,
-            );
-            let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
-            let compile_control =
-                crate::query_execution::planning::sql_compile_control_from_execution(execution);
-            let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_join_incremental_refresh_change_stream(
-                novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshAnalyzeContext {
-                    canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
-                    rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
-                    join_mode,
-                    write_mode,
-                    routes: sealed_change_stream_routes,
-                    current_catalog: None,
-                    current_database: refresh_rewrite.current_database.clone(),
-                    optimizer_settings: execution.optimizer_settings().clone(),
-                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
-                    catalog: &catalog,
-                    functions: query_kernel.function_catalog().as_ref(),
-                    constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
-                    constant_policy: query_kernel.constant_policy(),
-                    control: compile_control.clone(),
-                },
-            )?;
-            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-                query_kernel,
-                analyzer_catalog.query_table_bindings(),
-                connector_context,
-            )?;
-            let finish_control = compile_control.clone();
-            let (completion, needs) = novarocks_sql::planning::mv::first_refresh::begin_final_join_incremental_refresh_change_stream(
-                analyzed,
-                &statistics,
-                compile_control,
-                sealed_statistics_targets,
-                // Every writer is an ordinary dataflow node whose rows gather
-                // into one Root finish fragment; the session, not a terminal
-                // sink, owns the commit.
-                novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
-            )?;
-            prepare_completed_mv_write(
-                query_kernel,
-                execution,
-                target_bindings.as_ref(),
-                connector_context,
-                Arc::clone(write_session),
-                needs,
-                |version, dop, reads, targets| {
-                    completion
-                        .finish(
-                            novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
-                                novarocks_sql::planning::dml::DmlFinalPlanContext::new(
-                                    version, dop, reads,
-                                ),
-                                targets,
-                            ),
-                            &finish_control,
-                        )
-                        .map(|completed| completed.into_parts().0)
-                },
-                &finish_control,
-            )
-        }
-    }
 }
 
 #[cfg(test)]

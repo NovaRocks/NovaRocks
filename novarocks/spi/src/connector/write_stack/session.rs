@@ -58,6 +58,261 @@ use crate::connector::{
     StatisticsArtifactDraft, StatisticsRequiredAggregation,
 };
 
+/// An actual KnownCommitted receipt after its necessary finalization ended.
+/// Safe cleanup has its own original continuation and is absent from this fact.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ConnectorWriteNeededReady {
+    effect: crate::connector::ExternalMutationEffect,
+    receipt: ConnectorWriteReceipt,
+    finalization: crate::connector::ExternalMutationFinalization,
+}
+impl ConnectorWriteNeededReady {
+    /// Seal the actual provider verdict after its necessary finalization.
+    pub fn new(
+        effect: crate::connector::ExternalMutationEffect,
+        receipt: ConnectorWriteReceipt,
+        finalization: crate::connector::ExternalMutationFinalization,
+    ) -> Self {
+        Self {
+            effect,
+            receipt,
+            finalization,
+        }
+    }
+    /// Only a unique, not-yet-published fact can record a local settle failure.
+    pub fn finalization_mut(&mut self) -> &mut crate::connector::ExternalMutationFinalization {
+        &mut self.finalization
+    }
+    pub const fn effect(&self) -> crate::connector::ExternalMutationEffect {
+        self.effect
+    }
+    pub const fn receipt(&self) -> &ConnectorWriteReceipt {
+        &self.receipt
+    }
+    pub const fn finalization(&self) -> &crate::connector::ExternalMutationFinalization {
+        &self.finalization
+    }
+}
+/// Pending is an actual retained continuation, never an invented cleanup
+/// diagnostic. Only the original cleanup author records Observed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorWriteCleanupState {
+    Pending,
+    Observed(crate::connector::ExternalMutationFinalization),
+}
+/// The canonical committed business fact and its separate actual cleanup.
+/// The original Future, receiving and caller share ONE needed-ready Arc.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorWritePublicationCompletion {
+    KnownCommitted {
+        needed: Arc<ConnectorWriteNeededReady>,
+        cleanup: ConnectorWriteCleanupState,
+    },
+    KnownUncommitted {
+        failure: crate::connector::ConnectorMutationFailure,
+        cleanup: crate::connector::ExternalMutationFinalization,
+    },
+    CommitUnknown {
+        failure: crate::connector::ConnectorMutationFailure,
+        evidence: ExternalMutationEvidence,
+    },
+}
+impl ConnectorWritePublicationCompletion {
+    pub fn from_committed_frontier(
+        effect: crate::connector::ExternalMutationEffect,
+        receipt: ConnectorWriteReceipt,
+        finalization: crate::connector::ExternalMutationFinalization,
+    ) -> Self {
+        Self::KnownCommitted {
+            needed: Arc::new(ConnectorWriteNeededReady::new(
+                effect,
+                receipt,
+                finalization,
+            )),
+            cleanup: ConnectorWriteCleanupState::Pending,
+        }
+    }
+    /// Move the original fact. No receipt, partition Vec or failure is cloned.
+    pub fn from_outcome(outcome: ExternalMutationOutcome<ConnectorWriteReceipt>) -> Self {
+        match outcome {
+            ExternalMutationOutcome::KnownCommitted {
+                effect,
+                receipt,
+                finalization,
+                cleanup,
+            } => Self::KnownCommitted {
+                needed: Arc::new(ConnectorWriteNeededReady::new(
+                    effect,
+                    receipt,
+                    finalization,
+                )),
+                cleanup: ConnectorWriteCleanupState::Observed(cleanup),
+            },
+            ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
+                Self::KnownUncommitted { failure, cleanup }
+            }
+            ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
+                Self::CommitUnknown { failure, evidence }
+            }
+        }
+    }
+    /// Explicit legacy projection AFTER the original Future fully drained.
+    /// Governed publication Calls consume the shared completion directly and
+    /// never call this value-cloning migration entrance.
+    pub fn into_legacy_outcome(
+        self,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, Self> {
+        match self {
+            Self::KnownCommitted {
+                needed,
+                cleanup: ConnectorWriteCleanupState::Observed(cleanup),
+            } => {
+                let ConnectorWriteNeededReady {
+                    effect,
+                    receipt,
+                    finalization,
+                } = match Arc::try_unwrap(needed) {
+                    Ok(original) => original,
+                    Err(shared) => ConnectorWriteNeededReady {
+                        effect: shared.effect,
+                        receipt: shared.receipt.clone(),
+                        finalization: shared.finalization.clone(),
+                    },
+                };
+                Ok(ExternalMutationOutcome::KnownCommitted {
+                    effect,
+                    receipt,
+                    finalization,
+                    cleanup,
+                })
+            }
+            pending @ Self::KnownCommitted {
+                cleanup: ConnectorWriteCleanupState::Pending,
+                ..
+            } => Err(pending),
+            Self::KnownUncommitted { failure, cleanup } => {
+                Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup })
+            }
+            Self::CommitUnknown { failure, evidence } => {
+                Ok(ExternalMutationOutcome::CommitUnknown { failure, evidence })
+            }
+        }
+    }
+}
+#[derive(Default)]
+struct NeededReadyState {
+    ready: Option<Arc<ConnectorWriteNeededReady>>,
+    cleanup_permitted: bool,
+    waiter: Option<std::task::Waker>,
+}
+/// Original receiving storage. It grants no publication, operation or owner.
+#[derive(Default)]
+pub struct ConnectorWriteNeededReadyReceiving {
+    state: std::sync::Mutex<NeededReadyState>,
+}
+pub struct ConnectorWriteNeededHandoffNotice {
+    waiter: Option<std::task::Waker>,
+}
+impl ConnectorWriteNeededHandoffNotice {
+    pub fn notify(self) {
+        if let Some(waiter) = self.waiter {
+            waiter.wake();
+        }
+    }
+}
+impl ConnectorWriteNeededReadyReceiving {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    pub fn publish(&self, ready: Arc<ConnectorWriteNeededReady>) -> Result<(), ConnectorError> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.ready.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Write needed-ready fact was already published",
+            ));
+        }
+        state.ready = Some(ready);
+        Ok(())
+    }
+    /// Read-only observation is valid even after a poll/Drop failure. It does
+    /// not authorize cleanup, another dispatch, or source retirement.
+    pub fn observed(&self) -> Option<Arc<ConnectorWriteNeededReady>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .ready
+            .clone()
+    }
+    pub fn cleanup_is_permitted(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cleanup_permitted
+    }
+    /// Install the original typed fact before silently allowing the SAME
+    /// Provider Future to enter cleanup. Notify only outside every owner lock.
+    pub fn handoff_in(
+        &self,
+        target: &mut Option<Arc<ConnectorWriteNeededReady>>,
+    ) -> Result<ConnectorWriteNeededHandoffNotice, ConnectorError> {
+        if target.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Write needed-ready receiving target is occupied",
+            ));
+        }
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.cleanup_permitted {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Write needed-ready fact was already handed off",
+            ));
+        }
+        let ready = state
+            .ready
+            .as_ref()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Write needed-ready fact is not published",
+                )
+            })?
+            .clone();
+        *target = Some(ready);
+        state.cleanup_permitted = true;
+        Ok(ConnectorWriteNeededHandoffNotice {
+            waiter: state.waiter.take(),
+        })
+    }
+    pub fn poll_cleanup_permitted(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let registered = cx.waker().clone();
+        let retired = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.cleanup_permitted {
+                return std::task::Poll::Ready(());
+            }
+            state.waiter.replace(registered)
+        };
+        drop(retired);
+        std::task::Poll::Pending
+    }
+    pub async fn cleanup_permitted(&self) {
+        std::future::poll_fn(|cx| self.poll_cleanup_permitted(cx)).await
+    }
+    /// Actual SPI creator geometry, without creating a dummy receipt or Future.
+    pub fn known_layouts() -> Result<
+        [std::alloc::Layout; 2],
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        use novarocks_type_contract::owned_resources::layout::arc_layout;
+        Ok([
+            arc_layout(std::alloc::Layout::new::<Self>())?,
+            arc_layout(std::alloc::Layout::new::<ConnectorWriteNeededReady>())?,
+        ])
+    }
+}
+
 /// Cloneable FE planning facts for collect-on-write statistics on one logical
 /// write target.
 ///
@@ -1129,6 +1384,17 @@ pub struct ConnectorWriteFinishRequest<'a> {
     pub context: ConnectorRequestContext,
 }
 
+/// Borrowed view of the original stable finish packet. Polling or dropping a
+/// Provider future cannot destroy the caller's admitted input or authority.
+pub struct ConnectorWriteFinishRequestRef<'a> {
+    pub commit: &'a ConnectorWriteCommitHandle,
+    pub prepared: &'a ConnectorPreparedWriteSet,
+    pub statistics: &'a [WriteStatisticsArtifact],
+    pub publication: &'a ConnectorWriteFinishPublication,
+    pub context: &'a ConnectorRequestContext,
+    pub production: ConnectorWriteAbortProduction,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[expect(
     clippy::large_enum_variant,
@@ -1143,9 +1409,26 @@ pub enum ConnectorWriteFinishPublication {
 ///
 /// This is a known-uncommitted path: it may clean up provider-side staging, and
 /// it must never report a commit it did not observe.
+/// Original writer-production evidence, not an object-deletion capability.
+/// Only the frontend's stable Session can prove that no production was ever
+/// registered and that its complete received inventory is still empty.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorWriteAbortProduction {
+    NotStarted,
+    /// The original Session accepted every exact End on its own production
+    /// origin. This is not granted by constructing a prepared set: the caller
+    /// must retain the original received union and its provider binding.
+    CompleteReceived,
+    Unproven,
+}
+
 pub struct ConnectorWriteSessionAbortRequest<'a> {
     pub commit: &'a ConnectorWriteCommitHandle,
     pub context: ConnectorRequestContext,
+    pub production: ConnectorWriteAbortProduction,
+    /// Borrow only the original stable, complete received union. The Provider
+    /// additionally checks its own known-uncommitted state and exact binding.
+    pub received: Option<&'a ConnectorPreparedWriteSet>,
 }
 
 /// Resolve a commit whose external outcome is unknown.
@@ -1162,6 +1445,164 @@ pub struct ConnectorWriteSessionReconcileRequest<'a> {
 /// methods own external catalog effects. None is reachable from a backend role
 /// binding.
 pub trait ConnectorWriteControl: Send + Sync {
+    /// Initial selected routes of THIS original Rewrite-begin factory. This
+    /// reports no SDK layout, byte allowance or concurrency quota.
+    fn rewrite_begin_initial_dependencies(
+        &self,
+    ) -> Result<Vec<crate::connector::SharedDependency>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "selected Rewrite begin factory has no original route facts",
+        ))
+    }
+
+    /// Exact first-party Rewrite begin source of this selected generation.
+    /// This observation grants neither CPU nor I/O or payload capacity.
+    fn rewrite_begin_cpu_author(
+        &self,
+    ) -> Option<(
+        crate::connector::ConnectorProviderBindingKey,
+        std::any::TypeId,
+    )> {
+        None
+    }
+
+    /// Install the original source before any foreign poll. Preserve the SAME
+    /// scope, absolute deadline and retention through actual request/plan exit.
+    /// Refusal leaves both receiving slots unchanged; unsupported capability
+    /// never delegates to an ordinary or synchronous begin path.
+    fn prepare_rewrite_begin_source_in(
+        self: std::sync::Arc<Self>,
+        request: &mut Option<ConnectorWriteBeginRequest>,
+        original: crate::connector::ConnectorOriginalResultScope,
+        receiving: &mut Option<
+            std::sync::Arc<dyn crate::connector::ConnectorRewriteWriteBeginSource>,
+        >,
+    ) -> Result<(), ConnectorError> {
+        let _ = (request, original, receiving);
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "selected write control has no governed Rewrite begin source",
+        ))
+    }
+
+    /// Pure backing of the actual control factory and this exact generation's
+    /// selected routes. The caller adds its own source backing before admission.
+    /// This is a quote, never a grant.
+    fn io_profile(
+        &self,
+    ) -> Result<crate::connector::ConnectorMetadataMaintenanceIoProfile, ConnectorError>;
+
+    /// Pure observation of the original session's object responsibility.
+    /// Business completion, timeout and a lost waiter never prove disposal.
+    fn cleanup_responsibility(
+        &self,
+        commit: &ConnectorWriteCommitHandle,
+    ) -> Result<crate::connector::ConnectorMetadataCleanupResponsibility, ConnectorError>;
+
+    /// Observe only a finite finalization context already received by this
+    /// exact original session. This must never begin a grant or derive a new
+    /// deadline/stop. None is absence, not permission to use business control.
+    fn existing_finalization_context(
+        &self,
+        _commit: &ConnectorWriteCommitHandle,
+    ) -> Result<Option<ConnectorRequestContext>, ConnectorError> {
+        Ok(None)
+    }
+
+    /// Direct asynchronous control I/O. The original caller retains the
+    /// operation future; dropping a waiter is not a cancellation or exit fact.
+    fn begin_write_async(
+        &self,
+        request: ConnectorWriteBeginRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorWriteSessionPlan, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    >;
+
+    /// Checked COW admission preserves the caller's original result authority
+    /// across physical awaits. This is required and never delegates to ordinary begin.
+    fn begin_cow_write_checked_async(
+        &self,
+        request: ConnectorWriteBeginRequest,
+        original: crate::connector::ConnectorOriginalResultScope,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        crate::connector::ConnectorCowBeginPlan,
+                        crate::connector::ConnectorCowBeginFailure,
+                    >,
+                > + Send
+                + '_,
+        >,
+    >;
+
+    fn finish_write_async<'a>(
+        &'a self,
+        request: ConnectorWriteFinishRequestRef<'a>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError>,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    /// Same original finish, with its committed receipt handed off only after
+    /// needed finalization. The Future retains its actual cleanup until exit.
+    fn finish_write_with_needed_ready_async<'a>(
+        &'a self,
+        request: ConnectorWriteFinishRequestRef<'a>,
+        receiving: &'a ConnectorWriteNeededReadyReceiving,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ConnectorWritePublicationCompletion, ConnectorError>,
+                > + Send
+                + 'a,
+        >,
+    >;
+    /// The sole exact reconciliation uses the same needed-ready author.
+    fn reconcile_write_with_needed_ready_async<'a>(
+        &'a self,
+        request: ConnectorWriteSessionReconcileRequest<'a>,
+        receiving: &'a ConnectorWriteNeededReadyReceiving,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ConnectorWritePublicationCompletion, ConnectorError>,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    fn abort_write_async<'a>(
+        &'a self,
+        request: ConnectorWriteSessionAbortRequest<'a>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorWriteAbortOutcome, ConnectorError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    fn reconcile_write_async<'a>(
+        &'a self,
+        request: ConnectorWriteSessionReconcileRequest<'a>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError>,
+                > + Send
+                + 'a,
+        >,
+    >;
     fn binding_key(&self) -> &ConnectorProviderBindingKey;
 
     /// Complete all admission and freeze the write recipe. On return either a
@@ -1174,14 +1615,11 @@ pub trait ConnectorWriteControl: Send + Sync {
 
     /// First-party COW admission under the caller's original Internal window.
     /// Required: no default delegation to ordinary, unchecked begin_write.
-    /// existing_caller_upper is a truthful prospective caller receipt including
-    /// the neutral carrier, request and final FE session header coexistence.
-    /// Provider-owned allocations require their own borrowed phase recipes.
+    /// Provider capability checks and original request control remain required.
     fn begin_cow_write_checked(
         &self,
         request: ConnectorWriteBeginRequest,
         original: crate::connector::ConnectorOriginalResultScope,
-        existing_caller_upper: u64,
     ) -> Result<crate::connector::ConnectorCowBeginPlan, crate::connector::ConnectorCowBeginFailure>;
 
     /// Interpret every commit fragment and perform exactly one external commit.
@@ -1799,8 +2237,12 @@ mod tests {
             (arrow::datatypes::DataType::LargeBinary, "uuid"),
             (arrow::datatypes::DataType::FixedSizeBinary(16), "variant"),
         ] {
-            let field = arrow::datatypes::Field::new("v", carrier.clone(), true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), tag.to_owned())].into());
+            let field = arrow::datatypes::Field::new("v", carrier.clone(), true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    NR_LOGICAL_TYPE_KEY.to_owned(),
+                    tag.to_owned(),
+                )]),
+            );
             let value = FunctionValueType::new(carrier, true);
             let input = statistics_input_shape(field, value.clone());
             let contract = WriteStatisticsContract::try_new(
@@ -2197,6 +2639,120 @@ mod tests {
             .expect_err("partial coverage")
             .kind(),
             ConnectorErrorKind::InvalidRequest
+        );
+    }
+}
+
+#[cfg(test)]
+mod needed_ready_tests {
+    use super::*;
+    use crate::connector::{ExternalMutationEffect, ExternalMutationFinalization};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    fn actual_ready() -> Arc<ConnectorWriteNeededReady> {
+        let ConnectorWritePublicationCompletion::KnownCommitted { needed, .. } =
+            ConnectorWritePublicationCompletion::from_outcome(
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt: ConnectorWriteReceipt::try_new(bytes::Bytes::from_static(
+                        b"actual receipt",
+                    ))
+                    .unwrap(),
+                    finalization: ExternalMutationFinalization::Complete,
+                    cleanup: ExternalMutationFinalization::Complete,
+                },
+            )
+        else {
+            unreachable!()
+        };
+        needed
+    }
+    #[test]
+    fn canonical_frontier_moves_full_failure_and_payload_without_cloning_them() {
+        let payload = bytes::Bytes::from(vec![7; 128]);
+        let payload_pointer = payload.as_ptr();
+        let original_error = ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            String::from("original necessary finalization cause"),
+        );
+        let cause_pointer = original_error.message().as_ptr();
+        let completion = ConnectorWritePublicationCompletion::from_committed_frontier(
+            ExternalMutationEffect::Applied,
+            ConnectorWriteReceipt::try_new(payload).unwrap(),
+            ExternalMutationFinalization::Failed(
+                crate::connector::ConnectorMutationFailure::from_connector(original_error),
+            ),
+        );
+        let ConnectorWritePublicationCompletion::KnownCommitted { needed, cleanup } = &completion
+        else {
+            unreachable!()
+        };
+        assert_eq!(cleanup, &ConnectorWriteCleanupState::Pending);
+        assert_eq!(needed.receipt().payload().as_ptr(), payload_pointer);
+        let ExternalMutationFinalization::Failed(failure) = needed.finalization() else {
+            unreachable!()
+        };
+        assert_eq!(
+            failure.connector_source().unwrap().message().as_ptr(),
+            cause_pointer
+        );
+        let receiving = ConnectorWriteNeededReadyReceiving::new();
+        receiving.publish(Arc::clone(needed)).unwrap();
+        let mut stable = None;
+        receiving.handoff_in(&mut stable).unwrap().notify();
+        assert!(Arc::ptr_eq(needed, stable.as_ref().unwrap()));
+        // A retained frontier must never manufacture cleanup completion in a
+        // legacy result. Its real typed fact remains with the returned value.
+        assert!(matches!(
+            completion.into_legacy_outcome(),
+            Err(ConnectorWritePublicationCompletion::KnownCommitted {
+                cleanup: ConnectorWriteCleanupState::Pending,
+                ..
+            })
+        ));
+    }
+    struct PanicWake;
+    impl Wake for PanicWake {
+        fn wake(self: Arc<Self>) {
+            panic!("scripted original cleanup wake failed");
+        }
+    }
+    #[test]
+    fn handoff_stores_actual_fact_and_permission_before_foreign_wake() {
+        let receiving = ConnectorWriteNeededReadyReceiving::new();
+        let waker = Waker::from(Arc::new(PanicWake));
+        let mut cx = Context::from_waker(&waker);
+        receiving.publish(actual_ready()).unwrap();
+        assert_eq!(receiving.poll_cleanup_permitted(&mut cx), Poll::Pending);
+        let mut stable = None;
+        let notice = receiving.handoff_in(&mut stable).unwrap();
+        assert!(stable.is_some());
+        assert!(receiving.cleanup_is_permitted());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| notice.notify())).is_err()
+        );
+        assert!(Arc::ptr_eq(
+            stable.as_ref().unwrap(),
+            &receiving.observed().unwrap()
+        ));
+        assert_eq!(receiving.poll_cleanup_permitted(&mut cx), Poll::Ready(()));
+        assert!(receiving.handoff_in(&mut None).is_err());
+        assert!(receiving.publish(actual_ready()).is_err());
+    }
+    #[test]
+    fn absence_and_occupied_target_cannot_authorize_cleanup() {
+        let receiving = ConnectorWriteNeededReadyReceiving::new();
+        assert!(receiving.handoff_in(&mut None).is_err());
+        assert!(!receiving.cleanup_is_permitted());
+        receiving.publish(actual_ready()).unwrap();
+        let mut occupied = Some(actual_ready());
+        assert!(receiving.handoff_in(&mut occupied).is_err());
+        assert!(!receiving.cleanup_is_permitted());
+        assert_eq!(
+            ConnectorWriteNeededReadyReceiving::known_layouts()
+                .unwrap()
+                .len(),
+            2
         );
     }
 }

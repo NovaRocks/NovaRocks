@@ -38,6 +38,26 @@ pub enum CompileControlError {
     /// pure compiler keeps its cause/facts without acquiring runtime services.
     Source(novarocks_failure_contract::SharedFailureCause),
 }
+/// Semantic provenance captured from an actual compile-control error. This
+/// owns no originating error tree and is suitable for process-local history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompileControlProvenance {
+    Cancelled,
+    DeadlineExceeded,
+    ResourceExhausted,
+    Source(novarocks_failure_contract::FailureFact),
+}
+impl CompileControlError {
+    pub fn provenance(&self) -> CompileControlProvenance {
+        use novarocks_failure_contract::FailureProjection;
+        match self {
+            Self::Cancelled => CompileControlProvenance::Cancelled,
+            Self::DeadlineExceeded => CompileControlProvenance::DeadlineExceeded,
+            Self::ResourceExhausted => CompileControlProvenance::ResourceExhausted,
+            Self::Source(source) => CompileControlProvenance::Source(source.failure_fact()),
+        }
+    }
+}
 impl CompileControlError {
     pub fn detail(&self) -> &str {
         match self {

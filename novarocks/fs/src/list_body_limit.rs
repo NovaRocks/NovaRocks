@@ -17,8 +17,8 @@
 
 use futures::stream;
 use http::{Request, Response};
-use opendal::raw::{HttpBody, HttpClient, HttpFetch, Operation, oio::Read};
-use opendal::{Buffer, Error, ErrorKind};
+use opendal::raw::{Operation, oio::ReadStream};
+use opendal::{Buffer, Error, ErrorKind, HttpBody, HttpTransport, HttpTransporter};
 
 /// Per-response list body profile, independent of generic object reads.
 /// XML decoding and transport allocations remain third-party growth.
@@ -47,20 +47,20 @@ pub(crate) fn is_list_body_limit_exceeded(error: &(dyn std::error::Error + 'stat
     false
 }
 
-/// Wrap OpenDAL's existing reqwest fetcher through its public HTTP seam.
+/// Wrap OpenDAL's existing transport through its public HTTP seam.
 /// Signing credential acquisition keeps its separate reqwest client.
 pub(crate) struct ListBodyLimitFetch {
-    inner: HttpClient,
+    inner: HttpTransporter,
     limit: usize,
 }
 
 impl ListBodyLimitFetch {
-    pub(crate) fn new(inner: HttpClient, limit: usize) -> Self {
+    pub(crate) fn new(inner: HttpTransporter, limit: usize) -> Self {
         Self { inner, limit }
     }
 }
 
-impl HttpFetch for ListBodyLimitFetch {
+impl HttpTransport for ListBodyLimitFetch {
     async fn fetch(&self, request: Request<Buffer>) -> opendal::Result<Response<HttpBody>> {
         let is_list = request.extensions().get::<Operation>() == Some(&Operation::List);
         let response = self.inner.fetch(request).await?;
@@ -107,9 +107,9 @@ mod tests {
 
     use futures::stream;
     use http::{Request, Response};
-    use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer, RetryLayer, TimeoutLayer};
-    use opendal::raw::{HttpBody, HttpClient, HttpFetch, Operation};
-    use opendal::{Buffer, Operator};
+    use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
+    use opendal::raw::Operation;
+    use opendal::{Buffer, HttpBody, HttpTransport, HttpTransporter, Operator};
 
     use super::{ListBodyLimitFetch, is_list_body_limit_exceeded};
 
@@ -121,7 +121,7 @@ mod tests {
         operations: Arc<Mutex<Vec<Option<Operation>>>>,
     }
 
-    impl HttpFetch for RecordingFetch {
+    impl HttpTransport for RecordingFetch {
         async fn fetch(&self, request: Request<Buffer>) -> opendal::Result<Response<HttpBody>> {
             self.operations
                 .lock()
@@ -145,13 +145,13 @@ mod tests {
     fn operator(body: &'static [u8], cap: usize) -> (Operator, Arc<Mutex<Vec<Option<Operation>>>>) {
         let operations = Arc::new(Mutex::new(Vec::new()));
         let fetch = ListBodyLimitFetch::new(
-            HttpClient::with(RecordingFetch {
+            HttpTransporter::new(RecordingFetch {
                 body,
                 operations: Arc::clone(&operations),
             }),
             cap,
         );
-        // Use a remote endpoint: replacing the public HttpClient works for
+        // Use a remote endpoint: replacing the public HttpTransport works for
         // every S3 endpoint and does not depend on localhost detection.
         let operator = Operator::new(
             opendal::services::S3::default()
@@ -161,16 +161,19 @@ mod tests {
                 .access_key_id("key")
                 .secret_access_key("secret"),
         )
-        .unwrap()
-        .layer(HttpClientLayer::new(HttpClient::with(fetch)))
-        .layer(TimeoutLayer::new().with_timeout(Duration::from_secs(5)))
-        .layer(ConcurrentLimitLayer::new(1).with_http_concurrent_limit(1))
-        .layer(
-            RetryLayer::new()
-                .with_max_times(3)
-                .with_min_delay(Duration::from_millis(1)),
-        )
-        .finish();
+        .unwrap();
+        let context = operator
+            .base_context()
+            .with_http_transport(HttpTransporter::new(fetch));
+        let operator = operator
+            .with_context(context)
+            .layer(TimeoutLayer::new().with_timeout(Duration::from_secs(5)))
+            .layer(ConcurrentLimitLayer::new(1).with_http_concurrent_limit(1))
+            .layer(
+                RetryLayer::new()
+                    .with_max_times(3)
+                    .with_min_delay(Duration::from_millis(1)),
+            );
         (operator, operations)
     }
 
@@ -210,7 +213,7 @@ mod tests {
     async fn list_body_limit_preserves_unknown_operation_response() {
         let operations = Arc::new(Mutex::new(Vec::new()));
         let fetch = ListBodyLimitFetch::new(
-            HttpClient::with(RecordingFetch {
+            HttpTransporter::new(RecordingFetch {
                 body: XML,
                 operations: Arc::clone(&operations),
             }),

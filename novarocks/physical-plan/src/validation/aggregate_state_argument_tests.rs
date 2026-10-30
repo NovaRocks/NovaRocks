@@ -166,8 +166,12 @@ fn state_contract_preserves_nested_semantics_and_charges_actual_type_work() {
     let fields: Vec<_> = (0..320)
         .map(|index| {
             Arc::new(
-                Field::new(format!("field_{index}"), DataType::Utf8, false)
-                    .with_metadata([("provider.id".to_owned(), index.to_string())].into()),
+                Field::new(format!("field_{index}"), DataType::Utf8, false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider.id".to_owned(),
+                        index.to_string(),
+                    )]),
+                ),
             )
         })
         .collect();
@@ -200,7 +204,10 @@ fn state_contract_preserves_nested_semantics_and_charges_actual_type_work() {
                 1 => field
                     .as_ref()
                     .clone()
-                    .with_metadata([("provider.id".to_owned(), "foreign".to_owned())].into()),
+                    .with_metadata(std::collections::HashMap::<String, String>::from([(
+                        "provider.id".to_owned(),
+                        "foreign".to_owned(),
+                    )])),
                 _ => unreachable!(),
             });
             let mut wrong = b.clone();
