@@ -25,7 +25,7 @@
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
 use novarocks_spi::connector::{
-    ConnectorReadSelector, ConnectorRequestContext, MvCreateSourceObservation,
+    ConnectorReadSelector, ConnectorRequestContext, MvSourceSchemaObservation,
     MvStorageObservationPort,
 };
 use novarocks_sql::planning::mv::{
@@ -59,7 +59,7 @@ pub(crate) fn observe_mv_create_source_bindings_original(
         let metadata = binding.source_metadata.as_ref().ok_or_else(|| invalid(format!(
             "CREATE source occurrence {} was not admitted from exact provider metadata", relation.occurrence_id().get())))?;
         let lease = binding.admission.exact_planning_lease().map_err(invalid)?;
-        let observed = observer.observe_create_source(&lease, metadata, context.clone())
+        let observed = observer.observe_source_schema(&lease, metadata, context.clone())
             .map_err(|error| provider(error, format!("observe CREATE source fields for {}.{}.{}",
                 relation.catalog(), relation.namespace(), relation.relation())))?;
         validate_same_generation(metadata, &observed).map_err(invalid)?;
@@ -114,7 +114,7 @@ fn codec_failure(
 
 fn bind_relation_fields(
     relation: &SqlMvPersistenceRelationOccurrenceFacts,
-    observed: &MvCreateSourceObservation,
+    observed: &MvSourceSchemaObservation,
     provider_object_id: bytes::Bytes,
 ) -> Result<MvCreateRelationObservation, String> {
     let mut source_ordinals = std::collections::BTreeSet::new();
@@ -161,7 +161,7 @@ fn bind_relation_fields(
 
 fn validate_same_generation(
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
-    observed: &MvCreateSourceObservation,
+    observed: &MvSourceSchemaObservation,
 ) -> Result<(), String> {
     if observed.table() != &metadata.identity {
         return Err("CREATE source observation table does not match admitted metadata".to_string());
@@ -232,7 +232,7 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
-        ConnectorTableObjectId, MvCreateSourceObservation, MvObservedSourceField,
+        ConnectorTableObjectId, MvObservedSourceField, MvSourceSchemaObservation,
     };
 
     fn context() -> ConnectorRequestContext {
@@ -273,10 +273,12 @@ mod tests {
                 false,
             )],
         );
-        let observed = MvCreateSourceObservation::try_new(
+        let observed = MvSourceSchemaObservation::try_new(
             identity,
             ConnectorTableObjectId::try_new(Bytes::from_static(b"object-1")).expect("object"),
             Bytes::from_static(b"schema-2"),
+            true,
+            true,
             vec![
                 MvObservedSourceField::try_new(
                     Bytes::from_static(b"field-1"),

@@ -36,6 +36,12 @@ pub(crate) struct ListingAdmission {
     observer: Mutex<Option<HmsObservation>>,
 }
 
+/// Observation of a result already published by the original closed source.
+/// This grants no cancellation, CPU/I/O admission or new outcome selection.
+pub(crate) trait ListingOriginalError: Send + Sync {
+    fn selected_error(&self) -> Option<ConnectorError>;
+}
+
 impl Default for ListingAdmission {
     fn default() -> Self {
         Self {
@@ -230,12 +236,32 @@ impl ListingAdmission {
         context: &ConnectorRequestContext,
         call: impl Future<Output = Result<T, ConnectorError>>,
     ) -> Result<T, ConnectorError> {
-        context.check_active()?;
+        self.run_original(context, call, None).await
+    }
+
+    pub(crate) async fn run_with_original<T>(
+        &self,
+        context: &ConnectorRequestContext,
+        call: impl Future<Output = Result<T, ConnectorError>>,
+        original: &dyn ListingOriginalError,
+    ) -> Result<T, ConnectorError> {
+        self.run_original(context, call, Some(original)).await
+    }
+
+    async fn run_original<T>(
+        &self,
+        context: &ConnectorRequestContext,
+        call: impl Future<Output = Result<T, ConnectorError>>,
+        original: Option<&dyn ListingOriginalError>,
+    ) -> Result<T, ConnectorError> {
+        if let Err(error) = context.check_active() {
+            return Err(selected_original_error(original).unwrap_or(error));
+        }
         let deadline = tokio::time::Instant::from_std(context.deadline());
         let permit = tokio::select! {
             biased;
-            _ = context.stop().stopped() => return Err(cancelled()),
-            _ = tokio::time::sleep_until(deadline) => return Err(expired()),
+            _ = context.stop().stopped() => return Err(selected_original_error(original).unwrap_or_else(cancelled)),
+            _ = tokio::time::sleep_until(deadline) => return Err(selected_original_error(original).unwrap_or_else(expired)),
             permit = self.positions.clone().acquire_owned() => permit.map_err(|_| ConnectorError::new(ConnectorErrorKind::Internal, "catalog listing admission was closed"))?,
         };
         let result = {
@@ -244,14 +270,20 @@ impl ListingAdmission {
             tokio::pin!(call);
             tokio::select! {
                 biased;
-                _ = context.stop().stopped() => Err(cancelled()),
-                _ = tokio::time::sleep_until(deadline) => Err(expired()),
+                // Select at this exact point, while the SAME pinned F still lives.
+                // Its Drop cannot publish a later error over the chosen stop.
+                _ = context.stop().stopped() => Err(selected_original_error(original).unwrap_or_else(cancelled)),
+                _ = tokio::time::sleep_until(deadline) => Err(selected_original_error(original).unwrap_or_else(expired)),
                 result = &mut call => result,
             }
         };
         drop(permit);
         result
     }
+}
+
+fn selected_original_error(original: Option<&dyn ListingOriginalError>) -> Option<ConnectorError> {
+    original.and_then(ListingOriginalError::selected_error)
 }
 
 fn cancelled() -> ConnectorError {
@@ -444,3 +476,133 @@ mod tests {
 #[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
 #[path = "hms_listing_observer_tests.rs"]
 mod hms_observation_tests;
+
+#[cfg(test)]
+mod original_outcome_tests {
+    use super::*;
+    use novarocks_spi::connector::ConnectorStopOwner;
+    use std::{
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Poll},
+        time::{Duration, Instant},
+    };
+
+    // This models only the original SourceMutex publication cut. None is a
+    // currently loaned body; Some(None) is a returned body without an Err.
+    struct Original {
+        body: Mutex<Option<Option<ConnectorError>>>,
+    }
+    impl ListingOriginalError for Original {
+        fn selected_error(&self) -> Option<ConnectorError> {
+            self.body.lock().unwrap().as_ref().and_then(Clone::clone)
+        }
+    }
+    struct FooterPending {
+        original: Arc<Original>,
+        published_on_poll: Option<ConnectorError>,
+        published_on_drop: Option<ConnectorError>,
+        gate: Arc<Semaphore>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Future for FooterPending {
+        type Output = Result<(), ConnectorError>;
+        fn poll(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if let Some(error) = this.published_on_poll.take() {
+                *this.original.body.lock().unwrap() = Some(Some(error));
+            }
+            Poll::Pending
+        }
+    }
+    impl Drop for FooterPending {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.gate.available_permits(),
+                LISTING_CONCURRENCY - 1,
+                "the same original position must outlive this F Drop"
+            );
+            if let Some(error) = self.published_on_drop.take() {
+                *self.original.body.lock().unwrap() = Some(Some(error));
+            }
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    fn context(stop: &ConnectorStopOwner) -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(5),
+            stop.view(),
+            1024,
+            4096,
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn published_original_error_wins_late_stop_before_the_same_future_drop() {
+        let admission = ListingAdmission::default();
+        let stop = ConnectorStopOwner::new();
+        let context = context(&stop);
+        let original = Arc::new(Original {
+            body: Mutex::new(Some(None)),
+        });
+        let selected = ConnectorError::from_domain_static(
+            ConnectorErrorKind::CorruptData,
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+            "selected original listing source",
+        );
+        let dropped = Arc::new(AtomicBool::new(false));
+        let call = FooterPending {
+            original: original.clone(),
+            published_on_poll: Some(selected.clone()),
+            published_on_drop: None,
+            gate: admission.positions.clone(),
+            dropped: dropped.clone(),
+        };
+        let mut outcome = Box::pin(admission.run_with_original(&context, call, original.as_ref()));
+        assert!(futures::poll!(outcome.as_mut()).is_pending());
+        assert_eq!(original.selected_error(), Some(selected.clone()));
+        stop.request_stop();
+        assert_eq!(
+            outcome.await.unwrap_err(),
+            selected,
+            "the same opaque cause survives the later stop"
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(admission.positions.available_permits(), LISTING_CONCURRENCY);
+    }
+    #[tokio::test]
+    async fn loaned_body_stop_is_not_replaced_by_error_published_during_future_drop() {
+        let admission = ListingAdmission::default();
+        let stop = ConnectorStopOwner::new();
+        let context = context(&stop);
+        let original = Arc::new(Original {
+            body: Mutex::new(None),
+        });
+        let late = ConnectorError::new(ConnectorErrorKind::CorruptData, "later returned CPU body");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let call = FooterPending {
+            original: original.clone(),
+            published_on_poll: None,
+            published_on_drop: Some(late.clone()),
+            gate: admission.positions.clone(),
+            dropped: dropped.clone(),
+        };
+        let mut outcome = Box::pin(admission.run_with_original(&context, call, original.as_ref()));
+        assert!(futures::poll!(outcome.as_mut()).is_pending());
+        assert_eq!(original.selected_error(), None);
+        stop.request_stop();
+        assert_eq!(
+            outcome.await.unwrap_err().kind(),
+            ConnectorErrorKind::Cancelled
+        );
+        assert_eq!(
+            original.selected_error(),
+            Some(late),
+            "this fact was published only AFTER selection"
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(admission.positions.available_permits(), LISTING_CONCURRENCY);
+    }
+}

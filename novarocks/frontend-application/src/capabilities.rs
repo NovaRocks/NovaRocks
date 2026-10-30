@@ -239,7 +239,7 @@ impl DmlEnginePorts {
                 Arc::clone(&self.functions),
                 Arc::clone(&self.catalog_service),
                 self.constant_policy,
-                self.static_plan_carrier,
+                self.static_plan_carrier.clone(),
             ),
             self.catalog_application.clone(),
             Arc::clone(&self.connector_control),
@@ -460,7 +460,7 @@ impl MaintenanceCommandPorts {
             Arc::clone(&self.mv_readiness),
             Arc::clone(&self.service),
             self.constant_policy,
-            self.static_plan_carrier,
+            self.static_plan_carrier.clone(),
         )
         .with_state_store_original(self.state_store.clone());
         match self.rewrite_runtime.as_ref() {
@@ -738,16 +738,18 @@ pub(crate) fn mv_refresh_provider_activation(
         ports.constant_policy,
         ports.static_plan_carrier,
     );
-    let mv_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
-        ports.functions,
-        ports.catalog_service,
-        Some(ports.catalog_application),
-        ports.connector_control,
-        ports.mv_readiness,
-        ports.mv_storage_observation,
-        ports.constant_policy,
-    )
-    .with_management_entrance(ports.mv_management_entrance);
+    let mv_ports =
+        crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new_with_management_entrance(
+            ports.functions,
+            ports.catalog_service,
+            Some(ports.catalog_application),
+            ports.connector_control,
+            ports.typed_connector_control,
+            ports.mv_readiness,
+            ports.mv_storage_observation,
+            ports.mv_management_entrance,
+            ports.constant_policy,
+        );
     Arc::new(
         crate::query_execution::mv_assembly::iceberg_activation::IcebergMvRefreshProviderActivation::new(
             query_kernel,
@@ -911,22 +913,35 @@ impl MvBackgroundPorts {
     }
 }
 
+impl MvBackgroundPorts {
+    /// The execution services retain the same role-composed typed host. Keep
+    /// that leaf in the background preparation graph rather than rebuilding a
+    /// registry or acquiring another catalog generation.
+    pub(crate) fn into_core_ports(
+        self,
+        typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
+    ) -> crate::mv::domain::iceberg_refresh::IcebergMvCorePorts {
+        crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new_with_management_entrance(
+            self.functions,
+            self.catalog_service,
+            self.catalog_application,
+            self.connector_control,
+            typed_connector_control,
+            self.readiness,
+            self.storage_observation,
+            self.management_entrance,
+            self.constant_policy,
+        )
+    }
+}
+
 /// Build the two capabilities the Frontend binds into its MV background
 /// runtime after restore and maintenance recovery have completed.
 pub(crate) fn mv_background_bindings(
     ports: MvBackgroundPorts,
     execution: crate::query::mv_action::MvExecutionServices,
 ) -> crate::mv::background::MvBackgroundBindings {
-    let iceberg_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
-        ports.functions,
-        ports.catalog_service,
-        ports.catalog_application,
-        Arc::clone(&ports.connector_control),
-        Arc::clone(&ports.readiness),
-        Arc::clone(&ports.storage_observation),
-        ports.constant_policy,
-    )
-    .with_management_entrance(ports.management_entrance);
+    let iceberg_ports = ports.into_core_ports(Arc::clone(&execution.connector_control));
     crate::mv::background::MvBackgroundBindings {
         ports: iceberg_ports,
         execution,

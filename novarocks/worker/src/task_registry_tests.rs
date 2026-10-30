@@ -217,6 +217,8 @@ struct TestTaskHost {
     preparation_stages: Mutex<Vec<PreparationFailureStage>>,
     capabilities_removed: AtomicUsize,
     retain_normal_close: bool,
+    normal_retirement_rejection: bool,
+    normal_retirement_calls: AtomicUsize,
     inbound_capabilities: Option<Arc<TaskInboundCapabilities>>,
     install_gate: Option<Arc<InstallGate>>,
     /// Mark entry into the original loan wait, then hold cleanup after stop.
@@ -517,6 +519,19 @@ impl TaskExecutionHost for TestTaskHost {
         if let Some(capabilities) = &self.inbound_capabilities {
             capabilities.remove(descriptor);
         }
+    }
+
+    fn retire_receiver_normally(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
+        self.normal_retirement_calls.fetch_add(1, Ordering::SeqCst);
+        if self.normal_retirement_rejection {
+            return Err(fixture_host_rejection(
+                TaskFailureCategory::Protocol,
+                "checked inbound close contradiction",
+            ));
+        }
+        self.remove_inbound_capability(descriptor);
+        self.remove_receiver(descriptor);
+        Ok(())
     }
 
     fn submit_runnable(
@@ -3012,6 +3027,142 @@ fn first_quiesce_is_published_to_an_existing_covered_subscription() {
     assert!(
         subscription.select_next(4096, |_| 1).unwrap().is_none(),
         "replay must not publish another control fact"
+    );
+}
+
+#[test]
+fn actual_cancel_with_strict_input_uses_abort_cleanup_and_read_quiesce_keeps_normal_close() {
+    use novarocks_execution_contract::ExchangeDeliveryRequirement;
+    for delivery in [
+        ExchangeDeliveryRequirement::DemandDriven,
+        ExchangeDeliveryRequirement::MustDrain,
+    ] {
+        let fixture = Fixture::new(TestTaskHost::default());
+        let execution = execution(1189);
+        let context = fixture.context(execution);
+        establish(&fixture.registry, context);
+        let identity = task(execution, fixture.backend);
+        let source = TaskIdentity::new(
+            execution,
+            StageId::new(2).unwrap(),
+            TaskId::new(1).unwrap(),
+            fixture.backend,
+        );
+        let input = ExchangeInbound::try_new(
+            FragmentNodeId::new(7),
+            vec![ExchangeSource::new(source, UniqueId::new(11, 12), 0)],
+            delivery,
+        )
+        .unwrap();
+        let descriptor = TaskDescriptor::try_new(
+            identity,
+            UniqueId::new(1, 1),
+            std::num::NonZeroUsize::MIN,
+            vec![PlanNodeId::new(1).unwrap()],
+            ExchangeTopology::try_new(Vec::new(), vec![input]).unwrap(),
+        )
+        .unwrap();
+        let created = fixture
+            .registry
+            .create_task(&fixture.create(descriptor, Vec::new()), body(STREAM_PLAN));
+        assert_eq!(created.outcome(), OperationOutcome::Accepted);
+        let reporter = fixture.task_host.reporters.lock().unwrap()[0].clone();
+        reporter.running();
+        reporter.conclude_termination(
+            TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
+            novarocks_execution_contract::TaskOutputFacts::default(),
+        );
+        reporter.release_output();
+        reporter.note_actual_stopped();
+        reporter.note_resources_converged();
+        assert_eq!(fixture.registry.advance_deadlines().tasks_retired, 1);
+        assert_eq!(
+            fixture
+                .task_host
+                .normal_retirement_calls
+                .load(Ordering::SeqCst),
+            usize::from(delivery == ExchangeDeliveryRequirement::DemandDriven)
+        );
+        assert_eq!(
+            fixture.task_host.receivers_removed.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            reporter.current().termination(),
+            Some(&TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded
+            ))
+        );
+        assert!(fixture.health.is_healthy());
+    }
+}
+
+#[test]
+fn checked_close_failure_keeps_ingress_until_original_context_abort() {
+    let fixture = Fixture::new(TestTaskHost {
+        normal_retirement_rejection: true,
+        ..Default::default()
+    });
+    let execution = execution(1190);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let created = fixture.registry.create_task(
+        &fixture.create(descriptor(identity), Vec::new()),
+        body(STREAM_PLAN),
+    );
+    assert_eq!(created.outcome(), OperationOutcome::Accepted);
+    let reporter = fixture.task_host.reporters.lock().unwrap()[0].clone();
+    reporter.running();
+    reporter.conclude_success(novarocks_execution_contract::TaskOutputFacts::new(true));
+    reporter.release_output();
+    reporter.note_actual_stopped();
+    reporter.note_resources_converged();
+    assert_eq!(fixture.registry.advance_deadlines().tasks_retired, 0);
+    assert!(!fixture.health.is_healthy());
+    assert_eq!(
+        fixture
+            .task_host
+            .normal_retirement_calls
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        fixture.task_host.receivers_removed.load(Ordering::SeqCst),
+        0
+    );
+    // An unchanged revision does not spin a failed retirement retry.
+    assert_eq!(fixture.registry.advance_deadlines().tasks_retired, 0);
+    assert_eq!(
+        fixture
+            .task_host
+            .normal_retirement_calls
+            .load(Ordering::SeqCst),
+        1
+    );
+    fixture
+        .registry
+        .abort_query_context(&AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+            AbortCause::QueryFailed,
+        ));
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.task_host.receivers_removed.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        reporter.current().state(),
+        TaskState::Finished,
+        "cleanup cannot rewrite a terminal conclusion"
+    );
+    assert_eq!(
+        fixture
+            .task_host
+            .normal_retirement_calls
+            .load(Ordering::SeqCst),
+        1
     );
 }
 

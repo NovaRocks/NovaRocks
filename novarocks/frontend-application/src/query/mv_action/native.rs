@@ -101,7 +101,7 @@ impl MvNativePhase {
     pub(super) fn poll_ready(
         &mut self,
         runtime: &Runtime,
-        io: &MetadataIoAdmission,
+        io: &Arc<MetadataIoAdmission>,
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), QueryServiceError>> {

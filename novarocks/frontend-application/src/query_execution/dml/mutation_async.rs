@@ -489,7 +489,7 @@ impl PreparedCowSelection {
     pub(crate) async fn compile_async(
         &self,
         provider: &FrontendCompletionCustody,
-        _options: Option<QueryOptions>,
+        options: Option<QueryOptions>,
     ) -> Result<PreparedCowMatchAssembly, DmlError> {
         install_fact_source(&self.state, &self.facts, &self.bindings, provider)?;
         let control = crate::query_execution::planning::sql_compile_control_from_execution(
@@ -546,6 +546,7 @@ impl PreparedCowSelection {
             facts,
             access,
             &self.declarations,
+            options.as_ref(),
             &control,
         )?;
         let signed = self.facts.signed()?;

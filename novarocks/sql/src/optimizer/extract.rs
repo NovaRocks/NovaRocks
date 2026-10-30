@@ -1327,7 +1327,18 @@ mod tests {
 
     #[test]
     fn extracted_singleton_outer_expression_join_reaches_one_final_finish() {
-        for (seed, join_type) in [(51_u8, JoinKind::RightOuter), (52_u8, JoinKind::FullOuter)] {
+        for (seed, join_type, build_side) in [
+            (
+                51_u8,
+                JoinKind::RightOuter,
+                crate::optimizer::operator::HashJoinBuildSide::Left,
+            ),
+            (
+                52_u8,
+                JoinKind::FullOuter,
+                crate::optimizer::operator::HashJoinBuildSide::Right,
+            ),
+        ] {
             let mut memo = Memo::new();
             let left_column = OutputColumn {
                 column_id: ColumnId(10),
@@ -1386,7 +1397,7 @@ mod tests {
                         null_safe: false,
                     }],
                     other_condition: None,
-                    build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
+                    build_side,
                     distribution: JoinDistribution::Unknown,
                 }),
                 children: vec![left, right],

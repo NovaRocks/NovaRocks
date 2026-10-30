@@ -2284,6 +2284,37 @@ pub(crate) mod external_listing_tests {
         ]
     }
 
+    #[derive(Default)]
+    pub(crate) struct ListingMetadataGate {
+        started: std::sync::atomic::AtomicBool,
+        ready: tokio::sync::Notify,
+        released: Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+    impl ListingMetadataGate {
+        fn run(&self) {
+            self.started
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.ready.notify_waiters();
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.changed.wait(released).unwrap();
+            }
+        }
+        pub(crate) async fn wait_started(&self) {
+            let ready = self.ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            if !self.started.load(std::sync::atomic::Ordering::Acquire) {
+                ready.await;
+            }
+        }
+        pub(crate) fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+
     pub(crate) struct ListingFixture {
         pub(crate) registry: Arc<TestConnectorControlRegistry>,
         pub(crate) catalog_service: Arc<QueryCatalogService>,
@@ -2300,7 +2331,11 @@ pub(crate) mod external_listing_tests {
                 incarnation: ProviderBindingEpoch::new(),
                 failure,
                 kind,
-                calls: Mutex::new(Vec::new()),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                metadata_in_views: std::sync::atomic::AtomicBool::new(false),
+                metadata_gate: Mutex::new(None),
+                held_view: Mutex::new(None),
+                stop_in_view_poll: Mutex::new(None),
             });
             let binding = ConnectorControlBinding::try_new(
                 provider.descriptor.clone(),
@@ -2320,6 +2355,27 @@ pub(crate) mod external_listing_tests {
                 catalog_service: Arc::new(new_query_catalog_service()),
                 provider,
             }
+        }
+
+        pub(crate) fn stop_inside_view_poll(
+            &self,
+            original: novarocks_workload_control::WorkCancellationRequester,
+        ) {
+            *self.provider.stop_in_view_poll.lock().unwrap() = Some(original);
+        }
+
+        pub(crate) fn hold_metadata_cpu(&self, gate: Arc<ListingMetadataGate>) {
+            *self.provider.metadata_gate.lock().unwrap() = Some(gate);
+            self.form_metadata_in_views();
+        }
+        pub(crate) fn form_metadata_in_views(&self) {
+            self.provider
+                .metadata_in_views
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        pub(crate) fn hold_views(&self, gate: Arc<tokio::sync::Notify>) {
+            *self.provider.held_view.lock().unwrap() = Some(gate);
         }
 
         pub(crate) fn expected_error(&self) -> String {
@@ -2385,7 +2441,11 @@ pub(crate) mod external_listing_tests {
         incarnation: ProviderBindingEpoch,
         failure: FailurePoint,
         kind: ConnectorErrorKind,
-        calls: Mutex<Vec<String>>,
+        calls: Arc<Mutex<Vec<String>>>,
+        metadata_in_views: std::sync::atomic::AtomicBool,
+        metadata_gate: Mutex<Option<Arc<ListingMetadataGate>>>,
+        held_view: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        stop_in_view_poll: Mutex<Option<novarocks_workload_control::WorkCancellationRequester>>,
     }
 
     impl ListingProvider {
@@ -2402,6 +2462,17 @@ pub(crate) mod external_listing_tests {
     }
 
     impl ConnectorMetadata for ListingProvider {
+        fn provider_metadata_cpu_author(
+            &self,
+        ) -> Option<(ConnectorProviderBindingKey, std::any::TypeId)> {
+            Some((
+                ConnectorProviderBindingKey {
+                    instance_id: self.descriptor.instance_id.clone(),
+                    incarnation: self.incarnation,
+                },
+                std::any::TypeId::of::<Self>(),
+            ))
+        }
         fn instance_id(&self) -> &ConnectorInstanceId {
             &self.descriptor.instance_id
         }
@@ -2466,6 +2537,26 @@ pub(crate) mod external_listing_tests {
         }
     }
 
+    // The same closed fixture author can execute one finite metadata phase.
+    // Ordinary fault tests refuse before that phase; explicit CPU tests use
+    // the actual qualified factory/packet/worker and its physical footer.
+    impl ProviderMetadataCpuSource for ListingProvider {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            self.incarnation
+        }
+        fn run_metadata(&self) {
+            let gate = self.metadata_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                self.call("metadata-start");
+                gate.run();
+            }
+            self.call("metadata-cpu");
+        }
+    }
+
     impl ConnectorViewMetadata for ListingProvider {
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
@@ -2485,6 +2576,63 @@ pub(crate) mod external_listing_tests {
             } else {
                 unreachable!("the FORCE preflight must fail before a successful view listing")
             }
+        }
+
+        fn list_views_async(
+            &self,
+            request: ConnectorListViewsRequest,
+            cpu: Arc<dyn ProviderMetadataCpuPort>,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorViewIdentity>, ConnectorError>>
+        {
+            Box::pin(async move {
+                let gate = self.held_view.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    self.call("views-start");
+                    gate.notified().await;
+                }
+                let stop = self.stop_in_view_poll.lock().unwrap().take();
+                if let Some(original) = stop {
+                    original
+                        .request(novarocks_workload_control::CancellationReason::DeadlineExceeded)
+                        .unwrap();
+                }
+                if self
+                    .metadata_in_views
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    let original = Arc::new(Self {
+                        descriptor: self.descriptor.clone(),
+                        incarnation: self.incarnation,
+                        failure: self.failure,
+                        kind: self.kind,
+                        calls: self.calls.clone(),
+                        held_view: Mutex::new(None),
+                        stop_in_view_poll: Mutex::new(None),
+                        metadata_in_views: std::sync::atomic::AtomicBool::new(false),
+                        metadata_gate: Mutex::new(self.metadata_gate.lock().unwrap().clone()),
+                    });
+                    let mut input = Some(ProviderMetadataCpuInput(original));
+                    cpu.submit_metadata_in(&mut input)?;
+                    assert!(
+                        input.is_none(),
+                        "same closed metadata input transferred once"
+                    );
+                    self.call("metadata-submit");
+                    let held = self.metadata_gate.lock().unwrap().clone();
+                    if let Some(held) = held {
+                        // Deliberately return the original error after the
+                        // SAME actual worker started, before its footer. The
+                        // outer Action must retain and close this exact port.
+                        tokio::select! {
+                            _ = held.wait_started() => {},
+                            result = std::future::poll_fn(|cx| cpu.poll_finished(cx)) => result?,
+                        }
+                    } else {
+                        std::future::poll_fn(|cx| cpu.poll_finished(cx)).await?;
+                    }
+                }
+                self.list_views(request)
+            })
         }
 
         fn view_exists(&self, _: ConnectorViewRequest) -> Result<bool, ConnectorError> {

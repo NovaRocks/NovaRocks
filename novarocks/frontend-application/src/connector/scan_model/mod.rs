@@ -56,16 +56,16 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_spi::connector::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, CatalogHandle, CatalogProperties, CatalogVersion,
-    ConnectorBeginScanRequest, ConnectorChangeWindowAdmission, ConnectorControlBinding,
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorNamespaceRequest, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorProviderBinding, ConnectorProviderBindingKey,
-    ConnectorProviderId, ConnectorReadPurpose, ConnectorRequestContext, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit,
-    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
-    ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateKind,
-    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
+    ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderBinding,
+    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorReadPurpose,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
+    ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableHandle,
+    ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
 };
 use serde::{Deserialize, Serialize};
 
@@ -615,24 +615,14 @@ impl ConnectorScanPlanning for Fixture {
             )?,
         )?;
         let output_schema = Arc::new(Schema::new(fields));
-        match request.selection {
-            ConnectorScanSelection::Snapshot(selector) => ConnectorScan::try_new_snapshot(
-                owner,
-                selector,
-                scan_handle,
-                output_schema,
-                predicate_dispositions,
-            ),
-            ConnectorScanSelection::ChangeWindow(window) => ConnectorScan::try_new_change_window(
-                owner,
-                window,
-                ConnectorChangeWindowAdmission::MetadataOnly,
-                scan_handle,
-                output_schema,
-                predicate_dispositions,
-                &request.context,
-            ),
-        }
+        let ConnectorScanSelection::Snapshot(selector) = request.selection;
+        ConnectorScan::try_new_snapshot(
+            owner,
+            selector,
+            scan_handle,
+            output_schema,
+            predicate_dispositions,
+        )
     }
 
     fn plan_splits(
@@ -964,10 +954,9 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use novarocks_spi::connector::{
-        ConnectorBatchBudget, ConnectorChangeWindow, ConnectorControlPlanningLease,
-        ConnectorReadSelector, ConnectorScalarType, ConnectorScalarValue,
-        ConnectorStaticPredicateColumn, ConnectorStaticPredicateId, ConnectorTableIdentity,
-        ConnectorTableResolution,
+        ConnectorBatchBudget, ConnectorControlPlanningLease, ConnectorReadSelector,
+        ConnectorScalarType, ConnectorScalarValue, ConnectorStaticPredicateColumn,
+        ConnectorStaticPredicateId, ConnectorTableIdentity, ConnectorTableResolution,
     };
 
     use super::*;
@@ -1283,31 +1272,6 @@ mod tests {
             error.to_string().contains("is outside its schema"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn change_window_selection_is_admitted_as_metadata_only() {
-        let lease = lease(vec![FixtureScanFile::new("s3://fixture/delta.parquet")]);
-        let metadata = load(&lease, "orders");
-        let scan = lease
-            .binding()
-            .planning()
-            .begin_scan(
-                &metadata.table,
-                begin_scan_request(
-                    Vec::new(),
-                    Vec::new(),
-                    ConnectorScanSelection::ChangeWindow(ConnectorChangeWindow::new(6, 7)),
-                    ConnectorReadPurpose::Query,
-                ),
-            )
-            .expect("fixture change-window scan");
-
-        assert_eq!(
-            scan.selection(),
-            ConnectorScanSelection::ChangeWindow(ConnectorChangeWindow::new(6, 7))
-        );
-        assert_eq!(plan(&lease, &scan).splits[0].split_id(), "fixture-0");
     }
 
     #[test]

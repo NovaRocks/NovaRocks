@@ -3,9 +3,11 @@
 //! Runs on the single `PhysicalPlanNode` tree produced by the optimizer->planner
 //! bridge, BEFORE `distributed::build::build_distributed_plan` fragments it.
 //! Annotates hash joins with build-side `RuntimeFilterBuildIntent`s and pushes
-//! matching probe-side `RuntimeFilterProbeIntent`s. Behavior is a byte-for-byte
-//! port of the retired optimizer-side pass -- do not "improve" placement here;
-//! changes belong in the RF baseline / producer arcs.
+//! matching probe-side `RuntimeFilterProbeIntent`s. Placement policy retains
+//! the RF baseline / producer contract. Join-side eligibility consumes the
+//! exact physical build side and preservation semantics: a preserved outer
+//! probe cannot be filtered by missing build membership. New placement policy
+//! belongs in the RF baseline / producer arcs.
 
 use crate::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::column_id::ColumnId;
@@ -19,8 +21,9 @@ use crate::planner::physical::topn_runtime_filter_placement::{
     place_aggregate_topn_runtime_filters_with_policy,
 };
 use crate::planner::physical::{
-    JoinDistribution, JoinExecutionMode, PhysicalHashJoinEqCondition, PhysicalHashJoinNode,
-    PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlanSetOpKind, RedistributeMode,
+    JoinDistribution, JoinExecutionMode, PhysicalHashJoinBuildSide, PhysicalHashJoinEqCondition,
+    PhysicalHashJoinNode, PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlanSetOpKind,
+    RedistributeMode,
 };
 use crate::planner::runtime_filter::contract::NullSemantics;
 use std::collections::{HashMap, HashSet};
@@ -155,22 +158,23 @@ pub(crate) struct JoinRfSides {
     pub(crate) build_child: usize,
 }
 
-pub(crate) fn rf_sides_for_join(kind: JoinKind) -> Option<JoinRfSides> {
-    match kind {
-        JoinKind::Inner | JoinKind::RightOuter | JoinKind::LeftSemi => Some(JoinRfSides {
+pub(crate) fn rf_sides_for_join(
+    kind: JoinKind,
+    build_side: PhysicalHashJoinBuildSide,
+) -> Option<JoinRfSides> {
+    use PhysicalHashJoinBuildSide::{Left, Right};
+    // Membership may filter the probe only when a miss cannot be an output
+    // row. In particular, an outer join's preserved probe must remain intact.
+    match (kind, build_side) {
+        (JoinKind::Inner | JoinKind::RightOuter | JoinKind::LeftSemi, Right) => Some(JoinRfSides {
             probe_child: 0,
             build_child: 1,
         }),
-        JoinKind::RightSemi => Some(JoinRfSides {
+        (JoinKind::Inner | JoinKind::RightSemi, Left) => Some(JoinRfSides {
             probe_child: 1,
             build_child: 0,
         }),
-        JoinKind::LeftOuter
-        | JoinKind::FullOuter
-        | JoinKind::LeftAnti
-        | JoinKind::RightAnti
-        | JoinKind::NullAwareLeftAnti
-        | JoinKind::Cross => None,
+        _ => None,
     }
 }
 
@@ -811,7 +815,7 @@ fn place_current_node(
         let PhysicalPlanKind::HashJoin(join) = &node.kind else {
             return;
         };
-        let Some(sides) = rf_sides_for_join(join.join_type) else {
+        let Some(sides) = rf_sides_for_join(join.join_type, join.build_side) else {
             return;
         };
         let max_child = sides.probe_child.max(sides.build_child);
@@ -941,39 +945,104 @@ mod tests {
     #[test]
     fn rf_sides_match_join_semantics() {
         assert_eq!(
-            rf_sides_for_join(JoinKind::Inner),
+            rf_sides_for_join(JoinKind::Inner, PhysicalHashJoinBuildSide::Right),
             Some(JoinRfSides {
                 probe_child: 0,
                 build_child: 1
             })
         );
         assert_eq!(
-            rf_sides_for_join(JoinKind::RightOuter),
+            rf_sides_for_join(JoinKind::RightOuter, PhysicalHashJoinBuildSide::Right),
             Some(JoinRfSides {
                 probe_child: 0,
                 build_child: 1
             })
         );
         assert_eq!(
-            rf_sides_for_join(JoinKind::RightSemi),
+            rf_sides_for_join(JoinKind::RightSemi, PhysicalHashJoinBuildSide::Left),
             Some(JoinRfSides {
                 probe_child: 1,
                 build_child: 0
             })
         );
         assert_eq!(
-            rf_sides_for_join(JoinKind::LeftSemi),
+            rf_sides_for_join(JoinKind::LeftSemi, PhysicalHashJoinBuildSide::Right),
             Some(JoinRfSides {
                 probe_child: 0,
                 build_child: 1
             })
         );
-        assert_eq!(rf_sides_for_join(JoinKind::LeftOuter), None);
-        assert_eq!(rf_sides_for_join(JoinKind::FullOuter), None);
-        assert_eq!(rf_sides_for_join(JoinKind::LeftAnti), None);
-        assert_eq!(rf_sides_for_join(JoinKind::RightAnti), None);
-        assert_eq!(rf_sides_for_join(JoinKind::NullAwareLeftAnti), None);
-        assert_eq!(rf_sides_for_join(JoinKind::Cross), None);
+        assert_eq!(
+            rf_sides_for_join(JoinKind::LeftOuter, PhysicalHashJoinBuildSide::Right),
+            None
+        );
+        assert_eq!(
+            rf_sides_for_join(JoinKind::FullOuter, PhysicalHashJoinBuildSide::Right),
+            None
+        );
+        assert_eq!(
+            rf_sides_for_join(JoinKind::LeftAnti, PhysicalHashJoinBuildSide::Right),
+            None
+        );
+        assert_eq!(
+            rf_sides_for_join(JoinKind::RightAnti, PhysicalHashJoinBuildSide::Right),
+            None
+        );
+        assert_eq!(
+            rf_sides_for_join(
+                JoinKind::NullAwareLeftAnti,
+                PhysicalHashJoinBuildSide::Right
+            ),
+            None
+        );
+        assert_eq!(
+            rf_sides_for_join(JoinKind::Cross, PhysicalHashJoinBuildSide::Right),
+            None
+        );
+    }
+
+    #[test]
+    fn right_outer_left_build_never_filters_the_preserved_probe() {
+        for null_safe in [false, true] {
+            for (build_side, expected_filters) in [
+                (PhysicalHashJoinBuildSide::Left, 0),
+                (PhysicalHashJoinBuildSide::Right, 1),
+            ] {
+                let mut join = hash_join_node(
+                    JoinKind::RightOuter,
+                    JoinDistribution::Shuffle,
+                    Some(JoinExecutionMode::Partitioned),
+                    vec![eq_cond(
+                        col_ref(1, "target_key"),
+                        col_ref(2, "source_key"),
+                        null_safe,
+                    )],
+                    vec![
+                        leaf(vec![out_col(1, "target_key")]),
+                        leaf(vec![out_col(2, "source_key")]),
+                    ],
+                    stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+                );
+                let PhysicalPlanKind::HashJoin(hash) = &mut join.kind else {
+                    unreachable!()
+                };
+                hash.build_side = build_side;
+                let mut next_filter_id = 0;
+                let mut config = permissive_config(1024);
+                config.probe_min_selectivity = 0.0;
+                place_node(&mut join, &config, &mut next_filter_id);
+                assert_eq!(
+                    expect_hash_join(&join).build_runtime_filters.len(),
+                    expected_filters
+                );
+                assert!(join.children[1].probe_runtime_filters.is_empty());
+                assert_eq!(
+                    join.children[0].probe_runtime_filters.len(),
+                    expected_filters
+                );
+                assert_eq!(next_filter_id, expected_filters as i32);
+            }
+        }
     }
 
     #[test]

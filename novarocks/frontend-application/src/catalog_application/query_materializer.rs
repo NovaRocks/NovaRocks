@@ -96,7 +96,7 @@ pub fn connector_query_binding_from_materialization(
         write_target_admission: None,
         frozen_snapshot_materializations,
         frozen_cohort_read: None,
-        admitted_change_scans: BTreeMap::new(),
+        prepared_source_reads: BTreeMap::new(),
     })
 }
 
@@ -1279,7 +1279,7 @@ fn metadata_query_binding_from_materialization(
         write_target_admission: None,
         frozen_cohort_read: None,
         frozen_snapshot_materializations: BTreeMap::new(),
-        admitted_change_scans: BTreeMap::new(),
+        prepared_source_reads: BTreeMap::new(),
     })
 }
 
@@ -1611,7 +1611,7 @@ mod tests {
             mv_target_read: None,
             frozen_cohort_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
-            admitted_change_scans: BTreeMap::new(),
+            prepared_source_reads: BTreeMap::new(),
         }
     }
 

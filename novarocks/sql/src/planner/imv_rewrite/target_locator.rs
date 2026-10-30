@@ -205,6 +205,11 @@ fn build_target_locator_join(
     let ext = ctx
         .extension::<ImvExtension>()
         .ok_or_else(|| "InjectTargetLocatorJoin requires ImvExtension".to_string())?;
+    if ext.annotation.target_read
+        == crate::planner::imv_rewrite::annotation::TargetReadRequirement::NewOutputRowsOnly
+    {
+        return build_new_output_locator_projection(left, input, ctx);
+    }
     let right_apply_key_id = allocate_imv_column(
         ctx,
         &input.target_apply_key_column,
@@ -310,6 +315,55 @@ fn build_target_locator_join(
             output_qualifier: None,
         }),
         vec![join],
+        None,
+    ))
+}
+
+/// The original Insert-only proof makes the DELETE-only target join have no
+/// matches. Preserve its nullable output contract and retire source lineage;
+/// skipping the whole rule would leak source row IDs into the MV writer.
+fn build_new_output_locator_projection(
+    left: LogicalPlanNode,
+    input: LocatorJoinInput,
+    ctx: &RewriteContext,
+) -> Result<LogicalPlanNode, String> {
+    let mut items = input
+        .output
+        .iter()
+        .filter(|column| {
+            !is_row_lineage_locator_name(&column.name) && !ImvActionColumn::matches(column)
+        })
+        .map(project_item_for_output_column)
+        .collect::<Vec<_>>();
+    for (name, data_type) in [
+        (crate::common::ICEBERG_ROW_ID_COL, DataType::Int64),
+        (crate::common::ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64),
+        (crate::common::ICEBERG_FILE_PATH_COL, DataType::Utf8),
+        (crate::common::ICEBERG_ROW_POS_COL, DataType::Int64),
+    ] {
+        let value_type = novarocks_type_contract::FunctionValueType::new(data_type, true);
+        items.push(ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Null),
+                value_type: value_type.clone(),
+            },
+            output_name: name.to_owned(),
+            output_column_id: allocate_imv_column(ctx, name, value_type)?,
+        });
+    }
+    items.extend(
+        input
+            .output
+            .iter()
+            .filter(|column| ImvActionColumn::matches(column))
+            .map(project_item_for_output_column),
+    );
+    Ok(LogicalPlanNode::new(
+        LogicalPlanKind::Project(PlanProjectNode {
+            items,
+            output_qualifier: None,
+        }),
+        vec![left],
         None,
     ))
 }

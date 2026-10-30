@@ -194,8 +194,7 @@ impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
                 emit_writer_marker(
                     self.writer_observer.as_deref(),
                     "NOVAROCKS_CONNECTOR_WRITER_OPENED",
-                    writer.node_id(),
-                    writer.target(),
+                    writer,
                 );
                 Ok(Box::new(ObservedConnectorBatchWriter {
                     inner,
@@ -302,13 +301,25 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
 fn emit_writer_marker(
     observer: Option<&dyn novarocks_execution::runtime::exchange::TestEventObserver>,
     marker: &str,
-    plan_node_id: i32,
-    target: WriteTargetOrdinal,
+    writer: ConnectorWriterObservation,
 ) {
     if let Some(observer) = observer {
+        let execution = writer.execution_id();
+        let physical = writer.physical();
+        let bytes = physical.fragment_instance_id();
+        // The original Native binding authors these two big-endian halves.
+        // Render the same identity as the Task's prepared-DOP observation.
+        let high = i64::from_be_bytes(bytes[..8].try_into().expect("fixed identity high half"));
+        let low = i64::from_be_bytes(bytes[8..].try_into().expect("fixed identity low half"));
         observer.observe(&format!(
-            "{marker} plan_node={plan_node_id} write_target={}",
-            target.get()
+            "{marker} execution_id={}:{}:{} finst={high:x}:{low:x} plan_node={} write_target={} driver_id={} writer_ordinal={}",
+            execution.query_id().high(),
+            execution.query_id().low(),
+            execution.attempt_id().get(),
+            writer.node_id(),
+            writer.target().get(),
+            physical.driver_id(),
+            physical.writer_ordinal(),
         ));
     }
 }

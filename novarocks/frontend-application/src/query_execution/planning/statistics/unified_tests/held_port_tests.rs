@@ -180,10 +180,15 @@ impl novarocks_query_application::session_control::GovernedStatementAction
             novarocks_query_application::session_error::QueryServiceError,
         >,
     > {
-        self.original
-            .as_mut()
-            .poll(cx)
-            .map(|()| Ok(novarocks_query_application::session_control::StatementActionValue::Ok))
+        self.original.as_mut().poll(cx).map(|()| {
+            Ok(
+                novarocks_query_application::session_control::StatementActionValue::Ok(
+                    novarocks_query_application::session_control::StatementCommandCompletion::new(
+                        0,
+                    ),
+                ),
+            )
+        })
     }
 }
 

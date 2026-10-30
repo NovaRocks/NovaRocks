@@ -18,7 +18,7 @@
 //! Exact exchange stream identities, delivery requirements and normal-close facts.
 //! These declarations do not authorize capacity or infer consumer completion.
 
-// Design: ADR-0197 (docs/adr/ADR-0197-logical-write-counts-and-strict-stream-delivery.md)
+// Design: ADR-0208 (docs/adr/ADR-0208-logical-write-counts-and-strict-stream-delivery.md)
 use std::fmt;
 
 use novarocks_types::UniqueId;

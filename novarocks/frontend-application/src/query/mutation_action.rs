@@ -290,6 +290,50 @@ enum Phase {
     Done,
 }
 
+/// The logical count author is chosen by the original mutation path. A COW
+/// rewrite result cannot replace its exact matched-selection count.
+#[derive(Default)]
+enum MutationAffectedRows {
+    #[default]
+    Pending,
+    CowSelection(u64),
+    MorSummary(u64),
+}
+impl MutationAffectedRows {
+    fn receive_selection(
+        &mut self,
+        selection: &ConnectorRowMutationSelection,
+    ) -> Result<(), QueryServiceError> {
+        if !matches!(self, Self::Pending) {
+            return Err(internal_error(
+                "mutation selected-row count was already received",
+            ));
+        }
+        *self = Self::CowSelection(selection.row_count());
+        Ok(())
+    }
+    fn receive_write(&mut self, session: &ConnectorWriteSession) -> Result<(), QueryServiceError> {
+        match self {
+            Self::CowSelection(_) => Ok(()),
+            Self::Pending => {
+                *self = Self::MorSummary(session.freeze_received_row_count().map_err(|error| {
+                    QueryServiceError::from_failure_cause(
+                        novarocks_failure_contract::SharedFailureCause::new(error),
+                    )
+                })?);
+                Ok(())
+            }
+            Self::MorSummary(_) => Err(internal_error("mutation write count was already received")),
+        }
+    }
+    fn get(&self) -> Option<u64> {
+        match self {
+            Self::Pending => None,
+            Self::CowSelection(rows) | Self::MorSummary(rows) => Some(*rows),
+        }
+    }
+}
+
 struct MutationAction {
     original: Arc<OriginalInput>,
     root: WorkScope,
@@ -320,6 +364,7 @@ struct MutationAction {
     close_result: Option<Result<(), StatementNativeHealthFailure>>,
     failure: Option<DmlExecutionError>,
     selected: Option<Result<(), QueryServiceError>>,
+    affected_rows: MutationAffectedRows,
     publication: Option<StatementPublication>,
     phase: Phase,
     index: usize,
@@ -628,6 +673,9 @@ impl MutationAction {
                     self.store_tail()?;
                     match self.ready.as_ref().unwrap() {
                         MutationReady::Selection(ready) => {
+                            // This exact selection includes only admitted actions. COW
+                            // rewrite streams also contain unaffected retained rows.
+                            self.affected_rows.receive_selection(&ready.selection)?;
                             self.no_op = ready.selection.row_count() == 0;
                             self.tail_binding = Some(ready.binding.clone());
                             if self.no_op || cancellation.reason().is_some() {
@@ -664,6 +712,7 @@ impl MutationAction {
                                     "mutation Ready replaced the original session",
                                 )));
                             }
+                            self.affected_rows.receive_write(&session)?;
                             self.wrote_any |= !ready.accepted.is_empty();
                             self.index = self
                                 .index
@@ -833,14 +882,24 @@ impl MutationAction {
                             self.publication.as_ref().unwrap().attempt.terminal(),
                         ))
                     } else {
-                        self.selected.take().unwrap_or(Ok(()))
+                        self.selected.take().unwrap_or_else(|| {
+                            Err(internal_error(
+                                "mutation has no original business selection",
+                            ))
+                        })
                     };
-                    return Poll::Ready(result.map(|()| StatementActionValue::Ok).map_err(
-                        |error| match self.publication.as_ref().unwrap().attempt.terminal() {
-                            Some(t) => error.attach_publication_terminal(t.clone()),
-                            None => error,
-                        },
-                    ));
+                    return Poll::Ready(
+                        super::write_action::selected_command_completion(
+                            result,
+                            self.affected_rows.get(),
+                        )
+                        .map_err(|error| {
+                            match self.publication.as_ref().unwrap().attempt.terminal() {
+                                Some(t) => error.attach_publication_terminal(t.clone()),
+                                None => error,
+                            }
+                        }),
+                    );
                 }
             }
         }
@@ -1205,6 +1264,7 @@ pub(crate) fn prepare(
         close_result: None,
         failure: None,
         selected: None,
+        affected_rows: MutationAffectedRows::default(),
         publication: Some(StatementPublication::new(attempt)),
         phase: Phase::Admit,
         index: 0,
@@ -1308,5 +1368,67 @@ mod tests {
         assert!(!exited.load(Ordering::SeqCst));
         drop(preparation);
         assert!(exited.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod affected_count_tests {
+    use super::*;
+    use crate::query_execution::{
+        write_result::DecodedPreparedWriteSet,
+        write_session::tests::{fixture_with_outcome, known_committed},
+    };
+    use arrow::{
+        array::Int64Array,
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+
+    fn selected_rows() -> ConnectorRowMutationSelection {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 5, 9]))],
+        )
+        .unwrap();
+        ConnectorRowMutationSelection::try_new(schema, vec![batch], 3, 4096).unwrap()
+    }
+
+    #[test]
+    fn cow_action_count_keeps_selected_rows_across_larger_rewrite_output() {
+        let selection = selected_rows();
+        let fixture = fixture_with_outcome(1, 16, known_committed());
+        fixture
+            .session
+            .receive_for_test(DecodedPreparedWriteSet::for_test(29, Vec::new()))
+            .unwrap();
+        let mut rows = MutationAffectedRows::default();
+        rows.receive_selection(&selection).unwrap();
+        rows.receive_write(&fixture.session).unwrap();
+        let StatementActionValue::Ok(completion) =
+            super::super::write_action::selected_command_completion(Ok(()), rows.get()).unwrap()
+        else {
+            panic!("COW success must preserve selected logical count")
+        };
+        assert_eq!(completion.affected_rows(), 3);
+        assert_eq!(fixture.session.accumulated_row_count().unwrap(), 29);
+        assert_eq!(fixture.session.finish_invocations(), 0);
+    }
+
+    #[test]
+    fn mor_action_count_uses_complete_logical_root_and_cannot_be_reauthored() {
+        let fixture = fixture_with_outcome(1, 16, known_committed());
+        fixture
+            .session
+            .receive_for_test(DecodedPreparedWriteSet::for_test(19, Vec::new()))
+            .unwrap();
+        let mut rows = MutationAffectedRows::default();
+        assert_eq!(rows.get(), None);
+        rows.receive_write(&fixture.session).unwrap();
+        assert_eq!(rows.get(), Some(19));
+        assert!(rows.receive_write(&fixture.session).is_err());
+        assert!(rows.receive_selection(&selected_rows()).is_err());
+        assert_eq!(rows.get(), Some(19));
+        assert_eq!(fixture.session.finish_invocations(), 0);
     }
 }

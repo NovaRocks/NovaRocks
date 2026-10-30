@@ -68,7 +68,7 @@ pub(crate) fn admit_table_execute_scan_binding(
             write_target_admission: None,
             frozen_cohort_read: Some(QueryFrozenCohortRead::TableExecute(read)),
             frozen_snapshot_materializations: BTreeMap::new(),
-            admitted_change_scans: BTreeMap::new(),
+            prepared_source_reads: BTreeMap::new(),
         })
     })
 }

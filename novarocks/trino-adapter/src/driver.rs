@@ -280,10 +280,10 @@ pub(crate) async fn run(
             .await;
             (SettlementOwner::Governed(Box::new(owner)), produced)
         }
-        QuerySessionOutput::GovernedCompletion(result) => (
-            SettlementOwner::Governed(Box::new(result.into_protocol())),
-            Ok(()),
-        ),
+        QuerySessionOutput::GovernedCompletion(result) => {
+            let (_completion, protocol) = result.into_parts();
+            (SettlementOwner::Governed(Box::new(protocol)), Ok(()))
+        }
         QuerySessionOutput::GovernedError(result) => {
             let (error, owner) = result.into_parts();
             (

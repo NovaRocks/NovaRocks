@@ -255,13 +255,24 @@ fn scheduler_outcome_log_fields(
 
 fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposition {
     use crate::mv::domain::application::MvApplicationErrorKind;
+    // The selected domain cause and compiler sidecar are independent facts.
+    // Use the same neutral projector as the service path; a Provider failure
+    // must not disappear merely because domain policy was already selected.
+    let execution = error.original_failure().and_then(|cause| {
+        novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+            cause.clone(),
+        )
+        .execution_failure()
+        .cloned()
+    });
     let failure = novarocks_mv_application::scheduler_runtime::MvRefreshFailure::new(
         error.message(),
         error.compile_control_error(),
-    );
+    )
+    .with_execution_failure(execution);
     match error.kind() {
         MvApplicationErrorKind::AlreadyActive => {
-            ScheduledRefreshDisposition::AlreadyActive(error.compile_control_error())
+            ScheduledRefreshDisposition::AlreadyActive(failure)
         }
         MvApplicationErrorKind::Unavailable | MvApplicationErrorKind::BindingInvalidated => {
             ScheduledRefreshDisposition::TransientUnavailable(failure)
@@ -274,7 +285,7 @@ fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposi
             ScheduledRefreshDisposition::TerminalFailure(failure)
         }
         MvApplicationErrorKind::ShutdownCancelled => {
-            ScheduledRefreshDisposition::ShutdownCancelled(error.compile_control_error())
+            ScheduledRefreshDisposition::ShutdownCancelled(failure)
         }
         MvApplicationErrorKind::Engine => ScheduledRefreshDisposition::InvariantViolation(failure),
     }
@@ -430,6 +441,65 @@ mod compile_control_tests {
             assert!(matches!(decision, MvRefreshRuntimeDecision::Blocked { .. }));
             assert_eq!(decision.compile_control_error(), Some(control));
             assert!(runtime.is_suppressed(&7, 100));
+        }
+    }
+
+    #[test]
+    fn selected_connector_cause_reaches_blocked_scheduler_without_compile_relabeling() {
+        use super::{MvApplicationError, ScheduledRefreshDisposition, application_disposition};
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_mv_application::scheduler::MvSchedulerConfig;
+        use novarocks_mv_application::scheduler_runtime::{
+            MvRefreshRuntimeDecision, MvRefreshSchedulerRuntime,
+        };
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
+        for original in [
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "missing original composed capability",
+            ),
+            ConnectorError::from_domain(
+                ConnectorErrorKind::Unsupported,
+                novarocks_local_compiler::FragmentCompileError::Invalid(
+                    "unsupported text does not select the original category",
+                ),
+            ),
+        ] {
+            let fact = original.failure_fact();
+            let domain =
+                MvApplicationError::from_connector(MvApplicationErrorKind::Engine, original);
+            let selected = domain.original_failure().unwrap().clone();
+            let service =
+                novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+                    selected.clone(),
+                );
+            let disposition = application_disposition(domain);
+            assert!(matches!(
+                disposition,
+                ScheduledRefreshDisposition::InvariantViolation(_)
+            ));
+            assert_eq!(disposition.compile_control_error(), None);
+            assert_eq!(
+                disposition.execution_failure().unwrap(),
+                service.execution_failure().unwrap()
+            );
+            assert_eq!(
+                disposition.execution_failure().unwrap().fact(),
+                selected.failure_fact()
+            );
+            let mut runtime = MvRefreshSchedulerRuntime::<i64, ()>::new(MvSchedulerConfig::new(
+                true, 1, 1, 10, 40,
+            ));
+            let decision = runtime.record(&7, disposition, 100);
+            assert!(matches!(decision, MvRefreshRuntimeDecision::Blocked { .. }));
+            assert_eq!(decision.compile_control_error(), None);
+            assert_eq!(decision.execution_failure().unwrap().fact(), fact);
+            assert_eq!(
+                decision.execution_failure().unwrap(),
+                service.execution_failure().unwrap()
+            );
+            assert!(runtime.is_suppressed(&7, i64::MAX));
         }
     }
 

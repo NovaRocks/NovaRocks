@@ -830,6 +830,19 @@ impl TaskManifestBinding {
         bound_writer_cohorts(template.plan(), &self.tasks, &template.native_template)
     }
 
+    /// Each exact Task that owns the independent summary output of its
+    /// retained checked package. The edge is semantic identity, not a branch ordinal.
+    pub(crate) fn summary_sources(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            TaskIdentity,
+            crate::native::fragment_encoder::frozen::StaticSinkTarget,
+        ),
+    > + '_ {
+        bound_summary_sources(&self.tasks, &self.native_template.template.native_template)
+    }
+
     pub(crate) fn validate_submission_fragment(
         &self,
         execution: QueryExecutionId,
@@ -925,6 +938,25 @@ fn select_remote_writer_sender(
 enum ProjectedScanAssignment {
     RuntimeSplits,
     FrozenUnits(BoundManifestFrozenUnits),
+}
+
+fn bound_summary_sources<'a>(
+    tasks: &'a [BoundManifestTask],
+    fragments: &'a crate::query_execution::native_fragment::NativeFragmentAttachment,
+) -> impl Iterator<
+    Item = (
+        TaskIdentity,
+        crate::native::fragment_encoder::frozen::StaticSinkTarget,
+    ),
+> + 'a {
+    tasks.iter().filter_map(move |task| {
+        fragments
+            .get(task.fragment_id)
+            .expect("bound Task fragment belongs to its retained Native template")
+            .facts()
+            .logical_summary_output()
+            .map(|output| (task.identity, output))
+    })
 }
 
 fn bound_writer_cohorts<'a>(
@@ -1743,6 +1775,7 @@ fn protocol_fixture_inputs(
 
 #[cfg(test)]
 mod tests {
+    include!("task_manifest_binding_router_freeze_tests.rs");
     use crate::query_execution::completion_facts::test_support::FinalPlanCompletionDriverTestExt;
     use std::num::{NonZeroU32, NonZeroUsize};
 
@@ -2011,7 +2044,7 @@ mod tests {
             .unwrap_or_else(|(error, _access)| panic!("freeze the original root purpose: {error}"));
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             paired,
-            &crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+            &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
                 novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
                 novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
             ),
@@ -2995,6 +3028,11 @@ mod tests {
             expected
         );
         assert!(cohorts.iter().all(|cohort| cohort.plan() == seal));
+        assert_eq!(
+            super::bound_summary_sources(&tasks, &fragments).count(),
+            0,
+            "ordinary writer and finish Tasks declare no logical summary source"
+        );
         assert_ne!(cohorts[0].task(), cohorts[1].task());
         assert_eq!(cohorts[0].writer(), cohorts[1].writer());
     }

@@ -917,7 +917,11 @@ pub(crate) mod tests {
                 max: 4,
                 requires_power_of_two: false,
             },
-            Some((2, 20)),
+            Some((
+                2,
+                20,
+                novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+            )),
             0,
         )
     }

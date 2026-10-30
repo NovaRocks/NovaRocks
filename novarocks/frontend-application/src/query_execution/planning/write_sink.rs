@@ -127,7 +127,7 @@ pub(crate) fn admit_session_connector_write_target(
             }),
             frozen_cohort_read: None,
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
-            admitted_change_scans: std::collections::BTreeMap::new(),
+            prepared_source_reads: std::collections::BTreeMap::new(),
         })
     })
 }

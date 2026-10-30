@@ -205,6 +205,10 @@ SQL client
   编排 prepare、计算、publication 和必要 finalize。共享阶段/计算在 `query/statement_computation.rs`，
   共享 publication 在 `query/statement_publication.rs`。计算就绪、必要业务就绪与真实退出分别取证；
   成功和失败路径保留累计外部效果，seal/NoOp 不冒充最终 CREATE 或真实提交。
+  命令完成经 Query Application 的 `StatementCommandCompletion` / `GovernedCompletionStatementResult`
+  保留原业务选定的 affected rows，再由 MySQL `terminal.rs` 标准编码。普通/MOR 取同 Session
+  完整冻结的 Root 计数，COW 取原 selection，CTAS 等最终 CREATE；控制与签名 NoOp 显式为零。
+  缺计数或失败不能转成 OK(0)，完成数据不替代原 visibility、取消、真实 flush 与退出。
 
 - `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`
   Stats 的前台 capture 与后台 governed Action：capture 的 CPU/Provider 实际关闭后，原 query permit
@@ -322,7 +326,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `novarocks/execution/src/runtime/function_set.rs`
   只封存真实 EngineFunctionCatalog metadata；不持有旧实现 map、legacy registry 或 implementation manifest。
-  `novarocks/version/src/lib.rs` 的 compatibility domain 为 8、生产 epoch 为 9；旧执行实现摘要不再参与，
+  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 10；旧执行实现摘要不再参与，
   函数目录、pure 目录、descriptor、plan contract 与 Provider/carrier 事实仍保持 exact-island 判定。
 
 - `novarocks/execution/src/exec/operators/**`
@@ -339,8 +343,18 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `binding.rs` 定义 `ExchangeBindings`、`ScanBindings`，writer bindings 在 `runtime/fragment`。
 
 - `novarocks/execution/src/exec/pipeline/executor.rs`
-  `prepare_compiled_program_pipeline_execution_with_profiler` 准备 compiled pipeline；
-  program 与 Task 能力分别传入，不能重建已删除的 construction plan bridge。
+  生产入口 `prepare_compiled_program_with_sink_materializer` 先建立计算图，再按实际 root DOP
+  绑定 sink。change-stream 的独立 summary pipeline 加入同一 DriverBatch/FragmentCompletion，
+  不等待 Task terminal，也不从请求 profile 猜贡献者数量。program 与 Task 能力分别传入，
+  不能重建已删除的 construction plan bridge。
+
+- `novarocks/execution/src/runtime/fragment/sink.rs`、`exec/pipeline/builder/compiled_writer.rs`
+  Router 按原 static branch 绑定 provider route 与独立 summary，表达式 root 保留原 branch 身份。
+  writer 以相同 canonical typed key 分别消费 InstanceV1 与 DriverV1 hash 域；条件断言仅对
+  WhenTrue 行判重，FALSE/NULL 绕过 key。逻辑 finish 以 Source 公平消费有界 writer-results
+  合流和准确 source-bound summary，不再为 summary 构建竞争同一 receiver 的第二个 Source。
+  核心契约见 [ADR-0208](docs/adr/ADR-0208-logical-write-counts-and-strict-stream-delivery.md)，
+  冻结放置、Task 绑定与完成装配见 [ADR-0206](docs/adr/ADR-0206-frozen-write-placement-and-task-completion-assembly.md)。
 
 - `novarocks/execution/src/exec/pipeline/driver.rs`
   Driver execution logic.
@@ -447,6 +461,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   - `novarocks/connector/iceberg/src/commit/staging/**`：updates 前缀事实、ID 规范化、requirements 折算及 manifest-list 的实际 row-ID 分配。
   - `novarocks/connector/iceberg/src/commit/attempt.rs`：加载、验证、准备、冻结、单次派发和确定冲突的重试。
   - `novarocks/connector/iceberg/src/commit/operation.rs`：操作内 I/O 并发、先登记后写入、实际退出监督和有界 owned-object 清理。
+  - `novarocks/connector/iceberg/src/commit/write_stack/execution/cleanup.rs`：原 unsealed writer actor 持有准确 staged journal，首次清理启用现有 Provider 独立时间预算，保留原 scope、凭据与 I/O 能力；只在实际 DELETE 成功后移除原路径。Work 停止不取消已存在的清理义务，sealed 产物与 Unknown 仍保留原所有权及真实退出要求。
 
 - `novarocks/connector/paimon/**`
   Paimon Provider 已暂停；保留配置、合约与私有 wire codec，catalog materialize 成功，
@@ -492,8 +507,11 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    `novarocks/execution/src/runtime/fragment/io/exchange_receiver.rs` and the
    registry in `novarocks/execution/src/runtime/exchange.rs`.
 4. The exchange source operator
-   (`novarocks/execution/src/exec/operators/exchange_source.rs`) blocks until all
-   senders reach EOS.
+   (`novarocks/execution/src/exec/operators/exchange_source.rs`) waits for every
+   sender and authors Consumed only after the actual input consumes its final
+   EOS; early withdrawal remains Withdrawn. MustDrain inputs cannot use ordinary
+   demand withdrawal to authorize success or normal retirement. Pre-success
+   validation, settled conclusion and the retirement re-read remain distinct.
 5. On cancellation, `exchange::cancel_fragment` / `cancel_exchange_key` clear
    exchange keys and wake blocked waiters.
 
@@ -508,6 +526,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    per participating backend. A context exists only where the scheduler placed
    a task, so the number of participants is a property of the plan and the
    splits, never of the cluster size.
+   `coordination/schedule.rs` 消费显式 Singleton/ScanWork/Spread/FollowSources policy，
+   独立决定 source、各 writer route 和 finish 的实例集合；driver DOP 使用同一 query options
+   冻结的域。manifest 从同一准确 placement 分别冻结 writer 与 summary-source Task 集合。
 2. Query Application 的统一逻辑执行 owner 管理各分布式意图的恢复、结果与计算就绪；
    Frontend Action 编排 prepare、领域 publication 和必要 finalize，Task 驱动只提供协议事实。
    稳定 Source 在启动前接收原输入、同 Root 责任与访问能力，跨取消和 panic 保管原件；
@@ -531,6 +552,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    BE 的 typed 能力拒绝沿 `TaskFailureCategory::Unsupported` 与
    `AttemptFailureClass::Unsupported` 传至 `[UnsupportedCompiledShape]`，不重试或重新规划。
    SQL 分析期缺 pure 实现保留 `[sql.analyze.unavailable_implementation]`。
+   写完成要求完整 Root End、准确结果覆盖及各领域冻结 Task 的完成事实，并保留取消/deadline 否决。
+   root seal 后原 Task 驱动继续推进严格尾部；所有 MustDrain 端点终态后才进入原 normal drain，
+   不把 root seal 当成 source/writer 已完成，也不为普通读新增全参与者成功屏障。
 3. Push exchange edges start Closed and open once every frozen destination has
    an Installed fact or has normally withdrawn its exact input demand
    (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no

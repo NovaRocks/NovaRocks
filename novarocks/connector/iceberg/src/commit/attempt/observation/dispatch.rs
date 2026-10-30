@@ -1149,8 +1149,15 @@ mod tests {
     #[async_trait]
     impl PreparedCatalogDispatch for RealRestActivityDispatch {
         async fn dispatch_once(self: Box<Self>, context: EvidenceContext) -> DispatchCompletion {
-            let observed = self.0.dispatch(context).await;
-            DispatchCompletion::evidence(observed.dispatch_evidence())
+            let observed = match self.0.dispatch(context).await {
+                Ok(observed) => observed.dispatch_evidence(),
+                Err(original) => DispatchEvidence::NotDispatched {
+                    failure: novarocks_spi::connector::ConnectorMutationFailure::from_connector(
+                        original,
+                    ),
+                },
+            };
+            DispatchCompletion::evidence(observed)
         }
     }
     #[tokio::test]

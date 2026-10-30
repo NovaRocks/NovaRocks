@@ -72,6 +72,14 @@ enum ReadOpenCall {
     ),
     WholeMv(SchemaTableName, ConnectorTableObjectId, Option<i64>),
     PartitionMv(SchemaTableName, ConnectorMvTargetPartitionSelection),
+    Prepared(ConnectorReadSourceSelection, ConnectorReadSourceProjection),
+    Delta(SchemaTableName, ConnectorReadChangeWindow),
+}
+
+struct TinySourceObservation {
+    metadata: Arc<ConnectorTableMetadata>,
+    object: ConnectorTableObjectId,
+    owner: ConnectorProviderBindingKey,
 }
 
 struct LateProvider {
@@ -83,6 +91,8 @@ struct LateProvider {
     freezes: AtomicUsize,
     public_schemas: AtomicUsize,
     read_opens: Mutex<Vec<ReadOpenCall>>,
+    tiny_source: Mutex<Option<TinySourceObservation>>,
+    source_prepares: AtomicUsize,
 }
 impl LateProvider {
     fn open_table(
@@ -115,6 +125,99 @@ impl ProviderReadRuntime for LateProvider {
     fn transaction(&self) -> Self::Transaction {}
 }
 impl ProviderReadMetadata for LateProvider {
+    type PreparedSourceRead = (ConnectorReadSourceSelection, ConnectorTableObjectId);
+
+    fn prepare_source_read<'a>(
+        &'a self,
+        _: &'a ConnectorSession,
+        request: &'a ConnectorReadSourcePreparationRequest,
+        _: &'a Arc<dyn ProviderMetadataCpuPort>,
+        _: &'a ConnectorOriginalResultScope,
+        _: &'a mut Option<ConnectorProcessLocalPayload>,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<
+            novarocks_spi::connector::read_stack::adapter::ProviderPreparedSourceRead<
+                Self::PreparedSourceRead,
+            >,
+            ConnectorError,
+        >,
+    > {
+        Box::pin(async move {
+            let state = self.tiny_source.lock().unwrap();
+            let source = state.as_ref().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "fixture has no original tiny source",
+                )
+            })?;
+            request
+                .observed_source_facts()
+                .validate_owner(&source.owner)?;
+            let object = request
+                .observed_source_facts()
+                .value::<ConnectorTableObjectId>(source.owner.instance_id.as_str())?;
+            let supported = match request.selection() {
+                ConnectorReadSourceSelection::Snapshot(41) => true,
+                ConnectorReadSourceSelection::ChangeWindow(window) => {
+                    window == ConnectorReadChangeWindow::new(40, 41)
+                }
+                _ => false,
+            };
+            if request.name() != &SchemaTableName::try_new("db", "orders")?
+                || request.observed_table() != &source.metadata.table
+                || request.object_id() != &source.object
+                || object.as_ref() != &source.object
+                || request.to_revision().canonical_read_point()
+                    != Some(ConnectorCanonicalReadPoint::Snapshot(Some(41)))
+                || request.to_revision().object_identity().value() != source.object.as_bytes()
+                || matches!(
+                    request.selection(),
+                    ConnectorReadSourceSelection::ChangeWindow(_)
+                ) && !request.from_revision().is_some_and(|from| {
+                    from.canonical_read_point()
+                        == Some(ConnectorCanonicalReadPoint::Snapshot(Some(40)))
+                        && from.object_identity() == request.to_revision().object_identity()
+                })
+                || !supported
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "tiny source request differs from its original fixture observation",
+                ));
+            }
+            self.source_prepares.fetch_add(1, Ordering::AcqRel);
+            let facts = (request.selection(), source.object.clone());
+            let metadata = Arc::clone(&source.metadata);
+            Ok(match request.selection() {
+                ConnectorReadSourceSelection::Snapshot(_) => novarocks_spi::connector::read_stack::adapter::ProviderPreparedSourceRead::snapshot(facts, metadata),
+                ConnectorReadSourceSelection::ChangeWindow(_) => novarocks_spi::connector::read_stack::adapter::ProviderPreparedSourceRead::change_window(facts, ConnectorChangeWindowAdmission::Incremental { has_inserts: true, has_deletes: false, partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned }, metadata),
+            })
+        })
+    }
+
+    fn project_prepared_source_read(
+        &self,
+        _: &ConnectorSession,
+        request: &ConnectorReadSourcePreparationRequest,
+        source: &Self::PreparedSourceRead,
+        projection: ConnectorReadSourceProjection,
+    ) -> Result<Self::Table, ConnectorError> {
+        if source.0 != request.selection() || &source.1 != request.object_id() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "tiny source projection changed its original selection",
+            ));
+        }
+        self.open_table(request.name(), ReadOpenCall::Prepared(source.0, projection))?
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "tiny source fixture table was already consumed",
+                )
+            })
+    }
+
     type PreparedRelation = (
         Self::Table,
         Option<novarocks_spi::connector::read_stack::SystemTableUnitHint>,
@@ -354,9 +457,13 @@ impl ProviderReadMetadata for LateProvider {
     fn get_change_window_plan(
         &self,
         _: &ConnectorSession,
-        _: &SchemaTableName,
-        _: ConnectorReadChangeWindow,
+        name: &SchemaTableName,
+        window: ConnectorReadChangeWindow,
     ) -> Result<Option<Self::Table>, ConnectorError> {
+        self.read_opens
+            .lock()
+            .unwrap()
+            .push(ReadOpenCall::Delta(name.clone(), window));
         Ok(None)
     }
     fn get_table_execute_plan(
@@ -589,6 +696,8 @@ fn original_provider_completion_fixture(
         freezes: AtomicUsize::new(0),
         public_schemas: AtomicUsize::new(0),
         read_opens: Mutex::new(Vec::new()),
+        tiny_source: Mutex::new(None),
+        source_prepares: AtomicUsize::new(0),
     });
     let adapter = Arc::new(ReadRuntimeAdapter::new(provider.clone()));
     let seals = Arc::new(AtomicUsize::new(0));
@@ -1081,6 +1190,8 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
         freezes: AtomicUsize::new(0),
         public_schemas: AtomicUsize::new(0),
         read_opens: Mutex::new(Vec::new()),
+        tiny_source: Mutex::new(None),
+        source_prepares: AtomicUsize::new(0),
     });
     let adapter = Arc::new(ReadRuntimeAdapter::new(provider.clone()));
     let props = CatalogProperties::new(
@@ -1275,4 +1386,413 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
         provider.table.lock().unwrap().as_ref().unwrap(),
         &table
     ));
+}
+
+// This component fixture clones tiny immutable facts only. Any attempted CPU
+// dispatch or original-scope observation would exceed its routing-only scope.
+struct RoutingMustNotRunPreparation;
+impl ProviderMetadataCpuPort for RoutingMustNotRunPreparation {
+    fn submit_metadata_in(
+        &self,
+        _: &mut Option<ProviderMetadataCpuInput>,
+    ) -> Result<(), ConnectorError> {
+        panic!("routing fixture must not dispatch preparation CPU")
+    }
+    fn poll_finished(
+        &self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ConnectorError>> {
+        panic!("routing fixture has no preparation CPU result")
+    }
+    fn poll_closed(
+        &self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ConnectorError>> {
+        panic!("routing fixture cannot certify CPU close")
+    }
+    fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+        panic!("routing fixture has no CPU health observation")
+    }
+}
+impl ConnectorOriginalResultScopeCheck for RoutingMustNotRunPreparation {
+    fn original_deadline(&self) -> Instant {
+        panic!("routing fixture must not inspect an original preparation scope")
+    }
+    fn check_active(&self) -> Result<(), OriginalResultCheckError> {
+        panic!("routing fixture must not inspect original preparation work")
+    }
+}
+
+#[test]
+fn original_prepared_source_routing_uses_to_and_refuses_missing_or_foreign_facts() {
+    use crate::catalog_application::query_bindings::QueryPreparedSourceSelector;
+    use novarocks_spi::connector::read_stack::ConnectorReadSourceProjection as P;
+    let instance = ConnectorInstanceId::parse("catalog.analytics").unwrap();
+    let catalog = CatalogHandle::new(instance.clone(), CatalogVersion::from_bytes([7; 32]));
+    let owner = ConnectorProviderBindingKey {
+        instance_id: instance.clone(),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+    };
+    let object = ConnectorTableObjectId::try_new(Bytes::from_static(b"source-A")).unwrap();
+    let metadata_for = |object: &ConnectorTableObjectId,
+                        owner: &ConnectorProviderBindingKey,
+                        handle: &'static [u8]| {
+        crate::connector::schema_creation::declared_test_metadata(
+            ConnectorTableMetadataHeader {
+                identity: ConnectorTableIdentity {
+                    instance_id: instance.clone(),
+                    namespace: "db".into(),
+                    table: "orders".into(),
+                },
+                planning_facts: ConnectorTablePlanningFacts::empty(),
+                definition_facts: ConnectorTableDefinitionFacts::empty(),
+                version: Some(Bytes::from_static(b"schema-To41")),
+                statistics_data_version: None,
+                table: novarocks_spi::connector::ConnectorTableHandle::try_new(
+                    instance.clone(),
+                    Bytes::from_static(handle),
+                )
+                .unwrap(),
+            },
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int64, false),
+            ])),
+            vec![novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            )],
+        )
+        .with_source_read_facts(ConnectorProcessLocalPayload::new(
+            owner.clone(),
+            Arc::new(object.clone()),
+        ))
+    };
+    let metadata = Arc::new(metadata_for(&object, &owner, b"frozen-source-A-To41"));
+    let new_provider = |metadata: Arc<ConnectorTableMetadata>,
+                        object: ConnectorTableObjectId,
+                        owner: ConnectorProviderBindingKey| {
+        Arc::new(LateProvider {
+            descriptor: ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                instance_id: instance.clone(),
+            },
+            catalog: catalog.clone(),
+            table: Mutex::new(None),
+            declared_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+            opens: AtomicUsize::new(0),
+            freezes: AtomicUsize::new(0),
+            public_schemas: AtomicUsize::new(0),
+            read_opens: Mutex::new(Vec::new()),
+            tiny_source: Mutex::new(Some(TinySourceObservation {
+                metadata,
+                object,
+                owner,
+            })),
+            source_prepares: AtomicUsize::new(0),
+        })
+    };
+    let provider = new_provider(metadata.clone(), object.clone(), owner.clone());
+    let adapter = Arc::new(ReadRuntimeAdapter::new(provider.clone()));
+    let props = CatalogProperties::new(
+        catalog.clone(),
+        provider.descriptor.provider_id.clone(),
+        1,
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let generic = Arc::new(
+        novarocks_catalog_application::test_support::test_control_binding_for(instance.clone(), 7)
+            .with_catalog_properties(props.clone())
+            .unwrap(),
+    );
+    let host = ConnectorControlHost::new();
+    host.register_role_binding(
+        ConnectorControlRoleBinding::try_new(
+            NormalizedCatalogProperties::try_new(props).unwrap(),
+            generic,
+            Some(ConnectorControlReadBinding::new(
+                adapter.clone(),
+                adapter.clone(),
+                None,
+                Arc::new(LateEncoder {
+                    relation_allowed: false,
+                    catalog: catalog.clone(),
+                    relation_calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            )),
+            None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let lease = host.acquire_current(&instance).unwrap();
+    let session = ConnectorSession::try_new(
+        "prepared-routing",
+        "u",
+        "UTC",
+        "en_US",
+        SystemTime::UNIX_EPOCH,
+    )
+    .unwrap();
+    let context = crate::connector::test_request_context();
+    let cpu: Arc<dyn ProviderMetadataCpuPort> = Arc::new(RoutingMustNotRunPreparation);
+    let original =
+        ConnectorOriginalResultScope::from_original(Arc::new(RoutingMustNotRunPreparation));
+    let prepare = |adapter: &ReadRuntimeAdapter<LateProvider>,
+                   metadata: &ConnectorTableMetadata,
+                   object: &ConnectorTableObjectId| {
+        let revision = |id| {
+            ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                provider.descriptor.provider_id.clone(),
+                object,
+                Some(id),
+            )
+            .unwrap()
+        };
+        let request = ConnectorReadSourcePreparationRequest::change_window(
+            SchemaTableName::try_new("db", "orders").unwrap(),
+            metadata.table.clone(),
+            metadata.source_read_facts().unwrap().clone(),
+            object.clone(),
+            ConnectorReadChangeWindow::new(40, 41),
+            revision(40),
+            revision(41),
+        );
+        let mut receiving = None;
+        let value = futures::executor::block_on(adapter.prepare_source_read(
+            &session,
+            &request,
+            &cpu,
+            &original,
+            &mut receiving,
+        ))
+        .unwrap();
+        assert!(
+            receiving.is_none(),
+            "tiny immutable routing facts started a live Source"
+        );
+        value
+    };
+    let receipt = prepare(adapter.as_ref(), &metadata, &object);
+    assert_eq!(provider.source_prepares.load(Ordering::Acquire), 1);
+    let bindings = QueryTableBindingStore::try_new().unwrap();
+    let make_binding = |id| {
+        let resolved = novarocks_sql::planning::catalog::materialize_connector_read_table(
+            novarocks_sql::planning::catalog::ConnectorReadTableFacts {
+                catalog: instance.as_str().into(),
+                namespace: "db".into(),
+                table: "orders".into(),
+                columns: vec![novarocks_types::schema::ColumnDef {
+                    name: "k".into(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                }],
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                schema: Arc::new(metadata.schema().clone()),
+                binding: id,
+                selector: ConnectorReadSelector::SnapshotId(41),
+                planning_facts: ConnectorTablePlanningFacts::empty(),
+            },
+        )
+        .unwrap()
+        .into_resolved_table();
+        let mut value = QueryTableBinding::local(resolved, id);
+        value.admission = QueryTableBindingAdmission::Exact(lease.clone());
+        value.source_metadata = Some((*metadata).clone());
+        value.scan_materialization = Some(QueryScanMaterialization {
+            table: metadata.table.clone(),
+            selector: ConnectorReadSelector::SnapshotId(41),
+            mv_partition_selection: None,
+            planning_lease: lease.clone(),
+        });
+        value
+    };
+    let id = bindings
+        .resolve_or_insert_with_id(
+            QueryTableBindingKey::snapshot(instance.as_str(), "db", "orders", 41),
+            |id| {
+                let mut value = make_binding(id);
+                for projection in [P::To, P::From, P::Delta] {
+                    value.install_prepared_source_read(
+                        receipt.clone(),
+                        projection,
+                        lease.clone(),
+                    )?;
+                }
+                Ok(value)
+            },
+        )
+        .unwrap();
+    let column = novarocks_sql::compiler::fixtures::provider_read_column_need(
+        0,
+        "k",
+        novarocks_physical_plan::ValueType::new(arrow::datatypes::DataType::Int64, false),
+        ConnectorValueType::BigInt,
+    )
+    .unwrap();
+    let need = |relation| {
+        novarocks_sql::compiler::fixtures::provider_read_need(
+            1,
+            novarocks_physical_plan::ProviderReadOccurrenceId::new(1),
+            id,
+            relation,
+            vec![column.clone()],
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+    };
+    let relation = TableIdentity::new(instance.as_str(), "db", "orders");
+    let data = need(ProviderReadRelationNeed::Data {
+        relation: relation.clone(),
+        version: ProviderReadVersionNeed::Current,
+    });
+    let mut prepared = begin_one_read(data, &host, &bindings, &context).unwrap();
+    futures::executor::block_on(prepare_observation(&mut prepared, &session)).unwrap();
+    assert!(matches!(
+        prepared.observation.as_ref(),
+        Some(ReadObservation::OriginalPreparedSource)
+    ));
+    let (entered, entered_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    drop(entered_rx);
+    drop(release);
+    let table = Arc::new(ActualFrozenTable {
+        entered,
+        release: Mutex::new(release_rx),
+        destroyed: Arc::new(AtomicBool::new(false)),
+    });
+    *provider.table.lock().unwrap() = Some(table.clone());
+    let handle = open_relation(
+        adapter.as_ref(),
+        &session,
+        &prepared.opening.table,
+        prepared.need.relation(),
+        &prepared.opening.admitted,
+        "db.orders",
+    )
+    .unwrap()
+    .0;
+    assert!(Arc::ptr_eq(adapter.table(&handle).unwrap(), &table));
+    assert_eq!(
+        *provider.read_opens.lock().unwrap(),
+        [ReadOpenCall::Prepared(
+            ConnectorReadSourceSelection::ChangeWindow(ConnectorReadChangeWindow::new(40, 41)),
+            P::To
+        )]
+    );
+    assert_eq!(
+        provider.source_prepares.load(Ordering::Acquire),
+        1,
+        "read routing re-prepared original facts"
+    );
+    let delta_relation = ProviderReadRelationNeed::Delta {
+        relation: relation.clone(),
+        from_snapshot_id: 40,
+        to_snapshot_id: 41,
+    };
+    let exact = need(delta_relation.clone());
+    let exact = prepare_read_opening(&exact, &host, &bindings, &context).unwrap();
+    assert!(
+        matches!(exact.admitted,AdmittedRead::PreparedSource(ref value) if value.projection==P::Delta)
+    );
+    *provider.table.lock().unwrap() = Some(table.clone());
+    let delta_handle = open_relation(
+        adapter.as_ref(),
+        &session,
+        &exact.table,
+        &delta_relation,
+        &exact.admitted,
+        "db.orders",
+    )
+    .unwrap()
+    .0;
+    assert!(Arc::ptr_eq(adapter.table(&delta_handle).unwrap(), &table));
+    assert!(
+        matches!(provider.read_opens.lock().unwrap().last(), Some(ReadOpenCall::Prepared(ConnectorReadSourceSelection::ChangeWindow(window), P::Delta)) if *window == ConnectorReadChangeWindow::new(40, 41))
+    );
+    let missing = need(ProviderReadRelationNeed::Delta {
+        relation: relation.clone(),
+        from_snapshot_id: 39,
+        to_snapshot_id: 41,
+    });
+    assert!(prepare_read_opening(&missing, &host, &bindings, &context).is_err());
+    assert_eq!(provider.source_prepares.load(Ordering::Acquire), 1);
+    let admitted = bindings.binding(id).unwrap();
+    assert!(
+        admitted
+            .prepared_source_reads
+            .contains_key(&QueryPreparedSourceSelector::Snapshot(41))
+    );
+    let other_owner = ConnectorProviderBindingKey {
+        incarnation: ProviderBindingEpoch::from_bytes([8; 16]),
+        ..owner.clone()
+    };
+    let other_metadata = Arc::new(metadata_for(&object, &other_owner, b"frozen-source-A-To41"));
+    let other_adapter = ReadRuntimeAdapter::new(new_provider(
+        other_metadata.clone(),
+        object.clone(),
+        other_owner,
+    ));
+    let old = prepare(&other_adapter, &other_metadata, &object);
+    assert!(
+        make_binding(id)
+            .install_prepared_source_read(old, P::To, lease.clone())
+            .is_err(),
+        "same catalog content from a foreign generation was installed"
+    );
+    let other_object = ConnectorTableObjectId::try_new(Bytes::from_static(b"source-B")).unwrap();
+    let other_metadata = Arc::new(metadata_for(&other_object, &owner, b"frozen-source-B-To41"));
+    let other_adapter = ReadRuntimeAdapter::new(new_provider(
+        other_metadata.clone(),
+        other_object.clone(),
+        owner,
+    ));
+    let other = prepare(&other_adapter, &other_metadata, &other_object);
+    assert!(
+        make_binding(id)
+            .install_prepared_source_read(other, P::To, lease.clone())
+            .is_err()
+    );
+    let ordinary = QueryTableBindingStore::try_new().unwrap();
+    let ordinary_id = ordinary
+        .resolve_or_insert_with_id(
+            QueryTableBindingKey::strict_base(instance.as_str(), "db", "orders"),
+            |id| Ok(make_binding(id)),
+        )
+        .unwrap();
+    let delta = novarocks_sql::compiler::fixtures::provider_read_need(
+        1,
+        novarocks_physical_plan::ProviderReadOccurrenceId::new(1),
+        ordinary_id,
+        ProviderReadRelationNeed::Delta {
+            relation,
+            from_snapshot_id: 40,
+            to_snapshot_id: 41,
+        },
+        vec![column],
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+    let mut ordinary = begin_one_read(delta, &host, &ordinary, &context).unwrap();
+    assert!(matches!(
+        ordinary.opening.admitted,
+        AdmittedRead::Relation(_)
+    ));
+    assert!(
+        futures::executor::block_on(prepare_observation(&mut ordinary, &session)).is_err(),
+        "original fixture exposes no generic window"
+    );
+    assert!(
+        matches!(provider.read_opens.lock().unwrap().last(),Some(ReadOpenCall::Delta(_,window)) if *window==ConnectorReadChangeWindow::new(40,41)),
+        "ordinary explicit Delta stopped using its original typed author"
+    );
+    assert_eq!(provider.source_prepares.load(Ordering::Acquire), 1);
 }

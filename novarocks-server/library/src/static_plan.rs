@@ -54,7 +54,7 @@ impl ServerStaticPlan {
         }
     }
 
-    pub fn backend_interpreter(&self) -> anyhow::Result<CompiledStaticPlan> {
+    pub fn backend_interpreter(&self) -> CompiledStaticPlan {
         self.compiled.backend_interpreter()
     }
 
@@ -90,8 +90,37 @@ mod tests {
                 pure_function_catalog_digest: seal.catalog.digest(),
             }
         );
-        plan.backend_interpreter().expect("backend interpreter");
+        plan.backend_interpreter();
         let carrier = plan.frontend_carrier();
+        let another_carrier = plan.frontend_carrier();
+        assert!(std::sync::Arc::ptr_eq(
+            carrier.receiver_model(),
+            another_carrier.receiver_model()
+        ));
+        let actual = carrier.receiver_limits();
+        let expected = novarocks_plan_codec::physical_package_v2::PackageDecodeLimits::FROZEN.wire;
+        assert_eq!(
+            [
+                actual.max_input_bytes,
+                actual.max_requested_heap_bytes,
+                actual.max_message_occurrences,
+                actual.max_scalar_elements,
+                actual.max_field_occurrences,
+                actual.max_copied_bytes,
+                actual.max_initialization_bytes,
+                actual.max_wire_depth
+            ],
+            [
+                expected.max_input_bytes,
+                expected.max_requested_heap_bytes,
+                expected.max_message_occurrences,
+                expected.max_scalar_elements,
+                expected.max_field_occurrences,
+                expected.max_copied_bytes,
+                expected.max_initialization_bytes,
+                expected.max_wire_depth
+            ]
+        );
         let admission = carrier.admission();
         let limits = carrier.limits();
         let receiver = novarocks_plan_codec::physical_package_v2::PackageDecodeLimits::FROZEN;

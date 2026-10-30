@@ -152,8 +152,10 @@ async fn write_negotiated_statement<'writer, W: AsyncWrite + Unpin>(
             .await
         }
         StatementResult::GovernedCompletion(result) => {
+            let (completion, protocol) = result.into_parts();
             crate::terminal::write_governed_terminal_ok_with_more(
-                result.into_protocol(),
+                completion,
+                protocol,
                 results,
                 more_results,
             )
@@ -1111,7 +1113,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         let outcome = match statement {
             StatementResult::Ok => writer.ok().await,
             StatementResult::GovernedCompletion(result) => {
-                crate::write_governed_init_ok(result.into_protocol(), writer).await
+                let (completion, protocol) = result.into_parts();
+                crate::write_governed_init_ok(completion, protocol, writer).await
             }
             StatementResult::GovernedError(result) => {
                 let (error, protocol) = result.into_parts();
@@ -1335,7 +1338,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                 }.await
             }
             StatementResult::GovernedCompletion(result) => {
-                crate::write_governed_terminal_ok(result.into_protocol(), results).await
+                let (completion, protocol) = result.into_parts();
+                crate::write_governed_terminal_ok(completion, protocol, results).await
             }
             StatementResult::GovernedError(result) => {
                 let (error, protocol) = result.into_parts();

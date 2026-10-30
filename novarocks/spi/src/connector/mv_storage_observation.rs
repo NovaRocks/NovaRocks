@@ -160,26 +160,34 @@ impl MvObservedSourceField {
 }
 
 /// A provider projection from the same exact planning lease and metadata
-/// generation that admitted one CREATE source. Frontend stamps SQL relation
-/// occurrences onto this value; providers never receive or infer SQL aliases.
+/// generation and its selected source schema. Target partition layout and OCC
+/// are separate observations. Frontend stamps SQL relation occurrences onto
+/// these fields; providers never receive or infer SQL aliases.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvCreateSourceObservation {
+pub struct MvSourceSchemaObservation {
     table: ConnectorTableIdentity,
     object_id: ConnectorTableObjectId,
     schema_version: Bytes,
+    format_v3: bool,
+    stored_row_lineage_enabled: bool,
     fields: Vec<MvObservedSourceField>,
 }
 
-impl MvCreateSourceObservation {
+impl MvSourceSchemaObservation {
     pub fn try_new(
         table: ConnectorTableIdentity,
         object_id: ConnectorTableObjectId,
         schema_version: Bytes,
+        format_v3: bool,
+        stored_row_lineage_enabled: bool,
         fields: Vec<MvObservedSourceField>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_context(context)?;
-        validate_table(&table, "MV CREATE source")?;
+        validate_table(&table, "MV source schema")?;
+        if stored_row_lineage_enabled && !format_v3 {
+            return corrupt("MV source row lineage requires its observed v3 format");
+        }
         if schema_version.is_empty() || fields.is_empty() {
             return corrupt("MV CREATE source observation has no schema version or fields");
         }
@@ -216,6 +224,8 @@ impl MvCreateSourceObservation {
             table,
             object_id,
             schema_version,
+            format_v3,
+            stored_row_lineage_enabled,
             fields,
         })
     }
@@ -230,6 +240,14 @@ impl MvCreateSourceObservation {
 
     pub const fn schema_version(&self) -> &Bytes {
         &self.schema_version
+    }
+
+    pub const fn is_format_v3(&self) -> bool {
+        self.format_v3
+    }
+
+    pub const fn stored_row_lineage_enabled(&self) -> bool {
+        self.stored_row_lineage_enabled
     }
 
     pub fn fields(&self) -> &[MvObservedSourceField] {
@@ -822,12 +840,12 @@ pub trait MvStorageObservationPort: Send + Sync {
     /// Projects opaque source identities from the same retained generation as
     /// `metadata`. A caller must reject this observation if its table or schema
     /// version does not exactly match that admitted metadata.
-    fn observe_create_source(
+    fn observe_source_schema(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
-    ) -> Result<MvCreateSourceObservation, ConnectorError>;
+    ) -> Result<MvSourceSchemaObservation, ConnectorError>;
     fn observe_created_target(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
@@ -872,12 +890,12 @@ fn unavailable() -> ConnectorError {
 }
 
 impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
-    fn observe_create_source(
+    fn observe_source_schema(
         &self,
         _: &ConnectorControlPlanningLease,
         _: &ConnectorTableMetadata,
         _: ConnectorRequestContext,
-    ) -> Result<MvCreateSourceObservation, ConnectorError> {
+    ) -> Result<MvSourceSchemaObservation, ConnectorError> {
         Err(unavailable())
     }
     fn observe_created_target(
@@ -1159,15 +1177,39 @@ mod tests {
             false,
         )
         .expect("source field");
-        let err = MvCreateSourceObservation::try_new(
+        let err = MvSourceSchemaObservation::try_new(
             table(),
             target_object_id(),
             Bytes::from_static(b"schema-1"),
+            true,
+            true,
             vec![field.clone(), field],
             &context(),
         )
         .expect_err("duplicate provider identity must reject");
         assert_eq!(err.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn source_schema_cannot_claim_stored_row_lineage_without_v3() {
+        let field = MvObservedSourceField::try_new(
+            Bytes::from_static(b"id"),
+            "id".into(),
+            "long".into(),
+            false,
+        )
+        .unwrap();
+        let error = MvSourceSchemaObservation::try_new(
+            table(),
+            target_object_id(),
+            Bytes::from_static(b"schema-1"),
+            false,
+            true,
+            vec![field],
+            &context(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }
 
     #[test]

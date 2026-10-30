@@ -114,6 +114,8 @@ where
     T: Clone + std::fmt::Debug + Send + Sync + 'static,
     C: ColumnHandle,
 {
+    type PreparedSourceRead =
+        novarocks_spi::connector::read_stack::adapter::UnsupportedPreparedSourceRead;
     type PreparedRelation = (
         Self::Table,
         Option<novarocks_spi::connector::read_stack::SystemTableUnitHint>,

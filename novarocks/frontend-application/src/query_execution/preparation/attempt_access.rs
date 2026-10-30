@@ -193,6 +193,27 @@ impl LogicalExecutionAccessScope {
 }
 
 impl ConnectorAttemptAccessEntry {
+    #[cfg(test)]
+    pub(crate) fn for_initializer_test(
+        catalog_properties: CatalogProperties,
+        planning_lease: ConnectorControlPlanningLease,
+        access: ConnectorReadAttemptAccess,
+    ) -> Arc<Self> {
+        assert_eq!(
+            access.frozen().binding().catalog_handle(),
+            catalog_properties.handle()
+        );
+        assert_eq!(
+            access.frozen().binding().descriptor(),
+            planning_lease.binding().descriptor()
+        );
+        Arc::new(Self {
+            catalog_properties,
+            planning_lease,
+            access,
+        })
+    }
+
     pub(crate) const fn access(&self) -> &ConnectorReadAttemptAccess {
         &self.access
     }

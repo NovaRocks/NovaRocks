@@ -38,7 +38,7 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
 }
 
-pub(super) fn namespace_ident(
+pub(crate) fn namespace_ident(
     name: &CatalogNamespaceName,
 ) -> Result<NamespaceIdent, ConnectorError> {
     let normalized = normalize_identifier(&name.namespace).map_err(invalid)?;
@@ -53,7 +53,7 @@ pub(super) fn table_ident(name: &CatalogTableName) -> Result<TableIdent, Connect
 }
 
 /// Order a bounded listing and drop duplicate names.
-pub(super) fn sorted_unique(mut names: Vec<String>) -> Vec<String> {
+pub(crate) fn sorted_unique(mut names: Vec<String>) -> Vec<String> {
     names.sort();
     names.dedup();
     names

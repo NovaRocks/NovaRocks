@@ -199,6 +199,7 @@ pub enum SqlImvRewriteValidation {
 pub struct SqlImvPlanningInput {
     snapshot: SqlImvRewriteSnapshotHandle,
     pub(crate) validation: SqlImvRewriteValidation,
+    target_read: crate::planner::imv_rewrite::annotation::TargetReadRequirement,
 }
 
 impl SqlImvPlanningInput {
@@ -206,7 +207,17 @@ impl SqlImvPlanningInput {
         Self {
             snapshot,
             validation,
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
         }
+    }
+
+    pub(crate) fn with_target_read_requirement(
+        mut self,
+        requirement: crate::planner::imv_rewrite::annotation::TargetReadRequirement,
+    ) -> Self {
+        self.target_read = requirement;
+        self
     }
 
     pub(crate) fn snapshot(&self) -> &Arc<mv_rewrite::SqlImvRewriteSnapshot> {
@@ -1785,6 +1796,7 @@ impl SqlCompiler {
                             logical_plan,
                         ),
                     snapshot: Arc::clone(input.snapshot()),
+                    target_read: input.target_read,
                     disabled_rules: settings.disabled_rules.clone(),
                     decimal_overflow_policy,
                     constant_policy: request.constant_policy,

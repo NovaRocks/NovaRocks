@@ -75,6 +75,7 @@ pub enum PreparedMvRefreshWork {
 /// construct a native write.
 pub struct PreparedMvRefreshWrite {
     artifact: PreparedMvRefreshWriteArtifact,
+    sources: std::sync::Arc<super::refresh_preparation::captured_sources::CapturedRefreshSources>,
 }
 
 /// The assembly-facing shape remains crate-private so it cannot become part
@@ -85,15 +86,27 @@ pub(crate) enum PreparedMvRefreshWriteArtifact {
 }
 
 impl PreparedMvRefreshWrite {
-    pub(crate) fn first_refresh(write: PreparedMvFirstRefreshWrite) -> Self {
+    pub(crate) fn first_refresh(
+        write: PreparedMvFirstRefreshWrite,
+        sources: std::sync::Arc<
+            super::refresh_preparation::captured_sources::CapturedRefreshSources,
+        >,
+    ) -> Self {
         Self {
             artifact: PreparedMvRefreshWriteArtifact::FirstRefresh(write),
+            sources,
         }
     }
 
-    pub(crate) fn incremental(write: PreparedMvIncrementalWrite) -> Self {
+    pub(crate) fn incremental(
+        write: PreparedMvIncrementalWrite,
+        sources: std::sync::Arc<
+            super::refresh_preparation::captured_sources::CapturedRefreshSources,
+        >,
+    ) -> Self {
         Self {
             artifact: PreparedMvRefreshWriteArtifact::Incremental(write),
+            sources,
         }
     }
 
@@ -175,8 +188,13 @@ impl PreparedMvRefreshWrite {
         }
     }
 
-    pub(crate) fn into_assembly_artifact(self) -> PreparedMvRefreshWriteArtifact {
-        self.artifact
+    pub(crate) fn into_assembly_artifact(
+        self,
+    ) -> (
+        PreparedMvRefreshWriteArtifact,
+        std::sync::Arc<super::refresh_preparation::captured_sources::CapturedRefreshSources>,
+    ) {
+        (self.artifact, self.sources)
     }
 }
 

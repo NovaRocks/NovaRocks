@@ -832,6 +832,14 @@ impl ConnectorWriteSession {
         Ok(received)
     }
 
+    /// Observe the complete original Root count before publication. The first
+    /// freeze moves inventory into this session; later publication reuses that
+    /// same cached Arc. This neither copies payloads nor proves business success.
+    pub(crate) fn freeze_received_row_count(&self) -> Result<u64, ConnectorError> {
+        self.require_received_productions()?;
+        Ok(self.freeze_received_input()?.prepared.row_count())
+    }
+
     /// The rows accumulated so far. Report them to a client only after the
     /// external commit is known to have succeeded.
     #[cfg(test)]
@@ -4859,5 +4867,42 @@ pub(crate) mod tests {
         assert!(receiving.session().is_none());
         assert!(receiving.local_health_failure().is_some());
         assert_eq!(recorded.lock().unwrap().begin_future_drops, 1);
+    }
+}
+
+#[cfg(test)]
+mod command_count_tests {
+    use super::tests::{fixture_with_outcome, known_committed};
+    use super::*;
+    use crate::query_execution::write_result::DecodedPreparedWriteSet;
+    #[test]
+    fn original_complete_root_count_reuses_freeze_without_publishing() {
+        let fixture = fixture_with_outcome(1, 16, known_committed());
+        fixture
+            .session
+            .receive_for_test(DecodedPreparedWriteSet::for_test(19, Vec::new()))
+            .unwrap();
+        assert_eq!(fixture.session.freeze_received_row_count().unwrap(), 19);
+        let original = fixture
+            .session
+            .lock_accumulated()
+            .unwrap()
+            .received
+            .clone()
+            .unwrap();
+        assert_eq!(fixture.session.freeze_received_row_count().unwrap(), 19);
+        let again = fixture
+            .session
+            .lock_accumulated()
+            .unwrap()
+            .received
+            .clone()
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&original, &again),
+            "the original cached inventory must be reused"
+        );
+        assert_eq!(fixture.session.finish_invocations(), 0);
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
     }
 }

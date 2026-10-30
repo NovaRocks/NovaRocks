@@ -280,7 +280,7 @@ impl FrontendQueryCompiler {
                         }
                         novarocks_result_contract::ClientPresentationFamily::TrinoJson(_) => 0,
                     },
-                    carrier: *self.query.static_plan_carrier(),
+                    carrier: self.query.static_plan_carrier().clone(),
                     policy: self.constant_policy(),
                     control: encoding_control,
                     #[cfg(novarocks_dev_controls)]

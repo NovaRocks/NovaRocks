@@ -81,7 +81,8 @@ pub(crate) async fn prepare_analysis(
     let control =
         crate::query_execution::planning::sql_compile_control_from_execution(&input.execution);
     let settings = input.execution.optimizer_settings().clone();
-    match input.prepared.into_assembly_artifact() {
+    let (artifact, sources) = input.prepared.into_assembly_artifact();
+    match artifact {
         PreparedMvRefreshWriteArtifact::FirstRefresh(prepared) => {
             let current_catalog = prepared.current_catalog().map(str::to_owned);
             let current_database = prepared.current_database().to_owned();
@@ -193,7 +194,10 @@ pub(crate) async fn prepare_analysis(
                             context: input.context.clone(),
                             control: control.clone(),
                             bindings: bindings.clone(),
-                            overlays: Vec::new(),
+                            overlays: super::query_local_bindings::freeze_captured_source_overlays(
+                                &sources,
+                            )
+                            .map_err(|error| error.0)?,
                         },
                         io,
                     )

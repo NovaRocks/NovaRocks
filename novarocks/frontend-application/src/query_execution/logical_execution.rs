@@ -73,6 +73,7 @@ pub(crate) trait LogicalExecutionLauncher: Send + Sync + 'static {
         computation: &mut Option<PreparedLogicalComputation>,
         owner: &mut Option<WorkOwner>,
         capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        io: &Arc<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>,
         original: &mut OriginalComputationStart,
         #[cfg(novarocks_dev_controls)] observation: Option<
             crate::preparation_diagnostics::StatementObservationHandle,

@@ -23,19 +23,25 @@
 //! sealed it; the original extraction law publishes the checked packages; the
 //! v2 sender encodes them.
 //!
-//! The host provides [`CompiledPackageCarrier`] admission and encode limits
-//! once, paired with the compiled-package backend.
+//! The host provides [`CompiledPackageCarrier`] admission, encode limits and
+//! generated receiver resource model once, paired with the compiled backend.
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use novarocks_connector_contract::ConnectorWriteRecipeDraft;
 use novarocks_physical_plan::{
     ConstantPolicy, FragmentId, FragmentPackage, FragmentPackageAdmission,
     ProviderReadOccurrenceId, WriteTargetOrdinal, extract_fragment_packages,
 };
+#[cfg(test)]
+use novarocks_plan_codec::physical_package_v2::PackageDecodeLimits;
 use novarocks_plan_codec::physical_package_v2::{
     PackageEncodeError, PackageEncodeLimits, encode_fragment_package,
+};
+use novarocks_plan_codec::resource_preflight_v2::{
+    DecodeProjectionLimits, FragmentDecodeResourceModel, ResourceModelError,
 };
 use novarocks_query_application::preparation::CompletedPhysicalPlanCandidate;
 use novarocks_type_contract::{CompileControlError, PureCompileControl};
@@ -46,18 +52,54 @@ use crate::query_execution::provider_read_facts::FrozenReadEncoding;
 
 /// Host-owned configuration of the compiled package carrier.
 ///
-/// Both values are deployment sizing the composition chooses; neither has a
-/// default here. The statement constant policy is not part of it: each plan
-/// is packaged with the policy its own statement was compiled with.
-#[derive(Clone, Copy, Debug)]
+/// Structural ceilings and the immutable generated receiver model are supplied
+/// by the one startup composition; none grants runtime capacity or defaults
+/// here. The statement constant policy is not part of it: each plan is packaged
+/// with the policy its own statement was compiled with.
+#[derive(Clone)]
 pub struct CompiledPackageCarrier {
     admission: FragmentPackageAdmission,
     limits: PackageEncodeLimits,
+    receiver_model: Arc<FragmentDecodeResourceModel>,
+    receiver_limits: DecodeProjectionLimits,
 }
 
 impl CompiledPackageCarrier {
-    pub const fn new(admission: FragmentPackageAdmission, limits: PackageEncodeLimits) -> Self {
-        Self { admission, limits }
+    pub fn new(
+        admission: FragmentPackageAdmission,
+        limits: PackageEncodeLimits,
+        receiver_model: Arc<FragmentDecodeResourceModel>,
+        receiver_limits: DecodeProjectionLimits,
+    ) -> Self {
+        Self {
+            admission,
+            limits,
+            receiver_model,
+            receiver_limits,
+        }
+    }
+
+    /// The same immutable generated model the host supplied to its receiver.
+    pub fn receiver_model(&self) -> &Arc<FragmentDecodeResourceModel> {
+        &self.receiver_model
+    }
+
+    pub const fn receiver_limits(&self) -> DecodeProjectionLimits {
+        self.receiver_limits
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        admission: FragmentPackageAdmission,
+        limits: PackageEncodeLimits,
+    ) -> Self {
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+        Self::new(
+            admission,
+            limits,
+            Arc::new(FragmentDecodeResourceModel::try_new(&control).expect("test package model")),
+            PackageDecodeLimits::FROZEN.wire,
+        )
     }
 
     /// The admission every fragment's checked package is constructed under.
@@ -71,12 +113,23 @@ impl CompiledPackageCarrier {
     }
 }
 
+impl fmt::Debug for CompiledPackageCarrier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompiledPackageCarrier")
+            .field("admission", &self.admission)
+            .field("limits", &self.limits)
+            .field("receiver_limits", &self.receiver_limits)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum PackageFreezeError {
     Control(CompileControlError),
     Semantics(novarocks_sql::compiler::PackageSemanticsError),
     Extraction(String),
     Encode(PackageEncodeError),
+    Receiver(ResourceModelError),
     /// A carrier fact the plan states inconsistently.
     Facts(String),
     /// A frozen provider read the package cannot carry as frozen.
@@ -91,6 +144,7 @@ impl fmt::Display for PackageFreezeError {
             Self::Semantics(error) => error.fmt(f),
             Self::Extraction(detail) => write!(f, "fragment package extraction: {detail}"),
             Self::Encode(error) => error.fmt(f),
+            Self::Receiver(error) => error.fmt(f),
             Self::Facts(detail) => write!(f, "package carrier facts: {detail}"),
             Self::Read(detail) => write!(f, "frozen provider read: {detail}"),
             Self::Write(detail) => write!(f, "frozen writer recipe: {detail}"),
@@ -103,6 +157,7 @@ impl std::error::Error for PackageFreezeError {
             Self::Control(cause) => Some(cause),
             Self::Semantics(source) => Some(source),
             Self::Encode(source) => Some(source),
+            Self::Receiver(source) => Some(source),
             _ => None,
         }
     }
@@ -114,6 +169,7 @@ impl novarocks_failure_contract::FailureProjection for PackageFreezeError {
             Self::Control(cause) => return cause.failure_fact(),
             Self::Semantics(source) => return source.failure_fact(),
             Self::Encode(source) => return source.failure_fact(),
+            Self::Receiver(source) => return source.failure_fact(),
             Self::Extraction(_) => 200,
             Self::Facts(_) => 201,
             Self::Read(_) => 202,
@@ -134,6 +190,33 @@ impl From<PackageFreezeError> for novarocks_plan_codec::PhysicalEncodeError {
             PackageFreezeError::Control(cause) => Self::Control(cause),
             other => Self::from_domain(other),
         }
+    }
+}
+
+impl From<CompileControlError> for PackageFreezeError {
+    fn from(cause: CompileControlError) -> Self {
+        Self::Control(cause)
+    }
+}
+
+impl From<ResourceModelError> for PackageFreezeError {
+    fn from(error: ResourceModelError) -> Self {
+        match error {
+            ResourceModelError::Control(cause) => Self::Control(cause),
+            other => Self::Receiver(other),
+        }
+    }
+}
+
+/// A receiver refusal already owns its original typed cause; it is not a
+/// successful encode whose ordinary tail may replace that cause.
+pub(crate) fn is_receiver_refusal(error: &novarocks_plan_codec::PhysicalEncodeError) -> bool {
+    match error {
+        novarocks_plan_codec::PhysicalEncodeError::Source(source) => matches!(
+            source.downcast_ref::<PackageFreezeError>(),
+            Some(PackageFreezeError::Receiver(_))
+        ),
+        _ => false,
     }
 }
 
@@ -159,9 +242,15 @@ pub(crate) fn freeze_fragment_packages(
         admission,
         control,
     )?;
+    let carrier = CompiledPackageCarrier::new(
+        *admission,
+        *limits,
+        Arc::new(FragmentDecodeResourceModel::try_new(control)?),
+        PackageDecodeLimits::FROZEN.wire,
+    );
     let mut output = BTreeMap::new();
     for (id, package) in packages {
-        output.insert(id, encode_checked_package(&package, limits, control)?);
+        output.insert(id, encode_checked_package(&package, &carrier, control)?);
     }
     Ok(output)
 }
@@ -218,14 +307,24 @@ pub(crate) fn extract_checked_packages(
 /// The exact wire bytes of one checked package.
 pub(crate) fn encode_checked_package(
     package: &FragmentPackage,
-    limits: &PackageEncodeLimits,
+    carrier: &CompiledPackageCarrier,
     control: &dyn PureCompileControl,
 ) -> Result<Vec<u8>, PackageFreezeError> {
-    let wire = encode_fragment_package(package, limits, control).map_err(|error| match error {
-        PackageEncodeError::Control(cause) => PackageFreezeError::Control(cause),
-        other => PackageFreezeError::Encode(other),
-    })?;
-    Ok(wire.encode_to_vec())
+    let wire =
+        encode_fragment_package(package, carrier.limits(), control).map_err(
+            |error| match error {
+                PackageEncodeError::Control(cause) => PackageFreezeError::Control(cause),
+                other => PackageFreezeError::Encode(other),
+            },
+        )?;
+    let bytes = wire.encode_to_vec();
+    // Qualify these exact final bytes before any Native artifact/Task exists.
+    // The original statement owns control and progress; the model is startup
+    // metadata and grants neither a resource budget nor a dispatch capability.
+    carrier
+        .receiver_model
+        .preflight(&bytes, carrier.receiver_limits, control)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -233,6 +332,62 @@ mod error_projection_tests {
     use super::*;
     use novarocks_plan_codec::PhysicalEncodeError;
     use novarocks_sql::compiler::PackageSemanticsError;
+
+    #[test]
+    fn receiver_refusals_keep_original_resource_data_and_schema_authors() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use std::error::Error;
+        for (original, class) in [
+            (
+                ResourceModelError::Limit("protobuf field occurrences exceed caller limit"),
+                FailureClass::Resource,
+            ),
+            (ResourceModelError::Malformed, FailureClass::Data),
+            (
+                ResourceModelError::Schema("missing resource schema root"),
+                FailureClass::Invariant,
+            ),
+        ] {
+            let expected = original.failure_fact();
+            let encoded = PhysicalEncodeError::from(PackageFreezeError::from(original.clone()));
+            assert!(is_receiver_refusal(&encoded));
+            assert_eq!(encoded.failure_fact(), expected);
+            assert_eq!(expected.class(), class);
+            let PhysicalEncodeError::Source(source) = &encoded else {
+                panic!("original freeze author");
+            };
+            let freeze = source.downcast_ref::<PackageFreezeError>().unwrap();
+            assert_eq!(
+                freeze
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<ResourceModelError>(),
+                Some(&original)
+            );
+            assert_eq!(encoded.to_string(), original.to_string());
+        }
+    }
+
+    #[test]
+    fn receiver_preflight_keeps_malformed_prefix_separate_from_a_capacity_refusal() {
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+        let model = FragmentDecodeResourceModel::try_new(&control).unwrap();
+        // Resource preflight retains a malformed prefix's accounted work.
+        // It does not replace Prost's later format verdict with a capacity error.
+        let projection = model
+            .preflight(&[0x80], PackageDecodeLimits::FROZEN.wire, &control)
+            .unwrap();
+        assert_eq!(
+            projection.status,
+            novarocks_plan_codec::resource_preflight_v2::ResourceCursorStatus::MalformedPrefix
+        );
+        let mut receiver = PackageDecodeLimits::FROZEN.wire;
+        receiver.max_input_bytes = 0;
+        assert!(matches!(
+            model.preflight(&[0x80], receiver, &control),
+            Err(ResourceModelError::Limit(_))
+        ));
+    }
 
     #[test]
     fn package_freeze_preserves_only_typed_semantic_capability_refusals() {

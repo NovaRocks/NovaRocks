@@ -4004,9 +4004,6 @@ impl TaskExecutionRegistry {
                         continue;
                     };
                     let mut live = *live;
-                    live.status
-                        .retire()
-                        .expect("a retirement-ready live task can retire exactly once");
                     let status = live.status.current();
                     let normally_stopped = normal_context
                         && matches!(status.state(), TaskState::Finished | TaskState::Canceled)
@@ -4015,8 +4012,35 @@ impl TaskExecutionRegistry {
                                 status.termination(),
                                 Some(TerminationDetail::Canceled(_))
                             ));
-                    if normally_stopped && live.capability_installed && live.receiver_installed {
-                        self.task_host.retire_receiver_normally(&live.descriptor);
+                    // Real cancellation may withdraw strict input without
+                    // pretending consumption. It keeps its original cause and
+                    // uses cancellation cleanup; reads retain normal withdrawal.
+                    let strict_canceled = status.state() == TaskState::Canceled
+                        && live.descriptor.topology().inbound().iter().any(|input|
+                            input.delivery() == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain);
+                    if normally_stopped
+                        && !strict_canceled
+                        && live.capability_installed
+                        && live.receiver_installed
+                    {
+                        if let Err(rejection) =
+                            self.task_host.retire_receiver_normally(&live.descriptor)
+                        {
+                            // A contradiction after terminal publication cannot
+                            // rewrite that Task. The existing physical-exit
+                            // health owner keeps the evidence; Live retains the
+                            // original ingress/reservation until abort cleanup.
+                            use novarocks_execution_contract::failure::FailureProjection;
+                            self.ports.execution_health().report_unresolved(
+                                novarocks_execution::runtime::execution_health::ExecutionExitOrigin::Task {
+                                    identity,
+                                    phase: novarocks_execution_contract::TaskFailurePhase::Execution,
+                                }, rejection.failure_fact());
+                            entry
+                                .tasks
+                                .insert(identity, TaskEntry::Live(Box::new(live)));
+                            continue;
+                        }
                         live.capability_installed = false;
                         live.receiver_installed = false;
                     } else {
@@ -4029,6 +4053,9 @@ impl TaskExecutionRegistry {
                             live.receiver_installed = false;
                         }
                     }
+                    live.status
+                        .retire()
+                        .expect("a retirement-ready live task can retire exactly once");
                     let final_info = live.status.final_info();
                     let result_owner = live.prepared.sink_kind() == FragmentSinkKind::Result;
                     let bytes =

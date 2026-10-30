@@ -27,7 +27,7 @@ use crate::delete_semantics::{
     RawDeleteFile, ReadDomain, ReadObservationId, StatisticsPolicy, TypedPartition,
 };
 use crate::iceberg::spec::{
-    DataContentType, DataFile, DataFileFormat, Literal, ManifestStatus, NestedField,
+    DataContentType, DataFile, DataFileFormat, Literal, ManifestFile, ManifestStatus, NestedField,
     PrimitiveLiteral, PrimitiveType, Schema, Struct, StructType, TableMetadata, Type,
 };
 use crate::iceberg::table::Table;
@@ -351,15 +351,36 @@ pub(crate) async fn make_scoped_read_snapshot(
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
         .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
-    let schema = match &kind {
-        crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::SnapshotReadKind::ChangeWindow { schema } => schema.clone(),
-        _ => snapshot.schema(metadata).map_err(|e| e.to_string())?,
+    use crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::{
+        ReferencedSpecInventory, SnapshotReadKind,
     };
-    let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
+    let domain = match &kind {
+        SnapshotReadKind::PreparedSource { domain } => {
+            if domain.endpoint().snapshot_id() != snapshot_id {
+                return Err("prepared snapshot differs from its original read domain"
+                    .to_string()
+                    .into());
+            }
+            domain.clone()
+        }
+        SnapshotReadKind::ChangeWindow { schema } => {
+            mint_read_domain(metadata, snapshot_id, schema)?
+        }
+        _ => {
+            let schema = snapshot.schema(metadata).map_err(|e| e.to_string())?;
+            mint_read_domain(metadata, snapshot_id, &schema)?
+        }
+    };
+    let mut referenced_specs = match &kind {
+        SnapshotReadKind::PreparedSource { .. } => Some(
+            ReferencedSpecInventory::for_original(&context)
+                .map_err(|error| ReadFailure::Original(error.into()))?,
+        ),
+        _ => None,
+    };
     let mut all_deletes = Vec::new();
-    use crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::SnapshotReadKind;
     let files = match kind {
-        SnapshotReadKind::ChangeWindow { .. } => {
+        SnapshotReadKind::ChangeWindow { .. } | SnapshotReadKind::PreparedSource { .. } => {
             // Preserve the original full endpoint projection and delete
             // applicability. Both endpoints use the SAME To schema above.
             observe_read_files_original::<DataFile>(
@@ -369,6 +390,7 @@ pub(crate) async fn make_scoped_read_snapshot(
                 Some(&capture),
                 None,
                 Some(io.as_ref()),
+                referenced_specs.as_mut(),
             )
             .await?
         }
@@ -380,6 +402,7 @@ pub(crate) async fn make_scoped_read_snapshot(
                 Some(&capture),
                 None,
                 Some(io.as_ref()),
+                None,
             )
             .await?
         }
@@ -391,6 +414,7 @@ pub(crate) async fn make_scoped_read_snapshot(
                 Some(&capture),
                 Some(&mut all_deletes),
                 Some(io.as_ref()),
+                None,
             )
             .await?
         }
@@ -399,6 +423,7 @@ pub(crate) async fn make_scoped_read_snapshot(
         crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ScopedReadSnapshot {
             files,
             all_deletes,
+            referenced_specs,
             retention_guard: original.retention_guard(),
         },
     )
@@ -422,8 +447,26 @@ async fn observe_read_files_with_delete_receiving<P: ObservedDataFileProjection>
     capture: Option<&CaptureScope<'_>>,
     all_deletes: Option<&mut Vec<Arc<crate::delete_semantics::DeleteFact>>>,
 ) -> Result<Vec<P::File>, ReadFailure> {
-    observe_read_files_original::<P>(table, domain, control, capture, all_deletes, None).await
+    observe_read_files_original::<P>(table, domain, control, capture, all_deletes, None, None).await
 }
+
+/// Index by physical path, but retain the original descriptor as a borrowed
+/// fact. A path match is not proof of equal inheritance/interpretation facts.
+#[repr(transparent)]
+struct ManifestReferenceKey<'a>(&'a ManifestFile);
+impl PartialEq for ManifestReferenceKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.manifest_path == other.0.manifest_path
+    }
+}
+impl Eq for ManifestReferenceKey<'_> {}
+impl std::hash::Hash for ManifestReferenceKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.0.manifest_path, state);
+    }
+}
+const CONFLICTING_MANIFEST_REFERENCE: &str =
+    "Iceberg snapshot repeats one manifest path with conflicting descriptors";
 
 async fn observe_read_files_original<P: ObservedDataFileProjection>(
     table: &Table,
@@ -432,6 +475,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
     capture: Option<&CaptureScope<'_>>,
     all_deletes: Option<&mut Vec<Arc<crate::delete_semantics::DeleteFact>>>,
     io: Option<&crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::SnapshotIoGate>,
+    mut referenced_specs: Option<&mut crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ReferencedSpecInventory>,
 ) -> Result<Vec<P::File>, ReadFailure> {
     check_read_control(control)?;
     check_cow_active(capture)?;
@@ -468,16 +512,46 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
             .await
             .map_err(|e| format!("load manifest list: {e}"))?,
     };
-    let mut seen_manifests = HashSet::new();
+    if let Some(inventory) = referenced_specs.as_deref_mut() {
+        let gate = io.ok_or_else(|| {
+            ReadFailure::Original(
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    "prepared spec inventory requires the original snapshot gate",
+                )
+                .into(),
+            )
+        })?;
+        // Exact manifest-list slot count, before any inventory allocation.
+        // Repeated physical paths leave unused paid capacity, not extra reads.
+        inventory
+            .reserve_slots(gate, manifest_list.entries().len(), || {
+                check_read_control(control)?;
+                check_cow_active(capture)
+            })
+            .await?;
+    }
+    let mut seen_manifests: HashSet<ManifestReferenceKey<'_>> = HashSet::new();
     let mut delete_manifests = Vec::new();
     let mut observed_data = Vec::new();
     for manifest_file in manifest_list.entries() {
         check_read_control(control)?;
         check_cow_active(capture)?;
 
-        if !seen_manifests.insert(manifest_file.manifest_path.as_str()) {
+        let key = ManifestReferenceKey(manifest_file);
+        if let Some(previous) = seen_manifests.get(&key) {
+            if previous.0 != manifest_file {
+                return Err(ReadFailure::Original(
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                        CONFLICTING_MANIFEST_REFERENCE,
+                    )
+                    .into(),
+                ));
+            }
             continue;
         }
+        seen_manifests.insert(key);
         let manifest = match io {
             Some(io) => {
                 let bytes = io.read(&manifest_file.manifest_path).await?;
@@ -516,6 +590,12 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
             .endpoint()
             .partition_type(spec.spec_id())
             .map_err(|e| e.to_string())?;
+        if let Some(inventory) = referenced_specs.as_deref_mut() {
+            // This must precede entry filtering. Empty manifests and manifests
+            // containing only deleted/delete entries still depended on this
+            // exact pinned header, storage binding and inheritance context.
+            inventory.record(spec.spec_id())?;
+        }
         let mut delete_entries = Vec::new();
 
         let mut next_first_row_id = manifest_file
@@ -724,6 +804,12 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
             },
             &field_id_to_name,
         )?);
+    }
+    if let Some(inventory) = referenced_specs {
+        inventory.finish(|| {
+            check_read_control(control)?;
+            check_cow_active(capture)
+        })?;
     }
     Ok(files)
 }
@@ -1127,9 +1213,11 @@ fn column_stats_checked(
 
 fn check_read_control(
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
-) -> Result<(), String> {
+) -> Result<(), ReadFailure> {
     if let Some(control) = control {
-        control.check_active().map_err(|e| e.to_string())?;
+        control
+            .check_active()
+            .map_err(|cause| ReadFailure::Original(cause.into()))?;
     }
     Ok(())
 }
@@ -1153,6 +1241,52 @@ mod tests {
         DataFileBuilder, FormatVersion, ManifestListWriter, ManifestWriterBuilder, NestedField,
         Operation, PartitionSpec, Snapshot, SortOrder, Summary, TableMetadataBuilder, Transform,
     };
+
+    #[test]
+    fn read_control_keeps_original_typed_fact_instead_of_semantic_text() {
+        use novarocks_failure_contract::{FailureFact, FailureProjection, SharedFailureCause};
+        use novarocks_spi::connector::{
+            ConnectorCowBeginCause, ConnectorError, ConnectorErrorKind, ConnectorOperationControl,
+        };
+        use novarocks_type_contract::CompileControlError;
+        #[derive(Debug)]
+        struct CallerData;
+        impl std::fmt::Display for CallerData {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("caller source Display must not run");
+            }
+        }
+        impl std::error::Error for CallerData {}
+        impl FailureProjection for CallerData {
+            fn failure_fact(&self) -> FailureFact {
+                ConnectorErrorKind::CorruptData.failure_fact()
+            }
+        }
+        struct Refused(ConnectorError);
+        impl ConnectorOperationControl for Refused {
+            fn check_active(&self) -> Result<(), ConnectorError> {
+                Err(self.0.clone())
+            }
+        }
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::Source(SharedFailureCause::from_static_detail(
+                CallerData,
+                "safe caller data refusal",
+            )),
+        ] {
+            let original = ConnectorError::compile_interruption(control);
+            let checker = Refused(original.clone());
+            let failure = check_read_control(Some(&checker)).unwrap_err();
+            let ConnectorCowBeginCause::Provider(actual) = failure.into_cause() else {
+                panic!("the original connector error must survive the read boundary");
+            };
+            assert_eq!(actual.failure_fact(), original.failure_fact());
+            assert_eq!(actual, original);
+        }
+    }
 
     fn file(path: &str, content: DataContentType, partition: Struct) -> DataFileBuilder {
         let mut builder = DataFileBuilder::default();
@@ -1865,6 +1999,214 @@ mod tests {
                 read.logical_delete_set().position(),
                 PositionSource::OneDv(_)
             ));
+        }
+    }
+
+    /// Existing Avro owner, with entries whose inheritance is supplied by the
+    /// list descriptor. Snapshot 77 retains existing rows from an expired
+    /// predecessor, so each standalone historical descriptor is readable.
+    async fn descriptor_context_table() -> (Table, ManifestFile) {
+        let original = table(vec![vec![(data("a"), -1)]], None, false).await;
+        let mut metadata = serde_json::to_value(original.metadata()).unwrap();
+        metadata["last-sequence-number"] = serde_json::json!(8);
+        metadata["next-row-id"] = serde_json::json!(110);
+        let snapshot = &mut metadata["snapshots"][0];
+        snapshot["sequence-number"] = serde_json::json!(8);
+        snapshot["parent-snapshot-id"] = serde_json::json!(76);
+        snapshot["first-row-id"] = serde_json::json!(110);
+        snapshot["added-rows"] = serde_json::json!(0);
+        let original = with_metadata(&original, serde_json::from_value(metadata).unwrap());
+        let mut writer = ManifestWriterBuilder::new(
+            original
+                .file_io()
+                .new_output("memory:///descriptor-context.avro")
+                .unwrap(),
+            None,
+            original.metadata().current_schema().clone(),
+            original
+                .metadata()
+                .default_partition_spec()
+                .as_ref()
+                .clone(),
+        )
+        .build_v3_data();
+        writer.add_file(data("a"), -1).unwrap();
+        let mut descriptor = writer.write_manifest_file().await.unwrap();
+        descriptor.sequence_number = 6;
+        descriptor.min_sequence_number = 6;
+        descriptor.added_snapshot_id = 76;
+        descriptor.first_row_id = Some(0);
+        write_descriptor_references(&original, vec![descriptor.clone()]).await;
+        (original, descriptor)
+    }
+
+    async fn write_descriptor_references(table: &Table, descriptors: Vec<ManifestFile>) {
+        let snapshot = table.metadata().snapshot_by_id(77).unwrap();
+        let mut writer = ManifestListWriter::v3(
+            table
+                .file_io()
+                .new_output(snapshot.manifest_list())
+                .unwrap()
+                .writer()
+                .await
+                .unwrap(),
+            77,
+            Some(76),
+            8,
+            Some(110),
+        );
+        // All data first-row-ids are explicit before cloning. The SDK cannot
+        // assign different row identities to two pending clones here.
+        assert!(descriptors.iter().all(|entry| entry.first_row_id.is_some()));
+        writer
+            .add_manifests(descriptors.clone().into_iter())
+            .unwrap();
+        writer.close().await.unwrap();
+        let actual =
+            crate::manifest::load_manifest_list(snapshot, table.file_io(), table.metadata())
+                .await
+                .unwrap();
+        assert_eq!(
+            actual.entries(),
+            descriptors.as_slice(),
+            "SDK preserved both exact descriptor contexts"
+        );
+    }
+
+    async fn descriptor_observation_error<P: ObservedDataFileProjection>(
+        table: &Table,
+    ) -> ReadFailure {
+        let domain =
+            mint_read_domain(table.metadata(), 77, table.metadata().current_schema()).unwrap();
+        match observe_read_files::<P>(table, domain, None, None).await {
+            Ok(_) => panic!("conflicting manifest reference was accepted"),
+            Err(error) => error,
+        }
+    }
+    fn assert_descriptor_conflict(error: ReadFailure) {
+        let ReadFailure::Original(novarocks_spi::connector::ConnectorCowBeginCause::Provider(
+            error,
+        )) = error
+        else {
+            panic!("descriptor conflict lost its typed Provider cause");
+        };
+        assert_eq!(
+            error.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+        assert_eq!(error.message(), CONFLICTING_MANIFEST_REFERENCE);
+    }
+
+    #[tokio::test]
+    async fn avro_exact_data_manifest_repeat_keeps_one_explicit_inherited_row_identity() {
+        let (table, descriptor) = descriptor_context_table().await;
+        write_descriptor_references(&table, vec![descriptor.clone(), descriptor]).await;
+        let snapshot = build_read_snapshot_at(&table, 77).await.unwrap();
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].first_row_id, Some(0));
+        assert_eq!(snapshot.files[0].data_sequence_number, Some(6));
+        let cow = compare_cow_extraction(&table).await;
+        assert_eq!(cow.len(), 1);
+        assert_eq!(cow[0].first_row_id, Some(0));
+    }
+
+    #[tokio::test]
+    async fn avro_conflicting_manifest_inheritance_is_rejected_in_both_orders() {
+        for field in 0..3 {
+            let (table, descriptor) = descriptor_context_table().await;
+            let mut changed = descriptor.clone();
+            match field {
+                0 => {
+                    changed.sequence_number = 7;
+                    changed.min_sequence_number = 7;
+                }
+                1 => changed.added_snapshot_id = 75,
+                2 => changed.first_row_id = Some(100),
+                _ => unreachable!(),
+            }
+            for single in [&descriptor, &changed] {
+                write_descriptor_references(&table, vec![single.clone()]).await;
+                let read = build_read_snapshot_at(&table, 77).await.unwrap();
+                assert_eq!(
+                    read.files.len(),
+                    1,
+                    "each complete context is independently readable"
+                );
+                assert_eq!(
+                    read.files[0].data_sequence_number,
+                    Some(single.sequence_number)
+                );
+                assert_eq!(
+                    read.files[0].first_row_id,
+                    single.first_row_id.map(|id| i64::try_from(id).unwrap())
+                );
+                assert_eq!(compare_cow_extraction(&table).await.len(), 1);
+            }
+            for reversed in [false, true] {
+                let pair = if reversed {
+                    vec![changed.clone(), descriptor.clone()]
+                } else {
+                    vec![descriptor.clone(), changed.clone()]
+                };
+                write_descriptor_references(&table, pair).await;
+                assert_descriptor_conflict(descriptor_observation_error::<DataFile>(&table).await);
+                assert_descriptor_conflict(
+                    descriptor_observation_error::<FrozenCowDataFileProjection>(&table).await,
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn avro_conflicting_manifest_spec_rejects_without_reordering_original_header_failure() {
+        let (table, descriptor) = descriptor_context_table().await;
+        let mut changed = descriptor.clone();
+        changed.partition_spec_id += 1;
+        write_descriptor_references(&table, vec![descriptor.clone(), changed.clone()]).await;
+        assert_descriptor_conflict(descriptor_observation_error::<DataFile>(&table).await);
+        assert_descriptor_conflict(
+            descriptor_observation_error::<FrozenCowDataFileProjection>(&table).await,
+        );
+        write_descriptor_references(&table, vec![changed, descriptor]).await;
+        for error in [
+            descriptor_observation_error::<DataFile>(&table).await,
+            descriptor_observation_error::<FrozenCowDataFileProjection>(&table).await,
+        ] {
+            let ReadFailure::Semantic(message) = error else {
+                panic!("first manifest header failure was replaced by a later conflict");
+            };
+            assert!(message.contains("unknown spec"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn avro_first_manifest_decode_failure_precedes_a_later_descriptor_conflict() {
+        let (table, descriptor) = descriptor_context_table().await;
+        let mut changed = descriptor.clone();
+        changed.sequence_number = 7;
+        changed.min_sequence_number = 7;
+        write_descriptor_references(&table, vec![descriptor.clone(), changed]).await;
+        let mut output = table
+            .file_io()
+            .new_output(&descriptor.manifest_path)
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        output
+            .write(bytes::Bytes::from_static(b"invalid original manifest avro"))
+            .await
+            .unwrap();
+        output.close().await.unwrap();
+        for error in [
+            descriptor_observation_error::<DataFile>(&table).await,
+            descriptor_observation_error::<FrozenCowDataFileProjection>(&table).await,
+        ] {
+            let ReadFailure::Semantic(message) = error else {
+                panic!("original decode failure was replaced by descriptor pre-scan");
+            };
+            assert!(message.contains("load manifest"), "{message}");
+            assert!(!message.contains(CONFLICTING_MANIFEST_REFERENCE));
         }
     }
 

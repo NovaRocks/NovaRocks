@@ -224,7 +224,11 @@ impl StepSource {
             wake: wake.clone(),
             requests: requests.clone(),
         };
-        let gate = Arc::new(MvRefreshPreparationIo::new(services, original));
+        let gate = MvRefreshPreparationIo::new(services, original);
+        #[cfg(novarocks_dev_controls)]
+        let gate =
+            gate.with_source_window_control(input.services.controls.clone(), target.clone())?;
+        let gate = Arc::new(gate);
         let preparation = MvRefreshTurnCustody::new(
             gate.clone(),
             cpu.clone(),
@@ -887,6 +891,28 @@ impl Body {
         }
         match self.kind {
             Some(StepPreparedKind::Data) => {
+                #[cfg(novarocks_dev_controls)]
+                if let Some(controls) = &self.input.services.controls {
+                    let target = self
+                        .product_target
+                        .as_ref()
+                        .ok_or_else(|| phase_service("prepared MV has no target"))?;
+                    controls
+                        .recovery_async(
+                            target.catalog().unwrap(),
+                            target.namespace(),
+                            target.name(),
+                            "source-prepared",
+                        )
+                        .await
+                        .map_err(|error| {
+                            domain_error(MvApplicationError::new(
+                                MvApplicationErrorKind::Engine,
+                                error,
+                            ))
+                        })?;
+                }
+
                 self.initial = Some(InitialComputationReservation::new(self.input.services.launcher.reserve_identity()
                     .map_err(novarocks_query_application::session_outcome::governed_query_execution_error)?).map_err(distributed_error)?);
                 self.context = self

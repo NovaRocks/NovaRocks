@@ -343,7 +343,7 @@ impl GovernedBackgroundAction for BackgroundMvAction {
     ) -> Poll<Result<(), QueryServiceError>> {
         self.0.poll_action(context, cx).map(|result| {
             result.and_then(|value| match value {
-                StatementActionValue::Ok => Ok(()),
+                StatementActionValue::Ok(_) => Ok(()),
                 _ => Err(protocol("MV background command returned a row consumer")),
             })
         })
@@ -889,13 +889,14 @@ fn scheduler_service_disposition(error: &QueryServiceError) -> ScheduledRefreshD
     let failure = novarocks_mv_application::scheduler_runtime::MvRefreshFailure::new(
         error.message(),
         error.compile_control_error(),
-    );
+    )
+    .with_execution_failure(error.execution_failure().cloned());
     if error.external_effect_disposition().is_some_and(|d|matches!(d,novarocks_query_application::api::StatementExternalEffectDisposition::KnownCommitted|novarocks_query_application::api::StatementExternalEffectDisposition::CommitUnknown)) {
         return ScheduledRefreshDisposition::TerminalFailure(failure);
     }
     match error.kind() {
         QueryServiceErrorKind::Interrupted => {
-            ScheduledRefreshDisposition::ShutdownCancelled(error.compile_control_error())
+            ScheduledRefreshDisposition::ShutdownCancelled(failure)
         }
         QueryServiceErrorKind::Unavailable | QueryServiceErrorKind::FrontendDraining => {
             ScheduledRefreshDisposition::TransientUnavailable(failure)
@@ -1355,5 +1356,131 @@ mod management_root_tests {
         control.close_admission();
         drive(&mut driver);
         assert!(control.shutdown().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod native_scheduler_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_mv_application::{
+        scheduler::MvSchedulerConfig,
+        scheduler_runtime::{MvRefreshRuntimeDecision, MvRefreshSchedulerRuntime},
+    };
+    use novarocks_query_application::execution_error::{ExecutionFailureInput, QueryFailureReason};
+
+    #[test]
+    fn original_native_failure_reaches_scheduler_without_becoming_compile_control() {
+        let unsupported = novarocks_local_compiler::FragmentCompileError::Unsupported {
+            node: Some(novarocks_physical_plan::NodeId::new(2)),
+            feature: "private Native capability diagnostic",
+        };
+        let invalid = novarocks_local_compiler::FragmentCompileError::Invalid(
+            "unsupported diagnostic cannot choose the category",
+        );
+        for fact in [
+            unsupported.failure_fact(),
+            invalid.failure_fact(),
+            QueryFailureReason::Cancelled.failure_fact(),
+            QueryFailureReason::PreparationFailed.failure_fact(),
+            QueryFailureReason::BackendLost.failure_fact(),
+            QueryFailureReason::TransportCapacity.failure_fact(),
+        ] {
+            for coordinator in [false, true] {
+                let input = if coordinator {
+                    // An independent originating coordinator failure exercises
+                    // its own cancellation/resource policy. Do not relabel a
+                    // selected Task failure as a coordinator observation.
+                    ExecutionFailureInput::new(
+                        fact,
+                        novarocks_execution_contract::SafeDetail::truncating(
+                            "private original coordinator failure diagnostic",
+                        ),
+                        novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator,
+                    )
+                } else {
+                    let identity = novarocks_execution_contract::TaskIdentity::new(
+                        novarocks_types::QueryExecutionId::new(
+                            novarocks_types::QueryId::new(61, 21),
+                            novarocks_types::AttemptId::new(1).unwrap(),
+                        )
+                        .unwrap(),
+                        novarocks_types::StageId::new(3).unwrap(),
+                        novarocks_types::TaskId::new(5).unwrap(),
+                        novarocks_types::BackendProcessId::new_v7(),
+                    );
+                    let selected = novarocks_coordination_contract::SelectedTaskTermination::new(
+                        identity,
+                        novarocks_execution_contract::TerminationDetail::Failed(
+                            novarocks_execution_contract::TaskFailure::new_in_phase(
+                                fact,
+                                novarocks_execution_contract::SafeDetail::truncating(
+                                    "private original Native failure diagnostic",
+                                ),
+                                novarocks_execution_contract::TaskFailurePhase::Preparation,
+                            ),
+                        ),
+                    );
+                    ExecutionFailureInput::from_selected_task(&selected).unwrap()
+                };
+                let error = QueryServiceError::from_execution_failure(input.clone());
+                assert_eq!(error.compile_control_error(), None);
+                let disposition = scheduler_service_disposition(&error);
+                assert_eq!(disposition.execution_failure(), Some(&input));
+                assert_eq!(disposition.compile_control_error(), None);
+                let cancelled = matches!(error.kind(), QueryServiceErrorKind::Interrupted);
+                let transient = matches!(error.kind(), QueryServiceErrorKind::Unavailable);
+                assert!(if cancelled {
+                    matches!(
+                        &disposition,
+                        ScheduledRefreshDisposition::ShutdownCancelled(_)
+                    )
+                } else if transient {
+                    matches!(
+                        &disposition,
+                        ScheduledRefreshDisposition::TransientUnavailable(_)
+                    )
+                } else {
+                    matches!(
+                        &disposition,
+                        ScheduledRefreshDisposition::InvariantViolation(_)
+                    )
+                });
+                let mut runtime = MvRefreshSchedulerRuntime::<i64, ()>::new(
+                    MvSchedulerConfig::new(true, 1, 1, 10, 40),
+                );
+                assert!(runtime.mark_started(&7));
+                let decision = runtime.complete(&7, disposition, 100);
+                assert_eq!(decision.execution_failure(), Some(&input));
+                assert_eq!(decision.compile_control_error(), None);
+                assert!(if cancelled {
+                    matches!(decision, MvRefreshRuntimeDecision::NoChange { .. })
+                } else if transient {
+                    matches!(decision, MvRefreshRuntimeDecision::TransientBackoff { .. })
+                } else {
+                    matches!(decision, MvRefreshRuntimeDecision::Blocked { .. })
+                });
+                assert_eq!(runtime.is_suppressed(&7, 100), !cancelled);
+                for effect in [
+                novarocks_query_application::api::StatementExternalEffectDisposition::KnownCommitted,
+                novarocks_query_application::api::StatementExternalEffectDisposition::CommitUnknown,
+            ] {
+                let effected = error.clone().attach_external_effect_disposition(effect);
+                let disposition = scheduler_service_disposition(&effected);
+                assert!(matches!(&disposition, ScheduledRefreshDisposition::TerminalFailure(_)));
+                assert_eq!(disposition.execution_failure(), Some(&input));
+                assert_eq!(disposition.compile_control_error(), None);
+            }
+            }
+        }
+        let diagnostic = QueryServiceError::new(
+            QueryServiceErrorKind::Internal,
+            "[UnsupportedCompiledShape] diagnostic text is not an identity",
+        );
+        assert!(
+            scheduler_service_disposition(&diagnostic)
+                .execution_failure()
+                .is_none()
+        );
     }
 }

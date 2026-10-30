@@ -602,3 +602,319 @@ fn pure_nominal_constant_author_keeps_semantics_out_of_field_metadata() {
         assert!(value.pool().source_metadata_namespace().is_none());
     }
 }
+
+#[test]
+fn first_syntax_runs_preserve_scalar_rows_types_nulls_and_original_field() {
+    use crate::constant::admit_syntax_constant_run;
+    let large = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    let cases = vec![
+        (
+            ty(DataType::Int8, true),
+            vec![
+                LiteralValue::Int(-128),
+                LiteralValue::Null,
+                LiteralValue::Int(127),
+            ],
+        ),
+        (
+            ty(DataType::UInt64, true),
+            vec![
+                LiteralValue::Int(0),
+                LiteralValue::Null,
+                LiteralValue::Int(i64::MAX),
+            ],
+        ),
+        (
+            ty(DataType::Date64, true),
+            vec![
+                LiteralValue::Int(-1),
+                LiteralValue::Null,
+                LiteralValue::Int(9),
+            ],
+        ),
+        (
+            ty(
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            vec![
+                LiteralValue::Int(-1),
+                LiteralValue::Null,
+                LiteralValue::Int(9),
+            ],
+        ),
+        (
+            ty(DataType::Boolean, true),
+            vec![
+                LiteralValue::Bool(true),
+                LiteralValue::Null,
+                LiteralValue::Bool(false),
+            ],
+        ),
+        (
+            ty(DataType::Float32, true),
+            vec![
+                LiteralValue::Float(-0.0),
+                LiteralValue::Null,
+                LiteralValue::Float(1.5),
+            ],
+        ),
+        (
+            ty(DataType::Float64, true),
+            vec![
+                LiteralValue::Float(-0.0),
+                LiteralValue::Null,
+                LiteralValue::Float(0.1),
+            ],
+        ),
+        (
+            ty(DataType::Decimal32(8, 2), true),
+            vec![
+                LiteralValue::Decimal("-1.23".into()),
+                LiteralValue::Null,
+                LiteralValue::Decimal("45.60".into()),
+            ],
+        ),
+        (
+            ty(DataType::Decimal64(16, -2), true),
+            vec![
+                LiteralValue::Decimal("-1200".into()),
+                LiteralValue::Null,
+                LiteralValue::Decimal("4500".into()),
+            ],
+        ),
+        (
+            ty(DataType::Decimal128(30, 3), true),
+            vec![
+                LiteralValue::Decimal("-1.234".into()),
+                LiteralValue::Null,
+                LiteralValue::Decimal("45.600".into()),
+            ],
+        ),
+        (
+            ty(DataType::Decimal256(76, 0), true),
+            vec![
+                LiteralValue::Decimal("-1234567890123456789012345678901234567890".into()),
+                LiteralValue::Null,
+                LiteralValue::Decimal("45".into()),
+            ],
+        ),
+        (
+            large,
+            vec![
+                LiteralValue::LargeInt(i128::MIN),
+                LiteralValue::Null,
+                LiteralValue::LargeInt(i128::MAX),
+            ],
+        ),
+        (
+            ty(DataType::Utf8, true),
+            vec![
+                LiteralValue::String("é".into()),
+                LiteralValue::Null,
+                LiteralValue::String("".into()),
+            ],
+        ),
+        (
+            ty(DataType::LargeUtf8, true),
+            vec![
+                LiteralValue::String("é".into()),
+                LiteralValue::Null,
+                LiteralValue::String("".into()),
+            ],
+        ),
+        (
+            ty(DataType::Binary, true),
+            vec![
+                LiteralValue::Binary(vec![0, 255]),
+                LiteralValue::Null,
+                LiteralValue::Binary(vec![]),
+            ],
+        ),
+        (
+            ty(DataType::LargeBinary, true),
+            vec![
+                LiteralValue::Binary(vec![0, 255]),
+                LiteralValue::Null,
+                LiteralValue::Binary(vec![]),
+            ],
+        ),
+        (
+            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap(),
+            vec![
+                LiteralValue::String("{\"x\":1}".into()),
+                LiteralValue::Null,
+                LiteralValue::String("null".into()),
+            ],
+        ),
+        (
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Variant,
+            )
+            .unwrap(),
+            vec![
+                LiteralValue::Binary(vec![0, 42, 255]),
+                LiteralValue::Null,
+                LiteralValue::Binary(vec![]),
+            ],
+        ),
+        (
+            ty(DataType::Null, true),
+            vec![LiteralValue::Null, LiteralValue::Null, LiteralValue::Null],
+        ),
+    ];
+    for (declared, values) in cases {
+        let refs = values.iter().collect::<Vec<_>>();
+        let (pool, count) =
+            admit_syntax_constant_run(&refs, &declared, policy(), &Control::new(None)).unwrap();
+        assert_eq!(count, values.len());
+        assert_eq!(pool.array().len(), values.len());
+        assert_eq!(pool.value_type(), &declared);
+        assert!(
+            pool.source_owner().is_none(),
+            "actual SQL creation has no borrowed-source replacement"
+        );
+        for (ordinal, value) in values.iter().enumerate() {
+            let scalar =
+                admit_syntax_constant(value, &declared, policy(), &Control::new(None)).unwrap();
+            assert_eq!(pool.field_ref(), scalar.pool().field_ref());
+            assert_eq!(
+                pool.value(ordinal as u32).unwrap().ordinal(),
+                ordinal as u32
+            );
+            assert_eq!(
+                pool.array().slice(ordinal, 1).to_data(),
+                scalar.pool().array().to_data(),
+                "typed syntax cell {ordinal} for {declared:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn syntax_runs_chunk_only_new_pools_under_original_policy() {
+    use crate::constant::admit_syntax_constant_run;
+    let values = (0..9).map(LiteralValue::Int).collect::<Vec<_>>();
+    let refs = values.iter().collect::<Vec<_>>();
+    let declared = ty(DataType::Int64, false);
+    let (pool, count) =
+        admit_syntax_constant_run(&refs, &declared, policy(), &Control::new(None)).unwrap();
+    assert_eq!(count, 4);
+    assert_eq!(pool.array().len(), 4);
+    for row in 0..4 {
+        assert_eq!(
+            pool.value(row).unwrap().try_i64().unwrap(),
+            Some(i64::from(row))
+        );
+    }
+    let text = (0..4)
+        .map(|_| LiteralValue::String("x".repeat(100)))
+        .collect::<Vec<_>>();
+    let refs = text.iter().collect::<Vec<_>>();
+    let tight = ConstantPolicy {
+        max_retained_buffer_bytes: 256,
+        ..policy()
+    };
+    let (pool, count) =
+        admit_syntax_constant_run(&refs, &ty(DataType::Utf8, true), tight, &Control::new(None))
+            .unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(
+        pool.value(0).unwrap().try_utf8().unwrap(),
+        Some("x".repeat(100).as_str())
+    );
+    let too_large = LiteralValue::String("x".repeat(1000));
+    assert!(matches!(
+        admit_syntax_constant_run(
+            &[&too_large],
+            &ty(DataType::Utf8, true),
+            tight,
+            &Control::new(None)
+        ),
+        Err(ConstantError::Limit(_))
+    ));
+    for (value, declared) in [
+        (LiteralValue::Int(128), ty(DataType::Int8, false)),
+        (LiteralValue::Float(0.1), ty(DataType::Float32, false)),
+        (
+            LiteralValue::Decimal("1.001".into()),
+            ty(DataType::Decimal128(3, 2), false),
+        ),
+        (
+            LiteralValue::LargeInt(1),
+            ty(DataType::FixedSizeBinary(16), false),
+        ),
+        (LiteralValue::Null, ty(DataType::Utf8, false)),
+    ] {
+        assert!(
+            admit_syntax_constant_run(&[&value], &declared, policy(), &Control::new(None)).is_err()
+        );
+    }
+}
+
+#[test]
+fn first_literal_run_keeps_original_control_and_source_at_every_selected_prefix() {
+    use crate::constant::admit_syntax_constant_run;
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, SharedFailureCause, domain,
+    };
+    #[derive(Debug)]
+    struct Source;
+    impl std::fmt::Display for Source {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original literal source")
+        }
+    }
+    impl std::error::Error for Source {}
+    impl FailureProjection for Source {
+        fn failure_fact(&self) -> FailureFact {
+            FailureFact::new(
+                FailureClass::Resource,
+                FailureReason::new(domain::CONSTANT, std::num::NonZeroU16::new(2).unwrap()),
+            )
+        }
+    }
+    let values = (0..1024)
+        .map(|n| LiteralValue::String(format!("{n}:{}", "x".repeat(40))))
+        .collect::<Vec<_>>();
+    let refs = values.iter().collect::<Vec<_>>();
+    let declared = ty(DataType::Utf8, true);
+    let caps = ConstantPolicy {
+        max_rows: 1024,
+        max_logical_elements: 4096,
+        ..policy()
+    };
+    let baseline = Control::new(None);
+    assert_eq!(
+        admit_syntax_constant_run(&refs, &declared, caps, &baseline)
+            .unwrap()
+            .1,
+        1024
+    );
+    let trace = baseline.trace.into_inner().unwrap();
+    let first_quantum = trace.iter().position(|(_, n)| *n == 256).unwrap() + 1;
+    let last_quantum = trace.iter().rposition(|(_, n)| *n == 256).unwrap() + 1;
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+        CompileControlError::Source(SharedFailureCause::new(Source)),
+    ] {
+        for at in [1, first_quantum, last_quantum, trace.len()] {
+            let control = Control::new(Some((at, cause.clone())));
+            assert!(
+                matches!(admit_syntax_constant_run(&refs,&declared,caps,&control),
+                Err(ConstantError::Control(actual)) if actual==cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+        }
+    }
+}

@@ -40,6 +40,19 @@ fn compile_captured_refresh_explain(
     )
 }
 
+/// Display the original no-read decision without inventing a numeric snapshot.
+fn empty_refresh_explain_lines(
+    decision: crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision,
+) -> Option<Vec<String>> {
+    use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
+    matches!(decision, ExecutableRefreshDecision::SkipEmpty).then(|| {
+        vec![
+            "MV refresh: SkipEmpty".to_string(),
+            "Data read: none (original source snapshot policy selected SkipEmpty)".to_string(),
+        ]
+    })
+}
+
 /// Read-only inputs; no refresh identity, publication admission or writer.
 pub(crate) struct MvExplainPreparationInput {
     pub(crate) ports: IcebergMvCorePorts,
@@ -87,10 +100,48 @@ async fn explain_original_inner(
         &projection,
         &schema,
     )?;
-    let pin = io.capture_pin(ports, &projection, context).await?;
     let baseline =
         crate::mv::domain::iceberg_refresh::build_refresh_state_baseline(&projection, &binding)?;
+    io.capture_refresh_sources(ports, &projection, &baseline, input.statement.full, context)
+        .await?;
+    let base_refs = projection
+        .facts
+        .definition()
+        .relation_occurrences
+        .iter()
+        .map(|base| novarocks_types::naming::TableIdentity {
+            catalog: base.catalog_at_binding.clone(),
+            namespace: base.namespace_at_binding.clone(),
+            table: base.relation_at_binding.clone(),
+        })
+        .collect::<Vec<_>>();
+    let (projection, _) = io
+        .rebind_definition(
+            ports,
+            &projection,
+            &base_refs,
+            &target,
+            Some(&schema),
+            context,
+        )
+        .await?;
     let query = super::refresh_preparation::canonical_mv_select_query(&projection)?;
+    let decision =
+        crate::mv::domain::iceberg_refresh::async_preparation::captured_refresh_decision_original(
+            io,
+            ports,
+            &projection,
+            &runtime_bindings,
+            &baseline,
+            &query,
+            input.statement.full,
+            context,
+        )
+        .await?;
+    if let Some(lines) = empty_refresh_explain_lines(decision) {
+        return Ok(lines);
+    }
+    let pin = io.capture_pin(ports, &projection, context).await?;
     let aggregate = super::refresh_preparation::pure_reader::frozen_refresh_aggregate_analysis(
         io,
         ports,
@@ -173,4 +224,61 @@ async fn explain_original_inner(
         context,
     )
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::empty_refresh_explain_lines;
+    use crate::mv::domain::refresh::planning::{
+        RefreshPlanningInput, decide_requested_refresh_plan,
+    };
+    use crate::mv::domain::refresh::snapshot::{
+        BaseSnapshotPolicy as Policy, BaseSnapshotStatus as Status,
+    };
+
+    #[test]
+    fn empty_explain_preserves_the_original_single_all_and_partial_join_policy() {
+        let single = [Status::new("ice.ns.left", None, None)];
+        let mixed = [
+            Status::new("ice.ns.left", None, Some(17)),
+            Status::new("ice.ns.right", None, None),
+        ];
+        for (policy, statuses, skips) in [
+            (Policy::SingleBase, single.as_slice(), true),
+            (Policy::AllBasesRequired, mixed.as_slice(), false),
+            (Policy::JoinPairPartialInitialSkip, mixed.as_slice(), true),
+        ] {
+            let original = decide_requested_refresh_plan(
+                &RefreshPlanningInput {
+                    snapshot_policy: policy,
+                    base_snapshots: statuses,
+                    label: "EXPLAIN REFRESH",
+                },
+                false,
+            );
+            if skips {
+                let lines = empty_refresh_explain_lines(original.unwrap().refresh).unwrap();
+                assert!(lines.iter().any(|line| line.contains("SkipEmpty")));
+                assert!(lines.iter().any(|line| line.contains("Data read: none")));
+            } else {
+                assert!(original.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn empty_explain_never_hides_a_lost_predecessor_or_changes_full_policy() {
+        for (previous, full) in [(Some(17), false), (None, true)] {
+            let statuses = [Status::new("ice.ns.source", previous, None)];
+            let refused = decide_requested_refresh_plan(
+                &RefreshPlanningInput {
+                    snapshot_policy: Policy::SingleBase,
+                    base_snapshots: &statuses,
+                    label: "EXPLAIN REFRESH",
+                },
+                full,
+            );
+            assert!(refused.is_err());
+        }
+    }
 }

@@ -668,7 +668,7 @@ async fn run_catalog_action(
     )
     .await
     .expect("Catalog Action made progress with the sole ordinary worker");
-    let result = result.map(|value| assert!(matches!(value, StatementActionValue::Ok)));
+    let result = result.map(|value| assert!(matches!(value, StatementActionValue::Ok(_))));
     assert!(action.local_health_failure().is_none());
     let mut residual: Option<Box<dyn GovernedStatementResidual>> = None;
     action.handoff_residual_in(&mut residual).unwrap();

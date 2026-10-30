@@ -35,7 +35,8 @@
 //! Writer statistics are compiled by `writer_statistics`: a writer's partial
 //! calls write its multiplex relation's auxiliary channels, and a finish's
 //! final calls and grouped Unpivot expand them into Root artifact rows.
-//! Multi-writer finishes remain explicit refusals. A partitioned receiver
+//! The finish's frozen writer-input purpose survives local multi-writer merging.
+//! A partitioned receiver
 //! retains its exact edge keys for the original per-driver local shuffle.
 
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
@@ -341,6 +342,38 @@ fn relation_layout_inner_with_creation<H>(
             .map_err(Into::into)
     })();
     crate::creation::finish_attempt(result, work)
+}
+
+/// The finish's frozen writer-input declaration also owns a local merger's
+/// output purpose. Generic UnionAll labels cannot replace protocol field names.
+pub(crate) fn finish_input_layout_with_creation<H>(
+    package: &FragmentPackage,
+    node: &PhysicalNode,
+    slots: &[SlotId],
+    work: &mut CompileCheckpoints<'_>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<Option<StaticLayout>, crate::FragmentCreationError<H>> {
+    let root = package
+        .fragment()
+        .nodes()
+        .get(&package.fragment().root())
+        .ok_or(FragmentCompileError::Invalid("missing fragment root"))?;
+    work.step()?;
+    let NodeKind::TableFinish(spec) = &root.kind else {
+        return Ok(None);
+    };
+    let input = root
+        .inputs
+        .get(spec.inputs.writer_results as usize)
+        .ok_or(FragmentCompileError::Invalid("missing finish writer input"))?;
+    work.step()?;
+    if *input != node.id {
+        return Ok(None);
+    }
+    require_relation_output(node, &spec.input_schema, work)?;
+    work.flush()?;
+    relation_layout_inner_with_creation(&spec.input_schema, slots, work.control(), creation)
+        .map(Some)
 }
 
 /// The complete WriterProjection-arena scope of one writer: its flow and

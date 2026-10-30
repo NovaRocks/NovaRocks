@@ -23,6 +23,13 @@ The active C1 suite is intentionally lake-native only. It verifies that the
 `materialized-view` runner suite uses its suite-level REST Iceberg catalog and
 covers the basic Iceberg-target MV create / refresh / read / drop path.
 
+The runner owns a private REST Catalog and MinIO for this suite. Unique object
+names alone do not isolate namespace discovery: a shared REST Catalog can
+rediscover another run's MV and correctly refuse this suite's catalog cleanup.
+The suite uses the same isolated fixture lifecycle as `iceberg-ivm` and
+`iceberg-mv-scheduler`, and cannot share one runner invocation with a suite
+that requires the shared Spark/REST environment.
+
 The historical StarRocks-compatible MV cases from `dev/test/sql/test_materialized_view`
 are parked under `legacy/`. They cover OLAP rewrite, refresh, status, privilege,
 sync-MV, nested-MV, and partition-compensation behavior that is not the NIDL-C1

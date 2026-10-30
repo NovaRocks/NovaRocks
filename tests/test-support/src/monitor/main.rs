@@ -244,7 +244,12 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
                 failures.push(error.to_string());
             }
             if stopping.is_none() {
-                unix::signal_or_kill_original(&mut child, unix::TERM, &mut failures);
+                unix::signal_or_kill_original(
+                    &mut child,
+                    unix::TERM,
+                    &mut failures,
+                    "lifetime_expiry_term",
+                );
                 stopping = Some(now);
                 graceful_deadline = now.saturating_add(5_000_000_000).min(lifetime_kill_at);
             }
@@ -329,7 +334,16 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
                         unix::TERM
                     };
                     let prior_failures = failures.len();
-                    unix::signal_or_kill_original(&mut child, signal, &mut failures);
+                    unix::signal_or_kill_original(
+                        &mut child,
+                        signal,
+                        &mut failures,
+                        if operation == b'I' {
+                            "control_interrupt"
+                        } else {
+                            "control_term"
+                        },
+                    );
                     if failures.len() != prior_failures && stopping.is_none() {
                         stopping = Some(now);
                         graceful_deadline = now;
@@ -341,13 +355,27 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
                             b'K' => unix::KILL,
                             _ => unix::TERM,
                         };
-                        unix::signal_or_kill_original(&mut child, signal, &mut failures);
+                        unix::signal_or_kill_original(
+                            &mut child,
+                            signal,
+                            &mut failures,
+                            if operation == b'K' {
+                                "control_kill"
+                            } else {
+                                "stop_request_term"
+                            },
+                        );
                         stopping = Some(now);
                         graceful_deadline =
                             now.saturating_add(5_000_000_000).min(operation_deadline);
                         killed = operation == b'K';
                     } else if operation == b'K' && !killed {
-                        unix::signal_or_kill_original(&mut child, unix::KILL, &mut failures);
+                        unix::signal_or_kill_original(
+                            &mut child,
+                            unix::KILL,
+                            &mut failures,
+                            "control_kill_after_stop",
+                        );
                         killed = true;
                     }
                 }
@@ -357,7 +385,12 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
                     if stopping.is_none() {
                         stopping = Some(now);
                         graceful_deadline = now.saturating_add(5_000_000_000);
-                        unix::signal_or_kill_original(&mut child, unix::TERM, &mut failures);
+                        unix::signal_or_kill_original(
+                            &mut child,
+                            unix::TERM,
+                            &mut failures,
+                            "invalid_control_term",
+                        );
                     }
                 }
             }
@@ -381,7 +414,12 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
                 if stopping.is_none() {
                     stopping = Some(now);
                     graceful_deadline = now.saturating_add(5_000_000_000);
-                    unix::signal_or_kill_original(&mut child, unix::TERM, &mut failures);
+                    unix::signal_or_kill_original(
+                        &mut child,
+                        unix::TERM,
+                        &mut failures,
+                        "child_observation_error_term",
+                    );
                 }
             }
         }
@@ -395,7 +433,12 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
             }
             let elapsed = now.saturating_sub(started);
             if now >= graceful_deadline && !killed {
-                unix::signal_or_kill_original(&mut child, unix::KILL, &mut failures);
+                unix::signal_or_kill_original(
+                    &mut child,
+                    unix::KILL,
+                    &mut failures,
+                    "grace_deadline_kill",
+                );
                 killed = true;
             }
             if elapsed >= 10_000_000_000 && !incomplete {
@@ -410,7 +453,7 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
     }
     // Keep the unreaped leader through the final group signal even when the
     // normal command exited by itself. Never signal this identity afterwards.
-    unix::signal_or_kill_original(&mut child, unix::KILL, &mut failures);
+    unix::signal_or_kill_original(&mut child, unix::KILL, &mut failures, "final_group_kill");
     let mut group_exit_observed = false;
     let mut group_exit_observed_ns = 0;
     let mut group_observation_failed = false;

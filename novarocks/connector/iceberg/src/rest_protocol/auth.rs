@@ -33,7 +33,7 @@ use novarocks_fs::SecretValue;
 use reqwest::Method;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 
-use super::attempt::{AttemptCell, AttemptFailure};
+use super::attempt::{AttemptCell, AttemptFailure, BindingStepError};
 use super::binding::{is_authentication_header, is_protocol_header, protocol_headers};
 use super::evidence::{BindingFailure, DispatchStage};
 use super::http::{RequestContext, RestHttpClient, RestRequest};
@@ -203,7 +203,7 @@ async fn exchange_token(
     client_id: String,
     client_secret: SecretValue,
     context: RequestContext,
-) -> Result<HeaderValue, BindingFailure> {
+) -> Result<HeaderValue, BindingStepError> {
     let mut form = vec![
         ("grant_type", "client_credentials"),
         ("client_id", client_id.as_str()),
@@ -222,7 +222,12 @@ async fn exchange_token(
         persistent.token_request_headers(),
     )
     .with_form_body(form);
-    let (stage, body) = http.send_once(Ok(request), &[200], &context).await;
+    let (stage, body) = http
+        .send_once(Ok(request), &[200], &context)
+        .await
+        .map_err(|original| {
+            BindingStepError::from_original(BindingFailure::TokenUnavailable, original)
+        })?;
     match (stage, body) {
         (DispatchStage::Status { .. }, Some(body)) => {
             let bytes = body
@@ -231,12 +236,13 @@ async fn exchange_token(
                 .map_err(|_| BindingFailure::TokenUnavailable)?;
             let response: TokenResponse =
                 serde_json::from_slice(&bytes).map_err(|_| BindingFailure::TokenUnavailable)?;
-            bearer_value(response.access_token.as_str()).ok_or(BindingFailure::TokenUnavailable)
+            bearer_value(response.access_token.as_str())
+                .ok_or_else(|| BindingFailure::TokenUnavailable.into())
         }
         (DispatchStage::Status { code, .. }, None) if (400..500).contains(&code) => {
-            Err(BindingFailure::TokenRejected)
+            Err(BindingFailure::TokenRejected.into())
         }
-        _ => Err(BindingFailure::TokenUnavailable),
+        _ => Err(BindingFailure::TokenUnavailable.into()),
     }
 }
 
@@ -391,7 +397,7 @@ impl RestAuthOwner {
                     });
                     exchange_token(http, persistent, client_id, client_secret, context)
                         .await
-                        .map_err(|step| AttemptFailure { attempt, step })
+                        .map_err(|cause| AttemptFailure::from_cause(attempt, cause))
                 }
                 .boxed()
             })

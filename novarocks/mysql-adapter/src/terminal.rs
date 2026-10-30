@@ -17,12 +17,15 @@
 
 //! Terminal MySQL response encoding for governed Query Application statements.
 
+use mysql_common::io::WriteMysqlExt;
 use std::io;
 
 use crate::relay_result_writer::{CLOSING_DEADLINE, CLOSING_OBJECT_BYTES, timeout_error};
 use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::protocol_delivery::GovernedProtocolOwner;
-use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
+use novarocks_query_application::session_control::{
+    GovernedStatementVisibilitySealOutcome, StatementCommandCompletion,
+};
 use novarocks_query_application::session_error::QueryServiceError;
 use opensrv_mysql::{
     CapabilityFlags, ErrorKind, InitWriter, OkResponse, QueryResultWriter, StatusFlags,
@@ -55,15 +58,21 @@ pub async fn write_terminal_ok<W: AsyncWrite + Unpin>(
 pub async fn write_terminal_ok_one<'writer, W: AsyncWrite + Unpin>(
     results: QueryResultWriter<'writer, W>,
 ) -> io::Result<QueryResultWriter<'writer, W>> {
-    results.complete_one(OkResponse::default()).await
+    results
+        .complete_one(OkResponse {
+            affected_rows: 0,
+            ..OkResponse::default()
+        })
+        .await
 }
 
 /// Writes the final OK response and settles its governed statement owner.
 pub async fn write_governed_terminal_ok<W: AsyncWrite + Unpin>(
+    completion: StatementCommandCompletion,
     protocol: GovernedProtocolOwner,
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
-    match write_governed_terminal_ok_one(protocol, results).await? {
+    match write_governed_terminal_ok_one(completion, protocol, results).await? {
         crate::governed_result_writer::MysqlStatementWriteOutcome::Continue(results) => {
             results.no_more_results().await
         }
@@ -72,26 +81,44 @@ pub async fn write_governed_terminal_ok<W: AsyncWrite + Unpin>(
 }
 
 pub async fn write_governed_terminal_ok_one<'writer, W: AsyncWrite + Unpin>(
+    completion: StatementCommandCompletion,
     protocol: GovernedProtocolOwner,
     results: QueryResultWriter<'writer, W>,
 ) -> io::Result<crate::MysqlStatementWriteOutcome<'writer, W>> {
-    write_governed_terminal_ok_with_more(protocol, results, false).await
+    write_governed_terminal_ok_with_more(completion, protocol, results, false).await
 }
 
 pub(crate) async fn write_governed_terminal_ok_with_more<'writer, W: AsyncWrite + Unpin>(
+    completion: StatementCommandCompletion,
     protocol: GovernedProtocolOwner,
     results: QueryResultWriter<'writer, W>,
     more_results: bool,
 ) -> io::Result<crate::MysqlStatementWriteOutcome<'writer, W>> {
-    write_success(protocol, TerminalWriter::Query(Some(results)), more_results).await
+    write_success(
+        completion,
+        protocol,
+        TerminalWriter::Query(Some(results)),
+        more_results,
+    )
+    .await
 }
 
 /// COM_INIT_DB transfers into the same exact writer/flush lifetime.
 pub async fn write_governed_init_ok<W: AsyncWrite + Unpin>(
+    completion: StatementCommandCompletion,
     protocol: GovernedProtocolOwner,
     writer: InitWriter<'_, W>,
 ) -> io::Result<()> {
-    finish_outcome(write_success(protocol, TerminalWriter::Init(Some(writer)), false).await?).await
+    finish_outcome(
+        write_success(
+            completion,
+            protocol,
+            TerminalWriter::Init(Some(writer)),
+            false,
+        )
+        .await?,
+    )
+    .await
 }
 pub async fn write_governed_init_error<W: AsyncWrite + Unpin>(
     error: QueryServiceError,
@@ -171,6 +198,7 @@ impl<'writer, W: AsyncWrite + Unpin> TerminalWriter<'writer, W> {
     }
 }
 async fn write_success<'writer, W: AsyncWrite + Unpin>(
+    completion: StatementCommandCompletion,
     mut protocol: GovernedProtocolOwner,
     mut writer: TerminalWriter<'writer, W>,
     more_results: bool,
@@ -209,7 +237,7 @@ async fn write_success<'writer, W: AsyncWrite + Unpin>(
     // successful owner remains alive through its own packet and socket flush.
     let outcome = budget
         .run(async {
-            let payload = ok_payload(capabilities, more_results);
+            let payload = ok_payload(completion, capabilities, more_results)?;
             lease.finish(&payload).await
         })
         .await;
@@ -225,13 +253,19 @@ async fn write_success<'writer, W: AsyncWrite + Unpin>(
         }
     }
 }
-fn ok_payload(capabilities: CapabilityFlags, more_results: bool) -> Vec<u8> {
+fn ok_payload(
+    completion: StatementCommandCompletion,
+    capabilities: CapabilityFlags,
+    more_results: bool,
+) -> io::Result<Vec<u8>> {
     let status = if more_results {
         StatusFlags::SERVER_MORE_RESULTS_EXISTS.bits()
     } else {
         0
     };
-    let mut payload = vec![0, 0, 0]; // OK, affected rows, last insert id
+    let mut payload = vec![0]; // OK header
+    payload.write_lenenc_int(completion.affected_rows())?;
+    payload.write_lenenc_int(0)?; // No last insert id is authored by this completion.
     if capabilities.contains(CapabilityFlags::CLIENT_PROTOCOL_41) {
         payload.extend_from_slice(&status.to_le_bytes());
         payload.extend_from_slice(&[0, 0]);
@@ -241,7 +275,7 @@ fn ok_payload(capabilities: CapabilityFlags, more_results: bool) -> Vec<u8> {
     if capabilities.contains(CapabilityFlags::CLIENT_SESSION_TRACK) {
         payload.push(0);
     }
-    payload
+    Ok(payload)
 }
 fn cancellation_overrides_error(
     error: &QueryServiceError,
@@ -431,6 +465,53 @@ mod tests {
     use novarocks_user_error::{
         ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserError,
     };
+
+    #[test]
+    fn completion_counts_preserve_mysql_integer_widths_and_negotiated_flags() {
+        let cases: &[(u64, &[u8])] = &[
+            (0, &[0]),
+            (3, &[3]),
+            (250, &[250]),
+            (251, &[0xfc, 251, 0]),
+            (65_535, &[0xfc, 0xff, 0xff]),
+            (65_536, &[0xfd, 0, 0, 1]),
+            (16_777_215, &[0xfd, 0xff, 0xff, 0xff]),
+            (16_777_216, &[0xfe, 0, 0, 0, 1, 0, 0, 0, 0]),
+            (
+                u64::MAX,
+                &[0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ),
+        ];
+        for &(rows, encoded) in cases {
+            for capabilities in [
+                CapabilityFlags::empty(),
+                CapabilityFlags::CLIENT_TRANSACTIONS,
+                CapabilityFlags::CLIENT_PROTOCOL_41,
+                CapabilityFlags::CLIENT_PROTOCOL_41 | CapabilityFlags::CLIENT_SESSION_TRACK,
+            ] {
+                for more in [false, true] {
+                    let payload =
+                        ok_payload(StatementCommandCompletion::new(rows), capabilities, more)
+                            .unwrap();
+                    let mut expected = vec![0];
+                    expected.extend_from_slice(encoded);
+                    expected.push(0); // No last insert id.
+                    if capabilities.contains(CapabilityFlags::CLIENT_PROTOCOL_41) {
+                        expected.extend_from_slice(&[if more { 8 } else { 0 }, 0, 0, 0]);
+                    } else if capabilities.contains(CapabilityFlags::CLIENT_TRANSACTIONS) {
+                        expected.extend_from_slice(&[if more { 8 } else { 0 }, 0]);
+                    }
+                    if capabilities.contains(CapabilityFlags::CLIENT_SESSION_TRACK) {
+                        expected.push(0);
+                    }
+                    assert_eq!(
+                        payload, expected,
+                        "rows={rows} capabilities={capabilities:?} more={more}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn late_local_cancel_does_not_replace_a_selected_execution_error() {

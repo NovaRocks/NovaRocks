@@ -76,7 +76,9 @@ use crate::mv::domain::refresh::target_binding::MvTargetBinding;
 use crate::mv::domain::schema_validation::{
     validate_branch_id_field, validate_join_schema_contract, validate_schema_contract,
 };
-use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
+use crate::mv::domain::storage_observation::{
+    MvSchemaValidationObservation, MvSourceSchemaObservation,
+};
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_mv_application::persistence::codec::{ApplyKeyKind, RelationOccurrence};
 use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
@@ -130,41 +132,19 @@ pub struct IcebergMvCorePorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    typed_connector_control: Option<Arc<novarocks_catalog_application::ConnectorControlHost>>,
+    typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     readiness: Arc<MvReadinessPort>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
     /// The one FE-process management authority every document-managed effect
-    /// commits under. It is optional only so a composition root that does not
-    /// own the typed control host can install it separately.
+    /// commits under. The composed constructor installs this original authority;
+    /// its existing operation-facing getter retains the Result contract.
     management_entrance: Option<Arc<novarocks_mv_application::management::ManagementEntrance>>,
 }
 
 impl IcebergMvCorePorts {
-    /// Construct the exact provider and durable-MV ports required by the
-    /// Iceberg MV backend. Frontend composition must provide every leaf; this
-    /// value deliberately has no application-facade constructor.
-    pub(crate) fn new(
-        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
-        catalog_service: Arc<QueryCatalogService>,
-        catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
-        readiness: Arc<MvReadinessPort>,
-        storage_observation: Arc<dyn MvStorageObservationPort>,
-        constant_policy: novarocks_functions::ConstantPolicy,
-    ) -> Self {
-        Self {
-            functions,
-            constant_policy,
-            catalog_service,
-            catalog_application,
-            connector_control,
-            typed_connector_control: None,
-            readiness,
-            storage_observation,
-            management_entrance: None,
-        }
-    }
-
+    /// Construct a complete MV capability graph from the original role leaves.
+    /// Source preparation and staged publication share the exact typed host;
+    /// a background refresh cannot be composed with only the erased registry.
     pub(crate) fn new_with_management_entrance(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -182,29 +162,11 @@ impl IcebergMvCorePorts {
             catalog_service,
             catalog_application,
             connector_control,
-            typed_connector_control: Some(typed_connector_control),
+            typed_connector_control,
             readiness,
             storage_observation,
             management_entrance: Some(management_entrance),
         }
-    }
-
-    /// Install the FE management authority on a port set composed without it.
-    ///
-    /// Composition roots that do not own the typed control host still have to
-    /// publish, and publishing is a management effect. This is the one way to
-    /// add the authority after construction; it never replaces one already
-    /// installed, so a composition cannot quietly swap incarnations.
-    pub(crate) fn with_management_entrance(
-        mut self,
-        management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
-    ) -> Self {
-        debug_assert!(
-            self.management_entrance.is_none(),
-            "MV core ports already own a management entrance"
-        );
-        self.management_entrance = Some(management_entrance);
-        self
     }
 
     pub(crate) fn management_entrance(
@@ -217,11 +179,8 @@ impl IcebergMvCorePorts {
 
     pub(crate) fn typed_connector_control(
         &self,
-    ) -> Result<&Arc<novarocks_catalog_application::ConnectorControlHost>, String> {
-        self.typed_connector_control.as_ref().ok_or_else(|| {
-            "document-managed MV CREATE requires the composed typed connector control host"
-                .to_string()
-        })
+    ) -> &Arc<novarocks_catalog_application::ConnectorControlHost> {
+        &self.typed_connector_control
     }
 
     pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
@@ -520,7 +479,7 @@ pub(crate) fn finish_mv_create_preparation(
         novarocks_mv_application::persistence::aggregate_bindings::MvCreateRelationObservation,
     >,
     binding_document: novarocks_mv_application::persistence::codec::keyed::BindingDocument,
-    base_field_observations: BTreeMap<String, MvSchemaValidationObservation>,
+    base_field_observations: BTreeMap<String, MvSourceSchemaObservation>,
 ) -> Result<Arc<IcebergMvCreatePlan>, novarocks_sql::compiler::SqlCompileError> {
     let MvCreateShape {
         target,
@@ -784,7 +743,7 @@ pub(crate) fn build_create_documents_for_prepared_target(
 }
 
 fn base_table_descriptor_from_observation(
-    observation: &MvSchemaValidationObservation,
+    observation: &MvSourceSchemaObservation,
 ) -> BaseTableDescriptor {
     BaseTableDescriptor {
         format_version: if observation.is_format_v3() { 3 } else { 2 },
@@ -866,7 +825,7 @@ fn validate_union_projection_schema_contract_for_base(
     projection: &StoredKeyedMvProjection,
     branch_count: usize,
     occurrence: &RelationOccurrence,
-    base_observation: &MvSchemaValidationObservation,
+    base_observation: &MvSourceSchemaObservation,
     target_observation: &MvSchemaValidationObservation,
 ) -> Result<(), String> {
     let interpretation = projection.facts.interpretation();
@@ -1259,10 +1218,10 @@ fn union_branch_count(query: &ast::Query) -> u32 {
 fn observed_base<'a>(
     base_field_observations: &'a std::collections::BTreeMap<
         String,
-        crate::mv::domain::storage_observation::MvSchemaValidationObservation,
+        crate::mv::domain::storage_observation::MvSourceSchemaObservation,
     >,
     base_ref: &TableIdentity,
-) -> Result<&'a crate::mv::domain::storage_observation::MvSchemaValidationObservation, String> {
+) -> Result<&'a crate::mv::domain::storage_observation::MvSourceSchemaObservation, String> {
     base_field_observations.get(&base_ref.fqn()).ok_or_else(|| {
         format!(
             "MV base {} was not observed before contract build",

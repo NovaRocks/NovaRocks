@@ -30,7 +30,7 @@ pub use statement_action::{
     BackgroundActionResultGuard, GovernedStatementAction, GovernedStatementResidual,
     StatementActionAttempt, StatementActionFailure, StatementActionReady, StatementActionReceipt,
     StatementActionValue, StatementActionWaitError, StatementActionWaiter,
-    StatementProgressGeometry,
+    StatementCommandCompletion, StatementProgressGeometry,
 };
 #[doc(hidden)]
 pub use statement_action::{StatementActionSource, StatementProgressSlot};

@@ -74,9 +74,10 @@ impl BridgeCtx<'_> {
         self.materialize_change_window_sign(node, plan)
     }
 
-    /// The private IMV algebra uses Int8. Its provider scan must publish the
-    /// exact Int32 schema, with a real cast restoring the original internal
-    /// identity before any parent consumes the action column.
+    /// The private IMV algebra uses Int8. When that internal action is
+    /// declared, materialize the provider's exact Int32 schema and restore
+    /// the original internal identity with a real cast. Ordinary Delta TVF
+    /// projections do not declare this optimizer-private column.
     fn materialize_change_window_sign(
         &self,
         original: &OptimizedOperatorNode,
@@ -92,18 +93,14 @@ impl BridgeCtx<'_> {
         if !matches!(source.kind, SqlScanKind::Delta { .. }) {
             return Ok(plan);
         }
-        let actions = scan
-            .columns
-            .iter()
-            .filter(|column| ImvActionColumn::matches(column))
-            .cloned()
-            .collect::<Vec<_>>();
-        let [internal] = actions.as_slice() else {
-            return Err("ChangeWindow scan must declare exactly one internal action column".into());
+        let internal = match ImvActionColumn::declared(&scan.columns) {
+            Ok(None) => return Ok(plan),
+            Ok(Some(internal)) => internal.clone(),
+            Err(crate::planner::imv_rewrite::action_column::ImvActionColumnDeclarationError::Duplicate) => {
+                return Err("ChangeWindow scan must declare exactly one internal action column".into());
+            }
+            Err(_) => return Err("ChangeWindow internal action must be non-null Int8 before physical materialization".into()),
         };
-        if internal.value_type.data_type() != &DataType::Int8 || internal.value_type.nullable() {
-            return Err("ChangeWindow internal action must be non-null Int8 before physical materialization".into());
-        }
         let raw_id = crate::column_id::ColumnId(self.next_scan_column.get());
         self.next_scan_column.set(
             raw_id.0.checked_add(1).ok_or_else(|| {
@@ -1331,6 +1328,67 @@ mod tests {
         }));
         node.output_columns = columns;
         attach_arena(node, Arc::new(ScalarArena::new()))
+    }
+
+    #[test]
+    fn ordinary_change_window_without_private_action_keeps_exact_provider_projection() {
+        use arrow::datatypes::DataType;
+        let mut source = delta_sign_scan(novarocks_type_contract::FunctionValueType::new(
+            DataType::Int8,
+            false,
+        ));
+        let Operator::PhysicalScan(scan) = &mut source.op else {
+            unreachable!()
+        };
+        scan.columns.retain(|column| !column.is_internal);
+        scan.table
+            .iceberg_row_lineage_metadata_columns
+            .retain(|column| {
+                !column
+                    .name
+                    .eq_ignore_ascii_case(crate::common::CHANGE_OP_COLUMN)
+            });
+        scan.required_columns = Some(vec![ColumnId(1)]);
+        source.output_columns.retain(|column| !column.is_internal);
+        let plan = super::super::to_physical_plan(&source).unwrap();
+        let PhysicalPlanKind::Scan(scan) = &plan.kind else {
+            panic!("ordinary Delta projection needs no private sign cast")
+        };
+        assert_eq!(scan.required_columns, Some(vec![ColumnId(1)]));
+        assert_eq!(scan.columns.len(), 1);
+        assert_eq!(plan.output_columns.len(), 1);
+        assert_eq!(plan.output_columns[0].column_id, ColumnId(1));
+        assert!(!plan.output_columns[0].is_internal);
+        let crate::planner::table::ScanSource::Sql(binding) = &scan.table.source;
+        assert!(matches!(
+            binding.kind,
+            crate::planner::table::SqlScanKind::Delta {
+                from_snapshot_id: 7,
+                to_snapshot_id: 11
+            }
+        ));
+    }
+
+    #[test]
+    fn change_window_rejects_duplicate_private_action_declarations() {
+        use arrow::datatypes::DataType;
+        let mut source = delta_sign_scan(novarocks_type_contract::FunctionValueType::new(
+            DataType::Int8,
+            false,
+        ));
+        let Operator::PhysicalScan(scan) = &mut source.op else {
+            unreachable!()
+        };
+        let duplicate = crate::planner::imv_rewrite::action_column::ImvActionColumn::output_column(
+            ColumnId(12),
+        );
+        scan.columns.push(duplicate.clone());
+        source.output_columns.push(duplicate);
+        let error = super::super::to_physical_plan(&source).unwrap_err();
+        assert!(
+            error.contains("exactly one internal action column"),
+            "{error}"
+        );
     }
 
     #[test]

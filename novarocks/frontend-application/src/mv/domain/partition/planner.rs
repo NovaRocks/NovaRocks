@@ -15,87 +15,50 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::mv::domain::model::{AffectedTargetPartitions, MvPartitionKey};
-use crate::mv::domain::partition::mapping::map_connector_partition_to_mv_key;
+use crate::mv::domain::model::AffectedTargetPartitions;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 
 pub(crate) struct AffectedPartitionPlanInput<'a> {
     pub projection: &'a StoredKeyedMvProjection,
     pub source_occurrence_id: u32,
     pub target_partition: &'a novarocks_mv_application::persistence::schema::MvPartitionContract,
-    pub partition_impact:
-        Option<&'a novarocks_spi::connector::ConnectorChangeWindowPartitionImpact>,
-    pub schema_observation:
-        Option<&'a crate::mv::domain::storage_observation::MvSchemaValidationObservation>,
+    pub prepared_source: Option<PreparedPartitionSource<'a>>,
+}
+
+/// A prepared impact cannot be separated from its exact generation/schema inputs.
+pub(crate) struct PreparedPartitionSource<'a> {
+    pub receipt: &'a novarocks_spi::connector::read_stack::ConnectorPreparedSourceRead,
+    pub planning: &'a novarocks_spi::connector::ConnectorControlPlanningLease,
+    pub schema: &'a crate::mv::domain::storage_observation::MvSourceSchemaObservation,
 }
 
 pub(crate) fn plan_affected_partitions(
     input: &AffectedPartitionPlanInput<'_>,
-) -> AffectedTargetPartitions {
-    let Some(impact) = input.partition_impact else {
-        return AffectedTargetPartitions::not_derived(
+) -> Result<AffectedTargetPartitions, novarocks_spi::connector::ConnectorError> {
+    let Some(prepared) = &input.prepared_source else {
+        return Ok(AffectedTargetPartitions::not_derived(
             "full refresh affected partition planning is not implemented",
-        );
+        ));
     };
-    match impact {
-        novarocks_spi::connector::ConnectorChangeWindowPartitionImpact::Unavailable => {
-            AffectedTargetPartitions::not_derived(
-                "connector change-window partition impact is unavailable",
-            )
-        }
-        novarocks_spi::connector::ConnectorChangeWindowPartitionImpact::Unpartitioned => {
-            if input.target_partition.fields.is_empty() {
-                AffectedTargetPartitions::Unpartitioned
-            } else {
-                AffectedTargetPartitions::not_derived(
-                    "unpartitioned source changes cannot identify target partitions",
-                )
-            }
-        }
-        novarocks_spi::connector::ConnectorChangeWindowPartitionImpact::Exact {
-            has_row_deletes,
-            added,
-            removed,
-        } => {
-            if *has_row_deletes {
-                return AffectedTargetPartitions::not_derived(
-                    "row-level delete affected partitions require row-evaluation fallback",
-                );
-            }
-            let Some(observation) = input.schema_observation else {
-                return AffectedTargetPartitions::not_derived(
-                    "connector partition impact is missing its exact schema observation",
-                );
-            };
-            let mut partitions = Vec::<MvPartitionKey>::with_capacity(added.len() + removed.len());
-            for partition in added.iter().chain(removed) {
-                match map_connector_partition_to_mv_key(
-                    input.projection,
-                    input.source_occurrence_id,
-                    observation,
-                    input.target_partition,
-                    partition,
-                ) {
-                    Ok(Some(key)) => partitions.push(key),
-                    Ok(None) => return AffectedTargetPartitions::Unpartitioned,
-                    Err(reason) => return AffectedTargetPartitions::not_derived(reason),
-                }
-            }
-            AffectedTargetPartitions::known(partitions)
-        }
-    }
+    super::mapping::plan_prepared_source_partitions(
+        input.projection,
+        input.source_occurrence_id,
+        prepared.schema,
+        prepared.planning,
+        prepared.receipt,
+        input.target_partition,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
-    use novarocks_mv_application::persistence::schema::MvPartitionContract;
     use novarocks_mv_application::product::MvTarget;
-    use novarocks_spi::connector::ConnectorChangeWindowPartitionImpact;
 
-    fn projection() -> StoredKeyedMvProjection {
-        StoredKeyedMvProjection {
+    #[test]
+    fn full_partition_derivation_does_not_invent_a_prepared_window() {
+        let projection = StoredKeyedMvProjection {
             mv_id: 1,
             facts: ProjectionFixture::new(
                 MvTarget::from_parts(Some("ice"), "sales", "mv"),
@@ -103,73 +66,21 @@ mod tests {
             )
             .build()
             .unwrap(),
-        }
-    }
-
-    fn unpartitioned_target() -> MvPartitionContract {
-        MvPartitionContract {
+        };
+        let target = novarocks_mv_application::persistence::schema::MvPartitionContract {
             target_spec_id: 0,
             fields: vec![],
-        }
-    }
-
-    #[test]
-    fn provider_unpartitioned_fact_is_preserved_without_decoding_spec_identity() {
-        let projection = projection();
-        let target_partition = unpartitioned_target();
-        assert_eq!(
-            plan_affected_partitions(&AffectedPartitionPlanInput {
-                projection: &projection,
-                source_occurrence_id: 7,
-                target_partition: &target_partition,
-                partition_impact: Some(&ConnectorChangeWindowPartitionImpact::Unpartitioned),
-                schema_observation: None,
-            }),
-            AffectedTargetPartitions::Unpartitioned
-        );
-    }
-
-    #[test]
-    fn exact_impact_without_exact_schema_fails_closed() {
-        let projection = projection();
-        let target_partition = unpartitioned_target();
-        let impact = ConnectorChangeWindowPartitionImpact::Exact {
-            has_row_deletes: false,
-            added: Vec::new(),
-            removed: Vec::new(),
         };
         let result = plan_affected_partitions(&AffectedPartitionPlanInput {
             projection: &projection,
             source_occurrence_id: 7,
-            target_partition: &target_partition,
-            partition_impact: Some(&impact),
-            schema_observation: None,
-        });
+            target_partition: &target,
+            prepared_source: None,
+        })
+        .unwrap();
         assert_eq!(
             result.not_derived_reason(),
-            Some("connector partition impact is missing its exact schema observation")
-        );
-    }
-
-    #[test]
-    fn row_deletes_remain_non_derivable() {
-        let projection = projection();
-        let target_partition = unpartitioned_target();
-        let impact = ConnectorChangeWindowPartitionImpact::Exact {
-            has_row_deletes: true,
-            added: Vec::new(),
-            removed: Vec::new(),
-        };
-        let result = plan_affected_partitions(&AffectedPartitionPlanInput {
-            projection: &projection,
-            source_occurrence_id: 7,
-            target_partition: &target_partition,
-            partition_impact: Some(&impact),
-            schema_observation: None,
-        });
-        assert_eq!(
-            result.not_derived_reason(),
-            Some("row-level delete affected partitions require row-evaluation fallback")
+            Some("full refresh affected partition planning is not implemented")
         );
     }
 }

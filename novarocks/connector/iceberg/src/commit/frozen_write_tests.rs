@@ -457,3 +457,105 @@ async fn frozen_narrow_identity_partition_writes_standard_int_files_under_exact_
         vec![(-128, None), (-128, Some(-32768)), (127, Some(32767))]
     );
 }
+
+#[tokio::test]
+async fn frozen_replacement_after_images_partition_new_values_and_preserve_lineage_and_null() {
+    use crate::iceberg::spec::{Literal, Struct};
+    use arrow::array::Int64Array;
+    for (transform, after, partition) in [("identity", 11_i32, 11_i32), ("truncate[10]", 11, 10)] {
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("p", DataType::Int32, true),
+            Field::new(
+                crate::row_lineage_synth::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                true,
+            ),
+            Field::new(
+                crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL,
+                DataType::Int64,
+                true,
+            ),
+        ]));
+        let mut facts = frozen_facts(
+            &location,
+            vec![Arc::new(NestedField::optional(
+                11,
+                "p",
+                Type::Primitive(PrimitiveType::Int),
+            ))],
+        );
+        facts.format_version = 3;
+        facts.partition_source_column_names = vec!["p".into()];
+        facts.partition_column_names = vec!["new_partition".into()];
+        facts.transform_exprs = vec![transform.into()];
+        let context =
+            staged_write_context_from_frozen_facts(&local_binding(), &schema, facts).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(after), None])),
+                Arc::new(Int64Array::from(vec![Some(41), Some(42)])),
+                Arc::new(Int64Array::from(vec![None, None])),
+            ],
+        )
+        .unwrap();
+        let files = crate::commit::data_writer::write_record_batches(&context, vec![batch])
+            .await
+            .unwrap();
+        assert_eq!(
+            files.len(),
+            2,
+            "NULL and the new transformed value are distinct partitions"
+        );
+        let mut actual = Vec::new();
+        for file in files {
+            assert_eq!(file.partition_spec_id, 7);
+            let is_null = file.data_file.partition() == &Struct::from_iter([None]);
+            if !is_null {
+                assert_eq!(
+                    file.data_file.partition(),
+                    &Struct::from_iter([Some(Literal::int(partition))])
+                );
+            }
+            let path = file.data_file.file_path();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(
+                File::open(path.strip_prefix("file://").unwrap_or(path)).unwrap(),
+            )
+            .unwrap();
+            for batch in reader.build().unwrap() {
+                let batch = batch.unwrap();
+                let p = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let id = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let sequence = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    assert!(
+                        sequence.is_null(row),
+                        "Replace inherits actual commit sequence"
+                    );
+                    assert_eq!(p.is_null(row), is_null);
+                    actual.push((id.value(row), (!p.is_null(row)).then(|| p.value(row))));
+                }
+            }
+        }
+        actual.sort();
+        assert_eq!(
+            actual,
+            [(41, Some(after)), (42, None)],
+            "new partitioning must not mint a new logical row identity"
+        );
+    }
+}

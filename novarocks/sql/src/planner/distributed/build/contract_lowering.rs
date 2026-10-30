@@ -6632,6 +6632,19 @@ impl<'a> ContractLoweringVisitor<'a> {
             output.push(value);
         }
 
+        // Only newly authored syntax literals share these column-local runs.
+        // Expressions are still registered in the original row-major order;
+        // admitted constants and nonliteral cells keep their original authors.
+        let mut literal_runs = Vec::new();
+        self.work.flush()?;
+        literal_runs
+            .try_reserve_exact(plan.output_columns.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        for _ in &plan.output_columns {
+            self.work.step()?;
+            literal_runs.push(None);
+        }
+        self.work.flush()?;
         let mut rows = Vec::with_capacity(values.rows.len());
         for (row_ordinal, row) in values.rows.iter().enumerate() {
             if row.len() != plan.output_columns.len() {
@@ -6644,13 +6657,42 @@ impl<'a> ContractLoweringVisitor<'a> {
             let mut lowered_row = Vec::with_capacity(row.len());
             for (column_ordinal, expression) in row.iter().enumerate() {
                 let expected = value_type(&plan.output_columns[column_ordinal]);
-                lowered_row.push(self.lower_values_expression(
-                    node,
-                    expression,
-                    &expected,
-                    row_ordinal,
-                    column_ordinal,
-                )?);
+                let literal_type =
+                    self.values_literal_type(expression, &expected, row_ordinal, column_ordinal)?;
+                let lowered = match literal_type {
+                    Some(ty) if crate::constant::syntax_run_carrier(ty.data_type()) => {
+                        let cached = &mut literal_runs[column_ordinal];
+                        let reused = cached.as_ref().is_some_and(
+                            |(start, pool): &(usize, novarocks_constant_contract::ConstantPool)| {
+                                row_ordinal >= *start && row_ordinal - *start < pool.array().len()
+                            },
+                        );
+                        if !reused {
+                            let pool = self.author_values_literal_run(
+                                values,
+                                row_ordinal,
+                                column_ordinal,
+                                &ty,
+                            )?;
+                            *cached = Some((row_ordinal, pool));
+                        }
+                        let (start, pool) =
+                            cached.as_ref().expect("original literal run was installed");
+                        let ordinal = checked_ordinal("Values literal run", row_ordinal - *start)?;
+                        let value = pool.value(ordinal)?;
+                        self.lower_constant_expression(node, &value, ty)?
+                    }
+                    Some(ty) => {
+                        let ExprKind::Literal(literal) = &expression.kind else {
+                            unreachable!(
+                                "the original position contract selected a syntax literal"
+                            );
+                        };
+                        self.author_literal_expression(node, literal, ty)?
+                    }
+                    None => self.lower_values_expression(node, expression, &expected)?,
+                };
+                lowered_row.push(lowered);
             }
             rows.push(lowered_row.into_boxed_slice());
         }
@@ -8977,14 +9019,15 @@ impl<'a> ContractLoweringVisitor<'a> {
         )
     }
 
-    fn lower_values_expression(
-        &mut self,
-        owner: NodeId,
+    /// Retain the existing per-position assignment contract before deciding
+    /// whether this exact syntax occurrence can enter a first-created run.
+    fn values_literal_type(
+        &self,
         expression: &TypedExpr,
         target: &ValueType,
         row_ordinal: usize,
         column_ordinal: usize,
-    ) -> Result<ExprId, ContractLoweringError> {
+    ) -> Result<Option<ValueType>, ContractLoweringError> {
         let source = expression_type(expression);
         if source.nullable() && !target.nullable()
             || novarocks_types::wider_type(source.data_type(), target.data_type())
@@ -8997,20 +9040,72 @@ impl<'a> ContractLoweringVisitor<'a> {
             });
         }
 
-        // A literal carries this already-analyzed position's nullability directly.
-        // It still enters the same controlled constant author and source journal.
-        if source.same_physical_binding_ignoring_root_nullability_observed(target, || {
-            self.control
-                .checkpoint(CompilePhase::LowerProgram, 1)
-                .map_err(ContractLoweringError::from)
-        })? && let ExprKind::Literal(literal) = &expression.kind
+        if matches!(expression.kind, ExprKind::Literal(_))
+            && source.same_physical_binding_ignoring_root_nullability_observed(target, || {
+                self.control
+                    .checkpoint(CompilePhase::LowerProgram, 1)
+                    .map_err(ContractLoweringError::from)
+            })?
         {
-            let mut carrier = target.clone();
-            carrier = carrier
-                .with_nullable(carrier.nullable() || (source.nullable()))
-                .expect("validated root NULL contract");
-            return self.author_literal_expression(owner, literal, carrier);
+            return Ok(Some(target.clone()));
         }
+        Ok(None)
+    }
+
+    fn author_values_literal_run(
+        &mut self,
+        values: &crate::planner::payload::PlanValuesNode,
+        row: usize,
+        column: usize,
+        ty: &ValueType,
+    ) -> Result<novarocks_constant_contract::ConstantPool, ContractLoweringError> {
+        let maximum = usize::try_from(self.constant_policy.max_rows)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let count = values.rows.len().saturating_sub(row).min(maximum);
+        let mut literals = Vec::new();
+        self.work.flush()?;
+        literals
+            .try_reserve_exact(count)
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.work.flush()?;
+        for next in values.rows.iter().skip(row).take(count) {
+            self.work.step()?;
+            let Some(expression) = next.get(column) else {
+                break;
+            };
+            let ExprKind::Literal(literal) = &expression.kind else {
+                break;
+            };
+            let source = expression_type(expression);
+            if source.nullable() && !ty.nullable()
+                || !source.same_physical_binding_ignoring_root_nullability_observed(ty, || {
+                    self.control
+                        .checkpoint(CompilePhase::LowerProgram, 1)
+                        .map_err(ContractLoweringError::from)
+                })?
+            {
+                break;
+            }
+            literals.push(literal);
+        }
+        self.work.flush()?;
+        let (pool, _) = crate::constant::admit_syntax_constant_run(
+            &literals,
+            ty,
+            self.constant_policy,
+            self.control,
+        )?;
+        self.work.flush()?;
+        Ok(pool)
+    }
+
+    fn lower_values_expression(
+        &mut self,
+        owner: NodeId,
+        expression: &TypedExpr,
+        target: &ValueType,
+    ) -> Result<ExprId, ContractLoweringError> {
         // A cell keeps its analyzed type until here, so a NULL cell is typed
         // by its column as it is lowered rather than converted afterwards.
         let lowered = self.lower_expression_as(
@@ -13902,10 +13997,16 @@ mod tests {
             CompileControlError::Cancelled
         );
         let observed = control.observations.lock().unwrap();
-        assert!(matches!(
-            observed.last(),
-            Some((CompilePhase::LowerProgram, 1))
-        ));
+        // The first short pending-work flush must refuse before a draft is
+        // published. Its phase and exact unit count follow the actual author.
+        let (_, pending) = observed.last().expect("pending work must be observed");
+        assert!((1..256).contains(pending), "observations: {observed:?}");
+        assert!(
+            observed[..observed.len() - 1]
+                .iter()
+                .all(|(_, units)| *units == 0),
+            "the first positive observation must be the final callback: {observed:?}"
+        );
     }
 
     #[test]
@@ -17516,6 +17617,48 @@ mod tests {
     }
 
     #[test]
+    fn right_outer_left_build_keeps_source_output_and_null_extends_empty_target() {
+        let target = column(1, "target_key", DataType::Int64, false);
+        let source = column(2, "source_key", DataType::Int64, false);
+        let nullable_target = column(1, "target_key", DataType::Int64, true);
+        let joined = hash_join(
+            crate::common::JoinKind::RightOuter,
+            PhysicalHashJoinBuildSide::Left,
+            SqlJoinDistribution::Singleton,
+            Some(JoinExecutionMode::Singleton),
+            values(vec![target], Vec::new()),
+            values(
+                vec![source.clone()],
+                vec![vec![literal_int(7)], vec![literal_int(7)]],
+            ),
+            vec![nullable_target, source],
+        );
+        let plan = finish_for_test(&joined).unwrap();
+        let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let root = fragment.nodes().get(&fragment.root()).unwrap();
+        let NodeKind::HashJoin {
+            kind,
+            build_side,
+            null_extended,
+            ..
+        } = &root.kind
+        else {
+            panic!("expected hash join")
+        };
+        assert_eq!(*kind, ContractJoinKind::RightOuter);
+        assert_eq!(*build_side, ContractJoinSide::Left);
+        assert_eq!(null_extended.len(), 1);
+        assert_eq!(root.output.columns.len(), 2);
+        assert_eq!(root.output.columns[0], null_extended[0]);
+        assert!(fragment.values()[&root.output.columns[0]].ty.nullable());
+        assert!(!fragment.values()[&root.output.columns[1]].ty.nullable());
+        assert!(
+            matches!(fragment.values()[&null_extended[0]].origin, ValueOrigin::NullExtended { node, .. } if node == root.id)
+        );
+        assert!(plan.runtime_filters().is_empty());
+    }
+
+    #[test]
     fn left_outer_hash_join_defines_a_new_nullable_right_value() {
         let left = column(1, "left_key", DataType::Int64, false);
         let right = column(2, "right_key", DataType::Int64, false);
@@ -19193,7 +19336,29 @@ mod tests {
                     .collect()
             })
             .collect();
-        let final_plan = finish_for_test(&values(columns, rows)).unwrap();
+        // The existing production pool row ceiling is 4096; this fixture
+        // exercises the unchanged 16,384-by-four occurrence scale across it.
+        let caps = novarocks_constant_contract::ConstantPolicy {
+            max_rows: 4096,
+            ..crate::constant::test_constant_policy()
+        };
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let final_plan = lower_final_physical_plan(
+            &values(columns, rows),
+            version(),
+            dop(),
+            crate::functions::builtin_sql_function_catalog().snapshot(),
+            false,
+            caps,
+            &control,
+        )
+        .unwrap()
+        .finish_observed(&control)
+        .unwrap()
+        .plan()
+        .clone();
+        assert_eq!(final_plan.constants().entries().len(), 16);
+        let mut occurrences = BTreeSet::new();
         let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
         assert_eq!(fragment.expressions().len(), 65_536);
         let root = fragment.nodes().get(&fragment.root()).unwrap();
@@ -19204,9 +19369,15 @@ mod tests {
         for (row, expressions) in rows.iter().enumerate() {
             assert_eq!(expressions.len(), 4);
             for (col, expression) in expressions.iter().enumerate() {
+                assert!(
+                    occurrences.insert(*expression),
+                    "each original cell retains its own expression occurrence"
+                );
                 let expression = fragment.expressions().get(*expression).unwrap();
                 assert_eq!(expression.ty, ValueType::new(DataType::Utf8, true));
                 let value = checked_constant_for_test(&final_plan, expression);
+                assert_eq!(value.ordinal(), (row % 4096) as u32);
+                assert_eq!(value.pool().array().len(), 4096);
                 if row == 0 && col == 0 {
                     assert_eq!(value.try_utf8().unwrap(), None);
                 } else {
@@ -19218,6 +19389,160 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn physical_values_first_literal_author_keeps_original_typed_refusals() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Control {
+            cause: CompileControlError,
+            refused: AtomicBool,
+        }
+        impl PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert!(
+                    !self.refused.load(Ordering::Relaxed),
+                    "no callbacks after original typed refusal"
+                );
+                if phase == CompilePhase::FunctionSpecialization && units == 256 {
+                    self.refused.store(true, Ordering::Relaxed);
+                    return Err(self.cause.clone());
+                }
+                Ok(())
+            }
+        }
+        let input = values(
+            vec![column(1, "text", DataType::Utf8, false)],
+            (0..1024)
+                .map(|row| {
+                    vec![TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::String(format!("row{row}"))),
+                        value_type: ValueType::new(DataType::Utf8, false),
+                    }]
+                })
+                .collect(),
+        );
+        let original = novarocks_failure_contract::SharedFailureCause::new(
+            novarocks_constant_contract::ConstantError::Limit("original source refusal"),
+        );
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::Source(original),
+        ] {
+            let control = Control {
+                cause: cause.clone(),
+                refused: AtomicBool::new(false),
+            };
+            let error = lower_final_physical_plan(
+                &input,
+                version(),
+                dop(),
+                crate::functions::builtin_sql_function_catalog().snapshot(),
+                false,
+                crate::constant::test_constant_policy(),
+                &control,
+            )
+            .err()
+            .expect("original owner must refuse");
+            assert!(control.refused.load(Ordering::Relaxed));
+            assert!(matches!(error,ContractLoweringError::Control(actual) if actual==cause));
+        }
+    }
+
+    #[test]
+    fn values_runs_keep_permuted_columns_nonliteral_sites_and_admitted_backing() {
+        use arrow::array::{Array, Int32Array};
+        use novarocks_constant_contract::ConstantPool;
+        let declared = ValueType::new(DataType::Int32, false);
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let original = ConstantPool::try_new(
+            Arc::new(arrow::datatypes::Field::new(
+                "original",
+                DataType::Int32,
+                false,
+            )),
+            declared.clone(),
+            Int32Array::from(vec![11, 22, 33]).to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for row in 0..6 {
+            let integer = match row {
+                1 => TypedExpr {
+                    kind: ExprKind::Constant(original.value(1).unwrap()),
+                    value_type: declared.clone(),
+                },
+                2 => TypedExpr {
+                    kind: ExprKind::Nested(Box::new(literal_int32(2))),
+                    value_type: declared.clone(),
+                },
+                _ => literal_int32(row),
+            };
+            let text = TypedExpr {
+                kind: ExprKind::Literal(if row == 2 {
+                    LiteralValue::Null
+                } else {
+                    LiteralValue::String(format!("row{row}"))
+                }),
+                value_type: ValueType::new(DataType::Utf8, row == 2),
+            };
+            rows.push(vec![integer, text]);
+        }
+        let plan = finish_for_test(&values(
+            vec![
+                column(9, "second", DataType::Int32, false),
+                column(3, "first", DataType::Utf8, true),
+            ],
+            rows,
+        ))
+        .unwrap();
+        let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let NodeKind::Values { rows } = &fragment.nodes().get(&fragment.root()).unwrap().kind
+        else {
+            panic!("expected original Values");
+        };
+        let mut occurrences = BTreeSet::new();
+        for (row, cells) in rows.iter().enumerate() {
+            for (column, expression) in cells.iter().enumerate() {
+                assert!(occurrences.insert(*expression));
+                let expression = fragment.expressions().get(*expression).unwrap();
+                let value = checked_constant_for_test(&plan, expression);
+                if column == 0 {
+                    assert_eq!(
+                        value.try_i64().unwrap(),
+                        Some(if row == 1 { 22 } else { row as i64 })
+                    );
+                    if row == 1 {
+                        assert_eq!(value.pool().backing_identity(), original.backing_identity());
+                        assert_eq!(value.ordinal(), 1);
+                        assert_eq!(value.pool().field_ref().name(), "original");
+                    } else {
+                        assert_ne!(value.pool().backing_identity(), original.backing_identity());
+                        assert_eq!(value.ordinal(), if row >= 3 { (row - 3) as u32 } else { 0 });
+                    }
+                } else {
+                    assert_eq!(value.ordinal(), row as u32);
+                    let expected = format!("row{row}");
+                    assert_eq!(
+                        value.try_utf8().unwrap(),
+                        if row == 2 {
+                            None
+                        } else {
+                            Some(expected.as_str())
+                        }
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn narrowed_integer_literal_keeps_its_checked_width_without_guessed_source_cast() {
         let output = column(1, "small", DataType::Int32, false);

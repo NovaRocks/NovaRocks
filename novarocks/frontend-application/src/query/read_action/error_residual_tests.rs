@@ -236,6 +236,7 @@ impl LogicalExecutionLauncher for NoNativeLaunch {
         _: &mut Option<crate::query_execution::logical_execution::PreparedLogicalComputation>,
         _: &mut Option<WorkOwner>,
         _: &QueryResultCapacityBinding,
+        _: &Arc<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>,
         _: &mut OriginalComputationStart,
         #[cfg(novarocks_dev_controls)] _: Option<
             crate::preparation_diagnostics::StatementObservationHandle,

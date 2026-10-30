@@ -264,9 +264,10 @@ async fn sealed_deletion_vector_survives_old_abort_drop_and_lost_receipt() {
 async fn unsealed_data_and_equality_delete_still_clean_their_own_objects() {
     for branch in [IcebergWriteBranch::Data, IcebergWriteBranch::EqualityDelete] {
         let fixture = Fixture::new();
-        let (mut writer, batch, _stop) = fixture.writer(branch).await;
+        let (mut writer, batch, stop) = fixture.writer(branch).await;
         writer.append(batch).await.unwrap();
         assert!(!fixture.files().is_empty());
+        stop.request_stop();
         writer.abort().await.unwrap();
         assert!(fixture.files().is_empty());
         assert!(writer.finish().await.is_err());
@@ -281,7 +282,7 @@ async fn failed_unsealed_finish_keeps_cleanup_of_its_already_written_prefix() {
         IcebergWriteBranch::DeletionVector,
     ] {
         let fixture = Fixture::new();
-        let (mut writer, batch, _stop) = fixture.writer_with_late_failure(branch, true).await;
+        let (mut writer, batch, stop) = fixture.writer_with_late_failure(branch, true).await;
         writer.append(batch).await.unwrap();
         let failure = writer
             .finish()
@@ -297,6 +298,7 @@ async fn failed_unsealed_finish_keeps_cleanup_of_its_already_written_prefix() {
             1,
             "the first target already staged a real output before failure"
         );
+        stop.request_stop();
         writer.abort().await.unwrap();
         assert!(
             fixture.files().is_empty(),

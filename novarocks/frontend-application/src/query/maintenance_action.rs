@@ -183,7 +183,9 @@ impl MetadataMaintenanceAction {
             Err(error) => return Poll::Ready(Err(error)),
         };
         Poll::Ready(match result {
-            MaintenanceStatementResult::Ok => Ok(StatementActionValue::Ok),
+            MaintenanceStatementResult::Ok => Ok(StatementActionValue::Ok(
+                novarocks_query_application::session_control::StatementCommandCompletion::new(0),
+            )),
             MaintenanceStatementResult::Query(result) => {
                 let window = match owner.result_window_alias() {
                     Some(window) => window,

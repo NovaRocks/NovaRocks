@@ -355,7 +355,9 @@ impl State {
             .as_ref()
             .expect("catalog business result received");
         Poll::Ready(match outcome {
-            Ok(()) => Ok(StatementActionValue::Ok),
+            Ok(()) => Ok(StatementActionValue::Ok(
+                novarocks_query_application::session_control::StatementCommandCompletion::new(0),
+            )),
             Err(error) => Err(QueryServiceError::from_failure_cause(
                 SharedFailureCause::new(error.clone()),
             )),

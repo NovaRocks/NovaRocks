@@ -37,14 +37,14 @@ use crate::exec::fragment::program::FragmentSinkKind;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_writer::TableWriterRuntimeBinding;
 use crate::exec::operators::ResultBufferSinkFactory;
-use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation;
+use crate::exec::pipeline::executor::prepare_compiled_program_with_sink_materializer;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::exchange::materialize_compiled_exchange_receivers;
 use crate::runtime::fragment::instance::FragmentInstanceSpec;
 use crate::runtime::fragment::scan::{
     CompiledScanSources, materialize_compiled_scan_bindings, validate_compiled_scan_sources,
 };
-use crate::runtime::fragment::sink::materialize_compiled_sink;
+use crate::runtime::fragment::sink::materialize_compiled_sink_for_pipeline;
 
 /// One Task's write capabilities for its compiled program: one bound write
 /// capability per compiled TableWriter and one validation authority per
@@ -154,6 +154,43 @@ impl CompiledWriterBindings {
                 FragmentBindingErrorKind::InvalidAssignment,
                 "Task finish bindings do not cover exactly the program's table finishes",
             ));
+        }
+        for (id, binding) in &self.finishers {
+            let ProgramNodeKind::TableFinish {
+                inputs,
+                input_roles,
+                count_mode,
+                ..
+            } = program.graph().nodes()[id.index()].kind()
+            else {
+                unreachable!("finish binding set was checked above");
+            };
+            let receiver = input_roles
+                .logical_summary
+                .and_then(|ordinal| inputs.get(ordinal as usize))
+                .and_then(|input| program.exchange_inputs().get(input));
+            let valid =
+                match (count_mode, receiver, &binding.logical_summary) {
+                    (
+                        novarocks_local_program::FinishCountMode::LogicalChanges,
+                        Some(receiver),
+                        Some(bound),
+                    ) => !bound.sources.is_empty()
+                        && receiver.role
+                            == novarocks_local_program::ProgramOutputRole::LogicalSummary
+                        && receiver.delivery
+                            == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+                        && i32::try_from(receiver.receiver_node).ok() == Some(bound.receiver_node),
+                    (novarocks_local_program::FinishCountMode::LogicalChanges, _, _) => false,
+                    (_, None, None) => true,
+                    _ => false,
+                };
+            if !valid {
+                return Err(crate::exec::fragment::error::program_binding_failure(
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    "Task finish summary binding differs from its exact input role",
+                ));
+            }
         }
         for (node, binding) in &self.writers {
             let recipe = &program.write_recipes()[node];
@@ -269,11 +306,7 @@ pub fn compiled_sink_kind(
             Ok(FragmentSinkKind::MultiCastDataStream)
         }
         Some(StaticSinkProgram::SplitDataStream { .. }) => Ok(FragmentSinkKind::SplitDataStream),
-        Some(StaticSinkProgram::ChangeStreamRouter { .. }) => Err(FragmentBindingError::new(
-            FragmentBindingTarget::Sink,
-            FragmentBindingErrorKind::InvalidAssignment,
-            "compiled change-stream router runtime is not installed",
-        )),
+        Some(StaticSinkProgram::ChangeStreamRouter { .. }) => Ok(FragmentSinkKind::SplitDataStream),
         None => Err(FragmentBindingError::new(
             FragmentBindingTarget::Sink,
             FragmentBindingErrorKind::MissingAssignment,
@@ -492,37 +525,33 @@ fn prepare_compiled_fragment_in(
             }
             _ => None,
         };
-        let sink = materialize_compiled_sink(
-            program,
-            instance.sink_assignment(),
-            finst_id,
-            Arc::clone(&context.exchange_transmitter),
-            result_sink,
-            context.edge_gates.clone(),
-        )?;
         let scan_bindings =
             materialize_compiled_scan_bindings(program, &submission.scans, instance)?;
-        prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
+        prepare_compiled_program_with_sink_materializer(
             Arc::clone(program),
             Duration::from_millis(50),
-            sink,
+            |actual_root_dop| {
+                materialize_compiled_sink_for_pipeline(
+                    program,
+                    instance.sink_assignment(),
+                    finst_id,
+                    Arc::clone(&context.exchange_transmitter),
+                    result_sink,
+                    context.edge_gates.clone(),
+                    actual_root_dop,
+                    runtime_state.mem_tracker(),
+                )
+            },
             receivers.bindings,
             scan_bindings,
             writers,
             Some((finst_id.high(), finst_id.low())),
             context.profiler.clone(),
             pipeline_dop,
-            runtime_state,
+            Arc::clone(&runtime_state),
             Arc::clone(&context.event_sink),
             schema_preparation,
         )
-        .map_err(|error| {
-            FragmentLaunchError::from_failure(
-                FragmentLaunchStage::BuildPipelines,
-                FragmentLaunchErrorKind::PipelineBuild,
-                error,
-            )
-        })
     })();
     match prepare_result {
         Ok(prepared) => Ok(DormantFragmentHandle {
@@ -533,6 +562,7 @@ fn prepare_compiled_fragment_in(
             profiler: context.profiler.clone(),
             mem_tracker: context.mem_tracker.clone(),
             start_failure: context.start_failure(),
+            success_validator: None,
         }),
         Err(error) => Err(error.with_cleanup_diagnostics(resources.rollback())),
     }

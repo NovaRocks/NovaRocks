@@ -26,7 +26,9 @@ use crate::mv::domain::rewrite::analysis::{MvRewriteAnalysisInput, freeze_rewrit
 use crate::mv::domain::rewrite::context::{
     IcebergMvRewriteContext, MvRewriteAnalysisFacts, MvRewriteSourceSnapshot,
 };
-use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
+use crate::mv::domain::storage_observation::{
+    MvSchemaValidationObservation, MvSourceSchemaObservation,
+};
 use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 use novarocks_mv_application::persistence::{
     keyed_documents::StoredKeyedMvProjection, runtime_bindings::MvExactTargetSchemaFacts,
@@ -34,7 +36,7 @@ use novarocks_mv_application::persistence::{
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorChangeWindowAdmission, ConnectorControlRegistry, ConnectorExactSemanticRevision,
-    ConnectorReadSelector, ConnectorRequestContext, ConnectorScanAdmission,
+    ConnectorRequestContext,
 };
 use novarocks_sql::planning::mv::SqlMvAggregateCalls;
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
@@ -210,9 +212,10 @@ pub(crate) async fn rewrite_history_sources_original(
     Ok(result)
 }
 
-pub(crate) async fn observe_and_admit_change_window_for_table_original(
+/// Project policy and source schema from the one completed Root preparation.
+/// This function cannot start catalog or endpoint discovery.
+pub(crate) fn project_prepared_change_window_for_table_original(
     io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
-    connector_control: &dyn ConnectorControlRegistry,
     storage_observation: &dyn MvStorageObservationPort,
     table: &TableIdentity,
     from_revision: &ConnectorExactSemanticRevision,
@@ -220,49 +223,34 @@ pub(crate) async fn observe_and_admit_change_window_for_table_original(
     to_snapshot_id: i64,
     connector_context: &ConnectorRequestContext,
 ) -> Result<
-    (
-        ConnectorChangeWindowAdmission,
-        MvSchemaValidationObservation,
-    ),
+    (ConnectorChangeWindowAdmission, MvSourceSchemaObservation),
     crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
 > {
     use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError;
-    let (lease, metadata) = io
-        .table_metadata(connector_control, table, connector_context)
-        .await?;
-    let provider = lease.binding().metadata();
-    let to_revision =
-        provider.exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)?;
-    let window = provider.change_window_from_exact_revisions(
-        &metadata.table,
-        from_revision,
-        &to_revision,
-    )?;
-    if window.from_exclusive() != from_snapshot_id || window.to_inclusive() != to_snapshot_id {
-        return Err(PreparationError::user(format!(
-            "MV change-window revision and frozen numeric pin disagree for {}",
-            table.fqn()
-        )));
+    let captured = io.captured_sources().require(table)?;
+    if captured.snapshot != Some(to_snapshot_id) {
+        return Err("MV window To differs from its original pin".into());
     }
-    let scan = io
-        .change_window(
-            &lease,
-            &metadata.table,
-            Arc::new(metadata.schema().clone()),
-            connector_context.clone(),
-            window,
+    let from = from_revision.canonical_read_point();
+    if from
+        != Some(
+            novarocks_spi::connector::ConnectorCanonicalReadPoint::Snapshot(Some(from_snapshot_id)),
         )
-        .await?;
-    let ConnectorScanAdmission::ChangeWindow(admission) = scan.admission() else {
-        return Err(PreparationError::user(
-            "connector returned a snapshot admission for a change-window scan",
-        ));
-    };
-    let observation = crate::mv::domain::storage_observation::observe_schema_validation(
+    {
+        return Err("MV window From differs from its exact revision".into());
+    }
+    let prepared = captured.receipt(Some(from_revision)).ok_or_else(|| {
+        PreparationError::user("MV change window has no completed original typed preparation")
+    })?;
+    let admission = prepared
+        .admission()
+        .ok_or("MV change-window source has no lineage admission")?
+        .clone();
+    let observation = crate::mv::domain::storage_observation::observe_source_schema(
         storage_observation,
-        &lease,
-        &metadata,
+        &captured.lease,
+        prepared.to_metadata(),
         connector_context.clone(),
     )?;
-    Ok((admission.clone(), observation))
+    Ok((admission, observation))
 }

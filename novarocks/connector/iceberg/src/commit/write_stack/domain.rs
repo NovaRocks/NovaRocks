@@ -226,6 +226,17 @@ impl IcebergWriteFlavor {
         }
     }
 
+    /// These row deltas can change table state only through produced artifacts.
+    /// COW is excluded: removing frozen input files may legitimately produce none.
+    pub(crate) const fn is_artifact_row_delta(self) -> bool {
+        matches!(
+            self,
+            Self::RowMutationPositionDelete
+                | Self::RowMutationDeletionVector
+                | Self::EqualityDelete
+        )
+    }
+
     /// Whether this flavor is one of the two distributed rewrites.
     ///
     /// The two share every session-level rule but their branch set: both freeze
@@ -2293,14 +2304,13 @@ impl IcebergCommitHandle {
 
     /// What an empty prepared write set means for this session.
     ///
-    /// Two sessions terminate without any external commit: a managed
-    /// publication whose caller declared `AbortWithoutExternalCommit`, and a
-    /// distributed rewrite that found nothing to rewrite. Neither is a failure,
-    /// and neither is derivable from "there were no fragments" alone — the
-    /// first depends on a disposition only the publication carries, and the
-    /// second differs from a zero-row `INSERT`, which still publishes.
+    /// Artifact-only row deltas with zero logical actions, distributed rewrites
+    /// with no input, and managed publications explicitly declaring abort can
+    /// finish without publishing. COW/overwrite may remove frozen old data even
+    /// when they produce no artifact; zero-row append still publishes. A managed
+    /// publication's own declared disposition remains authoritative.
     pub fn empty_write_decision(&self) -> IcebergEmptyWriteDecision {
-        if self.flavor.is_distributed_rewrite() {
+        if self.flavor.is_distributed_rewrite() || self.flavor.is_artifact_row_delta() {
             return IcebergEmptyWriteDecision::SkipExternalCommit;
         }
         let disposition = self
@@ -2592,6 +2602,47 @@ impl IcebergCommitHandle {
             }
             _ => R::Retained,
         }
+    }
+
+    /// Settle the same unstarted session without an external commit. This
+    /// Active claim shares the state mutex with commit and release claims.
+    pub(crate) fn settle_empty_noop(
+        &self,
+        needed: Arc<novarocks_spi::connector::write_stack::ConnectorWriteNeededReady>,
+    ) -> Result<(), ConnectorError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| corrupt("Iceberg write session state lock is poisoned"))?;
+        if !matches!(&*state, IcebergWriteSessionState::Active) {
+            return Err(invalid(
+                "Iceberg empty write requires its original active session",
+            ));
+        }
+        // There is no fallible or asynchronous work after the original claim.
+        // A refused call above leaves all original cleanup and terminal facts.
+        self.record_empty_cleanup_disposed();
+        *state = IcebergWriteSessionState::KnownCommitted { needed };
+        Ok(())
+    }
+
+    /// Observe the original release verdict while atomically claiming Active.
+    /// Returning Active proves this call changed it to KnownUncommitted under
+    /// the same lock; the caller must only project that already-chosen fact.
+    /// Every other state is borrowed unchanged, including the same needed Arc.
+    pub(crate) fn claim_release_state(&self) -> Result<IcebergWriteSessionState, ConnectorError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| corrupt("Iceberg write session state lock is poisoned"))?;
+        let observed = state.clone();
+        if matches!(&*state, IcebergWriteSessionState::Active) {
+            *state = IcebergWriteSessionState::KnownUncommitted {
+                message: "Iceberg write session was released before any external commit"
+                    .to_string(),
+            };
+        }
+        Ok(observed)
     }
 
     /// Claim the single commit attempt this session allows.

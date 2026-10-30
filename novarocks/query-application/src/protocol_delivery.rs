@@ -25,7 +25,7 @@ use crate::cancellation::QueryCancellationView;
 use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
 use crate::session_control::{
     GovernedQueryStatementOwner, GovernedStatementFinishOutcome,
-    GovernedStatementVisibilitySealOutcome, StatementToken,
+    GovernedStatementVisibilitySealOutcome, StatementCommandCompletion, StatementToken,
 };
 use crate::session_error::QueryServiceError;
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
@@ -410,13 +410,18 @@ impl GovernedImmediateStatementResult {
 /// terminal protocol OK packet.
 #[must_use = "the governed completion must be settled by its protocol owner"]
 pub struct GovernedCompletionStatementResult {
+    completion: StatementCommandCompletion,
     protocol: GovernedProtocolOwner,
     effects: crate::session_effects::SessionEffects,
 }
 
 impl GovernedCompletionStatementResult {
-    pub fn new(statement: GovernedQueryStatementOwner) -> Self {
+    pub fn new(
+        completion: StatementCommandCompletion,
+        statement: GovernedQueryStatementOwner,
+    ) -> Self {
         Self {
+            completion,
             protocol: GovernedProtocolOwner::new(statement),
             effects: crate::session_effects::SessionEffects::default(),
         }
@@ -426,6 +431,9 @@ impl GovernedCompletionStatementResult {
         effects: crate::session_effects::SessionEffects,
     ) -> Self {
         Self {
+            // Session mutations are control statements with no affected rows.
+            // DML completion carries its own explicit logical row count.
+            completion: StatementCommandCompletion::new(0),
             protocol: GovernedProtocolOwner::new(statement),
             effects,
         }
@@ -434,8 +442,8 @@ impl GovernedCompletionStatementResult {
         std::mem::take(&mut self.effects)
     }
 
-    pub fn into_protocol(self) -> GovernedProtocolOwner {
-        self.protocol
+    pub fn into_parts(self) -> (StatementCommandCompletion, GovernedProtocolOwner) {
+        (self.completion, self.protocol)
     }
 }
 

@@ -1352,3 +1352,5 @@ fn compiled_stream_materialization_keeps_its_exact_edge_gate() {
         assert_eq!(factory.create(1, 0).name(), expected);
     }
 }
+
+include!("compiled_router_runtime_tests.rs");

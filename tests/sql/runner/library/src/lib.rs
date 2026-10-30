@@ -7383,6 +7383,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
 /// those foreign MV references and refuses cleanup. Such a suite gets its own
 /// REST Catalog so its outcome does not depend on other worktrees.
 const ISOLATED_REST_CATALOG_SUITES: &[&str] = &[
+    "materialized-view",
     "iceberg-ivm",
     "iceberg-mv-apply",
     "iceberg-mv-scheduler",
@@ -10119,21 +10120,23 @@ oss_sk = "private-secret"
 
     #[test]
     fn an_ordinary_suite_never_silently_gets_the_isolated_catalog() {
-        let result = super::start_isolated_rest_catalog(
-            &[
-                "mv-storage-contract".to_string(),
-                "iceberg-compatibility".to_string(),
-            ],
-            &test_fixture_budget(),
-        );
-        let error = match result {
-            Ok(_) => panic!("a shared-environment suite must not be redirected silently"),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().contains("cannot share this run"),
-            "{error}"
-        );
+        for isolated_suite in ["mv-storage-contract", "materialized-view"] {
+            let result = super::start_isolated_rest_catalog(
+                &[
+                    isolated_suite.to_string(),
+                    "iceberg-compatibility".to_string(),
+                ],
+                &test_fixture_budget(),
+            );
+            let error = match result {
+                Ok(_) => panic!("a shared-environment suite must not be redirected silently"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("cannot share this run"),
+                "{isolated_suite}: {error}"
+            );
+        }
     }
 
     #[test]

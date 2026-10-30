@@ -133,6 +133,11 @@ impl MvRefreshPreparationOriginal {
             io,
         })
     }
+    #[cfg(test)]
+    pub(crate) fn original_io_for_test(&self) -> &Arc<MvRefreshPreparationIo> {
+        &self.io
+    }
+
     pub(crate) fn is_for_io(&self, io: &Arc<MvRefreshPreparationIo>) -> bool {
         Arc::ptr_eq(&self.io, io)
     }

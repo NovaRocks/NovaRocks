@@ -168,6 +168,7 @@ fn frozen_fragment(
         [target] => Some((
             target.target_fragment_id(),
             target.target_exchange_node_id(),
+            target.delivery(),
         )),
         _ => None,
     };
@@ -194,7 +195,11 @@ fn edge_sink(
         .iter()
         .filter(|edge| edge.source_fragment_id == fragment_id)
         .map(|edge| {
-            StaticSinkTarget::for_test(edge.target_fragment_id, edge.target_exchange_node_id)
+            StaticSinkTarget::for_test(
+                edge.target_fragment_id,
+                edge.target_exchange_node_id,
+                edge.delivery,
+            )
         })
         .collect()
 }
@@ -202,7 +207,13 @@ fn edge_sink(
 fn multicast_sink(targets: [(FragmentId, i32); 2]) -> Vec<StaticSinkTarget> {
     targets
         .into_iter()
-        .map(|(fragment, node)| StaticSinkTarget::for_test(fragment, node))
+        .map(|(fragment, node)| {
+            StaticSinkTarget::for_test(
+                fragment,
+                node,
+                novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+            )
+        })
         .collect()
 }
 
@@ -3850,6 +3861,505 @@ fn a_union_node_counts_every_producer_of_every_edge_that_feeds_it() {
 // ---------------------------------------------------------------------------
 // Stage state and cancellation
 // ---------------------------------------------------------------------------
+
+// Demand release is only a read-side optimization. These witnesses drive the
+// original QueryTaskExecution/TaskRound owners and inspect their actual wire
+// intents, including work that was not yet Created when drain was requested.
+fn delivery_chain_harness(
+    delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
+) -> Harness {
+    let schedule = chain_schedule(&[0], &[1]);
+    let mut edges = chain_edges();
+    for edge in &mut edges {
+        edge.delivery = delivery;
+    }
+    Harness::from_graph(
+        build_graph(&schedule, &edges, &backends(2), 512)
+            .expect("the delivery contract forms the original chain"),
+    )
+}
+
+/// The original required-input chain with a real Finished root status and
+/// nonterminal strict upstream Tasks. Callers install their original source
+/// pump before requesting normal convergence.
+pub(crate) fn strict_split_failure_convergence_round_fixture() -> (
+    TaskRoundForTest,
+    crate::task_execution::status_intake::StatusIntakeHandle,
+    crate::native::task_transport::TaskAckIntakeHandle,
+) {
+    let (mut round, status, acks, creates) = round_waiting_on_creates(delivery_chain_harness(
+        novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain,
+    ));
+    for create in &creates {
+        acks.publish(accepted_create_ack(create));
+    }
+    round.turn().unwrap();
+    let root = round.root_task();
+    for (version, state, output) in [
+        (2, TaskState::Running, false),
+        (3, TaskState::Flushing, false),
+        (4, TaskState::Finished, true),
+    ] {
+        status.publish(StatusEvent::Published(Box::new(
+            TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(version).unwrap(),
+                state,
+                None,
+                TaskOutputFacts::new(output),
+            )
+            .unwrap(),
+        )));
+    }
+    round.turn().unwrap();
+    (round, status, acks)
+}
+
+fn assert_no_strict_demand_controls(intents: &[OperationIntent]) {
+    assert!(
+        intents.iter().all(|intent| match intent {
+            OperationIntent::CancelTask(_) => false,
+            OperationIntent::UpdateTask(update) => update.domains().iter().all(|domain| {
+                !matches!(domain, TaskDomainUpdate::CloseExchangeDestination { .. })
+            }),
+            _ => true,
+        }),
+        "strict work cannot acquire a demand Cancel or destination Close: {intents:?}"
+    );
+}
+
+#[test]
+fn strict_producer_and_consumer_keep_unsent_create_when_demand_is_released() {
+    use novarocks_execution_contract::ExchangeDeliveryRequirement::{DemandDriven, MustDrain};
+    for delivery in [DemandDriven, MustDrain] {
+        for stage in [1, 2] {
+            let mut harness = delivery_chain_harness(delivery);
+            let task = harness.stage_tasks(stage)[0];
+            let identity = harness.identity(task);
+            harness
+                .execution
+                .stand_down_task_normally(identity)
+                .unwrap();
+            let released = harness.settle_until_quiet(Duration::from_secs(10));
+            let created = released.iter().any(|intent| {
+                matches!(intent, OperationIntent::CreateTask(create) if create.identity() == identity)
+            });
+            assert_eq!(
+                created,
+                delivery == MustDrain,
+                "{delivery:?}, stage {stage}"
+            );
+            assert_eq!(
+                harness.execution.task(task).unwrap().normally_stood_down(),
+                delivery == DemandDriven
+            );
+            if delivery == MustDrain {
+                assert_no_strict_demand_controls(&released);
+                assert!(harness.execution.task(task).unwrap().installed());
+            }
+        }
+    }
+}
+
+#[test]
+fn strict_consumer_unknown_create_survives_demand_release_and_late_ack_opens_input() {
+    use novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain;
+    let mut harness = delivery_chain_harness(MustDrain);
+    let leaf = harness.identity(harness.stage_tasks(1)[0]);
+    let middle_task = harness.stage_tasks(2)[0];
+    let middle = harness.identity(middle_task);
+    let creates = harness
+        .establish_all(Duration::from_secs(10))
+        .into_iter()
+        .filter(|intent| intent.kind() == OperationKind::CreateTask)
+        .collect::<Vec<_>>();
+    let late = creates
+        .iter()
+        .find(|create| create_identity(create) == middle)
+        .unwrap()
+        .clone();
+    for create in &creates {
+        if create_identity(create) == middle {
+            harness.transport_unknown_ack(create).unwrap();
+        } else {
+            harness
+                .create_ack(create, OperationOutcome::Accepted)
+                .unwrap();
+        }
+    }
+    harness.execution.stand_down_task_normally(middle).unwrap();
+    let before_ack = harness.released();
+    assert_no_strict_demand_controls(&before_ack);
+    assert!(
+        !harness
+            .execution
+            .task(middle_task)
+            .unwrap()
+            .normally_stood_down()
+    );
+    assert!(before_ack.iter().all(|intent| !matches!(intent, OperationIntent::UpdateTask(update)
+        if update.identity() == leaf && update.domains().iter().any(|domain| matches!(domain, TaskDomainUpdate::OpenExchangeEdges { .. })))), "unknown strict destination still needs its real Installed fact");
+    harness
+        .create_ack(&late, OperationOutcome::Accepted)
+        .unwrap();
+    let after_ack = harness.released();
+    assert_no_strict_demand_controls(&after_ack);
+    assert!(after_ack.iter().any(|intent| matches!(intent, OperationIntent::UpdateTask(update)
+        if update.identity() == leaf && update.domains().iter().any(|domain| matches!(domain, TaskDomainUpdate::OpenExchangeEdges { .. })))), "late strict Installed resolves the original opening barrier");
+}
+
+#[test]
+fn strict_normal_drain_request_keeps_create_split_and_late_edge_open_until_terminals() {
+    use novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain;
+    let mut harness = delivery_chain_harness(MustDrain);
+    let leaf = harness.stage_tasks(1)[0];
+    let middle = harness.stage_tasks(2)[0];
+    let root = harness.stage_tasks(3)[0];
+    let leaf_identity = harness.identity(leaf);
+    let middle_identity = harness.identity(middle);
+    harness.sink.refuse(
+        DispatchLane::Create,
+        leaf_identity.backend_process_id(),
+        QueueRefusal::Target,
+    );
+    let first = harness.establish_all(Duration::from_secs(10));
+    let creates = first
+        .into_iter()
+        .filter(|intent| intent.kind() == OperationKind::CreateTask)
+        .collect::<Vec<_>>();
+    // The leaf and root share backend zero: both may be transport-blocked.
+    // Keep every already-released create, including the middle's late ACK.
+    assert!(
+        creates
+            .iter()
+            .any(|intent| create_identity(intent) == middle_identity)
+    );
+    assert!(
+        !creates
+            .iter()
+            .any(|intent| create_identity(intent) == leaf_identity)
+    );
+    harness.execution.begin_normal_drain();
+    assert!(!harness.execution.normal_drain_started());
+    assert!(matches!(
+        harness
+            .execution
+            .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, true))
+            .unwrap(),
+        UpdateAdmission::Preparing | UpdateAdmission::Queued
+    ));
+    harness
+        .sink
+        .admit(DispatchLane::Create, leaf_identity.backend_process_id());
+    let late = harness.released();
+    assert_no_strict_demand_controls(&late);
+    assert!(late.iter().any(|intent| matches!(intent, OperationIntent::CreateTask(create) if create.identity() == leaf_identity)), "the unsent strict producer still gets Created");
+    let mut all_creates = creates;
+    all_creates.extend(
+        late.into_iter()
+            .filter(|intent| intent.kind() == OperationKind::CreateTask),
+    );
+    for create in &all_creates {
+        harness
+            .create_ack(create, OperationOutcome::Accepted)
+            .unwrap();
+    }
+    let continued = harness.settle_until_quiet(Duration::from_secs(10));
+    assert_no_strict_demand_controls(&continued);
+    assert!(continued.iter().any(|intent| matches!(intent, OperationIntent::UpdateTask(update)
+        if update.identity() == leaf_identity && update.domains().iter().any(|domain| matches!(domain, TaskDomainUpdate::SplitAssignment(_))))), "the original split remains deliverable after requesting drain");
+    assert!(continued.iter().any(|intent| matches!(intent, OperationIntent::UpdateTask(update)
+        if update.identity() == leaf_identity && update.domains().iter().any(|domain| matches!(domain, TaskDomainUpdate::OpenExchangeEdges { .. })))), "late strict Installed opens its producer edge");
+    assert!(!harness.execution.normal_drain_started());
+    for task in [root, middle] {
+        for (state, complete) in [
+            (TaskState::Running, false),
+            (TaskState::Flushing, false),
+            (TaskState::Finished, true),
+        ] {
+            harness.publish(task, state, None, complete);
+        }
+    }
+    let still_waiting = harness.released();
+    assert_no_strict_demand_controls(&still_waiting);
+    assert!(
+        !harness.execution.normal_drain_started(),
+        "one live strict endpoint still owes actual Task completion"
+    );
+    assert!(
+        still_waiting
+            .iter()
+            .all(|intent| !matches!(intent, OperationIntent::QuiesceQueryContext(_)))
+    );
+    for (state, complete) in [
+        (TaskState::Running, false),
+        (TaskState::Flushing, false),
+        (TaskState::Finished, true),
+    ] {
+        harness.publish(leaf, state, None, complete);
+    }
+    let closing = harness.released();
+    assert!(harness.execution.normal_drain_started());
+    assert!(
+        closing
+            .iter()
+            .any(|intent| matches!(intent, OperationIntent::QuiesceQueryContext(_))),
+        "ordinary Context closure begins only after all strict endpoints terminate"
+    );
+}
+
+#[test]
+fn task_round_root_seal_keeps_strict_late_installation_and_pumps_alive_until_real_tail() {
+    use crate::task_execution::round::{PumpCloseUnresolved, TurnPump};
+    use novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain;
+    struct ProbePump {
+        drives: Arc<AtomicUsize>,
+        closes: Arc<AtomicUsize>,
+        closed: bool,
+    }
+    impl TurnPump for ProbePump {
+        fn name(&self) -> &'static str {
+            "strict-drain-regression"
+        }
+        fn drive(&mut self, _: &mut QueryTaskExecution) -> Result<usize, TaskExecutionError> {
+            assert!(!self.closed);
+            self.drives.fetch_add(1, Ordering::SeqCst);
+            Ok(1)
+        }
+        fn begin_close(&mut self) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            self.closed = true;
+        }
+        fn close_turn(&mut self) -> Result<usize, TaskExecutionError> {
+            Ok(0)
+        }
+        fn is_closed(&self) -> bool {
+            self.closed
+        }
+        fn take_close_unresolved(&mut self) -> Option<PumpCloseUnresolved> {
+            None
+        }
+    }
+    fn installed_ack(intent: &OperationIntent) -> OperationAcknowledgement {
+        let OperationIntent::CreateTask(create) = intent else {
+            unreachable!();
+        };
+        OperationAcknowledgement::new(
+            intent.operation_id(),
+            OperationKind::CreateTask,
+            OperationOutcome::Accepted,
+            AckPayload::Create(Box::new(CreateTaskReceipt::new(
+                create.identity(),
+                Vec::new(),
+                TaskStatus::created(create.identity()).with_installed(),
+            ))),
+        )
+    }
+    let harness = delivery_chain_harness(MustDrain);
+    let sink = harness.sink.clone();
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    let root = round.root_task();
+    let source = round.take_root_status_source().unwrap();
+    let drives = Arc::new(AtomicUsize::new(0));
+    let closes = Arc::new(AtomicUsize::new(0));
+    round.add_pump(Box::new(ProbePump {
+        drives: drives.clone(),
+        closes: closes.clone(),
+        closed: false,
+    }));
+    let root_create = creates
+        .iter()
+        .find(|create| create_identity(create) == root)
+        .unwrap();
+    acks.publish(installed_ack(root_create));
+    round.turn().unwrap();
+    let mut seal = source.begin_success_seal_request().unwrap();
+    // The original ordered intake applies this control before later statuses.
+    round.turn().unwrap();
+    assert!(matches!(
+        seal.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    for (version, state, complete) in [
+        (2, TaskState::Running, false),
+        (3, TaskState::Flushing, false),
+        (4, TaskState::Finished, true),
+    ] {
+        status.publish(StatusEvent::Published(Box::new(
+            TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(version).unwrap(),
+                state,
+                None,
+                TaskOutputFacts::new(complete),
+            )
+            .unwrap()
+            .with_installed(),
+        )));
+        round.turn().unwrap();
+    }
+    assert_eq!(seal.try_recv().unwrap(), Ok(()));
+    assert!(round.accepted_root_success_sealed());
+    assert!(!round.execution().normal_drain_started());
+    assert!(!round.attempt_drained());
+    assert_eq!(
+        closes.load(Ordering::SeqCst),
+        0,
+        "root result demand cannot close strict input owners"
+    );
+    let after_seal_drives = drives.load(Ordering::SeqCst);
+    let mut released = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .collect::<Vec<_>>();
+    for create in creates
+        .iter()
+        .filter(|create| create_identity(create) != root)
+    {
+        acks.publish(installed_ack(create));
+        round.turn().unwrap();
+        released.extend(
+            sink.take()
+                .into_iter()
+                .flat_map(|(_, operations)| operations),
+        );
+    }
+    assert_no_strict_demand_controls(&released);
+    assert!(released.iter().any(|intent| matches!(intent, OperationIntent::UpdateTask(update)
+        if update.domains().iter().any(|domain| matches!(domain, TaskDomainUpdate::OpenExchangeEdges { .. })))), "late strict Create ACK still authors real Open after root seal");
+    assert!(drives.load(Ordering::SeqCst) > after_seal_drives);
+    assert_eq!(closes.load(Ordering::SeqCst), 0);
+    for intent in &released {
+        if let OperationIntent::UpdateTask(update) = intent {
+            acks.publish(OperationAcknowledgement::new(
+                intent.operation_id(),
+                OperationKind::UpdateTask,
+                OperationOutcome::Accepted,
+                AckPayload::Update(UpdateTaskReceipt::new(
+                    update.identity(),
+                    update.domains().iter().map(task_domain_receipt).collect(),
+                )),
+            ));
+        }
+    }
+    for create in creates
+        .iter()
+        .filter(|create| create_identity(create) != root)
+    {
+        for (version, state, complete) in [
+            (2, TaskState::Running, false),
+            (3, TaskState::Flushing, false),
+            (4, TaskState::Finished, true),
+        ] {
+            status.publish(StatusEvent::Published(Box::new(
+                TaskStatus::try_new(
+                    create_identity(create),
+                    TaskStatusVersion::new(version).unwrap(),
+                    state,
+                    None,
+                    TaskOutputFacts::new(complete),
+                )
+                .unwrap()
+                .with_installed(),
+            )));
+            round.turn().unwrap();
+        }
+    }
+    round.turn().unwrap();
+    assert!(round.execution().normal_drain_started());
+    assert_eq!(
+        closes.load(Ordering::SeqCst),
+        1,
+        "the original pump closes exactly once after the required Task tail"
+    );
+    assert!(round.failure_cause().is_none());
+    assert!(
+        round.accepted_root_success_sealed(),
+        "finishing strict obligations does not replace the accepted root cut"
+    );
+}
+
+#[test]
+fn mixed_strict_input_ordinary_output_never_bypasses_the_task_stand_down_guard() {
+    use novarocks_execution_contract::ExchangeDeliveryRequirement::{DemandDriven, MustDrain};
+    for incoming in [DemandDriven, MustDrain] {
+        let schedule = chain_schedule(&[0], &[1]);
+        let mut edges = chain_edges();
+        edges[0].delivery = incoming;
+        edges[1].delivery = DemandDriven;
+        let graph = build_graph(&schedule, &edges, &backends(2), 512).unwrap();
+        let mut harness = Harness::from_graph(graph);
+        harness.settle_until_quiet(Duration::from_secs(10));
+        let middle_task = harness.stage_tasks(2)[0];
+        let middle = harness.identity(middle_task);
+        let root = harness.stage_tasks(3)[0];
+        for task in [harness.stage_tasks(1)[0], middle_task, root] {
+            harness.publish(task, TaskState::Running, None, false);
+        }
+        // The parent release travels through the real stage reducer. The
+        // middle's outgoing edge is ordinary, but it still owns its strict
+        // incoming obligation; a second bulk Cancel author must not undo the
+        // exact stand_down_task_normally decision.
+        harness.publish(root, TaskState::Flushing, None, false);
+        let released = harness.released();
+        let cancels_middle = released
+            .iter()
+            .filter(|intent| {
+                matches!(intent, OperationIntent::CancelTask(cancel)
+                if cancel.identity() == middle
+                    && cancel.reason() == CancelReason::UpstreamNoLongerNeeded)
+            })
+            .count();
+        assert_eq!(
+            cancels_middle,
+            usize::from(incoming == DemandDriven),
+            "{incoming:?}"
+        );
+        assert_eq!(
+            harness
+                .execution
+                .task(middle_task)
+                .unwrap()
+                .normally_stood_down(),
+            incoming == DemandDriven
+        );
+        assert_eq!(
+            harness
+                .execution
+                .task(middle_task)
+                .unwrap()
+                .cancel_requested(),
+            incoming == DemandDriven
+        );
+        if incoming == MustDrain {
+            assert_eq!(
+                harness.execution.task(middle_task).unwrap().task_state(),
+                TaskState::Running
+            );
+            assert!(
+                released.iter().all(
+                    |intent| !matches!(intent, OperationIntent::UpdateTask(update)
+                if update.domains().iter().any(|domain| matches!(domain,
+                    TaskDomainUpdate::CloseExchangeDestination { destination, .. }
+                    if *destination == middle)))
+                ),
+                "a parent release cannot withdraw the middle's required input"
+            );
+            harness.publish(root, TaskState::Finished, None, true);
+            let finished_root = harness.released();
+            assert!(finished_root.iter().all(|intent| !matches!(intent, OperationIntent::CancelTask(cancel) if cancel.identity() == middle)));
+            assert!(
+                !harness
+                    .execution
+                    .task(middle_task)
+                    .unwrap()
+                    .cancel_requested()
+            );
+            assert!(harness.execution.failure_cause().is_none());
+        }
+    }
+}
 
 #[test]
 fn one_finished_task_does_not_make_its_stage_flush_or_cancel_its_children() {
@@ -8086,6 +8596,77 @@ impl ManifestReleaseTail {
             .expect("the original status owner accepts writer success");
     }
 
+    #[cfg(novarocks_dev_controls)]
+    fn exact_upstream_fragment_task(
+        &self,
+        round: &TaskRoundForTest,
+        fragment: FragmentId,
+    ) -> TaskIdentity {
+        let mut tasks = round
+            .execution()
+            .graph()
+            .tasks()
+            .filter(|task| task.fragment_id() == fragment)
+            .map(|task| task.identity())
+            .filter(|identity| self.upstream.contains(identity));
+        let task = tasks
+            .next()
+            .expect("the original fixture has this upstream role");
+        assert!(
+            tasks.next().is_none(),
+            "this fixture declares one Task per role"
+        );
+        task
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    fn publish_original_fragment_success(
+        &self,
+        round: &mut TaskRoundForTest,
+        fragment: FragmentId,
+    ) {
+        let identity = self.exact_upstream_fragment_task(round, fragment);
+        self.status.publish(StatusEvent::Published(Box::new(
+            TaskStatus::try_new(
+                identity,
+                TaskStatusVersion::new(3).unwrap(),
+                TaskState::Finished,
+                None,
+                TaskOutputFacts::new(true),
+            )
+            .unwrap(),
+        )));
+        round
+            .turn()
+            .expect("the original status owner accepts this exact role terminal");
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn publish_original_distinct_writer_success(&self, round: &mut TaskRoundForTest) {
+        self.publish_original_fragment_success(round, MIDDLE_FRAGMENT);
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn publish_original_summary_success(&self, round: &mut TaskRoundForTest) {
+        self.publish_original_fragment_success(round, LEAF_FRAGMENT);
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn publish_original_summary_failure(
+        &self,
+        round: &mut TaskRoundForTest,
+        failure: novarocks_execution_contract::TaskFailure,
+    ) -> novarocks_coordination_contract::SelectedTaskTermination {
+        let identity = self.exact_upstream_fragment_task(round, LEAF_FRAGMENT);
+        let selected = self.publish_original_failure_for_identity(round, identity, failure);
+        assert_eq!(
+            selected.identity(),
+            identity,
+            "the original summary Task authors its failure"
+        );
+        selected
+    }
+
     /// Invoke the original convergence author after the actual cut or failure.
     pub(crate) fn begin_original_convergence(
         &self,
@@ -8110,7 +8691,15 @@ impl ManifestReleaseTail {
         round: &mut TaskRoundForTest,
         failure: novarocks_execution_contract::TaskFailure,
     ) -> novarocks_coordination_contract::SelectedTaskTermination {
-        let identity = self.upstream[0];
+        self.publish_original_failure_for_identity(round, self.upstream[0], failure)
+    }
+
+    fn publish_original_failure_for_identity(
+        &self,
+        round: &mut TaskRoundForTest,
+        identity: TaskIdentity,
+        failure: novarocks_execution_contract::TaskFailure,
+    ) -> novarocks_coordination_contract::SelectedTaskTermination {
         self.status.publish(StatusEvent::Published(Box::new(
             TaskStatus::try_new(
                 identity,
@@ -8351,6 +8940,24 @@ pub(crate) fn manifest_pending_write_with_protocol_fixture(
         manifest_protocol_harness(execution),
         Some(plan),
         true,
+        false,
+    );
+    (round, acks, tail, clock, protocol.unwrap(), facts)
+}
+
+/// The original three-stage Task graph with disjoint roles: its leaf is
+/// the summary source, the middle Task is the writer, and the root is finish.
+/// This is a completion-owner fixture, not a Router runtime capability claim.
+#[cfg(novarocks_dev_controls)]
+pub(crate) fn manifest_pending_write_with_summary_source_protocol_fixture(
+    execution: QueryExecutionId,
+    plan: novarocks_query_application::api::PlanSeal,
+) -> ManifestFixture<ManifestReleaseTail, super::protocol_facts::AttemptProtocolFactsReceiver> {
+    let (round, acks, tail, clock, protocol, facts) = manifest_pending_release_fixture_with_writers(
+        manifest_protocol_harness(execution),
+        Some(plan),
+        true,
+        true,
     );
     (round, acks, tail, clock, protocol.unwrap(), facts)
 }
@@ -8360,13 +8967,14 @@ fn manifest_pending_release_fixture(
     plan: Option<novarocks_query_application::api::PlanSeal>,
 ) -> ManifestFixture<ManifestReleaseTail, Option<super::protocol_facts::AttemptProtocolFactsReceiver>>
 {
-    manifest_pending_release_fixture_with_writers(harness, plan, false)
+    manifest_pending_release_fixture_with_writers(harness, plan, false, false)
 }
 
 fn manifest_pending_release_fixture_with_writers(
     harness: Harness,
     plan: Option<novarocks_query_application::api::PlanSeal>,
     declare_upstream_writers: bool,
+    declare_independent_summary_source: bool,
 ) -> ManifestFixture<ManifestReleaseTail, Option<super::protocol_facts::AttemptProtocolFactsReceiver>>
 {
     let sink = Arc::clone(&harness.sink);
@@ -8383,7 +8991,10 @@ fn manifest_pending_release_fixture_with_writers(
             .graph()
             .tasks()
             .filter(|task| task.identity() != round.root_task())
-            .map(|task| task.fragment_id())
+            .filter(|task| {
+                !declare_independent_summary_source || task.fragment_id() == MIDDLE_FRAGMENT
+            })
+            .map(|task| task.identity())
             .collect::<BTreeSet<_>>()
     } else {
         BTreeSet::new()
@@ -8391,9 +9002,29 @@ fn manifest_pending_release_fixture_with_writers(
     if declare_upstream_writers {
         assert!(!writers.is_empty());
     }
+    let summary_sources = if declare_independent_summary_source {
+        assert!(declare_upstream_writers);
+        let sources = round
+            .execution()
+            .graph()
+            .tasks()
+            .filter(|task| task.fragment_id() == LEAF_FRAGMENT)
+            .map(|task| task.identity())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            sources.len(),
+            1,
+            "this exact fixture has one independent summary source"
+        );
+        assert_eq!(writers.len(), 1, "this exact fixture has one writer");
+        assert!(sources.is_disjoint(&writers));
+        sources
+    } else {
+        BTreeSet::new()
+    };
     let protocol = plan.map(|plan| {
         round
-            .install_protocol_facts(plan, &writers)
+            .install_protocol_facts(plan, &writers, &summary_sources)
             .expect("original protocol before root transfer")
     });
     let _root_source = round

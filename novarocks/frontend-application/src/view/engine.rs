@@ -55,6 +55,14 @@ pub(super) struct EmptyViewService;
 
 #[cfg(test)]
 impl ViewService for EmptyViewService {
+    fn prepare_show_views(
+        &self,
+        _statement: &novarocks_parser::ast::ShowViews,
+        _context: ViewRequestContext<'_>,
+    ) -> Result<novarocks_query_application::view::PreparedShowViews, String> {
+        Err("view service is not injected".to_string())
+    }
+
     fn execute_statement(
         &self,
         _engine: &dyn ViewEngine,
@@ -378,44 +386,6 @@ impl ViewEngine for FrontendViewEngine {
         }
     }
 
-    fn list_external_views(
-        &self,
-        catalog: &str,
-        database: &str,
-        context: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, String> {
-        let lease =
-            crate::connector::acquire_metadata_planning_lease(self.connector_control(), catalog)?;
-        let binding = lease.binding();
-        let Some(capability) = binding.view_metadata() else {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "connector control generation does not declare view metadata",
-            )
-            .to_string());
-        };
-        let instance_id = binding.descriptor().instance_id.clone();
-        capability
-            .list_views(novarocks_spi::connector::ConnectorListViewsRequest {
-                namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
-                    instance_id,
-                    namespace: Arc::from(database),
-                },
-                bound: novarocks_spi::connector::ConnectorListingBound::V1,
-                context: context.clone(),
-            })
-            .map(|views| {
-                let mut names = views
-                    .into_iter()
-                    .map(|view| view.view.to_string())
-                    .collect::<Vec<_>>();
-                names.sort();
-                names.dedup();
-                names
-            })
-            .map_err(|error| error.to_string())
-    }
-
     fn analyze_external_view(
         &self,
         catalog: &str,
@@ -650,15 +620,6 @@ mod tests {
             unreachable!("empty view service must not access the engine")
         }
 
-        fn list_external_views(
-            &self,
-            _catalog: &str,
-            _database: &str,
-            _context: &ConnectorRequestContext,
-        ) -> Result<Vec<String>, String> {
-            unreachable!("empty view service must not access the engine")
-        }
-
         fn analyze_external_view(
             &self,
             _catalog: &str,
@@ -670,29 +631,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn show_views_listing_errors_preserve_connector_error_text() {
-        use crate::catalog_application::statement::external_listing_tests::{
-            FailurePoint, ListingFixture, error_kinds,
-        };
-
-        for kind in error_kinds() {
-            let fixture = ListingFixture::new(FailurePoint::Views, kind);
-            let engine = FrontendViewEngine::new(ViewExecutionKernel::new(
-                Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
-                fixture.catalog_service.clone(),
-                None,
-                fixture.registry.clone(),
-                Arc::new(EmptyViewService),
-                crate::application::test_constant_policy(),
-            ));
-            let result = engine.list_external_views(
-                "catalog",
-                "db",
-                &crate::connector::test_request_context(),
-            );
-            assert_eq!(result.err(), Some(fixture.expected_error()), "{kind:?}");
-            assert_eq!(fixture.calls(), vec!["views"]);
+    #[tokio::test]
+    async fn show_views_listing_errors_preserve_connector_error_text() {
+        for kind in crate::catalog_application::statement::external_listing_tests::error_kinds() {
+            crate::query::view_read_action::tests::assert_listing_error_text(kind).await;
         }
     }
 

@@ -40,6 +40,7 @@ use crate::planner::payload::{AggregateCall, WindowExpr};
 pub(crate) struct ImvRewriteInput<'a> {
     pub plan: LogicalPlanNode,
     pub snapshot: Arc<SqlImvRewriteSnapshot>,
+    pub target_read: crate::planner::imv_rewrite::annotation::TargetReadRequirement,
     pub disabled_rules: Vec<String>,
     pub decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     pub constant_policy: novarocks_functions::ConstantPolicy,
@@ -62,6 +63,7 @@ pub(crate) fn run_imv_rewrite(
     let ImvRewriteInput {
         mut plan,
         snapshot,
+        target_read,
         disabled_rules,
         decimal_overflow_policy,
         constant_policy,
@@ -71,6 +73,14 @@ pub(crate) fn run_imv_rewrite(
         function_catalog,
     } = input;
 
+    if target_read
+        == crate::planner::imv_rewrite::annotation::TargetReadRequirement::NewOutputRowsOnly
+        && snapshot.schema_contract.aggregate.is_some()
+    {
+        return Err(SqlCompileError::InvalidRequest(
+            "aggregate MV refresh requires existing target rows".into(),
+        ));
+    }
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
         .map_err(crate::compiler::SqlCompileError::from)?;
     // These boundary helpers still own opaque internal traversals. The stage
@@ -96,7 +106,10 @@ pub(crate) fn run_imv_rewrite(
     ctx_rw.set_function_catalog(function_catalog);
     ctx_rw.set_extension::<ImvExtension>(ImvExtension {
         snapshot,
-        annotation: ImvPlanAnnotation::default(),
+        annotation: ImvPlanAnnotation {
+            target_read,
+            ..ImvPlanAnnotation::default()
+        },
     });
 
     // Boundary materialization for ImvRewriteInput: engine-side refresh code
@@ -118,6 +131,9 @@ pub(crate) fn run_imv_rewrite(
     // optimizer still consume LogicalPlanNode. This is the optimizer-to-engine
     // exit, not an internal optimizer rewrite round-trip.
     let plan_out = to_logical_plan(opt_out, &scalars.borrow());
+    // This is an IMV input contract, not an optional optimization rule.
+    // Aggregate roots may omit their sign, but each Delta producer may not.
+    crate::planner::imv_rewrite::action_column::validate_delta_producer_scans(&plan_out, control)?;
 
     let ext = ctx_rw
         .extension::<ImvExtension>()
@@ -1186,11 +1202,242 @@ pub(crate) mod tests {
         );
     }
 
+    fn physical_scan_kinds(
+        plan: &crate::planner::physical::PhysicalPlanNode,
+        kinds: &mut Vec<crate::planner::table::SqlScanKind>,
+        joins: &mut usize,
+    ) {
+        use crate::planner::physical::PhysicalPlanKind;
+        if let PhysicalPlanKind::Scan(scan) = &plan.kind {
+            let ScanSource::Sql(source) = &scan.table.source;
+            kinds.push(source.kind.clone());
+        }
+        if matches!(
+            plan.kind,
+            PhysicalPlanKind::HashJoin(_) | PhysicalPlanKind::NestLoopJoin(_)
+        ) {
+            *joins += 1;
+        }
+        for child in &plan.children {
+            physical_scan_kinds(child, kinds, joins);
+        }
+    }
+
+    // Match the admitted projection fixture below: the original Project
+    // propagation author derives the MV apply key from injected source lineage.
+    // A bare scan deliberately does not satisfy that contract.
+    fn projection_scan_plan() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanKind::Project(PlanProjectNode {
+                items: vec![ProjectItem {
+                    expr: column_ref(1, "k", DataType::Int64, false),
+                    output_name: "k".to_string(),
+                    output_column_id: ColumnId(1),
+                }],
+                output_qualifier: None,
+            }),
+            vec![iceberg_scan_plan()],
+            None,
+        )
+    }
+
+    #[test]
+    fn insert_only_rewrite_keeps_null_locator_contract_without_target_data_read() {
+        use crate::planner::imv_rewrite::annotation::TargetReadRequirement;
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: projection_scan_plan(),
+            snapshot: dummy_mv_ctx(),
+            target_read: TargetReadRequirement::NewOutputRowsOnly,
+            disabled_rules: Vec::new(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            column_ref_factory: test_column_ref_factory(),
+        })
+        .unwrap();
+        // This projection is the original target-locator output contract, not
+        // source lineage passed through after merely disabling the join rule.
+        let LogicalPlanKind::Project(project) = &outcome.plan.kind else {
+            panic!("typed new-output locator projection")
+        };
+        let locators = [
+            crate::common::ICEBERG_ROW_ID_COL,
+            crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
+            crate::common::ICEBERG_FILE_PATH_COL,
+            crate::common::ICEBERG_ROW_POS_COL,
+        ];
+        let offset = project
+            .items
+            .iter()
+            .position(|v| v.output_name == locators[0])
+            .unwrap();
+        assert_eq!(
+            project
+                .items
+                .iter()
+                .filter(|item| locators.contains(&item.output_name.as_str()))
+                .count(),
+            4,
+            "source lineage is retired, not emitted beside the target NULL locators"
+        );
+        assert_eq!(
+            project.items.last().unwrap().output_name,
+            crate::planner::imv_rewrite::action_column::ImvActionColumn::NAME
+        );
+        assert_eq!(
+            project.items[offset..offset + 4]
+                .iter()
+                .map(|v| v.output_name.as_str())
+                .collect::<Vec<_>>(),
+            locators
+        );
+        for (i, item) in project.items[offset..offset + 4].iter().enumerate() {
+            assert!(matches!(
+                item.expr.kind,
+                crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Null)
+            ));
+            assert!(item.expr.value_type.nullable());
+            assert_eq!(
+                item.expr.value_type.data_type(),
+                if i == 2 {
+                    &DataType::Utf8
+                } else {
+                    &DataType::Int64
+                }
+            );
+        }
+        let optimized = optimize_logical_for_test(outcome.plan);
+        assert_physical_project_refs_resolve_to_child_outputs(&optimized);
+        let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized).unwrap();
+        let mut kinds = Vec::new();
+        let mut joins = 0;
+        physical_scan_kinds(&physical, &mut kinds, &mut joins);
+        assert!(
+            kinds.iter().any(|k| matches!(k, SqlScanKind::Delta { .. })),
+            "the actual source Delta must remain a physical scan"
+        );
+        assert!(!kinds.iter().any(|k| matches!(
+            k,
+            SqlScanKind::MvTargetLocator { .. } | SqlScanKind::MvTargetState { .. }
+        )));
+        assert_eq!(
+            joins, 0,
+            "a simple append projection needs no physical target join"
+        );
+    }
+
+    #[test]
+    fn insert_only_union_retains_both_occurrence_scans_without_target_data_read() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: top_level_project_filter_union_plan(),
+            snapshot: repeated_source_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::NewOutputRowsOnly,
+            disabled_rules: Vec::new(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            column_ref_factory: test_column_ref_factory(),
+        })
+        .unwrap();
+        let optimized = optimize_logical_for_test(outcome.plan);
+        assert_physical_project_refs_resolve_to_child_outputs(&optimized);
+        let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized).unwrap();
+        let mut kinds = Vec::new();
+        let mut joins = 0;
+        physical_scan_kinds(&physical, &mut kinds, &mut joins);
+        let mut windows = kinds
+            .iter()
+            .filter_map(|kind| match kind {
+                SqlScanKind::Delta {
+                    from_snapshot_id,
+                    to_snapshot_id,
+                    ..
+                } => Some((*from_snapshot_id, *to_snapshot_id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        windows.sort_unstable();
+        assert_eq!(
+            windows.len(),
+            2,
+            "both separately admitted occurrence windows remain physical inputs"
+        );
+        assert_ne!(windows[0], windows[1]);
+        assert!(!kinds.iter().any(|kind| matches!(
+            kind,
+            SqlScanKind::MvTargetLocator { .. } | SqlScanKind::MvTargetState { .. }
+        )));
+        assert_eq!(joins, 0);
+    }
+
+    #[test]
+    fn existing_row_rewrite_keeps_the_actual_target_locator_scan() {
+        use crate::planner::imv_rewrite::annotation::TargetReadRequirement;
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: projection_scan_plan(),
+            snapshot: dummy_mv_ctx(),
+            target_read: TargetReadRequirement::ExistingRows,
+            disabled_rules: Vec::new(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            column_ref_factory: test_column_ref_factory(),
+        })
+        .unwrap();
+        let optimized = optimize_logical_for_test(outcome.plan);
+        let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized).unwrap();
+        let mut kinds = Vec::new();
+        let mut joins = 0;
+        physical_scan_kinds(&physical, &mut kinds, &mut joins);
+        assert!(kinds.iter().any(|k| matches!(k, SqlScanKind::Delta { .. })));
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, SqlScanKind::MvTargetLocator { .. }))
+        );
+        assert!(joins > 0, "a signed retraction must keep old-row lookup");
+    }
+
+    #[test]
+    fn aggregate_rewrite_keeps_existing_target_state_and_rejects_insert_only_intent() {
+        use crate::planner::imv_rewrite::annotation::TargetReadRequirement;
+        let make = |requirement| ImvRewriteInput {
+            plan: aggregate_plan(),
+            snapshot: aggregate_mv_ctx(),
+            target_read: requirement,
+            disabled_rules: Vec::new(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            column_ref_factory: test_column_ref_factory_reserved_until(30),
+        };
+        assert!(matches!(
+            run_imv_rewrite(make(TargetReadRequirement::NewOutputRowsOnly)),
+            Err(SqlCompileError::InvalidRequest(_))
+        ));
+        let outcome = run_imv_rewrite(make(TargetReadRequirement::ExistingRows)).unwrap();
+        let optimized = optimize_logical_for_test(outcome.plan);
+        let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized).unwrap();
+        let mut kinds = Vec::new();
+        let mut joins = 0;
+        physical_scan_kinds(&physical, &mut kinds, &mut joins);
+        assert!(kinds.iter().any(|k| matches!(k, SqlScanKind::Delta { .. })));
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, SqlScanKind::MvTargetState { .. })),
+            "aggregate refresh still reads the old target state"
+        );
+    }
+
     #[test]
     fn repeated_source_union_keeps_non_dense_occurrences_and_separate_windows() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: top_level_project_filter_union_plan(),
             snapshot: repeated_source_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -1259,6 +1506,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: Arc::new(snapshot),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -1883,6 +2132,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             snapshot: dummy_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
 
@@ -1897,6 +2148,114 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn imv_delta_producer_validation_survives_disabled_rewrite_rules() {
+        use crate::planner::imv_rewrite::action_column::ImvActionColumn;
+        let action = ImvActionColumn::output_column(ColumnId(100));
+        let mut wrong = action.clone();
+        wrong.value_type = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
+        let mut nullable = action.clone();
+        nullable.value_type = novarocks_type_contract::FunctionValueType::new(DataType::Int8, true);
+        for (actions, expected) in [
+            (vec![], "missing action column"),
+            (vec![wrong], "non-Int8 action column"),
+            (vec![nullable], "nullable action column"),
+            (
+                vec![action, ImvActionColumn::output_column(ColumnId(101))],
+                "duplicate action columns",
+            ),
+        ] {
+            let mut plan = iceberg_scan_plan();
+            let LogicalPlanKind::Scan(scan) = &mut plan.kind else {
+                unreachable!()
+            };
+            let ScanSource::Sql(source) = &mut scan.table.source;
+            source.kind = SqlScanKind::Delta {
+                from_snapshot_id: 11,
+                to_snapshot_id: 22,
+            };
+            scan.columns.extend(actions);
+            // Deliberately disable both injection and the optional validation
+            // rule. The entrypoint still owns this exact producer contract.
+            let disabled_rules = build_imv_pipeline()
+                .rule_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let error = run_imv_rewrite(ImvRewriteInput {
+                plan,
+                snapshot: dummy_mv_ctx(),
+                target_read:
+                    crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
+                disabled_rules,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                constant_policy: crate::constant::test_constant_policy(),
+                control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                column_ref_factory: test_column_ref_factory(),
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, SqlCompileError::Compilation(message) if message.contains("Delta-bound scan ice.db.b") && message.contains(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn mandatory_imv_delta_leaf_validation_does_not_require_an_aggregate_root_sign() {
+        fn sign_delta_leaf(plan: &mut LogicalPlanNode) {
+            if let LogicalPlanKind::Scan(scan) = &mut plan.kind {
+                let ScanSource::Sql(source) = &mut scan.table.source;
+                source.kind = SqlScanKind::Delta {
+                    from_snapshot_id: 11,
+                    to_snapshot_id: 22,
+                };
+                scan.columns.push(
+                    crate::planner::imv_rewrite::action_column::ImvActionColumn::output_column(
+                        ColumnId(100),
+                    ),
+                );
+                crate::planner::imv_rewrite::action_column::ImvActionColumn::ensure_metadata_column(
+                    &mut scan.table.iceberg_row_lineage_metadata_columns,
+                );
+            }
+            for child in &mut plan.children {
+                sign_delta_leaf(child);
+            }
+        }
+        let mut plan = aggregate_plan();
+        sign_delta_leaf(&mut plan);
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan,
+            snapshot: aggregate_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
+            disabled_rules: build_imv_pipeline()
+                .rule_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            constant_policy: crate::constant::test_constant_policy(),
+            control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            column_ref_factory: test_column_ref_factory(),
+        })
+        .unwrap();
+        let outputs = crate::planner::plan_output_columns(&outcome.plan).unwrap();
+        assert!(outputs.iter().all(|column| {
+            !crate::planner::imv_rewrite::action_column::ImvActionColumn::matches(column)
+        }));
+        let leaf = find_delta_scan(&outcome.plan).unwrap();
+        assert_eq!(
+            leaf.columns
+                .iter()
+                .filter(|column| {
+                    crate::planner::imv_rewrite::action_column::ImvActionColumn::matches(column)
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn annotation_is_default_initialized_in_extension_slot() {
         // Disable WrapRootInImvDelta so the pipeline succeeds and we can
         // inspect the annotation; annotation initialization is independent
@@ -1904,6 +2263,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
 
@@ -1931,6 +2292,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: dummy_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
 
@@ -2055,6 +2418,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["NoSuchRule".to_string(), "WrapRootInImvDelta".to_string()],
 
@@ -2168,6 +2533,8 @@ pub(crate) mod tests {
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2193,6 +2560,8 @@ pub(crate) mod tests {
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2216,6 +2585,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
 
@@ -2234,6 +2605,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             snapshot: empty_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
 
@@ -2276,6 +2649,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             snapshot: dummy_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec![
                 "InjectApplyKeyProject".to_string(),
@@ -2322,6 +2697,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: dummy_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
 
@@ -2361,6 +2738,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: dummy_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
 
@@ -2392,6 +2771,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             snapshot: dummy_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec![
                 "InjectApplyKeyProject".to_string(),
@@ -2451,6 +2832,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: project,
             snapshot: dummy_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2511,6 +2894,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: project,
             snapshot: dummy_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2595,6 +2980,8 @@ pub(crate) mod tests {
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: project,
             snapshot: dummy_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2616,6 +3003,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: top_level_project_filter_union_plan(),
             snapshot: repeated_source_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2695,6 +3084,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
             snapshot: partitioned_aggregate_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2731,6 +3122,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
             snapshot: aggregate_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2766,6 +3159,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
             snapshot: ctx,
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2804,6 +3199,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: project,
             snapshot: dummy_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2820,6 +3217,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
             snapshot: aggregate_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2879,6 +3278,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: join_aggregate_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2924,6 +3325,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: join_aggregate_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -2942,6 +3345,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
             snapshot: join_projection_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
 
@@ -3018,6 +3423,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
             snapshot: join_projection_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
 
@@ -3058,6 +3465,8 @@ pub(crate) mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
             snapshot: join_projection_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
 
@@ -3107,6 +3516,7 @@ crate::constant::test_constant_policy(),
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_plan(),
                     snapshot: join_projection_mv_ctx(),
+                    target_read: crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
                     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
 
@@ -3160,6 +3570,7 @@ crate::constant::test_constant_policy(),
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_filter_plan(),
                     snapshot: join_projection_mv_ctx(),
+                    target_read: crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
                     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
 
@@ -3217,6 +3628,7 @@ crate::constant::test_constant_policy(),
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_left_filter_plan(),
                     snapshot: join_projection_mv_ctx(),
+                    target_read: crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
                     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
 
@@ -3273,6 +3685,8 @@ crate::constant::test_constant_policy(),
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: ctx,
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -3300,6 +3714,8 @@ crate::constant::test_constant_policy(),
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
             snapshot: ctx,
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -3373,6 +3789,8 @@ crate::constant::test_constant_policy(),
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
             snapshot: join_aggregate_mv_ctx(),
+            target_read:
+                crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
 
@@ -3878,6 +4296,98 @@ crate::constant::test_constant_policy(),
     }
 
     #[test]
+    fn wide_imv_delta_producer_keeps_mid_scan_control_and_original_source() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct StopValidateBatch {
+            cause: CompileControlError,
+            batches: std::sync::atomic::AtomicUsize,
+        }
+        impl PureCompileControl for StopValidateBatch {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                if phase == CompilePhase::Validate
+                    && units == novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK
+                {
+                    self.batches
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(self.cause.clone())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let source = CompileControlError::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+        );
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            source,
+        ] {
+            let mut plan = iceberg_scan_plan();
+            let LogicalPlanKind::Scan(scan) = &mut plan.kind else {
+                unreachable!()
+            };
+            let ScanSource::Sql(binding) = &mut scan.table.source;
+            binding.kind = SqlScanKind::Delta {
+                from_snapshot_id: 11,
+                to_snapshot_id: 22,
+            };
+            // These are real ordinary scan declarations, not private actions.
+            // A one-node plan makes the full Validate quantum belong to the
+            // mandatory declaration scan, rather than node or edge traversal.
+            for ordinal in 2..=769u32 {
+                let name = format!("payload_{ordinal}");
+                scan.table.columns.push(ColumnDef {
+                    name: name.clone(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                });
+                scan.columns.push(OutputColumn {
+                    column_id: ColumnId(ordinal),
+                    name,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+                    is_internal: false,
+                });
+            }
+            let control = StopValidateBatch {
+                cause: cause.clone(),
+                batches: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let error = run_imv_rewrite(ImvRewriteInput {
+                plan,
+                snapshot: dummy_mv_ctx(),
+                target_read:
+                    crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
+                disabled_rules: build_imv_pipeline()
+                    .rule_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                constant_policy: crate::constant::test_constant_policy(),
+                control: &control,
+                column_ref_factory: test_column_ref_factory(),
+            })
+            .unwrap_err();
+            assert_eq!(control.batches.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(error, SqlCompileError::from(cause.clone()));
+            if let CompileControlError::Source(expected) = &cause {
+                assert_eq!(error.source_failure(), Some(expected));
+            }
+        }
+    }
+
+    #[test]
     fn imv_rewrite_observes_all_request_stops_before_plain_plan_validation() {
         struct Stop(novarocks_type_contract::CompileControlError);
         impl novarocks_type_contract::PureCompileControl for Stop {
@@ -3900,6 +4410,8 @@ crate::constant::test_constant_policy(),
             let failure = run_imv_rewrite(ImvRewriteInput {
                 plan: empty_values_plan(),
                 snapshot: empty_mv_ctx(),
+                target_read:
+                    crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 disabled_rules: vec![],
 

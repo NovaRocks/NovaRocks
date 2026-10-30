@@ -24,8 +24,8 @@
 //! [`AttemptReady`] can hand the artifacts,
 //! source plan, and sealed credential leases to task-round construction.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::query_execution::artifact::FragmentId;
@@ -200,6 +200,11 @@ trait SerialAttemptInitialization: Send + Sized + 'static {
         outcome: &mut Option<AttemptSourceOpenOutcome<Self::Opened>>,
     ) -> std::task::Poll<()>;
 
+    /// Raw health is separate from a business outcome and never proves exit.
+    fn opening_health(_: &Self::Opening) -> Option<StatementNativeHealthFailure> {
+        None
+    }
+
     fn accept_opened(&mut self, opened: Self::Opened) -> Result<(), DistributedQueryError>;
 
     fn finish_in(&mut self, ready: &mut Option<Self::Ready>) -> Result<(), DistributedQueryError>;
@@ -320,6 +325,9 @@ impl<S: SerialAttemptInitialization> InitializationProgress<S> {
                     }
                 }
             }
+            if S::opening_health(self.opening.as_ref().unwrap()).is_some() {
+                return Err(failed("original source preparation CPU exit is unproven"));
+            }
             // Keep the actual outcome installed through all fallible checks.
             self.lifecycle.check()?;
             let opened = match self.outcome.as_ref().unwrap() {
@@ -354,7 +362,14 @@ impl<S: SerialAttemptInitialization> InitializationProgress<S> {
         if let Some(opening) = &mut self.opening
             && self.outcome.is_none()
         {
-            std::future::poll_fn(|cx| S::poll_open_in(opening, cx, &mut self.outcome)).await;
+            std::future::poll_fn(|cx| {
+                let polled = S::poll_open_in(opening, cx, &mut self.outcome);
+                if let Some(health) = S::opening_health(opening) {
+                    return std::task::Poll::Ready(Err(health));
+                }
+                polled.map(Ok)
+            })
+            .await?;
         }
         if let Some(Err(error)) = &self.outcome {
             return Err(StatementNativeHealthFailure::actual_exit_unproven(
@@ -430,6 +445,10 @@ struct ProductionInitializationState {
     next_scan: usize,
     session: Option<novarocks_spi::connector::read_stack::ConnectorSession>,
     connector_context: ConnectorRequestContext,
+    metadata_preparation:
+        Option<Weak<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>>,
+    cancellation: novarocks_workload_control::CancellationView,
+    runtime: tokio::runtime::Handle,
     feedback: Arc<RuntimeFilterFeedbackState>,
     sources: OpenRoundSplitSources,
     retry_policy: TaskUpdateRetryPolicy,
@@ -443,6 +462,19 @@ struct ProductionSourceRecipe {
     source: RoundSplitSourceRecipe,
     session: novarocks_spi::connector::read_stack::ConnectorSession,
     connector_context: ConnectorRequestContext,
+    metadata_preparation:
+        Option<Weak<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>>,
+    cancellation: novarocks_workload_control::CancellationView,
+    runtime: tokio::runtime::Handle,
+    blocking_io: ConnectorBlockingIoSupervisor,
+}
+
+#[derive(Debug, Default)]
+struct SourcePreparationWake(futures::task::AtomicWaker);
+impl crate::task_execution::status_intake::StatusIntakeWake for SourcePreparationWake {
+    fn wake(&self) {
+        self.0.wake();
+    }
 }
 
 struct ProductionSourceOpening {
@@ -452,6 +484,10 @@ struct ProductionSourceOpening {
     access_result:
         Option<Result<novarocks_spi::connector::ConnectorReadAttemptCapabilities, ConnectorError>>,
     capabilities: Option<novarocks_spi::connector::ConnectorReadAttemptCapabilities>,
+    preparation: Option<novarocks_spi::connector::read_stack::ConnectorReadSplitPreparation>,
+    preparation_wake: Arc<SourcePreparationWake>,
+    raw_health: Option<StatementNativeHealthFailure>,
+    open_owner: Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
     open_future: Option<novarocks_spi::connector::read_stack::ConnectorReadSplitOpenFuture>,
     open_result: Option<
         Result<
@@ -510,24 +546,113 @@ fn poll_original_preparation<T>(
     }
 }
 impl ProductionSourceOpening {
+    fn select_metadata_preparation(&mut self) -> Result<(), ConnectorError> {
+        if self.preparation.is_some() {
+            return Ok(());
+        }
+        let recipe = &self
+            .recipe
+            .as_ref()
+            .expect("same original source recipe")
+            .recipe;
+        if !recipe.source.requires_metadata_split_preparation() {
+            return Ok(());
+        }
+        let original = recipe.metadata_preparation.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "prepared source has no original metadata preparation source",
+            )
+        })?;
+        let io = original.upgrade().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "original metadata source exited before split preparation",
+            )
+        })?;
+        let admission_error = |error| {
+            // Keep the original Work fact and cause; this carrier does not
+            // reclassify a resource/control refusal as a Provider decision.
+            ConnectorError::from_domain(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                error,
+            )
+        };
+        let capacity = io.root_capacity().map_err(admission_error)?;
+        let original = io
+            .original_result_scope(&recipe.connector_context)
+            .map_err(|error| {
+                ConnectorError::from_domain(
+                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    error,
+                )
+            })?;
+        let cpu = recipe
+            .blocking_io
+            .provider_creator_cpu()
+            .map_err(admission_error)?;
+        let cpu = cpu
+            .planning_metadata_cpu_port(
+                capacity.scope(),
+                capacity.try_window_alias().map_err(admission_error)?,
+                recipe.source.planning_lease(),
+                novarocks_query_application::cancellation::QueryCancellationView::governed(
+                    recipe.cancellation.clone(),
+                    None,
+                ),
+                recipe.runtime.clone(),
+                self.preparation_wake.clone(),
+            )
+            .map_err(admission_error)?;
+        self.preparation = Some(
+            novarocks_spi::connector::read_stack::ConnectorReadSplitPreparation::new(cpu, original),
+        );
+        Ok(())
+    }
+
+    fn poll_metadata_closed(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        use std::task::Poll;
+        if self.raw_health.is_some() {
+            return Poll::Ready(());
+        }
+        let Some(preparation) = &self.preparation else {
+            return Poll::Ready(());
+        };
+        self.poisoned = true;
+        let closed = preparation.cpu().poll_closed(cx);
+        let observed = match closed {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(()),
+            Poll::Ready(Err(error)) => {
+                let cause = preparation
+                    .cpu()
+                    .local_failure()
+                    .unwrap_or_else(|| Arc::new(error));
+                self.raw_health = Some(StatementNativeHealthFailure::actual_exit_unproven(
+                    "original split preparation CPU exit is unproven",
+                    cause,
+                ));
+                Poll::Ready(())
+            }
+        };
+        self.poisoned = false;
+        observed
+    }
+
     fn poll_in(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        outcome: &mut Option<
-            Result<
-                Result<OpenedAttemptSource<OpenedRoundSplitSource>, DistributedQueryError>,
-                ConnectorBlockingIoError,
-            >,
-        >,
+        outcome: &mut Option<AttemptSourceOpenOutcome<OpenedRoundSplitSource>>,
     ) -> std::task::Poll<()> {
         use std::task::Poll;
-        if outcome.is_some() {
+        if outcome.is_some() || self.raw_health.is_some() {
             return Poll::Ready(());
         }
         assert!(
             !self.poisoned,
             "poisoned original source opening retains its actual state"
         );
+        self.preparation_wake.0.register(cx.waker());
         if self.responsibility.is_none() {
             match self
                 .recipe
@@ -545,47 +670,59 @@ impl ProductionSourceOpening {
                 Poll::Ready(Ok(owner)) => self.responsibility = Some(owner),
             }
         }
-        if self.capabilities.is_none() {
+        if self.open_result.is_none()
+            && let Err(error) = self.select_metadata_preparation()
+        {
+            self.open_result = Some(Err(error));
+        }
+        if self.capabilities.is_none() && self.open_result.is_none() {
             if self.access_future.is_none() && self.access_result.is_none() {
                 let recipe = &self.recipe.as_ref().unwrap().recipe;
-                match recipe.source.begin_access(&recipe.connector_context) {
+                self.poisoned = true;
+                let access = recipe.source.begin_access(&recipe.connector_context);
+                self.poisoned = false;
+                match access {
                     Ok(future) => self.access_future = Some(future),
-                    Err(error) => {
-                        *outcome = Some(Ok(Err(failed_connector(error))));
-                        return Poll::Ready(());
-                    }
+                    Err(error) => self.access_result = Some(Err(error)),
                 }
             }
             std::task::ready!(poll_original_preparation(
                 &mut self.access_future,
                 &mut self.access_result,
                 &mut self.poisoned,
-                cx
+                cx,
             ));
             match self.access_result.take().unwrap() {
                 Ok(capabilities) => self.capabilities = Some(capabilities),
-                Err(error) => {
-                    *outcome = Some(Ok(Err(failed_connector(error))));
-                    return Poll::Ready(());
-                }
+                Err(error) => self.open_result = Some(Err(error)),
             }
         }
         if self.open_future.is_none() && self.open_result.is_none() {
             let recipe = &self.recipe.as_ref().unwrap().recipe;
-            self.open_future = Some(
-                recipe
-                    .source
-                    .begin_split_open(&recipe.session, self.capabilities.as_ref().unwrap()),
+            self.poisoned = true;
+            let future = recipe.source.begin_split_open(
+                &recipe.session,
+                self.capabilities.as_ref().unwrap(),
+                self.preparation.clone(),
+                &mut self.open_owner,
             );
+            self.open_future = Some(future);
+            self.poisoned = false;
         }
-        std::task::ready!(poll_original_preparation(
-            &mut self.open_future,
-            &mut self.open_result,
-            &mut self.poisoned,
-            cx
-        ));
-        // Only pure moves remain; original recipe/context/authority stays in
-        // this exact field until the real raw source has been installed.
+        if self.open_result.is_none() {
+            std::task::ready!(poll_original_preparation(
+                &mut self.open_future,
+                &mut self.open_result,
+                &mut self.poisoned,
+                cx,
+            ));
+        }
+        // Raw business result is stable before F Drop; its original Provider
+        // body and packet remain installed through actual worker/forwarder exit.
+        std::task::ready!(self.poll_metadata_closed(cx));
+        if self.raw_health.is_some() {
+            return Poll::Ready(());
+        }
         let raw = match self.open_result.take().unwrap() {
             Ok(raw) => raw,
             Err(error) => {
@@ -656,6 +793,10 @@ impl SerialAttemptInitialization for ProductionInitializationState {
                 // coalesce repeated frozen-table access without crossing an
                 // attempt boundary.
                 connector_context: self.connector_context.clone(),
+                metadata_preparation: self.metadata_preparation.clone(),
+                cancellation: self.cancellation.clone(),
+                runtime: self.runtime.clone(),
+                blocking_io: self.blocking_io.clone(),
             },
         }))
     }
@@ -670,6 +811,10 @@ impl SerialAttemptInitialization for ProductionInitializationState {
             access_future: None,
             access_result: None,
             capabilities: None,
+            preparation: None,
+            preparation_wake: Arc::new(SourcePreparationWake::default()),
+            raw_health: None,
+            open_owner: None,
             open_future: None,
             open_result: None,
             poisoned: false,
@@ -686,6 +831,10 @@ impl SerialAttemptInitialization for ProductionInitializationState {
         >,
     ) -> std::task::Poll<()> {
         opening.poll_in(cx, outcome)
+    }
+
+    fn opening_health(opening: &Self::Opening) -> Option<StatementNativeHealthFailure> {
+        opening.raw_health.clone()
     }
 
     fn accept_opened(&mut self, opened: Self::Opened) -> Result<(), DistributedQueryError> {
@@ -766,6 +915,9 @@ impl AttemptInitializing {
         initial_dynamic_filter_wait_cap: Duration,
         connector_context: ConnectorRequestContext,
         runtime: FrontendDataRuntime,
+        metadata_preparation: Option<
+            Weak<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>,
+        >,
         credential_lease_source: &mut Option<RoundCredentialLeaseSource>,
         lifecycle: AttemptInitializationLifecycle,
         source_cohort: crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
@@ -778,6 +930,7 @@ impl AttemptInitializing {
         }
         let scan_keys = artifacts.typed_scans().collect::<Vec<_>>();
         let blocking_io = runtime.connector_blocking_io().clone();
+        let cancellation = lifecycle.cancellation.clone();
         Ok(Self {
             progress: InitializationProgress::new(
                 blocking_io.clone(),
@@ -797,6 +950,9 @@ impl AttemptInitializing {
                     next_scan: 0,
                     session: None,
                     connector_context,
+                    metadata_preparation,
+                    cancellation,
+                    runtime: runtime.handle().clone(),
                     feedback,
                     retry_policy,
                     initial_dynamic_filter_wait_cap,
@@ -830,6 +986,9 @@ impl AttemptInitializing {
         connector_context: ConnectorRequestContext,
         cancellation: novarocks_workload_control::CancellationView,
         runtime: FrontendDataRuntime,
+        metadata_preparation: Option<
+            Weak<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>,
+        >,
         credential_lease_source: &mut Option<RoundCredentialLeaseSource>,
         destination: &mut Option<Self>,
     ) -> Result<(), DistributedQueryError> {
@@ -850,6 +1009,7 @@ impl AttemptInitializing {
             initial_dynamic_filter_wait_cap,
             connector_context,
             runtime,
+            metadata_preparation,
             credential_lease_source,
             lifecycle,
             source_cohort,
@@ -935,6 +1095,7 @@ impl AttemptReady {
 
 #[cfg(test)]
 mod tests {
+    mod prepared_opening_tests;
     use std::future::Future;
     use std::sync::mpsc;
 

@@ -179,6 +179,40 @@ pub(super) fn for_module(
             .map(str::to_owned),
         );
     }
+    if module == "mv_recovery" && name == "mv/current-dependency-recheck" {
+        paths.extend(
+            [
+                "novarocks/spi/src/connector/**",
+                "novarocks/connector-contract/**",
+                "novarocks/connector/iceberg/**",
+                "novarocks/failure-contract/**",
+                "tests/system-test-runner/src/scenarios/mv_control_plan.rs",
+                "tests/system-test-runner/src/scenarios/mv_uea7.rs",
+                "tests/system-test-runner/src/scenarios/mv_uea7_documents.rs",
+                "tests/system-test-runner/src/scenarios/mv_uea7_documents/wire.rs",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    }
+    if module == "distributed_writer" {
+        paths.extend(
+            [
+                "tests/system-test-runner/src/scenarios/distributed_writer_row_level.rs",
+                "tests/system-test-runner/src/scenarios/distributed_writer_dop_observation.rs",
+                "tests/system-test-runner/src/scenarios/distributed_writer_same_file.rs",
+                "novarocks/execution-contract/**",
+                "novarocks/result-contract/**",
+                "novarocks/physical-plan/**",
+                "novarocks/plan-codec/**",
+                "novarocks/task-codec/**",
+                "novarocks/local-program/**",
+                "novarocks/local-compiler/**",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    }
     if module == "query_lifecycle" {
         paths.push("tests/system-test-runner/src/scenarios/query_lifecycle/**".into());
     }

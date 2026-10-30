@@ -291,7 +291,6 @@ pub(crate) struct TaskRound {
     abort_closing_receipts:
         BTreeMap<novarocks_execution::task_execution::TaskOperationId, OperationAcknowledgement>,
     success_sealed: bool,
-    normal_drain_started: bool,
     terminal_cleanup_started: bool,
 }
 
@@ -351,7 +350,6 @@ impl TaskRound {
             late_abort_settlements: BTreeMap::new(),
             abort_closing_receipts: BTreeMap::new(),
             success_sealed: false,
-            normal_drain_started: false,
             terminal_cleanup_started: false,
         }
     }
@@ -359,7 +357,8 @@ impl TaskRound {
     pub(crate) fn install_protocol_facts(
         &mut self,
         plan: novarocks_query_application::api::PlanSeal,
-        writer_fragments: &BTreeSet<crate::query_execution::artifact::FragmentId>,
+        writers: &BTreeSet<TaskIdentity>,
+        summary_sources: &BTreeSet<TaskIdentity>,
     ) -> Result<super::protocol_facts::AttemptProtocolFactsReceiver, TaskExecutionError> {
         if self.protocol_facts.is_some() || self.root_status_source.is_none() {
             return Err(TaskExecutionError::Schedule(
@@ -370,7 +369,8 @@ impl TaskRound {
             super::protocol_facts::AttemptProtocolFactsPublisher::for_graph(
                 plan,
                 self.execution.graph(),
-                writer_fragments,
+                writers,
+                summary_sources,
             )?;
         self.protocol_facts = Some(publisher);
         Ok(receiver)
@@ -678,7 +678,7 @@ impl TaskRound {
 
     fn turn_with_dispatch(&mut self, dispatch: bool) -> Result<TurnReport, TaskExecutionError> {
         let mut report = TurnReport::default();
-        if self.normal_drain_started
+        if self.execution.normal_drain_started()
             || self.terminal_cleanup_started
             || self.execution.failure_cause().is_some()
         {
@@ -905,7 +905,7 @@ impl TaskRound {
         }
 
         if dispatch
-            && !self.normal_drain_started
+            && !self.execution.normal_drain_started()
             && !self.terminal_cleanup_started
             && self.execution.failure_cause().is_none()
         {
@@ -1032,14 +1032,12 @@ impl TaskRound {
     /// Stops input-producing pumps after the accepted root success seal while
     /// keeping status observation, cancellation, renewal, and Release live.
     pub(crate) fn begin_normal_drain(&mut self) {
-        if self.normal_drain_started {
-            return;
-        }
-        self.normal_drain_started = true;
-        for pump in &mut self.pumps {
-            pump.begin_close();
-        }
         self.execution.begin_normal_drain();
+        if self.execution.normal_drain_started() {
+            for pump in &mut self.pumps {
+                pump.begin_close();
+            }
+        }
     }
 
     /// Freezes normal attempt progress before remote convergence. Status and
@@ -1530,8 +1528,8 @@ impl TaskRound {
                 && status.state() == novarocks_execution::task_execution::TaskState::Finished
         });
         if root_finished && self.execution.failure_cause().is_none() {
-            // Freeze admission in this same serial cut, before the seal reply
-            // can race a residual transport error or this turn's pumps.
+            // Request closure in the original serial cut. Strict input work
+            // stays live until its independent Task obligations complete.
             self.begin_normal_drain();
             let withdrawals = self.root_activation.map_or_else(Vec::new, |activation| {
                 self.execution.result_context_withdrawals(activation)

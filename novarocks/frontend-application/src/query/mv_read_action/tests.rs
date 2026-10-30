@@ -65,6 +65,7 @@ async fn with_original_driver<F: std::future::Future>(
 struct Fixture {
     _directory: tempfile::TempDir,
     host: StateStoreHost,
+    readiness_service: Option<novarocks_mv_application::readiness::MvKeyedReadinessService>,
     ordinary: QueryBlockingExecutorOwner,
     cpu: InternalResultCpuOwner,
     control: WorkloadControl,
@@ -78,6 +79,12 @@ impl Fixture {
         Self::for_explain(None).await
     }
     async fn for_explain(level: Option<novarocks_sql::compiler::ExplainLevel>) -> Self {
+        Self::with_source_explain(level, None).await
+    }
+    async fn with_source_explain(
+        level: Option<novarocks_sql::compiler::ExplainLevel>,
+        source: Option<Arc<source_projection_tests::SourceFixture>>,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("show-original.sqlite");
         let mut registry = StateStoreProviderRegistry::new();
@@ -149,11 +156,12 @@ impl Fixture {
             .await
             .unwrap(); // This constructor stores its two inputs and performs no I/O.
         let entrance = crate::mv::domain::test_admission::management_entrance();
+        let readiness_service = novarocks_mv_application::readiness::MvKeyedReadinessService::new(
+            repository,
+            Arc::default(),
+        );
         let readiness = Arc::new(MvReadinessPort::from_product(
-            novarocks_mv_application::readiness::MvKeyedReadinessService::new(
-                repository,
-                Arc::default(),
-            ),
+            readiness_service.clone(),
             tokio::runtime::Handle::current(),
             entrance.clone(),
         ));
@@ -223,40 +231,49 @@ impl Fixture {
         )
         .await
         .unwrap();
-        let input = if let Some(level) = level {
-            let ports = IcebergMvCorePorts::new(
+        let input =
+            if let Some(level) = level {
+                let ports =
+                    if let Some(source) = &source {
+                        source.ports(readiness.clone(), entrance.clone())
+                    } else {
+                        let host =
+                            Arc::new(novarocks_catalog_application::ConnectorControlHost::new());
+                        IcebergMvCorePorts::new_with_management_entrance(
                 Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
                 None,
-                Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
+                host.clone(),
+                host,
                 readiness.clone(),
                 Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
+                entrance.clone(),
                 crate::application::test_constant_policy(),
             )
-            .with_management_entrance(entrance.clone());
-            ReadRequest::Explain(Box::new(MvExplainPreparationInput {
-                ports,
-                current_catalog: Some("ice".into()),
-                current_database: "db".into(),
-                statement: crate::mv::domain::application::MvRefreshRequest {
-                    name_parts: vec!["missing_mv".into()],
-                    full: false,
-                },
-                level,
-                context: novarocks_spi::connector::ConnectorRequestContext::try_new(
-                    Instant::now() + Duration::from_secs(5),
-                    novarocks_spi::connector::ConnectorStopOwner::new().view(),
-                    4096,
-                    64 * 1024,
-                )
-                .unwrap(),
-            }))
-        } else {
-            ReadRequest::Show {
-                catalog: Some("ice".into()),
-                statement: MvShowStatement { database: None },
-            }
-        };
+                    };
+                ReadRequest::Explain(Box::new(MvExplainPreparationInput {
+                    ports,
+                    current_catalog: Some("ice".into()),
+                    current_database: if source.is_some() { "sales" } else { "db" }.into(),
+                    statement: crate::mv::domain::application::MvRefreshRequest {
+                        name_parts: vec![if source.is_some() { "mv" } else { "missing_mv" }.into()],
+                        full: false,
+                    },
+                    level,
+                    context: novarocks_spi::connector::ConnectorRequestContext::try_new(
+                        Instant::now() + Duration::from_secs(5),
+                        novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                        4096,
+                        64 * 1024,
+                    )
+                    .unwrap(),
+                }))
+            } else {
+                ReadRequest::Show {
+                    catalog: Some("ice".into()),
+                    statement: MvShowStatement { database: None },
+                }
+            };
         let mut state = State {
             family: novarocks_result_contract::ClientPresentationFamily::MysqlText,
             readiness,
@@ -291,6 +308,7 @@ impl Fixture {
         Self {
             _directory: directory,
             host,
+            readiness_service: Some(readiness_service),
             ordinary,
             cpu,
             control,
@@ -332,6 +350,10 @@ impl Fixture {
         .expect("same original SS/CPU/MIO close")
         .unwrap();
         drop(self.state.take());
+        // The fixture's seed-only alias is not a live SQLite consumer after
+        // the original State has closed. Release it before the host's exact
+        // single-owner close checks its repository/store strong references.
+        drop(self.readiness_service.take());
         drop(self.local.take());
         if cancelled {
             self.root.owner.complete_after_terminal_cancel_settled();
@@ -638,3 +660,6 @@ fn explain_domain_projection_preserves_actual_connector_cause_and_missing_pure_i
         Some(novarocks_type_contract::CompileControlError::ResourceExhausted)
     );
 }
+
+#[path = "tests/source_projection_tests.rs"]
+mod source_projection_tests;

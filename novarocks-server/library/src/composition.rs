@@ -54,12 +54,12 @@ use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExec
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableMetadata, MvCreateSourceObservation, MvCreatedTargetObservation,
-    MvMaintenanceMetadataObservation, MvObservedField, MvObservedMaintenancePolicy,
-    MvObservedPartitionField, MvObservedPartitionSpec, MvObservedPartitionTransform,
-    MvObservedRefreshMarker, MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
-    MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
-    WriteCommitEvidenceLimits,
+    ConnectorTableMetadata, MvCreatedTargetObservation, MvMaintenanceMetadataObservation,
+    MvObservedField, MvObservedMaintenancePolicy, MvObservedPartitionField,
+    MvObservedPartitionSpec, MvObservedPartitionTransform, MvObservedRefreshMarker,
+    MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
+    MvRefreshTargetObservation, MvSchemaValidationObservation, MvSourceSchemaObservation,
+    MvStorageObservationPort, WriteCommitEvidenceLimits,
 };
 use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_runtime::{
@@ -148,15 +148,15 @@ fn mv_partition_observation(
 }
 
 impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
-    fn observe_create_source(
+    fn observe_source_schema(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
-    ) -> Result<MvCreateSourceObservation, ConnectorError> {
+    ) -> Result<MvSourceSchemaObservation, ConnectorError> {
         let observed =
             self.inspector
-                .observe_create_source(exact_lease, metadata, context.clone())?;
+                .observe_source_schema(exact_lease, metadata, context.clone())?;
         if metadata.version.as_ref() != Some(&observed.schema_version) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
@@ -175,10 +175,12 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        MvCreateSourceObservation::try_new(
+        MvSourceSchemaObservation::try_new(
             metadata.identity.clone(),
             observed.object_id,
             observed.schema_version,
+            observed.format_v3,
+            observed.stored_row_lineage_enabled,
             fields,
             &context,
         )
@@ -492,7 +494,7 @@ pub fn compose_backend_server_config(
             #[cfg(novarocks_dev_controls)]
             &test_slots,
         )?,
-        static_plan_interpreter: static_plan.backend_interpreter()?,
+        static_plan_interpreter: static_plan.backend_interpreter(),
         process_memory: backend_process_memory_observation(memory_authority),
     })
 }
@@ -611,12 +613,15 @@ pub fn compose_frontend_role_config(
         result_profile,
         capacity_profile,
     );
+    // The frontend freezes the one carrier its island's backends interpret,
+    // under the same structural package admission as their receiver.
     let mut execution = FrontendExecutionConfig::new(
         runtime_filter_worker_count,
         native_compatibility_id,
         function_catalog,
         logical_runtime,
         constant_policy,
+        static_plan.frontend_carrier(),
     )
     .with_catalog_desired_state_source(catalog_source)
     .try_with_catalog_prune_config(
@@ -674,9 +679,6 @@ pub fn compose_frontend_role_config(
         Duration::from_millis(runtime_config.frontend_workload.planning_idle_keepalive_ms),
     ))
     .with_query_blocking_executor_config(query_blocking_config);
-    // The frontend freezes the one carrier its island's backends interpret,
-    // under the same structural package admission as their receiver.
-    execution = execution.with_static_plan_carrier(static_plan.frontend_carrier());
     let (remote_effect_policy, management_audit, startup_isolation) =
         mv_management_continuation(config)?;
     execution =

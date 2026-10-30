@@ -352,6 +352,7 @@ pub struct QueryTaskExecution {
     expired_actor_aborts: Vec<TaskOperationId>,
     status_reconciliations: BTreeSet<QueryContextRef>,
     covered_reconciliations: BTreeSet<QueryContextRef>,
+    normal_drain_requested: bool,
     normal_drain_started: bool,
     profile_release_deadline: Option<MonotonicInstant>,
     terminal_cleanup_started: bool,
@@ -617,6 +618,7 @@ impl QueryTaskExecution {
             expired_actor_aborts: Vec::new(),
             status_reconciliations: BTreeSet::new(),
             covered_reconciliations: BTreeSet::new(),
+            normal_drain_requested: false,
             normal_drain_started: false,
             profile_release_deadline: None,
             terminal_cleanup_started: false,
@@ -871,6 +873,7 @@ impl QueryTaskExecution {
         &mut self,
         establish: &dyn ContextEstablishSource,
     ) -> Result<PumpReport, TaskExecutionError> {
+        self.advance_normal_drain();
         self.refresh_deployment_window();
         let now = self.clock.now();
         self.expire_queued_operations(now)?;
@@ -1263,11 +1266,30 @@ impl QueryTaskExecution {
         Ok(())
     }
 
-    /// Keeps observation and context closure live after a successful root
-    /// seal while stopping unsent task and input work. In-flight operations
-    /// may still settle; only exact destination-close controls may replay.
+    /// Requests normal closure after the root seal. Strict producers and
+    /// consumers keep their original admission and input owners until their
+    /// Task terminals arrive; result demand cannot quiesce required work.
     pub(crate) fn begin_normal_drain(&mut self) {
-        if self.normal_drain_started {
+        self.normal_drain_requested = true;
+        self.advance_normal_drain();
+    }
+
+    pub(crate) fn normal_drain_started(&self) -> bool {
+        self.normal_drain_started
+    }
+
+    fn advance_normal_drain(&mut self) {
+        if !self.normal_drain_requested
+            || self.normal_drain_started
+            || self.terminal_cleanup_started
+            || self.failure_cause().is_some()
+            || self.graph.tasks().any(|task| {
+                self.edges.requires_drain(task.identity())
+                    && !self
+                        .task_by_identity_ref(task.identity())
+                        .is_some_and(RemoteTask::is_terminal)
+            })
+        {
             return;
         }
         let destinations = self
@@ -1349,6 +1371,11 @@ impl QueryTaskExecution {
         let task = self
             .task_by_identity_ref(identity)
             .ok_or(TaskExecutionError::UnknownOperation)?;
+        // Strict participants finish their own inputs and outputs. A demand
+        // release cannot suppress an unsent Create/update or cancel that work.
+        if self.edges.requires_drain(identity) && !task.is_terminal() {
+            return Ok(());
+        }
         if task
             .status()
             .and_then(TaskStatus::termination)
@@ -1793,6 +1820,9 @@ impl QueryTaskExecution {
                 .is_none_or(|detail| detail.is_success_compatible())
             {
                 self.close_destination_normally(destination);
+                // Strict edges ignored the demand withdrawal above. This
+                // installed Task still supplies their real opening fact.
+                self.open_ready_edges(destination)?;
             }
         } else {
             self.open_ready_edges(destination)?;
@@ -2412,7 +2442,7 @@ impl QueryTaskExecution {
                     .stages
                     .get_mut(&child)
                     .expect("the child stage was just located")
-                    .cancel_non_root_tasks();
+                    .cancel_normally_stood_down_tasks();
                 for intent in intents {
                     let identity = match &intent {
                         OperationIntent::CancelTask(request) => request.identity(),

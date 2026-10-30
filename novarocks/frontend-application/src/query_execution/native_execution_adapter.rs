@@ -1070,7 +1070,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                 aborts.closure_epoch(),
             );
             let factory = ProductionDormantAttemptFactory {
-                read_io: Some(Arc::downgrade(io)),
+                metadata_io: OriginalAttemptMetadataSource::Read(Arc::downgrade(io)),
                 runtime: self.runtime.clone(),
                 options,
                 aborts: Arc::clone(&aborts),
@@ -1129,6 +1129,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
         computation: &mut Option<PreparedLogicalComputation>,
         owner: &mut Option<WorkOwner>,
         capacity: &QueryResultCapacityBinding,
+        io: &Arc<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>,
         original: &mut crate::query_execution::logical_execution::OriginalComputationStart,
         #[cfg(novarocks_dev_controls)] observation: Option<
             crate::preparation_diagnostics::StatementObservationHandle,
@@ -1153,6 +1154,18 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                 "logical execution result window belongs to a foreign scope",
             ));
         }
+        // Borrow the SAME positive metadata Root before moving prepared input,
+        // credentials, reservation or owner. The existing stage author checks
+        // the real authority, active direct child and retained original grant.
+        io.root_stage_source(work).map(drop).map_err(|error| {
+            QueryExecutionError::from_execution(ExecutionFailureInput::new(
+                error.failure_fact(),
+                SafeDetail::truncating_display(format_args!(
+                    "computation metadata source refused: {error}"
+                )),
+                ExecutionFailureSite::Coordinator,
+            ))
+        })?;
         if original.input.is_none() && original.request.is_none() {
             let prepared = computation
                 .as_ref()
@@ -1201,7 +1214,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                 aborts.closure_epoch(),
             );
             let factory = ProductionDormantAttemptFactory {
-                read_io: None,
+                metadata_io: OriginalAttemptMetadataSource::Computation(Arc::downgrade(io)),
                 runtime: self.runtime.clone(),
                 options,
                 aborts: Arc::clone(&aborts),
@@ -1277,8 +1290,17 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
     }
 }
 
+/// Both arms borrow an already-owned original action Source. The Internal
+/// arm can project its existing positive Root for metadata CPU; the ordinary
+/// Read arm retains its original lazy preparation and progress author.
+#[derive(Clone)]
+enum OriginalAttemptMetadataSource {
+    Read(Weak<crate::query::read_action::io_source::ReadMetadataIoSource>),
+    Computation(Weak<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>),
+}
+
 struct ProductionManifestAttemptProjection {
-    read_io: Option<Weak<crate::query::read_action::io_source::ReadMetadataIoSource>>,
+    metadata_io: OriginalAttemptMetadataSource,
     control_binding: NativeControlBinding,
     source_cohort: NativeSourceCohortAdmission,
     native_actions: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
@@ -1525,7 +1547,7 @@ impl ProjectedManifestAttempt {
 }
 
 struct ProductionDormantAttemptFactory {
-    read_io: Option<Weak<crate::query::read_action::io_source::ReadMetadataIoSource>>,
+    metadata_io: OriginalAttemptMetadataSource,
     runtime: FrontendNativeLogicalExecutionRuntime,
     options: Arc<ResolvedQueryOptions>,
     aborts: Arc<LogicalAbortRouter>,
@@ -1574,7 +1596,7 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
             .native_action_authority()
             .map_err(|error| attempt_failure(QueryFailureReason::PreparationProtocol, error))?;
         self.pending_projection = Some(ProductionManifestAttemptProjection {
-            read_io: self.read_io.clone(),
+            metadata_io: self.metadata_io.clone(),
             control_binding: NativeControlBinding::default(),
             source_cohort: NativeSourceCohortAdmission::default(),
             native_actions,
@@ -1896,16 +1918,20 @@ impl ProductionManifestAttemptProjection {
             ),
         )
         .map_err(projection_message)?;
-        let connector_context = match &self.read_io {
-            Some(original) => {
-                let source = original.upgrade().ok_or_else(|| {
-                    projection_message(
-                        "ordinary Read I/O source exited before Native initialization",
-                    )
-                })?;
-                connector_context.with_io_admission(source)
-            }
-            None => connector_context,
+        // The original action strongly owns and drives this source until all
+        // active/retired initializers actually exit. A scope cannot replace it.
+        let unavailable = || {
+            projection_message("original metadata I/O source exited before Native initialization")
+        };
+        let (connector_context, metadata_preparation) = match &self.metadata_io {
+            OriginalAttemptMetadataSource::Read(original) => (
+                connector_context.with_io_admission(original.upgrade().ok_or_else(unavailable)?),
+                None,
+            ),
+            OriginalAttemptMetadataSource::Computation(original) => (
+                connector_context.with_io_admission(original.upgrade().ok_or_else(unavailable)?),
+                Some(original.clone()),
+            ),
         };
         let connector_context = self
             .pending_credential_source
@@ -1931,6 +1957,7 @@ impl ProductionManifestAttemptProjection {
             connector_context,
             cancellation,
             self.runtime.data_runtime.clone(),
+            metadata_preparation,
             &mut self.pending_credential_source,
             &mut self.pending_initializer,
         )

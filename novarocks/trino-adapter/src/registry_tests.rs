@@ -1263,9 +1263,13 @@ async fn partial_row_survives_page_cut_and_backing_reclaims_only_after_actual_re
     assert!(pipeline.at_row_boundary());
     drop(next_page);
     drop(pipeline);
-    GovernedCompletionStatementResult::new(owner)
-        .into_protocol()
-        .complete();
+    GovernedCompletionStatementResult::new(
+        novarocks_query_application::session_control::StatementCommandCompletion::new(0),
+        owner,
+    )
+    .into_parts()
+    .1
+    .complete();
     drop(lease);
     assert_eq!(fixture.state.capacity.snapshot().held_positions, [0; 4]);
     fixture.registry.finalize().await;

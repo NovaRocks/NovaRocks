@@ -54,13 +54,10 @@ pub fn compiled_fragment_sink_assignment(
                 "compiled multicast and router sinks are not executable yet",
             ));
         }
-        StaticSinkProgram::ChangeStreamRouter { .. } => {
-            return Err(error(
-                path,
-                ProtocolErrorKind::Unsupported,
-                "compiled change-stream router runtime is not installed",
-            ));
-        }
+        StaticSinkProgram::ChangeStreamRouter { branches, .. } => branches
+            .iter()
+            .map(|branch| (branch.dest_node_id(), branch.partition_type()))
+            .collect(),
     };
     let edges = decode_sink_edges(&expected, sink_edge_ids, topology, path)?;
     let mut groups = edges
@@ -72,6 +69,12 @@ pub fn compiled_fragment_sink_assignment(
             destinations: groups.pop().expect("one stream edge was validated"),
             sender_id: None,
         }),
+        StaticSinkProgram::ChangeStreamRouter { .. } => {
+            Ok(FragmentSinkAssignment::DestinationGroups {
+                groups,
+                sender_id: None,
+            })
+        }
         _ => Ok(FragmentSinkAssignment::None),
     }
 }
@@ -242,6 +245,107 @@ mod tests {
                 (4, 6),
                 "each destination reads the edge's producer position"
             );
+        }
+    }
+
+    #[test]
+    fn router_binds_provider_and_summary_to_their_exact_frozen_edges() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use novarocks_execution_contract::ExchangeDeliveryRequirement;
+        use novarocks_local_program::{
+            ImmutableExpressions, ProgramOutputRole, ProgramWriteLayoutPreference, StaticLayout,
+            StaticRouterRoute, StaticSinkProgram, StaticStreamBranch, StaticStreamContract,
+            StaticStreamRouting,
+        };
+        use std::sync::Arc;
+        let slots = [10, 11, 12].map(novarocks_types::SlotId::new);
+        let layout = StaticLayout::try_new(
+            Arc::new(Schema::new(
+                ["inserted", "replaced", "deleted"]
+                    .map(|name| Field::new(name, DataType::Int64, false))
+                    .to_vec(),
+            )),
+            Arc::from(slots),
+        )
+        .unwrap();
+        let branch = |node, columns, role| {
+            StaticStreamBranch::try_new(
+                node,
+                DataStreamPartitionType::Unpartitioned,
+                vec![],
+                columns,
+                None,
+                StaticStreamContract {
+                    role,
+                    delivery: ExchangeDeliveryRequirement::MustDrain,
+                    routing: StaticStreamRouting::Ordinary,
+                },
+            )
+            .unwrap()
+        };
+        let sink = StaticSinkProgram::try_change_stream_router(
+            vec![
+                branch(
+                    9,
+                    vec![novarocks_types::SlotId::new(2)],
+                    ProgramOutputRole::ProviderRoute {
+                        target: novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(
+                            0,
+                        )
+                        .unwrap(),
+                    },
+                ),
+                branch(10, slots.to_vec(), ProgramOutputRole::LogicalSummary),
+            ],
+            Arc::new(
+                ImmutableExpressions::try_new(
+                    vec![],
+                    false,
+                    std::collections::HashMap::new(),
+                    None,
+                )
+                .unwrap(),
+            ),
+            novarocks_types::SlotId::new(1),
+            vec![StaticRouterRoute {
+                branch: 0,
+                layout: ProgramWriteLayoutPreference::None,
+                accepted_effects: Arc::from([
+                    novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
+                ]),
+            }],
+            1,
+            layout,
+        )
+        .unwrap();
+        let execution = execution();
+        let edge = |id, node| {
+            ExchangeEdge::try_new(
+                ExchangeEdgeId::new(id).unwrap(),
+                FragmentNodeId::new(node),
+                DataStreamPartitionType::Unpartitioned,
+                vec![ExchangeDestination::new(
+                    task(execution, id),
+                    UniqueId::new(i64::from(id), 1),
+                    RuntimeEndpoint::new("be.local", 8060).unwrap(),
+                    FragmentNodeId::new(node),
+                )],
+                0,
+                NonZeroU32::MIN,
+            )
+            .unwrap()
+        };
+        let topology = ExchangeTopology::try_new(vec![edge(2, 10), edge(7, 9)], vec![]).unwrap();
+        let assignment =
+            compiled_fragment_sink_assignment(&sink, &[7, 2], SOURCE, &topology).unwrap();
+        let FragmentSinkAssignment::DestinationGroups { groups, .. } = assignment else {
+            panic!("router requires independent output groups")
+        };
+        assert_eq!(groups.len(), 2);
+        assert_eq!(*groups[0][0].finst_id(), UniqueId::new(7, 1));
+        assert_eq!(*groups[1][0].finst_id(), UniqueId::new(2, 1));
+        for edges in [vec![7], vec![2, 7], vec![7, 7]] {
+            assert!(compiled_fragment_sink_assignment(&sink, &edges, SOURCE, &topology).is_err());
         }
     }
 

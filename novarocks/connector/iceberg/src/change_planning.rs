@@ -27,39 +27,18 @@ use novarocks_spi::connector::{
     ConnectorChangePartitionValue, ConnectorChangeWindowAdmission,
     ConnectorChangeWindowFullRebuildReason, ConnectorChangeWindowPartitionImpact,
     ConnectorChangeWindowReplaceFailure, ConnectorError, ConnectorErrorKind,
-    ConnectorOperationControl, ConnectorRequestContext,
+    ConnectorRequestContext,
 };
 
 use crate::iceberg::spec::{
     FormatVersion, NestedField, Operation, Schema, Snapshot, TableMetadata, Type,
 };
-use crate::iceberg::table::Table;
-use crate::resources::IcebergCatalogRuntime;
 
 #[derive(Debug)]
 enum LineageAdmission {
     MetadataOnly,
     Incremental,
     FullRebuild(ConnectorChangeWindowFullRebuildReason),
-}
-
-/// Plans one exact Iceberg snapshot window without leaking manifests, file
-/// paths, or numeric Iceberg field identities into SPI admission facts.
-pub(crate) fn plan_change_window(
-    table: &Table,
-    from_exclusive: i64,
-    to_inclusive: i64,
-    runtime: &IcebergCatalogRuntime,
-    context: &ConnectorRequestContext,
-) -> Result<ConnectorChangeWindowAdmission, ConnectorError> {
-    let schema =
-        match prepare_change_window(table.metadata(), from_exclusive, to_inclusive, context)? {
-            ChangeWindowPlan::Resolved(admission) => return Ok(admission),
-            ChangeWindowPlan::Endpoints { schema } => schema,
-        };
-    let from = build_snapshot_controlled(table, from_exclusive, &schema, runtime, context)?;
-    let to = build_snapshot_controlled(table, to_inclusive, &schema, runtime, context)?;
-    endpoint_admission(table.metadata(), &from.files, &to.files, context)
 }
 
 pub(crate) enum ChangeWindowPlan {
@@ -96,7 +75,7 @@ pub(crate) fn prepare_change_window(
     }
 }
 
-/// The actual endpoint comparison, shared with the existing synchronous author.
+/// The actual endpoint comparison used by the typed original preparation.
 pub(crate) fn finish_change_window(
     metadata: &TableMetadata,
     from: &[crate::read_model::IcebergReadFile],
@@ -193,30 +172,6 @@ fn endpoint_admission(
             context,
         )?,
     })
-}
-
-fn build_snapshot_controlled(
-    table: &Table,
-    snapshot_id: i64,
-    schema: &Schema,
-    runtime: &IcebergCatalogRuntime,
-    context: &ConnectorRequestContext,
-) -> Result<crate::read_model::IcebergReadSnapshot, ConnectorError> {
-    check_active(context)?;
-    let table = table.clone();
-    let control = context.clone();
-    let domain = crate::read_snapshot::mint_read_domain(table.metadata(), snapshot_id, schema)
-        .map_err(corrupt)?;
-    let result = runtime.block_on(async move {
-        crate::read_snapshot::build_read_snapshot_in_domain(
-            &table,
-            domain,
-            Some(&control as &dyn ConnectorOperationControl),
-        )
-        .await
-    });
-    check_active(context)?;
-    result.map_err(unavailable)?.map_err(unavailable)
 }
 
 fn classify_lineage(
@@ -659,10 +614,6 @@ fn corrupt(message: impl Into<String>) -> ConnectorError {
 
 fn unsupported(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unsupported, message)
-}
-
-fn unavailable(message: impl Into<String>) -> ConnectorError {
-    ConnectorError::new(ConnectorErrorKind::Unavailable, message).with_retryable_before_progress()
 }
 
 #[cfg(test)]

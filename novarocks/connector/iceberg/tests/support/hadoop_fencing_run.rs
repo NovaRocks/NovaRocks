@@ -507,10 +507,10 @@ mod tests {
         let original_complete = owner.complete_end;
         let result =
             owner.capture_pair([sleeping_child(&pid_files[0]), sleeping_child(&pid_files[1])]);
-        ensure!(
-            result.is_err(),
-            "sleeping children cannot finish within the original work budget"
-        );
+        let capture_error = result
+            .as_ref()
+            .err()
+            .context("sleeping children cannot finish within the original work budget")?;
         ensure!(
             Instant::now() >= original_work,
             "the original work deadline must actually expire"
@@ -525,7 +525,7 @@ mod tests {
         // independent observation rather than accepting the failure alone.
         ensure!(
             owner.writers_settled,
-            "both actual monitor Final records must prove clean settlement"
+            "both actual monitor Final records must prove clean settlement; original capture_pair error: {capture_error:#}"
         );
         let pids = pid_files.map(|file| -> Result<u32> {
             Ok(std::fs::read_to_string(file)

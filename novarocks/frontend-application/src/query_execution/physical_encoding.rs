@@ -150,7 +150,11 @@ pub(crate) fn encode_completed_plan(
     if matches!(
         &result,
         Err(novarocks_plan_codec::PhysicalEncodeError::Control(_))
-    ) {
+    ) || result
+        .as_ref()
+        .err()
+        .is_some_and(crate::query_execution::package_freeze::is_receiver_refusal)
+    {
         return result;
     }
     control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
@@ -371,7 +375,11 @@ fn encode_borrowed_original(
     if matches!(
         &result,
         Err(novarocks_plan_codec::PhysicalEncodeError::Control(_))
-    ) {
+    ) || result
+        .as_ref()
+        .err()
+        .is_some_and(crate::query_execution::package_freeze::is_receiver_refusal)
+    {
         return result;
     }
     control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
@@ -420,7 +428,7 @@ fn encode_static_packages(
             plan,
             &submission,
             topology.anchor,
-            carrier.limits(),
+            carrier,
             control,
         )?,
         topology.anchor,
@@ -481,24 +489,19 @@ const fn compiled_sink_refusal(sink: &FragmentSink) -> Option<&'static str> {
         FragmentSink::Multicast { .. } => {
             Some("the compiled package carrier does not express CTE multicast sinks yet")
         }
-        FragmentSink::Router { .. } => {
-            Some("the compiled package carrier does not express change-stream router sinks yet")
-        }
         FragmentSink::Result
         | FragmentSink::RootResult(_)
         | FragmentSink::Stream { .. }
+        | FragmentSink::Router { .. }
         | FragmentSink::Noop => None,
     }
 }
 
 const fn compiled_edge_refusal(kind: EdgeKind) -> Option<&'static str> {
     match kind {
-        EdgeKind::Stream => None,
+        EdgeKind::Stream | EdgeKind::ChangeStreamRouter => None,
         EdgeKind::CteMulticast => {
             Some("the compiled package carrier does not express CTE multicast edges yet")
-        }
-        EdgeKind::ChangeStreamRouter => {
-            Some("the compiled package carrier does not express change-stream router edges yet")
         }
     }
 }
@@ -532,11 +535,10 @@ fn completed_plan_submission_fragments(
     let mut stream_edge_sources = BTreeSet::new();
     for edge in plan.edges().values() {
         match edge.kind {
-            EdgeKind::Stream => {
+            EdgeKind::Stream | EdgeKind::ChangeStreamRouter => {
                 stream_edge_sources.insert(edge.source.fragment.get());
             }
             EdgeKind::CteMulticast => {}
-            EdgeKind::ChangeStreamRouter => {}
         }
     }
     let mut fragments = Vec::with_capacity(plan.fragments().len());
@@ -566,9 +568,9 @@ fn completed_plan_submission_fragments(
 
 /// What submission encoding reads about a plan frozen into compiled packages.
 ///
-/// It is derived from the physical plan alone. The compiled carrier refuses
-/// CTE multicast and change-stream routing, so there is no consumer to patch
-/// and no router edge to carry.
+/// It is derived from the physical plan alone. Every declared routed output
+/// keeps its original producer; no placement or receiver is patched into the
+/// shared package. Unsupported sinks retain their separate admission refusal.
 fn compiled_plan_submission_facts(
     candidate: &novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
     topology: &CompletedPlanTopology,
@@ -1126,7 +1128,7 @@ mod tests {
 
     /// The compiled package carrier under test sizing.
     fn compiled_carrier() -> CompiledPackageCarrier {
-        CompiledPackageCarrier::new(
+        CompiledPackageCarrier::for_test(
             test_package_admission(),
             novarocks_plan_codec::physical_package_v2::test_support::encode_limits(),
         )
@@ -1278,7 +1280,7 @@ mod tests {
     /// A scan is expressed, from the read its freeze kept, and a writer from
     /// the session that sealed its target.
     #[test]
-    fn the_compiled_carrier_refuses_routers_and_multicast_but_admits_scans_and_writers() {
+    fn compiled_router_uses_package_validation_and_multicast_remains_refused() {
         use novarocks_physical_plan::ValueId;
 
         let (plan, _) = crate::query_execution::package_writes::tests::insert_values_plan();
@@ -1297,7 +1299,7 @@ mod tests {
                 effect: ValueId::new(0),
                 routes: Box::default(),
             })
-            .is_some_and(|reason| reason.contains("router"))
+            .is_none()
         );
         assert!(
             compiled_sink_refusal(&FragmentSink::Multicast {
@@ -1305,10 +1307,7 @@ mod tests {
             })
             .is_some_and(|reason| reason.contains("multicast"))
         );
-        assert!(
-            compiled_edge_refusal(EdgeKind::ChangeStreamRouter)
-                .is_some_and(|reason| reason.contains("router"))
-        );
+        assert_eq!(compiled_edge_refusal(EdgeKind::ChangeStreamRouter), None);
         assert!(
             compiled_edge_refusal(EdgeKind::CteMulticast)
                 .is_some_and(|reason| reason.contains("multicast"))
@@ -1574,6 +1573,444 @@ mod tests {
         }
     }
 
+    #[test]
+    fn completed_values_receiver_refusal_freezes_no_native_artifact_and_keeps_its_cause() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_plan_codec::physical_package_v2::{
+            FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits, PackageEncodeLimits,
+            encode_fragment_package,
+        };
+        use novarocks_plan_codec::resource_preflight_v2::{
+            FragmentDecodeResourceModel, ResourceModelError,
+        };
+        use prost::Message;
+        let control = SqlCompileControl::unbounded();
+        let completed = completed_for("SELECT a FROM (VALUES (1),(2),(3)) t(a) ORDER BY a");
+        let packages = crate::query_execution::package_freeze::extract_checked_packages(
+            completed.candidate(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            crate::application::test_constant_policy(),
+            &FROZEN_PACKAGE_ADMISSION,
+            &control,
+        )
+        .unwrap();
+        let model = Arc::new(FragmentDecodeResourceModel::try_new(&control).unwrap());
+        let first = packages.first_key_value().unwrap().1;
+        let bytes = encode_fragment_package(first, &PackageEncodeLimits::FROZEN, &control)
+            .unwrap()
+            .encode_to_vec();
+        let usage = model
+            .preflight(&bytes, PackageDecodeLimits::FROZEN.wire, &control)
+            .unwrap()
+            .usage;
+        // A complete genuine producer DTO is over this receiver's exact tag
+        // budget. Bytes are within production limits; this is not a byte-only gate.
+        let mut receiver = PackageDecodeLimits::FROZEN.wire;
+        receiver.max_field_occurrences = usage.field_occurrences.checked_sub(1).unwrap();
+        let expected = model.preflight(&bytes, receiver, &control).unwrap_err();
+        assert!(matches!(expected, ResourceModelError::Limit(_)));
+        let carrier = CompiledPackageCarrier::new(
+            FROZEN_PACKAGE_ADMISSION,
+            PackageEncodeLimits::FROZEN,
+            model,
+            receiver,
+        );
+        struct TailRefusal {
+            decoded: std::sync::atomic::AtomicBool,
+        }
+        impl novarocks_type_contract::PureCompileControl for TailRefusal {
+            fn checkpoint(
+                &self,
+                phase: novarocks_type_contract::CompilePhase,
+                _: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                use std::sync::atomic::Ordering;
+                if phase == novarocks_type_contract::CompilePhase::Decode {
+                    self.decoded.store(true, Ordering::SeqCst);
+                }
+                if phase == novarocks_type_contract::CompilePhase::Encode
+                    && self.decoded.load(Ordering::SeqCst)
+                {
+                    return Err(novarocks_type_contract::CompileControlError::Cancelled);
+                }
+                Ok(())
+            }
+        }
+        let tail = TailRefusal {
+            decoded: std::sync::atomic::AtomicBool::new(false),
+        };
+        let before = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
+        let error = match encode_completed_plan(
+            completed,
+            &carrier,
+            crate::application::test_constant_policy(),
+            None,
+            &tail,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("receiver refusal must not produce a Native encoding"),
+        };
+        assert_eq!(error.failure_fact(), expected.failure_fact());
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        let novarocks_plan_codec::PhysicalEncodeError::Source(source) = error else {
+            panic!("original resource author");
+        };
+        let freeze = source
+            .downcast_ref::<crate::query_execution::package_freeze::PackageFreezeError>()
+            .unwrap();
+        assert!(
+            matches!(freeze, crate::query_execution::package_freeze::PackageFreezeError::Receiver(actual) if actual == &expected)
+        );
+        // Without a frozen artifact or EncodedCompletedPlan the original
+        // attempt/transport owner has no submission capability to dispatch.
+        assert_eq!(
+            crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread(),
+            before
+        );
+    }
+
+    #[test]
+    fn final_package_preflight_keeps_every_original_fe_control_cause() {
+        use novarocks_failure_contract::SharedFailureCause;
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Reject {
+            cause: CompileControlError,
+        }
+        impl PureCompileControl for Reject {
+            fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                if phase == CompilePhase::Decode {
+                    Err(self.cause.clone())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::Source(SharedFailureCause::new(
+                novarocks_functions::ComparisonPrepareError::Unsupported,
+            )),
+        ] {
+            let completed = completed_for("SELECT a FROM (VALUES (1),(2)) t(a)");
+            let before = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
+            let error = match encode_completed_plan(
+                completed,
+                &compiled_carrier(),
+                crate::application::test_constant_policy(),
+                None,
+                &Reject {
+                    cause: cause.clone(),
+                },
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("original control must refuse Native encoding"),
+            };
+            assert_eq!(
+                error,
+                novarocks_plan_codec::PhysicalEncodeError::Control(cause)
+            );
+            assert_eq!(
+                crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn original_information_schema_scale_values_freeze_under_the_production_receiver() {
+        use novarocks_plan_codec::physical_package_v2::{
+            FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
+            PackageEncodeLimits, decode_fragment_package,
+        };
+        use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
+        let rows = (0..32)
+            .flat_map(|namespace| {
+                (0..512).map(move |table| {
+                    format!(
+                        "('cl_normal','cl_ns_{namespace:04}','cl_table_{table:06}','BASE TABLE')"
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT COUNT(*) FROM (VALUES {rows}) t(table_catalog,table_schema,table_name,table_type) WHERE table_catalog='cl_normal' AND table_schema LIKE 'cl_ns_%'"
+        );
+        let control = SqlCompileControl::unbounded();
+        let request = SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([23; 16]).unwrap(),
+            SqlStatementInput::sql(&sql),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                current_catalog: Some("iceberg".into()),
+                current_database: "db".into(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            crate::query_execution::constant_eval::constant_evaluator(),
+            FROZEN_CONSTANT_POLICY,
+            control.clone(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_root, scope) = query_scope();
+        let completed = runtime
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete_for_test(request, &scope),
+            )
+            .unwrap();
+        let packages = crate::query_execution::package_freeze::extract_checked_packages(
+            completed.candidate(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            FROZEN_CONSTANT_POLICY,
+            &FROZEN_PACKAGE_ADMISSION,
+            &control,
+        )
+        .unwrap();
+        let model = Arc::new(FragmentDecodeResourceModel::try_new(&control).unwrap());
+        let carrier = CompiledPackageCarrier::new(
+            FROZEN_PACKAGE_ADMISSION,
+            PackageEncodeLimits::FROZEN,
+            Arc::clone(&model),
+            PackageDecodeLimits::FROZEN.wire,
+        );
+        assert!(packages.values().any(|package| {
+            package
+                .fragment()
+                .nodes()
+                .values()
+                .any(|node| matches!(&node.kind, NodeKind::Values { rows } if rows.len() == 16_384))
+        }));
+        for (id, package) in packages {
+            let bytes = crate::query_execution::package_freeze::encode_checked_package(
+                &package, &carrier, &control,
+            )
+            .unwrap_or_else(|error| panic!("original-scale fragment {id:?}: {error}"));
+            let projection = model
+                .preflight(&bytes, PackageDecodeLimits::FROZEN.wire, &control)
+                .unwrap();
+            assert_eq!(projection.usage.input_bytes, bytes.len());
+            let decoded =
+                decode_fragment_package(&bytes, &model, &PackageDecodeLimits::FROZEN, &control)
+                    .unwrap();
+            assert_eq!(decoded.fragment().id(), id);
+        }
+    }
+
+    #[test]
+    fn four_column_values_at_original_scale_preserve_frozen_field_resource_boundary() {
+        use crate::native::fragment_encoder::frozen::FragmentArtifact;
+        use crate::query_execution::package_freeze::PackageFreezeError;
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_plan_codec::physical_package_v2::{
+            FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
+            PackageEncodeLimits, decode_fragment_package, encode_fragment_package,
+        };
+        use novarocks_plan_codec::resource_preflight_v2::{
+            FragmentDecodeResourceModel, ResourceModelError,
+        };
+        use prost::Message;
+        use std::error::Error;
+        // The separate COUNT/LIKE regression above keeps the original query
+        // shape. Here every output and every column varies, so ordinary column
+        // pruning or constant lifting cannot turn the scale check into a
+        // narrower VALUES package. Production accepts this legal package;
+        // an explicit caller field budget must still preserve the original
+        // resource failure through artifact freezing without creating one.
+        let rows = (0..16_384)
+            .map(|row| {
+                format!("('catalog_{row:05}','schema_{row:05}','table_{row:05}','type_{row:05}')")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        // VALUES exposes all four columns without adding projection roots to
+        // the existing 65,536 expression-use boundary.
+        let sql = format!("VALUES {rows}");
+        let control = SqlCompileControl::unbounded();
+        let request = SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([24; 16]).unwrap(),
+            SqlStatementInput::sql(&sql),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                current_catalog: Some("iceberg".into()),
+                current_database: "db".into(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            crate::query_execution::constant_eval::constant_evaluator(),
+            FROZEN_CONSTANT_POLICY,
+            control.clone(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_root, scope) = query_scope();
+        let completed = runtime
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete_for_test(request, &scope),
+            )
+            .unwrap();
+        assert_eq!(
+            completed
+                .candidate()
+                .plan()
+                .result_port()
+                .unwrap()
+                .fields
+                .len(),
+            4
+        );
+        let packages = crate::query_execution::package_freeze::extract_checked_packages(
+            completed.candidate(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            FROZEN_CONSTANT_POLICY,
+            &FROZEN_PACKAGE_ADMISSION,
+            &control,
+        )
+        .unwrap();
+        let model = Arc::new(FragmentDecodeResourceModel::try_new(&control).unwrap());
+        let carrier = CompiledPackageCarrier::new(
+            FROZEN_PACKAGE_ADMISSION,
+            PackageEncodeLimits::FROZEN,
+            Arc::clone(&model),
+            PackageDecodeLimits::FROZEN.wire,
+        );
+        let mut values_nodes = 0;
+        let mut expression_positions = 0;
+        for package in packages.values() {
+            for node in package.fragment().nodes().values() {
+                let NodeKind::Values { rows } = &node.kind else {
+                    continue;
+                };
+                values_nodes += 1;
+                assert_eq!(rows.len(), 16_384);
+                for row in rows {
+                    assert_eq!(row.len(), 4);
+                    expression_positions += row.len();
+                }
+            }
+        }
+        assert_eq!(values_nodes, 1);
+        assert_eq!(expression_positions, 65_536);
+        let mut limited_values_packages = 0;
+        for (id, package) in packages {
+            let contains_values = package
+                .fragment()
+                .nodes()
+                .values()
+                .any(|node| matches!(&node.kind, NodeKind::Values { .. }));
+            if contains_values {
+                limited_values_packages += 1;
+                // Measure the complete legal producer bytes, then exercise an
+                // explicit caller budget one field below their actual usage.
+                let bytes =
+                    encode_fragment_package(&package, &PackageEncodeLimits::FROZEN, &control)
+                        .unwrap()
+                        .encode_to_vec();
+                let production = model
+                    .preflight(&bytes, PackageDecodeLimits::FROZEN.wire, &control)
+                    .expect("production accepts the complete legal four-column package");
+                assert_eq!(production.usage.input_bytes, bytes.len());
+                let mut receiver = PackageDecodeLimits::FROZEN.wire;
+                receiver.max_field_occurrences =
+                    production.usage.field_occurrences.checked_sub(1).unwrap();
+                let limited_carrier = CompiledPackageCarrier::new(
+                    FROZEN_PACKAGE_ADMISSION,
+                    PackageEncodeLimits::FROZEN,
+                    Arc::clone(&model),
+                    receiver,
+                );
+                let original = model
+                    .preflight(&bytes, receiver, &control)
+                    .expect_err("the explicit caller field limit must reject the full package");
+                assert_eq!(
+                    original,
+                    ResourceModelError::Limit("protobuf field occurrences exceed caller limit")
+                );
+                assert_eq!(original.failure_fact().class(), FailureClass::Resource);
+                let before =
+                    crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
+                let error = match FragmentArtifact::freeze_package(
+                    &package,
+                    completed.candidate().plan().edges(),
+                    &limited_carrier,
+                    &control,
+                ) {
+                    Err(error) => error,
+                    Ok(_) => panic!("an over-limit package must not produce its Native artifact"),
+                };
+                assert_eq!(error.failure_fact(), original.failure_fact());
+                let PackageFreezeError::Receiver(actual) = &error else {
+                    panic!("the original receiver resource author must survive artifact freezing");
+                };
+                assert_eq!(actual, &original);
+                let source = error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<ResourceModelError>()
+                    .unwrap();
+                assert!(std::ptr::eq(actual, source));
+                assert_eq!(
+                    crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread(),
+                    before,
+                    "the refused Values fragment creates no artifact"
+                );
+                // The caller-limited failure is separate from the normal
+                // production round trip, which must also accept this package.
+            }
+            let bytes = crate::query_execution::package_freeze::encode_checked_package(
+                &package, &carrier, &control,
+            )
+            .unwrap_or_else(|error| panic!("four-column original-scale fragment {id:?}: {error}"));
+            let projection = model
+                .preflight(&bytes, PackageDecodeLimits::FROZEN.wire, &control)
+                .unwrap();
+            assert_eq!(projection.usage.input_bytes, bytes.len());
+            let decoded =
+                decode_fragment_package(&bytes, &model, &PackageDecodeLimits::FROZEN, &control)
+                    .unwrap();
+            assert_eq!(decoded.fragment().id(), id);
+        }
+        assert_eq!(
+            limited_values_packages, 1,
+            "the caller-limited check uses the one actual full Values package"
+        );
+    }
+
     // Compile the original 1024-column statistics seed through the public
     // DML writer planner and production package ceilings. The marker handle
     // is a test-owned write declaration, not an Iceberg execution capability.
@@ -1784,7 +2221,10 @@ mod tests {
         for (id, package) in &packages {
             let bytes = crate::query_execution::package_freeze::encode_checked_package(
                 package,
-                &PackageEncodeLimits::FROZEN,
+                &CompiledPackageCarrier::for_test(
+                    FROZEN_PACKAGE_ADMISSION,
+                    PackageEncodeLimits::FROZEN,
+                ),
                 &control,
             )
             .unwrap_or_else(|error| panic!("wide INSERT fragment {id:?} encode: {error:#?}"));

@@ -342,6 +342,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
     clippy::too_many_arguments,
     reason = "Program, task capabilities, and schema preparation remain independently owned inputs."
 )]
+#[cfg(test)]
 pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
     program: Arc<novarocks_local_program::LocalProgram>,
     time_slice: Duration,
@@ -358,6 +359,50 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_sche
         &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
     >,
 ) -> ExecutionResult<PreparedPipelineExecution> {
+    prepare_compiled_program_with_sink_materializer(
+        program,
+        time_slice,
+        |_| Ok(crate::runtime::fragment::sink::MaterializedCompiledSink::single(sink)),
+        exchange_bindings,
+        scan_bindings,
+        writer_bindings,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        event_sink,
+        schema_preparation,
+    )
+    .map_err(|error| error.cause().clone())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Program, Task capabilities, and schema preparation remain independently owned inputs."
+)]
+// Design: ADR-0206 (docs/adr/ADR-0206-frozen-write-placement-and-task-completion-assembly.md)
+pub(crate) fn prepare_compiled_program_with_sink_materializer(
+    program: Arc<novarocks_local_program::LocalProgram>,
+    time_slice: Duration,
+    materialize: impl FnOnce(
+        std::num::NonZeroUsize,
+    ) -> Result<
+        crate::runtime::fragment::sink::MaterializedCompiledSink,
+        crate::runtime::fragment::error::FragmentLaunchError,
+    >,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    event_sink: Arc<dyn FragmentEventSink>,
+    schema_preparation: Option<
+        &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+    >,
+) -> Result<PreparedPipelineExecution, crate::runtime::fragment::error::FragmentLaunchError> {
+    let mut graph = (|| -> ExecutionResult<PipelineGraph> {
     for node_id in exchange_bindings.node_ids() {
         let binding = exchange_bindings.get(node_id).ok_or_else(|| {
             crate::runtime::fragment::ExecutionFailure::from(
@@ -424,11 +469,42 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_sche
         execution_runtime.function_set().clone(),
         runtime_state.error_state(),
         ordered.as_ref(),
+        execution_runtime.config().local_exchange_buffer_mem_limit_per_driver,
+        execution_runtime.config().local_exchange_max_buffered_rows,
     )?;
+        Ok(graph)
+    })().map_err(compiled_pipeline_launch_error)?;
+    let mut roots = graph
+        .pipelines
+        .iter()
+        .filter(|pipeline| pipeline.id == graph.root_id);
+    let root = roots.next().ok_or_else(|| {
+        compiled_pipeline_launch_error(crate::exec::fragment::error::program_binding_failure(
+            crate::exec::fragment::error::FragmentBindingErrorKind::MissingAssignment,
+            "compiled computing graph has no root pipeline",
+        ))
+    })?;
+    let width = usize::try_from(root.dop)
+        .ok()
+        .and_then(std::num::NonZeroUsize::new);
+    if roots.next().is_some() || !root.needs_sink || width.is_none() {
+        return Err(compiled_pipeline_launch_error(
+            crate::exec::fragment::error::program_binding_failure(
+                crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
+                "compiled computing graph has invalid root geometry",
+            ),
+        ));
+    }
+    let sink = materialize(width.expect("positive original root width was checked"))?;
+    if let Some(summary) = sink.summary {
+        graph
+            .append_summary_pipeline(summary.source, summary.sink)
+            .map_err(compiled_pipeline_launch_error)?;
+    }
     prepare_pipeline_execution_from_graph(
         graph,
         time_slice,
-        sink,
+        sink.root,
         exchange_finst_id,
         profiler,
         pipeline_dop,
@@ -439,6 +515,20 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_sche
         event_sink,
         true,
         schema_preparation,
+    )
+    .map_err(compiled_pipeline_launch_error)
+}
+
+fn compiled_pipeline_launch_error(
+    cause: ExecutionFailure,
+) -> crate::runtime::fragment::error::FragmentLaunchError {
+    use crate::runtime::fragment::error::{
+        FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage,
+    };
+    FragmentLaunchError::from_failure(
+        FragmentLaunchStage::BuildPipelines,
+        FragmentLaunchErrorKind::PipelineBuild,
+        cause,
     )
 }
 

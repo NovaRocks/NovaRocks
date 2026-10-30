@@ -18,9 +18,9 @@ code-anchors:
   - "novarocks/spi/src/connector/write_stack/relation.rs (writer_output_schema, root_output_schema)"
   - "novarocks/execution/src/exec/operators/table_writer.rs (TableWriterOperatorFactory)"
   - "novarocks/execution/src/exec/operators/table_finish.rs (TableFinishOperatorFactory)"
-  - "novarocks/backend/src/connector/write_data_plane.rs (RootCommitFragmentCarrierValidator)"
-  - "novarocks/frontend/src/query_execution/write_barrier.rs (WriteCommitBarrier)"
-  - "novarocks/frontend/src/query_execution/write_session.rs (ConnectorWriteSession)"
+  - "novarocks/native-adapter/src/connector_write_data_plane.rs (RootCommitFragmentCarrierValidator)"
+  - "novarocks/frontend-application/src/query_execution/internal_consumer/write.rs (wait_write)"
+  - "novarocks/frontend-application/src/query_execution/write_session.rs (ConnectorWriteSession)"
   - "novarocks/connector/iceberg/src/commit/write_stack/control.rs (IcebergWriteSessionControl)"
 ---
 

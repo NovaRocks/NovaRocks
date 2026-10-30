@@ -136,9 +136,13 @@ pub(crate) fn assemble_manifest_round(
     let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
     // Freeze declaration before submissions are consumed; never infer writers
     // from the subset of Task statuses that happens to report writer facts.
-    let writer_fragments = manifest
+    let writers = manifest
         .writer_cohorts()
-        .map(|cohort| cohort.fragment())
+        .map(|cohort| cohort.task())
+        .collect::<std::collections::BTreeSet<_>>();
+    let summary_sources = manifest
+        .summary_sources()
+        .map(|(task, _)| task)
         .collect::<std::collections::BTreeSet<_>>();
     let mut plans = SubmissionFragmentPlans::index_manifest(submissions, manifest)?;
     let graph = build_task_graph_from_manifest(manifest, &mut plans, transport.transport_budget)?;
@@ -243,7 +247,8 @@ pub(crate) fn assemble_manifest_round(
     .observing(Arc::clone(&split_delivery) as Arc<dyn AcknowledgementObserver>)
     .observing(actor_observer)
     .with_connector_blocking_io(connector_blocking_io);
-    let protocol_facts = round.install_protocol_facts(manifest.plan(), &writer_fragments)?;
+    let protocol_facts =
+        round.install_protocol_facts(manifest.plan(), &writers, &summary_sources)?;
     let convergence =
         NativeAttemptConvergenceOwner::new(&round, convergence_source, convergence_targets)?;
     Ok(ManifestAssembledRound {
@@ -289,6 +294,8 @@ impl ManifestAssembledRound {
         self.split_failure = guard
             .as_ref()
             .map(SplitAssignmentRoundGuard::failure_source);
+        self.convergence
+            .bind_split_failure_source(self.split_failure.clone());
         if let Some(diagnostics) = self.profile_diagnostics.as_mut() {
             diagnostics.set_split_profile_source(
                 guard
@@ -608,9 +615,15 @@ impl ManifestAssembledRound {
             {
                 self.record_protocol_failure(TaskExecutionError::SplitAssignment(error));
             }
-            let success_sealed = completion == ManifestAttemptCompletion::AcceptedRootSuccessSeal
-                && self.round.accepted_root_success_sealed();
-            if success_sealed {
+            // Root output is its own accepted cut. A strict writer/source
+            // tail can still owe the independent internal consumer a terminal
+            // fact, so the original run must keep folding its Task statuses.
+            // Normal drain starts only after those frozen obligations finish;
+            // a DemandDriven read has no such tail and keeps its early return.
+            let success_ready = completion == ManifestAttemptCompletion::AcceptedRootSuccessSeal
+                && self.round.accepted_root_success_sealed()
+                && self.round.execution().normal_drain_started();
+            if success_ready {
                 if let Some(residual) = self.pending_terminal.take() {
                     tracing::warn!(
                         ?residual,
@@ -623,7 +636,7 @@ impl ManifestAssembledRound {
                     return terminal;
                 }
             }
-            if !success_sealed
+            if !success_ready
                 && (self.pending_terminal.is_none()
                     || self.pending_pre_ready.is_some_and(PendingPreReadyObservation::is_unknown)
                     || self.pending_terminal.as_ref().is_some_and(|pending| {
@@ -646,7 +659,7 @@ impl ManifestAssembledRound {
                     return terminal;
                 }
             }
-            if !success_sealed
+            if !success_ready
                 && matches!(
                     self.pending_pre_ready,
                     Some(PendingPreReadyObservation::RejectedIdentity { .. })
@@ -671,7 +684,7 @@ impl ManifestAssembledRound {
                     self.pending_pre_ready = None;
                 }
             }
-            if !success_sealed
+            if !success_ready
                 && self.pending_pre_ready.is_some()
                 && let Some(reason) = cancellation.reason()
             {
@@ -682,13 +695,13 @@ impl ManifestAssembledRound {
                 self.terminal = Some(terminal.clone());
                 return terminal;
             }
-            if !success_sealed && self.pending_pre_ready.is_some() && process_changes.is_none() {
+            if !success_ready && self.pending_pre_ready.is_some() && process_changes.is_none() {
                 // Subscribe for this exact pending Establish before its first
                 // process read. Ordinary attempts never acquire this observer.
                 process_changes = Some(self.convergence.subscribe_process_changes());
             }
-            let waiting_for_process = !success_sealed && self.pending_pre_ready_must_wait();
-            if !success_sealed && self.pending_terminal.is_some() && !waiting_for_process {
+            let waiting_for_process = !success_ready && self.pending_pre_ready_must_wait();
+            if !success_ready && self.pending_terminal.is_some() && !waiting_for_process {
                 // A Task-protocol failure is already an authoritative attempt
                 // terminal. Closing the actor gate prevents any further
                 // admission, but outstanding actor-owned transport effects
@@ -704,17 +717,7 @@ impl ManifestAssembledRound {
                 self.terminal = Some(terminal.clone());
                 return terminal;
             }
-            let completed = match completion {
-                ManifestAttemptCompletion::AcceptedRootSuccessSeal => {
-                    self.round.accepted_root_success_sealed()
-                }
-            };
-            if !waiting_for_process && completed && self.actor_gate.prepare_convergence() {
-                let terminal = NativeAttemptTerminal::Completed;
-                self.terminal = Some(terminal.clone());
-                return terminal;
-            }
-            if !success_sealed
+            if !success_ready
                 && let Some(reason) = cancellation.reason()
                 && self.actor_gate.prepare_convergence()
             {
@@ -727,7 +730,7 @@ impl ManifestAssembledRound {
             }
             tokio::select! {
                 _ = notified => {}
-                reason = cancellation.cancelled(), if !success_sealed => {
+                reason = cancellation.cancelled(), if !success_ready => {
                     if self.actor_gate.prepare_convergence() || waiting_for_process {
                         let terminal = self.terminal_after_pre_ready_stop(reason);
                         self.terminal = Some(terminal.clone());
@@ -3927,4 +3930,5 @@ mod tests {
             assert!(empty, "Completed must not hide an orphan gate: {retained}");
         }
     }
+    include!("manifest_round_native_tail_tests.rs");
 }

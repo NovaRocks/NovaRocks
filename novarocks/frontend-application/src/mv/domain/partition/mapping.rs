@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::mv::domain::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
-use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
+use crate::mv::domain::storage_observation::MvSourceSchemaObservation;
 use novarocks_mv_application::persistence::codec::{ExpressionKind, TargetPartitionTransform};
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::persistence::schema::{
@@ -26,17 +26,183 @@ use novarocks_spi::connector::{
     ConnectorChangePartition, ConnectorChangePartitionTransform, ConnectorChangePartitionValue,
 };
 
+use crate::mv::domain::model::AffectedTargetPartitions;
+use novarocks_spi::connector::read_stack::ConnectorPreparedSourceRead;
+use novarocks_spi::connector::{
+    ConnectorChangeWindowAdmission, ConnectorChangeWindowPartitionImpact,
+    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+};
+
+#[derive(Debug)]
+enum PartitionMappingFailure {
+    Connector(ConnectorError),
+    NotDerived(&'static str),
+}
+impl From<&str> for PartitionMappingFailure {
+    fn from(message: &str) -> Self {
+        Self::Connector(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            message,
+        ))
+    }
+}
+impl From<String> for PartitionMappingFailure {
+    fn from(message: String) -> Self {
+        Self::Connector(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            message,
+        ))
+    }
+}
+impl std::fmt::Display for PartitionMappingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connector(error) => std::fmt::Display::fmt(error, f),
+            Self::NotDerived(message) => f.write_str(message),
+        }
+    }
+}
+
+/// The only production impact entry: a copied admission cannot claim a source/spec author.
+pub(crate) fn plan_prepared_source_partitions(
+    projection: &StoredKeyedMvProjection,
+    source_occurrence_id: u32,
+    source: &MvSourceSchemaObservation,
+    planning: &ConnectorControlPlanningLease,
+    prepared: &ConnectorPreparedSourceRead,
+    target_partition: &MvPartitionContract,
+) -> Result<AffectedTargetPartitions, ConnectorError> {
+    prepared.request().observed_source_facts().validate_owner(
+        &novarocks_spi::connector::ConnectorProviderBindingKey {
+            instance_id: planning.binding().descriptor().instance_id.clone(),
+            incarnation: planning.binding().incarnation(),
+        },
+    )?;
+    if prepared.binding().descriptor() != planning.binding().descriptor()
+        || prepared.binding().catalog_handle() != planning.binding().catalog_handle()?
+        || prepared.request().object_id() != source.table_object_id()
+        || &prepared.to_metadata().identity != source.table()
+        || prepared.to_metadata().version.as_ref() != Some(source.schema_version())
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "partition impact differs from its original prepared source generation",
+        ));
+    }
+    let occurrence = projection
+        .facts
+        .definition()
+        .relation_occurrences
+        .iter()
+        .find(|value| value.occurrence_id == source_occurrence_id)
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "partition impact names no D occurrence",
+            )
+        })?;
+    if occurrence.catalog_at_binding != source.table().instance_id.as_str()
+        || !novarocks_mv_application::persistence::exact_revision::persisted_object_names(
+            &occurrence.object_id,
+            source.table_object_id(),
+        )?
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "partition impact does not belong to the original D source occurrence",
+        ));
+    }
+    if target_partition.fields.is_empty() && prepared.admission().is_some() {
+        return Ok(AffectedTargetPartitions::Unpartitioned);
+    }
+    match prepared.admission() {
+        Some(ConnectorChangeWindowAdmission::MetadataOnly) => {
+            Ok(AffectedTargetPartitions::known(std::iter::empty()))
+        }
+        Some(ConnectorChangeWindowAdmission::FullRebuild(_)) => {
+            Ok(AffectedTargetPartitions::not_derived(
+                "connector change-window admission requires a full rebuild",
+            ))
+        }
+        Some(ConnectorChangeWindowAdmission::Incremental {
+            partition_impact, ..
+        }) => derive_prepared_partition_impact(
+            projection,
+            source_occurrence_id,
+            source,
+            target_partition,
+            partition_impact,
+        ),
+        None => Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "snapshot preparation cannot authorize a change-window partition impact",
+        )),
+    }
+}
+
+/// Pure derivation kernel; its production caller borrows impact only from the validated receipt above.
+fn derive_prepared_partition_impact(
+    projection: &StoredKeyedMvProjection,
+    source_occurrence_id: u32,
+    source: &MvSourceSchemaObservation,
+    target_partition: &MvPartitionContract,
+    impact: &ConnectorChangeWindowPartitionImpact,
+) -> Result<AffectedTargetPartitions, ConnectorError> {
+    Ok(match impact {
+        ConnectorChangeWindowPartitionImpact::Unavailable => AffectedTargetPartitions::not_derived(
+            "connector change-window partition impact is unavailable",
+        ),
+        ConnectorChangeWindowPartitionImpact::Unpartitioned => {
+            if target_partition.fields.is_empty() {
+                AffectedTargetPartitions::Unpartitioned
+            } else {
+                AffectedTargetPartitions::not_derived(
+                    "unpartitioned source changes cannot identify target partitions",
+                )
+            }
+        }
+        ConnectorChangeWindowPartitionImpact::Exact {
+            has_row_deletes,
+            added,
+            removed,
+        } => {
+            if *has_row_deletes {
+                return Ok(AffectedTargetPartitions::not_derived(
+                    "row-level delete affected partitions require row-evaluation fallback",
+                ));
+            }
+            let mut partitions = Vec::with_capacity(added.len() + removed.len());
+            for partition in added.iter().chain(removed) {
+                match map_partition_fields(
+                    projection,
+                    source_occurrence_id,
+                    source,
+                    target_partition,
+                    partition,
+                ) {
+                    Ok(Some(key)) => partitions.push(key),
+                    Ok(None) => return Ok(AffectedTargetPartitions::Unpartitioned),
+                    Err(PartitionMappingFailure::NotDerived(reason)) => {
+                        return Ok(AffectedTargetPartitions::not_derived(reason));
+                    }
+                    Err(PartitionMappingFailure::Connector(error)) => return Err(error),
+                }
+            }
+            AffectedTargetPartitions::known(partitions)
+        }
+    })
+}
+
 /// Derive one target key only when D's output lineage and L's exact partition
 /// binding prove that each target field is the same source field and transform
 /// as the provider's per-file impact. Any weaker relation requires a full scan.
-pub(crate) fn map_connector_partition_to_mv_key(
+fn map_partition_fields(
     projection: &StoredKeyedMvProjection,
     source_occurrence_id: u32,
-    source_observation: &MvSchemaValidationObservation,
+    source_observation: &MvSourceSchemaObservation,
     target_partition: &MvPartitionContract,
     connector_partition: &ConnectorChangePartition,
-) -> Result<Option<MvPartitionKey>, String> {
-    let schema = source_observation.exact_schema();
+) -> Result<Option<MvPartitionKey>, PartitionMappingFailure> {
     let occurrence = projection
         .facts
         .definition()
@@ -47,30 +213,24 @@ pub(crate) fn map_connector_partition_to_mv_key(
     if occurrence.catalog_at_binding != source_observation.table().instance_id.as_str()
         || !novarocks_mv_application::persistence::exact_revision::persisted_object_names(
             &occurrence.object_id,
-            &schema.object_id,
+            source_observation.table_object_id(),
         )
-        .map_err(|error| error.to_string())?
+        .map_err(PartitionMappingFailure::Connector)?
     {
         return Err(
-            "connector partition impact does not belong to an exact D source occurrence"
-                .to_string(),
+            "connector partition impact does not belong to an exact D source occurrence".into(),
         );
     }
-    if connector_partition.partition_spec_identity().as_ref()
-        != schema.partition_spec_version.as_bytes()
-    {
-        return Err("connector partition impact uses a different source partition spec".into());
-    }
     for field in connector_partition.fields() {
-        if !schema
-            .fields
+        if !source_observation
+            .fields()
             .iter()
             .any(|observed| observed.field_id.as_bytes() == field.source_field_identity().as_ref())
         {
             return Err(format!(
                 "connector partition impact references source field {} outside the exact schema observation",
                 field.source_column()
-            ));
+            ).into());
         }
     }
     let definition = projection.facts.definition();
@@ -98,11 +258,13 @@ pub(crate) fn map_connector_partition_to_mv_key(
             || output.expression.source_fields.len() != 1
             || output.expression.source_fields[0].occurrence_id != source_occurrence_id
         {
-            return Err("target partition output is not one direct source field".into());
+            return Err(PartitionMappingFailure::NotDerived(
+                "target partition output is not one direct source field",
+            ));
         }
         let source_id = &output.expression.source_fields[0].field_id;
-        let source_field = schema
-            .fields
+        let source_field = source_observation
+            .fields()
             .iter()
             .find(|field| field.field_id == *source_id)
             .ok_or("direct target partition source is absent from the exact observation")?;
@@ -118,7 +280,9 @@ pub(crate) fn map_connector_partition_to_mv_key(
                 field.source_field_identity().as_ref() == source_id.as_bytes()
                     && impact_transform_matches(&binding.transform, field.transform())
             })
-            .ok_or("source partition impact cannot derive the target transform")?;
+            .ok_or(PartitionMappingFailure::NotDerived(
+                "source partition impact cannot derive the target transform",
+            ))?;
         fields.push(MvPartitionKeyField::new(
             binding.partition_field_id.clone(),
             match impact.value() {
@@ -197,9 +361,8 @@ mod tests {
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{
         ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
-        ConnectorChangePartitionValue, ConnectorCommittedVersion, ConnectorInstanceId,
-        ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectId,
-        MvObservedSourceField, MvSchemaValidationObservation as SpiObservation,
+        ConnectorChangePartitionValue, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorTableIdentity, ConnectorTableObjectId, MvObservedSourceField,
     };
     use std::sync::Arc;
 
@@ -225,27 +388,20 @@ mod tests {
         }
     }
 
-    fn observation(object: &'static [u8]) -> MvSchemaValidationObservation {
+    fn observation(object: &'static [u8]) -> MvSourceSchemaObservation {
         let context = context();
-        crate::mv::domain::storage_observation::schema_validation_from_spi(
-            SpiObservation::try_new(
+        crate::mv::domain::storage_observation::source_schema_from_spi(
+            novarocks_spi::connector::MvSourceSchemaObservation::try_new(
                 ConnectorTableIdentity {
                     instance_id: ConnectorInstanceId::parse("ice").unwrap(),
                     namespace: Arc::from("sales"),
                     table: Arc::from("orders"),
                 },
                 ConnectorTableObjectId::try_new(Bytes::from_static(object)).unwrap(),
-                ConnectorCommittedVersion::try_new(
-                    Bytes::from_static(b"source-metadata"),
-                    Some(11),
-                )
-                .unwrap(),
                 Bytes::from_static(&[1]),
-                Bytes::from_static(&[4]),
                 true,
                 true,
-                vec![(
-                    0,
+                vec![
                     MvObservedSourceField::try_new(
                         Bytes::from_static(&[1]),
                         "order_id".to_string(),
@@ -253,8 +409,7 @@ mod tests {
                         false,
                     )
                     .unwrap(),
-                )],
-                vec![],
+                ],
                 &context,
             )
             .unwrap(),
@@ -336,7 +491,7 @@ mod tests {
     fn exact_partition_impact_derives_direct_bound_target_key() {
         let projection = partitioned_projection();
         assert_eq!(
-            map_connector_partition_to_mv_key(
+            map_partition_fields(
                 &projection,
                 7,
                 &observation(&[11]),
@@ -363,15 +518,26 @@ mod tests {
             partition().fields().to_vec(),
         )
         .unwrap();
-        let error = map_connector_partition_to_mv_key(
+        let original = map_partition_fields(
+            &projection,
+            7,
+            &observation(&[11]),
+            &target_partition(),
+            &partition(),
+        )
+        .unwrap();
+        let changed = map_partition_fields(
             &projection,
             7,
             &observation(&[11]),
             &target_partition(),
             &changed_spec,
         )
-        .unwrap_err();
-        assert!(error.contains("different source partition spec"), "{error}");
+        .unwrap();
+        assert_eq!(
+            changed, original,
+            "field derivation must not compare an opaque prepared spec token with Current default spec"
+        );
     }
 
     #[test]
@@ -381,7 +547,7 @@ mod tests {
             target_spec_id: 0,
             fields: vec![],
         };
-        let error = map_connector_partition_to_mv_key(
+        let error = map_partition_fields(
             &projection,
             7,
             &observation(&[11]),
@@ -389,9 +555,9 @@ mod tests {
             &partition(),
         )
         .unwrap_err();
-        assert!(error.contains("canonical L"), "{error}");
+        assert!(error.to_string().contains("canonical L"), "{error}");
 
-        let error = map_connector_partition_to_mv_key(
+        let error = map_partition_fields(
             &projection,
             7,
             &observation(&[12]),
@@ -399,6 +565,49 @@ mod tests {
             &partition(),
         )
         .unwrap_err();
-        assert!(error.contains("exact D source occurrence"), "{error}");
+        assert!(
+            error.to_string().contains("exact D source occurrence"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn prepared_unpartitioned_impact_is_preserved_without_decoding_spec_identity() {
+        let projection = projection();
+        let target = MvPartitionContract {
+            target_spec_id: 0,
+            fields: vec![],
+        };
+        assert_eq!(
+            derive_prepared_partition_impact(
+                &projection,
+                7,
+                &observation(&[11]),
+                &target,
+                &ConnectorChangeWindowPartitionImpact::Unpartitioned
+            )
+            .unwrap(),
+            AffectedTargetPartitions::Unpartitioned
+        );
+    }
+
+    #[test]
+    fn prepared_row_deletes_remain_non_derivable() {
+        let projection = projection();
+        let target = MvPartitionContract {
+            target_spec_id: 0,
+            fields: vec![],
+        };
+        let impact = ConnectorChangeWindowPartitionImpact::Exact {
+            has_row_deletes: true,
+            added: vec![],
+            removed: vec![],
+        };
+        let result =
+            derive_prepared_partition_impact(&projection, 7, &observation(&[11]), &target, &impact)
+                .unwrap();
+        assert_eq!(
+            result.not_derived_reason(),
+            Some("row-level delete affected partitions require row-evaluation fallback")
+        );
     }
 }

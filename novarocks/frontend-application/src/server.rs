@@ -1643,7 +1643,8 @@ mod tests {
         let StatementResult::GovernedCompletion(result) = result else {
             panic!("successful statement must retain its owner through terminal OK");
         };
-        let mut protocol = result.into_protocol();
+        let (completion, mut protocol) = result.into_parts();
+        assert_eq!(completion.affected_rows(), 0);
         let _ = protocol.seal_success_visibility();
         let _ = protocol.complete();
         terminal.complete();
@@ -2496,7 +2497,8 @@ mod tests {
                     "query timeout SET did not return its governed completion"
                 ));
             };
-            let mut protocol = result.into_protocol();
+            let (completion, mut protocol) = result.into_parts();
+            ensure!(completion.affected_rows() == 0, "SET has no affected rows");
             let seal = protocol.seal_success_visibility();
             let finish = protocol.complete();
             terminal.complete();

@@ -30,6 +30,9 @@ use novarocks_type_contract::{
 };
 use std::sync::Arc;
 
+mod literal_run;
+pub(crate) use literal_run::{admit_syntax_constant_run, syntax_run_carrier};
+
 pub(crate) fn admit_syntax_constant(
     value: &LiteralValue,
     value_type: &FunctionValueType,
@@ -39,23 +42,7 @@ pub(crate) fn admit_syntax_constant(
     let phase = CompilePhase::FunctionSpecialization;
     let mut work = CompileCheckpoints::try_new(control, phase)?;
     let result = (|| {
-        novarocks_functions::validate_function_value_type_observed(value_type, &mut work).map_err(
-            |error| match error {
-                novarocks_functions::KernelFailure::CompileControl(cause) => {
-                    ConstantError::Control(cause)
-                }
-                novarocks_functions::KernelFailure::Cancelled => {
-                    ConstantError::Control(novarocks_type_contract::CompileControlError::Cancelled)
-                }
-                novarocks_functions::KernelFailure::DeadlineExceeded => ConstantError::Control(
-                    novarocks_type_contract::CompileControlError::DeadlineExceeded,
-                ),
-                novarocks_functions::KernelFailure::ResourceExhausted => ConstantError::Control(
-                    novarocks_type_contract::CompileControlError::ResourceExhausted,
-                ),
-                error => ConstantError::from_domain(error),
-            },
-        )?;
+        validate_syntax_type(value_type, &mut work)?;
         let field = Arc::new(arrow::datatypes::Field::new(
             "literal",
             value_type.data_type().clone(),
@@ -100,11 +87,7 @@ pub(crate) fn admit_syntax_constant(
             LiteralValue::Int(value) => {
                 macro_rules! signed {
                     ($array:ty, $native:ty) => {{
-                        let value = <$native>::try_from(*value).map_err(|_| {
-                            ConstantError::Invalid(
-                                "SQL integer syntax exceeds its declared carrier",
-                            )
-                        })?;
+                        let value = syntax_integer_value::<$native>(*value)?;
                         Arc::new(<$array>::from(vec![value])) as ArrayRef
                     }};
                 }
@@ -167,12 +150,7 @@ pub(crate) fn admit_syntax_constant(
             LiteralValue::Float(value) => match value_type.data_type() {
                 DataType::Float64 => scalar!(from_f64_bits, value.to_bits()),
                 DataType::Float32 => {
-                    let narrowed = *value as f32;
-                    if f64::from(narrowed).to_bits() != value.to_bits() {
-                        return Err(ConstantError::Invalid(
-                            "SQL FLOAT syntax is not exact in its declared Float32 carrier",
-                        ));
-                    }
+                    let narrowed = syntax_float32_value(*value)?;
                     let array = arrow::array::Float32Array::from(vec![narrowed]);
                     work.flush()?;
                     ConstantValue::from_scalar_array(
@@ -238,6 +216,45 @@ pub(crate) fn admit_syntax_constant(
         Ok(checked)
     })();
     work.finish_result(result, ConstantError::from)
+}
+
+// First scalar and VALUES run creation share the same original syntax
+// checks. They keep their own actual construction recipe and backing owner.
+fn validate_syntax_type(
+    value_type: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ConstantError> {
+    novarocks_functions::validate_function_value_type_observed(value_type, work).map_err(
+        |error| match error {
+            novarocks_functions::KernelFailure::CompileControl(cause) => {
+                ConstantError::Control(cause)
+            }
+            novarocks_functions::KernelFailure::Cancelled => {
+                ConstantError::Control(novarocks_type_contract::CompileControlError::Cancelled)
+            }
+            novarocks_functions::KernelFailure::DeadlineExceeded => ConstantError::Control(
+                novarocks_type_contract::CompileControlError::DeadlineExceeded,
+            ),
+            novarocks_functions::KernelFailure::ResourceExhausted => ConstantError::Control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            ),
+            error => ConstantError::from_domain(error),
+        },
+    )?;
+    Ok(())
+}
+fn syntax_integer_value<T: TryFrom<i64>>(value: i64) -> Result<T, ConstantError> {
+    T::try_from(value)
+        .map_err(|_| ConstantError::Invalid("SQL integer syntax exceeds its declared carrier"))
+}
+fn syntax_float32_value(value: f64) -> Result<f32, ConstantError> {
+    let narrowed = value as f32;
+    if f64::from(narrowed).to_bits() != value.to_bits() {
+        return Err(ConstantError::Invalid(
+            "SQL FLOAT syntax is not exact in its declared Float32 carrier",
+        ));
+    }
+    Ok(narrowed)
 }
 
 /// Read exact plain SQL spelling into the declared unscaled coefficient.

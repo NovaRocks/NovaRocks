@@ -91,15 +91,26 @@ runtime-inputs = [
     "tests/fixtures/iceberg-rest-publication/src/**",
 ]
 env-inputs = [
-    { name = "NOVA_FIXTURE_STORE", kind = "value" },
     { name = "NOVA_TRINO_IMAGE", kind = "value" },
+    { name = "PATH", kind = "value" },
     { name = "HOME", kind = "value" },
+    { name = "TMPDIR", kind = "value" },
+    { name = "LANG", kind = "value" },
+    { name = "LC_ALL", kind = "value" },
+    { name = "SSL_CERT_FILE", kind = "file-content" },
+    { name = "DOCKER_CONTEXT", kind = "value" },
+    { name = "DOCKER_HOST", kind = "value" },
+    { name = "DOCKER_TLS_VERIFY", kind = "value" },
+    { name = "DOCKER_CERT_PATH", kind = "value" },
+    { name = "DOCKER_CONFIG", kind = "value" },
+    { name = "XDG_CONFIG_HOME", kind = "value" },
     { name = "XDG_CACHE_HOME", kind = "value" },
-    { name = "UEA7_TEST_CONTROL_URI", kind = "value" },
+    { name = "XDG_STATE_HOME", kind = "value" },
+    { name = "NOVA_FIXTURE_STORE", kind = "value" },
     { name = "NOVAROCKS_UEA4G_ORACLE_RECEIPT", kind = "file-content" },
     { name = "NOVAROCKS_UEA4G_ORACLE_OUTPUT", kind = "value" },
 ]
 ignored = [
-    { filter = "test(=actors::catalog::tests::reads_live_fixture_trace_and_metrics)", class = "heavy", requires = ["fixture:iceberg-rest-publication"], reason = "Requires a live isolated publication fixture control endpoint" },
+    { filter = "test(=actors::catalog::tests::reads_live_fixture_trace_and_metrics)", class = "heavy", requires = ["fixture:docker"], reason = "Owns an isolated publication-hook fixture; requires Docker and locally provisioned fixture inputs" },
     { filter = "test(=scenarios::iceberg_delete_oracle::tests::frozen_receipt_replay_without_native)", class = "heavy", requires = ["dataset:iceberg-java-oracle"], reason = "Requires an independently prepared frozen Java oracle receipt and captured output" },
 ]

@@ -270,7 +270,8 @@ mod tests {
                     &[200],
                     &RequestContext::with_deadline((started + policy.evidence).into()),
                 )
-                .await;
+                .await
+                .expect("the original transport fixture has no MIO admission source");
             assert!(
                 matches!(
                     stage,
@@ -304,7 +305,8 @@ mod tests {
                 &[200],
                 &RequestContext::with_deadline((started + Duration::from_millis(100)).into()),
             )
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO admission source");
         assert!(matches!(
             stage,
             crate::rest_protocol::evidence::DispatchStage::WrittenNoStatus(_)

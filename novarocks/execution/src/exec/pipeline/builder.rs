@@ -95,6 +95,42 @@ pub struct PipelineGraph {
     pub root_id: i32,
 }
 
+impl PipelineGraph {
+    /// Add a complete independent summary pipeline to this Task's graph.
+    /// Its single driver joins the same batch and completion owner.
+    pub(crate) fn append_summary_pipeline(
+        &mut self,
+        source: Box<dyn OperatorFactory>,
+        sink: Box<dyn OperatorFactory>,
+    ) -> ExecutionResult<()> {
+        let mut ids = std::collections::BTreeSet::new();
+        if self
+            .pipelines
+            .iter()
+            .any(|pipeline| !ids.insert(pipeline.id))
+            || !ids.contains(&self.root_id)
+        {
+            return Err(program_failure(
+                crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
+                "compiled pipeline identities do not define one original root",
+            ));
+        }
+        let id = ids.last().and_then(|id| id.checked_add(1)).ok_or_else(|| {
+            program_failure(
+                crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
+                "compiled summary pipeline identity is exhausted",
+            )
+        })?;
+        self.pipelines.push(PipelinePlan {
+            id,
+            factories: vec![source, sink],
+            dop: 1,
+            needs_sink: false,
+        });
+        Ok(())
+    }
+}
+
 struct PipelineBuildResult {
     pipeline: PipelinePlan,
     extra_pipelines: Vec<PipelinePlan>,
@@ -234,6 +270,66 @@ fn shuffle_compiled_group_input_slots(
         distribution,
         partition_count,
     )
+}
+
+/// The receiver/assertion has already frozen its typed key and applicability.
+/// DriverV1 routing is independent of the network's InstanceV1 selection.
+fn shuffle_compiled_typed_keys(
+    mut build: PipelineBuildResult,
+    ctx: &mut PipelineBuildContext,
+    owner_node_id: i32,
+    keys: Vec<(
+        novarocks_types::SlotId,
+        novarocks_type_contract::FunctionValueType,
+    )>,
+    applies: Option<novarocks_types::SlotId>,
+    partition_count: usize,
+) -> PipelineBuildResult {
+    if partition_count <= 1 {
+        build.stream = StreamDesc::single();
+        return build;
+    }
+    let slots = keys.iter().map(|(slot, _)| *slot).collect();
+    let producer_count = build.pipeline.dop.max(1) as usize;
+    let spec = match applies {
+        Some(applies) => LocalExchangePartitionSpec::ConditionalKey { applies, keys },
+        None => LocalExchangePartitionSpec::HierarchicalInputSlotIds(keys),
+    };
+    let exchanger = LocalExchanger::new_with_limits(
+        partition_count,
+        producer_count,
+        spec,
+        ctx.local_exchange_buffer_mem_limit_per_driver,
+        ctx.local_exchange_max_buffered_rows,
+    );
+    build
+        .pipeline
+        .factories
+        .push(Box::new(LocalExchangeSinkFactory::new(
+            owner_node_id,
+            Arc::clone(&exchanger),
+        )));
+    build.pipeline.needs_sink = false;
+    let source = Box::new(LocalExchangeSourceFactory::new(
+        owner_node_id,
+        partition_count,
+        exchanger,
+    ));
+    let pipeline = new_source_pipeline_with_dop(ctx, source, partition_count as i32);
+    let mut extra_pipelines = build.extra_pipelines;
+    extra_pipelines.push(build.pipeline);
+    PipelineBuildResult {
+        pipeline,
+        extra_pipelines,
+        stream: StreamDesc {
+            dop: partition_count as i32,
+            distribution: Distribution::HashInputSlots {
+                slots,
+                partitions: partition_count,
+                hash_version: 1,
+            },
+        },
+    }
 }
 
 fn shuffle_input_slots_with_distribution(

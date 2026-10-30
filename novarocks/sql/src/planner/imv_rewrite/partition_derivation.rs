@@ -163,6 +163,8 @@ mod tests {
         ctx.set_extension::<ImvExtension>(ImvExtension {
             snapshot: crate::compiler::mv_rewrite::test_incremental_snapshot(),
             annotation: ImvPlanAnnotation {
+                target_read:
+                    crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
                 partition: None,
                 change_stream: ImvChangeStreamDescriptor {
                     join_refresh: Some(descriptor.clone()),

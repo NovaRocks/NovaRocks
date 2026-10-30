@@ -149,6 +149,22 @@ pub trait ConnectorViewMetadata: Send + Sync {
         &self,
         request: ConnectorListViewsRequest,
     ) -> Result<Vec<ConnectorViewIdentity>, ConnectorError>;
+
+    /// Enumerate with the same request facts without a synchronous bridge.
+    /// Providers must explicitly support this path; there is no sync fallback.
+    fn list_views_async(
+        &self,
+        request: ConnectorListViewsRequest,
+        cpu: Arc<dyn super::ProviderMetadataCpuPort>,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorViewIdentity>, ConnectorError>> {
+        Box::pin(async move {
+            let _ = (request, cpu);
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector view metadata does not support asynchronous listing",
+            ))
+        })
+    }
 }
 
 pub(crate) fn validate_view_metadata_owner(
@@ -178,6 +194,7 @@ mod tests {
     struct ViewCapability {
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
+        list_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl ConnectorViewMetadata for ViewCapability {
@@ -207,6 +224,8 @@ mod tests {
             &self,
             _: ConnectorListViewsRequest,
         ) -> Result<Vec<ConnectorViewIdentity>, ConnectorError> {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Vec::new())
         }
     }
@@ -307,11 +326,66 @@ mod tests {
         let capability = ViewCapability {
             descriptor: descriptor.clone(),
             incarnation: ProviderBindingEpoch::new(),
+            list_calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
         let error = validate_view_metadata_owner(&descriptor, expected_incarnation, &capability)
             .expect_err("view capability must belong to the exact control generation");
 
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    struct NoListingCpu;
+    impl crate::connector::ProviderMetadataCpuPort for NoListingCpu {
+        fn submit_metadata_in(
+            &self,
+            _: &mut Option<crate::connector::ProviderMetadataCpuInput>,
+        ) -> Result<(), ConnectorError> {
+            panic!("the unsupported default cannot submit a CPU phase")
+        }
+        fn poll_finished(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            panic!("no submitted phase")
+        }
+        fn poll_closed(
+            &self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ConnectorError>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn asynchronous_view_listing_requires_explicit_provider_support() {
+        let capability = ViewCapability {
+            descriptor: descriptor(),
+            incarnation: ProviderBindingEpoch::new(),
+            list_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let request = ConnectorListViewsRequest {
+            namespace: ConnectorNamespaceIdentity {
+                instance_id: capability.descriptor.instance_id.clone(),
+                namespace: Arc::from("db"),
+            },
+            bound: crate::connector::ConnectorListingBound::V1,
+            context: context(),
+        };
+        let error = capability
+            .list_views_async(request, Arc::new(NoListingCpu))
+            .await
+            .expect_err("a synchronous capability is not an async listing implementation");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(
+            capability
+                .list_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the default must not call a synchronous provider or fabricate an empty listing"
+        );
     }
 }

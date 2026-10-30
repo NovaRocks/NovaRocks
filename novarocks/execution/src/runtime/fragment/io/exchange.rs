@@ -196,6 +196,16 @@ impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
         self.registry
             .get_receiver_handle(Self::key(key), expected_senders)
     }
+    fn stream_close_facts(
+        &self,
+        key: super::ExchangeReceiverKey,
+        expected: &[novarocks_execution_contract::ExchangeStreamIdentity],
+    ) -> Result<
+        Vec<novarocks_execution_contract::ExchangeStreamClose>,
+        crate::runtime::exchange::ExchangeFailure,
+    > {
+        self.registry.stream_close_facts(Self::key(key), expected)
+    }
     fn ensure_mem_tracker(
         &self,
         key: super::ExchangeReceiverKey,

@@ -69,6 +69,8 @@ use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpe
 #[path = "writer_statement_actor.rs"]
 mod writer_statement_actor;
 use writer_statement_actor::{WriterActor, retain_write_result};
+#[path = "distributed_writer_row_level.rs"]
+mod row_level_contract;
 
 use super::connector::{
     await_resource_convergence, connector_launch_config, create_catalog, create_warehouse,
@@ -126,7 +128,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(DistributedWriterConcurrentProgress::default()),
         Box::new(DistributedStatisticsDataflow),
         Box::new(DistributedWriterOverwrite),
-        Box::new(DistributedWriterRowLevel),
+        Box::new(DistributedWriterRowLevel::default()),
         Box::new(DistributedWriterFaults::default()),
     ]
 }
@@ -2101,7 +2103,10 @@ impl Scenario for DistributedWriterOverwrite {
 /// refuses a commit whose artifact superseded a different reference set, so a
 /// second DELETE that both commits and preserves the first one's effect is
 /// end-to-end evidence that the merge used exactly the frozen references.
-struct DistributedWriterRowLevel;
+#[derive(Default)]
+struct DistributedWriterRowLevel {
+    observations: SqlIntentOwner,
+}
 
 impl Scenario for DistributedWriterRowLevel {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
@@ -2121,6 +2126,23 @@ impl Scenario for DistributedWriterRowLevel {
         Ok(connector_launch_config())
     }
 
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.observations.freeze(
+            row_level_contract::observation_specs(cluster_size),
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
@@ -2131,8 +2153,8 @@ impl Scenario for DistributedWriterRowLevel {
             context.remaining("connect row-level mutation control session")?,
         )?;
 
-        const CATALOG: &str = "row_level_writer";
-        const DATABASE: &str = "row_level_writer_db";
+        const CATALOG: &str = row_level_contract::CATALOG;
+        const DATABASE: &str = row_level_contract::DATABASE;
         let warehouse = create_warehouse(context, "distributed-writer-row-level")?;
         create_catalog(&mut control, CATALOG, &warehouse)?;
         control
@@ -2172,6 +2194,7 @@ impl Scenario for DistributedWriterRowLevel {
         control
             .query_drop(format!("DELETE FROM {dv} WHERE id IN (1, 5, 9)"))
             .context("first deletion-vector DELETE")?;
+        row_level_contract::assert_affected(&control, 3, "first deletion-vector DELETE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -2205,6 +2228,7 @@ impl Scenario for DistributedWriterRowLevel {
         control
             .query_drop(format!("DELETE FROM {dv} WHERE v > 10"))
             .context("second deletion-vector DELETE")?;
+        row_level_contract::assert_affected(&control, 2, "second deletion-vector DELETE")?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         assert_committed_once(
             before_terminals,
@@ -2256,6 +2280,7 @@ impl Scenario for DistributedWriterRowLevel {
         control
             .query_drop(format!("DELETE FROM {positional} WHERE id IN (1, 5, 9)"))
             .context("position-delete DELETE")?;
+        row_level_contract::assert_affected(&control, 3, "position-delete DELETE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -2316,6 +2341,7 @@ impl Scenario for DistributedWriterRowLevel {
                 "UPDATE {cow} SET v = v + 100 WHERE id IN (1, 5, 9)"
             ))
             .context("copy-on-write UPDATE")?;
+        row_level_contract::assert_affected(&control, 3, "copy-on-write UPDATE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -2365,6 +2391,11 @@ impl Scenario for DistributedWriterRowLevel {
                  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"
             ))
             .context("MERGE across the delete and data branches")?;
+        row_level_contract::assert_affected(
+            &control,
+            2,
+            "MERGE across the delete and data branches",
+        )?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -2400,6 +2431,8 @@ impl Scenario for DistributedWriterRowLevel {
         {
             bail!("MERGE left {merged:?}");
         }
+
+        row_level_contract::run(context, &mut control, CATALOG, DATABASE, &self.observations)?;
 
         await_resource_convergence(context, &baseline, "distributed row-level writes")?;
         Ok(())

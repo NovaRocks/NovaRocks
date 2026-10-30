@@ -682,6 +682,16 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         self.list_views(namespace, bound).await
     }
 
+    /// The original closed metadata author forms this governed view listing.
+    /// The synchronous listing remains the separate existing DDL consumer.
+    async fn list_views_with_metadata_cpu(
+        &self,
+        _source: Arc<crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal>,
+        _cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    ) -> Result<Vec<novarocks_spi::connector::ConnectorViewIdentity>, ConnectorError> {
+        Err(views_unsupported("list_views"))
+    }
+
     async fn list_tables_page_for_request(
         &self,
         namespace: CatalogNamespaceName,

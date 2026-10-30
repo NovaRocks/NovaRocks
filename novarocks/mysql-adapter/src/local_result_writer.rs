@@ -582,9 +582,10 @@ mod tests {
                 session,
             }
         }
-        fn protocol(&self) -> GovernedProtocolOwner {
-            let statement = self
-                .control
+        fn statement(
+            &self,
+        ) -> novarocks_query_application::session_control::GovernedQueryStatementOwner {
+            self.control
                 .begin_governed_statement_with_result(
                     self.session.token(),
                     &self.host.root_admission(),
@@ -594,8 +595,34 @@ mod tests {
                     None,
                     ResultWindowClass::Local,
                 )
-                .unwrap();
-            GovernedProtocolOwner::new(statement)
+                .unwrap()
+        }
+        fn protocol(&self) -> GovernedProtocolOwner {
+            GovernedProtocolOwner::new(self.statement())
+        }
+        fn completion(
+            &self,
+            affected_rows: u64,
+        ) -> novarocks_query_application::protocol_delivery::GovernedCompletionStatementResult
+        {
+            use novarocks_query_application::{
+                protocol_delivery::QuerySessionOutput,
+                session_control::{
+                    StatementActionReady, StatementActionValue, StatementCommandCompletion,
+                },
+            };
+            let mut ready = Some(StatementActionReady {
+                result: Ok(StatementActionValue::Ok(StatementCommandCompletion::new(
+                    affected_rows,
+                ))),
+                owner: self.statement(),
+            });
+            let mut output = None;
+            StatementActionReady::transfer_protocol_in(&mut ready, &mut output).unwrap();
+            let Some(QuerySessionOutput::GovernedCompletion(result)) = output else {
+                panic!("the original completion retains its statement protocol owner")
+            };
+            result
         }
         fn result(&self, value: String) -> GovernedImmediateStatementResult {
             let statement = self
@@ -788,7 +815,14 @@ mod tests {
                         novarocks_query_application::session_error::QueryServiceErrorKind::BadDatabase,
                         "unknown database"), self.fixture.protocol(), writer).await
             } else {
-                crate::terminal::write_governed_init_ok(self.fixture.protocol(), writer).await
+                crate::terminal::write_governed_init_ok(
+                    novarocks_query_application::session_control::StatementCommandCompletion::new(
+                        0,
+                    ),
+                    self.fixture.protocol(),
+                    writer,
+                )
+                .await
             }
         }
         async fn on_query<'a>(
@@ -796,6 +830,12 @@ mod tests {
             query: &'a str,
             results: QueryResultWriter<'a, W>,
         ) -> io::Result<()> {
+            if let Some(rows) = query.strip_prefix("terminal-affected:") {
+                let rows = rows.parse::<u64>().map_err(io::Error::other)?;
+                let (completion, protocol) = self.fixture.completion(rows).into_parts();
+                return crate::terminal::write_governed_terminal_ok(completion, protocol, results)
+                    .await;
+            }
             if matches!(query, "relay-wait" | "relay-query-timeout" | "relay-budget") {
                 use crate::governed_result_writer::streaming_result_tests::{
                     fixture_with_admission_deadline, string_fields, text_body,
@@ -872,7 +912,11 @@ mod tests {
                         .pause_flush
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
-                let protocol = self.fixture.protocol();
+                let more = query == "terminal-more";
+                let (completion, protocol) = self
+                    .fixture
+                    .completion(if more { 7 } else { 0 })
+                    .into_parts();
                 if query == "cancel-terminal" {
                     self.fixture.control.cancel_session_statement(
                         self.fixture.session.token(),
@@ -885,9 +929,8 @@ mod tests {
                         },
                     );
                 }
-                let more = query == "terminal-more";
                 return match crate::terminal::write_governed_terminal_ok_with_more(
-                    protocol, results, more,
+                    completion, protocol, results, more,
                 )
                 .await?
                 {
@@ -1378,13 +1421,64 @@ mod tests {
         .unwrap();
     }
     #[tokio::test]
+    async fn action_completion_count_reaches_the_original_terminal_packet() {
+        use mysql_common::{
+            io::ParseBuf,
+            packets::{CommonOkPacket, OkPacketDeserializer},
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let fixture = Fixture::new();
+            let capacity = fixture.capacity.clone();
+            let control = fixture.control.clone();
+            let (mut client, server) = socket_with(fixture, Arc::new(WriteGate::new())).await;
+            for rows in [
+                0_u64,
+                3,
+                250,
+                251,
+                65_535,
+                65_536,
+                16_777_215,
+                16_777_216,
+                u64::MAX,
+            ] {
+                let command = format!("\x03terminal-affected:{rows}");
+                packet(&mut client, 0, command.as_bytes()).await;
+                let (sequence, payload) = read_packet(&mut client).await;
+                assert_eq!(sequence, 1);
+                let parsed = ParseBuf(&payload)
+                    .parse::<OkPacketDeserializer<CommonOkPacket>>(
+                        CapabilityFlags::CLIENT_PROTOCOL_41,
+                    )
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(parsed.affected_rows(), rows);
+                assert_eq!(parsed.last_insert_id(), None);
+                assert!(
+                    !parsed
+                        .status_flags()
+                        .contains(opensrv_mysql::StatusFlags::SERVER_MORE_RESULTS_EXISTS)
+                );
+            }
+            packet(&mut client, 0, b"\x03again").await;
+            assert_eq!(read_result(&mut client, 1).await.0, b"\x05again");
+            packet(&mut client, 0, &[1]).await;
+            server.await.unwrap().unwrap();
+            assert!(control.list_processes().is_empty());
+            assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn finite_terminal_ok_has_explicit_more_results_and_no_deferred_owner() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (mut client, server) = socket().await;
             packet(&mut client, 0, b"\x03terminal-more").await;
             assert_eq!(
                 read_packet(&mut client).await,
-                (1, vec![0, 0, 0, 8, 0, 0, 0])
+                (1, vec![0, 7, 0, 8, 0, 0, 0])
             );
             assert_eq!(read_result(&mut client, 2).await.0, b"\x04next");
             packet(&mut client, 0, &[1]).await;

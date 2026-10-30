@@ -361,7 +361,7 @@ async fn run_case(case: Case) {
                     plan,
                     true,
                     None,
-                    false,
+                    WriteProtocolRoles::None,
                     Some(original),
                 )
                 .await

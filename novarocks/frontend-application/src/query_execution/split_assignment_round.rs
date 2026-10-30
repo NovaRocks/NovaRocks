@@ -105,6 +105,24 @@ pub(crate) struct RoundSplitSourceRecipe {
 }
 
 impl RoundSplitSourceRecipe {
+    #[cfg(test)]
+    pub(crate) fn for_initializer_test(
+        fragment_id: FragmentId,
+        plan_node_id: i32,
+        access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessEntry>,
+    ) -> Self {
+        Self {
+            fragment_id,
+            plan_node_id,
+            access,
+            assignments: Vec::new(),
+            dynamic_filters: Vec::new(),
+            constraint: novarocks_spi::connector::read_stack::ConnectorReadConstraint::of_summary(
+                novarocks_spi::connector::read_stack::TupleDomain::all(),
+            ),
+        }
+    }
+
     pub(crate) fn from_artifacts(
         artifacts: &PreparedDistributedQuery,
         fragment_id: FragmentId,
@@ -140,6 +158,16 @@ impl RoundSplitSourceRecipe {
 
     pub(crate) const fn plan_node_id(&self) -> i32 {
         self.plan_node_id
+    }
+
+    pub(crate) fn requires_metadata_split_preparation(&self) -> bool {
+        self.access.access().requires_metadata_split_preparation()
+    }
+
+    pub(crate) fn planning_lease(
+        &self,
+    ) -> &novarocks_spi::connector::ConnectorControlPlanningLease {
+        self.access.planning_lease()
     }
 
     pub(crate) fn generation(&self) -> &novarocks_spi::connector::read_stack::ConnectorReadBinding {
@@ -217,19 +245,24 @@ impl RoundSplitSourceRecipe {
         &self,
         session: &novarocks_spi::connector::read_stack::ConnectorSession,
         capabilities: &novarocks_spi::connector::ConnectorReadAttemptCapabilities,
+        preparation: Option<novarocks_spi::connector::read_stack::ConnectorReadSplitPreparation>,
+        original_owner: &mut Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
     ) -> novarocks_spi::connector::read_stack::ConnectorReadSplitOpenFuture {
-        capabilities.splits().get_splits(
-            novarocks_spi::connector::read_stack::ConnectorReadSplitOpenRequest::new(
-                session.clone(),
-                capabilities.frozen().clone(),
-                self.assignments.clone(),
-                self.dynamic_filters
-                    .iter()
-                    .map(|(_, column)| column.clone())
-                    .collect(),
-                self.constraint.clone(),
-            ),
-        )
+        let request = novarocks_spi::connector::read_stack::ConnectorReadSplitOpenRequest::new(
+            session.clone(),
+            capabilities.frozen().clone(),
+            self.assignments.clone(),
+            self.dynamic_filters
+                .iter()
+                .map(|(_, column)| column.clone())
+                .collect(),
+            self.constraint.clone(),
+        );
+        let request = match preparation {
+            Some(preparation) => request.with_source_preparation(preparation),
+            None => request,
+        };
+        capabilities.splits().get_splits(request, original_owner)
     }
     pub(crate) fn finish_open(
         self,

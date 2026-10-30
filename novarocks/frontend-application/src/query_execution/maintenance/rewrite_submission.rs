@@ -363,7 +363,7 @@ impl OptimizeSubmissionState {
             self.observed
                 .take()
                 .expect("same Optimize observation")
-                .map(|_| StatementActionValue::Ok)
+                .map(|_| StatementActionValue::Ok(novarocks_query_application::session_control::StatementCommandCompletion::new(0)))
                 .map_err(super::rewrite_job::computation_service_error),
         )
     }

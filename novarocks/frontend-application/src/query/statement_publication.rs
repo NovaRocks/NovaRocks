@@ -865,6 +865,8 @@ mod selection_migration_tests {
             novarocks_spi::connector::ConnectorWriteReceipt,
         >,
         expected: LakePublicationDisposition,
+        selected_rows: Option<u64>,
+        cancellation: Option<QueryCancellationReason>,
     ) {
         let fixture = fixture_with_outcome(1, 16, outcome);
         let prepared =
@@ -879,6 +881,9 @@ mod selection_migration_tests {
         assert!(accepted.belongs_to(&fixture.session));
         assert_eq!(accepted.row_count(), 7);
         assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
+        let rows = fixture.session.freeze_received_row_count().unwrap();
+        assert_eq!(rows, accepted.row_count());
+        assert_eq!(fixture.session.finish_invocations(), 0);
         let mut publication = StatementPublication::new(original_attempt());
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(
@@ -887,13 +892,22 @@ mod selection_migration_tests {
                 .is_ready()
         );
         assert_eq!(publication.disposition(), Some(expected));
-        match expected {
-            LakePublicationDisposition::KnownCommitted => publication
-                .select(None)
-                .expect("only a known committed write selects success"),
+        let completion = super::super::write_action::selected_command_completion(
+            publication.select(cancellation),
+            Some(rows),
+        );
+        match selected_rows {
+            Some(expected_rows) => {
+                let novarocks_query_application::session_control::StatementActionValue::Ok(rows) =
+                    completion.expect("only a known committed write selects success")
+                else {
+                    panic!("publication success must preserve command metadata")
+                };
+                assert_eq!(rows.affected_rows(), expected_rows);
+            }
             _ => assert!(
-                publication.select(None).is_err(),
-                "an uncommitted or unknown write cannot select success"
+                completion.is_err(),
+                "an uncommitted or unknown write cannot expose successful row metadata"
             ),
         }
         assert_eq!(
@@ -908,6 +922,8 @@ mod selection_migration_tests {
         assert_original_rows_reach_actual_selection(
             known_committed(),
             LakePublicationDisposition::KnownCommitted,
+            Some(7),
+            None,
         );
     }
     #[test]
@@ -915,6 +931,8 @@ mod selection_migration_tests {
         assert_original_rows_reach_actual_selection(
             crate::query_execution::write_session::tests::commit_unknown(),
             LakePublicationDisposition::CommitUnknown,
+            None,
+            None,
         );
     }
     #[test]
@@ -928,6 +946,39 @@ mod selection_migration_tests {
                 cleanup: ExternalMutationFinalization::Complete,
             },
             LakePublicationDisposition::KnownUncommitted,
+            None,
+            None,
+        );
+    }
+    #[test]
+    fn applied_late_cancel_keeps_the_original_count() {
+        assert_original_rows_reach_actual_selection(
+            known_committed(),
+            LakePublicationDisposition::KnownCommitted,
+            Some(7),
+            Some(QueryCancellationReason::ClientDisconnected),
+        );
+    }
+    #[test]
+    fn committed_necessary_finalization_failure_exposes_no_successful_count() {
+        let mut outcome = known_committed();
+        let novarocks_spi::connector::ExternalMutationOutcome::KnownCommitted {
+            finalization, ..
+        } = &mut outcome
+        else {
+            unreachable!()
+        };
+        *finalization = ExternalMutationFinalization::Failed(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                "original necessary finalization failed",
+            ),
+        );
+        assert_original_rows_reach_actual_selection(
+            outcome,
+            LakePublicationDisposition::KnownCommitted,
+            None,
+            None,
         );
     }
 }

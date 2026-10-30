@@ -285,7 +285,13 @@ impl PhysicalHashJoinOp {
                 cols,
                 source: HashSource::ShuffleAgg,
             } => DistributionSpec::hash_partitioned(
-                expand_with_eq_equivalents(scalars, &cols, &self.eq_conditions),
+                if self.join_type == crate::common::JoinKind::Inner {
+                    expand_with_eq_equivalents(scalars, &cols, &self.eq_conditions)
+                } else {
+                    // Outer NULL extension and semi/anti projection do not
+                    // publish an equality between both input keys.
+                    cols
+                },
                 HashSource::ShuffleAgg,
             ),
             DistributionSpec::HashPartitioned {
@@ -300,21 +306,44 @@ impl PhysicalHashJoinOp {
         }
     }
 
-    fn derive_shuffle_output(&self, scalars: &ScalarArena) -> PhysicalPropertySet {
-        // Symmetric over both sides of each eq pair: a shuffle join partitions
-        // both inputs on their respective eq columns, so its output key is an
-        // equivalence class containing every eq column from either side.
-        let cols = if shuffle_join_keys_are_supported(scalars, &self.eq_conditions) {
-            shuffle_join_column_ids(scalars, &self.eq_conditions)
-        } else {
-            Vec::new()
+    fn derive_shuffle_output(
+        &self,
+        scalars: &ScalarArena,
+        children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
+        use crate::common::JoinKind::*;
+        // Only an inner join publishes equality between both output keys.
+        // A preserved side keeps its chosen child's actual partition facts,
+        // including the key order aligned for the parent's requirements.
+        let preserved_side = match self.join_type {
+            Inner => {
+                let cols = if shuffle_join_keys_are_supported(scalars, &self.eq_conditions) {
+                    shuffle_join_column_ids(scalars, &self.eq_conditions)
+                } else {
+                    Vec::new()
+                };
+                return PhysicalPropertySet {
+                    distribution: if cols.is_empty() {
+                        DistributionSpec::Any
+                    } else {
+                        DistributionSpec::shuffle_join(cols)
+                    },
+                    ordering: OrderingSpec::Any,
+                };
+            }
+            LeftOuter | LeftSemi | LeftAnti | NullAwareLeftAnti => 0,
+            RightOuter | RightSemi | RightAnti => 1,
+            FullOuter | Cross => return PhysicalPropertySet::any(),
+        };
+        let distribution = match children
+            .get(preserved_side)
+            .map(|child| &child.distribution)
+        {
+            Some(distribution @ DistributionSpec::HashPartitioned { .. }) => distribution.clone(),
+            _ => DistributionSpec::Any,
         };
         PhysicalPropertySet {
-            distribution: if cols.is_empty() {
-                DistributionSpec::Any
-            } else {
-                DistributionSpec::shuffle_join(cols)
-            },
+            distribution,
             ordering: OrderingSpec::Any,
         }
     }
@@ -353,7 +382,7 @@ impl PhysicalHashJoinOp {
             PropertyAlternativeKind::BroadcastJoin => {
                 self.derive_broadcast_output(scalars, children)
             }
-            PropertyAlternativeKind::ShuffleJoin => self.derive_shuffle_output(scalars),
+            PropertyAlternativeKind::ShuffleJoin => self.derive_shuffle_output(scalars, children),
             PropertyAlternativeKind::SingletonJoin => PhysicalPropertySet::gather(),
             PropertyAlternativeKind::Default => self.derive_output(scalars, children),
         }
@@ -464,7 +493,7 @@ impl DeriveOutput for PhysicalHashJoinOp {
             JoinDistribution::Unknown => {
                 panic!("unknown join distribution should be resolved before property derivation")
             }
-            JoinDistribution::Shuffle => self.derive_shuffle_output(scalars),
+            JoinDistribution::Shuffle => self.derive_shuffle_output(scalars, children),
             JoinDistribution::Broadcast => self.derive_broadcast_output(scalars, children),
             JoinDistribution::Colocate => self.derive_colocate_output(scalars, children),
             JoinDistribution::Singleton => PhysicalPropertySet::gather(),
@@ -724,6 +753,10 @@ mod tests {
             JoinDistribution::Unknown,
         );
 
+        assert_eq!(
+            op.build_side,
+            crate::optimizer::operator::HashJoinBuildSide::Left
+        );
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
         assert_eq!(alternatives.len(), 1);
         assert_eq!(alternatives[0].kind, PropertyAlternativeKind::ShuffleJoin);
@@ -1321,5 +1354,161 @@ mod tests {
             }
             other => panic!("expected HashPartitioned([10, 20]), got {other:?}"),
         }
+    }
+    #[test]
+    fn outer_and_selection_shuffle_outputs_keep_only_published_partition_keys() {
+        for (kind, expected) in [
+            (JoinKind::LeftOuter, vec![ColumnId(10)]),
+            (JoinKind::LeftSemi, vec![ColumnId(10)]),
+            (JoinKind::LeftAnti, vec![ColumnId(10)]),
+            (JoinKind::NullAwareLeftAnti, vec![ColumnId(10)]),
+            (JoinKind::RightOuter, vec![ColumnId(20)]),
+            (JoinKind::RightSemi, vec![ColumnId(20)]),
+            (JoinKind::RightAnti, vec![ColumnId(20)]),
+        ] {
+            let op = join_op(kind, vec![eq(col(10), col(20))], JoinDistribution::Shuffle);
+            let left = PhysicalPropertySet {
+                distribution: DistributionSpec::shuffle_join([ColumnId(10)]),
+                ordering: OrderingSpec::Any,
+            };
+            let right = PhysicalPropertySet {
+                distribution: DistributionSpec::shuffle_join([ColumnId(20)]),
+                ordering: OrderingSpec::Any,
+            };
+            let out = op.derive_output(&[&left, &right]);
+            assert_eq!(
+                out.distribution,
+                DistributionSpec::shuffle_join(expected),
+                "{kind:?}"
+            );
+            assert_eq!(
+                op.derive_output(&[&PhysicalPropertySet::any(), &PhysicalPropertySet::any()])
+                    .distribution,
+                DistributionSpec::Any,
+                "{kind:?}: absent facts grant no partition property"
+            );
+        }
+        let full = join_op(
+            JoinKind::FullOuter,
+            vec![eq(col(10), col(20))],
+            JoinDistribution::Shuffle,
+        );
+        assert_eq!(
+            full.derive_output(&[&PhysicalPropertySet::any(), &PhysicalPropertySet::any()])
+                .distribution,
+            DistributionSpec::Any
+        );
+    }
+
+    #[test]
+    fn null_extended_keys_require_original_downstream_group_and_join_enforcers() {
+        use crate::optimizer::derive::{EnforcerKind, needed_enforcers};
+        // With an empty non-preserved input, distinct preserved keys still
+        // hash to different partitions while every extended key is NULL.
+        for (kind, preserved, extended) in [
+            (JoinKind::LeftOuter, ColumnId(10), ColumnId(20)),
+            (JoinKind::RightOuter, ColumnId(20), ColumnId(10)),
+        ] {
+            let op = join_op(kind, vec![eq(col(10), col(20))], JoinDistribution::Shuffle);
+            let left = PhysicalPropertySet {
+                distribution: DistributionSpec::shuffle_join([ColumnId(10)]),
+                ordering: OrderingSpec::Any,
+            };
+            let right = PhysicalPropertySet {
+                distribution: DistributionSpec::shuffle_join([ColumnId(20)]),
+                ordering: OrderingSpec::Any,
+            };
+            let out = op.derive_output(&[&left, &right]);
+            for required_distribution in [
+                DistributionSpec::shuffle_agg([extended]),
+                DistributionSpec::shuffle_join([extended]),
+            ] {
+                let required = PhysicalPropertySet {
+                    distribution: required_distribution.clone(),
+                    ordering: OrderingSpec::Any,
+                };
+                assert!(
+                    !out.satisfies(&required),
+                    "{kind:?}: NULL extension must not satisfy {required:?}"
+                );
+                assert!(
+                    matches!(needed_enforcers(&required, &out).as_slice(), [EnforcerKind::Distribution(distribution)] if *distribution == required_distribution)
+                );
+            }
+            assert!(out.satisfies(&PhysicalPropertySet {
+                distribution: DistributionSpec::shuffle_agg([preserved]),
+                ordering: OrderingSpec::Any
+            }));
+        }
+        let op = broadcast_with_type(JoinKind::LeftOuter);
+        let out = op.derive_output(&[
+            &PhysicalPropertySet {
+                distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
+                ordering: OrderingSpec::Any,
+            },
+            &PhysicalPropertySet::broadcast(),
+        ]);
+        assert_eq!(
+            out.distribution,
+            DistributionSpec::shuffle_agg([ColumnId(10)])
+        );
+        let extended = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_agg([ColumnId(20)]),
+            ordering: OrderingSpec::Any,
+        };
+        assert!(!out.satisfies(&extended));
+        assert!(matches!(
+            needed_enforcers(&extended, &out).as_slice(),
+            [EnforcerKind::Distribution(_)]
+        ));
+    }
+    #[test]
+    fn right_outer_shuffle_output_retains_chosen_parent_aligned_composite_key_order() {
+        use crate::optimizer::derive::{EnforcerKind, needed_enforcers};
+        let op = join_op(
+            JoinKind::RightOuter,
+            vec![eq(col(10), col(20)), eq(col(11), col(21))],
+            JoinDistribution::Unknown,
+        );
+        let parent = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(21), ColumnId(20)]),
+            ordering: OrderingSpec::Any,
+        };
+        let alternatives = op.derive_required_alternatives(&parent, 2);
+        let [alternative] = alternatives.as_slice() else {
+            panic!("right outer keeps one original shuffle alternative")
+        };
+        assert_eq!(alternative.kind, PropertyAlternativeKind::ShuffleJoin);
+        assert_eq!(
+            alternative.child_props[0].distribution,
+            DistributionSpec::shuffle_join([ColumnId(11), ColumnId(10)])
+        );
+        assert_eq!(alternative.child_props[1].distribution, parent.distribution);
+        let children = alternative.child_props.iter().collect::<Vec<_>>();
+        let out = op
+            .op
+            .derive_output_for_alternative(&op.scalars, &children, &alternative.kind);
+        assert_eq!(out.distribution, parent.distribution);
+        assert!(out.satisfies(&parent));
+        let reordered = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(20), ColumnId(21)]),
+            ordering: OrderingSpec::Any,
+        };
+        assert!(!out.satisfies(&reordered));
+        assert!(matches!(
+            needed_enforcers(&reordered, &out).as_slice(),
+            [EnforcerKind::Distribution(_)]
+        ));
+        // Keep the original chosen hash source, rather than reauthoring it.
+        let chosen = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_agg([ColumnId(21), ColumnId(20)]),
+            ordering: OrderingSpec::Any,
+        };
+        let out = op.op.derive_output_for_alternative(
+            &op.scalars,
+            &[&alternative.child_props[0], &chosen],
+            &alternative.kind,
+        );
+        assert_eq!(out.distribution, chosen.distribution);
     }
 }

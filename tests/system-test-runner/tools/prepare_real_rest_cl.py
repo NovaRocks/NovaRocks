@@ -69,7 +69,7 @@ BOUNDS = {
     "max_request_bytes": 65536, "page_size": 256,
 }
 SOURCE = {
-    "canonical_lock_sha256": "76512c5eb0aaef5b918c0fb551e32e1d9b3d51cccbf74b9e8ad8364cabc7c25b",
+    "canonical_lock_sha256": "60ffd560721ee8d65ba55da5b7dde44e4e3a4992fa9d77443eea75c27cc37d44",
     "image_source": "apache/iceberg-rest-fixture", "platform": "linux/arm64",
     "image_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
     "image_alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9",
@@ -933,6 +933,89 @@ class ParserTests(unittest.TestCase):
     def rejected(self, callback):
         with self.assertRaises(Refusal):
             callback()
+
+    def test_source_matches_current_stock_fixture_input_owner(self):
+        # Resolve the current source lock through its original schema/platform
+        # author. This is local identity validation, not Docker or HTTP proof.
+        import importlib.util
+
+        repository = Path(__file__).resolve().parents[3]
+        module_path = repository / "docker/fixture-inputs/fixture_inputs.py"
+        spec = importlib.util.spec_from_file_location("real_rest_fixture_inputs", module_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        inputs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(inputs)
+        lock, identity = inputs.load_lock(
+            repository / "docker/fixture-inputs/lock.json",
+            platform=SOURCE["platform"], consumer="iceberg-rest")
+        self.assertEqual(identity, SOURCE["canonical_lock_sha256"])
+        rest = lock["images"]["iceberg-rest"]
+        self.assertEqual(rest["source"], SOURCE["image_source"])
+        self.assertEqual(rest["platform"], SOURCE["platform"])
+        self.assertEqual(rest["manifest_digest"], SOURCE["image_digest"])
+        self.assertEqual(rest["alias"], SOURCE["image_alias"])
+
+    def test_private_owner_guard_keeps_stock_bom_and_image_exact(self):
+        repository = Path(__file__).resolve().parents[3]
+        with tempfile.TemporaryDirectory() as directory:
+            entry = Path(directory) / "private-fixture"
+            entry.mkdir()
+            manifest_path = entry / "manifest.json"
+            freeze_path = entry / "freeze.json"
+            binding = {"owner_mode": "task-private", "fixture_id": entry.name,
+                       "compose_project": "nr-isolated-rest-test",
+                       "owner_manifest_path": str(manifest_path),
+                       "owner_manifest_sha256": "0" * 64,
+                       "rest_uri": "http://127.0.0.1:21000",
+                       "warehouse": "s3://warehouse/private-fixture/rest",
+                       "server_default_warehouse": "s3://warehouse/private-fixture/rest/",
+                       "rest_image_id": SOURCE["image_digest"]}
+            owner = {"ready": True, "shared_docker": False,
+                     "compose_project": binding["compose_project"], "env_id": entry.name,
+                     "current_dir": str(entry),
+                     "iceberg_rest": {key: binding[key] for key in
+                                      ("rest_uri", "warehouse", "server_default_warehouse")},
+                     "runtime": {"profile": "stock", "publication_dir": str(entry),
+                                 "entry_root": str(entry),
+                                 "producer_receipt": {"lock_sha256": SOURCE["canonical_lock_sha256"]},
+                                 "catalog": {"project": binding["compose_project"],
+                                             "images": {"rest": {"image_id": SOURCE["image_digest"],
+                                                                 "tag": SOURCE["image_alias"]}}}}}
+            owner["iceberg_rest"]["uri"] = owner["iceberg_rest"].pop("rest_uri")
+            freeze = {"schema_version": 1, "task": "MEM-1-M07", "frozen_before_execution": True,
+                      "original_input": {"path": str(repository / "docs/testing/mem-1-m07/inputs/cl-listing-freeze-v3.json"),
+                                         "sha256": ORIGINAL_SHA256},
+                      "normal": NORMAL, "bounds": BOUNDS, "source": SOURCE,
+                      "producer_sha256": sha(Path(__file__).read_bytes()), "binding": binding,
+                      "view_timestamp_ms": 1791504000000,
+                      "scope": "external-producer-only; native/SQL deadlines remain independent"}
+
+            def write_owner(value):
+                raw = encoded(value)
+                manifest_path.write_bytes(raw)
+                binding["owner_manifest_sha256"] = sha(raw)
+                freeze_path.write_bytes(encoded(freeze))
+
+            write_owner(owner)
+            self.assertEqual(validate_freeze(freeze_path)[0]["source"], SOURCE)
+            for field, value, reason in (
+                ("profile", "publication-hook", "owner stock profile or BOM mismatch"),
+                ("lock", "76512c5eb0aaef5b918c0fb551e32e1d9b3d51cccbf74b9e8ad8364cabc7c25b",
+                 "owner stock profile or BOM mismatch"),
+                ("image", "sha256:" + "0" * 64, "owner REST image digest or alias mismatch"),
+            ):
+                with self.subTest(field=field):
+                    changed = strict_json(encoded(owner))
+                    if field == "profile":
+                        changed["runtime"]["profile"] = value
+                    elif field == "lock":
+                        changed["runtime"]["producer_receipt"]["lock_sha256"] = value
+                    else:
+                        changed["runtime"]["catalog"]["images"]["rest"]["image_id"] = value
+                    write_owner(changed)
+                    with self.assertRaisesRegex(Refusal, reason):
+                        validate_freeze(freeze_path)
 
     def test_json_duplicate_nonfinite(self):
         for value in (b'{"namespaces":[],"namespaces":[["extra"]]}', b'{"x":NaN}', b'{'):

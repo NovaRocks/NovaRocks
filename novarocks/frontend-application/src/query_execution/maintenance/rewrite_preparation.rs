@@ -477,7 +477,7 @@ pub(crate) async fn prepare_original_cohort_in(
                 fact: facts.pop().unwrap(),
                 access: Some(access),
                 functions: engine.kernel.function_catalog().clone(),
-                carrier: *engine.kernel.static_plan_carrier(),
+                carrier: engine.kernel.static_plan_carrier().clone(),
                 constant_policy: engine.kernel.constant_policy(),
             },
             started: false,

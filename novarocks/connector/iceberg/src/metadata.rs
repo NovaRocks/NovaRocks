@@ -33,20 +33,19 @@ use bytes::Bytes;
 use novarocks_spi::connector::ConnectorProviderBindingKey;
 use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
 use novarocks_spi::connector::{
-    ConnectorBeginScanRequest, ConnectorCanonicalReadPoint, ConnectorChangeWindow, ConnectorError,
-    ConnectorErrorKind, ConnectorExactSemanticRevision, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorMutationOperationId, ConnectorNamespaceIdentity,
-    ConnectorNamespaceRequest, ConnectorOperationControl, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorReadNamedReference, ConnectorReadPurpose,
-    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
-    ConnectorReadSelector, ConnectorReadSnapshotLogEntry, ConnectorScalarType,
-    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
-    ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableDefinitionFacts,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
+    ConnectorBeginScanRequest, ConnectorCanonicalReadPoint, ConnectorError, ConnectorErrorKind,
+    ConnectorExactSemanticRevision, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorMetadata,
+    ConnectorMutationOperationId, ConnectorNamespaceIdentity, ConnectorNamespaceRequest,
+    ConnectorOperationControl, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
+    ConnectorReadNamedReference, ConnectorReadPurpose, ConnectorReadReferenceFacts,
+    ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind, ConnectorReadSelector,
+    ConnectorReadSnapshotLogEntry, ConnectorScalarType, ConnectorScalarValue, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit,
+    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateKind,
+    ConnectorTableDefinitionFacts, ConnectorTableHandle, ConnectorTableIdentity,
+    ConnectorTableMetadata, ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
     ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
     ConnectorTableObjectSelector, ConnectorTablePlanningFacts, ConnectorTableRequest,
     ConnectorTableResolution, ProviderBindingEpoch, validate_static_predicates,
@@ -64,7 +63,9 @@ use crate::metadata_batch_reader::{
     MetadataTableType, metadata_output_schema, metadata_table_output_columns,
 };
 use crate::metadata_context::IcebergMetadataContext;
-use crate::planning_facts::{IcebergTablePlanningFactsInput, table_planning_facts};
+use crate::planning_facts::{
+    IcebergTablePlanningFactsInput, snapshot_source_planning_facts, table_planning_facts,
+};
 use crate::scan_model::{
     IcebergDataFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
     IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue, IcebergTableInfo,
@@ -490,35 +491,6 @@ impl ConnectorMetadata for IcebergMetadata {
             })?;
         select_snapshot(&metadata, ConnectorReadSelector::SnapshotId(snapshot_id))?;
         Ok(ConnectorReadSelector::SnapshotId(snapshot_id))
-    }
-
-    fn change_window_from_exact_revisions(
-        &self,
-        table: &ConnectorTableHandle,
-        from: &ConnectorExactSemanticRevision,
-        to: &ConnectorExactSemanticRevision,
-    ) -> Result<ConnectorChangeWindow, ConnectorError> {
-        let ConnectorReadSelector::SnapshotId(from_snapshot_id) =
-            self.read_selector_from_exact_revision(table, from)?
-        else {
-            return Err(corrupt(
-                "Iceberg exact revision returned a non-snapshot selector",
-            ));
-        };
-        let ConnectorReadSelector::SnapshotId(to_snapshot_id) =
-            self.read_selector_from_exact_revision(table, to)?
-        else {
-            return Err(corrupt(
-                "Iceberg exact revision returned a non-snapshot selector",
-            ));
-        };
-        if self.exact_semantic_revision(table, ConnectorReadSelector::Current)? != *to {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg change-window end is not the exact frozen current revision",
-            ));
-        }
-        Ok(ConnectorChangeWindow::new(from_snapshot_id, to_snapshot_id))
     }
 
     fn list_namespaces(
@@ -980,6 +952,13 @@ impl ConnectorMetadata for IcebergMetadata {
         Box::pin(self.prepare_table_original(request))
     }
 
+    fn prepare_source_table(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> novarocks_spi::connector::ConnectorTablePreparationFuture<'_> {
+        Box::pin(self.prepare_source_table_original(request))
+    }
+
     fn create_prepared_table(
         &self,
         preparation: novarocks_spi::connector::ConnectorTablePreparation,
@@ -1024,17 +1003,18 @@ impl ConnectorMetadata for IcebergMetadata {
         self.runtime
             .control_state()
             .invalidate_table(&request.table.namespace, &table_name);
+        let snapshots = if metadata_table_type.is_none() {
+            crate::catalog::SnapshotLoading::Refs
+        } else {
+            crate::catalog::SnapshotLoading::All
+        };
         let loaded = self
             .runtime
             .observe_table_classified_for_request_with_snapshots(
                 &request.table.namespace,
                 &table_name,
                 &request.context,
-                if metadata_table_type.is_none() {
-                    crate::catalog::SnapshotLoading::Refs
-                } else {
-                    crate::catalog::SnapshotLoading::All
-                },
+                snapshots,
             )
             .map_err(classified_control_error)?;
         self.create_table_from_observation(
@@ -1043,6 +1023,7 @@ impl ConnectorMetadata for IcebergMetadata {
                 loaded,
                 table_name,
                 metadata_table_type,
+                snapshots,
                 incarnation: self.incarnation,
                 generation_owner: Arc::clone(&self.generation_owner),
             },
@@ -1057,6 +1038,7 @@ pub(crate) struct IcebergPreparedTableFacts {
     loaded: crate::loaded_table::IcebergPhysicalTable,
     table_name: String,
     metadata_table_type: Option<MetadataTableType>,
+    snapshots: crate::catalog::SnapshotLoading,
     incarnation: ProviderBindingEpoch,
     generation_owner: Arc<GenerationOwner>,
 }
@@ -1148,6 +1130,29 @@ impl IcebergMetadata {
         &self,
         request: ConnectorTableRequest,
     ) -> Result<novarocks_spi::connector::ConnectorTablePreparation, ConnectorError> {
+        self.prepare_table_observation_original(request, false)
+            .await
+    }
+    async fn prepare_source_table_original(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> Result<novarocks_spi::connector::ConnectorTablePreparation, ConnectorError> {
+        if !matches!(
+            request.resolution,
+            ConnectorTableResolution::StrictBaseTable
+        ) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "source observation requires an exact base table",
+            ));
+        }
+        self.prepare_table_observation_original(request, true).await
+    }
+    async fn prepare_table_observation_original(
+        &self,
+        request: ConnectorTableRequest,
+        source_observation: bool,
+    ) -> Result<novarocks_spi::connector::ConnectorTablePreparation, ConnectorError> {
         self.validate_context(&request.context)?;
         self.ensure_owner(&request.table.instance_id)?;
         let (table_name, metadata_table_type) =
@@ -1155,17 +1160,18 @@ impl IcebergMetadata {
         self.runtime
             .control_state()
             .invalidate_table(&request.table.namespace, &table_name);
+        let snapshots = if source_observation || metadata_table_type.is_some() {
+            crate::catalog::SnapshotLoading::All
+        } else {
+            crate::catalog::SnapshotLoading::Refs
+        };
         let loaded = self
             .runtime
             .observe_table_original_for_request_with_snapshots_async(
                 &request.table.namespace,
                 &table_name,
                 &request.context,
-                if metadata_table_type.is_none() {
-                    crate::catalog::SnapshotLoading::Refs
-                } else {
-                    crate::catalog::SnapshotLoading::All
-                },
+                snapshots,
             )
             .await?;
         Ok(novarocks_spi::connector::ConnectorTablePreparation::new(
@@ -1175,6 +1181,7 @@ impl IcebergMetadata {
                 loaded,
                 table_name,
                 metadata_table_type,
+                snapshots,
                 incarnation: self.incarnation,
                 generation_owner: Arc::clone(&self.generation_owner),
             },
@@ -1255,304 +1262,240 @@ impl IcebergMetadata {
             loaded,
             table_name,
             metadata_table_type,
+            snapshots,
             ..
         } = facts;
-        let metadata = loaded.table.metadata();
-        let definition_schema = metadata.current_schema().clone();
-        let table_comment = metadata.properties().get("comment").cloned();
-        let nominal_document =
-            crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(
-                metadata,
-            )?;
-        let mut base_schema = crate::scalar_integer_domain::sql_schema_from_document(
-            metadata.current_schema(),
-            &nominal_document,
-        )?;
-        let hidden_columns = hidden_internal_columns(metadata.properties());
-        base_schema = annotate_hidden_fields(base_schema, &hidden_columns);
-        // Carry the same frozen field facts a scan output schema carries, so the
-        // admitted projection and the scan the provider later returns stay
-        // field-for-field identical.
-        base_schema = crate::schema_mapping::annotate_read_schema_from_scan_model(
-            &base_schema,
-            &iceberg_schema_def(metadata.current_schema()),
-        )
-        .map_err(corrupt)?;
-        let metadata_columns = metadata_column_names(metadata);
-        let table_info =
-            IcebergTableInfo {
-                catalog: self.descriptor.instance_id.as_str().to_string(),
-                namespace: request.table.namespace.to_string(),
-                table: table_name.clone(),
-                table_uuid: Some(metadata.uuid().to_string()),
-                current_snapshot_id: metadata.current_snapshot_id(),
-                schema_id: metadata.current_schema_id(),
-                location: metadata.location().to_string(),
-                schema: iceberg_schema_def(metadata.current_schema()),
-                serialized_metadata: Some(serde_json::to_string(metadata).map_err(|error| {
-                    corrupt(format!("serialize Iceberg table metadata: {error}"))
-                })?),
-            };
-        let payload = IcebergTablePayload {
-            namespace: request.table.namespace.to_string(),
-            table: table_name.clone(),
-            metadata_location: loaded.table.metadata_location().map(str::to_owned),
-            table_info: Some(table_info),
-            metadata_columns,
-            metadata_table_type,
-            prepared_files: Vec::new(),
-            explicit_files: None,
-            row_mutation_frozen_source: false,
-            hidden_columns,
-        };
-        let (schema, execution_schema) = if let Some(metadata_table_type) =
-            payload.metadata_table_type
-        {
-            let columns = metadata_table_output_columns(metadata_table_type, metadata, creation)?;
-            let schema = metadata_output_schema(&columns).map_err(corrupt)?;
-            let execution =
-                crate::metadata_batch_reader::metadata_output_execution_schema(&columns, creation)?;
-            (schema, execution)
-        } else {
-            // The table schema exposed to SQL carries the Iceberg metadata
-            // pseudo-columns after the storage fields, in exactly the order
-            // `projected_schema` uses for scans. Their planning facts are what
-            // marks them hidden and row-lineage-owned, so omitting them here
-            // would make `_file`, `_pos`, `_row_id` and
-            // `_last_updated_sequence_number` unresolvable.
-            let mut fields = base_schema.fields().to_vec();
-            fields.extend(metadata_arrow_fields(&payload.metadata_columns)?);
-            let schema = Arc::new(Schema::new_with_metadata(
-                fields,
-                base_schema.metadata().clone(),
-            ));
-            let execution = crate::schema_mapping::catalog_value::table_with_document(
-                &nominal_document,
-                definition_schema.as_ref(),
-                &payload.metadata_columns,
-                creation,
-            )?;
-            (schema, execution)
-        };
-        let planning_facts = if payload.metadata_table_type.is_some() {
-            ConnectorTablePlanningFacts::empty()
-        } else {
-            table_planning_facts(IcebergTablePlanningFactsInput {
-                schema: &schema,
-                iceberg_schema: Some(definition_schema.as_ref()),
-                metadata_columns: &payload.metadata_columns,
-                hidden_columns: &payload.hidden_columns,
-                nominal_declarations: &nominal_document.nominals,
-                serialized_metadata: payload
-                    .table_info
-                    .as_ref()
-                    .and_then(|table| table.serialized_metadata.as_deref()),
-                namespace: &request.table.namespace,
-                instance_id: &self.descriptor.instance_id,
-                context: &request.context,
-            })?
-        };
-        let definition_facts = if payload.metadata_table_type.is_some() {
-            ConnectorTableDefinitionFacts::empty()
-        } else {
-            crate::table_definition::table_definition_facts(
-                &definition_schema,
-                &schema,
-                &planning_facts,
-                table_comment.as_deref(),
-                &request.context,
-            )?
-        };
-        let statistics_data_version = crate::statistics_codec::statistics_data_version(
-            &metadata.uuid().to_string(),
-            metadata.current_snapshot_id(),
-        )?;
-        ConnectorTableMetadata::try_new_typed(
-            novarocks_spi::connector::ConnectorTableMetadataHeader {
-                identity: ConnectorTableIdentity {
-                    instance_id: self.descriptor.instance_id.clone(),
-                    namespace: request.table.namespace,
-                    table: Arc::from(table_name),
-                },
-                planning_facts,
-                definition_facts,
-                version: Some(Bytes::copy_from_slice(
-                    &metadata.current_schema_id().to_le_bytes(),
-                )),
-                statistics_data_version: Some(statistics_data_version),
-                table: ConnectorTableHandle::try_new(
-                    self.descriptor.instance_id.clone(),
-                    encode_payload(
-                        &payload,
-                        "table handle",
-                        request.context.max_handle_payload_bytes(),
-                    )?,
-                )?,
+        build_table_metadata(
+            TableMetadataBuildInput {
+                descriptor: &self.descriptor,
+                incarnation: self.incarnation,
+                request,
+                loaded,
+                table_name,
+                metadata_table_type,
+                snapshots,
+                projection: TableMetadataProjection::Current,
             },
-            schema,
-            execution_schema,
             creation,
         )
     }
 }
 
-pub(crate) struct PreparedChangeWindowScan {
-    pub(crate) table: IcebergTablePayload,
-    pub(crate) output_schema: SchemaRef,
-    pub(crate) window: ConnectorChangeWindow,
+/// The read projection is separate from the real metadata used by control
+/// handles. Snapshot sources never supply Current write partition membership.
+#[derive(Clone, Copy)]
+pub(crate) enum TableMetadataProjection {
+    Current,
+    SnapshotTo(i64),
 }
-impl IcebergMetadata {
-    /// Decode and check only the exact original value input. No Provider I/O.
-    pub(crate) fn prepare_change_window_scan(
-        &self,
-        table: &ConnectorTableHandle,
-        request: &ConnectorBeginScanRequest,
-    ) -> Result<PreparedChangeWindowScan, ConnectorError> {
-        self.validate_context(&request.context)?;
-        validate_static_predicates(&request.static_predicates)?;
-        let ConnectorScanSelection::ChangeWindow(window) = request.selection else {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "Iceberg asynchronous scan planning currently requires a change window",
-            ));
-        };
-        let table = self.table_payload(table)?;
-        if table.metadata_table_type.is_some() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg metadata aliases do not support change-window scans",
-            ));
+
+pub(crate) struct TableMetadataBuildInput<'a> {
+    pub(crate) descriptor: &'a ConnectorInstanceDescriptor,
+    pub(crate) incarnation: ProviderBindingEpoch,
+    pub(crate) request: ConnectorTableRequest,
+    pub(crate) loaded: crate::loaded_table::IcebergPhysicalTable,
+    pub(crate) table_name: String,
+    pub(crate) metadata_table_type: Option<MetadataTableType>,
+    pub(crate) snapshots: crate::catalog::SnapshotLoading,
+    pub(crate) projection: TableMetadataProjection,
+}
+
+/// Project the full public metadata once in the caller's original CPU turn.
+/// The opaque control payload always describes the actual observed metadata.
+pub(crate) fn build_table_metadata(
+    input: TableMetadataBuildInput<'_>,
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    ConnectorTableMetadata,
+    novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+> {
+    let TableMetadataBuildInput {
+        descriptor,
+        incarnation,
+        request,
+        loaded,
+        table_name,
+        metadata_table_type,
+        snapshots,
+        projection,
+    } = input;
+    let metadata = loaded.table.metadata();
+    let (definition_schema, projected_snapshot, snapshot_source) = match projection {
+        TableMetadataProjection::Current => (
+            metadata.current_schema().clone(),
+            metadata.current_snapshot_id(),
+            false,
+        ),
+        TableMetadataProjection::SnapshotTo(snapshot_id) => {
+            if metadata_table_type.is_some() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Snapshot-source metadata requires a base table",
+                )
+                .into());
+            }
+            let schema = crate::change_planning::resolved_window_schema(metadata, snapshot_id)?;
+            (schema, Some(snapshot_id), true)
         }
-        let table_info = table.table_info.as_ref().ok_or_else(|| {
-            corrupt("Iceberg change-window scan is missing its resolved table pin")
-        })?;
-        if table_info.current_snapshot_id != Some(window.to_inclusive()) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg change-window upper endpoint does not match the exact table pin",
-            ));
-        }
-        let output_schema = projected_schema(&table, &request.projection)?;
-        Ok(PreparedChangeWindowScan {
-            table,
-            output_schema,
-            window,
-        })
-    }
-    pub(crate) fn validate_change_window_physical(
-        &self,
-        prepared: &PreparedChangeWindowScan,
-        physical: &crate::iceberg::table::Table,
-    ) -> Result<String, ConnectorError> {
-        let table_info = prepared.table.table_info.as_ref().ok_or_else(|| {
-            corrupt("Iceberg change-window scan is missing its resolved table pin")
-        })?;
-        let metadata = physical.metadata();
-        let uuid = metadata.uuid().to_string();
-        if metadata.current_snapshot_id() != Some(prepared.window.to_inclusive())
-            || table_info.table_uuid.as_deref() != Some(uuid.as_str())
-            || table_info.location != metadata.location()
-        {
-            return Err(corrupt(
-                "Iceberg change-window scan drifted from its exact table pin",
-            ));
-        }
-        Ok(uuid)
-    }
-    pub(crate) fn finish_change_window_scan(
-        &self,
-        prepared: &PreparedChangeWindowScan,
-        request: &ConnectorBeginScanRequest,
-        admission: novarocks_spi::connector::ConnectorChangeWindowAdmission,
-        metadata_uuid: String,
-    ) -> Result<ConnectorScan, ConnectorError> {
-        let window = prepared.window;
-        let predicate_dispositions = request
-            .static_predicates
-            .iter()
-            .map(|predicate| ConnectorPredicateDisposition {
-                predicate_id: predicate.id,
-                kind: ConnectorPredicateDispositionKind::Unsupported,
-            })
-            .collect();
-        let fact_columns = scan_fact_columns(
-            &prepared.output_schema,
-            &request.projection,
-            &prepared.table,
+    };
+    let table_comment = metadata.properties().get("comment").cloned();
+    let nominal_document =
+        crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(metadata)?;
+    let mut base_schema = crate::scalar_integer_domain::sql_schema_from_document(
+        definition_schema.as_ref(),
+        &nominal_document,
+    )?;
+    let hidden_columns = hidden_internal_columns(metadata.properties());
+    base_schema = annotate_hidden_fields(base_schema, &hidden_columns);
+    // Carry the same frozen field facts a scan output schema carries, so the
+    // admitted projection and the scan the provider later returns stay
+    // field-for-field identical.
+    base_schema = crate::schema_mapping::annotate_read_schema_from_scan_model(
+        &base_schema,
+        &iceberg_schema_def(definition_schema.as_ref()),
+    )
+    .map_err(corrupt)?;
+    let metadata_columns = metadata_column_names(metadata);
+    let table_info = IcebergTableInfo {
+        catalog: descriptor.instance_id.as_str().to_string(),
+        namespace: request.table.namespace.to_string(),
+        table: table_name.clone(),
+        table_uuid: Some(metadata.uuid().to_string()),
+        current_snapshot_id: metadata.current_snapshot_id(),
+        schema_id: metadata.current_schema_id(),
+        location: metadata.location().to_string(),
+        schema: iceberg_schema_def(metadata.current_schema()),
+        serialized_metadata: Some(
+            serde_json::to_string(metadata)
+                .map_err(|error| corrupt(format!("serialize Iceberg table metadata: {error}")))?,
+        ),
+    };
+    let payload = IcebergTablePayload {
+        namespace: request.table.namespace.to_string(),
+        table: table_name.clone(),
+        metadata_location: loaded.table.metadata_location().map(str::to_owned),
+        table_info: Some(table_info),
+        metadata_columns,
+        metadata_table_type,
+        prepared_files: Vec::new(),
+        explicit_files: None,
+        row_mutation_frozen_source: false,
+        hidden_columns,
+    };
+    let (schema, execution_schema) = if let Some(metadata_table_type) = payload.metadata_table_type
+    {
+        let columns = metadata_table_output_columns(metadata_table_type, metadata, creation)?;
+        let schema = metadata_output_schema(&columns).map_err(corrupt)?;
+        let execution =
+            crate::metadata_batch_reader::metadata_output_execution_schema(&columns, creation)?;
+        (schema, execution)
+    } else {
+        // The table schema exposed to SQL carries the Iceberg metadata
+        // pseudo-columns after the storage fields, in exactly the order
+        // `projected_schema` uses for scans. Their planning facts are what
+        // marks them hidden and row-lineage-owned, so omitting them here
+        // would make `_file`, `_pos`, `_row_id` and
+        // `_last_updated_sequence_number` unresolvable.
+        let mut fields = base_schema.fields().to_vec();
+        fields.extend(metadata_arrow_fields(&payload.metadata_columns)?);
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            base_schema.metadata().clone(),
+        ));
+        let execution = crate::schema_mapping::catalog_value::table_with_document(
+            &nominal_document,
+            definition_schema.as_ref(),
+            &payload.metadata_columns,
+            creation,
         )?;
-        let payload = IcebergScanPayload {
-            table: prepared.table.clone(),
-            snapshot_id: Some(window.to_inclusive()),
-            table_uuid: Some(metadata_uuid),
-            projection: request.projection.clone(),
-            limit: request.limit,
-            purpose: request.purpose.into(),
-            fact_columns,
-            physical_predicates: Vec::new(),
-            mode: IcebergScanModeV1::ChangeWindowAdmission,
+        (schema, execution)
+    };
+    let planning_facts = if payload.metadata_table_type.is_some() {
+        ConnectorTablePlanningFacts::empty()
+    } else {
+        let input = IcebergTablePlanningFactsInput {
+            schema: &schema,
+            iceberg_schema: Some(definition_schema.as_ref()),
+            metadata_columns: &payload.metadata_columns,
+            hidden_columns: &payload.hidden_columns,
+            nominal_declarations: &nominal_document.nominals,
+            serialized_metadata: payload
+                .table_info
+                .as_ref()
+                .and_then(|table| table.serialized_metadata.as_deref()),
+            namespace: &request.table.namespace,
+            instance_id: &descriptor.instance_id,
+            context: &request.context,
         };
-        ConnectorScan::try_new_change_window(
+        if snapshot_source {
+            snapshot_source_planning_facts(input)?
+        } else {
+            table_planning_facts(input)?
+        }
+    };
+    let definition_facts = if payload.metadata_table_type.is_some() {
+        ConnectorTableDefinitionFacts::empty()
+    } else {
+        crate::table_definition::table_definition_facts(
+            &definition_schema,
+            &schema,
+            &planning_facts,
+            table_comment.as_deref(),
+            &request.context,
+        )?
+    };
+    let statistics_data_version = crate::statistics_codec::statistics_data_version(
+        &metadata.uuid().to_string(),
+        projected_snapshot,
+    )?;
+    let observed_source = creation.arc(
+        crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts {
+            access: Arc::new(crate::loaded_table::IcebergAttemptTableAccess::freeze(loaded.clone())),
+            snapshots,
+            projection,
+        },
+    )?;
+    let source_facts =
+        novarocks_spi::connector::ConnectorProcessLocalPayload::try_new_with_creation(
             ConnectorProviderBindingKey {
-                instance_id: self.descriptor.instance_id.clone(),
-                incarnation: self.incarnation,
+                instance_id: descriptor.instance_id.clone(),
+                incarnation,
             },
-            window,
-            admission,
-            ConnectorScanHandle::try_new(
-                self.descriptor.instance_id.clone(),
+            observed_source,
+            creation,
+        )?;
+    ConnectorTableMetadata::try_new_typed(
+        novarocks_spi::connector::ConnectorTableMetadataHeader {
+            identity: ConnectorTableIdentity {
+                instance_id: descriptor.instance_id.clone(),
+                namespace: request.table.namespace,
+                table: Arc::from(table_name),
+            },
+            planning_facts,
+            definition_facts,
+            version: Some(Bytes::copy_from_slice(
+                &definition_schema.schema_id().to_le_bytes(),
+            )),
+            statistics_data_version: Some(statistics_data_version),
+            table: ConnectorTableHandle::try_new(
+                descriptor.instance_id.clone(),
                 encode_payload(
                     &payload,
-                    "scan handle",
+                    "table handle",
                     request.context.max_handle_payload_bytes(),
                 )?,
             )?,
-            prepared.output_schema.clone(),
-            predicate_dispositions,
-            &request.context,
-        )
-    }
+        },
+        schema,
+        execution_schema,
+        creation,
+    )
+    .map(|metadata| metadata.with_source_read_facts(source_facts))
 }
 
 impl ConnectorScanPlanning for IcebergMetadata {
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.descriptor.instance_id
-    }
-
-    fn begin_scan_async_in<'a>(
-        &'a self,
-        table: &'a ConnectorTableHandle,
-        request: ConnectorBeginScanRequest,
-        cpu: &'a Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
-        original: &'a novarocks_spi::connector::ConnectorOriginalResultScope,
-        owner: &'a mut Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ConnectorScan, ConnectorError>> + Send + 'a>,
-    > {
-        if owner.is_some() {
-            return Box::pin(async {
-                Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "change-window original owner receiver is occupied",
-                ))
-            });
-        }
-        // The actual caller's original receiver holds the SAME Source before
-        // any foreign/worker poll. Neither F exit nor CPU retirement can drop
-        // its SDK inputs before the caller receives and validates the result.
-        let source = crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal::change_window_source(
-            self.clone(), table.clone(), request, original.clone(),
-        );
-        *owner = Some(novarocks_spi::connector::ConnectorProcessLocalPayload::new(
-            ConnectorProviderBindingKey {
-                instance_id: self.descriptor.instance_id.clone(),
-                incarnation: self.incarnation,
-            },
-            source.clone(),
-        ));
-        Box::pin(async move {
-            source.drive_change_window(cpu).await?;
-            source.take_change_window_result()
-        })
     }
 
     fn begin_scan(
@@ -1568,54 +1511,7 @@ impl ConnectorScanPlanning for IcebergMetadata {
         } else {
             projected_schema(&table, &request.projection)?
         };
-        if let ConnectorScanSelection::ChangeWindow(window) = request.selection {
-            if table.metadata_table_type.is_some() {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "Iceberg metadata aliases do not support change-window scans",
-                ));
-            }
-            let table_info = table.table_info.as_ref().ok_or_else(|| {
-                corrupt("Iceberg change-window scan is missing its resolved table pin")
-            })?;
-            if table_info.current_snapshot_id != Some(window.to_inclusive()) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "Iceberg change-window upper endpoint does not match the exact table pin",
-                ));
-            }
-            let physical = self
-                .runtime
-                .load_table_for_request(&table.namespace, &table.table, &request.context)
-                .map_err(unavailable)?;
-            let metadata = physical.table.metadata();
-            let metadata_uuid = metadata.uuid().to_string();
-            if metadata.current_snapshot_id() != Some(window.to_inclusive())
-                || table_info.table_uuid.as_deref() != Some(metadata_uuid.as_str())
-                || table_info.location != metadata.location()
-            {
-                return Err(corrupt(
-                    "Iceberg change-window scan drifted from its exact table pin",
-                ));
-            }
-            let admission = crate::change_planning::plan_change_window(
-                &physical.table,
-                window.from_exclusive(),
-                window.to_inclusive(),
-                self.runtime.resources().catalog_runtime(),
-                &request.context,
-            )?;
-            let prepared = PreparedChangeWindowScan {
-                table,
-                output_schema,
-                window,
-            };
-            return self.finish_change_window_scan(&prepared, &request, admission, metadata_uuid);
-        }
-
-        let ConnectorScanSelection::Snapshot(selector) = request.selection else {
-            unreachable!("change-window scans return above")
-        };
+        let ConnectorScanSelection::Snapshot(selector) = request.selection;
         let (snapshot_id, table_uuid) = match selector {
             ConnectorReadSelector::Current => {
                 let table_info = table.table_info.as_ref().ok_or_else(|| {
@@ -1685,12 +1581,6 @@ impl ConnectorScanPlanning for IcebergMetadata {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "Iceberg metadata relations read only through the typed provider split source",
-            ));
-        }
-        if matches!(scan.mode, IcebergScanModeV1::ChangeWindowAdmission) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "Iceberg change-window admission is not an executable legacy scan; use the typed read adapter",
             ));
         }
         let files = self.scan_files(&scan, &request.context)?;
@@ -2140,7 +2030,6 @@ struct IcebergScanPayload {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum IcebergScanModeV1 {
     Snapshot,
-    ChangeWindowAdmission,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -2722,7 +2611,7 @@ fn annotate_hidden_fields(schema: SchemaRef, hidden: &[String]) -> SchemaRef {
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
-fn metadata_column_names(metadata: &crate::iceberg::spec::TableMetadata) -> Vec<String> {
+pub(crate) fn metadata_column_names(metadata: &crate::iceberg::spec::TableMetadata) -> Vec<String> {
     let mut columns = vec!["_file".to_string(), "_pos".to_string()];
     if row_lineage_enabled(metadata) {
         columns.push("_row_id".to_string());
@@ -3012,6 +2901,22 @@ mod plan_splits_pruning_tests {
                 resolution: ConnectorTableResolution::StrictBaseTable,
                 context: context(),
             };
+            // Source capture requests complete history through its own port;
+            // ordinary catalog projection retains its existing refs request.
+            for (source, expected) in [(false, crate::catalog::SnapshotLoading::Refs), (true, crate::catalog::SnapshotLoading::All)] {
+                let preparation = if source { metadata.prepare_source_table(request.clone()).await }
+                    else { metadata.prepare_table(request.clone()).await }.unwrap();
+                let observed = with_pure_schema_creation(&request.context, |creation| metadata.create_prepared_table(preparation, creation).map_err(metadata_creation_error)).unwrap();
+                let facts = observed.source_read_facts().unwrap()
+                    .value::<crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts>(metadata.descriptor.instance_id.as_str()).unwrap();
+                assert_eq!(facts.snapshots, expected);
+                assert!(matches!(facts.projection, TableMetadataProjection::Current));
+                assert_eq!(facts.access.identifier().name(), "t");
+            }
+            let mut alias = request.clone();
+            alias.resolution = ConnectorTableResolution::ProviderReadAlias;
+            let Err(error) = metadata.prepare_source_table(alias).await else { panic!("source observation cannot use a catalog alias"); };
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
             let first = metadata
                 .capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
                     table: request.table.clone(),
@@ -3128,6 +3033,407 @@ mod plan_splits_pruning_tests {
         fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
             None
         }
+    }
+
+    #[test]
+    fn snapshot_metadata_projects_to_schema_without_current_partition_membership() {
+        use crate::iceberg::spec::{Literal, Transform};
+        use novarocks_spi::connector::ConnectorColumnDefault;
+
+        let (_executor, _warehouse, provider) = provider();
+        let old_schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(
+                    NestedField::optional(2, "label", Type::Primitive(PrimitiveType::String))
+                        .with_initial_default(Literal::string("old-read"))
+                        .with_write_default(Literal::string("old-write")),
+                ),
+            ])
+            .build()
+            .unwrap();
+        let base = TableMetadataBuilder::new(
+            old_schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///to-metadata".to_string(),
+            FormatVersion::V3,
+            HashMap::from([
+                ("write.row-lineage".to_string(), "false".to_string()),
+                ("unique_constraints".to_string(), "id".to_string()),
+                (
+                    "foreign_key_constraints".to_string(),
+                    "(id) REFERENCES db.parent(id)".to_string(),
+                ),
+            ]),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let old_schema_id = base.current_schema_id();
+        let snapshot_base_ms = base.last_updated_ms();
+        let snapshot = |id, parent, schema_id| {
+            Snapshot::builder()
+                .with_snapshot_id(id)
+                .with_parent_snapshot_id(parent)
+                .with_sequence_number(id)
+                .with_timestamp_ms(snapshot_base_ms + id)
+                .with_manifest_list(format!("file:///to-metadata/snap-{id}.avro"))
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .with_schema_id(schema_id)
+                .with_row_range(0, 0)
+                .build()
+        };
+        let base = base
+            .into_builder(None)
+            .add_snapshot(snapshot(101, None, old_schema_id))
+            .unwrap()
+            .set_ref(
+                "main",
+                SnapshotReference::new(101, SnapshotRetention::branch(None, None, None)),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let current_schema = Schema::builder()
+            .with_schema_id(old_schema_id + 1)
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    3,
+                    "future",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(
+                    NestedField::optional(2, "label", Type::Primitive(PrimitiveType::String))
+                        .with_initial_default(Literal::string("old-read"))
+                        .with_write_default(Literal::string("new-write")),
+                ),
+                Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let future_spec = PartitionSpec::builder(Arc::new(current_schema.clone()))
+            .add_partition_field("future", "future_partition", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let evolved = base
+            .into_builder(None)
+            .add_current_schema(current_schema)
+            .unwrap()
+            .add_partition_spec(future_spec.into_unbound())
+            .unwrap()
+            .set_default_partition_spec(-1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let current_schema_id = evolved.current_schema_id();
+        let evolved = evolved
+            .into_builder(None)
+            .add_snapshot(snapshot(102, Some(101), current_schema_id))
+            .unwrap()
+            .set_ref(
+                "main",
+                SnapshotReference::new(102, SnapshotRetention::branch(None, None, None)),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_ne!(old_schema_id, evolved.current_schema_id());
+        assert_eq!(evolved.default_partition_spec().fields()[0].source_id, 3);
+        let uuid = evolved.uuid().to_string();
+        let io = crate::fs_io::build_file_io_for_location(
+            evolved.location(),
+            provider.runtime.resources().planning_binding().clone(),
+        );
+        let table = crate::iceberg::table::Table::builder()
+            .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+            .metadata(Arc::new(evolved))
+            .file_io(io)
+            .runtime(
+                provider
+                    .runtime
+                    .resources()
+                    .catalog_runtime()
+                    .iceberg_runtime()
+                    .clone(),
+            )
+            .build()
+            .unwrap();
+        let physical = crate::loaded_table::IcebergPhysicalTable::new(table);
+        let request = ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id: provider.descriptor.instance_id.clone(),
+                namespace: Arc::from("db"),
+                table: Arc::from("t"),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context(),
+        };
+        let build = |projection| {
+            with_pure_schema_creation(&request.context, |creation| {
+                build_table_metadata(
+                    TableMetadataBuildInput {
+                        descriptor: &provider.descriptor,
+                        incarnation: provider.incarnation,
+                        request: request.clone(),
+                        loaded: physical.clone(),
+                        table_name: "t".to_string(),
+                        metadata_table_type: None,
+                        snapshots: crate::catalog::SnapshotLoading::All,
+                        projection,
+                    },
+                    creation,
+                )
+                .map_err(metadata_creation_error)
+            })
+            .unwrap()
+        };
+        let to = build(TableMetadataProjection::SnapshotTo(101));
+        let current = build(TableMetadataProjection::Current);
+        let owner = ConnectorProviderBindingKey {
+            instance_id: provider.descriptor.instance_id.clone(),
+            incarnation: provider.incarnation,
+        };
+        let inspect_source = |metadata: &ConnectorTableMetadata| {
+            crate::storage_inspector::source_schema_observation(
+                physical.table.metadata(),
+                metadata,
+                &owner,
+                &request.context,
+            )
+        };
+        let selected_source = inspect_source(&to).unwrap();
+        let current_source = inspect_source(&current).unwrap();
+        assert_eq!(
+            selected_source
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "label"]
+        );
+        assert_eq!(
+            current_source
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["future", "label", "id"]
+        );
+        assert_eq!(selected_source.schema_version, to.version.clone().unwrap());
+        assert_eq!(
+            current_source.schema_version,
+            current.version.clone().unwrap()
+        );
+        assert!(selected_source.format_v3);
+        assert!(!selected_source.stored_row_lineage_enabled);
+        assert_eq!(selected_source.object_id, current_source.object_id);
+        // The default Current spec uses future field 3, absent from To. Source
+        // inspection must not call the target partition-author under To schema.
+        assert_eq!(
+            physical.table.metadata().default_partition_spec().fields()[0].source_id,
+            3
+        );
+        let mut wrong_version = to.clone();
+        wrong_version.version = Some(Bytes::copy_from_slice(&(old_schema_id + 19).to_le_bytes()));
+        assert_eq!(
+            inspect_source(&wrong_version).unwrap_err().kind(),
+            ConnectorErrorKind::CorruptData
+        );
+        let original_marker = to.source_read_facts().unwrap()
+            .value::<crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts>(provider.descriptor.instance_id.as_str()).unwrap();
+        assert!(matches!(
+            original_marker.projection,
+            TableMetadataProjection::SnapshotTo(101)
+        ));
+        let foreign = to.clone().with_source_read_facts(novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+            ConnectorProviderBindingKey {
+                instance_id: provider.descriptor.instance_id.clone(),
+                incarnation: ProviderBindingEpoch::from_bytes([0x79;16]),
+            },
+            Arc::new(crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts {
+                access: Arc::clone(&original_marker.access), snapshots: original_marker.snapshots,
+                projection: original_marker.projection,
+            }),
+        ));
+        assert_eq!(
+            inspect_source(&foreign).unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        for missing_field in [false, true] {
+            let mut frame = serde_json::to_value(physical.table.metadata()).unwrap();
+            let selected_schema = frame["schemas"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|schema| schema["schema-id"].as_i64() == Some(i64::from(old_schema_id)))
+                .unwrap();
+            if missing_field {
+                selected_schema["fields"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|field| field["id"] != serde_json::json!(2));
+            } else {
+                selected_schema["fields"][0]["type"] = serde_json::json!("string");
+            }
+            let altered: crate::iceberg::spec::TableMetadata =
+                serde_json::from_value(frame).unwrap();
+            let changed_table = crate::iceberg::table::Table::builder()
+                .identifier(physical.table.identifier().clone())
+                .metadata(Arc::new(altered.clone()))
+                .file_io(physical.table.file_io().clone())
+                .runtime(
+                    provider
+                        .runtime
+                        .resources()
+                        .catalog_runtime()
+                        .iceberg_runtime()
+                        .clone(),
+                )
+                .build()
+                .unwrap();
+            let malformed = to.clone().with_source_read_facts(novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+                owner.clone(), Arc::new(crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts {
+                    access: Arc::new(crate::loaded_table::IcebergAttemptTableAccess::freeze(crate::loaded_table::IcebergPhysicalTable::new(changed_table))),
+                    snapshots: original_marker.snapshots, projection: original_marker.projection,
+                }),
+            ));
+            // Model the same decoded frozen frame and private marker disagreeing
+            // with the already-admitted typed schema. Same schema ID is not proof.
+            assert_eq!(
+                crate::storage_inspector::source_schema_observation(
+                    &altered,
+                    &malformed,
+                    &owner,
+                    &request.context,
+                )
+                .unwrap_err()
+                .kind(),
+                ConnectorErrorKind::CorruptData
+            );
+        }
+        let names = |metadata: &ConnectorTableMetadata| {
+            metadata
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&to), ["id", "label", "_file", "_pos"]);
+        assert_eq!(names(&current), ["future", "label", "id", "_file", "_pos"]);
+        assert_eq!(
+            to.execution_schema()
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            ["id", "label", "_file", "_pos"]
+        );
+        assert_eq!(to.planning_facts.column_facts().len(), 4);
+        assert_eq!(
+            to.planning_facts
+                .column_facts()
+                .iter()
+                .map(|f| f.field_ordinal())
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(
+            to.planning_facts.column_facts()[1].write_default(),
+            Some(&ConnectorColumnDefault::String(Arc::from("old-write")))
+        );
+        assert_eq!(
+            current.planning_facts.column_facts()[1].write_default(),
+            Some(&ConnectorColumnDefault::String(Arc::from("new-write")))
+        );
+        let initial = crate::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY;
+        assert!(to.schema().field(1).metadata()[initial].contains("old-read"));
+        assert!(current.schema().field(1).metadata()[initial].contains("old-read"));
+        assert_eq!(to.planning_facts.partition_source_column_ordinals(), None);
+        assert_eq!(
+            current.planning_facts.partition_source_column_ordinals(),
+            Some([0].as_slice())
+        );
+        assert_eq!(
+            to.planning_facts.unique_constraints()[0].column_ordinals(),
+            &[0]
+        );
+        assert_eq!(
+            current.planning_facts.unique_constraints()[0].column_ordinals(),
+            &[2]
+        );
+        assert_eq!(
+            to.planning_facts.foreign_key_constraints()[0].local_column_ordinals(),
+            &[0]
+        );
+        assert_eq!(
+            to.version.as_deref(),
+            Some(old_schema_id.to_le_bytes().as_slice())
+        );
+        assert_eq!(
+            current.version.as_deref(),
+            Some(current_schema_id.to_le_bytes().as_slice())
+        );
+        assert_eq!(
+            to.statistics_data_version,
+            Some(crate::statistics_codec::statistics_data_version(&uuid, Some(101)).unwrap())
+        );
+        assert_eq!(
+            current.statistics_data_version,
+            Some(crate::statistics_codec::statistics_data_version(&uuid, Some(102)).unwrap())
+        );
+        let current_revision = provider
+            .exact_semantic_revision(&to.table, ConnectorReadSelector::Current)
+            .unwrap();
+        assert_eq!(
+            current_revision.canonical_read_point(),
+            Some(ConnectorCanonicalReadPoint::Snapshot(Some(102)))
+        );
+        let payload = provider.table_payload(&to.table).unwrap();
+        let info = payload.table_info.unwrap();
+        assert_eq!(info.current_snapshot_id, Some(102));
+        assert_eq!(info.schema_id, current_schema_id);
+        let real: crate::iceberg::spec::TableMetadata =
+            serde_json::from_str(info.serialized_metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(real.current_snapshot_id(), Some(102));
+        assert_eq!(real.current_schema_id(), current_schema_id);
+        let error = with_pure_schema_creation(&request.context, |creation| {
+            build_table_metadata(
+                TableMetadataBuildInput {
+                    descriptor: &provider.descriptor,
+                    incarnation: provider.incarnation,
+                    request: request.clone(),
+                    loaded: physical.clone(),
+                    table_name: "t".to_string(),
+                    metadata_table_type: Some(MetadataTableType::Files),
+                    snapshots: crate::catalog::SnapshotLoading::All,
+                    projection: TableMetadataProjection::SnapshotTo(101),
+                },
+                creation,
+            )
+            .map_err(metadata_creation_error)
+        })
+        .err()
+        .expect("metadata aliases cannot masquerade as snapshot sources");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
 
     #[test]
@@ -3417,16 +3723,11 @@ mod plan_splits_pruning_tests {
                 .unwrap(),
             ConnectorReadSelector::SnapshotId(101)
         );
-        let window = provider
-            .change_window_from_exact_revisions(&table, &from, &to)
-            .unwrap();
-        assert_eq!((window.from_exclusive(), window.to_inclusive()), (101, 102));
         assert_eq!(
             provider
-                .change_window_from_exact_revisions(&table, &from, &from)
-                .unwrap_err()
-                .kind(),
-            ConnectorErrorKind::InvalidRequest
+                .read_selector_from_exact_revision(&table, &to)
+                .unwrap(),
+            ConnectorReadSelector::SnapshotId(102)
         );
         let object_id = ConnectorTableObjectId::try_new(Bytes::from(table_uuid)).unwrap();
         let replaced_object =
@@ -3643,16 +3944,260 @@ mod plan_splits_pruning_tests {
         assert_eq!(metrics.candidate_units_pruned, 2);
         assert_eq!(metrics.scan_units_planned, 0);
     }
+    mod prepared_source_phase_support {
+        use super::*;
+        use crate::iceberg::spec::{DataContentType, DataFileFormat, Struct};
+        use novarocks_spi::connector::{
+            ConnectorIoAdmissionPort, ConnectorIoCleanupFuture, ConnectorIoProgressSource,
+            ConnectorIoRequest, ConnectorIoRequestSource, ConnectorOriginalResultScopeCheck,
+            ConnectorPayloadRetentionGuard, OriginalResultCheckError, ProviderMetadataCpuInput,
+            ProviderMetadataCpuPort, SharedDependency,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Waker};
+        pub(super) struct OriginalScope(pub(super) Instant);
+        impl ConnectorOriginalResultScopeCheck for OriginalScope {
+            fn original_deadline(&self) -> Instant {
+                self.0
+            }
+            fn check_active(&self) -> Result<(), OriginalResultCheckError> {
+                Ok(())
+            }
+        }
+        // Explicit SPI resource-cell fixture. It observes the real FileIO
+        // requests; it does not certify a WC Root, a CPU offer or worker exit.
+        pub(super) struct IoFixture {
+            pub(super) in_cpu: Arc<AtomicBool>,
+            pub(super) owned_reads: AtomicUsize,
+        }
+        struct IoCell;
+        impl ConnectorIoRequestSource for IoCell {
+            fn exit_waker(&self) -> Waker {
+                Waker::noop().clone()
+            }
+            fn reserve_stream(&self) -> Result<(), ConnectorError> {
+                panic!("snapshot whole-object reads do not open streams")
+            }
+            fn stream_closed(&self) {
+                panic!("no snapshot stream")
+            }
+            fn install_stream_cleanup_in(
+                &self,
+                _: &mut Option<ConnectorIoCleanupFuture>,
+            ) -> Result<(), ConnectorError> {
+                panic!("no snapshot stream cleanup")
+            }
+            fn stream_custody_lost(&self) {
+                panic!("no snapshot stream custody")
+            }
+            fn record_cleanup_failure(
+                &self,
+                original: Box<dyn std::any::Any + Send>,
+            ) -> Result<(), Box<dyn std::any::Any + Send>> {
+                Err(original)
+            }
+            fn attach_original_progress(
+                &self,
+                _: Arc<dyn ConnectorIoProgressSource>,
+            ) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+            fn poll_admitted(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_include_dependency(
+                &self,
+                _: &SharedDependency,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), ConnectorError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl ConnectorIoAdmissionPort for IoFixture {
+            fn request_owned(
+                &self,
+                _: std::num::NonZeroU64,
+            ) -> Result<ConnectorIoRequest, ConnectorError> {
+                assert!(
+                    !self.in_cpu.load(Ordering::SeqCst),
+                    "raw snapshot read must be driven outside the pure CPU phase"
+                );
+                self.owned_reads.fetch_add(1, Ordering::SeqCst);
+                Ok(ConnectorIoRequest::from_original(Arc::new(IoCell)))
+            }
+            fn request(&self, _: SharedDependency) -> Result<ConnectorIoRequest, ConnectorError> {
+                assert!(
+                    !self.in_cpu.load(Ordering::SeqCst),
+                    "selected physical I/O must not be polled by the pure CPU phase"
+                );
+                Ok(ConnectorIoRequest::from_original(Arc::new(IoCell)))
+            }
+            fn publication_obligation_started(&self) {
+                panic!("scan cannot publish")
+            }
+            fn retain_payload(&self) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+                Ok(ConnectorPayloadRetentionGuard::new(()))
+            }
+        }
+        pub(super) struct PhasePort {
+            pub(super) in_cpu: Arc<AtomicBool>,
+            pub(super) descriptor: ConnectorInstanceDescriptor,
+            pub(super) incarnation: ProviderBindingEpoch,
+            pub(super) calls: AtomicUsize,
+        }
+        impl ProviderMetadataCpuPort for PhasePort {
+            fn submit_metadata_in(
+                &self,
+                input: &mut Option<ProviderMetadataCpuInput>,
+            ) -> Result<(), ConnectorError> {
+                let source = input.as_ref().unwrap();
+                assert_eq!(source.descriptor(), &self.descriptor);
+                assert_eq!(source.incarnation(), self.incarnation);
+                assert_eq!(
+                    source.original_source_type_id(),
+                    std::any::TypeId::of::<
+                        crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+                    >()
+                );
+                assert!(!self.in_cpu.swap(true, Ordering::SeqCst));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                input.take().unwrap().run_original_phase();
+                self.in_cpu.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            fn poll_finished(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_closed(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+                None
+            }
+        }
+        pub(super) fn written(
+            table: &crate::iceberg::table::Table,
+            label: &str,
+        ) -> crate::commit::WrittenFile {
+            crate::commit::WrittenFile {
+                path: format!("{}/data/{label}.parquet", table.metadata().location()),
+                format: DataFileFormat::Parquet,
+                content: DataContentType::Data,
+                partition_values: Struct::empty(),
+                partition_spec_id: table.metadata().default_partition_spec_id(),
+                record_count: 3,
+                file_size_in_bytes: 128,
+                split_offsets: Vec::new(),
+                column_sizes: HashMap::new(),
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                nan_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                referenced_data_file: None,
+                equality_ids: None,
+                first_row_id: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            }
+        }
+    }
+    mod prepared_split_execution_tests;
+
+    fn prepared_source_fixture_control(
+        provider: &IcebergMetadata,
+        context: &ConnectorRequestContext,
+    ) -> novarocks_spi::connector::read_stack::ConnectorReadRequestControl {
+        use novarocks_spi::connector::read_stack::ConnectorReadRequestControlFactory;
+        let template = Arc::new(crate::typed_boundary::IcebergTypedBoundary::new(
+            provider.descriptor.clone(),
+            provider.incarnation,
+            novarocks_spi::connector::CatalogHandle::new(
+                provider.descriptor.instance_id.clone(),
+                novarocks_spi::connector::CatalogVersion::from_bytes([0x65; 32]),
+            ),
+            crate::typed_read::HiveTransactionHandle::new(true, [0x71; 16]),
+            Arc::clone(&provider.runtime),
+        ));
+        crate::typed_boundary::IcebergTypedRequestControlFactory::new(template)
+            .for_planning(
+                &novarocks_spi::connector::ConnectorPlanningContext::try_from_request(
+                    context.clone().without_attempt_capabilities(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+    }
+
+    async fn prepared_source_fixture_metadata(
+        provider: &IcebergMetadata,
+        namespace: &str,
+        context: &ConnectorRequestContext,
+    ) -> ConnectorTableMetadata {
+        let preparation = provider
+            .prepare_source_table(ConnectorTableRequest {
+                table: ConnectorTableIdentity {
+                    instance_id: provider.descriptor.instance_id.clone(),
+                    namespace: namespace.into(),
+                    table: "t".into(),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context.clone(),
+            })
+            .await
+            .unwrap();
+        with_pure_schema_creation(context, |creation| {
+            provider
+                .create_prepared_table(preparation, creation)
+                .map_err(metadata_creation_error)
+        })
+        .unwrap()
+    }
+
+    fn prepared_source_fixture_window(
+        provider: &IcebergMetadata,
+        metadata: &ConnectorTableMetadata,
+        namespace: &str,
+        from: i64,
+        to: i64,
+    ) -> novarocks_spi::connector::read_stack::ConnectorReadSourcePreparationRequest {
+        let facts = metadata.source_read_facts().unwrap().value::<
+            crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts
+        >(provider.descriptor.instance_id.as_str()).unwrap();
+        let object = ConnectorTableObjectId::try_new(Bytes::from(
+            facts.access.metadata().uuid().to_string(),
+        ))
+        .unwrap();
+        let revision = |snapshot| {
+            ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                provider.descriptor.provider_id.clone(),
+                &object,
+                Some(snapshot),
+            )
+            .unwrap()
+        };
+        novarocks_spi::connector::read_stack::ConnectorReadSourcePreparationRequest::change_window(
+            novarocks_spi::connector::read_stack::SchemaTableName::try_new(namespace, "t").unwrap(),
+            metadata.table.clone(),
+            metadata.source_read_facts().unwrap().clone(),
+            object.clone(),
+            novarocks_spi::connector::read_stack::ConnectorReadChangeWindow::new(from, to),
+            revision(from),
+            revision(to),
+        )
+    }
+
     #[test]
     fn original_async_change_window_uses_loaded_exact_pin_without_cpu_catalog_io() {
         use crate::catalog::{
             CatalogNamespaceName, catalog_request::CatalogPublicationRequest, error::CatalogOutcome,
         };
         use novarocks_spi::connector::{
-            ConnectorBatchBudget, ConnectorChangeWindowAdmission,
-            ConnectorChangeWindowFullRebuildReason, ConnectorOriginalResultScope,
-            ConnectorOriginalResultScopeCheck, OriginalResultCheckError, ProviderMetadataCpuInput,
-            ProviderMetadataCpuPort,
+            ConnectorChangeWindowAdmission, ConnectorChangeWindowFullRebuildReason,
+            ConnectorOriginalResultScope, ConnectorOriginalResultScopeCheck,
+            OriginalResultCheckError, ProviderMetadataCpuInput, ProviderMetadataCpuPort,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct OriginalScope(Instant);
@@ -3665,8 +4210,8 @@ mod plan_splits_pruning_tests {
             }
         }
         // Like CaptureAfterOriginalIo above, this is a real-input phase fixture,
-        // not a physical CPU admission/exit oracle. The second pure phase must
-        // finish from the exact already-loaded facts after the catalog is gone.
+        // not a physical CPU admission/exit oracle. The typed pure phase must
+        // finish from the exact already-captured facts after the catalog is gone.
         struct LoadedPhasePort {
             path: std::path::PathBuf,
             descriptor: ConnectorInstanceDescriptor,
@@ -3688,10 +4233,11 @@ mod plan_splits_pruning_tests {
                     >()
                 );
                 let turn = self.calls.fetch_add(1, Ordering::SeqCst);
-                assert!(turn < 2, "resolved lineage uses only Prepare and Inspect");
-                if turn == 1 {
-                    std::fs::remove_dir_all(&self.path).unwrap();
-                }
+                assert_eq!(
+                    turn, 0,
+                    "resolved lineage needs one typed preparation phase"
+                );
+                std::fs::remove_dir_all(&self.path).unwrap();
                 input.take().unwrap().run_original_phase();
                 Ok(())
             }
@@ -3772,41 +4318,35 @@ mod plan_splits_pruning_tests {
                     .runtime()
                     .control_state()
                     .invalidate_table_cache("async_window", "t");
-                let table = provider
-                    .capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
-                        table: ConnectorTableIdentity {
-                            instance_id: provider.descriptor.instance_id.clone(),
-                            namespace: "async_window".into(),
-                            table: "t".into(),
-                        },
-                        resolution: ConnectorTableResolution::StrictBaseTable,
-                        selector: ConnectorTableObjectSelector::Current,
-                        context: context(),
-                    })
-                    .await
-                    .unwrap()
-                    .metadata;
+                let request_context = context();
+                let table =
+                    prepared_source_fixture_metadata(&provider, "async_window", &request_context)
+                        .await;
                 let from = if missing_from {
                     snapshot.checked_add(1).unwrap_or(snapshot - 1)
                 } else {
                     snapshot
                 };
-                let window = ConnectorChangeWindow::new(from, snapshot);
-                let request = ConnectorBeginScanRequest {
-                    projection: vec![0],
-                    static_predicates: Vec::new(),
-                    selection: ConnectorScanSelection::ChangeWindow(window),
-                    purpose: ConnectorReadPurpose::Query,
-                    limit: None,
-                    batch: ConnectorBatchBudget {
-                        max_rows: std::num::NonZeroUsize::new(4096).unwrap(),
-                        max_bytes: std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
-                    },
-                    context: context(),
-                };
+                let request = prepared_source_fixture_window(
+                    &provider,
+                    &table,
+                    "async_window",
+                    from,
+                    snapshot,
+                );
                 let original = ConnectorOriginalResultScope::from_original(Arc::new(
-                    OriginalScope(request.context.deadline()),
+                    OriginalScope(request_context.deadline()),
                 ));
+                let read = prepared_source_fixture_control(&provider, &request_context);
+                let metadata = read.metadata();
+                let session = novarocks_spi::connector::read_stack::ConnectorSession::try_new(
+                    "q",
+                    "u",
+                    "UTC",
+                    "en_US",
+                    std::time::SystemTime::UNIX_EPOCH,
+                )
+                .unwrap();
                 let port = Arc::new(LoadedPhasePort {
                     path: warehouse.path().to_path_buf(),
                     descriptor: provider.descriptor.clone(),
@@ -3815,8 +4355,8 @@ mod plan_splits_pruning_tests {
                 });
                 let cpu: Arc<dyn ProviderMetadataCpuPort> = port.clone();
                 let mut owner = None;
-                let result = provider
-                    .begin_scan_async_in(&table.table, request.clone(), &cpu, &original, &mut owner)
+                let result = metadata
+                    .prepare_source_read(&session, &request, &cpu, &original, &mut owner)
                     .await
                     .unwrap();
                 let key = ConnectorProviderBindingKey {
@@ -3831,26 +4371,22 @@ mod plan_splits_pruning_tests {
                     weak.upgrade().is_some(),
                     "actual Source outlives the completed Provider F"
                 );
-                let rejected = provider
-                    .begin_scan_async_in(&table.table, request, &cpu, &original, &mut owner)
+                let rejected = match metadata
+                    .prepare_source_read(&session, &request, &cpu, &original, &mut owner)
                     .await
-                    .expect_err("same owner receiver cannot be overwritten");
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("same owner receiver cannot be overwritten"),
+                };
                 assert_eq!(rejected.kind(), ConnectorErrorKind::InvalidRequest);
                 assert_eq!(
                     rejected.message(),
-                    "change-window original owner receiver is occupied"
+                    "source preparation owner slot is occupied"
                 );
                 assert!(weak.upgrade().is_some());
-                assert_eq!(port.calls.load(Ordering::SeqCst), 2);
-                result
-                    .validate(
-                        &ConnectorProviderBindingKey {
-                            instance_id: provider.descriptor.instance_id.clone(),
-                            incarnation: provider.incarnation,
-                        },
-                        ConnectorScanSelection::ChangeWindow(window),
-                    )
-                    .unwrap();
+                assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(result.request().to_revision(), request.to_revision());
+                assert_eq!(result.request().from_revision(), request.from_revision());
                 let expected = if missing_from {
                     ConnectorChangeWindowAdmission::FullRebuild(
                         ConnectorChangeWindowFullRebuildReason::LineageBroken {
@@ -3860,15 +4396,17 @@ mod plan_splits_pruning_tests {
                 } else {
                     ConnectorChangeWindowAdmission::MetadataOnly
                 };
-                assert_eq!(
-                    result.admission(),
-                    &novarocks_spi::connector::ConnectorScanAdmission::ChangeWindow(expected)
-                );
-                // Value facts carry no runtime owner. The actual receiving
-                // slot, after result validation and F Drop above, retires it.
+                assert_eq!(result.admission(), Some(&expected));
+                // This fixture's port reports its explicit close. It is not a
+                // physical worker exit oracle; actual Source custody stays in
+                // the original receiver until the caller closes and drops it.
+                std::future::poll_fn(|cx| cpu.poll_closed(cx))
+                    .await
+                    .unwrap();
                 drop(owner.take());
                 assert!(weak.upgrade().is_none());
-                assert_eq!(result.output_schema().fields().len(), 1);
+                assert_eq!(result.to_metadata().schema().field(0).name(), "id");
+                assert_eq!(result.to_metadata().schema().fields().len(), 3);
             });
         }
     }
@@ -3877,168 +4415,15 @@ mod plan_splits_pruning_tests {
         use crate::catalog::{
             CatalogNamespaceName, catalog_request::CatalogPublicationRequest, error::CatalogOutcome,
         };
-        use crate::iceberg::spec::{DataContentType, DataFileFormat, Struct};
         use novarocks_spi::connector::{
-            ConnectorBatchBudget, ConnectorCatalogMutation, ConnectorCatalogMutationOperation,
+            ConnectorCatalogMutation, ConnectorCatalogMutationOperation,
             ConnectorCatalogMutationRequest, ConnectorChangeWindowAdmission,
-            ConnectorChangeWindowPartitionImpact, ConnectorColumnPath, ConnectorIoAdmissionPort,
-            ConnectorIoCleanupFuture, ConnectorIoProgressSource, ConnectorIoRequest,
-            ConnectorIoRequestSource, ConnectorOriginalResultScope,
-            ConnectorOriginalResultScopeCheck, ConnectorPayloadRetentionGuard,
-            ConnectorSchemaChange, ExternalMutationEffect, ExternalMutationOutcome,
-            OriginalResultCheckError, ProviderMetadataCpuInput, ProviderMetadataCpuPort,
-            SharedDependency,
+            ConnectorChangeWindowPartitionImpact, ConnectorColumnPath,
+            ConnectorOriginalResultScope, ConnectorSchemaChange, ExternalMutationEffect,
+            ExternalMutationOutcome, ProviderMetadataCpuPort,
         };
+        use prepared_source_phase_support::{IoFixture, OriginalScope, PhasePort, written};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::task::{Context, Poll, Waker};
-        struct OriginalScope(Instant);
-        impl ConnectorOriginalResultScopeCheck for OriginalScope {
-            fn original_deadline(&self) -> Instant {
-                self.0
-            }
-            fn check_active(&self) -> Result<(), OriginalResultCheckError> {
-                Ok(())
-            }
-        }
-        // Explicit SPI resource-cell fixture. It observes the real FileIO
-        // requests; it does not certify a WC Root, a CPU offer or worker exit.
-        struct IoFixture {
-            in_cpu: Arc<AtomicBool>,
-            owned_reads: AtomicUsize,
-        }
-        struct IoCell;
-        impl ConnectorIoRequestSource for IoCell {
-            fn exit_waker(&self) -> Waker {
-                Waker::noop().clone()
-            }
-            fn reserve_stream(&self) -> Result<(), ConnectorError> {
-                panic!("snapshot whole-object reads do not open streams")
-            }
-            fn stream_closed(&self) {
-                panic!("no snapshot stream")
-            }
-            fn install_stream_cleanup_in(
-                &self,
-                _: &mut Option<ConnectorIoCleanupFuture>,
-            ) -> Result<(), ConnectorError> {
-                panic!("no snapshot stream cleanup")
-            }
-            fn stream_custody_lost(&self) {
-                panic!("no snapshot stream custody")
-            }
-            fn record_cleanup_failure(
-                &self,
-                original: Box<dyn std::any::Any + Send>,
-            ) -> Result<(), Box<dyn std::any::Any + Send>> {
-                Err(original)
-            }
-            fn attach_original_progress(
-                &self,
-                _: Arc<dyn ConnectorIoProgressSource>,
-            ) -> Result<(), ConnectorError> {
-                Ok(())
-            }
-            fn poll_admitted(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
-                Poll::Ready(Ok(()))
-            }
-            fn poll_include_dependency(
-                &self,
-                _: &SharedDependency,
-                _: &mut Context<'_>,
-            ) -> Poll<Result<(), ConnectorError>> {
-                Poll::Ready(Ok(()))
-            }
-        }
-        impl ConnectorIoAdmissionPort for IoFixture {
-            fn request_owned(
-                &self,
-                _: std::num::NonZeroU64,
-            ) -> Result<ConnectorIoRequest, ConnectorError> {
-                assert!(
-                    !self.in_cpu.load(Ordering::SeqCst),
-                    "raw snapshot read must be driven outside the pure CPU phase"
-                );
-                self.owned_reads.fetch_add(1, Ordering::SeqCst);
-                Ok(ConnectorIoRequest::from_original(Arc::new(IoCell)))
-            }
-            fn request(&self, _: SharedDependency) -> Result<ConnectorIoRequest, ConnectorError> {
-                assert!(
-                    !self.in_cpu.load(Ordering::SeqCst),
-                    "selected physical I/O must not be polled by the pure CPU phase"
-                );
-                Ok(ConnectorIoRequest::from_original(Arc::new(IoCell)))
-            }
-            fn publication_obligation_started(&self) {
-                panic!("scan cannot publish")
-            }
-            fn retain_payload(&self) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
-                Ok(ConnectorPayloadRetentionGuard::new(()))
-            }
-        }
-        struct PhasePort {
-            in_cpu: Arc<AtomicBool>,
-            descriptor: ConnectorInstanceDescriptor,
-            incarnation: ProviderBindingEpoch,
-            calls: AtomicUsize,
-        }
-        impl ProviderMetadataCpuPort for PhasePort {
-            fn submit_metadata_in(
-                &self,
-                input: &mut Option<ProviderMetadataCpuInput>,
-            ) -> Result<(), ConnectorError> {
-                let source = input.as_ref().unwrap();
-                assert_eq!(source.descriptor(), &self.descriptor);
-                assert_eq!(source.incarnation(), self.incarnation);
-                assert_eq!(
-                    source.original_source_type_id(),
-                    std::any::TypeId::of::<
-                        crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
-                    >()
-                );
-                assert!(!self.in_cpu.swap(true, Ordering::SeqCst));
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                input.take().unwrap().run_original_phase();
-                self.in_cpu.store(false, Ordering::SeqCst);
-                Ok(())
-            }
-            fn poll_finished(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
-                Poll::Ready(Ok(()))
-            }
-            fn poll_closed(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
-                Poll::Ready(Ok(()))
-            }
-            fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
-                None
-            }
-        }
-        fn written(
-            table: &crate::iceberg::table::Table,
-            label: &str,
-        ) -> crate::commit::WrittenFile {
-            crate::commit::WrittenFile {
-                path: format!("{}/data/{label}.parquet", table.metadata().location()),
-                format: DataFileFormat::Parquet,
-                content: DataContentType::Data,
-                partition_values: Struct::empty(),
-                partition_spec_id: table.metadata().default_partition_spec_id(),
-                record_count: 3,
-                file_size_in_bytes: 128,
-                split_offsets: Vec::new(),
-                column_sizes: HashMap::new(),
-                value_counts: HashMap::new(),
-                null_value_counts: HashMap::new(),
-                nan_value_counts: HashMap::new(),
-                lower_bounds: HashMap::new(),
-                upper_bounds: HashMap::new(),
-                key_metadata: None,
-                referenced_data_file: None,
-                equality_ids: None,
-                first_row_id: None,
-                content_offset: None,
-                content_size_in_bytes: None,
-                cardinality: None,
-            }
-        }
         let (executor, _warehouse, provider) = provider();
         let from = executor.block_on(async {
             let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
@@ -4144,43 +4529,41 @@ mod plan_splits_pruning_tests {
                     assert_eq!(from_schema.field_by_id(1).unwrap().name, "id");
                     assert_eq!(to_schema.field_by_id(1).unwrap().name, "renamed");
                     assert_ne!(from_schema.schema_id(), to_schema.schema_id());
-                    let table = provider.capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
-                        table: ConnectorTableIdentity { instance_id: provider.descriptor.instance_id.clone(), namespace: "endpoint_window".into(), table: "t".into() },
-                        resolution: ConnectorTableResolution::StrictBaseTable, selector: ConnectorTableObjectSelector::Current, context: context(),
-                    }).await.unwrap().metadata;
                     let active = Arc::new(AtomicBool::new(false));
                     let io = Arc::new(IoFixture { in_cpu: active.clone(), owned_reads: AtomicUsize::new(0) });
                     let phase = Arc::new(PhasePort { in_cpu: active, descriptor: provider.descriptor.clone(), incarnation: provider.incarnation, calls: AtomicUsize::new(0) });
                     let cpu: Arc<dyn ProviderMetadataCpuPort> = phase.clone();
                     let request_context = context().with_io_admission(io.clone());
                     let original = ConnectorOriginalResultScope::from_original(Arc::new(OriginalScope(request_context.deadline())));
-                    let window = ConnectorChangeWindow::new(from, to);
-                    let request = ConnectorBeginScanRequest {
-                        projection: vec![0], static_predicates: Vec::new(), selection: ConnectorScanSelection::ChangeWindow(window),
-                        purpose: ConnectorReadPurpose::Query, limit: None,
-                        batch: ConnectorBatchBudget { max_rows: std::num::NonZeroUsize::new(4096).unwrap(), max_bytes: std::num::NonZeroUsize::new(1024 * 1024).unwrap() },
-                        context: request_context,
-                    };
-                    // The receiving slot is installed even if its borrower is dropped
-                    // before the first CPU or foreign poll. No input was dispatched.
+                    let table = prepared_source_fixture_metadata(&provider, "endpoint_window", &request_context).await;
+                    let initial_owned_reads = io.owned_reads.load(Ordering::SeqCst);
+                    let request = prepared_source_fixture_window(&provider, &table, "endpoint_window", from, to);
+                    let read = prepared_source_fixture_control(&provider, &request_context);
+                    let metadata = read.metadata();
+                    let session = novarocks_spi::connector::read_stack::ConnectorSession::try_new(
+                        "q", "u", "UTC", "en_US", std::time::SystemTime::UNIX_EPOCH,
+                    ).unwrap();
+                    // An unpolled typed borrower dispatches no work and installs
+                    // no opaque Source. The caller's original gate owns its inputs;
+                    // first poll installs Source custody before any worker/foreign poll.
                     let mut unpolled_owner = None;
-                    let borrower = provider.begin_scan_async_in(&table.table, request.clone(), &cpu, &original, &mut unpolled_owner);
+                    let borrower = metadata.prepare_source_read(&session, &request, &cpu, &original, &mut unpolled_owner);
                     drop(borrower);
-                    assert!(unpolled_owner.is_some());
+                    assert!(unpolled_owner.is_none());
                     assert_eq!(phase.calls.load(Ordering::SeqCst), 0);
                     drop(unpolled_owner);
                     let mut owner = None;
-                    let scan = provider.begin_scan_async_in(&table.table, request, &cpu, &original, &mut owner).await.unwrap();
-                    assert_eq!(scan.output_schema().field(0).name(), "renamed");
-                    scan.validate(&ConnectorProviderBindingKey { instance_id: provider.descriptor.instance_id.clone(), incarnation: provider.incarnation }, ConnectorScanSelection::ChangeWindow(window)).unwrap();
-                    assert_eq!(scan.admission(), &novarocks_spi::connector::ConnectorScanAdmission::ChangeWindow(ConnectorChangeWindowAdmission::Incremental {
+                    let scan = metadata.prepare_source_read(&session, &request, &cpu, &original, &mut owner).await.unwrap();
+                    assert_eq!(scan.to_metadata().schema().field(0).name(), "renamed");
+                    owner.as_ref().unwrap().validate_owner(&ConnectorProviderBindingKey { instance_id: provider.descriptor.instance_id.clone(), incarnation: provider.incarnation }).unwrap();
+                    assert_eq!(scan.admission(), Some(&ConnectorChangeWindowAdmission::Incremental {
                         has_inserts: true, has_deletes: false, partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
                     }));
                     assert!(phase.calls.load(Ordering::SeqCst) > 3, "both endpoint readers suspend and resume before the common Finish phase");
-                    assert!(io.owned_reads.load(Ordering::SeqCst) >= 4, "both nonempty manifest lists and their data manifests were actually read");
+                    assert!(io.owned_reads.load(Ordering::SeqCst) - initial_owned_reads >= 4, "both nonempty manifest lists and their data manifests were actually read");
                     let weak = Arc::downgrade(owner.as_ref().unwrap().value::<crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal>(provider.descriptor.instance_id.as_str()).unwrap());
                     assert!(weak.upgrade().is_some());
-                    let endpoints = owner.as_ref().unwrap().value::<crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal>(provider.descriptor.instance_id.as_str()).unwrap().change_window_endpoint_facts_for_test();
+                    let endpoints = owner.as_ref().unwrap().value::<crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal>(provider.descriptor.instance_id.as_str()).unwrap().prepared_source_endpoint_facts_for_test();
                     assert_eq!(endpoints[0].len(), 1);
                     assert_eq!(endpoints[1].len(), 2);
                     assert!(endpoints[0][0].path.ends_with("/a.parquet"));
@@ -4196,6 +4579,7 @@ mod plan_splits_pruning_tests {
                         }
                     }
                     drop(endpoints);
+                    std::future::poll_fn(|cx| cpu.poll_closed(cx)).await.unwrap();
                     drop(owner);
                     assert!(weak.upgrade().is_none(), "the received value does not hide a runtime Source alias");
                 });

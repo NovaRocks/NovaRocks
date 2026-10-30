@@ -343,7 +343,7 @@ fn admit_statistics_scan_binding(
                         planning_lease: planning_lease.clone(),
                     },
                 )]),
-                admitted_change_scans: BTreeMap::new(),
+                prepared_source_reads: BTreeMap::new(),
             })
         })
         .map_err(contract_violation)

@@ -142,16 +142,14 @@ impl StageExecution {
             .all(|task| task.task_state() != TaskState::Finished || task.output_released())
     }
 
-    /// Stands down every task of this stage except the query's root.
-    ///
-    /// There is one normal reason, and this is the only thing that uses it:
-    /// anything else is a failure or an abort, which take their own paths and
-    /// can never be dressed up as a success-compatible cancellation.
-    pub fn cancel_non_root_tasks(&mut self) -> Vec<OperationIntent> {
+    /// Emit normal cancellation only for Tasks whose original demand owner
+    /// already authorized stand-down. Required input/output obligations can
+    /// refuse that authorization even after a parent stage releases demand.
+    pub fn cancel_normally_stood_down_tasks(&mut self) -> Vec<OperationIntent> {
         let root = self.root_task;
         self.tasks
             .iter_mut()
-            .filter(|(task_id, _)| Some(**task_id) != root)
+            .filter(|(task_id, task)| Some(**task_id) != root && task.normally_stood_down())
             .filter_map(|(_, task)| task.cancel_intent(CancelReason::UpstreamNoLongerNeeded))
             .collect()
     }
@@ -220,6 +218,8 @@ impl EdgeNormalCloseResolution {
 
 #[derive(Debug)]
 pub struct EdgeOpenTracker {
+    must_drain: BTreeSet<ExchangeEdgeId>,
+    drain_tasks: BTreeSet<TaskIdentity>,
     awaiting: BTreeMap<ExchangeEdgeId, BTreeSet<TaskIdentity>>,
     normally_closed: BTreeMap<ExchangeEdgeId, BTreeSet<TaskIdentity>>,
     producers: BTreeMap<ExchangeEdgeId, Vec<TaskIdentity>>,
@@ -245,7 +245,26 @@ impl EdgeOpenTracker {
                     .push(edge.edge_id());
             }
         }
+        let must_drain = graph
+            .edges()
+            .filter(|edge| {
+                edge.delivery()
+                    == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+            })
+            .map(|edge| edge.edge_id())
+            .collect();
+        let drain_tasks = graph
+            .edges()
+            .filter(|edge| {
+                edge.delivery()
+                    == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+            })
+            .flat_map(|edge| edge.producers().iter().chain(edge.destinations()))
+            .copied()
+            .collect();
         Self {
+            must_drain,
+            drain_tasks,
             awaiting,
             normally_closed: BTreeMap::new(),
             producers,
@@ -282,6 +301,11 @@ impl EdgeOpenTracker {
             .into_iter()
             .flatten()
         {
+            // A Task state says no more input is needed; it does not say
+            // that this exact strict stream was consumed through End.
+            if normally_closed && self.must_drain.contains(edge_id) {
+                continue;
+            }
             let Some(pending) = self.awaiting.get_mut(edge_id) else {
                 continue;
             };
@@ -337,6 +361,10 @@ impl EdgeOpenTracker {
         producers
     }
 
+    pub(crate) fn requires_drain(&self, task: TaskIdentity) -> bool {
+        self.drain_tasks.contains(&task)
+    }
+
     pub fn producers_of(&self, edge_id: ExchangeEdgeId) -> &[TaskIdentity] {
         self.producers
             .get(&edge_id)
@@ -365,6 +393,8 @@ mod destination_close_tests {
         let target = identity(2);
         let sibling = identity(3);
         let mut tracker = EdgeOpenTracker {
+            must_drain: BTreeSet::new(),
+            drain_tasks: BTreeSet::new(),
             awaiting: BTreeMap::from([(edge, BTreeSet::from([target, sibling]))]),
             normally_closed: BTreeMap::new(),
             producers: BTreeMap::from([(edge, vec![producer])]),
@@ -385,6 +415,57 @@ mod destination_close_tests {
             "late creation cannot reopen the closed destination"
         );
         assert_eq!(tracker.producers_of(edge), &[producer]);
+    }
+
+    #[test]
+    fn strict_streams_ignore_demand_withdrawal_and_wait_for_installation() {
+        let ordinary = ExchangeEdgeId::new(1).unwrap();
+        let strict = ExchangeEdgeId::new(2).unwrap();
+        let producer = identity(1);
+        let target = identity(2);
+        let mut tracker = EdgeOpenTracker {
+            must_drain: BTreeSet::from([strict]),
+            drain_tasks: BTreeSet::from([producer, target]),
+            awaiting: BTreeMap::from([
+                (ordinary, BTreeSet::from([target])),
+                (strict, BTreeSet::from([target])),
+            ]),
+            normally_closed: BTreeMap::new(),
+            producers: BTreeMap::from([(ordinary, vec![producer]), (strict, vec![producer])]),
+            edges_of_destination: BTreeMap::from([(target, vec![ordinary, strict])]),
+            decided: BTreeSet::new(),
+        };
+        let withdrawal = tracker.note_normally_closed(target);
+        assert_eq!(
+            withdrawal
+                .closed()
+                .iter()
+                .map(|effect| effect.edge_id())
+                .collect::<Vec<_>>(),
+            [ordinary]
+        );
+        assert_eq!(
+            withdrawal
+                .opened()
+                .iter()
+                .map(|effect| effect.edge_id())
+                .collect::<Vec<_>>(),
+            [ordinary]
+        );
+        assert!(tracker.awaiting[&strict].contains(&target));
+        assert!(!tracker.normally_closed.contains_key(&strict));
+        let installed = tracker.note_created(target);
+        assert_eq!(
+            installed
+                .iter()
+                .map(|effect| effect.edge_id())
+                .collect::<Vec<_>>(),
+            [strict]
+        );
+        assert!(installed[0].normally_closed().is_empty());
+        assert!(tracker.note_normally_closed(target).closed().is_empty());
+        assert!(tracker.requires_drain(producer));
+        assert!(tracker.requires_drain(target));
     }
 
     /// Exhaust every word up to length six, including repeated observations.
@@ -443,6 +524,8 @@ mod destination_close_tests {
                 }
                 traces += 1;
                 let mut tracker = EdgeOpenTracker {
+                    must_drain: BTreeSet::new(),
+                    drain_tasks: BTreeSet::new(),
                     awaiting: BTreeMap::from([(edge, BTreeSet::from(destinations))]),
                     normally_closed: BTreeMap::new(),
                     producers: BTreeMap::from([(edge, vec![producer])]),

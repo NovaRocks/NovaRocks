@@ -97,7 +97,7 @@ impl NovaRocksRestCatalog {
     }
 }
 
-fn preflight_rest_page<'a>(
+pub(crate) fn preflight_rest_page<'a>(
     collector: &ConnectorListingCollector<String>,
     names: impl IntoIterator<Item = &'a str>,
     next: Option<&str>,
@@ -143,7 +143,7 @@ fn preflight_rest_page<'a>(
 /// Admit a REST response before retaining any of its names or following its
 /// token. Non-paging servers may return a larger final response within the
 /// whole-listing bound; continuing oversized pages remain invalid.
-fn accept_rest_page(
+pub(crate) fn accept_rest_page(
     collector: &mut ConnectorListingCollector<String>,
     names: Vec<String>,
     next: Option<String>,
@@ -634,6 +634,27 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     ) -> Result<Vec<String>, ConnectorError> {
         self.listing
             .run(&context, self.list_views(namespace, bound))
+            .await
+    }
+
+    async fn list_views_with_metadata_cpu(
+        &self,
+        source: Arc<crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal>,
+        cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    ) -> Result<Vec<novarocks_spi::connector::ConnectorViewIdentity>, ConnectorError> {
+        let context = source.view_listing_context();
+        // This is the SAME original eight-position whole-listing owner. The
+        // SDK/CPU future exits before run returns its original position.
+        self.listing
+            .run_with_original(
+                &context,
+                crate::catalog_control::views::async_listing::run(
+                    self.endpoints.clone(),
+                    source.clone(),
+                    cpu,
+                ),
+                source.as_ref(),
+            )
             .await
     }
 
@@ -2718,7 +2739,18 @@ impl super::publication_dispatch::PreparedCatalogDispatch for PreparedRestCatalo
         self: Box<Self>,
         evidence: super::publication::EvidenceContext,
     ) -> super::publication_dispatch::DispatchCompletion {
-        let result = self.prepared.dispatch(evidence).await;
+        let result = match self.prepared.dispatch(evidence).await {
+            Ok(result) => result,
+            Err(original) => {
+                return super::publication_dispatch::DispatchCompletion::evidence(
+                    crate::commit::attempt::observation::DispatchEvidence::NotDispatched {
+                        failure: novarocks_spi::connector::ConnectorMutationFailure::from_connector(
+                            original,
+                        ),
+                    },
+                );
+            }
+        };
         let evidence = result.dispatch_evidence();
         // Moving already-read response data is infallible and performs no
         // materialization. Only the journal will record the conclusion.
@@ -2732,7 +2764,14 @@ impl super::publication_dispatch::PreparedCatalogDispatch for PreparedRestTableP
         self: Box<Self>,
         evidence: super::publication::EvidenceContext,
     ) -> super::publication_dispatch::DispatchCompletion {
-        let result = self.0.dispatch(evidence).await;
-        super::publication_dispatch::DispatchCompletion::evidence(result.dispatch_evidence())
+        let result = match self.0.dispatch(evidence).await {
+            Ok(result) => result.dispatch_evidence(),
+            Err(original) => crate::commit::attempt::observation::DispatchEvidence::NotDispatched {
+                failure: novarocks_spi::connector::ConnectorMutationFailure::from_connector(
+                    original,
+                ),
+            },
+        };
+        super::publication_dispatch::DispatchCompletion::evidence(result)
     }
 }

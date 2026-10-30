@@ -108,10 +108,11 @@ impl RestHttpClient {
         request: Result<RestRequest, NotWrittenCause>,
         success_statuses: &[u16],
         context: &RequestContext,
-    ) -> (DispatchStage, Option<ResponseBody>) {
+    ) -> Result<(DispatchStage, Option<ResponseBody>), novarocks_spi::connector::ConnectorError>
+    {
         let request = match request.and_then(|request| request.build(&self.inner)) {
             Ok(request) => request,
-            Err(cause) => return (DispatchStage::NotWritten(cause), None),
+            Err(cause) => return Ok((DispatchStage::NotWritten(cause), None)),
         };
         // The route is the exact prepared request, before credentials/wire
         // dispatch. The same original receipt continues in the raw body.
@@ -121,12 +122,9 @@ impl RestHttpClient {
                     request.url(),
                 ) {
                     Ok(origin) => novarocks_spi::connector::SharedDependency::Network(origin),
-                    Err(_) => return (DispatchStage::NotWritten(NotWrittenCause::Url), None),
+                    Err(_) => return Ok((DispatchStage::NotWritten(NotWrittenCause::Url), None)),
                 };
-                match original.admit_selected_io(fact).await {
-                    Ok(permit) => permit,
-                    Err(_) => return (DispatchStage::NotWritten(NotWrittenCause::Build), None),
-                }
+                original.admit_selected_io(fact).await?
             }
             None => None,
         };
@@ -135,16 +133,16 @@ impl RestHttpClient {
                 match tokio::time::timeout_at(deadline, self.inner.execute(request)).await {
                     Ok(result) => result,
                     Err(_) => {
-                        return (
+                        return Ok((
                             DispatchStage::WrittenNoStatus(NoStatusCause::DeadlineExceeded),
                             None,
-                        );
+                        ));
                     }
                 }
             }
             None => self.inner.execute(request).await,
         };
-        match executed {
+        Ok(match executed {
             Ok(response) => {
                 let code = response.status().as_u16();
                 let header_names = response.headers().keys().cloned().collect();
@@ -156,7 +154,7 @@ impl RestHttpClient {
                 (DispatchStage::Status { code, header_names }, body)
             }
             Err(error) => (classify_send_error(&error), None),
-        }
+        })
     }
 }
 
@@ -429,7 +427,8 @@ mod not_written {
     async fn stage_of(request: Result<RestRequest, NotWrittenCause>) -> DispatchStage {
         let (stage, body) = test_client(Duration::from_secs(10))
             .send_once(request, &[200], &RequestContext::default())
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO refusal");
         assert!(body.is_none());
         stage
     }
@@ -480,7 +479,8 @@ mod not_written {
         let started = std::time::Instant::now();
         let (stage, body) = client
             .send_once(get(url), &[200], &RequestContext::default())
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO refusal");
         assert_eq!(stage, DispatchStage::NotWritten(NotWrittenCause::Connect));
         assert!(body.is_none());
         assert!(started.elapsed() < Duration::from_secs(3));
@@ -533,7 +533,8 @@ mod tests {
                 &[200],
                 &RequestContext::default(),
             )
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO refusal");
         assert!(
             matches!(stage, DispatchStage::Status { code: 307, ref header_names }
             if header_names.iter().any(|name| name == "location"))
@@ -555,7 +556,8 @@ mod tests {
         .with_json_body(&serde_json::json!({"k": 1}));
         let (stage, body) = test_client(Duration::from_secs(2))
             .send_once(request, &[200], &RequestContext::default())
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO refusal");
         assert!(
             matches!(stage, DispatchStage::WrittenNoStatus(_)),
             "{stage:?}"
@@ -579,7 +581,8 @@ mod tests {
                 &[200],
                 &RequestContext::default(),
             )
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO refusal");
         assert!(
             matches!(stage, DispatchStage::WrittenNoStatus(_)),
             "{stage:?}"
@@ -595,7 +598,8 @@ mod tests {
                 &[200],
                 &RequestContext::default(),
             )
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO refusal");
         assert_eq!(
             stage,
             DispatchStage::WrittenNoStatus(NoStatusCause::ReadTimeout)
@@ -623,7 +627,8 @@ mod tests {
                 &[200],
                 &RequestContext::default(),
             )
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO refusal");
         assert!(matches!(stage, DispatchStage::Status { code: 503, .. }));
         assert!(body.is_none());
         let outcomes = server.shut_down();
@@ -652,7 +657,8 @@ mod tests {
                 &[200],
                 &RequestContext::default(),
             )
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO refusal");
         let DispatchStage::Status { code, header_names } = &stage else {
             panic!("{stage:?}");
         };
@@ -686,7 +692,8 @@ mod tests {
                 &[200],
                 &context,
             )
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO refusal");
         assert!(
             matches!(stage, DispatchStage::Status { code: 200, .. }),
             "{stage:?}"
@@ -713,7 +720,8 @@ mod tests {
         let context = RequestContext::with_deadline(Instant::now() + Duration::from_millis(300));
         let (_, body) = client
             .send_once(get(format!("{}/table", server.url())), &[200], &context)
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO refusal");
         drop(client);
         let started = std::time::Instant::now();
         assert_eq!(
@@ -735,7 +743,8 @@ mod tests {
         let started = std::time::Instant::now();
         let (stage, body) = client
             .send_once(get(format!("{}/table", server.url())), &[200], &context)
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO refusal");
         drop(client);
         assert_eq!(
             stage,
@@ -772,7 +781,8 @@ mod tests {
         let context = RequestContext::with_deadline(Instant::now() + Duration::from_millis(250));
         let (stage, body) = client
             .send_once(get(format!("{}/table", server.url())), &[200], &context)
-            .await;
+            .await
+            .expect("the original transport fixture has no MIO refusal");
         drop(client);
         assert!(matches!(stage, DispatchStage::Status { code: 200, .. }));
         assert_eq!(
@@ -780,5 +790,265 @@ mod tests {
             Err(BodyReadError::DeadlineExceeded)
         );
         assert_eq!(server.count("GET", "/table"), 1);
+    }
+}
+
+#[cfg(test)]
+mod original_admission_tests {
+    use super::*;
+    use crate::rest_protocol::test_server::{
+        FrontendFixture, Reply, Script, TestServer, oauth2_identity,
+    };
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorIoAdmissionPort, ConnectorIoCleanupFuture,
+        ConnectorIoProgressSource, ConnectorIoRequest, ConnectorIoRequestSource,
+        ConnectorPayloadRetentionGuard, ConnectorRequestContext, ConnectorStopOwner,
+        SharedDependency,
+    };
+    use std::{
+        future::Future,
+        num::NonZeroU64,
+        sync::{
+            Arc, Mutex, Weak,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Poll, Waker},
+    };
+
+    struct Decision {
+        ready: AtomicBool,
+        error: Option<ConnectorError>,
+        wake: futures::task::AtomicWaker,
+    }
+    struct Cell {
+        decision: Arc<Decision>,
+    }
+    impl ConnectorIoRequestSource for Cell {
+        fn exit_waker(&self) -> Waker {
+            Waker::noop().clone()
+        }
+        fn reserve_stream(&self) -> Result<(), ConnectorError> {
+            panic!("not a stream fixture")
+        }
+        fn stream_closed(&self) {
+            panic!("not a stream fixture")
+        }
+        fn install_stream_cleanup_in(
+            &self,
+            _: &mut Option<ConnectorIoCleanupFuture>,
+        ) -> Result<(), ConnectorError> {
+            panic!("not a stream fixture")
+        }
+        fn stream_custody_lost(&self) {
+            panic!("not a stream fixture")
+        }
+        fn record_cleanup_failure(
+            &self,
+            original: Box<dyn std::any::Any + Send>,
+        ) -> Result<(), Box<dyn std::any::Any + Send>> {
+            Err(original)
+        }
+        fn attach_original_progress(
+            &self,
+            _: Arc<dyn ConnectorIoProgressSource>,
+        ) -> Result<(), ConnectorError> {
+            panic!("not an acquisition fixture")
+        }
+        fn poll_admitted(&self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+            self.decision.wake.register(cx.waker());
+            if !self.decision.ready.load(Ordering::Acquire) {
+                return Poll::Pending;
+            }
+            Poll::Ready(match &self.decision.error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            })
+        }
+        fn poll_include_dependency(
+            &self,
+            _: &SharedDependency,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<(), ConnectorError>> {
+            panic!("the HTTP author requests its selected URL once")
+        }
+    }
+    struct Port {
+        decision: Arc<Decision>,
+        seen: Mutex<Vec<SharedDependency>>,
+        cell: Mutex<Option<Weak<Cell>>>,
+    }
+    impl Port {
+        fn new(error: Option<ConnectorError>, ready: bool) -> Arc<Self> {
+            Arc::new(Self {
+                decision: Arc::new(Decision {
+                    ready: AtomicBool::new(ready),
+                    error,
+                    wake: Default::default(),
+                }),
+                seen: Mutex::new(Vec::new()),
+                cell: Mutex::new(None),
+            })
+        }
+        fn context(self: &Arc<Self>) -> RequestContext {
+            let original = ConnectorRequestContext::try_new(
+                std::time::Instant::now() + Duration::from_secs(10),
+                ConnectorStopOwner::new().view(),
+                1024,
+                4096,
+            )
+            .unwrap()
+            .with_io_admission(self.clone());
+            RequestContext::from_connector(&original)
+        }
+        fn release(&self) {
+            self.decision.ready.store(true, Ordering::Release);
+            self.decision.wake.wake();
+        }
+    }
+    // Only the transport's original receipt/retention is modelled here. The
+    // production Root grant and CPU factory are verified by the FE owner.
+    impl ConnectorIoAdmissionPort for Port {
+        fn request(
+            &self,
+            selected: SharedDependency,
+        ) -> Result<ConnectorIoRequest, ConnectorError> {
+            self.seen.lock().unwrap().push(selected);
+            let cell = Arc::new(Cell {
+                decision: self.decision.clone(),
+            });
+            *self.cell.lock().unwrap() = Some(Arc::downgrade(&cell));
+            Ok(ConnectorIoRequest::from_original(cell))
+        }
+        fn request_owned(&self, _: NonZeroU64) -> Result<ConnectorIoRequest, ConnectorError> {
+            panic!("not an owned-allocation fixture")
+        }
+        fn publication_obligation_started(&self) {
+            panic!("read has no publication")
+        }
+        fn retain_payload(&self) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+            panic!("not a payload fixture")
+        }
+    }
+    fn source_error() -> ConnectorError {
+        ConnectorError::compile_interruption(
+            novarocks_type_contract::CompileControlError::from_domain(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+            ),
+        )
+    }
+    #[tokio::test]
+    async fn original_admission_error_keeps_exact_url_and_source_before_zero_dispatch() {
+        let server = TestServer::start(Script::new().on("GET", "/views", Reply::status(200)));
+        let original = source_error();
+        let port = Port::new(Some(original.clone()), true);
+        let url = format!("{}/views?secret=not-recorded", server.url());
+        let result = test_client(Duration::from_secs(1))
+            .send_once(get(url.clone()), &[200], &port.context())
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("unadmitted HTTP cannot dispatch"),
+        };
+        assert_eq!(error, original);
+        let selected = novarocks_spi::connector::NetworkServiceOrigin::from_selected_url(
+            &Url::parse(&url).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            *port.seen.lock().unwrap(),
+            [SharedDependency::Network(selected)]
+        );
+        assert!(server.requests().is_empty());
+    }
+    #[tokio::test]
+    async fn actual_response_body_keeps_its_original_io_cell_until_body_exit() {
+        let server = TestServer::start(Script::new().on(
+            "GET",
+            "/views",
+            Reply::json(200, &serde_json::json!({"identifiers":[]})),
+        ));
+        let port = Port::new(None, true);
+        let (_, body) = test_client(Duration::from_secs(1))
+            .send_once(
+                get(format!("{}/views", server.url())),
+                &[200],
+                &port.context(),
+            )
+            .await
+            .unwrap();
+        let cell = port.cell.lock().unwrap().as_ref().unwrap().clone();
+        assert!(cell.upgrade().is_some());
+        let bytes = body.unwrap().read_to_end().await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::json!({"identifiers":[]})
+        );
+        assert!(
+            cell.upgrade().is_none(),
+            "the actual body exited before its permit alias"
+        );
+        assert_eq!(server.count("GET", "/views"), 1);
+    }
+    #[tokio::test]
+    async fn config_and_oauth_attempts_preserve_the_original_admission_error() {
+        for identity in [None, Some(oauth2_identity("client", "private-secret"))] {
+            let server = TestServer::start(Script::new().on(
+                "GET",
+                "/v1/config",
+                Reply::config(&[], &[], None),
+            ));
+            let fixture = FrontendFixture::new(
+                &[("uri", &server.url())],
+                identity,
+                RestHttpClient::new().unwrap(),
+            )
+            .await;
+            let original = source_error();
+            let port = Port::new(Some(original.clone()), true);
+            let error = fixture
+                .endpoints
+                .binding_in(&port.context())
+                .await
+                .unwrap_err();
+            assert_eq!(error, original);
+            assert_eq!(port.seen.lock().unwrap().len(), 1);
+            assert!(server.requests().is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn shared_auth_waiter_receives_the_actual_attempt_cause_after_starter_drop() {
+        let server = TestServer::start(Script::new());
+        let fixture = FrontendFixture::new(
+            &[("uri", &server.url())],
+            Some(oauth2_identity("client", "private-secret")),
+            RestHttpClient::new().unwrap(),
+        )
+        .await;
+        let selected = source_error();
+        let first = Port::new(Some(selected.clone()), false);
+        let other = Port::new(
+            Some(ConnectorError::new(
+                ConnectorErrorKind::PermissionDenied,
+                "other request refusal",
+            )),
+            true,
+        );
+        let a = first.context();
+        let b = other.context();
+        let mut starter = Box::pin(fixture.endpoints.binding_in(&a));
+        let mut waiter = Box::pin(fixture.endpoints.binding_in(&b));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(starter.as_mut().poll(&mut cx).is_pending());
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(first.seen.lock().unwrap().len(), 1);
+        assert!(other.seen.lock().unwrap().is_empty());
+        drop(starter);
+        first.release();
+        assert_eq!(waiter.await.unwrap_err(), selected);
+        assert!(
+            other.seen.lock().unwrap().is_empty(),
+            "joining never borrows another request's admission authority"
+        );
+        assert!(server.requests().is_empty());
     }
 }

@@ -239,7 +239,7 @@ pub(crate) fn bind_imv_target_query_table_from_metadata(
             write_target_admission: None,
             frozen_cohort_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
-            admitted_change_scans: BTreeMap::new(),
+            prepared_source_reads: BTreeMap::new(),
         })
     })
 }
@@ -276,82 +276,77 @@ pub(crate) async fn bind_imv_target_query_table_in_store_from_rewrite_original(
 
 pub(crate) async fn freeze_imv_base_query_local_overlays_from_captured_inputs_original(
     io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
-    connector_control: &dyn ConnectorControlRegistry,
-    connector_context: &ConnectorRequestContext,
+    _connector_control: &dyn ConnectorControlRegistry,
+    _connector_context: &ConnectorRequestContext,
     rewrite: &IcebergMvRewriteContext,
 ) -> Result<
     Vec<QueryLocalTableOverlay>,
     crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
 > {
-    let source_groups = group_sources_by_locator(rewrite)?;
-    let mut overlays = Vec::with_capacity(source_groups.len());
+    let sources = io.captured_sources();
     for SourceGroup {
         base,
         current,
         previous,
-    } in source_groups.into_values()
+    } in group_sources_by_locator(rewrite)?.into_values()
     {
-        let snapshot_id = current
-            .first()
-            .ok_or("MV query binding source group has no current snapshot")?
-            .snapshot_id;
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&base.catalog)
-            .map_err(|error| error.to_string())?;
-        let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
-            connector_control,
-            &instance_id,
-        )?;
-        let metadata = io
-            .metadata(
-                &planning_lease,
-                connector_context.clone(),
-                &base.namespace,
-                &base.table,
-                novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-            )
-            .await?;
-        let mut materialization = crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
-            metadata,
-            planning_lease,
-        )?;
-        validate_source_revisions_original(
-            &materialization,
-            current.iter().chain(previous.values()),
-        )?;
-        materialization.read_selector = ConnectorReadSelector::SnapshotId(snapshot_id);
-        let mut frozen_snapshot_ids = current
-            .iter()
-            .map(|source| source.snapshot_id)
-            .collect::<BTreeSet<_>>();
-        let mut admitted_change_scans = BTreeMap::new();
-        for source in &current {
-            let Some(previous_source) = previous.get(&source.occurrence_id) else {
-                continue;
-            };
-            frozen_snapshot_ids.insert(previous_source.snapshot_id);
-            let window = novarocks_spi::connector::ConnectorChangeWindow::new(
-                previous_source.snapshot_id,
-                source.snapshot_id,
-            );
-            let admitted_scan = io
-                .change_window(
-                    &materialization.planning_lease,
-                    &materialization.read_table,
-                    Arc::clone(&materialization.read_schema),
-                    connector_context.clone(),
-                    window,
+        let source = sources.require(&base)?;
+        let metadata = source.metadata()?;
+        let materialization = crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
+            metadata, source.lease.clone())?;
+        validate_source_revisions_original(&materialization, current.iter())?;
+        // Historical From is an execution dependency only for a Delta-capable receipt.
+        // FullRebuild/MetadataOnly cannot manufacture an executable From relation.
+        for old in previous.values() {
+            if let Some(receipt) = source.receipt(Some(&old.semantic_revision))
+                && matches!(
+                    receipt.admission(),
+                    Some(
+                        novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. }
+                    )
                 )
-                .await?;
-            admitted_change_scans.insert(
-                (previous_source.snapshot_id, source.snapshot_id),
-                admitted_scan,
-            );
+            {
+                validate_source_revisions_original(&materialization, std::iter::once(old))?;
+            }
         }
+    }
+    freeze_captured_source_overlays(&sources)
+}
 
+/// Used by early schema analysis, first SQL and final activation alike.
+/// The materialization and read recipes come from the same original To author.
+pub(crate) fn freeze_captured_source_overlays(
+    sources: &super::refresh_preparation::captured_sources::CapturedRefreshSources,
+) -> Result<
+    Vec<QueryLocalTableOverlay>,
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
+> {
+    use novarocks_spi::connector::read_stack::ConnectorReadSourceProjection as Projection;
+    let mut overlays = Vec::new();
+    for (base, captured) in sources.bindings() {
+        let metadata = if captured.snapshot.is_some() {
+            captured.metadata()?
+        } else {
+            captured.observed.clone()
+        };
+        let mut materialization = crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
+            metadata, captured.lease.clone())?;
+        if let Some(snapshot) = captured.snapshot {
+            materialization.read_selector = ConnectorReadSelector::SnapshotId(snapshot);
+        }
+        let receipts = captured.receipts();
+        let to = if captured.snapshot.is_some() {
+            Some(captured.to_receipt()?)
+        } else {
+            None
+        };
         let catalog = base.catalog.clone();
         let namespace = base.namespace.clone();
         let table = base.table.clone();
-        let key = QueryTableBindingKey::snapshot(&catalog, &namespace, &table, snapshot_id);
+        let key = match captured.snapshot {
+            Some(id) => QueryTableBindingKey::snapshot(&catalog, &namespace, &table, id),
+            None => QueryTableBindingKey::strict_base(&catalog, &namespace, &table),
+        };
         overlays.push(QueryLocalTableOverlay::for_catalog(
             catalog.clone(),
             namespace.clone(),
@@ -365,17 +360,42 @@ pub(crate) async fn freeze_imv_base_query_local_overlays_from_captured_inputs_or
                     &table,
                     binding,
                 )?;
-                result.admitted_change_scans = admitted_change_scans.clone();
-                for frozen_snapshot_id in frozen_snapshot_ids.iter().copied() {
-                    result.frozen_snapshot_materializations.insert(
-                        frozen_snapshot_id,
-                        QueryScanMaterialization {
-                            table: materialization.read_table.clone(),
-                            selector: ConnectorReadSelector::SnapshotId(frozen_snapshot_id),
-                            mv_partition_selection: None,
-                            planning_lease: materialization.planning_lease.clone(),
-                        },
-                    );
+                if let Some(to) = &to {
+                    result.install_prepared_source_read(
+                        to.clone(),
+                        Projection::To,
+                        materialization.planning_lease.clone(),
+                    )?;
+                }
+                for receipt in &receipts {
+                    match receipt.admission() {
+                        Some(
+                            novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental {
+                                ..
+                            },
+                        ) => {
+                            result.install_prepared_source_read(
+                                receipt.clone(),
+                                Projection::From,
+                                materialization.planning_lease.clone(),
+                            )?;
+                            result.install_prepared_source_read(
+                                receipt.clone(),
+                                Projection::Delta,
+                                materialization.planning_lease.clone(),
+                            )?;
+                        }
+                        Some(
+                            novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
+                        ) => {
+                            result.install_prepared_source_read(
+                                receipt.clone(),
+                                Projection::Delta,
+                                materialization.planning_lease.clone(),
+                            )?;
+                        }
+                        _ => {}
+                    }
                 }
                 Ok(result)
             },
