@@ -24,7 +24,6 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-pub(crate) mod broadcast_join_shared;
 mod build_artifact;
 mod build_capture;
 mod build_collection;

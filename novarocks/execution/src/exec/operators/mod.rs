@@ -41,7 +41,6 @@ pub(crate) mod compiled_expression;
 pub(crate) mod compiled_generate_series;
 pub(crate) mod compiled_grouped_topn;
 pub(crate) mod compiled_grouped_topn_resources;
-pub(crate) mod compiled_nljoin;
 pub(crate) mod compiled_repeat;
 pub(crate) mod compiled_sort;
 pub(crate) mod compiled_table_function;
@@ -62,7 +61,6 @@ mod local_exchange_sink;
 mod local_exchange_source;
 pub(crate) mod local_exchanger;
 pub(crate) mod logical_change_summary;
-mod nljoin;
 mod noop_sink;
 #[cfg(test)]
 mod opaque_memory_host_tests;
@@ -91,8 +89,6 @@ pub use exchange_source::ExchangeSourceFactory;
 pub use limit_processor::LimitProcessorFactory;
 pub use local_exchange_sink::LocalExchangeSinkFactory;
 pub use local_exchange_source::LocalExchangeSourceFactory;
-pub use nljoin::NlJoinBuildSinkFactory;
-pub(crate) use nljoin::NlJoinSharedState;
 pub use noop_sink::NoopSinkFactory;
 #[cfg(test)]
 pub(crate) use project_processor::materialize_project_output;

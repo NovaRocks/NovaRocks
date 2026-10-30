@@ -1527,6 +1527,7 @@ type StepJoinOperators = (
     Arc<LocalProgram>,
     Box<dyn crate::exec::pipeline::operator::Operator>,
     Box<dyn crate::exec::pipeline::operator::Operator>,
+    Box<dyn crate::exec::pipeline::operator::Operator>,
     crate::exec::chunk::Chunk,
     Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 );
@@ -1544,16 +1545,13 @@ fn schema_owner_join_operators(nested: bool) -> StepJoinOperators {
 
 fn step_join_operators(spec: Spec, left_rows: &[Row], right_rows: &[Row]) -> StepJoinOperators {
     use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::operators::compiled_nljoin::{
-        CompiledNlJoinPlan, CompiledNlJoinProbeProcessorFactory,
+    use crate::exec::operators::hashjoin::{
+        JoinParticipants,
+        compiled_hash_join::{
+            CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
+            CompiledJoinInputSinkFactory, CompiledJoinProbeProcessorFactory,
+        },
     };
-    use crate::exec::operators::hashjoin::broadcast_join_shared::BroadcastJoinSharedState;
-    use crate::exec::operators::hashjoin::compiled_hash_join::{
-        CompiledHashJoinBuildSinkFactory, CompiledHashJoinPlan,
-        CompiledHashJoinProbeProcessorFactory,
-    };
-    use crate::exec::operators::{NlJoinBuildSinkFactory, NlJoinSharedState};
-    use crate::exec::pipeline::dependency::DependencyManager;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     let nested = matches!(spec.family, Family::NestLoop);
     let mut packages = packages(&single_plan(spec, left_rows, right_rows));
@@ -1584,55 +1582,46 @@ fn step_join_operators(spec: Spec, left_rows: &[Row], right_rows: &[Row]) -> Ste
     );
     let error = Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default());
     let node = novarocks_local_program::ProgramNodeId::new(ordinal);
-    let (probe, build): (
-        Box<dyn crate::exec::pipeline::operator::Operator>,
-        Box<dyn crate::exec::pipeline::operator::Operator>,
-    ) = if nested {
-        let plan = Arc::new(CompiledNlJoinPlan::try_new(&program, node).unwrap());
-        let state = Arc::new(NlJoinSharedState::new(17, DependencyManager::default()));
-        (
-            CompiledNlJoinProbeProcessorFactory::new(
-                program.clone(),
-                plan,
-                state.clone(),
-                error.clone(),
-            )
-            .create(1, 0),
-            NlJoinBuildSinkFactory::new(state).create(1, 0),
-        )
-    } else {
-        let plan = Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap());
-        let state = Arc::new(BroadcastJoinSharedState::new(
-            17,
-            DependencyManager::default(),
-            1,
-        ));
-        (
-            CompiledHashJoinProbeProcessorFactory::new(
-                program.clone(),
-                plan.clone(),
-                state.clone(),
-                error.clone(),
-            )
-            .create(1, 0),
-            CompiledHashJoinBuildSinkFactory::new(
-                program.clone(),
-                plan,
-                state,
-                error.clone(),
-                None,
-            )
-            .create(1, 0),
-        )
+    let participants = JoinParticipants {
+        inputs: 1,
+        finalizers: std::num::NonZeroUsize::MIN,
+        probes: 1,
+        tails: 0,
     };
-    (program, probe, build, input, error)
+    let declaration = Arc::new(if nested {
+        CompiledJoinFrame::new_nested_loop(program.clone(), node, participants, None).unwrap()
+    } else {
+        CompiledJoinFrame::new(
+            program.clone(),
+            Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap()),
+            participants,
+            None,
+        )
+    });
+    let probe =
+        CompiledJoinProbeProcessorFactory::new(declaration.clone(), error.clone()).create(1, 0);
+    let build =
+        CompiledJoinInputSinkFactory::new(declaration.clone(), error.clone(), None).create(1, 0);
+    let finalize = CompiledJoinFinalizeSourceFactory::new(declaration, error.clone()).create(1, 0);
+    (program, probe, build, finalize, input, error)
+}
+
+fn settle_step_build(
+    finalize: &mut dyn crate::exec::pipeline::operator::Operator,
+    runtime: &RuntimeState,
+) {
+    let mut calls = TestDriver::new(finalize, runtime);
+    assert!(
+        calls.collect_until_finished().unwrap().is_empty(),
+        "the real F emits no rows"
+    );
 }
 
 #[test]
 fn compiled_join_schema_prepare_missing_owner_precedes_build_and_input() {
     use crate::exec::pipeline::operator::ConstructionFailure;
     for nested in [false, true] {
-        let (_, mut operator, _, input, _) = schema_owner_join_operators(nested);
+        let (_, mut operator, _, _, input, _) = schema_owner_join_operators(nested);
         let first = operator.prepare().unwrap_err();
         assert!(matches!(
             first.cause(),
@@ -1651,7 +1640,7 @@ fn compiled_join_schema_prepare_keeps_first_memory_refusal_and_rolls_back() {
     use crate::exec::pipeline::operator::ConstructionFailure;
     use crate::runtime::mem_tracker::MemTracker;
     for nested in [false, true] {
-        let (_, mut operator, _, input, error) = schema_owner_join_operators(nested);
+        let (_, mut operator, _, _, input, error) = schema_owner_join_operators(nested);
         let tracker = MemTracker::new_root("join first actual schema refusal");
         operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
             tracker.clone(),
@@ -1681,7 +1670,8 @@ fn compiled_join_schema_prepare_keeps_first_memory_refusal_and_rolls_back() {
 fn compiled_join_schema_last_slot_keeps_creator_after_plan_and_operators_exit() {
     use crate::runtime::mem_tracker::MemTracker;
     for nested in [false, true] {
-        let (program, mut operator, mut build, input, error) = schema_owner_join_operators(nested);
+        let (program, mut operator, mut build, mut finalize, input, error) =
+            schema_owner_join_operators(nested);
         let weak = Arc::downgrade(&program);
         let tracker = MemTracker::new_root("join independent output schema creator");
         let runtime = RuntimeState::new(
@@ -1697,18 +1687,26 @@ fn compiled_join_schema_last_slot_keeps_creator_after_plan_and_operators_exit() 
         let factory =
             super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error);
         operator.set_construction_factory(factory.clone());
-        build.set_construction_factory(factory);
+        build.set_construction_factory(factory.clone());
+        finalize.set_construction_factory(factory);
         operator.set_mem_tracker(tracker.clone());
         build.set_mem_tracker(tracker.clone());
+        finalize.set_mem_tracker(tracker.clone());
         operator.prepare().unwrap();
         build.prepare().unwrap();
+        finalize.prepare().unwrap();
         operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
         build.bind_runtime_state(&runtime).unwrap();
+        build.activate(&runtime).unwrap();
+        finalize.bind_runtime_state(&runtime).unwrap();
+        finalize.activate(&runtime).unwrap();
         {
             let mut build_calls = TestDriver::new(build.as_mut(), &runtime);
             build_calls.signal_eos().unwrap();
             assert!(build_calls.collect_until_finished().unwrap().is_empty());
         }
+        settle_step_build(finalize.as_mut(), &runtime);
         let mut processor = TestDriver::new(operator.as_mut(), &runtime);
         processor.accept_without_output(input).unwrap();
         processor.signal_eos().unwrap();
@@ -1727,6 +1725,7 @@ fn compiled_join_schema_last_slot_keeps_creator_after_plan_and_operators_exit() 
         drop(processor);
         drop(operator);
         drop(build);
+        drop(finalize);
         drop(program);
         assert!(weak.upgrade().is_none());
         drop(output);
@@ -1966,7 +1965,8 @@ fn compiled_join_output_last_batch_ref_keeps_original_source_creator() {
     use crate::runtime::mem_tracker::MemTracker;
     use novarocks_type_contract::ValueTypeStorageLifetime;
     for nested in [false, true] {
-        let (program, mut operator, mut build, input, error) = schema_owner_join_operators(nested);
+        let (program, mut operator, mut build, mut finalize, input, error) =
+            schema_owner_join_operators(nested);
         let weak = Arc::downgrade(&program);
         let source_tracker = MemTracker::new_root("join input source construction");
         let source_factory = super::aggregate_fixture::runtime_construction_factory(
@@ -2004,18 +2004,26 @@ fn compiled_join_output_last_batch_ref_keeps_original_source_creator() {
         let factory =
             super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error);
         operator.set_construction_factory(factory.clone());
-        build.set_construction_factory(factory);
+        build.set_construction_factory(factory.clone());
+        finalize.set_construction_factory(factory);
         operator.set_mem_tracker(tracker.clone());
         build.set_mem_tracker(tracker.clone());
+        finalize.set_mem_tracker(tracker.clone());
         operator.prepare().unwrap();
         build.prepare().unwrap();
+        finalize.prepare().unwrap();
         operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
         build.bind_runtime_state(&runtime).unwrap();
+        build.activate(&runtime).unwrap();
+        finalize.bind_runtime_state(&runtime).unwrap();
+        finalize.activate(&runtime).unwrap();
         {
             let mut build_calls = TestDriver::new(build.as_mut(), &runtime);
             build_calls.signal_eos().unwrap();
             assert!(build_calls.collect_until_finished().unwrap().is_empty());
         }
+        settle_step_build(finalize.as_mut(), &runtime);
         let mut processor = TestDriver::new(operator.as_mut(), &runtime);
         processor.accept_without_output(input).unwrap();
         processor.signal_eos().unwrap();
@@ -2032,6 +2040,7 @@ fn compiled_join_output_last_batch_ref_keeps_original_source_creator() {
         drop(processor);
         drop(operator);
         drop(build);
+        drop(finalize);
         drop(program);
         assert!(weak.upgrade().is_none());
         drop(output);
@@ -2046,7 +2055,7 @@ fn compiled_join_output_last_batch_ref_keeps_original_source_creator() {
 #[test]
 fn compiled_hash_build_prepare_missing_owner_preserves_input_and_first_cause() {
     use crate::exec::pipeline::operator::ConstructionFailure;
-    let (_, probe, mut build, input, _) = schema_owner_join_operators(false);
+    let (_, probe, mut build, _, input, _) = schema_owner_join_operators(false);
     let source = input.batch_projection();
     let rows = int64_rows(std::slice::from_ref(&input));
     let first = build.prepare().unwrap_err();
@@ -2095,17 +2104,19 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
     };
     use crate::runtime::mem_tracker::MemTracker;
     use std::num::NonZeroU64;
-    let (program, mut probe, mut build, input, error) = schema_owner_join_operators(true);
+    let (program, mut probe, mut build, mut finalize, input, error) =
+        schema_owner_join_operators(true);
     let runtime = RuntimeState::default();
     let tracker = MemTracker::new_root("nested-loop receiver steps");
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
     let factory =
         super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error.clone());
-    for operator in [&mut probe, &mut build] {
+    for operator in [&mut probe, &mut build, &mut finalize] {
         operator.set_construction_factory(factory.clone());
         operator.set_mem_tracker(tracker.clone());
-        operator.bind_runtime_state(&runtime).unwrap();
         operator.prepare().unwrap();
+        operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
     }
     drop(factory);
     let original = input.columns()[0].clone();
@@ -2143,10 +2154,12 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
         );
         let build_step = build.as_mut();
         build_step.finish(&mut ctx).unwrap();
-        assert!(matches!(
-            build_step.drive(&mut ctx).unwrap().next,
-            NextStep::Finished
-        ));
+        // EOS was signalled under a zero-CPU probe turn. The real E gets
+        // ordinary driver turns to finish its own admitted work and receipt.
+        let mut build_calls = TestDriver::new(build_step, &runtime);
+        assert!(build_calls.collect_until_finished().unwrap().is_empty());
+        drop(build_calls);
+        settle_step_build(finalize.as_mut(), &runtime);
         assert_ne!(wait.observable.generation(), wait.observed_generation);
         assert!(matches!(
             step.try_push(&mut ctx, input),
@@ -2154,7 +2167,7 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
         ));
         let applied = step.drive(&mut ctx).unwrap();
         assert!(applied.output.is_none());
-        assert!(matches!(applied.next, NextStep::Runnable));
+        assert!(matches!(applied.next, NextStep::Runnable | NextStep::Yield));
         step.finish(&mut ctx).unwrap();
         let allocated = tracker.allocated();
         assert!(matches!(
@@ -2163,14 +2176,12 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
         ));
         assert_eq!(tracker.allocated(), allocated);
     }
-    turn.begin_turn(1).unwrap();
-    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
-    let emitted = step.drive(&mut ctx).unwrap();
-    assert!(matches!(emitted.next, NextStep::Runnable));
-    let output = emitted.output.unwrap();
+    // Drain through the original receiver under real driver turns. The oracle
+    // fixes all admitted rows, independently of the kernel's working page size.
+    let mut calls = TestDriver::new(step, &runtime);
+    let output = calls.collect_until_finished().unwrap();
     assert_eq!(
-        sorted(int64_rows(std::slice::from_ref(&output))),
+        sorted(int64_rows(&output)),
         sorted(
             LEFT_ROWS
                 .iter()
@@ -2178,12 +2189,11 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
                 .collect()
         )
     );
-    let ended = step.drive(&mut ctx).unwrap();
-    assert!(ended.output.is_none());
-    assert!(matches!(ended.next, NextStep::Finished));
-    assert!(step.drive(&mut ctx).unwrap().output.is_none());
+    assert!(calls.advance_to_boundary().unwrap().output.is_none());
+    drop(calls);
     drop(probe);
     drop(build);
+    drop(finalize);
     drop(program);
     assert!(tracker.current() > 0);
     drop(output);
@@ -2205,7 +2215,8 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
         .map(|value| (Some(1), Some(value)))
         .collect::<Vec<Row>>();
     let spec = Spec::hash(JoinKind::Inner, false);
-    let (program, mut probe, mut build, input, error) = step_join_operators(spec, &rows, &rows);
+    let (program, mut probe, mut build, mut finalize, input, error) =
+        step_join_operators(spec, &rows, &rows);
     let right = program
         .graph()
         .nodes()
@@ -2237,11 +2248,12 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
     let factory =
         super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error.clone());
-    for operator in [&mut probe, &mut build] {
+    for operator in [&mut probe, &mut build, &mut finalize] {
         operator.set_construction_factory(factory.clone());
         operator.set_mem_tracker(tracker.clone());
-        operator.bind_runtime_state(&runtime).unwrap();
         operator.prepare().unwrap();
+        operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
     }
     drop(factory);
     let mut turn = TurnWork::new(NonZeroU64::new(1).unwrap(), 0);
@@ -2271,10 +2283,12 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
         ));
         assert!(build_step.drive(&mut ctx).unwrap().output.is_none());
         build_step.finish(&mut ctx).unwrap();
-        assert!(matches!(
-            build_step.drive(&mut ctx).unwrap().next,
-            NextStep::Finished
-        ));
+        // EOS was signalled under a zero-CPU probe turn. The real E gets
+        // ordinary driver turns to finish its own admitted work and receipt.
+        let mut build_calls = TestDriver::new(build_step, &runtime);
+        assert!(build_calls.collect_until_finished().unwrap().is_empty());
+        drop(build_calls);
+        settle_step_build(finalize.as_mut(), &runtime);
         assert_ne!(wait.observable.generation(), wait.observed_generation);
         assert!(matches!(
             step.try_push(&mut ctx, input),
@@ -2282,7 +2296,7 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
         ));
         let applied = step.drive(&mut ctx).unwrap();
         assert!(applied.output.is_none());
-        assert!(matches!(applied.next, NextStep::Runnable));
+        assert!(matches!(applied.next, NextStep::Runnable | NextStep::Yield));
         step.finish(&mut ctx).unwrap();
         let allocated = tracker.allocated();
         assert!(matches!(
@@ -2291,43 +2305,26 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
         ));
         assert_eq!(tracker.allocated(), allocated);
     }
-    let mut output = Vec::new();
-    for expected in [
-        MAX_JOIN_OUTPUT_ROWS_PER_BATCH,
-        rows.len() * rows.len() - MAX_JOIN_OUTPUT_ROWS_PER_BATCH,
-    ] {
-        turn.begin_turn(1).unwrap();
-        let mut value_conversions =
-            novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
-        let page = step.drive(&mut ctx).unwrap();
-        assert!(matches!(page.next, NextStep::Runnable));
-        let page = page.output.unwrap();
-        assert_eq!(page.len(), expected);
-        output.push(page);
-        let allocated = tracker.allocated();
-        let yielded = step.drive(&mut ctx).unwrap();
-        assert!(yielded.output.is_none());
-        assert!(matches!(yielded.next, NextStep::Yield));
-        assert_eq!(tracker.allocated(), allocated);
-    }
+    let mut calls = TestDriver::new(step, &runtime);
+    let output = calls.collect_until_finished().unwrap();
+    assert!(
+        output.len() > 1,
+        "duplicate occurrences must survive multiple transferred pages"
+    );
+    assert!(
+        output
+            .iter()
+            .all(|page| page.len() <= MAX_JOIN_OUTPUT_ROWS_PER_BATCH)
+    );
     assert_eq!(
         sorted(int64_rows(&output)),
         sorted(oracle(spec, &rows, &rows))
     );
-    turn.begin_turn(1).unwrap();
-    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
-    let tail = step.drive(&mut ctx).unwrap();
-    assert!(tail.output.is_none());
-    assert!(matches!(tail.next, NextStep::Runnable));
-    assert!(matches!(
-        step.drive(&mut ctx).unwrap().next,
-        NextStep::Finished
-    ));
-    assert!(step.drive(&mut ctx).unwrap().output.is_none());
+    assert!(calls.advance_to_boundary().unwrap().output.is_none());
+    drop(calls);
     drop(probe);
     drop(build);
+    drop(finalize);
     drop(program);
     assert!(tracker.current() > 0);
     drop(output);

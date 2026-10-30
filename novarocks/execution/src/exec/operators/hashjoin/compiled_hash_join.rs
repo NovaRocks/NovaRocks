@@ -15,32 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compiled hash join: the build sink and probe processor of one compiled
-//! LocalProgram Join node.
+//! Frozen join metadata and the installed E/F/Q/T factories.
 //!
-//! Keys and the residual are evaluated only through per-driver compiled root
-//! instances. A key root reads its own side's batch as the operator receives
-//! it; the residual reads the gathered candidate pairs in the join-scope
-//! layout. The hash map, build store, gather and match-decision kernels work
-//! on the evaluated arrays; nothing reads a legacy expression arena.
+//! E captures evaluated roots and payload pages without constructing lookup
+//! tables. Independent F sources poll the original K task graph and join-owned
+//! directory/CSR/bitmap work. Q evaluates original compiled roots over stable
+//! physical rows; independent T sources publish retained build rows after the
+//! original Q completion barrier. Every participant has an exact installed slot.
 //!
-//! The local orientation is fixed by the compiler: the probe is the program's
-//! left input and the build its right input. One build driver publishes one
-//! artifact that every probe driver of the instance shares: every physical
-//! distribution has already delivered this instance its whole share of both
-//! sides. This milestone executes Inner, LeftOuter, LeftSemi, LeftAnti and
-//! NullAwareLeftAnti; a kind that must publish unmatched build rows is
-//! refused when the pipeline is built.
-//!
-//! Output batches are exactly the node's frozen canonical layout: a
-//! NULL-extended build column is already nullable there, so no schema is
-//! patched at runtime. A row data error of a key or of the residual over a
-//! candidate pair is a required error.
-//!
-//! The build driver also feeds the join's membership runtime-filter
-//! producers: each evaluated build-key array is submitted once, the producers
-//! close after the artifact is published, and any build failure or cancel
-//! fails them. The instance's one build driver is their one local partition.
+//! Canonical output roles and signed null extension come from LocalCompiler.
+//! SharedBuild is a local layout, independent of the network distribution.
+//! Runtime-filter producers receive each key once from the actual E participants.
 
 use super::join_hash_map::build_store::BuildStoreChunkProjection;
 use crate::exec::fragment::error::{
@@ -57,7 +42,6 @@ use novarocks_local_program::{
     ProgramNodeId, ProgramNodeKind,
 };
 
-use super::broadcast_join_shared::BroadcastJoinSharedState;
 use super::build_artifact::{BuildView, JoinBuildArtifact};
 use super::build_requirements::{
     BuildComponentRequirements, NullKeyRequirement, required_build_components,
@@ -321,22 +305,18 @@ impl CompiledHashJoinPlan {
     }
 }
 
-mod build;
 mod finalize;
 mod frame;
 mod input;
 mod phased_probe;
-mod probe;
 mod tail;
 
-pub(crate) use build::CompiledHashJoinBuildSinkFactory;
 pub(crate) use finalize::CompiledJoinFinalizeSourceFactory;
 pub(crate) use frame::CompiledJoinFrame;
 #[cfg(test)]
 pub(crate) use frame::{frame_fixture_chunks, frame_fixture_inputs};
 pub(crate) use input::CompiledJoinInputSinkFactory;
 pub(crate) use phased_probe::CompiledJoinProbeProcessorFactory;
-pub(crate) use probe::CompiledHashJoinProbeProcessorFactory;
 
 /// The scope retains the probe then build slots and complete frozen fields.
 pub(crate) fn validate_join_scope(

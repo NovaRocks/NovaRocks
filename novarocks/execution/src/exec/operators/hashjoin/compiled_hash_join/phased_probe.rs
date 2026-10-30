@@ -667,6 +667,13 @@ impl TransformKernel for JoinProbe {
             let Some(cursor) = admitted.as_mut() else {
                 return Ok(StepResult::new(None, NextStep::NeedInput, 0));
             };
+            self.frame()?.completion.check()?;
+            self.control.checkpoint(0)?;
+            // A zero-work continuation retains its original cursor without
+            // constructing a new allocation owner or requesting scratch.
+            if ctx.work().remaining() == 0 {
+                return Ok(StepResult::new(None, NextStep::Yield, 0));
+            }
             let prep = self
                 .prepared
                 .as_ref()
