@@ -180,6 +180,10 @@ impl BulkDomain {
     }
     /// The claim is private and non-Clone. Reusing a caller usize cannot create
     /// another writer for the same run, or manufacture a completed run receipt.
+    #[cfg(test)]
+    pub(crate) fn capture_claims_for_test(&self) -> ExecutionResult<usize> {
+        Ok(self.gate()?.issued)
+    }
     pub(crate) fn begin_capture(&self, work: &CaptureWork<'_>) -> ExecutionResult<CaptureBuilder> {
         let result = (|| {
             let claim = self.claim()?;

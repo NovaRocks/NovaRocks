@@ -173,7 +173,7 @@ pub(crate) struct JoinBuildFrame {
     state: Mutex<State>,
     live_slots: NonZeroUsize,
     match_bits: bool,
-    _closed_subscription: Option<ObserverSubscription>,
+    activation: OnceLock<ExecutionResult<Option<ObserverSubscription>>>,
     _storage: ValueTypeStorageLifetime,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,19 +205,6 @@ impl JoinBuildFrame {
             work.control,
         )?;
         let inputs = BuildCollection::new(Arc::clone(&completion), work.owner, work.control)?;
-        let subscription = if let Some(closed) = completion.handoff_closed_observable() {
-            let weak = Arc::downgrade(&changed);
-            let retention = work.owner.storage_lifetime();
-            let callback = funded_shared(work.owner, move || {
-                let _retention = &retention;
-                if let Some(changed) = weak.upgrade() {
-                    changed.notify_observers();
-                }
-            })?;
-            Some(closed.subscribe(callback))
-        } else {
-            None
-        };
         funded_shared(
             work.owner,
             Self {
@@ -227,10 +214,33 @@ impl JoinBuildFrame {
                 state: Mutex::new(State::Collecting),
                 live_slots: options.live_slots,
                 match_bits: options.match_bits,
-                _closed_subscription: subscription,
+                activation: OnceLock::new(),
                 _storage: work.owner.storage_lifetime(),
             },
         )
+    }
+    /// Registration belongs to admitted operator activation. Preparation
+    /// creates only dormant metadata, never a live subscription.
+    pub(crate) fn activate(&self, work: &BulkWork<'_>) -> ExecutionResult<()> {
+        self.activation
+            .get_or_init(|| {
+                let Some(closed) = self.completion.handoff_closed_observable() else {
+                    return Ok(None);
+                };
+                let changed = self.completion.observable();
+                let weak = Arc::downgrade(&changed);
+                let retention = work.owner.storage_lifetime();
+                let callback = funded_shared(work.owner, move || {
+                    let _retention = &retention;
+                    if let Some(changed) = weak.upgrade() {
+                        changed.notify_observers();
+                    }
+                })?;
+                Ok(Some(closed.subscribe(callback)))
+            })
+            .as_ref()
+            .map(|_| ())
+            .map_err(Clone::clone)
     }
     fn state(&self) -> ExecutionResult<std::sync::MutexGuard<'_, State>> {
         self.state.lock().map_err(|p| {

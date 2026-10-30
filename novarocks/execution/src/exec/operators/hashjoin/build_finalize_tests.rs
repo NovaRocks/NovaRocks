@@ -211,6 +211,11 @@ fn original_handoff_all_closed_event_wakes_frame_without_partial_close_withdrawa
         &work,
     )
     .unwrap();
+    assert!(
+        frame.activation.get().is_none(),
+        "prepare must remain dormant"
+    );
+    frame.activate(&work).unwrap();
     let changed = frame.completion.observable();
     let before = changed.generation();
     handoff.close_consumer(0);
@@ -269,17 +274,71 @@ fn naa_two_original_projections_make_progress_without_cross_domain_coordinate_gu
         &work,
     )
     .unwrap();
-    let mut writers: Vec<_> = (0..2)
-        .map(|slot| {
+    let ProjectionDomains::Naa {
+        group: Some(group),
+        full,
+        ..
+    } = &frame.domains
+    else {
+        unreachable!()
+    };
+    struct PauseAfterScope<'a> {
+        group: &'a crate::exec::hash_table::key_index::BulkDomain,
+        full: &'a crate::exec::hash_table::key_index::BulkDomain,
+        claimed: &'a std::sync::Barrier,
+        resume: &'a std::sync::Barrier,
+        paused: std::sync::atomic::AtomicBool,
+    }
+    impl novarocks_functions::KernelEvaluationControl for PauseAfterScope<'_> {
+        fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+            if self.group.capture_claims_for_test().unwrap() == 1
+                && self.full.capture_claims_for_test().unwrap() == 0
+                && !self.paused.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.claimed.wait();
+                self.resume.wait();
+            }
+            Ok(())
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+            panic!("local capture never waits for I/O");
+        }
+    }
+    let claimed = std::sync::Barrier::new(2);
+    let resume = std::sync::Barrier::new(2);
+    let pause = PauseAfterScope {
+        group,
+        full,
+        claimed: &claimed,
+        resume: &resume,
+        paused: std::sync::atomic::AtomicBool::new(false),
+    };
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            let work = super::super::build_pages::tests::work(owner.as_ref(), &tracker, &pause);
             InputRunWriter::new(
                 &frame.domains,
-                B3RunId::from_input_slot(slot, 2).unwrap(),
+                B3RunId::from_input_slot(0, 2).unwrap(),
                 false,
                 &work,
             )
             .unwrap()
-        })
-        .collect();
+        });
+        let second = scope.spawn(|| {
+            claimed.wait();
+            let writer = InputRunWriter::new(
+                &frame.domains,
+                B3RunId::from_input_slot(1, 2).unwrap(),
+                false,
+                &work,
+            )
+            .unwrap();
+            resume.wait();
+            writer
+        });
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    let mut writers = [first, second];
     // Push in an order different from E-slot order; each domain mints its own
     // real run identity. The page directory must preserve those actual facts.
     for slot in [1, 0, 1, 0] {
@@ -293,7 +352,7 @@ fn naa_two_original_projections_make_progress_without_cross_domain_coordinate_gu
                 .map(|i| if i % 11 == 0 { None } else { Some(i % 59) })
                 .collect::<Vec<_>>(),
         ));
-        writers[slot]
+        let page = writers[slot]
             .push_evaluated(
                 &source(701),
                 EvaluatedJoinKeyPage::Naa {
@@ -310,6 +369,14 @@ fn naa_two_original_projections_make_progress_without_cross_domain_coordinate_gu
                 &work,
             )
             .unwrap();
+        assert_ne!(
+            page.projection_id(ProjectionKind::Group)
+                .unwrap()
+                .run_index(),
+            page.projection_id(ProjectionKind::Full)
+                .unwrap()
+                .run_index()
+        );
     }
     for (slot, writer) in writers.iter_mut().enumerate() {
         frame
