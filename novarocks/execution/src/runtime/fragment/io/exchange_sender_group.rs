@@ -133,6 +133,26 @@ impl ExchangeSenderGroup {
         &self.observable
     }
 
+    /// Observation only. Busy is unavailable; never wait for a sender or
+    /// clone a sender/claim/payload merely to produce a diagnostic marker.
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn try_diagnostic_state(&self) -> Option<String> {
+        let state = self.state.try_lock().ok()?;
+        let Some(binding) = &state.binding else {
+            return Some("unbound".into());
+        };
+        let mut samples = Vec::with_capacity(binding.entries.len());
+        for (stream, entry) in &binding.entries {
+            samples.push((
+                *stream,
+                entry.gate.state(),
+                entry.end.load(Ordering::Acquire),
+                entry.sender.try_diagnostic_snapshot()?,
+            ));
+        }
+        Some(format!("{samples:?}"))
+    }
+
     /// The stream group contributes its transport counters once to the
     /// factory's operator profile, regardless of how many drivers publish.
     pub(crate) fn install_profiles(&self, profiles: OperatorProfiles) {
@@ -579,6 +599,15 @@ impl ExchangeFrameTransmitter for MeasuredTransmitter {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn busy_diagnostic_sampling_does_not_wait_or_report_an_empty_group() {
+        let group = super::ExchangeSenderGroup::new();
+        let guard = group.state.lock().unwrap();
+        assert!(group.try_diagnostic_state().is_none());
+        drop(guard);
+        assert_eq!(group.try_diagnostic_state().as_deref(), Some("unbound"));
+    }
     use super::super::exchange::test_support::Fixture;
     use super::super::{ExchangeReceiverKey, ExchangeReceiverRegistration};
     use super::*;

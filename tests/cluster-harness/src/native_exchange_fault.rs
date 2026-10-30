@@ -183,9 +183,19 @@ pub struct ExchangeFaultObservation {
 pub(super) struct ExchangeState {
     peers: Vec<(usize, NativeCallerSubject, BackendProcessId)>,
     session_deadline: Option<Instant>,
-    capture: Option<Capture>,
+    capture: Option<CaptureState>,
 }
-struct Capture {
+enum CaptureState {
+    Live(Capture),
+    RetiredReceipt(CaptureReceipt),
+}
+
+struct Capture(CaptureReceipt);
+
+// Only bounded scalar identities, hashes and attempt observations. No future,
+// payload, ByteCredit, thread, connection, secret or resource permit is retained.
+struct CaptureReceipt {
+    retired_elapsed_millis: Option<u64>,
     action: ExchangeFaultAction,
     selector: ExchangeFaultSelector,
     started: Instant,
@@ -206,8 +216,11 @@ struct Capture {
     active_custody_batches_held: usize,
     custody_released_after_replay: bool,
 }
-impl Capture {
+impl CaptureReceipt {
     fn millis(&self) -> u64 {
+        if let Some(elapsed) = self.retired_elapsed_millis {
+            return elapsed;
+        }
         self.started
             .elapsed()
             .as_millis()
@@ -217,19 +230,52 @@ impl Capture {
 }
 
 impl ExchangeState {
+    fn live_capture(&self) -> Option<&CaptureReceipt> {
+        match self.capture.as_ref() {
+            Some(CaptureState::Live(capture)) => Some(&capture.0),
+            _ => None,
+        }
+    }
+    fn live_capture_mut(&mut self) -> Option<&mut CaptureReceipt> {
+        match self.capture.as_mut() {
+            Some(CaptureState::Live(capture)) => Some(&mut capture.0),
+            _ => None,
+        }
+    }
+    fn receipt(&self) -> Option<&CaptureReceipt> {
+        match self.capture.as_ref() {
+            Some(CaptureState::Live(capture)) => Some(&capture.0),
+            Some(CaptureState::RetiredReceipt(receipt)) => Some(receipt),
+            None => None,
+        }
+    }
+    pub(super) fn retire_after_group_join(&mut self, _joined: &JoinedRootReplyGroup) -> Result<()> {
+        if let Some(capture) = self.live_capture() {
+            ensure!(
+                capture.active == 0 && capture.active_custody_batches_held == 0,
+                "Exchange target or custody work has not actually exited"
+            );
+        }
+        self.capture = match self.capture.take() {
+            Some(CaptureState::Live(Capture(mut receipt))) => {
+                receipt.retired_elapsed_millis = Some(receipt.millis());
+                Some(CaptureState::RetiredReceipt(receipt))
+            }
+            other => other,
+        };
+        Ok(())
+    }
     pub(super) fn occupied(&self) -> bool {
-        self.capture.is_some()
+        self.live_capture().is_some()
     }
     pub(super) fn pending_deadline(&self) -> Option<Instant> {
-        self.capture
-            .as_ref()
+        self.live_capture()
             .filter(|capture| !capture.released && !capture.fired)
             .map(|capture| capture.deadline)
     }
     pub(super) fn expire(&mut self, deadline: Instant) -> bool {
         if let Some(capture) = self
-            .capture
-            .as_mut()
+            .live_capture_mut()
             .filter(|capture| capture.deadline == deadline && !capture.released && !capture.fired)
         {
             capture.released = true;
@@ -329,15 +375,15 @@ impl RootReplyFaultControl {
         ensure!(
             state
                 .exchange
-                .capture
-                .as_ref()
+                .live_capture()
                 .is_none_or(|capture| capture.active == 0
                     && capture.active_custody_batches_held == 0
                     && (capture.released || capture.fired)),
             "Previous Exchange target owners have not exited"
         );
         state.used_capture = true;
-        state.exchange.capture = Some(Capture {
+        state.exchange.capture = Some(CaptureState::Live(Capture(CaptureReceipt {
+            retired_elapsed_millis: None,
             action,
             selector,
             started: now,
@@ -357,7 +403,8 @@ impl RootReplyFaultControl {
             custody_batches_held: 0,
             active_custody_batches_held: 0,
             custody_released_after_replay: false,
-        });
+        })));
+
         drop(state);
         self.core.changed.notify_waiters();
         Ok(())
@@ -368,8 +415,7 @@ impl RootReplyFaultControl {
             .lock()
             .expect("root fault state lock")
             .exchange
-            .capture
-            .as_ref()
+            .receipt()
             .and_then(|capture| capture.candidate.clone())
     }
     pub fn arm_exchange_exact(&self, candidate: &ExchangeFaultCandidate) -> Result<()> {
@@ -380,8 +426,7 @@ impl RootReplyFaultControl {
         );
         let capture = state
             .exchange
-            .capture
-            .as_mut()
+            .live_capture_mut()
             .context("Exchange capture was not started")?;
         ensure!(
             !capture.armed && !capture.released && capture.deadline > Instant::now(),
@@ -403,8 +448,7 @@ impl RootReplyFaultControl {
             .lock()
             .expect("root fault state lock")
             .exchange
-            .capture
-            .as_mut()
+            .live_capture_mut()
         {
             capture.released = true;
         }
@@ -412,7 +456,7 @@ impl RootReplyFaultControl {
     }
     pub fn exchange_observation(&self) -> ExchangeFaultObservation {
         let state = self.core.state.lock().expect("root fault state lock");
-        let capture = state.exchange.capture.as_ref();
+        let capture = state.exchange.receipt();
         let attempts = capture
             .map(|capture| capture.attempts.clone())
             .unwrap_or_default();
@@ -421,7 +465,7 @@ impl RootReplyFaultControl {
             candidate: capture.and_then(|capture| capture.candidate.clone()),
             armed: capture.is_some_and(|capture| capture.armed),
             released: capture.is_some_and(|capture| capture.released),
-            elapsed_millis: capture.map_or(0, Capture::millis),
+            elapsed_millis: capture.map_or(0, CaptureReceipt::millis),
             active_target_streams: capture.map_or(0, |capture| capture.active),
             data_forward_held: attempts
                 .iter()
@@ -555,14 +599,16 @@ fn append_growing(buffer: &mut OwnedBuffer, value: &[u8]) -> Result<()> {
         "Exchange actor message exceeds the native decoded-message bound"
     );
     if next > buffer.bytes.capacity() {
-        let mut credit = ByteCredit::new(buffer._credit.core.clone(), next)?;
+        let mut credit = ByteCredit::new(buffer._credit.context.clone(), next)?;
         buffer
             .bytes
             .try_reserve_exact(next - buffer.bytes.len())
             .context("grow credited Exchange actor buffer")?;
         if buffer.bytes.capacity() > next {
-            let mut extra =
-                ByteCredit::new(buffer._credit.core.clone(), buffer.bytes.capacity() - next)?;
+            let mut extra = ByteCredit::new(
+                buffer._credit.context.clone(),
+                buffer.bytes.capacity() - next,
+            )?;
             credit.bytes += extra.bytes;
             extra.bytes = 0;
         }
@@ -571,8 +617,11 @@ fn append_growing(buffer: &mut OwnedBuffer, value: &[u8]) -> Result<()> {
     buffer.bytes.extend_from_slice(value);
     Ok(())
 }
-async fn unary_body(body: &mut RecvStream, core: Arc<Core>) -> Result<(Bytes, Option<HeaderMap>)> {
-    let mut buffer = OwnedBuffer::new(core, 0)?;
+async fn unary_body(
+    body: &mut RecvStream,
+    buffers: BufferContext,
+) -> Result<(Bytes, Option<HeaderMap>)> {
+    let mut buffer = OwnedBuffer::new(buffers, 0)?;
     while let Some(chunk) = body.data().await {
         let chunk = chunk?;
         ensure!(
@@ -594,7 +643,7 @@ struct AttemptOwner {
 impl Drop for AttemptOwner {
     fn drop(&mut self) {
         let mut state = self.core.state.lock().expect("root fault state lock");
-        if let Some(capture) = state.exchange.capture.as_mut() {
+        if let Some(capture) = state.exchange.live_capture_mut() {
             let now = capture.millis();
             capture.attempts[self.index].stream_future_exited_at_millis = Some(now);
             capture.active -= 1;
@@ -608,8 +657,7 @@ impl AttemptOwner {
         let mut state = self.core.state.lock().expect("root fault state lock");
         let capture = state
             .exchange
-            .capture
-            .as_mut()
+            .live_capture_mut()
             .expect("original Exchange capture owner");
         let now = capture.millis();
         apply(&mut capture.attempts[self.index], now);
@@ -622,7 +670,7 @@ fn select_unit(
     candidate: ExchangeFaultCandidate,
 ) -> Result<Option<AttemptOwner>> {
     let mut state = core.state.lock().expect("root fault state lock");
-    let Some(capture) = state.exchange.capture.as_mut() else {
+    let Some(capture) = state.exchange.live_capture_mut() else {
         return Ok(None);
     };
     if !capture
@@ -700,7 +748,7 @@ fn select_unit(
     Ok(Some(owner))
 }
 fn add_attempt(
-    capture: &mut Capture,
+    capture: &mut CaptureReceipt,
     candidate: ExchangeFaultCandidate,
     core: Arc<Core>,
 ) -> Result<AttemptOwner> {
@@ -754,8 +802,7 @@ async fn wait_gate(
             let state = core.state.lock().expect("root fault state lock");
             let capture = state
                 .exchange
-                .capture
-                .as_ref()
+                .live_capture()
                 .expect("original Exchange gate");
             let rebuilt = capture.action == ExchangeFaultAction::CutGrantSubscription
                 && capture.rebuilt_snapshot_complete
@@ -786,13 +833,288 @@ fn peer_cancel(error: &anyhow::Error) -> bool {
             matches!(closed.reset,CapacityResetObservation::Reason(reason) if reason==u32::from(h2::Reason::CANCEL)))
 }
 
+/// Constructed only after the original BE authentication, full unary decode,
+/// request EOF and exact live process-pair validation have succeeded.
+#[derive(Clone, Copy, Debug)]
+struct VerifiedGrantHeaderScope {
+    expected: DecodedExchangeGrantSubscription,
+    caller: BackendProcessId,
+    backend_index: usize,
+    downstream: u32,
+}
+
+#[derive(Debug)]
+enum GrantCancelRejection {
+    ExpiredSession,
+    RetiredScope,
+    InvalidLivePair,
+    UnknownCandidate,
+    InvalidCandidateKind,
+    ProtectedCustodyPair,
+    ProtectedSubscriptionPair,
+}
+
+fn non_target_grant_headers(
+    state: &ExchangeState,
+    scope: VerifiedGrantHeaderScope,
+) -> std::result::Result<(), GrantCancelRejection> {
+    if matches!(state.capture, Some(CaptureState::RetiredReceipt(_))) {
+        return Err(GrantCancelRejection::RetiredScope);
+    }
+    if !state
+        .session_deadline
+        .is_some_and(|deadline| deadline > Instant::now())
+    {
+        return Err(GrantCancelRejection::ExpiredSession);
+    }
+    let pair = scope.expected.pair;
+    if scope.caller != pair.sender
+        || !state
+            .peers
+            .iter()
+            .any(|(_, _, process)| *process == scope.caller)
+        || !state
+            .peers
+            .iter()
+            .any(|(index, _, process)| *index == scope.backend_index && *process == pair.receiver)
+    {
+        return Err(GrantCancelRejection::InvalidLivePair);
+    }
+    let Some(capture) = state.live_capture() else {
+        return Ok(());
+    };
+    match capture.action {
+        // These closed actions select only DeliverExchangeUnit. A grant RPC
+        // cannot become their target while the Unit candidate is being chosen.
+        ExchangeFaultAction::HoldDataBeforeForward
+        | ExchangeFaultAction::HoldReplyAfterAdmission => {
+            if capture.candidate.as_ref().is_none_or(|candidate| {
+                matches!(candidate.target, ExchangeFaultTarget::Unit { .. })
+            }) {
+                Ok(())
+            } else {
+                Err(GrantCancelRejection::InvalidCandidateKind)
+            }
+        }
+        // A watch can carry the selected Unit's custody in any generation.
+        // Explicit release does not prove that the original obligation settled.
+        ExchangeFaultAction::DropAcceptedReply => {
+            match capture.candidate.as_ref().map(|candidate| candidate.target) {
+                Some(ExchangeFaultTarget::Unit { stream, .. })
+                    if ExchangeProcessPair::for_stream(stream) != pair =>
+                {
+                    Ok(())
+                }
+                Some(ExchangeFaultTarget::Unit { .. }) => {
+                    Err(GrantCancelRejection::ProtectedCustodyPair)
+                }
+                Some(_) => Err(GrantCancelRejection::InvalidCandidateKind),
+                None => Err(GrantCancelRejection::UnknownCandidate),
+            }
+        }
+        // Protect both the original subscription and every same-pair generation,
+        // including the rebuild which must furnish the real complete snapshot.
+        ExchangeFaultAction::CutGrantSubscription => {
+            match capture.candidate.as_ref().map(|candidate| candidate.target) {
+                Some(ExchangeFaultTarget::Subscription { pair: selected, .. })
+                    if selected != pair =>
+                {
+                    Ok(())
+                }
+                Some(ExchangeFaultTarget::Subscription { .. }) => {
+                    Err(GrantCancelRejection::ProtectedSubscriptionPair)
+                }
+                Some(_) => Err(GrantCancelRejection::InvalidCandidateKind),
+                None => Err(GrantCancelRejection::UnknownCandidate),
+            }
+        }
+    }
+}
+
+async fn recover_grant_cancel_before_headers(
+    core: &Core,
+    scope: VerifiedGrantHeaderScope,
+    response: &mut server::SendResponse<Bytes>,
+    inbound: &mut RecvStream,
+    sending: &mut SendStream<Bytes>,
+) -> bool {
+    if response.stream_id().as_u32() != scope.downstream
+        || inbound.stream_id() != response.stream_id()
+    {
+        return false;
+    }
+    let reset = poll_fn(|cx| std::task::Poll::Ready(response.poll_reset(cx))).await;
+    if !matches!(reset, std::task::Poll::Ready(Ok(h2::Reason::CANCEL))) {
+        return false;
+    }
+    let input = poll_fn(|cx| std::task::Poll::Ready(inbound.poll_data(cx))).await;
+    match input {
+        std::task::Poll::Ready(None) => {}
+        std::task::Poll::Ready(Some(Err(error)))
+            if error.is_reset()
+                && error.is_remote()
+                && error.reason() == Some(h2::Reason::CANCEL) => {}
+        _ => return false,
+    }
+    settle_grant_peer_cancel(core, ObservedGrantPeerCancel { scope }, sending).is_ok()
+}
+
+// This observation is constructed only after a nonblocking original H2 handle
+// returns Ready(CANCEL). A boolean or a failed send is not a reset receipt.
+struct ObservedGrantPeerCancel {
+    scope: VerifiedGrantHeaderScope,
+}
+
+fn settle_grant_peer_cancel(
+    core: &Core,
+    observed: ObservedGrantPeerCancel,
+    sending: &mut SendStream<Bytes>,
+) -> std::result::Result<(), GrantCancelRejection> {
+    let mut state = core.state.lock().expect("root fault state lock");
+    // The capture may have changed while the original upstream headers were
+    // awaited. Reclassify under its current lock; no old classification grants
+    // cancellation authority over a new target or its custody/rebuild watch.
+    non_target_grant_headers(&state.exchange, observed.scope)?;
+    // No local reset has been sent to this non-target downstream stream. The
+    // original handle's independently observed CANCEL is the peer's.
+    // Retire only the corresponding original upstream RPC, never its connection.
+    sending.send_reset(h2::Reason::CANCEL);
+    if let Some(capture) = state.exchange.live_capture_mut() {
+        capture.peer_cancels = capture.peer_cancels.saturating_add(1);
+    }
+    drop(state);
+    core.changed.notify_waiters();
+    Ok(())
+}
+
+#[derive(Debug)]
+enum GrantCancelProbe {
+    Settled,
+    StreamMismatch { actual: u32, expected: u32 },
+    Pending,
+    ReadyOther(u32),
+    ObservationError(FailureDigest),
+    ReadyCancelRejected(GrantCancelRejection),
+}
+
+impl std::fmt::Display for GrantCancelProbe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Settled => formatter.write_str("Ready(CANCEL) settled"),
+            Self::StreamMismatch { actual, expected } => write!(
+                formatter,
+                "stream-mismatch(actual={actual},expected={expected})"
+            ),
+            Self::Pending => formatter.write_str("Pending"),
+            Self::ReadyOther(reason) => write!(formatter, "Ready(reason={reason})"),
+            Self::ObservationError(error) => write!(formatter, "observation-error({error:?})"),
+            Self::ReadyCancelRejected(reason) => {
+                write!(formatter, "Ready(CANCEL) rejected={reason:?}")
+            }
+        }
+    }
+}
+
+async fn recover_grant_cancel_after_headers(
+    core: &Core,
+    scope: VerifiedGrantHeaderScope,
+    output: &mut SendStream<Bytes>,
+    sending: &mut SendStream<Bytes>,
+) -> GrantCancelProbe {
+    if output.stream_id().as_u32() != scope.downstream {
+        return GrantCancelProbe::StreamMismatch {
+            actual: output.stream_id().as_u32(),
+            expected: scope.downstream,
+        };
+    }
+    // Request EOF is an immutable fact of the same original verified scope.
+    // The Streaming handle now owns reset observation; SendResponse cannot be
+    // polled in this phase. This probe never waits or adds an idle deadline.
+    match poll_fn(|cx| std::task::Poll::Ready(output.poll_reset(cx))).await {
+        std::task::Poll::Pending => GrantCancelProbe::Pending,
+        std::task::Poll::Ready(Err(error)) => GrantCancelProbe::ObservationError(digest_display(
+            "grant-output-reset-observation",
+            &error,
+        )),
+        std::task::Poll::Ready(Ok(reason)) if reason != h2::Reason::CANCEL => {
+            GrantCancelProbe::ReadyOther(u32::from(reason))
+        }
+        std::task::Poll::Ready(Ok(_)) => {
+            match settle_grant_peer_cancel(core, ObservedGrantPeerCancel { scope }, sending) {
+                Ok(()) => GrantCancelProbe::Settled,
+                Err(rejection) => GrantCancelProbe::ReadyCancelRejected(rejection),
+            }
+        }
+    }
+}
+
+enum GrantOutput {
+    Message(Bytes),
+    Trailers(HeaderMap),
+    End,
+}
+
+#[derive(Debug)]
+struct GrantOutputFailure {
+    stage: &'static str,
+    scope: VerifiedGrantHeaderScope,
+    reset: GrantCancelProbe,
+}
+
+impl std::fmt::Display for GrantOutputFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Exchange grant stage={} scope={:?} reset={}",
+            self.stage, self.scope, self.reset
+        )
+    }
+}
+
+async fn forward_grant_output(
+    core: &Core,
+    scope: VerifiedGrantHeaderScope,
+    output: &mut SendStream<Bytes>,
+    sending: &mut SendStream<Bytes>,
+    part: GrantOutput,
+) -> Result<bool> {
+    let (stage, outcome) = match part {
+        GrantOutput::Message(message) => ("send-message", send_bytes(output, message).await),
+        GrantOutput::Trailers(trailers) => (
+            "send-trailers",
+            output.send_trailers(trailers).map_err(anyhow::Error::from),
+        ),
+        GrantOutput::End => (
+            "send-eof",
+            output
+                .send_data(Bytes::new(), true)
+                .map_err(anyhow::Error::from),
+        ),
+    };
+    match outcome {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let reset = recover_grant_cancel_after_headers(core, scope, output, sending).await;
+            if matches!(reset, GrantCancelProbe::Settled) {
+                return Ok(false);
+            }
+            Err(error).context(GrantOutputFailure {
+                stage,
+                scope,
+                reset,
+            })
+        }
+    }
+}
+
 pub(super) async fn forward(
     request: Request<RecvStream>,
     mut response: server::SendResponse<Bytes>,
     sender: client::SendRequest<Bytes>,
     backend_index: usize,
-    core: Arc<Core>,
+    buffers: BufferContext,
 ) -> Result<()> {
+    let core = buffers.core.clone();
     let caller = authenticate(&core, &request, backend_index)?;
     let path = request.uri().path().to_owned();
     let downstream = response.stream_id().as_u32();
@@ -801,7 +1123,7 @@ pub(super) async fn forward(
     let mut verified = false;
     let mut owner: Option<AttemptOwner> = None;
     let work = async {
-        let (body, trailers) = unary_body(&mut inbound, core.clone()).await?;
+        let (body, trailers) = unary_body(&mut inbound, buffers.clone()).await?;
         ensure!(
             trailers.as_ref().is_none_or(HeaderMap::is_empty),
             "Exchange request contains unexpected trailers"
@@ -853,7 +1175,12 @@ pub(super) async fn forward(
                     FieldPath::root("exchange_fault_subscription_request"),
                 )?;
                 require_pair(&core, decoded.pair, caller, backend_index)?;
-                subscription = Some(decoded);
+                subscription = Some(VerifiedGrantHeaderScope {
+                    expected: decoded,
+                    caller,
+                    backend_index,
+                    downstream,
+                });
             }
             _ => bail!("Exchange actor received an unowned method"),
         }
@@ -863,8 +1190,7 @@ pub(super) async fn forward(
                 let state = core.state.lock().expect("root fault state lock");
                 let action = state
                     .exchange
-                    .capture
-                    .as_ref()
+                    .live_capture()
                     .expect("original Exchange target")
                     .action;
                 matches!(
@@ -903,26 +1229,58 @@ pub(super) async fn forward(
         .await
         .context("Exchange upstream response establishment deadline")??;
         let (reply_parts, mut reply_body) = upstream_response.into_parts();
-        if let Some(expected) = subscription {
+        if let Some(scope) = subscription {
+            if recover_grant_cancel_before_headers(
+                &core,
+                scope,
+                &mut response,
+                &mut inbound,
+                &mut sending,
+            )
+            .await
+            {
+                return Ok(());
+            }
             let mut output =
-                response.send_response(Response::from_parts(reply_parts, ()), false)?;
+                match response.send_response(Response::from_parts(reply_parts, ()), false) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        // The original connection can process RST after the first
+                        // probe but before this transition. Observe its typed reset
+                        // again; the failed transition is not cancellation proof.
+                        if recover_grant_cancel_before_headers(
+                            &core,
+                            scope,
+                            &mut response,
+                            &mut inbound,
+                            &mut sending,
+                        )
+                        .await
+                        {
+                            return Ok(());
+                        }
+                        return Err(error).with_context(|| {
+                            format!("Exchange grant stage=response-headers scope={scope:?}")
+                        });
+                    }
+                };
             return forward_grants(
                 &core,
+                buffers.clone(),
                 &mut reply_body,
                 &mut output,
                 &mut sending,
-                expected,
-                backend_index,
-                caller,
-                downstream,
+                scope,
                 upstream,
                 hash(&body),
                 dispatched,
             )
-            .await;
+            .await
+            .with_context(|| format!("Exchange grant stage=response-body scope={scope:?}"));
         }
         if let Some(owner) = owner.as_ref() {
-            let (reply_bytes, reply_trailers) = unary_body(&mut reply_body, core.clone()).await?;
+            let (reply_bytes, reply_trailers) =
+                unary_body(&mut reply_body, buffers.clone()).await?;
             let frame = unit.as_ref().context("Exchange target has no Unit frame")?;
             // Header-only RPC failures remain the real upstream RPC outcome.
             // They never authorize an accepted-receipt mutation.
@@ -952,8 +1310,7 @@ pub(super) async fn forward(
                         let mut state = core.state.lock().expect("root fault state lock");
                         let capture = state
                             .exchange
-                            .capture
-                            .as_mut()
+                            .live_capture_mut()
                             .expect("original Exchange target");
                         if owner.mutate
                             && capture.armed
@@ -1002,7 +1359,7 @@ pub(super) async fn forward(
             }
         } else {
             let output = response.send_response(Response::from_parts(reply_parts, ()), false)?;
-            copy_body(reply_body, output, core.clone()).await?;
+            copy_body(reply_body, output, buffers.clone()).await?;
         }
         Ok::<_, anyhow::Error>(())
     };
@@ -1019,7 +1376,7 @@ pub(super) async fn forward(
     match outcome {
         Err(error) if verified && peer_cancel(&error) => {
             if let Some(owner)=owner.as_ref() {owner.update(|attempt,_|attempt.peer_cancelled=true);}
-            if let Some(capture)=core.state.lock().expect("root fault state lock").exchange.capture.as_mut() {capture.peer_cancels+=1;}
+            if let Some(capture)=core.state.lock().expect("root fault state lock").exchange.live_capture_mut() {capture.peer_cancels+=1;}
             Ok(())
         },
         result=>result.with_context(||format!("Exchange actor method={path} backend_index={backend_index} downstream_stream={downstream}")),
@@ -1037,8 +1394,7 @@ impl Drop for CustodyBatchOwner {
             .lock()
             .expect("root fault state lock")
             .exchange
-            .capture
-            .as_mut()
+            .live_capture_mut()
         {
             capture.active_custody_batches_held -= 1;
         }
@@ -1053,7 +1409,7 @@ async fn hold_selected_custody(
 ) -> Result<bool> {
     let hold = {
         let mut state = core.state.lock().expect("root fault state lock");
-        if let Some(capture) = state.exchange.capture.as_mut() {
+        if let Some(capture) = state.exchange.live_capture_mut() {
             let selected = capture.action == ExchangeFaultAction::DropAcceptedReply
                 && capture.armed
                 && !capture.released
@@ -1099,8 +1455,7 @@ async fn hold_selected_custody(
             let mut state = core.state.lock().expect("root fault state lock");
             let capture = state
                 .exchange
-                .capture
-                .as_mut()
+                .live_capture_mut()
                 .expect("original custody batch owner");
             let replay = capture.attempts.iter().any(|attempt| {
                 attempt.replay
@@ -1134,8 +1489,12 @@ struct MessageReader {
     pending: Bytes,
 }
 impl MessageReader {
-    async fn next(&mut self, body: &mut RecvStream, core: Arc<Core>) -> Result<Option<Bytes>> {
-        let mut buffer = OwnedBuffer::new(core, 0)?;
+    async fn next(
+        &mut self,
+        body: &mut RecvStream,
+        buffers: BufferContext,
+    ) -> Result<Option<Bytes>> {
+        let mut buffer = OwnedBuffer::new(buffers, 0)?;
         let mut wanted = 5;
         loop {
             if buffer.bytes.len() == wanted {
@@ -1182,33 +1541,45 @@ impl MessageReader {
 #[allow(clippy::too_many_arguments)]
 async fn forward_grants(
     core: &Arc<Core>,
+    buffers: BufferContext,
     body: &mut RecvStream,
     output: &mut SendStream<Bytes>,
     sending: &mut SendStream<Bytes>,
-    expected: DecodedExchangeGrantSubscription,
-    backend_index: usize,
-    caller: BackendProcessId,
-    downstream: u32,
+    scope: VerifiedGrantHeaderScope,
     upstream: u32,
     request_sha256: String,
     dispatched: Instant,
 ) -> Result<()> {
+    let VerifiedGrantHeaderScope {
+        expected,
+        backend_index,
+        caller,
+        downstream,
+    } = scope;
     let mut reader = MessageReader {
         pending: Bytes::new(),
     };
-    while let Some(message) = reader.next(body, core.clone()).await? {
-        let wire = wire::ExchangeGrantBatch::decode(single_message(&message)?)?;
+    while let Some(message) = reader
+        .next(body, buffers.clone())
+        .await
+        .context("Exchange grant stage=read-message")?
+    {
+        let wire = wire::ExchangeGrantBatch::decode(
+            single_message(&message).context("Exchange grant stage=decode-envelope")?,
+        )
+        .context("Exchange grant stage=decode-protobuf")?;
         let batch = codec::decode_grant_batch(
             &wire,
             expected,
             FieldPath::root("exchange_fault_grant_batch"),
-        )?;
+        )
+        .context("Exchange grant stage=decode-batch")?;
         if !hold_selected_custody(core, &batch, output, sending).await? {
             return Ok(());
         }
         let selected = {
             let mut state = core.state.lock().expect("root fault state lock");
-            if let Some(capture) = state.exchange.capture.as_mut() {
+            if let Some(capture) = state.exchange.live_capture_mut() {
                 if let Some(ExchangeFaultCandidate {
                     target:
                         ExchangeFaultTarget::Subscription {
@@ -1303,8 +1674,7 @@ async fn forward_grants(
                     let state = core.state.lock().expect("root fault state lock");
                     let capture = state
                         .exchange
-                        .capture
-                        .as_ref()
+                        .live_capture()
                         .expect("original grant capture");
                     (capture.armed, capture.released, capture.deadline)
                 };
@@ -1317,8 +1687,7 @@ async fn forward_grants(
                         .lock()
                         .expect("root fault state lock")
                         .exchange
-                        .capture
-                        .as_mut()
+                        .live_capture_mut()
                         .expect("original grant capture")
                         .fired = true;
                     // Reset only the selected H2 stream on both original peers.
@@ -1337,13 +1706,22 @@ async fn forward_grants(
                 }
             }
         }
-        send_bytes(output, message).await?;
+        if !forward_grant_output(core, scope, output, sending, GrantOutput::Message(message))
+            .await?
+        {
+            return Ok(());
+        }
     }
-    if let Some(trailers) = body.trailers().await? {
-        output.send_trailers(trailers)?;
+    let part = if let Some(trailers) = body
+        .trailers()
+        .await
+        .context("Exchange grant stage=read-trailers")?
+    {
+        GrantOutput::Trailers(trailers)
     } else {
-        output.send_data(Bytes::new(), true)?;
-    }
+        GrantOutput::End
+    };
+    forward_grant_output(core, scope, output, sending, part).await?;
     Ok(())
 }
 
@@ -1459,7 +1837,7 @@ mod tests {
         let reply = reply.await?;
         let (parts, mut body) = reply.into_parts();
         let core = super::super::tests::core();
-        let (bytes, trailers) = unary_body(&mut body, core).await?;
+        let (bytes, trailers) = unary_body(&mut body, BufferContext::standalone(core)).await?;
         success_status(&parts.headers, trailers.as_ref())?;
         Ok(bytes)
     }
@@ -1619,7 +1997,7 @@ mod tests {
     #[test]
     fn growing_message_funds_old_and_new_capacity_and_last_alias() -> Result<()> {
         let core = super::super::tests::core();
-        let mut body = OwnedBuffer::new(core.clone(), 0)?;
+        let mut body = OwnedBuffer::new(BufferContext::standalone(core.clone()), 0)?;
         append_growing(&mut body, b"abc")?;
         let first = body.bytes.capacity();
         append_growing(&mut body, b"def")?;
@@ -1630,8 +2008,11 @@ mod tests {
         assert!(core.bytes.load(Ordering::Acquire) > 0);
         drop(alias);
         assert_eq!(core.bytes.load(Ordering::Acquire), 0);
-        let mut body = OwnedBuffer::new(core.clone(), 0)?;
-        let credit = ByteCredit::new(core.clone(), core.bounds.maximum_owned_buffer_bytes)?;
+        let mut body = OwnedBuffer::new(BufferContext::standalone(core.clone()), 0)?;
+        let credit = ByteCredit::new(
+            BufferContext::standalone(core.clone()),
+            core.bounds.maximum_owned_buffer_bytes,
+        )?;
         assert!(append_growing(&mut body, b"x").is_err());
         drop(credit);
         drop(body);
@@ -1662,7 +2043,7 @@ mod tests {
         let reply = reply.await?;
         let (parts, mut body) = reply.into_parts();
         let core = super::super::tests::core();
-        let (body, trailers) = unary_body(&mut body, core).await?;
+        let (body, trailers) = unary_body(&mut body, BufferContext::standalone(core)).await?;
         success_status(&parts.headers, trailers.as_ref())?;
         Ok(body)
     }
@@ -1701,7 +2082,7 @@ mod tests {
                     let Some(request)=request else{break};let (request,reply)=request?;
                     let state=state.clone();let core=core.clone();
                     handlers.spawn(async move {
-                        let path=request.uri().path().to_owned();let (_,mut body)=request.into_parts();let (body,_)=unary_body(&mut body,core).await?;
+                        let path=request.uri().path().to_owned();let (_,mut body)=request.into_parts();let (body,_)=unary_body(&mut body,BufferContext::standalone(core)).await?;
                         match path.as_str() {
                             DELIVER=>{
                                 let decoded=codec::decode_delivery_request(wire::DeliverExchangeUnitRequest::decode(single_message(&body)?)?,FieldPath::root("real_h2_test"))?;
@@ -1956,17 +2337,940 @@ mod tests {
                 .iter()
                 .all(|attempt| attempt.stream_future_exited_at_millis.is_some())
         );
+        let before_retirement = control.exchange_observation();
+        assert_eq!(control.observation().target_slots, 1);
+        RootReplyFaultProxy::retire_joined_group(std::iter::once(&proxy))?;
+        assert_eq!(control.observation().target_slots, 0);
+        let retained = control.exchange_observation();
+        assert_eq!(retained.candidate, before_retirement.candidate);
+        assert_eq!(
+            retained.replay_idempotent,
+            before_retirement.replay_idempotent
+        );
+        assert_eq!(
+            retained.subscriptions_cut,
+            before_retirement.subscriptions_cut
+        );
+        assert_eq!(retained.attempts.len(), before_retirement.attempts.len());
+        RootReplyFaultProxy::retire_joined_group(std::iter::once(&proxy))?;
         let actors = control.observation();
         assert_eq!(actors.active_listeners, 0);
         assert_eq!(actors.active_connections, 0);
         assert_eq!(actors.active_streams, 0);
         assert!(actors.non_target_peer_cancels > 0);
         assert_eq!(actors.owned_buffer_bytes, 0);
+        assert!(actors.connection_bound_buffer_charges > 0);
+        assert_eq!(
+            actors.connection_bound_buffer_charges,
+            actors.connection_bound_buffer_drops
+        );
+        assert_eq!(
+            actors.standalone_buffer_charges, 0,
+            "every real Exchange/Root allocation stays bound to its original connection"
+        );
         assert!(actors.shutdown_joined);
         assert!(actors.failures.is_empty(), "{:?}", actors.failures);
         assert_eq!(fixture_core.bytes.load(Ordering::Acquire), 0);
         Ok(())
     }
+    #[tokio::test]
+    async fn bound_unarmed_grant_subscription_cancels_without_losing_its_h2_connection()
+    -> Result<()> {
+        let core = super::super::tests::core();
+        let control = RootReplyFaultControl { core: core.clone() };
+        let stream = stream();
+        // Binding precedes all seed traffic. There is deliberately no capture,
+        // candidate, target or mutation during this ordinary subscription.
+        control.bind_exchange_peers(peers(stream), Instant::now() + Duration::from_secs(5))?;
+        let expected = DecodedExchangeGrantSubscription {
+            pair: ExchangeProcessPair::for_stream(stream),
+            generation: NonZeroU64::new(7).unwrap(),
+        };
+        let mut drivers = JoinSet::new();
+        let result=tokio::time::timeout(Duration::from_secs(3),async {
+            let (up_client,up_server)=tokio::io::duplex(65536);let upstream_core=core.clone();
+            let (up_reset_tx,up_reset_rx)=tokio::sync::oneshot::channel();
+            drivers.spawn(async move {
+                let mut connection=server::handshake::<_>(up_server).await?;
+                let (request,mut response)=connection.accept().await.context("ordinary grant upstream request absent")??;
+                let work=async {
+                    assert_eq!(request.uri().path(),GRANTS);
+                    let caller=authenticate(&upstream_core,&request,1)?;assert_eq!(caller,expected.pair.sender);
+                    let mut inbound=request.into_body();let (body,trailers)=unary_body(&mut inbound,BufferContext::standalone(upstream_core)).await?;assert!(trailers.is_none());
+                    let decoded=codec::decode_grant_subscription(&wire::SubscribeExchangeGrantsRequest::decode(single_message(&body)?)?,FieldPath::root("ordinary_unarmed_subscription"))?;
+                    assert_eq!(decoded,expected);drop(body);
+                    let batch=codec::DecodedExchangeGrantBatch {generation:expected.generation,snapshot:true,snapshot_complete:true,
+                        states:vec![codec::DecodedExchangeStreamState {stream,facts:novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeStreamFacts {granted_through:1,..Default::default()}}]};
+                    let body=encoded(codec::encode_grant_batch(&batch,expected.pair,FieldPath::root("ordinary_unarmed_snapshot"))?);
+                    let mut output=response.send_response(Response::new(()),false)?;output.send_data(body,false)?;
+                    let reset=poll_fn(|cx|output.poll_reset(cx)).await?;let _=up_reset_tx.send(reset);
+                    std::future::pending::<Result<()>>().await
+                };
+                tokio::select! {result=work=>result,_=async {while connection.accept().await.is_some(){}}=>Ok(())}
+            });
+            let (up_sender,up_driver)=client::handshake(up_client).await?;
+            // Keep the connection alive until its original server observes the
+            // actor's actual upstream reset; dropping a driver is not evidence.
+            let up_keep_alive=up_sender.clone();drivers.spawn(async move {up_driver.await.context("ordinary grant upstream driver")});
+            let (down_client,down_server)=tokio::io::duplex(65536);let downstream_core=core.clone();
+            let (outcome_tx,outcome_rx)=tokio::sync::oneshot::channel();
+            drivers.spawn(async move {
+                let mut connection=server::handshake::<_>(down_server).await?;
+                let (request,response)=connection.accept().await.context("ordinary grant downstream request absent")??;
+                assert!(enabled_method(&downstream_core,&request));
+                assert!(authenticated_normal_frontend(&request,&downstream_core).is_none());
+                let forwarding=async {
+                    let outcome=forward_stream(request,response,up_sender,1,downstream_core).await;
+                    let _=outcome_tx.send(outcome);
+                    std::future::pending::<()>().await
+                };
+                let healthy=async {
+                    let (request,mut response)=connection.accept().await.context("ordinary grant healthy next stream absent")??;
+                    assert_eq!(request.uri().path(),"/healthy-next");response.send_response(Response::new(()),true)?;
+                    while connection.accept().await.is_some(){}Ok::<_,anyhow::Error>(())
+                };
+                tokio::join!(forwarding,healthy).1
+            });
+            let mut builder=client::Builder::new();builder.initial_window_size(0);
+            let (mut sender,driver)=builder.handshake::<_,Bytes>(down_client).await?;
+            drivers.spawn(async move {driver.await.context("ordinary grant downstream driver")});
+            let request=signed_request(GRANTS,peers(stream)[0].1.clone(),NativeProcessIdentity::Backend(expected.pair.sender))?;
+            let (reply,mut send)=sender.send_request(request,false)?;
+            send.send_data(encoded(codec::encode_grant_subscription(expected)),true)?;
+            let reply=reply.await?;assert_eq!(reply.status(),http::StatusCode::OK);send.send_reset(h2::Reason::CANCEL);
+            outcome_rx.await??;assert_eq!(up_reset_rx.await?,h2::Reason::CANCEL);
+            assert!(control.exchange_candidate().is_none());let observed=control.observation();assert_eq!(observed.target_slots,0);assert_eq!(observed.claimed,0);assert!(observed.failures.is_empty());
+            drop(reply);drop(send);sender=sender.ready().await?;
+            let (next,next_send)=sender.send_request(Request::builder().uri("http://localhost/healthy-next").body(())?,true)?;
+            assert_eq!(next.await?.status(),http::StatusCode::OK);drop(next_send);drop(sender);drop(up_keep_alive);Ok::<_,anyhow::Error>(())
+        }).await;
+        drivers.abort_all();
+        let mut cleanup_error = None;
+        while let Some(joined) = drivers.join_next().await {
+            let failure = match joined {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(error) if error.is_cancelled() => None,
+                Err(error) => Some(error.into()),
+            };
+            if cleanup_error.is_none() {
+                cleanup_error = failure;
+            }
+        }
+        result.context("ordinary unarmed grant cancellation deadline")??;
+        if let Some(error) = cleanup_error {
+            return Err(error);
+        }
+        assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    fn retirement_proxy(
+        index: usize,
+        shared: Option<&RootReplyFaultProxy>,
+    ) -> Result<RootReplyFaultProxy> {
+        let fixture = super::super::tests::core();
+        RootReplyFaultProxy::start(
+            "127.0.0.1:9".parse()?,
+            index,
+            shared,
+            RootReplyFaultBounds::default(),
+            fixture.verifier.clone(),
+            fixture.normal_subject.clone(),
+        )
+    }
+
+    fn retirement_capture(proxy: &RootReplyFaultProxy) -> Result<RootReplyFaultControl> {
+        let control = proxy.control();
+        control.bind_exchange_peers(peers(stream()), Instant::now() + Duration::from_secs(5))?;
+        control.begin_exchange_capture(
+            ExchangeFaultAction::HoldDataBeforeForward,
+            Instant::now() + Duration::from_secs(2),
+        )?;
+        Ok(control)
+    }
+
+    #[test]
+    fn capture_retirement_requires_every_original_registered_join_and_exact_core() -> Result<()> {
+        let mut first = retirement_proxy(0, None)?;
+        let mut second = retirement_proxy(1, Some(&first))?;
+        let mut third = retirement_proxy(2, Some(&first))?;
+        let control = retirement_capture(&first)?;
+        assert!(RootReplyFaultProxy::retire_joined_group([&first, &second, &third]).is_err());
+        assert_eq!(control.observation().target_slots, 1);
+        first.stop();
+        second.stop();
+        third.stop();
+        assert!(
+            RootReplyFaultProxy::retire_joined_group([&first, &second]).is_err(),
+            "a subset cannot replace the original registered listener group"
+        );
+        let mut foreign = retirement_proxy(2, None)?;
+        foreign.stop();
+        assert!(RootReplyFaultProxy::retire_joined_group([&first, &second, &foreign]).is_err());
+        assert!(RootReplyFaultProxy::retire_joined_group([&first, &second, &first]).is_err());
+        assert_eq!(control.observation().target_slots, 1);
+        RootReplyFaultProxy::retire_joined_group([&first, &second, &third])?;
+        assert_eq!(control.observation().target_slots, 0);
+        assert_eq!(control.observation().joined_listeners, 3);
+        assert!(!control.exchange_observation().armed);
+        RootReplyFaultProxy::retire_joined_group([&first, &second, &third])?;
+        assert_eq!(
+            control.exchange_observation().action,
+            Some(ExchangeFaultAction::HoldDataBeforeForward)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stopped_group_rejects_shared_listener_registration_and_preserves_original_proof()
+    -> Result<()> {
+        let mut proxy = retirement_proxy(1, None)?;
+        let control = retirement_capture(&proxy)?;
+        proxy.stop();
+        let joined = RootReplyFaultProxy::joined_group([&proxy])?;
+        let original_roster = control.observation().preapplication_backend_indices;
+        assert!(retirement_proxy(2, Some(&proxy)).is_err());
+        assert_eq!(
+            control.observation().preapplication_backend_indices,
+            original_roster
+        );
+        assert_eq!(control.observation().active_listeners, 0);
+        assert_eq!(control.observation().joined_listeners, 1);
+        joined.retire_exchange_capture()?;
+        assert_eq!(control.observation().target_slots, 0);
+        assert!(control.observation().failures.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn original_sticky_stop_rejects_shared_registration_before_scope_close() -> Result<()> {
+        let mut proxy = retirement_proxy(1, None)?;
+        let control = retirement_capture(&proxy)?;
+        let original_roster = control.observation().preapplication_backend_indices;
+        assert!(!control.core.state.lock().unwrap().lifecycle_closed);
+        control.core.stop.send_replace(true);
+        assert!(retirement_proxy(2, Some(&proxy)).is_err());
+        assert_eq!(
+            control.observation().preapplication_backend_indices,
+            original_roster
+        );
+        proxy.stop();
+        RootReplyFaultProxy::retire_joined_group([&proxy])?;
+        assert_eq!(control.observation().joined_listeners, 1);
+        assert_eq!(control.observation().target_slots, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn original_join_fact_can_recheck_only_after_the_last_real_byte_alias_exits() -> Result<()> {
+        let mut proxy = retirement_proxy(1, None)?;
+        let control = retirement_capture(&proxy)?;
+        let body =
+            OwnedBuffer::new(BufferContext::standalone(control.core.clone()), 8)?.into_bytes();
+        let alias = body.clone();
+        drop(body);
+        control.release_exchange();
+        proxy.stop();
+        assert_eq!(control.observation().active_connections, 0);
+        assert_eq!(control.observation().owned_buffer_bytes, 8);
+        assert!(RootReplyFaultProxy::retire_joined_group([&proxy]).is_err());
+        assert_eq!(control.observation().target_slots, 1);
+        drop(alias);
+        RootReplyFaultProxy::retire_joined_group([&proxy])?;
+        assert_eq!(control.observation().owned_buffer_bytes, 0);
+        assert_eq!(control.observation().target_slots, 0);
+        assert_eq!(
+            control.observation().joined_listeners,
+            1,
+            "rechecking the same actual join must not invent another join"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn released_capture_cannot_retire_live_target_or_custody_owners() -> Result<()> {
+        let mut proxy = retirement_proxy(1, None)?;
+        let control = retirement_capture(&proxy)?;
+        let stream = stream();
+        let candidate = ExchangeFaultCandidate {
+            target: ExchangeFaultTarget::Unit {
+                stream,
+                sequence: ExchangeUnitSequence::FIRST,
+            },
+            backend_index: 1,
+            caller: stream.source().task().backend_process_id(),
+            downstream_stream: 1,
+            request_sha256: hash(&data(stream)),
+        };
+        let target = select_unit(&control.core, candidate)?.context("original target absent")?;
+        control
+            .core
+            .state
+            .lock()
+            .unwrap()
+            .exchange
+            .live_capture_mut()
+            .unwrap()
+            .active_custody_batches_held = 1;
+        let custody = CustodyBatchOwner {
+            core: control.core.clone(),
+        };
+        control.release_exchange();
+        proxy.stop();
+        assert!(RootReplyFaultProxy::retire_joined_group([&proxy]).is_err());
+        drop(target);
+        assert!(RootReplyFaultProxy::retire_joined_group([&proxy]).is_err());
+        assert_eq!(control.observation().target_slots, 1);
+        drop(custody);
+        let pointer = control
+            .core
+            .state
+            .lock()
+            .unwrap()
+            .exchange
+            .live_capture()
+            .unwrap()
+            .attempts
+            .as_ptr();
+        RootReplyFaultProxy::retire_joined_group([&proxy])?;
+        {
+            let state = control.core.state.lock().unwrap();
+            assert!(state.exchange.live_capture().is_none());
+            assert_eq!(
+                state.exchange.receipt().unwrap().attempts.as_ptr(),
+                pointer,
+                "retirement moves the same bounded attempt allocation"
+            );
+        }
+        assert_eq!(control.observation().target_slots, 0);
+        assert_eq!(control.exchange_observation().active_target_streams, 0);
+        assert_eq!(
+            control.exchange_observation().active_custody_batches_held,
+            0
+        );
+        assert!(
+            control
+                .begin_exchange_capture(
+                    ExchangeFaultAction::DropAcceptedReply,
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .is_err()
+        );
+        let elapsed = control.exchange_observation().elapsed_millis;
+        control.release_exchange();
+        assert_eq!(control.exchange_observation().elapsed_millis, elapsed);
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_preserves_unfired_failure_overflow_and_closed_scope_facts() -> Result<()> {
+        let mut proxy = retirement_proxy(1, None)?;
+        let control = retirement_capture(&proxy)?;
+        control.core.failure("original actor fixture failure");
+        control.core.failure(&"x".repeat(FAILURE_BYTES + 1));
+        proxy.stop();
+        let before = control.observation();
+        RootReplyFaultProxy::retire_joined_group([&proxy])?;
+        let after = control.observation();
+        assert_eq!(after.target_slots, 0);
+        assert_eq!(after.failures, before.failures);
+        assert!(after.failure_overflow);
+        assert_eq!(after.overflow_failures, before.overflow_failures);
+        assert_eq!(
+            after.first_failure.as_ref().unwrap().sha256,
+            before.first_failure.as_ref().unwrap().sha256
+        );
+        let state = control.core.state.lock().unwrap();
+        assert!(state.lifecycle_closed && state.used_capture);
+        assert!(!state.exchange.receipt().unwrap().fired);
+        assert!(!state.exchange.receipt().unwrap().released);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_original_join_handle_cannot_mint_retirement_from_zero_counters() -> Result<()> {
+        let mut proxy = retirement_proxy(1, None)?;
+        let control = retirement_capture(&proxy)?;
+        let original = proxy
+            .thread
+            .take()
+            .context("original listener handle absent")?;
+        proxy.stop();
+        original.join().expect("original listener fixture panicked");
+        assert_eq!(control.observation().active_listeners, 0);
+        assert_eq!(control.observation().active_connections, 0);
+        assert!(RootReplyFaultProxy::retire_joined_group([&proxy]).is_err());
+        assert_eq!(control.observation().target_slots, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_original_thread_join_never_mints_a_group_capability() -> Result<()> {
+        let core = super::super::tests::core();
+        core.state
+            .lock()
+            .unwrap()
+            .preapplication_closes
+            .register(1)?;
+        let control = RootReplyFaultControl { core: core.clone() };
+        control.bind_exchange_peers(peers(stream()), Instant::now() + Duration::from_secs(5))?;
+        control.begin_exchange_capture(
+            ExchangeFaultAction::HoldDataBeforeForward,
+            Instant::now() + Duration::from_secs(2),
+        )?;
+        // A real owned thread and real JoinError, without fabricating a success
+        // record from the otherwise empty transport counters.
+        let thread: JoinHandle<()> =
+            std::thread::spawn(|| panic!("original actor join failure fixture"));
+        let mut proxy = RootReplyFaultProxy {
+            address: "127.0.0.1:9".parse()?,
+            generation: watch::channel(0).0,
+            core,
+            thread: Some(thread),
+            backend_index: 1,
+            original_join: None,
+        };
+        proxy.stop();
+        assert!(proxy.original_join.is_none());
+        assert!(RootReplyFaultProxy::retire_joined_group([&proxy]).is_err());
+        assert_eq!(control.observation().target_slots, 1);
+        assert!(!control.observation().failures.is_empty());
+        Ok(())
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum GrantHeaderCase {
+        HeldUnit,
+        HeldReply,
+        Custody,
+        SelectedSubscription,
+        Rebuild,
+        UnknownSubscription,
+        ReclassifiedSubscription,
+        ForeignScope,
+        ExpiredScope,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum GrantBodyPart {
+        Message,
+        Trailers,
+        End,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum GrantResetPhase {
+        Headers(bool),
+        Body(GrantBodyPart),
+    }
+
+    async fn grant_pre_headers_reset_case(
+        case: GrantHeaderCase,
+        reason: h2::Reason,
+        after_failed_headers: bool,
+    ) -> Result<()> {
+        grant_reset_case(case, reason, GrantResetPhase::Headers(after_failed_headers)).await
+    }
+
+    async fn grant_reset_case(
+        case: GrantHeaderCase,
+        reason: h2::Reason,
+        phase: GrantResetPhase,
+    ) -> Result<()> {
+        let core = super::super::tests::core();
+        let control = RootReplyFaultControl { core: core.clone() };
+        let stream = stream();
+        control.bind_exchange_peers(peers(stream), Instant::now() + Duration::from_secs(5))?;
+        let action = match case {
+            GrantHeaderCase::HeldReply => ExchangeFaultAction::HoldReplyAfterAdmission,
+            GrantHeaderCase::Custody => ExchangeFaultAction::DropAcceptedReply,
+            GrantHeaderCase::SelectedSubscription
+            | GrantHeaderCase::Rebuild
+            | GrantHeaderCase::UnknownSubscription => ExchangeFaultAction::CutGrantSubscription,
+            _ => ExchangeFaultAction::HoldDataBeforeForward,
+        };
+        control.begin_exchange_capture(action, Instant::now() + Duration::from_secs(2))?;
+        let expected = DecodedExchangeGrantSubscription {
+            pair: ExchangeProcessPair::for_stream(stream),
+            generation: NonZeroU64::new(if case == GrantHeaderCase::Rebuild {
+                8
+            } else {
+                7
+            })
+            .unwrap(),
+        };
+        // This fixture controls the actor's target register. The request,
+        // authentication, unary decoder, both H2 peers and reset remain real;
+        // this is not qualification of a Native receiver's custody semantics.
+        if case != GrantHeaderCase::UnknownSubscription {
+            let candidate = ExchangeFaultCandidate {
+                target: if matches!(
+                    case,
+                    GrantHeaderCase::SelectedSubscription | GrantHeaderCase::Rebuild
+                ) {
+                    ExchangeFaultTarget::Subscription {
+                        stream,
+                        pair: expected.pair,
+                        generation: NonZeroU64::new(7).unwrap(),
+                    }
+                } else {
+                    ExchangeFaultTarget::Unit {
+                        stream,
+                        sequence: ExchangeUnitSequence::FIRST,
+                    }
+                },
+                backend_index: 1,
+                caller: expected.pair.sender,
+                downstream_stream: 1,
+                request_sha256: if matches!(
+                    case,
+                    GrantHeaderCase::SelectedSubscription | GrantHeaderCase::Rebuild
+                ) {
+                    hash(&encoded(codec::encode_grant_subscription(
+                        DecodedExchangeGrantSubscription {
+                            pair: expected.pair,
+                            generation: NonZeroU64::new(7).unwrap(),
+                        },
+                    )))
+                } else {
+                    hash(&data(stream))
+                },
+            };
+            core.state
+                .lock()
+                .unwrap()
+                .exchange
+                .live_capture_mut()
+                .unwrap()
+                .candidate = Some(candidate.clone());
+            control.arm_exchange_exact(&candidate)?;
+            assert!(control.exchange_observation().armed);
+        }
+        let should_recover = matches!(case, GrantHeaderCase::HeldUnit | GrantHeaderCase::HeldReply)
+            && reason == h2::Reason::CANCEL;
+        let mut drivers = JoinSet::new();
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            let (up_client, up_server) = tokio::io::duplex(65536);
+            let upstream_core = core.clone();
+            let (up_reset_tx, mut up_reset_rx) = tokio::sync::oneshot::channel();
+            drivers.spawn(async move {
+                let mut connection = server::handshake::<_>(up_server).await?;
+                let (request, mut response) = connection
+                    .accept()
+                    .await
+                    .context("pre-header grant upstream request absent")??;
+                let work = async {
+                    assert_eq!(request.uri().path(), GRANTS);
+                    let caller = authenticate(&upstream_core, &request, 1)?;
+                    let mut inbound = request.into_body();
+                    let (body, trailers) = unary_body(
+                        &mut inbound,
+                        BufferContext::standalone(upstream_core.clone()),
+                    )
+                    .await?;
+                    assert!(trailers.is_none());
+                    let actual = codec::decode_grant_subscription(
+                        &wire::SubscribeExchangeGrantsRequest::decode(single_message(&body)?)?,
+                        FieldPath::root("pre_header_upstream_subscription"),
+                    )?;
+                    require_pair(&upstream_core, actual.pair, caller, 1)?;
+                    assert_eq!(actual, expected);
+                    let mut output = response.send_response(Response::new(()), false)?;
+                    let actual = poll_fn(|cx| output.poll_reset(cx)).await?;
+                    let _ = up_reset_tx.send(actual);
+                    std::future::pending::<Result<()>>().await
+                };
+                let healthy = async {
+                    let (request, mut response) = connection
+                        .accept()
+                        .await
+                        .context("pre-header grant healthy upstream request absent")??;
+                    assert_eq!(request.uri().path(), "/healthy-upstream");
+                    response.send_response(Response::new(()), true)?;
+                    while connection.accept().await.is_some() {}
+                    Ok::<_, anyhow::Error>(())
+                };
+                tokio::join!(work, healthy).1
+            });
+            let (up_sender, up_driver) = client::handshake(up_client).await?;
+            let mut up_keep_alive = up_sender.clone();
+            drivers
+                .spawn(async move { up_driver.await.context("pre-header grant upstream driver") });
+            let (down_client, down_server) = tokio::io::duplex(65536);
+            let downstream_core = core.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+            drivers.spawn(async move {
+                let mut connection = server::handshake::<_>(down_server).await?;
+                let (request, mut response) = connection
+                    .accept()
+                    .await
+                    .context("pre-header grant downstream request absent")??;
+                let work = async {
+                    assert_eq!(request.uri().path(), GRANTS);
+                    let caller = authenticate(&downstream_core, &request, 1)?;
+                    require_uncompressed(request.headers())?;
+                    let (parts, mut inbound) = request.into_parts();
+                    let (body, trailers) = unary_body(
+                        &mut inbound,
+                        BufferContext::standalone(downstream_core.clone()),
+                    )
+                    .await?;
+                    assert!(trailers.is_none());
+                    let actual = codec::decode_grant_subscription(
+                        &wire::SubscribeExchangeGrantsRequest::decode(single_message(&body)?)?,
+                        FieldPath::root("pre_header_downstream_subscription"),
+                    )?;
+                    require_pair(&downstream_core, actual.pair, caller, 1)?;
+                    assert_eq!(actual, expected);
+                    let mut scope = VerifiedGrantHeaderScope {
+                        expected: actual,
+                        caller,
+                        backend_index: 1,
+                        downstream: response.stream_id().as_u32(),
+                    };
+                    if case == GrantHeaderCase::ForeignScope {
+                        scope.caller = BackendProcessId::new_v7();
+                    }
+                    let mut up_sender = up_sender.ready().await?;
+                    let (up_reply, mut sending) =
+                        up_sender.send_request(Request::from_parts(parts, ()), false)?;
+                    sending.send_data(body, true)?;
+                    let _up_reply_body = up_reply.await?.into_body();
+                    let mut output = match phase {
+                        GrantResetPhase::Headers(_) => None,
+                        GrantResetPhase::Body(_) => Some(response.send_response(Response::new(()), false)?),
+                    };
+                    if let Some(output) = output.as_mut() {
+                        assert!(matches!(recover_grant_cancel_after_headers(
+                            &downstream_core, scope, output, &mut sending,
+                        ).await, GrantCancelProbe::Pending),
+                            "Pending body reset cannot authorize cancellation");
+                    } else {
+                        assert!(!recover_grant_cancel_before_headers(
+                            &downstream_core, scope, &mut response, &mut inbound, &mut sending,
+                        ).await, "Pending reset cannot authorize cancellation");
+                    }
+                    assert_eq!(
+                        downstream_core
+                            .state
+                            .lock()
+                            .unwrap()
+                            .exchange
+                            .live_capture()
+                            .unwrap()
+                            .peer_cancels,
+                        0
+                    );
+                    let _ = ready_tx.send(());
+                    let actual = if let Some(output) = output.as_mut() {
+                        poll_fn(|cx| output.poll_reset(cx)).await?
+                    } else { poll_fn(|cx| response.poll_reset(cx)).await? };
+                    assert_eq!(actual, reason);
+                    if case == GrantHeaderCase::ReclassifiedSubscription {
+                        // Replace the formerly disjoint capture while original
+                        // headers are awaited. Its unknown cut target is protected.
+                        let control = RootReplyFaultControl {
+                            core: downstream_core.clone(),
+                        };
+                        control.release_exchange();
+                        control.begin_exchange_capture(
+                            ExchangeFaultAction::CutGrantSubscription,
+                            Instant::now() + Duration::from_secs(1),
+                        )?;
+                    }
+                    if case == GrantHeaderCase::ExpiredScope {
+                        // Expire the original bound authority after the real
+                        // upstream await; retaining its roster is not renewal.
+                        downstream_core
+                            .state
+                            .lock()
+                            .unwrap()
+                            .exchange
+                            .session_deadline = Some(Instant::now());
+                    }
+                    let recovered = match phase {
+                        GrantResetPhase::Headers(after_failed_headers) => {
+                            if after_failed_headers {
+                                assert!(response.send_response(Response::new(()), false).is_err());
+                            }
+                            let recovered = recover_grant_cancel_before_headers(
+                                &downstream_core, scope, &mut response, &mut inbound, &mut sending,
+                            ).await;
+                            if !recovered {
+                                assert!(response.send_response(Response::new(()), false).is_err());
+                            }
+                            recovered
+                        }
+                        GrantResetPhase::Body(part) => {
+                            if matches!(case, GrantHeaderCase::Custody |
+                                GrantHeaderCase::SelectedSubscription | GrantHeaderCase::Rebuild) {
+                                let control = RootReplyFaultControl { core: downstream_core.clone() };
+                                control.release_exchange();
+                                assert!(control.exchange_observation().released,
+                                    "release alone must not discharge the protected pair");
+                            }
+                            let (part, stage) = match part {
+                                GrantBodyPart::Message => {
+                                    let batch = codec::DecodedExchangeGrantBatch {
+                                        generation: expected.generation, snapshot: true, snapshot_complete: true,
+                                        states: vec![codec::DecodedExchangeStreamState { stream,
+                                            facts: novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeStreamFacts {
+                                                granted_through: 1, ..Default::default()
+                                            },
+                                        }],
+                                    };
+                                    (GrantOutput::Message(encoded(codec::encode_grant_batch(
+                                        &batch, expected.pair, FieldPath::root("grant_body_output_fixture"),
+                                    )?)), "send-message")
+                                }
+                                GrantBodyPart::Trailers => {
+                                    let mut trailers = HeaderMap::new();
+                                    trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                                    (GrantOutput::Trailers(trailers), "send-trailers")
+                                }
+                                GrantBodyPart::End => (GrantOutput::End, "send-eof"),
+                            };
+                            match forward_grant_output(
+                                &downstream_core, scope, output.as_mut().unwrap(), &mut sending, part,
+                            ).await {
+                                Ok(forwarded) => {
+                                    assert!(!forwarded, "closed output cannot forward successfully");
+                                    true
+                                }
+                                Err(error) => {
+                                    let diagnostic = error.downcast_ref::<GrantOutputFailure>()
+                                        .context("grant output lost its typed send/reset diagnostic")?;
+                                    assert_eq!(diagnostic.stage, stage);
+                                    assert_eq!(diagnostic.scope.expected, expected);
+                                    if reason == h2::Reason::CANCEL {
+                                        assert!(matches!(&diagnostic.reset,
+                                            GrantCancelProbe::ReadyCancelRejected(_)),
+                                            "actual CANCEL must remain diagnostic when rejected");
+                                    } else {
+                                        assert!(matches!(&diagnostic.reset,
+                                            GrantCancelProbe::ReadyOther(actual) if *actual == u32::from(reason)));
+                                    }
+                                    false
+                                }
+                            }
+                        }
+                    };
+                    let _ = outcome_tx.send(recovered);
+                    std::future::pending::<Result<()>>().await
+                };
+                let healthy = async {
+                    let (request, mut response) = connection
+                        .accept()
+                        .await
+                        .context("pre-header grant healthy next request absent")??;
+                    assert_eq!(request.uri().path(), "/healthy-next");
+                    response.send_response(Response::new(()), true)?;
+                    while connection.accept().await.is_some() {}
+                    Ok::<_, anyhow::Error>(())
+                };
+                tokio::join!(work, healthy).1
+            });
+            let (mut sender, driver) = client::handshake(down_client).await?;
+            drivers
+                .spawn(async move { driver.await.context("pre-header grant downstream driver") });
+            let request = signed_request(
+                GRANTS,
+                peers(stream)[0].1.clone(),
+                NativeProcessIdentity::Backend(expected.pair.sender),
+            )?;
+            let (reply, mut send) = sender.send_request(request, false)?;
+            send.send_data(encoded(codec::encode_grant_subscription(expected)), true)?;
+            ready_rx.await?;
+            assert!(matches!(
+                up_reset_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            send.send_reset(reason);
+            assert_eq!(outcome_rx.await?, should_recover);
+            if should_recover {
+                assert_eq!(up_reset_rx.await?, h2::Reason::CANCEL);
+            } else {
+                assert!(matches!(
+                    up_reset_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+            }
+            assert_eq!(
+                control.exchange_observation().peer_cancels,
+                u64::from(should_recover)
+            );
+            assert!(control.observation().failures.is_empty());
+            drop(reply);
+            drop(send);
+            sender = sender.ready().await?;
+            let (next, next_send) = sender.send_request(
+                Request::builder()
+                    .uri("http://localhost/healthy-next")
+                    .body(())?,
+                true,
+            )?;
+            assert_eq!(next.await?.status(), http::StatusCode::OK);
+            up_keep_alive = up_keep_alive.ready().await?;
+            let (up_next, up_next_send) = up_keep_alive.send_request(
+                Request::builder()
+                    .uri("http://localhost/healthy-upstream")
+                    .body(())?,
+                true,
+            )?;
+            assert_eq!(up_next.await?.status(), http::StatusCode::OK);
+            drop(up_next_send);
+            drop(next_send);
+            drop(sender);
+            drop(up_keep_alive);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        drivers.abort_all();
+        let mut cleanup_error = None;
+        while let Some(joined) = drivers.join_next().await {
+            let failure = match joined {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(error) if error.is_cancelled() => None,
+                Err(error) => Some(error.into()),
+            };
+            if cleanup_error.is_none() {
+                cleanup_error = failure;
+            }
+        }
+        result.context("pre-header grant cancellation fixture deadline")??;
+        if let Some(error) = cleanup_error {
+            return Err(error);
+        }
+        assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn armed_non_target_grant_pre_header_cancel_preserves_healthy_h2_successor() -> Result<()>
+    {
+        for case in [GrantHeaderCase::HeldUnit, GrantHeaderCase::HeldReply] {
+            grant_pre_headers_reset_case(case, h2::Reason::CANCEL, false).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grant_cancel_remains_observable_after_failed_response_headers() -> Result<()> {
+        grant_pre_headers_reset_case(GrantHeaderCase::HeldUnit, h2::Reason::CANCEL, true).await
+    }
+
+    #[tokio::test]
+    async fn custody_target_unknown_subscription_and_rebuild_protect_header_failures() -> Result<()>
+    {
+        for case in [
+            GrantHeaderCase::Custody,
+            GrantHeaderCase::SelectedSubscription,
+            GrantHeaderCase::Rebuild,
+            GrantHeaderCase::UnknownSubscription,
+        ] {
+            grant_pre_headers_reset_case(case, h2::Reason::CANCEL, true).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_cancel_grant_reset_does_not_authorize_header_recovery() -> Result<()> {
+        grant_pre_headers_reset_case(GrantHeaderCase::HeldUnit, h2::Reason::REFUSED_STREAM, true)
+            .await
+    }
+
+    #[tokio::test]
+    async fn grant_header_recovery_rechecks_current_capture_after_await() -> Result<()> {
+        grant_pre_headers_reset_case(
+            GrantHeaderCase::ReclassifiedSubscription,
+            h2::Reason::CANCEL,
+            true,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn grant_header_recovery_requires_the_original_exact_verified_scope() -> Result<()> {
+        grant_pre_headers_reset_case(GrantHeaderCase::ForeignScope, h2::Reason::CANCEL, true).await
+    }
+
+    #[tokio::test]
+    async fn grant_header_recovery_rejects_the_original_bound_scope_expired_after_await()
+    -> Result<()> {
+        grant_pre_headers_reset_case(GrantHeaderCase::ExpiredScope, h2::Reason::CANCEL, true).await
+    }
+
+    #[tokio::test]
+    async fn armed_non_target_grant_body_cancel_preserves_healthy_h2_successors() -> Result<()> {
+        for part in [
+            GrantBodyPart::Message,
+            GrantBodyPart::Trailers,
+            GrantBodyPart::End,
+        ] {
+            for case in [GrantHeaderCase::HeldUnit, GrantHeaderCase::HeldReply] {
+                grant_reset_case(case, h2::Reason::CANCEL, GrantResetPhase::Body(part)).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn protected_grant_body_cancel_preserves_real_reset_diagnostic_after_release()
+    -> Result<()> {
+        for case in [
+            GrantHeaderCase::Custody,
+            GrantHeaderCase::SelectedSubscription,
+            GrantHeaderCase::Rebuild,
+            GrantHeaderCase::UnknownSubscription,
+        ] {
+            grant_reset_case(
+                case,
+                h2::Reason::CANCEL,
+                GrantResetPhase::Body(GrantBodyPart::Trailers),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_cancel_grant_body_reset_preserves_failure_and_exact_reason() -> Result<()> {
+        for part in [
+            GrantBodyPart::Message,
+            GrantBodyPart::Trailers,
+            GrantBodyPart::End,
+        ] {
+            grant_reset_case(
+                GrantHeaderCase::HeldUnit,
+                h2::Reason::REFUSED_STREAM,
+                GrantResetPhase::Body(part),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grant_body_recovery_rechecks_current_capture_and_original_bound_authority()
+    -> Result<()> {
+        for case in [
+            GrantHeaderCase::ReclassifiedSubscription,
+            GrantHeaderCase::ForeignScope,
+            GrantHeaderCase::ExpiredScope,
+        ] {
+            grant_reset_case(
+                case,
+                h2::Reason::CANCEL,
+                GrantResetPhase::Body(GrantBodyPart::Trailers),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     // The H2 error from trying headers on a reset stream is not evidence of
     // cancellation. Only the original stream's separately observed reset is.
     async fn pre_headers_reset_case(
@@ -2008,8 +3312,12 @@ mod tests {
                         Some(caller)
                     );
                     let mut inbound = request.into_body();
-                    let (body, trailers) =
-                        read_bounded(&mut inbound, REQUEST_BYTES, server_core.clone()).await?;
+                    let (body, trailers) = read_bounded(
+                        &mut inbound,
+                        REQUEST_BYTES,
+                        BufferContext::standalone(server_core.clone()),
+                    )
+                    .await?;
                     assert!(trailers.is_none());
                     let read = decode_read(
                         &wire::FetchRootResultRequest::decode(single_message(&body)?)?,

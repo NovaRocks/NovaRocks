@@ -2158,6 +2158,8 @@ impl Scenario for DistributedWriterRowLevel {
         let mut specs = row_level_contract::observation_specs(cluster_size);
         if self.small_slots {
             small_slots::add_append_holds(&mut specs, cluster_size)?;
+            specs.push(small_slots::partition_observation(cluster_size));
+            specs.push(small_slots::selected_update_observation(cluster_size));
         }
         Ok(Some(self.observations.freeze(
             specs,
@@ -2460,7 +2462,30 @@ impl Scenario for DistributedWriterRowLevel {
             bail!("MERGE left {merged:?}");
         }
 
-        row_level_contract::run(context, &mut control, CATALOG, DATABASE, &self.observations)?;
+        let partition_diagnostic = if self.small_slots {
+            Some(
+                self.observations
+                    .take(small_slots::PARTITION_OBSERVATION_INDEX)?,
+            )
+        } else {
+            None
+        };
+        row_level_contract::run(
+            context,
+            &mut control,
+            CATALOG,
+            DATABASE,
+            &self.observations,
+            partition_diagnostic,
+            if self.small_slots {
+                Some(
+                    self.observations
+                        .take(small_slots::SELECTED_UPDATE_OBSERVATION_INDEX)?,
+                )
+            } else {
+                None
+            },
+        )?;
 
         await_resource_convergence(context, &baseline, "distributed row-level writes")?;
         if self.small_slots {

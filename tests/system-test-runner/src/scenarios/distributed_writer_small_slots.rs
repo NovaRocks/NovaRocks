@@ -21,6 +21,38 @@
 use super::*;
 
 const APPEND_HOLD: &str = "connector-write-append-hold";
+pub(super) const PARTITION_OBSERVATION_INDEX: usize = 4;
+pub(super) const SELECTED_UPDATE_OBSERVATION_INDEX: usize = 5;
+
+pub(super) fn selected_update_observation(cluster_size: usize) -> StatementSpec {
+    let mut spec = partition_observation(cluster_size);
+    spec.sql = row_level_contract::selected_update_case2_sql(
+        row_level_contract::CATALOG,
+        row_level_contract::DATABASE,
+    );
+    spec
+}
+
+pub(super) fn partition_observation(cluster_size: usize) -> StatementSpec {
+    StatementSpec {
+        sql: row_level_contract::partition_move_update_sql(
+            row_level_contract::CATALOG,
+            row_level_contract::DATABASE,
+            1,
+        ),
+        faults: vec![],
+        observations: (0..cluster_size)
+            .flat_map(|index| {
+                [
+                    (index, "grpc-fragment", None),
+                    (index, "writer-marker", None),
+                    (index, "reader-marker", None),
+                    (index, "exchange-snapshot", None),
+                ]
+            })
+            .collect(),
+    }
+}
 const LIMITS: &[(&str, i64)] = &[
     ("exchange_instance_floor_slots", 1),
     ("exchange_instance_max_slots", 2),
@@ -269,6 +301,45 @@ pub(super) fn retain_idle_flow(context: &mut ScenarioContext) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_diagnostics_append_exact_statements_without_changing_original_indices() {
+        let mut specs = row_level_contract::observation_specs(3);
+        let original_sql: Vec<_> = specs.iter().map(|spec| spec.sql.clone()).collect();
+        add_append_holds(&mut specs, 3).unwrap();
+        assert_eq!(specs.len(), PARTITION_OBSERVATION_INDEX);
+        specs.push(partition_observation(3));
+        specs.push(selected_update_observation(3));
+        assert_eq!(specs.len(), 6);
+        assert_eq!(
+            specs[..4]
+                .iter()
+                .map(|spec| spec.sql.clone())
+                .collect::<Vec<_>>(),
+            original_sql
+        );
+        let diagnostic = &specs[PARTITION_OBSERVATION_INDEX];
+        assert_eq!(
+            diagnostic.sql,
+            "UPDATE row_level_writer.row_level_writer_db.partition_move_1 SET p=1,v=11 WHERE id=1"
+        );
+        assert!(diagnostic.faults.is_empty());
+        assert_eq!(diagnostic.observations.len(), 12);
+        assert!(
+            diagnostic
+                .observations
+                .iter()
+                .all(|(_, _, attempt)| attempt.is_none())
+        );
+        assert_eq!(row_level_contract::observation_specs(3).len(), 4);
+        let selected = &specs[SELECTED_UPDATE_OBSERVATION_INDEX];
+        assert_eq!(
+            selected.sql,
+            "MERGE INTO row_level_writer.row_level_writer_db.selected_update_1 t USING row_level_writer.row_level_writer_db.selected_source_update_1 s ON t.id=s.id AND s.case_id=2 WHEN MATCHED AND s.selected THEN UPDATE SET v=s.new_v"
+        );
+        assert!(selected.faults.is_empty());
+        assert_eq!(selected.observations, diagnostic.observations);
+    }
 
     #[test]
     fn small_slots_preserves_every_original_launch_setting_except_its_four_limits() {

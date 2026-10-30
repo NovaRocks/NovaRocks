@@ -47,6 +47,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 
+#[path = "native_actor_capacity.rs"]
+mod capacity;
+use capacity::{BufferContext, ConnectionExit, ConnectionState};
+
 #[path = "native_exchange_fault.rs"]
 mod exchange_fault;
 pub use exchange_fault::{
@@ -134,6 +138,9 @@ impl RootReplyFaultBounds {
             "exchange_rebuild":"hold-same-stream-unit-before-forward-until-new-generation-complete-snapshot-and-positive-grant",
             "exchange_successor":"observe-next-sequence-without-mutation-in-existing-attempt-positions",
             "exchange_decoded_message_bytes":novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+            "connection_capacity":"original-shared-position-before-accept-pressure-idle-graceful-retirement",
+            "idle_connection":"all-app-children-joined-no-h2-streams-last-connection-byte-alias-exited",
+            "idle_grace":"continue-inflight-rpcs-original-position-until-transport-and-children-and-alias-exit-no-new-timer",
             "target_slots":1, "maximum_data_listeners":3, "one_shot_root_capture_per_actor_group":true,
             "exchange_target_reuse":"only-after-original-target-stream-futures-exited-and-release-or-one-shot-fault",
             "maximum_target_attempts":MAX_TARGET_ATTEMPTS, "target_attempt_evidence_positions":MAX_TARGET_ATTEMPTS,
@@ -195,6 +202,13 @@ pub struct RootReplyFaultObservation {
     pub target_consumed_positive_requests: u64,
     pub joined_connections: u64,
     pub joined_children: u64,
+    pub pressure_listeners: usize,
+    pub idle_drains_started: u64,
+    pub idle_drains_completed: u64,
+    pub idle_drain_yields: u64,
+    pub connection_bound_buffer_charges: u64,
+    pub connection_bound_buffer_drops: u64,
+    pub standalone_buffer_charges: u64,
     pub shutdown_joined: bool,
     pub failures: Vec<String>,
     pub failure_overflow: bool,
@@ -301,6 +315,15 @@ struct Core {
     peak_bytes: AtomicUsize,
     joined_connections: AtomicU64,
     joined_children: AtomicU64,
+    next_connection_id: AtomicU64,
+    pressure_listeners: AtomicUsize,
+    idle_victim: AtomicU64,
+    idle_drains_started: AtomicU64,
+    idle_drains_completed: AtomicU64,
+    idle_drain_yields: AtomicU64,
+    connection_bound_buffer_charges: AtomicU64,
+    connection_bound_buffer_drops: AtomicU64,
+    standalone_buffer_charges: AtomicU64,
 }
 
 impl Core {
@@ -444,6 +467,19 @@ impl RootReplyFaultControl {
             target_consumed_positive_requests: state.target_consumed_positive_requests,
             joined_connections: self.core.joined_connections.load(Ordering::Acquire),
             joined_children: self.core.joined_children.load(Ordering::Acquire),
+            pressure_listeners: self.core.pressure_listeners.load(Ordering::Acquire),
+            idle_drains_started: self.core.idle_drains_started.load(Ordering::Acquire),
+            idle_drains_completed: self.core.idle_drains_completed.load(Ordering::Acquire),
+            idle_drain_yields: self.core.idle_drain_yields.load(Ordering::Acquire),
+            connection_bound_buffer_charges: self
+                .core
+                .connection_bound_buffer_charges
+                .load(Ordering::Acquire),
+            connection_bound_buffer_drops: self
+                .core
+                .connection_bound_buffer_drops
+                .load(Ordering::Acquire),
+            standalone_buffer_charges: self.core.standalone_buffer_charges.load(Ordering::Acquire),
             shutdown_joined: state.shutdown_joined,
             failures: state.failures.clone(),
             failure_overflow: state.failure_overflow,
@@ -474,6 +510,44 @@ pub(crate) struct RootReplyFaultProxy {
     generation: watch::Sender<u64>,
     core: Arc<Core>,
     thread: Option<JoinHandle<()>>,
+    backend_index: usize,
+    original_join: Option<OriginalListenerJoin>,
+}
+
+// Constructed only by consuming the original owned Thread JoinHandle after its
+// successful join. Counters, a closed scope, or a non-owning Control cannot mint it.
+struct OriginalListenerJoin {
+    core: std::sync::Weak<Core>,
+    backend_index: usize,
+    thread_id: std::thread::ThreadId,
+}
+
+struct JoinedRootReplyGroup {
+    core: Arc<Core>,
+}
+
+impl JoinedRootReplyGroup {
+    fn retire_exchange_capture(self) -> Result<()> {
+        let mut state = self.core.state.lock().expect("root fault state lock");
+        ensure!(
+            state.lifecycle_closed && state.shutdown_joined,
+            "Original RootReply actor scope has not closed and joined"
+        );
+        ensure!(
+            self.core.listeners.load(Ordering::Acquire) == 0
+                && self.core.connections.load(Ordering::Acquire) == 0
+                && self.core.streams.load(Ordering::Acquire) == 0
+                && self.core.connection_positions.available_permits()
+                    == self.core.bounds.maximum_connections
+                && self.core.stream_positions.available_permits()
+                    == self.core.bounds.maximum_active_streams
+                && self.core.bytes.load(Ordering::Acquire) == 0
+                && !state.pending_capture
+                && state.slot.is_none(),
+            "Original RootReply actor transport, children, payload aliases or target work remain live"
+        );
+        state.exchange.retire_after_group_join(&self)
+    }
 }
 
 impl RootReplyFaultProxy {
@@ -511,13 +585,27 @@ impl RootReplyFaultProxy {
                 peak_bytes: AtomicUsize::new(0),
                 joined_connections: AtomicU64::new(0),
                 joined_children: AtomicU64::new(0),
+                next_connection_id: AtomicU64::new(1),
+                pressure_listeners: AtomicUsize::new(0),
+                idle_victim: AtomicU64::new(0),
+                idle_drains_started: AtomicU64::new(0),
+                idle_drains_completed: AtomicU64::new(0),
+                idle_drain_yields: AtomicU64::new(0),
+                connection_bound_buffer_charges: AtomicU64::new(0),
+                connection_bound_buffer_drops: AtomicU64::new(0),
+                standalone_buffer_charges: AtomicU64::new(0),
             })
         };
-        core.state
-            .lock()
-            .expect("root fault state lock")
-            .preapplication_closes
-            .register(backend_index)?;
+        {
+            let mut state = core.state.lock().expect("root fault state lock");
+            // Seal this original registration roster before its owned joins can
+            // certify the group. A stopped Core cannot acquire another listener.
+            ensure!(
+                !state.lifecycle_closed && !*core.stop.borrow(),
+                "RootReply actor cannot register a listener after its original scope stopped"
+            );
+            state.preapplication_closes.register(backend_index)?;
+        }
         core.listeners.fetch_add(1, Ordering::AcqRel);
         core.state
             .lock()
@@ -562,6 +650,8 @@ impl RootReplyFaultProxy {
             generation,
             core,
             thread: Some(thread),
+            backend_index,
+            original_join: None,
         })
     }
     pub(crate) fn address(&self) -> SocketAddr {
@@ -591,12 +681,83 @@ impl RootReplyFaultProxy {
         self.control().disarm();
         self.core.stop.send_replace(true);
         if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() {
-                self.core
-                    .failure("root actor thread panicked before its join barrier");
+            self.original_join = None;
+            let thread_id = thread.thread().id();
+            match thread.join() {
+                Ok(()) => {
+                    self.original_join = Some(OriginalListenerJoin {
+                        core: Arc::downgrade(&self.core),
+                        backend_index: self.backend_index,
+                        thread_id,
+                    });
+                }
+                Err(_) => {
+                    self.core
+                        .failure("root actor thread panicked before its join barrier");
+                }
             }
             self.core.joined_listeners.fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    fn joined_group<'a>(
+        proxies: impl IntoIterator<Item = &'a Self>,
+    ) -> Result<JoinedRootReplyGroup> {
+        let mut core: Option<Arc<Core>> = None;
+        let mut joined: [Option<(usize, std::thread::ThreadId)>; 3] = [None; 3];
+        let mut count = 0;
+        for proxy in proxies {
+            ensure!(
+                count < joined.len(),
+                "RootReply actor group exceeds its original listener roster"
+            );
+            let record = proxy
+                .original_join
+                .as_ref()
+                .context("Original RootReply listener join is missing or unknown")?;
+            ensure!(
+                proxy.thread.is_none()
+                    && record.backend_index == proxy.backend_index
+                    && std::sync::Weak::ptr_eq(&record.core, &Arc::downgrade(&proxy.core)),
+                "RootReply original listener join differs from its owner"
+            );
+            if let Some(expected) = &core {
+                ensure!(
+                    Arc::ptr_eq(expected, &proxy.core),
+                    "RootReply actor group contains a foreign Core"
+                );
+            } else {
+                core = Some(proxy.core.clone());
+            }
+            ensure!(
+                !joined[..count].iter().flatten().any(|(index, thread)| {
+                    *index == record.backend_index || *thread == record.thread_id
+                }),
+                "RootReply actor group repeats an original listener join"
+            );
+            joined[count] = Some((record.backend_index, record.thread_id));
+            count += 1;
+        }
+        let core = core.context("RootReply actor group has no original listener joins")?;
+        {
+            let state = core.state.lock().expect("root fault state lock");
+            let registered = state.preapplication_closes.backend_indices;
+            ensure!(
+                registered.iter().flatten().count() == count
+                    && registered
+                        .iter()
+                        .flatten()
+                        .all(|index| joined.iter().flatten().any(|(actual, _)| actual == index)),
+                "RootReply actor group has not consumed every original registered listener join"
+            );
+        }
+        Ok(JoinedRootReplyGroup { core })
+    }
+
+    pub(crate) fn retire_joined_group<'a>(
+        proxies: impl IntoIterator<Item = &'a Self>,
+    ) -> Result<()> {
+        Self::joined_group(proxies)?.retire_exchange_capture()
     }
 }
 impl Drop for RootReplyFaultProxy {
@@ -626,6 +787,7 @@ impl Drop for CountGuard {
         } else {
             self.core.streams.fetch_sub(1, Ordering::AcqRel);
         }
+        self.core.changed.notify_waiters();
     }
 }
 
@@ -641,11 +803,12 @@ impl AsRef<[u8]> for OwnedBuffer {
     }
 }
 struct ByteCredit {
-    core: Arc<Core>,
+    context: BufferContext,
     bytes: usize,
 }
 impl ByteCredit {
-    fn new(core: Arc<Core>, bytes: usize) -> Result<Self> {
+    fn new(context: BufferContext, bytes: usize) -> Result<Self> {
+        let core = context.core.clone();
         let previous = core
             .bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -656,23 +819,28 @@ impl ByteCredit {
             .map_err(|_| anyhow::anyhow!("root actor owned-buffer positions exhausted"))?;
         core.peak_bytes
             .fetch_max(previous + bytes, Ordering::AcqRel);
-        Ok(Self { core, bytes })
+        context.charge(bytes);
+        Ok(Self { context, bytes })
     }
 }
 impl Drop for ByteCredit {
     fn drop(&mut self) {
-        self.core.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.context
+            .core
+            .bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+        self.context.refund(self.bytes);
     }
 }
 impl OwnedBuffer {
-    fn new(core: Arc<Core>, capacity: usize) -> Result<Self> {
-        let mut credit = ByteCredit::new(core.clone(), capacity)?;
+    fn new(context: BufferContext, capacity: usize) -> Result<Self> {
+        let mut credit = ByteCredit::new(context.clone(), capacity)?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(capacity)
             .context("allocate bounded actor buffer")?;
         if bytes.capacity() > capacity {
-            let mut extra = ByteCredit::new(core, bytes.capacity() - capacity)?;
+            let mut extra = ByteCredit::new(context, bytes.capacity() - capacity)?;
             credit.bytes += extra.bytes;
             extra.bytes = 0;
             drop(extra);
@@ -705,7 +873,7 @@ async fn serve_listener(
     generation: watch::Sender<u64>,
     core: Arc<Core>,
 ) -> Result<()> {
-    let listener = tokio::net::TcpListener::from_std(listener)?;
+    let listener = capacity::register_listener(listener)?;
     let mut stop = core.stop.subscribe();
     if *stop.borrow() {
         return Ok(());
@@ -723,17 +891,14 @@ async fn serve_listener(
                             Err(error) => core.failure(&format!("root connection join: {error}"))}
                     }
                 }
-                accepted = listener.accept() => {
-                    let (stream, _) = accepted.context("accept root fault actor")?;
-                    let Ok(position) = core.connection_positions.clone().try_acquire_owned() else {
-                        core.failure("root actor connection positions exhausted"); drop(stream); continue;
-                    };
+                accepted = capacity::accept_owned(&listener,&core) => {
+                    let (stream,position) = accepted?;
+                    let connection=ConnectionState::new(&core,position)?;
                     let child_core = core.clone();
                     let child_generation = generation.subscribe();
                     connections.spawn(async move {
-                        let _position = position;
-                        let _count = CountGuard::new(child_core.clone(), true);
-                        serve_connection(stream, upstream, backend_index, child_generation, child_core).await
+                        let _exit=ConnectionExit(connection.clone());
+                        serve_connection(stream, upstream, backend_index, child_generation, child_core,connection).await
                     });
                 }
             }
@@ -1849,6 +2014,7 @@ async fn serve_connection(
     backend_index: usize,
     mut generation: watch::Receiver<u64>,
     core: Arc<Core>,
+    connection: Arc<ConnectionState>,
 ) -> Result<()> {
     let mut stop = core.stop.subscribe();
     if *stop.borrow() {
@@ -1911,22 +2077,30 @@ async fn serve_connection(
         result = tokio::time::timeout_at(handshake_deadline, connect) => result.context("root actor handshake deadline")??,
     };
     let mut children = JoinSet::new();
+    connection.spawned_children();
     children.spawn(async move {
         driver.await.context("root upstream H2 driver")?;
         Ok::<_, anyhow::Error>(ChildExit::Upstream)
     });
     let mut accepted_rpcs = 0u64;
+    let mut application_children = 0usize;
+    let mut normal_capacity_eof = false;
     let mut failed_at_downstream_accept = false;
     let mut unresolved_rpcs_at_failure = 0;
     let outcome = async {
         loop {
+            let changed=core.changed.notified();tokio::pin!(changed);changed.as_mut().enable();
+            let bytes_changed=connection.changed.notified();tokio::pin!(bytes_changed);bytes_changed.as_mut().enable();
+            if connection.begin_idle_drain(application_children,downstream.has_streams()) {downstream.graceful_shutdown();}
             tokio::select! {
+                _=&mut changed=>{},
+                _=&mut bytes_changed=>{},
                 _ = stop.changed() => break Ok::<_,anyhow::Error>(()),
                 _ = generation.changed() => break Ok(()),
                 joined = children.join_next(), if !children.is_empty() => {
                     core.joined_children.fetch_add(1, Ordering::AcqRel);
                     match joined {
-                        Some(Ok(Ok(ChildExit::Stream))) => {},
+                        Some(Ok(Ok(ChildExit::Stream))) => {application_children-=1;},
                         Some(Ok(Ok(ChildExit::Upstream))) | None => break Ok(()),
                         Some(Ok(Err(error))) => break Err(error),
                         Some(Err(error)) => break Err(anyhow::anyhow!("root child join: {error}")),
@@ -1945,18 +2119,21 @@ async fn serve_connection(
                                 error.is_reset(), error.is_remote(), error.reason());
                             anyhow::Error::new(error).context(context)
                         })?
-                        else {break Ok(())};
+                        else {normal_capacity_eof=connection.is_draining();break Ok(())};
                     accepted_rpcs = accepted_rpcs.saturating_add(1);
                     let Ok(position) = core.stream_positions.clone().try_acquire_owned() else {
                         response.send_reset(h2::Reason::REFUSED_STREAM);
                         core.failure("root actor stream positions exhausted"); continue;
                     };
                     let child_core = core.clone();
+                    connection.accepted_during_grace();
+                    let buffers=BufferContext::connection(core.clone(),connection.clone());
                     let child_sender = sender.clone();
+                    application_children+=1;
                     children.spawn(async move {
                         let _position = position;
                         let _count = CountGuard::new(child_core.clone(), false);
-                        forward_stream(request, response, child_sender, backend_index, child_core).await?;
+                        forward_stream_bound(request, response, child_sender, backend_index, buffers).await?;
                         Ok(ChildExit::Stream)
                     });
                 }
@@ -1964,26 +2141,18 @@ async fn serve_connection(
         }
     }
     .await;
-    // Abort is only harness shutdown/failure cleanup, never a production task
-    // terminal. Await every original child JoinHandle before returning.
-    let mut cleanup_failed = false;
-    children.abort_all();
-    while let Some(joined) = children.join_next().await {
-        core.joined_children.fetch_add(1, Ordering::AcqRel);
-        match joined {
-            Ok(Err(error)) => {
-                cleanup_failed = true;
-                core.failure(&format!("root child cleanup failure: {error:#}"));
-            }
-            Err(error) if !error.is_cancelled() => {
-                cleanup_failed = true;
-                core.failure(&format!("root child cleanup join: {error}"))
-            }
-            Ok(Ok(_)) | Err(_) => {}
-        }
-    }
-    drop(sender);
+    let cleanup_failed = capacity::finish_children(
+        &mut children,
+        application_children,
+        sender,
+        normal_capacity_eof && outcome.is_ok(),
+        &mut stop,
+        &mut generation,
+        &core,
+    )
+    .await;
     drop(downstream);
+    connection.joined_children();
     if failed_at_downstream_accept && let Err(error) = &outcome {
         let frames = downstream_frames.lock().expect("root ingress facts lock");
         let mut state = core.state.lock().expect("root fault state lock");
@@ -2245,15 +2414,34 @@ async fn recover_covered_status_cancel(
     true
 }
 
+#[cfg(test)]
 async fn forward_stream(
     request: Request<RecvStream>,
-    mut response: server::SendResponse<Bytes>,
+    response: server::SendResponse<Bytes>,
     sender: client::SendRequest<Bytes>,
     backend_index: usize,
     core: Arc<Core>,
 ) -> Result<()> {
+    forward_stream_bound(
+        request,
+        response,
+        sender,
+        backend_index,
+        BufferContext::standalone(core),
+    )
+    .await
+}
+
+async fn forward_stream_bound(
+    request: Request<RecvStream>,
+    mut response: server::SendResponse<Bytes>,
+    sender: client::SendRequest<Bytes>,
+    backend_index: usize,
+    buffers: BufferContext,
+) -> Result<()> {
+    let core = buffers.core.clone();
     if exchange_fault::enabled_method(&core, &request) {
-        return exchange_fault::forward(request, response, sender, backend_index, core).await;
+        return exchange_fault::forward(request, response, sender, backend_index, buffers).await;
     }
     let rpc_path = request.uri().path();
     let rpc_label = if rpc_path.len() <= 128 {
@@ -2286,7 +2474,8 @@ async fn forward_stream(
             .context("ready root upstream request")?;
         let saved_request = if inspect {
             require_uncompressed(&parts.headers)?;
-            let (body, trailers) = read_bounded(&mut inbound, REQUEST_BYTES, core.clone()).await?;
+            let (body, trailers) =
+                read_bounded(&mut inbound, REQUEST_BYTES, buffers.clone()).await?;
             ensure!(
                 trailers.as_ref().is_none_or(HeaderMap::is_empty),
                 "captured root request has trailers"
@@ -2315,7 +2504,8 @@ async fn forward_stream(
         // RecvStream until response forwarding exits. No new buffer or clock.
         let saved_status = if let Some(caller) = covered_status_caller {
             require_uncompressed(&parts.headers)?;
-            let (body, trailers) = read_bounded(&mut inbound, REQUEST_BYTES, core.clone()).await?;
+            let (body, trailers) =
+                read_bounded(&mut inbound, REQUEST_BYTES, buffers.clone()).await?;
             ensure!(
                 trailers.as_ref().is_none_or(HeaderMap::is_empty),
                 "covered status request has trailers"
@@ -2440,7 +2630,7 @@ async fn forward_stream(
             send_bytes(&mut upstream_send, body).await?;
             upstream_send.send_data(Bytes::new(), true)?;
             let upstream_response = upstream_response.await?;
-            inject_reply(upstream_response, response, read, deadline, core.clone()).await
+            inject_reply(upstream_response, response, read, deadline, buffers.clone()).await
         } else if let Some(body) = saved_status.or_else(|| {
             if stream_class == StreamClass::NonTarget
                 && core
@@ -2492,7 +2682,7 @@ async fn forward_stream(
                         return Err(error).context("root downstream response headers");
                     }
                 };
-                match copy_body(body, output, core.clone()).await {
+                match copy_body(body, output, buffers.clone()).await {
                     Err(error) => {
                         if recover_covered_status_cancel(stream_class, &error, &mut inbound, &core)
                             .await
@@ -2514,7 +2704,7 @@ async fn forward_stream(
                     upstream_send.send_data(Bytes::new(), true)?;
                     Ok::<_, anyhow::Error>(())
                 } else {
-                    copy_body(inbound, upstream_send, core.clone())
+                    copy_body(inbound, upstream_send, buffers.clone())
                         .await
                         .context("root upstream request copy")
                 }
@@ -2523,7 +2713,7 @@ async fn forward_stream(
                 let upstream_response = upstream_response.await?;
                 let (parts, body) = upstream_response.into_parts();
                 let output = response.send_response(Response::from_parts(parts, ()), false)?;
-                copy_body(body, output, core.clone())
+                copy_body(body, output, buffers.clone())
                     .await
                     .context("root downstream response copy")
             })?;
@@ -2564,9 +2754,9 @@ impl Drop for SlotExit {
 async fn read_bounded(
     body: &mut RecvStream,
     cap: usize,
-    core: Arc<Core>,
+    buffers: BufferContext,
 ) -> Result<(Bytes, Option<HeaderMap>)> {
-    let mut buffer = OwnedBuffer::new(core, cap)?;
+    let mut buffer = OwnedBuffer::new(buffers, cap)?;
     while let Some(bytes) = body.data().await {
         let bytes = bytes?;
         ensure!(
@@ -2583,7 +2773,7 @@ async fn read_bounded(
 async fn copy_body(
     mut input: RecvStream,
     mut output: SendStream<Bytes>,
-    core: Arc<Core>,
+    buffers: BufferContext,
 ) -> Result<()> {
     while let Some(bytes) = input.data().await {
         let bytes = bytes?;
@@ -2591,7 +2781,7 @@ async fn copy_body(
             bytes.len() <= FRAME_BYTES,
             "root forwarding received oversized DATA frame"
         );
-        let mut copy = OwnedBuffer::new(core.clone(), FRAME_BYTES)?;
+        let mut copy = OwnedBuffer::new(buffers.clone(), FRAME_BYTES)?;
         copy.append(&bytes)?;
         input.flow_control().release_capacity(bytes.len())?;
         drop(bytes);
@@ -2694,7 +2884,7 @@ fn hash(bytes: &[u8]) -> String {
 fn require_canonical_reply(
     wire: &wire::FetchRootResultResponse,
     original_message: &Bytes,
-    core: Arc<Core>,
+    buffers: BufferContext,
 ) -> Result<()> {
     let canonical_length = wire.encoded_len();
     ensure!(
@@ -2710,7 +2900,7 @@ fn require_canonical_reply(
     // Byte equality, rather than length alone, establishes this actor's
     // canonical wire precondition. The temporary Vec shares the same credit;
     // OwnedBuffer also charges any excess actual allocation capacity.
-    let mut canonical = OwnedBuffer::new(core, canonical_length)?;
+    let mut canonical = OwnedBuffer::new(buffers, canonical_length)?;
     wire.encode(&mut canonical.bytes)
         .context("encode bounded canonical real root protobuf")?;
     ensure!(
@@ -2724,7 +2914,7 @@ fn require_canonical_reply(
 
 // Preserve the exact real scalar row; only append the closed malformed suffix.
 // The new body backing is charged alongside the original until its last alias exits.
-fn append_prefix_only_suffix(core: Arc<Core>, original: &Bytes) -> Result<Bytes> {
+fn append_prefix_only_suffix(buffers: BufferContext, original: &Bytes) -> Result<Bytes> {
     ensure!(
         original.len() == 69,
         "suffix fixture requires the real 69-byte scalar body"
@@ -2737,7 +2927,7 @@ fn append_prefix_only_suffix(core: Arc<Core>, original: &Bytes) -> Result<Bytes>
         length <= RootProfileV1::SEGMENT_BYTES,
         "suffix body exceeds frozen segment"
     );
-    let mut body = OwnedBuffer::new(core, length)?;
+    let mut body = OwnedBuffer::new(buffers, length)?;
     body.append(original)?;
     body.append(&[1, 0, 0, 0])?;
     Ok(body.into_bytes())
@@ -2772,15 +2962,16 @@ async fn inject_reply(
     mut downstream: server::SendResponse<Bytes>,
     expected: RootResultRead,
     deadline: Instant,
-    core: Arc<Core>,
+    buffers: BufferContext,
 ) -> Result<()> {
+    let core = buffers.core.clone();
     let (mut parts, mut body) = upstream.into_parts();
     ensure!(
         parts.status == http::StatusCode::OK,
         "real root response HTTP status is not 200"
     );
     require_uncompressed(&parts.headers)?;
-    let (original, trailers) = read_bounded(&mut body, RESPONSE_BYTES, core.clone()).await?;
+    let (original, trailers) = read_bounded(&mut body, RESPONSE_BYTES, buffers.clone()).await?;
     success_status(&parts.headers, trailers.as_ref())?;
     let original_message = single_message(&original)?;
     let mut wire = wire::FetchRootResultResponse::decode(original_message.clone())
@@ -2821,7 +3012,7 @@ async fn inject_reply(
             return Ok(());
         }
     };
-    require_canonical_reply(&wire, &original_message, core.clone())?;
+    require_canonical_reply(&wire, &original_message, buffers.clone())?;
     drop(original_message);
     let is_not_ready = matches!(&reply.outcome, RootReadOutcome::NotReady);
     ensure!(
@@ -2908,7 +3099,7 @@ async fn inject_reply(
         }
         RootReplyMutation::ValidRowPrefixOnlySuffix => {
             let data = reply_data_mut(&mut wire)?;
-            data.body = append_prefix_only_suffix(core.clone(), &data.body)?;
+            data.body = append_prefix_only_suffix(buffers.clone(), &data.body)?;
         }
     }
     // The mutation list is closed. Identity, watermark, sequence and optional
@@ -2921,7 +3112,7 @@ async fn inject_reply(
         frame_length <= RESPONSE_BYTES,
         "mutated root exceeds existing root envelope"
     );
-    let mut frame = OwnedBuffer::new(core.clone(), frame_length)?;
+    let mut frame = OwnedBuffer::new(buffers.clone(), frame_length)?;
     frame.append(&[0])?;
     frame.append(&(u32::try_from(length)?).to_be_bytes())?;
     wire.encode(&mut frame.bytes)?;
@@ -3052,6 +3243,15 @@ mod tests {
             peak_bytes: AtomicUsize::new(0),
             joined_connections: AtomicU64::new(0),
             joined_children: AtomicU64::new(0),
+            next_connection_id: AtomicU64::new(1),
+            pressure_listeners: AtomicUsize::new(0),
+            idle_victim: AtomicU64::new(0),
+            idle_drains_started: AtomicU64::new(0),
+            idle_drains_completed: AtomicU64::new(0),
+            idle_drain_yields: AtomicU64::new(0),
+            connection_bound_buffer_charges: AtomicU64::new(0),
+            connection_bound_buffer_drops: AtomicU64::new(0),
+            standalone_buffer_charges: AtomicU64::new(0),
         })
     }
 
@@ -3071,7 +3271,8 @@ mod tests {
             .unwrap();
         assert_eq!(valid.after().completed_rows(), 1);
         valid.after().validate_end().unwrap();
-        let body = append_prefix_only_suffix(core.clone(), &original).unwrap();
+        let body =
+            append_prefix_only_suffix(BufferContext::standalone(core.clone()), &original).unwrap();
         assert_eq!(&body[..69], original.as_ref());
         assert_eq!(&body[69..], &[1, 0, 0, 0]);
         assert_eq!(
@@ -3091,7 +3292,11 @@ mod tests {
         drop(alias);
         assert_eq!(core.bytes.load(Ordering::Acquire), 0);
         assert!(
-            append_prefix_only_suffix(core.clone(), &Bytes::from_static(&[1, 0, 0, 0])).is_err()
+            append_prefix_only_suffix(
+                BufferContext::standalone(core.clone()),
+                &Bytes::from_static(&[1, 0, 0, 0])
+            )
+            .is_err()
         );
         assert_eq!(core.bytes.load(Ordering::Acquire), 0);
     }
@@ -3106,8 +3311,16 @@ mod tests {
         let actual = wire::FetchRootResultResponse::decode(reordered.clone()).unwrap();
         assert_eq!(actual, expected);
         assert_eq!(actual.encoded_len(), reordered.len());
-        require_canonical_reply(&expected, &canonical, core.clone()).unwrap();
-        assert!(require_canonical_reply(&actual, &reordered, core.clone()).is_err());
+        require_canonical_reply(
+            &expected,
+            &canonical,
+            BufferContext::standalone(core.clone()),
+        )
+        .unwrap();
+        assert!(
+            require_canonical_reply(&actual, &reordered, BufferContext::standalone(core.clone()))
+                .is_err()
+        );
         assert_eq!(core.bytes.load(Ordering::Acquire), 0);
     }
 
@@ -3115,10 +3328,14 @@ mod tests {
     fn credited_vec_refuses_global_cap_and_preserves_live_alias_credit() {
         let core = core();
         assert!(
-            OwnedBuffer::new(core.clone(), core.bounds.maximum_owned_buffer_bytes + 1).is_err()
+            OwnedBuffer::new(
+                BufferContext::standalone(core.clone()),
+                core.bounds.maximum_owned_buffer_bytes + 1
+            )
+            .is_err()
         );
         assert_eq!(core.bytes.load(Ordering::Acquire), 0);
-        let mut owner = OwnedBuffer::new(core.clone(), 8).unwrap();
+        let mut owner = OwnedBuffer::new(BufferContext::standalone(core.clone()), 8).unwrap();
         owner.append(b"12345678").unwrap();
         let capacity = owner.bytes.capacity();
         let body = owner.into_bytes();
@@ -3130,8 +3347,8 @@ mod tests {
         assert_eq!(core.bytes.load(Ordering::Acquire), capacity);
         assert_eq!(slice.as_ref(), b"3456");
         let remaining = core.bounds.maximum_owned_buffer_bytes - capacity;
-        let credit = ByteCredit::new(core.clone(), remaining).unwrap();
-        assert!(OwnedBuffer::new(core.clone(), 1).is_err());
+        let credit = ByteCredit::new(BufferContext::standalone(core.clone()), remaining).unwrap();
+        assert!(OwnedBuffer::new(BufferContext::standalone(core.clone()), 1).is_err());
         drop(credit);
         assert_eq!(core.bytes.load(Ordering::Acquire), capacity);
         drop(slice);
@@ -3144,9 +3361,15 @@ mod tests {
         let message = Bytes::from_static(&[0x10, 1, 0x22, 2, 0x10, 1]);
         let wire = wire::FetchRootResultResponse::decode(message.clone()).unwrap();
         assert_eq!(wire.encoded_len(), message.len());
-        let credit =
-            ByteCredit::new(core.clone(), core.bounds.maximum_owned_buffer_bytes - 3).unwrap();
-        assert!(require_canonical_reply(&wire, &message, core.clone()).is_err());
+        let credit = ByteCredit::new(
+            BufferContext::standalone(core.clone()),
+            core.bounds.maximum_owned_buffer_bytes - 3,
+        )
+        .unwrap();
+        assert!(
+            require_canonical_reply(&wire, &message, BufferContext::standalone(core.clone()))
+                .is_err()
+        );
         assert_eq!(
             core.bytes.load(Ordering::Acquire),
             core.bounds.maximum_owned_buffer_bytes - 3
@@ -3280,7 +3503,7 @@ mod tests {
             required_identities: vec![novarocks_task_codec::identity::encode_task_identity(task)],
             ..Default::default()
         };
-        let mut frame = OwnedBuffer::new(core.clone(), REQUEST_BYTES)?;
+        let mut frame = OwnedBuffer::new(BufferContext::standalone(core.clone()), REQUEST_BYTES)?;
         frame.append(&[0])?;
         frame.append(&(u32::try_from(wire.encoded_len())?).to_be_bytes())?;
         wire.encode(&mut frame.bytes)?;
@@ -3348,8 +3571,12 @@ mod tests {
                             Some(caller)
                         );
                         let mut inbound = request.into_body();
-                        let (body, trailers) =
-                            read_bounded(&mut inbound, REQUEST_BYTES, upstream_core).await?;
+                        let (body, trailers) = read_bounded(
+                            &mut inbound,
+                            REQUEST_BYTES,
+                            BufferContext::standalone(upstream_core),
+                        )
+                        .await?;
                         assert!(trailers.is_none());
                         validate_covered_status(&body, caller)?;
                         drop(body);
@@ -3518,7 +3745,7 @@ mod tests {
                     let mut inbound = request.into_body();
                     let work = async {
                         let (body, trailers) =
-                            read_bounded(&mut inbound, REQUEST_BYTES, server_core.clone()).await?;
+                            read_bounded(&mut inbound, REQUEST_BYTES, BufferContext::standalone(server_core.clone())).await?;
                         validate_covered_status(&body, caller)?;
                         assert!(trailers.is_none());
                         drop(body);
@@ -3733,7 +3960,7 @@ mod tests {
 
     fn frame(core: Arc<Core>, wire: &wire::FetchRootResultResponse) -> Result<Bytes> {
         let length = wire.encoded_len();
-        let mut frame = OwnedBuffer::new(core, length + 5)?;
+        let mut frame = OwnedBuffer::new(BufferContext::standalone(core), length + 5)?;
         frame.append(&[0])?;
         frame.append(&(length as u32).to_be_bytes())?;
         wire.encode(&mut frame.bytes)?;
@@ -3818,13 +4045,24 @@ mod tests {
                 true,
             )?;
             let response = response_rx.await?;
-            inject_reply(up_reply, response, expected, deadline, core.clone()).await?;
+            inject_reply(
+                up_reply,
+                response,
+                expected,
+                deadline,
+                BufferContext::standalone(core.clone()),
+            )
+            .await?;
             let response = down_reply.await?;
             assert_eq!(response.status(), http::StatusCode::OK);
             assert_eq!(response.headers(), &expected_headers);
             let mut body = response.into_body();
-            let (actual, actual_trailers) =
-                read_bounded(&mut body, RESPONSE_BYTES, core.clone()).await?;
+            let (actual, actual_trailers) = read_bounded(
+                &mut body,
+                RESPONSE_BYTES,
+                BufferContext::standalone(core.clone()),
+            )
+            .await?;
             assert_eq!(actual, original_bytes);
             assert_eq!(actual.len(), original_len);
             assert_eq!(hash(&actual), original_hash);

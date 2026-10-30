@@ -78,6 +78,17 @@ fn mutate(
     subject: &str,
 ) -> Result<()> {
     let before = snapshot_count(control, table)?;
+    mutate_after_snapshot(control, table, sql, affected, snapshots, subject, before)
+}
+fn mutate_after_snapshot(
+    control: &mut mysql::Conn,
+    table: &str,
+    sql: &str,
+    affected: u64,
+    snapshots: i64,
+    subject: &str,
+    before: i64,
+) -> Result<()> {
     control
         .query_drop(sql)
         .with_context(|| subject.to_owned())?;
@@ -114,6 +125,8 @@ pub(super) fn run(
     catalog: &str,
     database: &str,
     observations: &SqlIntentOwner,
+    partition_diagnostic: Option<SelectedStatement>,
+    selected_update_diagnostic: Option<SelectedStatement>,
 ) -> Result<()> {
     for (index, dop) in [1, 4].into_iter().enumerate() {
         context.action(format!(
@@ -121,13 +134,30 @@ pub(super) fn run(
         ));
         control.query_drop(format!("SET pipeline_dop = {dop}"))?;
         mixed_actions(control, catalog, database, dop)?;
-        partition_movement(control, catalog, database, dop)?;
+        partition_movement(
+            context,
+            control,
+            catalog,
+            database,
+            dop,
+            partition_diagnostic.as_ref().filter(|_| dop == 1),
+        )?;
         context.action(format!(
             "check old-file/current-spec Replace routing and COW peer retention with DOP {dop}"
         ));
         partition_replacement_after_spec_evolution(control, catalog, database, dop)?;
         for action in [MatchedAction::Update, MatchedAction::Delete] {
-            selected_actions(context, control, catalog, database, dop, action)?;
+            selected_actions(
+                context,
+                control,
+                catalog,
+                database,
+                dop,
+                action,
+                selected_update_diagnostic
+                    .as_ref()
+                    .filter(|_| dop == 1 && matches!(action, MatchedAction::Update)),
+            )?;
         }
         unmatched_inserts(
             context,
@@ -247,6 +277,21 @@ impl MatchedAction {
     }
 }
 
+fn selected_action_sql(table: &str, source: &str, action: MatchedAction, case_id: i64) -> String {
+    format!(
+        "MERGE INTO {table} t USING {source} s ON t.id=s.id AND s.case_id={case_id} \
+         WHEN MATCHED AND s.selected THEN {}",
+        action.clause()
+    )
+}
+pub(super) fn selected_update_case2_sql(catalog: &str, database: &str) -> String {
+    selected_action_sql(
+        &format!("{catalog}.{database}.selected_update_1"),
+        &format!("{catalog}.{database}.selected_source_update_1"),
+        MatchedAction::Update,
+        2,
+    )
+}
 fn selected_actions(
     context: &mut ScenarioContext,
     control: &mut mysql::Conn,
@@ -254,6 +299,7 @@ fn selected_actions(
     database: &str,
     dop: i32,
     action: MatchedAction,
+    diagnostic: Option<&SelectedStatement>,
 ) -> Result<()> {
     let label = action.label();
     let table = format!("{catalog}.{database}.selected_{label}_{dop}");
@@ -278,28 +324,43 @@ fn selected_actions(
     ] {
         control.query_drop(format!("INSERT INTO {source} VALUES {rows}"))?;
     }
-    let sql = |case_id| {
-        format!(
-            "MERGE INTO {table} t USING {source} s ON t.id=s.id AND s.case_id={case_id} \
-         WHEN MATCHED AND s.selected THEN {}",
-            action.clause()
-        )
-    };
+    let sql = |case_id| selected_action_sql(&table, &source, action, case_id);
     let mut expected = vec![(1, 10), (2, 20), (3, 30), (4, 40)];
     for (case_id, subject) in [(1, "TRUE+FALSE"), (2, "TRUE+NULL")] {
-        mutate(
-            control,
-            &table,
-            &sql(case_id),
-            1,
-            1,
-            &format!("{label} {subject}"),
-        )?;
-        match action {
-            MatchedAction::Update => expected[case_id as usize - 1].1 = case_id * 101,
-            MatchedAction::Delete => expected.retain(|(id, _)| *id != case_id),
-        }
-        assert_rows(control, &table, &expected, subject)?;
+        let before = snapshot_count(control, &table)?;
+        let statement = sql(case_id);
+        let observation = if case_id == 2
+            && let Some(selected) = diagnostic
+        {
+            Some(arm_diagnostic(
+                context,
+                control,
+                selected,
+                &statement,
+                "selected-update-case2-submission.json",
+                dop,
+            )?)
+        } else {
+            None
+        };
+        let primary = (|| -> Result<()> {
+            mutate_after_snapshot(
+                control,
+                &table,
+                &statement,
+                1,
+                1,
+                &format!("{label} {subject}"),
+                before,
+            )?;
+            match action {
+                MatchedAction::Update => expected[case_id as usize - 1].1 = case_id * 101,
+                MatchedAction::Delete => expected.retain(|(id, _)| *id != case_id),
+            }
+            assert_rows(control, &table, &expected, subject)?;
+            Ok(())
+        })();
+        settle_diagnostic(context, diagnostic, observation, primary)?;
     }
     mutate(
         control,
@@ -441,11 +502,62 @@ fn unmatched_inserts(
     Ok(())
 }
 
+pub(super) fn partition_move_update_sql(catalog: &str, database: &str, dop: i32) -> String {
+    format!("UPDATE {catalog}.{database}.partition_move_{dop} SET p=1,v=11 WHERE id=1")
+}
+fn arm_diagnostic(
+    context: &mut ScenarioContext,
+    control: &mut mysql::Conn,
+    selected: &SelectedStatement,
+    sql: &str,
+    artifact: &str,
+    dop: i32,
+) -> Result<novarocks_cluster_harness::QueryLifecycleStatementObservation> {
+    std::fs::write(
+        context.scenario_root().join(artifact),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "statement_run_token": selected.token, "connection_id": control.connection_id(),
+            "sql": sql, "requested_dop": dop, "phase": "preparing-original-arm-and-query",
+        }))?,
+    )?;
+    selected.arm(context, control.connection_id(), sql)
+}
+// The returned nomination handle remains owned through the original SQL and
+// result oracles, then uses its original journal and frozen deadline to drain.
+fn settle_diagnostic(
+    context: &mut ScenarioContext,
+    selected: Option<&SelectedStatement>,
+    observation: Option<novarocks_cluster_harness::QueryLifecycleStatementObservation>,
+    primary: Result<()>,
+) -> Result<()> {
+    let Some(observation) = observation else {
+        return primary;
+    };
+    let selected =
+        selected.context("diagnostic observation lost its original selected statement")?;
+    let cleanup = if primary.is_ok() {
+        let observed = context
+            .handle()
+            .await_query_lifecycle_statement_observation(&observation, true, selected.deadline)
+            .map(|_| ());
+        let drained = context
+            .handle()
+            .drain_query_lifecycle_statement_observation(&observation);
+        writer_statement_actor::combine(observed, drained)
+    } else {
+        context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&observation, selected.deadline)
+    };
+    writer_statement_actor::combine(primary, cleanup)
+}
 fn partition_movement(
+    context: &mut ScenarioContext,
     control: &mut mysql::Conn,
     catalog: &str,
     database: &str,
     dop: i32,
+    diagnostic: Option<&SelectedStatement>,
 ) -> Result<()> {
     let table = format!("{catalog}.{database}.partition_move_{dop}");
     control.query_drop(format!(
@@ -460,43 +572,63 @@ fn partition_movement(
         original.len() == 2,
         "cross-partition fixture lost an original row: {original:?}"
     );
-    mutate(
-        control,
-        &table,
-        &format!("UPDATE {table} SET p=1,v=11 WHERE id=1"),
-        1,
-        1,
-        "Replace moves one row across table partitions",
-    )?;
-    let rows: Vec<(i64, i64, i64)> =
-        control.query(format!("SELECT id,v,p FROM {table} ORDER BY id"))?;
-    anyhow::ensure!(
-        rows == [(1, 11, 1), (2, 20, 0)],
-        "cross-partition Replace returned {rows:?}"
-    );
-    let rewritten: Vec<(i64, String, i64)> =
-        control.query(format!("SELECT id,_file,_row_id FROM {table} ORDER BY id"))?;
-    anyhow::ensure!(
-        rewritten.len() == 2,
-        "cross-partition Replace lost a physical row: {rewritten:?}"
-    );
-    anyhow::ensure!(
-        rewritten[0].1 != original[0].1,
-        "cross-partition Replace kept its old data location"
-    );
-    anyhow::ensure!(
-        rewritten[0].2 == original[0].2 && rewritten[1] == original[1],
-        "cross-partition Replace changed logical lineage or its untouched peer: before={original:?} after={rewritten:?}"
-    );
-    let new_partition: Vec<i64> =
-        control.query(format!("SELECT id FROM {table} WHERE p=1 ORDER BY id"))?;
-    let old_partition: Vec<i64> =
-        control.query(format!("SELECT id FROM {table} WHERE p=0 ORDER BY id"))?;
-    anyhow::ensure!(
-        new_partition == [1] && old_partition == [2],
-        "partition-qualified reads returned new={new_partition:?}, old={old_partition:?}"
-    );
-    Ok(())
+    // Nominate immediately before the original UPDATE, after its metadata
+    // read, so that no intervening SQL can take the selected input identity.
+    let before = snapshot_count(control, &table)?;
+    let sql = partition_move_update_sql(catalog, database, dop);
+    let observation = if let Some(selected) = diagnostic {
+        Some(arm_diagnostic(
+            context,
+            control,
+            selected,
+            &sql,
+            "partition-move-selected-submission.json",
+            dop,
+        )?)
+    } else {
+        None
+    };
+    let primary = (|| -> Result<()> {
+        mutate_after_snapshot(
+            control,
+            &table,
+            &sql,
+            1,
+            1,
+            "Replace moves one row across table partitions",
+            before,
+        )?;
+        let rows: Vec<(i64, i64, i64)> =
+            control.query(format!("SELECT id,v,p FROM {table} ORDER BY id"))?;
+        anyhow::ensure!(
+            rows == [(1, 11, 1), (2, 20, 0)],
+            "cross-partition Replace returned {rows:?}"
+        );
+        let rewritten: Vec<(i64, String, i64)> =
+            control.query(format!("SELECT id,_file,_row_id FROM {table} ORDER BY id"))?;
+        anyhow::ensure!(
+            rewritten.len() == 2,
+            "cross-partition Replace lost a physical row: {rewritten:?}"
+        );
+        anyhow::ensure!(
+            rewritten[0].1 != original[0].1,
+            "cross-partition Replace kept its old data location"
+        );
+        anyhow::ensure!(
+            rewritten[0].2 == original[0].2 && rewritten[1] == original[1],
+            "cross-partition Replace changed logical lineage or its untouched peer: before={original:?} after={rewritten:?}"
+        );
+        let new_partition: Vec<i64> =
+            control.query(format!("SELECT id FROM {table} WHERE p=1 ORDER BY id"))?;
+        let old_partition: Vec<i64> =
+            control.query(format!("SELECT id FROM {table} WHERE p=0 ORDER BY id"))?;
+        anyhow::ensure!(
+            new_partition == [1] && old_partition == [2],
+            "partition-qualified reads returned new={new_partition:?}, old={old_partition:?}"
+        );
+        Ok(())
+    })();
+    settle_diagnostic(context, diagnostic, observation, primary)
 }
 
 fn partition_replacement_after_spec_evolution(

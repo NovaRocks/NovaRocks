@@ -33,11 +33,12 @@ use novarocks_cluster_harness::native_root_reply_fault::{
     RootReplyFaultBounds, RootReplyFaultControl,
 };
 use novarocks_cluster_harness::{
-    CrossProcessRootReplyFaultConfig, LaunchProfile, QueryLifecycleStatementObservation,
-    ServerHandle,
+    CrossProcessNativeFaultProxyConfig, CrossProcessRootReplyFaultConfig, LaunchProfile,
+    QueryLifecycleStatementObservation, ServerHandle,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::mpsc;
@@ -476,7 +477,7 @@ enum Outcome {
 fn seed(context: &mut ScenarioContext) -> Result<()> {
     let warehouse = create_warehouse(context, "exchange-flow")?;
     let deadline = context.deadline();
-    mysql_actor::connect_until(context.mysql_user(), context.mysql_port(), deadline)?.run(|control| {
+    let files: Vec<(i32, String, String, i64, i64)> = mysql_actor::connect_until(context.mysql_user(), context.mysql_port(), deadline)?.run(|control| {
         create_catalog(control, CATALOG, &warehouse)?;
         control.query_drop(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))?;
         control.query_drop(format!("CREATE TABLE {TABLE} (k BIGINT NOT NULL)"))?;
@@ -487,12 +488,33 @@ fn seed(context: &mut ScenarioContext) -> Result<()> {
             let last = first + ROWS_PER_FILE - 1;
             control.query_drop(format!("INSERT INTO {TABLE} SELECT generate_series FROM TABLE(generate_series({first},{last}))"))?;
         }
-        Ok(())
-    })
+        control.query(format!(
+            "SELECT content,file_path,file_format,record_count,file_size_in_bytes FROM {TABLE}$files ORDER BY file_path"
+        )).context("read original Exchange fixture file geometry")
+    })?;
+    retain(context, "exchange-seed-file-geometry.json", &files)?;
+    // All six original files share Iceberg's minimum split weight (0.05 of
+    // its 128 MiB target). The initial 256-split pump and least-total-weight
+    // assignment therefore give each of the three original scan Tasks two
+    // files. A Parquet page belongs to one split and never joins two files.
+    ensure!(
+        files.len() == FILES as usize
+            && files
+                .iter()
+                .all(|(content, _, format, rows, bytes)| *content == 0
+                    && format == "PARQUET"
+                    && *rows == ROWS_PER_FILE
+                    && *bytes > 0
+                    && *bytes <= 128 * 1024 * 1024 / 20),
+        "Exchange fixture requires six original 4096-row, minimum-weight Parquet files: {files:?}"
+    );
+    Ok(())
 }
 
 fn gather_sql() -> String {
-    format!("SELECT k FROM {TABLE}")
+    // A plain scan can deliver several root streams without an Exchange.
+    // The original global ordering property requires a real singleton input.
+    format!("SELECT k FROM {TABLE} ORDER BY k")
 }
 
 fn join_sql() -> String {
@@ -600,12 +622,16 @@ impl Scenario for ExchangeFlow {
             "connector overlay has no runtime table"
         );
         config.config_overlay.be = Some(original.replacen("[runtime]\n", &format!(
-            "[runtime]\nexchange_instance_floor_slots = 1\nexchange_instance_max_slots = 2\nexchange_floating_slots = 1\nexchange_stream_window = 2\nexchange_transport_timeout_ms = {TRANSPORT_MILLIS}\nexchange_io_max_inflight_bytes = 262144\nexchange_max_transmit_batched_bytes = 32768\n"
+            "[runtime]\nexchange_instance_floor_slots = 1\nexchange_instance_max_slots = 2\nexchange_floating_slots = 1\nexchange_stream_window = 2\nexchange_transport_timeout_ms = {TRANSPORT_MILLIS}\nexchange_io_max_inflight_bytes = 262144\nexchange_max_transmit_batched_bytes = 8192\n"
         ), 1));
         config.native_root_reply_fault = Some(CrossProcessRootReplyFaultConfig {
             backend_indices: (0..3).collect(),
             bounds: RootReplyFaultBounds::default(),
         });
+        config.native_fault_proxies = CrossProcessNativeFaultProxyConfig {
+            // Keep the existing Root actor's separate Control TCP budget.
+            backend_retained_byte_limits: (0..3).map(|index| (index, 1024 * 1024)).collect(),
+        };
         Ok(config)
     }
 
@@ -649,6 +675,9 @@ impl Scenario for ExchangeFlow {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         context.recheck_live_process_launch_identities()?;
+        // Bind the authenticated live BE pairs before ordinary seed SQL can
+        // open long-lived grant subscriptions. No fault is captured here.
+        let fault = context.handle().native_exchange_fault(0)?;
         let baseline = resource_baseline(context)?;
         seed(context)?;
         await_resource_convergence(context, &baseline, "ordinary private Exchange seed SQL")?;
@@ -668,7 +697,6 @@ impl Scenario for ExchangeFlow {
             );
         }
         retain(context, "exchange-initial-flow.json", &idle)?;
-        let fault = context.handle().native_exchange_fault(0)?;
         let mut jobs = Vec::new();
         let mut evidence = json!({"schema_version":1,"scenario":self.name(),"rows":ROWS,
             "oracle":"full unique integer domain, independent of received rows", "phases":[]});
@@ -714,8 +742,112 @@ impl Scenario for ExchangeFlow {
     }
 }
 
-fn explain(context: &mut ScenarioContext, sql: &str, partitioned: bool) -> Result<String> {
-    mysql_actor::connect_until(
+#[derive(Serialize)]
+struct ExplainedPlan {
+    physical_tree: String,
+    contract: String,
+}
+
+impl ExplainedPlan {
+    fn new(physical_tree: String, contract: String) -> Result<Self> {
+        ensure!(
+            physical_tree
+                .lines()
+                .any(|line| line.starts_with("PLAN FRAGMENT ")),
+            "EXPLAIN VERBOSE did not return the original physical tree"
+        );
+        ensure!(
+            contract.starts_with("PHYSICAL PLAN version=") && !plan_nodes(&contract)?.is_empty(),
+            "EXPLAIN CONTRACT did not return original frozen node identities"
+        );
+        Ok(Self {
+            physical_tree,
+            contract,
+        })
+    }
+
+    fn gather_receiver(&self) -> Result<ExplainedReceiver> {
+        ensure!(
+            self.physical_tree.lines().any(|line| {
+                let label = line.trim_start().split_once(':').map(|(_, label)| label);
+                label.is_some_and(|label| label.starts_with("SORT BY "))
+            }) && self.physical_tree.lines().any(|line| {
+                line.trim_start()
+                    .split_once(':')
+                    .is_some_and(|(_, label)| label == "GATHER" || label.starts_with("GATHER "))
+            }),
+            "gather physical tree has no actual global Sort and Gather: {}",
+            self.physical_tree
+        );
+        receiver_contract(&self.contract, singleton_receiver_node(&self.contract)?)
+    }
+
+    fn build_receiver(&self, partitioned: bool) -> Result<ExplainedReceiver> {
+        let label = if partitioned {
+            "HASH JOIN (PARTITIONED,"
+        } else {
+            "HASH JOIN (BROADCAST,"
+        };
+        ensure!(
+            self.physical_tree.contains(label) && self.contract.contains(label),
+            "join distribution differs from the required physical tree/Contract: {}",
+            self.physical_tree
+        );
+        receiver_contract(&self.contract, build_receiver_node(&self.contract)?)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ExplainedReceiver {
+    destination_fragment: u32,
+    node: i32,
+    edge: u32,
+    source_fragment: u32,
+}
+
+fn receiver_contract(plan: &str, node: i32) -> Result<ExplainedReceiver> {
+    let nodes = plan_nodes(plan)?;
+    // The transport selector accepts a node within an actual Task. It cannot
+    // reconstruct the scheduler's StageId from a display fragment ordinal.
+    // This fixed corpus must therefore have one unambiguous receiver with
+    // this original node ID before using that selector across its Tasks.
+    let receivers: Vec<_> = nodes
+        .iter()
+        .filter(|actual| actual.node == node && actual.header.contains("(EXCHANGE ID:"))
+        .collect();
+    ensure!(
+        receivers.len() == 1,
+        "original receiver node is ambiguous across frozen fragments"
+    );
+    let receiver = receivers[0];
+    let edge = number_after::<u32>(receiver.header, "(EXCHANGE ID: ")?;
+    let edges: Vec<_> = plan
+        .lines()
+        .filter(|line| line.trim_start().starts_with(&format!("edge{edge} kind=")))
+        .collect();
+    ensure!(
+        edges.len() == 1,
+        "selected receiver has no unique original edge"
+    );
+    let (source, destination) = edges[0]
+        .split_once(" destination={")
+        .context("edge has no frozen destination")?;
+    let destination_fragment = number_after(destination, "fragment=f")?;
+    ensure!(
+        destination_fragment == receiver.fragment
+            && number_after::<i32>(destination, "node=n")? == node,
+        "receiver node and frozen edge destination disagree"
+    );
+    Ok(ExplainedReceiver {
+        destination_fragment,
+        node,
+        edge,
+        source_fragment: number_after(source, "source={fragment=f")?,
+    })
+}
+
+fn explain(context: &mut ScenarioContext, sql: &str, partitioned: bool) -> Result<ExplainedPlan> {
+    let (physical_tree, contract) = mysql_actor::connect_until(
         context.mysql_user(),
         context.mysql_port(),
         context.deadline(),
@@ -724,9 +856,21 @@ fn explain(context: &mut ScenarioContext, sql: &str, partitioned: bool) -> Resul
         for setting in settings(partitioned, 120) {
             control.query_drop(setting)?;
         }
-        let lines: Vec<String> = control.query(format!("EXPLAIN VERBOSE {sql}"))?;
-        Ok(lines.join("\n"))
-    })
+        let tree: Vec<String> = control.query(format!("EXPLAIN VERBOSE {sql}"))?;
+        let contract: Vec<String> = control.query(format!("EXPLAIN CONTRACT {sql}"))?;
+        Ok((tree.join("\n"), contract.join("\n")))
+    })?;
+    // Retain both original replies even if the subsequent format/identity
+    // checks reject the fixture. No display ordinal is used as a wire ID.
+    let input = format!("{partitioned}:{sql}");
+    let digest = format!("{:x}", Sha256::digest(input.as_bytes()));
+    retain(
+        context,
+        &format!("exchange-explain-{digest}.json"),
+        &json!({"sql":sql,"settings":settings(partitioned,120),
+            "physical_tree":physical_tree,"contract":contract}),
+    )?;
+    ExplainedPlan::new(physical_tree, contract)
 }
 
 struct PlanNode<'a> {
@@ -735,6 +879,87 @@ struct PlanNode<'a> {
     fragment: u32,
     node: i32,
     depth: usize,
+}
+
+fn plan_nodes(plan: &str) -> Result<Vec<PlanNode<'_>>> {
+    plan.lines()
+        .enumerate()
+        .filter(|(_, header)| header.contains("[fragment="))
+        .map(|(line, header)| {
+            Ok(PlanNode {
+                header,
+                line,
+                fragment: number_after(header, "[fragment=")?,
+                node: number_after(header, "node=")?,
+                depth: number_after(header, "depth=")?,
+            })
+        })
+        .collect()
+}
+
+fn singleton_receiver_node(plan: &str) -> Result<i32> {
+    let destinations = plan
+        .lines()
+        .filter_map(|line| line.split_once(" destination={").map(|(_, value)| value))
+        .filter(|destination| {
+            destination
+                .split_once("distribution=")
+                .is_some_and(|(_, value)| value.starts_with("singleton,"))
+        })
+        .map(|destination| {
+            Ok((
+                number_after::<u32>(destination, "fragment=f")?,
+                number_after::<i32>(destination, "node=n")?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        destinations.len() == 1,
+        "gather case requires one exact singleton Exchange edge: {plan}"
+    );
+    let (fragment, node) = destinations[0];
+    let nodes = plan_nodes(plan)?;
+    let receivers: Vec<_> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, actual)| {
+            actual.fragment == fragment
+                && actual.node == node
+                && actual.header.contains("EXCHANGE (EXCHANGE ID:")
+        })
+        .collect();
+    ensure!(
+        receivers.len() == 1,
+        "singleton edge has no exact receiver node"
+    );
+    let (receiver_index, receiver) = receivers[0];
+    ensure!(
+        nodes[..receiver_index]
+            .iter()
+            .enumerate()
+            .any(|(index, ancestor)| {
+                ancestor.fragment == fragment
+                    && ancestor.depth < receiver.depth
+                    && ancestor.header.trim_start().starts_with("SORT ")
+                    && nodes[index + 1..receiver_index].iter().all(|between| {
+                        between.fragment == fragment && between.depth > ancestor.depth
+                    })
+            }),
+        "singleton receiver is not the actual global Sort input"
+    );
+    Ok(node)
+}
+
+fn explain_gather(context: &mut ScenarioContext, evidence_file: &str) -> Result<ExplainedReceiver> {
+    let sql = gather_sql();
+    let plan = explain(context, &sql, false)?;
+    let receiver = plan.gather_receiver()?;
+    retain(
+        context,
+        evidence_file,
+        &json!({"sql":sql,"plan":plan,"receiver":receiver}),
+    )?;
+    Ok(receiver)
 }
 
 fn number_after<T: std::str::FromStr>(text: &str, prefix: &str) -> Result<T>
@@ -758,20 +983,7 @@ where
 /// Task/query/BE identities. A node number alone never supplies Task authority.
 fn build_receiver_node(plan: &str) -> Result<i32> {
     let lines: Vec<_> = plan.lines().collect();
-    let nodes = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.contains("[fragment="))
-        .map(|(line, header)| {
-            Ok(PlanNode {
-                header,
-                line,
-                fragment: number_after(header, "[fragment=")?,
-                node: number_after(header, "node=")?,
-                depth: number_after(header, "depth=")?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let nodes = plan_nodes(plan)?;
     let joins: Vec<_> = nodes
         .iter()
         .enumerate()
@@ -845,6 +1057,7 @@ fn bind_candidate(
     context: &mut ScenarioContext,
     fault: &RootReplyFaultControl,
     job: &QueryJob,
+    receiver: &ExplainedReceiver,
 ) -> Result<ExchangeFaultCandidate> {
     loop {
         context
@@ -852,6 +1065,10 @@ fn bind_candidate(
         capture_healthy(fault)?;
         if let Some(candidate) = fault.exchange_candidate() {
             let stream = candidate.target.stream();
+            ensure!(
+                stream.destination_node().get() == receiver.node,
+                "fault candidate differs from the actual explained receiver node"
+            );
             let source = stream.source().task();
             let destination = stream.destination();
             ensure!(
@@ -907,6 +1124,18 @@ fn bind_candidate(
             }
             if source_found && destination_found {
                 fault.arm_exchange_exact(&candidate)?;
+                let token_digest = format!("{:x}", Sha256::digest(job.selected.token.as_bytes()));
+                retain(
+                    context,
+                    &format!("exchange-armed-candidate-{token_digest}.json"),
+                    &json!({
+                        "schema_version": 1,
+                        "statement_run_token": job.selected.token,
+                        "receiver": receiver,
+                        "candidate": candidate,
+                        "armed": true,
+                    }),
+                )?;
                 return Ok(candidate);
             }
         }
@@ -1201,33 +1430,22 @@ impl ExchangeFlow {
             let sql = self.sqls()[ordinal].clone();
             let partitioned = ordinal == 2;
             let plan = explain(context, &sql, partitioned)?;
-            let node = if ordinal == 0 {
-                ensure!(
-                    plan.contains("destination={") && plan.contains("distribution=singleton"),
-                    "gather case has no real singleton Exchange: {plan}"
-                );
-                None
+            let receiver = if ordinal == 0 {
+                plan.gather_receiver()?
             } else {
-                ensure!(
-                    plan.contains(if partitioned {
-                        "HASH JOIN (PARTITIONED,"
-                    } else {
-                        "HASH JOIN (BROADCAST,"
-                    }),
-                    "join Exchange shape changed: {plan}"
-                );
-                Some(build_receiver_node(&plan)?)
+                plan.build_receiver(partitioned)?
             };
+            let node = receiver.node;
             retain(
                 context,
                 &format!("exchange-shape-{ordinal}.json"),
-                &json!({"sql":sql,"plan":plan,"held_build_node":node}),
+                &json!({"sql":sql,"plan":plan,"receiver":receiver}),
             )?;
             capture(
                 context,
                 fault,
                 ExchangeFaultAction::HoldDataBeforeForward,
-                node,
+                Some(node),
             )?;
             let target = jobs.len();
             jobs.push(QueryJob::start(
@@ -1235,7 +1453,7 @@ impl ExchangeFlow {
                 self.intent.take(ordinal)?,
                 settings(partitioned, 120),
             )?);
-            let candidate = bind_candidate(context, fault, &jobs[target])?;
+            let candidate = bind_candidate(context, fault, &jobs[target], &receiver)?;
             let pressure = await_pressure(context, fault)?;
             let concurrent = jobs.len();
             jobs.push(QueryJob::start(
@@ -1276,15 +1494,12 @@ impl ExchangeFlow {
         evidence: &mut Value,
     ) -> Result<()> {
         let plan = explain(context, &join_sql(), true)?;
-        ensure!(
-            plan.contains("HASH JOIN (PARTITIONED,"),
-            "cross-query case lost shuffle: {plan}"
-        );
-        let node = build_receiver_node(&plan)?;
+        let receiver = plan.build_receiver(true)?;
+        let node = receiver.node;
         retain(
             context,
             "exchange-probe-build-plan.json",
-            &json!({"sql":join_sql(),"plan":plan,"held_build_node":node}),
+            &json!({"sql":join_sql(),"plan":plan,"receiver":receiver}),
         )?;
         capture(
             context,
@@ -1297,7 +1512,7 @@ impl ExchangeFlow {
             self.intent.take(0)?,
             settings(true, 120),
         )?);
-        let candidate = bind_candidate(context, fault, &jobs[0])?;
+        let candidate = bind_candidate(context, fault, &jobs[0], &receiver)?;
         let pressure = await_pressure(context, fault)?;
         jobs.push(QueryJob::start(
             context,
@@ -1326,14 +1541,21 @@ impl ExchangeFlow {
         jobs: &mut Vec<QueryJob>,
         evidence: &mut Value,
     ) -> Result<()> {
+        let receiver = explain_gather(context, "exchange-replay-plan.json")?;
+        let node = receiver.node;
         let before = await_flow_idle(context)?;
-        capture(context, fault, ExchangeFaultAction::DropAcceptedReply, None)?;
+        capture(
+            context,
+            fault,
+            ExchangeFaultAction::DropAcceptedReply,
+            Some(node),
+        )?;
         jobs.push(QueryJob::start(
             context,
             self.intent.take(0)?,
             settings(false, 120),
         )?);
-        let candidate = bind_candidate(context, fault, &jobs[0])?;
+        let candidate = bind_candidate(context, fault, &jobs[0], &receiver)?;
         let sequence = candidate
             .target
             .sequence()
@@ -1393,18 +1615,20 @@ impl ExchangeFlow {
         jobs: &mut Vec<QueryJob>,
         evidence: &mut Value,
     ) -> Result<()> {
+        let receiver = explain_gather(context, "exchange-rebuild-plan.json")?;
+        let node = receiver.node;
         capture(
             context,
             fault,
             ExchangeFaultAction::CutGrantSubscription,
-            None,
+            Some(node),
         )?;
         jobs.push(QueryJob::start(
             context,
             self.intent.take(0)?,
             settings(false, 120),
         )?);
-        let candidate = bind_candidate(context, fault, &jobs[0])?;
+        let candidate = bind_candidate(context, fault, &jobs[0], &receiver)?;
         let original = candidate
             .target
             .generation()
@@ -1457,11 +1681,12 @@ impl ExchangeFlow {
         evidence: &mut Value,
     ) -> Result<()> {
         let plan = explain(context, &join_sql(), true)?;
-        let node = build_receiver_node(&plan)?;
+        let receiver = plan.build_receiver(true)?;
+        let node = receiver.node;
         retain(
             context,
             "exchange-long-wait-plan.json",
-            &json!({"sql":join_sql(),"plan":plan,"held_build_node":node}),
+            &json!({"sql":join_sql(),"plan":plan,"receiver":receiver}),
         )?;
         capture(
             context,
@@ -1474,7 +1699,7 @@ impl ExchangeFlow {
             self.intent.take(0)?,
             settings(true, 120),
         )?);
-        let candidate = bind_candidate(context, fault, &jobs[0])?;
+        let candidate = bind_candidate(context, fault, &jobs[0], &receiver)?;
         let pressure = await_pressure(context, fault)?;
         let park = hold_parked(context, fault, &candidate)?;
         ensure!(
@@ -1505,7 +1730,7 @@ impl ExchangeFlow {
             self.intent.take(1)?,
             settings(true, 1),
         )?);
-        let deadline_candidate = bind_candidate(context, fault, &jobs[1])?;
+        let deadline_candidate = bind_candidate(context, fault, &jobs[1], &receiver)?;
         let deadline = jobs[1].finish(context, Outcome::Deadline)?;
         let held = fault.exchange_observation();
         ensure!(
@@ -1528,11 +1753,12 @@ impl ExchangeFlow {
         evidence: &mut Value,
     ) -> Result<()> {
         let plan = explain(context, &join_sql(), true)?;
-        let node = build_receiver_node(&plan)?;
+        let receiver = plan.build_receiver(true)?;
+        let node = receiver.node;
         retain(
             context,
             "exchange-control-plan.json",
-            &json!({"sql":join_sql(),"plan":plan,"held_build_node":node}),
+            &json!({"sql":join_sql(),"plan":plan,"receiver":receiver}),
         )?;
         capture(
             context,
@@ -1545,7 +1771,7 @@ impl ExchangeFlow {
             self.intent.take(0)?,
             settings(true, 120),
         )?);
-        let candidate = bind_candidate(context, fault, &jobs[0])?;
+        let candidate = bind_candidate(context, fault, &jobs[0], &receiver)?;
         let pressure = await_pressure(context, fault)?;
         short_query(context)?;
         jobs.push(QueryJob::start(
@@ -1600,7 +1826,7 @@ mod tests {
             ("exchange_stream_window", 2),
             ("exchange_transport_timeout_ms", 1000),
             ("exchange_io_max_inflight_bytes", 262144),
-            ("exchange_max_transmit_batched_bytes", 32768),
+            ("exchange_max_transmit_batched_bytes", 8192),
         ];
         for (name, value) in fields {
             assert_eq!(
@@ -1615,7 +1841,151 @@ mod tests {
             expected["runtime"].as_table_mut().unwrap().remove(name);
         }
         assert_eq!(actual, expected);
-        assert!(configured.native_root_reply_fault.is_some());
+        assert_eq!(
+            configured.native_root_reply_fault.unwrap().backend_indices,
+            configured
+                .native_fault_proxies
+                .backend_retained_byte_limits
+                .into_keys()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn physical_tree_display_ids_never_supply_frozen_receiver_identity() {
+        // The physical tree is the gather shape captured by p10-native03.
+        // Its global display ordinal 1 is not an original fragment node ID.
+        let tree = "PLAN FRAGMENT 0\n  OUTPUT EXPRS: *\n  STAGE PLACEMENT: singleton\n  DRIVER DOMAIN: min=1, max=5, power-of-two=false\n  PARTITION: UNPARTITIONED\n0:SORT BY [k ASC NULLS FIRST] stats={rows=24576}\n  1:GATHER stats={rows=24576}\nPLAN FRAGMENT 1\n  OUTPUT EXPRS: *\n  STAGE PLACEMENT: scan-work\n  DRIVER DOMAIN: min=1, max=5, power-of-two=false\n  PARTITION: UNPARTITIONED\n  STREAM DATA SINK\n    EXCHANGE ID: 1\n    PARTITION: UNPARTITIONED\n2:PROJECT [k] stats={rows=24576}\n  3:SCAN native_flow.rows stats={rows=24576}\n";
+        // CONTRACT uses the separate completed.rs renderer's original IDs,
+        // original edge identity and explicit fragment/depth fields.
+        let contract = "PHYSICAL PLAN version=01, contract-revision=1\nEDGE GRAPH\n  edge7 kind=relational source={fragment=f1, projection=[v1], distribution=unconstrained, multiplicity=single-copy} destination={fragment=f0, node=n0, mapping=[f1.v1->f0.v2], distribution=singleton, multiplicity=single-copy}\nSORT [fragment=0, node=1, depth=0]\n  EXCHANGE (EXCHANGE ID: 7) [fragment=0, node=0, depth=1]\n    edge=7, imports=[v1->v2]\nSCAN native_flow.rows [fragment=1, node=0, depth=0]\n";
+        let plan = ExplainedPlan::new(tree.into(), contract.into()).unwrap();
+        let selected = plan.gather_receiver().unwrap();
+        assert_eq!(selected.node, 0);
+        assert_eq!(
+            (
+                selected.destination_fragment,
+                selected.edge,
+                selected.source_fragment
+            ),
+            (0, 7, 1)
+        );
+        assert!(ExplainedPlan::new(tree.into(), tree.into()).is_err());
+        assert!(ExplainedPlan::new(contract.into(), tree.into()).is_err());
+        assert!(
+            ExplainedPlan::new(
+                tree.into(),
+                "PHYSICAL PLAN version=01, contract-revision=1".into()
+            )
+            .is_err()
+        );
+        assert!(
+            ExplainedPlan::new(tree.into(), contract.replace("edge7 kind=", "edge8 kind="))
+                .unwrap()
+                .gather_receiver()
+                .is_err()
+        );
+        assert!(
+            ExplainedPlan::new(
+                tree.replace("1:GATHER", "1:BROADCAST EXCHANGE"),
+                contract.into()
+            )
+            .unwrap()
+            .gather_receiver()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn contract_build_selection_preserves_original_side_edge_and_fragment() {
+        // This is the partitioned tree captured by p10-native03. It contains
+        // no frozen build-side field and cannot supply a protocol identity.
+        let tree = "PLAN FRAGMENT 0\n0:GATHER stats={rows=24648}\nPLAN FRAGMENT 1\n  STREAM DATA SINK\n    EXCHANGE ID: 0\n    PARTITION: UNPARTITIONED\n1:PROJECT [p.k] stats={rows=24648}\n  2:HASH JOIN (PARTITIONED, INNER, eq: [p.k = b.k]) stats={rows=24648}\n    3:HASH EXCHANGE\n    4:HASH EXCHANGE\nPLAN FRAGMENT 2\n  STREAM DATA SINK\n    EXCHANGE ID: 3\n    PARTITION: HASH_PARTITIONED (p.k)\n5:SCAN native_flow.rows (alias=p) stats={rows=24576}\nPLAN FRAGMENT 3\n  STREAM DATA SINK\n    EXCHANGE ID: 4\n    PARTITION: HASH_PARTITIONED (b.k)\n6:SCAN native_flow.rows (alias=b) stats={rows=24576}\n";
+        let contract = "PHYSICAL PLAN version=01, contract-revision=1\nEDGE GRAPH\n edge10 kind=relational source={fragment=f1, projection=[v1]} destination={fragment=f0, node=n0, distribution=singleton, multiplicity=single-copy}\n edge11 kind=relational source={fragment=f2, projection=[v1]} destination={fragment=f1, node=n0, distribution=hash, multiplicity=single-copy}\n edge12 kind=relational source={fragment=f3, projection=[v1]} destination={fragment=f1, node=n1, distribution=hash, multiplicity=single-copy}\nEXCHANGE (EXCHANGE ID: 10) [fragment=0, node=0, depth=0]\nPROJECT [fragment=1, node=3, depth=0]\n HASH JOIN (PARTITIONED, INNER) [fragment=1, node=2, depth=1]\n  kind=INNER, build-side=right, distribution=PARTITIONED\n  HASH EXCHANGE (EXCHANGE ID: 11) [fragment=1, node=0, depth=2]\n  HASH EXCHANGE (EXCHANGE ID: 12) [fragment=1, node=1, depth=2]\nSCAN native_flow.rows [fragment=2, node=0, depth=0]\nSCAN native_flow.rows [fragment=3, node=0, depth=0]\n";
+        let plan = ExplainedPlan::new(tree.into(), contract.into()).unwrap();
+        let selected = plan.build_receiver(true).unwrap();
+        assert_eq!(
+            (
+                selected.destination_fragment,
+                selected.node,
+                selected.edge,
+                selected.source_fragment
+            ),
+            (1, 1, 12, 3)
+        );
+        assert!(plan.build_receiver(false).is_err());
+        assert!(build_receiver_node(tree).is_err());
+        assert!(
+            ExplainedPlan::new(
+                tree.into(),
+                contract.replace("build-side=right", "missing-side=right")
+            )
+            .unwrap()
+            .build_receiver(true)
+            .is_err()
+        );
+        // Node 0 exists in two receiver fragments. A local node selector is
+        // insufficient here; do not guess StageId from either display view.
+        assert!(
+            ExplainedPlan::new(
+                tree.into(),
+                contract.replace("build-side=right", "build-side=left")
+            )
+            .unwrap()
+            .build_receiver(true)
+            .is_err()
+        );
+        let left = contract
+            .replace("build-side=right", "build-side=left")
+            .replace("fragment=f0, node=n0", "fragment=f0, node=n9")
+            .replace(
+                "[fragment=0, node=0, depth=0]",
+                "[fragment=0, node=9, depth=0]",
+            );
+        let selected = ExplainedPlan::new(tree.into(), left)
+            .unwrap()
+            .build_receiver(true)
+            .unwrap();
+        assert_eq!(
+            (
+                selected.destination_fragment,
+                selected.node,
+                selected.edge,
+                selected.source_fragment
+            ),
+            (1, 0, 11, 2)
+        );
+    }
+
+    #[test]
+    fn gather_selection_requires_the_exact_singleton_edge_and_global_sort_input() {
+        let edge = "edge7 kind=relational source={fragment=f1, projection=[v1], distribution=unconstrained, multiplicity=single-copy} destination={fragment=f0, node=n42, mapping=[f1.v1->f0.v2], distribution=singleton, multiplicity=single-copy}\n";
+        let tree = "SORT [fragment=0, node=9, depth=0]\n EXCHANGE (EXCHANGE ID: 7) [fragment=0, node=42, depth=1]\nSCAN native_flow.rows [fragment=1, node=1, depth=0]\n";
+        let plan = format!("{edge}{tree}");
+        assert_eq!(singleton_receiver_node(&plan).unwrap(), 42);
+        // A singleton source is not authority for a broadcast destination.
+        let broadcast = edge
+            .replace("distribution=unconstrained", "distribution=singleton")
+            .replace(
+                "mapping=[f1.v1->f0.v2], distribution=singleton",
+                "mapping=[f1.v1->f0.v2], distribution=broadcast",
+            );
+        assert!(singleton_receiver_node(&format!("{broadcast}{tree}")).is_err());
+        assert!(singleton_receiver_node(&plan.replace("node=n42", "node=n43")).is_err());
+        assert!(
+            singleton_receiver_node(
+                &plan.replace("fragment=f0, node=n42", "fragment=f2, node=n42")
+            )
+            .is_err()
+        );
+        assert!(singleton_receiver_node(&plan.replace("SORT [", "PROJECT [")).is_err());
+        assert!(singleton_receiver_node(&format!("{edge}{plan}")).is_err());
+        assert!(singleton_receiver_node("PROJECT [fragment=0, node=0, depth=0]\nSCAN native_flow.rows [fragment=0, node=1, depth=1]\n").is_err());
+        let unrelated = tree.replace(
+            "SORT [fragment=0, node=9, depth=0]\n",
+            "PROJECT [fragment=0, node=8, depth=0]\n SORT [fragment=0, node=9, depth=1]\n PROJECT [fragment=0, node=10, depth=1]\n",
+        ).replace("node=42, depth=1", "node=42, depth=2");
+        assert!(singleton_receiver_node(&format!("{edge}{unrelated}")).is_err());
     }
 
     #[test]

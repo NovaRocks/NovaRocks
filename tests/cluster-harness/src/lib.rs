@@ -1045,6 +1045,14 @@ impl BackendNativeFaultProxies {
             proxy.stop();
         }
         let mut failures = Vec::new();
+        if !self.root_reply_proxies.is_empty()
+            && let Err(error) =
+                RootReplyFaultProxy::retire_joined_group(self.root_reply_proxies.values())
+        {
+            failures.push(format!(
+                "retire original joined RootReply capture: {error:#}"
+            ));
+        }
         for (index, proxy) in &self.root_reply_proxies {
             let observed = proxy.control().observation();
             if !observed.shutdown_joined
@@ -1059,7 +1067,8 @@ impl BackendNativeFaultProxies {
                 || observed.failure_overflow
             {
                 failures.push(format!(
-                    "RootReply actor BE[{index}] failed its explicit join barrier"
+                    "RootReply actor BE[{index}] failed its explicit join barrier: {observed:?}; exchange={:?}",
+                    proxy.control().exchange_observation()
                 ));
             }
         }
@@ -4572,8 +4581,10 @@ impl CrossProcessServerHandle {
             .ok_or_else(|| anyhow::anyhow!("RootReply fault actor is not enabled for BE[{index}]"))
     }
 
-    /// Enable BE message faults only inside an existing authenticated test session.
+    /// Bind BE message inspection inside an existing authenticated test session.
     /// Live membership binds both the advertised subject and the exact process.
+    /// Call before seed or Task traffic: each live subscription keeps the decoder
+    /// chosen when its RPC starts. Binding does not begin or arm a fault capture.
     pub fn native_exchange_fault(&self, index: usize) -> Result<RootReplyFaultControl> {
         let session_deadline = self
             .test_sessions

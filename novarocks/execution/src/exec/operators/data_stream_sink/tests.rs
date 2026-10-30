@@ -62,6 +62,8 @@ fn make_test_operator(fixture: &Fixture) -> DataStreamSinkOperator {
         end_of_stream_sent: AtomicBool::new(false),
         send_observable: send_group.observable().clone(),
         error_state: Some(fixture.state().error_state()),
+        #[cfg(novarocks_dev_controls)]
+        writer_diagnostics: None,
         finish_state: Arc::new(DataStreamSinkFinishState::default()),
         profile_initialized: false,
         profiles: None,

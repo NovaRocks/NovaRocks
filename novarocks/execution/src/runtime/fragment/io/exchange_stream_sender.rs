@@ -518,6 +518,22 @@ impl ExchangeStreamSender {
         }
     }
 
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn try_diagnostic_snapshot(&self) -> Option<ExchangeStreamSenderSnapshot> {
+        let state = self.state.try_lock().ok()?;
+        Some(ExchangeStreamSenderSnapshot {
+            retention: state.kernel.snapshot(),
+            status: state.status,
+            pending_grant: state.pending.map(|sequence| {
+                ExchangeUnitSequence::try_new(sequence).expect("published sequence")
+            }),
+            granted_through: state.granted,
+            active_calls: state.active.len(),
+            watching: state.watching,
+            stop_obligation: state.stop_obligation,
+        })
+    }
+
     /// Borrows the driver-owned payload and retains a shared reference only on
     /// publication. Backpressured is normal flow control: it consumes no sequence
     /// and changes no failure state. The driver keeps the payload and waits for

@@ -1186,70 +1186,67 @@ impl novarocks_execution::runtime::exchange::TestEventObserver for RealUnitDecod
 }
 
 #[cfg(novarocks_dev_controls)]
-#[tokio::test]
-async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_decoder_failure() {
-    use crate::native_transport_admission::{NativeTransportAdmission, TransportClass};
-    use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
-    use novarocks_execution::exec::pipeline::operator::InputConstructionFactory;
-    use novarocks_execution::runtime::exchange::{
-        ExchangeColumnBinding, ExchangeKey, encode_chunks,
-    };
+struct RealUnitCompileControl;
+#[cfg(novarocks_dev_controls)]
+impl novarocks_type_contract::PureCompileControl for RealUnitCompileControl {
+    fn checkpoint(
+        &self,
+        _: novarocks_type_contract::CompilePhase,
+        _: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
+    }
+}
+#[cfg(novarocks_dev_controls)]
+fn real_unit_schema(
+    factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
+    ty: arrow::datatypes::DataType,
+) -> novarocks_execution::exec::chunk::ChunkSchemaRef {
+    let binding = novarocks_type_contract::FunctionValueType::new(ty.clone(), false);
+    let declaration = novarocks_local_program::StaticLayout::try_new_typed_for_compile(
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("v", ty, false),
+        ])),
+        Arc::from([novarocks_types::SlotId::new(1)]),
+        vec![(binding.typed_binding().clone(), None)],
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        |_| Ok(()),
+        &RealUnitCompileControl,
+    )
+    .unwrap();
+    factory.create_compiled_chunk_schema(&declaration).unwrap()
+}
+
+#[cfg(novarocks_dev_controls)]
+struct RealUnitReceiverFixture {
+    stream: ExchangeStreamIdentity,
+    execution: Arc<novarocks_execution::runtime::execution_runtime::ExecutionRuntime>,
+    owner: Arc<novarocks_worker::TaskStatusOwner>,
+    failure: Arc<novarocks_execution::runtime::runtime_state::RuntimeErrorState>,
+    factory: Arc<dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory>,
+    port: Arc<novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort>,
+    key: ExchangeReceiverKey,
+    registry_key: novarocks_execution::runtime::exchange::ExchangeKey,
+    descriptor: Arc<novarocks_execution_contract::TaskDescriptor>,
+}
+
+#[cfg(novarocks_dev_controls)]
+fn real_unit_receiver_fixture(
+    delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
+) -> RealUnitReceiverFixture {
+    use novarocks_execution::runtime::exchange::{ExchangeColumnBinding, ExchangeKey};
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntime, ExecutionRuntimeConfig,
     };
     use novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort;
     use novarocks_execution::runtime::runtime_state::RuntimeErrorState;
     use novarocks_execution::runtime::task_control::TaskExecutionControl;
-    use novarocks_execution_contract::ordered_retained_stream::exchange::{
-        ExchangeAdmissionVerdict, ExchangeUnitDemand, ExchangeUnitItem,
-    };
     use novarocks_execution_contract::{
-        ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeInbound, ExchangeTopology,
-        TaskConclusionPort, TaskDescriptor, TaskFailurePhase,
+        ExchangeInbound, ExchangeTopology, TaskDescriptor, TaskFailurePhase,
     };
-    use novarocks_native_trust::{NativeIncomingAdapter, NativeProcessIdentity};
-    use novarocks_proto_codec::native_rpc::NativeEndpointDomain;
     use novarocks_worker::{
         METRIC_PUBLISH_MIN_INTERVAL, ProcessMonotonicClock, TaskStatusOwner, TaskStatusSource,
     };
-
-    struct Control;
-    impl novarocks_type_contract::PureCompileControl for Control {
-        fn checkpoint(
-            &self,
-            _: novarocks_type_contract::CompilePhase,
-            _: u32,
-        ) -> Result<(), novarocks_type_contract::CompileControlError> {
-            Ok(())
-        }
-    }
-    fn schema(
-        factory: &dyn InputConstructionFactory,
-        ty: arrow::datatypes::DataType,
-    ) -> ChunkSchemaRef {
-        let binding = novarocks_type_contract::FunctionValueType::new(ty.clone(), false);
-        let declaration = novarocks_local_program::StaticLayout::try_new_typed_for_compile(
-            Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("v", ty, false),
-            ])),
-            Arc::from([novarocks_types::SlotId::new(1)]),
-            vec![(binding.typed_binding().clone(), None)],
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            |_| Ok(()),
-            &Control,
-        )
-        .unwrap();
-        factory.create_compiled_chunk_schema(&declaration).unwrap()
-    }
-    // If an assertion unwinds, release the actual blocking handler before the
-    // Native server's own Drop joins it. This does not author receiver closure.
-    struct ReleaseDecode(Arc<DeliveryHold>);
-    impl Drop for ReleaseDecode {
-        fn drop(&mut self) {
-            self.0.release();
-        }
-    }
-
     let base = base_stream();
     let stream = ExchangeStreamIdentity::try_new(
         ExchangeSource::new(
@@ -1313,49 +1310,21 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
     port.register(ExchangeReceiverRegistration {
         key,
         expected_senders: 1,
-        expected_chunk_schema: schema(factory.as_ref(), arrow::datatypes::DataType::Int64),
+        expected_chunk_schema: real_unit_schema(
+            factory.as_ref(),
+            arrow::datatypes::DataType::Int64,
+        ),
         column_binding: ExchangeColumnBinding::Positional,
         creation_factory: factory.clone(),
     })
     .unwrap();
     port.bind_unit_receiver(key, vec![stream], failure.clone(), 64 * 1024 * 1024)
         .unwrap();
-    let registry = execution.exchange_registry();
     let registry_key = ExchangeKey {
         finst_id_hi: key.fragment_instance_id.high(),
         finst_id_lo: key.fragment_instance_id.low(),
         node_id: key.node_id,
     };
-    let observation = Arc::new(RealUnitDecodeObservation::default());
-    registry
-        .install_test_observer(registry_key, observation.clone())
-        .unwrap();
-    let receiver = port.receiver_handle(key, 1).unwrap();
-    // An actual, well-formed IPC Int32 field violates the receiver's frozen
-    // Int64 declaration. The original reader, rather than a test callback,
-    // must reject it after the first RPC's outcome has become unknown.
-    let chunk = Chunk::try_new_with_columns(
-        schema(factory.as_ref(), arrow::datatypes::DataType::Int32),
-        vec![Arc::new(arrow::array::Int32Array::from(vec![7]))],
-    )
-    .unwrap();
-    let payload = Bytes::from(encode_chunks(&[chunk], true).unwrap());
-    let demand = ExchangeUnitDemand {
-        sequence: ExchangeUnitSequence::FIRST,
-        wire_bytes: payload.len() as u64,
-    };
-    let frame = codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
-        stream,
-        sender_count: 1,
-        sender_id: 0,
-        backend_number: 0,
-        item: ExchangeUnitItem::Unit {
-            demand,
-            end_after_unit: false,
-        },
-        payload,
-        next_demand: None,
-    });
     let descriptor = TaskDescriptor::try_new(
         stream.destination(),
         key.fragment_instance_id,
@@ -1367,7 +1336,7 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
                 ExchangeInbound::try_new(
                     stream.destination_node(),
                     vec![stream.source()],
-                    ExchangeDeliveryRequirement::MustDrain,
+                    delivery,
                 )
                 .unwrap(),
             ],
@@ -1375,8 +1344,34 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
         .unwrap(),
     )
     .unwrap();
+    RealUnitReceiverFixture {
+        stream,
+        execution,
+        owner,
+        failure,
+        factory,
+        port,
+        key,
+        registry_key,
+        descriptor: Arc::new(descriptor),
+    }
+}
+
+#[cfg(novarocks_dev_controls)]
+fn start_real_unit_receiver_service(
+    stream: ExchangeStreamIdentity,
+    port: Arc<novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort>,
+    descriptor: Arc<novarocks_execution_contract::TaskDescriptor>,
+) -> (
+    crate::NativeRpcServerHandle,
+    Arc<NativeRpcClient>,
+    Arc<novarocks_worker::TaskInboundCapabilities>,
+) {
+    use crate::native_transport_admission::{NativeTransportAdmission, TransportClass};
+    use novarocks_native_trust::{NativeIncomingAdapter, NativeProcessIdentity};
+    use novarocks_proto_codec::native_rpc::NativeEndpointDomain;
     let capabilities = novarocks_worker::TaskInboundCapabilities::new();
-    capabilities.install(Arc::new(descriptor)).unwrap();
+    capabilities.install(descriptor).unwrap();
     let trust = crate::backend_test_support::test_backend_native_trust();
     trust
         .bind_process_identity(NativeProcessIdentity::Backend(
@@ -1404,7 +1399,7 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
         Arc::new(UnusedIngress),
         Arc::new(UnusedIngress),
         port.clone(),
-        capabilities,
+        capabilities.clone(),
         crate::backend_heartbeat::BackendHeartbeatResponder::new(
             backend,
             Arc::new(novarocks_worker::WorkerDrainState::new()),
@@ -1412,7 +1407,7 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
         ),
         crate::native_control_executor::NativeControlExecutor::start(1, 4).unwrap(),
     );
-    let mut server = crate::NativeRpcServerHandle::start_with_admission(
+    let server = crate::NativeRpcServerHandle::start_with_admission(
         "127.0.0.1",
         0,
         service,
@@ -1432,7 +1427,6 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
         None,
     )
     .unwrap();
-    let release_on_exit = ReleaseDecode(observation.hold.clone());
     let runtime = BackendDataRuntime::new(
         tokio::runtime::Handle::current(),
         trust,
@@ -1445,6 +1439,75 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
             .clone(),
         stream.destination().backend_process_id(),
     ));
+    (server, client, capabilities)
+}
+
+#[cfg(novarocks_dev_controls)]
+#[tokio::test]
+async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_decoder_failure() {
+    use novarocks_execution::exec::chunk::Chunk;
+    use novarocks_execution::runtime::exchange::encode_chunks;
+    use novarocks_execution_contract::ordered_retained_stream::exchange::{
+        ExchangeAdmissionVerdict, ExchangeUnitDemand, ExchangeUnitItem,
+    };
+    use novarocks_execution_contract::{
+        ExchangeCloseDisposition, ExchangeDeliveryRequirement, TaskConclusionPort,
+    };
+
+    // If an assertion unwinds, release the actual blocking handler before the
+    // Native server's own Drop joins it. This does not author receiver closure.
+    struct ReleaseDecode(Arc<DeliveryHold>);
+    impl Drop for ReleaseDecode {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    let RealUnitReceiverFixture {
+        stream,
+        execution,
+        owner,
+        failure,
+        factory,
+        port,
+        key,
+        registry_key,
+        descriptor,
+    } = real_unit_receiver_fixture(ExchangeDeliveryRequirement::MustDrain);
+    let registry = execution.exchange_registry();
+    let observation = Arc::new(RealUnitDecodeObservation::default());
+    registry
+        .install_test_observer(registry_key, observation.clone())
+        .unwrap();
+    let receiver = port.receiver_handle(key, 1).unwrap();
+    // An actual, well-formed IPC Int32 field violates the receiver's frozen
+    // Int64 declaration. The original reader, rather than a test callback,
+    // must reject it after the first RPC's outcome has become unknown.
+    let chunk = Chunk::try_new_with_columns(
+        real_unit_schema(factory.as_ref(), arrow::datatypes::DataType::Int32),
+        vec![Arc::new(arrow::array::Int32Array::from(vec![7]))],
+    )
+    .unwrap();
+    let payload = Bytes::from(encode_chunks(&[chunk], true).unwrap());
+    let demand = ExchangeUnitDemand {
+        sequence: ExchangeUnitSequence::FIRST,
+        wire_bytes: payload.len() as u64,
+    };
+    let frame = codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
+        stream,
+        sender_count: 1,
+        sender_id: 0,
+        backend_number: 0,
+        item: ExchangeUnitItem::Unit {
+            demand,
+            end_after_unit: false,
+        },
+        payload,
+        next_demand: None,
+    });
+    let (mut server, client, _capabilities) =
+        start_real_unit_receiver_service(stream, port.clone(), descriptor);
+    let release_on_exit = ReleaseDecode(observation.hold.clone());
     let result = tokio::time::timeout(Duration::from_secs(8), async {
         let reply = client.register_exchange_demand_async(codec::encode_demand_request(&[
             codec::DecodedExchangeDemandEntry { stream, operation: codec::ExchangeDemandOperation::Demand(demand) },
@@ -1482,4 +1545,126 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
     port.cancel(key);
     server.stop().unwrap();
     result.expect("real native decoder regression exceeded its failure watchdog");
+}
+
+#[cfg(novarocks_dev_controls)]
+#[tokio::test]
+async fn authenticated_tonic_stop_before_first_demand_fences_the_real_frozen_receiver() {
+    use novarocks_execution::exec::chunk::Chunk;
+    use novarocks_execution::runtime::exchange::encode_chunks;
+    use novarocks_execution_contract::ordered_retained_stream::exchange::{
+        ExchangeAdmissionVerdict, ExchangeUnitDemand, ExchangeUnitItem,
+    };
+    use novarocks_execution_contract::{
+        ExchangeCloseDisposition, ExchangeDeliveryRequirement, TaskConclusionPort, TaskIdentity,
+    };
+
+    async fn demand(
+        client: &NativeRpcClient,
+        stream: ExchangeStreamIdentity,
+        operation: codec::ExchangeDemandOperation,
+    ) -> Result<ExchangeStreamFacts, FailureFact> {
+        let entry = codec::DecodedExchangeDemandEntry { stream, operation };
+        let response = client
+            .register_exchange_demand_async(
+                codec::encode_demand_request(&[entry], FieldPath::root("real_stop_test")).unwrap(),
+                Duration::from_secs(2),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        codec::decode_demand_response(&response, &[stream], FieldPath::root("real_stop_test"))
+            .unwrap()[0]
+            .outcome
+    }
+
+    let fixture = real_unit_receiver_fixture(ExchangeDeliveryRequirement::DemandDriven);
+    let stream = fixture.stream;
+    let registry = fixture.execution.exchange_registry();
+    let receiver = fixture.port.receiver_handle(fixture.key, 1).unwrap();
+    let (mut server, client, capabilities) =
+        start_real_unit_receiver_service(stream, fixture.port.clone(), fixture.descriptor.clone());
+    let result = tokio::time::timeout(Duration::from_secs(8), async {
+        let initial = registry.unit_sender_states(stream.source().task().backend_process_id(), None, 2);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].stream, stream);
+        assert_eq!(initial[0].facts, facts(0, 0));
+
+        // This authenticated call is the first operation on the exact stream:
+        // registration froze its receipt, but no demand or unit has existed.
+        let stopped = demand(&client, stream, codec::ExchangeDemandOperation::StopSender).await.unwrap();
+        assert_eq!(stopped, ExchangeStreamFacts { sender_stopped: true, ..facts(0, 0) });
+        let chunk = Chunk::try_new_with_columns(
+            real_unit_schema(fixture.factory.as_ref(), arrow::datatypes::DataType::Int64),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![7]))],
+        ).unwrap();
+        let payload = Bytes::from(encode_chunks(&[chunk], true).unwrap());
+        let first = ExchangeUnitDemand { sequence: ExchangeUnitSequence::FIRST, wire_bytes: payload.len() as u64 };
+        assert_eq!(demand(&client, stream, codec::ExchangeDemandOperation::Demand(first)).await.unwrap(), stopped);
+        // A real valid IPC payload, and then an End, must not decode, publish
+        // rows, mint custody or pretend that this receiver consumed input.
+        for (item, payload) in [
+            (ExchangeUnitItem::Unit { demand: first, end_after_unit: false }, payload),
+            (ExchangeUnitItem::End(first.sequence.checked_next().unwrap()), Bytes::new()),
+        ] {
+            let response = client.deliver_exchange_unit_async(codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
+                stream, sender_count: 1, sender_id: 0, backend_number: 0, item, payload, next_demand: None,
+            }), Duration::from_secs(2), CancellationToken::new()).await.unwrap();
+            assert!(matches!(codec::decode_delivery_response(&response, stream, item.sequence(), FieldPath::root("real_stop_test")).unwrap(),
+                codec::DecodedExchangeDeliveryOutcome::Observed { verdict: ExchangeAdmissionVerdict::Idempotent, facts } if facts == stopped));
+        }
+        assert_eq!(demand(&client, stream, codec::ExchangeDemandOperation::StopSender).await.unwrap(), stopped);
+
+        // Authentication of a BE process does not grant another Task or node
+        // access to this receipt, even after its sender has stopped.
+        let original = stream.source().task();
+        let foreign_task = TaskIdentity::new(
+            original.query_execution_id(), original.stage_id(),
+            novarocks_types::TaskId::new(original.task_id().get().checked_add(1).unwrap()).unwrap(),
+            original.backend_process_id(),
+        );
+        let foreign = ExchangeStreamIdentity::try_new(
+            ExchangeSource::new(foreign_task, stream.source().fragment_instance_id(), stream.source().sender_ordinal()),
+            stream.destination(), stream.destination_fragment_instance_id(), stream.destination_node(),
+        ).unwrap();
+        for absent in [foreign, sibling(stream, stream.destination_node().get() as usize + 1)] {
+            assert!(demand(&client, absent, codec::ExchangeDemandOperation::StopSender).await.is_err());
+        }
+        assert_eq!(registry.unit_sender_states(original.backend_process_id(), None, 2), vec![ExchangeStreamObservation { stream, facts: stopped }]);
+        let flow = registry.try_flow_snapshot().expect("original real slot ledger is observable");
+        assert_eq!(flow.live_instances, 1);
+        assert_eq!((flow.in_use, flow.decoding, flow.pending_demands, flow.floating_in_use, flow.max_instance_in_use), (0, 0, 0, 0, 0));
+        let queue = fixture.port.snapshot(fixture.key).unwrap();
+        assert_eq!((queue.queued_chunks, queue.queued_rows, queue.finished_senders), (0, 0, 0));
+        assert!(!queue.canceled);
+        assert!(receiver.try_pop_next_with_stats(1).unwrap().is_none());
+        assert!(receiver.complete_input_consumption(1).is_err());
+        assert_eq!(fixture.port.stream_close_facts(fixture.key, &[stream]).unwrap()[0].disposition, ExchangeCloseDisposition::Withdrawn);
+        assert!(fixture.owner.accepted().is_none());
+        assert!(fixture.failure.error().is_none());
+
+        // The same real Worker retirement now wins before late requests.
+        // Its retained Withdrawn proof, rather than an absent queue, answers
+        // both Stop and Demand without inventing a Consumed prefix.
+        capabilities.close_normally_with_facts(
+            &fixture.descriptor,
+            fixture.port.stream_close_facts(fixture.key, &[stream]).unwrap(),
+            || fixture.port.remove(fixture.key),
+        ).unwrap();
+        for operation in [codec::ExchangeDemandOperation::StopSender, codec::ExchangeDemandOperation::Demand(first)] {
+            let closed = demand(&client, stream, operation).await.unwrap();
+            assert_eq!(closed.receiver_closed, Some(ExchangeCloseDisposition::Withdrawn));
+            assert_eq!((closed.custody_through, closed.granted_through), (0, 0));
+        }
+        let retired = registry.try_flow_snapshot().unwrap();
+        // The original receiver handle still pins the retired ledger. An
+        // empty slot census does not mean that this actual holder exited.
+        assert_eq!((retired.live_instances, retired.closed_instances), (1, 1));
+        assert_eq!((retired.in_use, retired.decoding, retired.pending_demands, retired.floating_in_use), (0, 0, 0, 0));
+        drop(receiver);
+        assert_eq!(registry.try_flow_snapshot().unwrap().live_instances, 0);
+    }).await;
+    fixture.port.cancel(fixture.key);
+    server.stop().unwrap();
+    result.expect("real native stop-before-demand regression exceeded its failure watchdog");
 }

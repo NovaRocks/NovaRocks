@@ -278,6 +278,8 @@ impl OperatorFactory for LogicalSummarySourceFactory {
             factory: None,
             emitted: false,
             failure,
+            #[cfg(novarocks_dev_controls)]
+            diagnostics: None,
         }))
     }
 }
@@ -288,6 +290,8 @@ struct SummarySource {
     factory: Option<Arc<dyn InputConstructionFactory>>,
     emitted: bool,
     failure: Option<ExecutionFailure>,
+    #[cfg(novarocks_dev_controls)]
+    diagnostics: Option<crate::runtime::writer_diagnostics::WriterDiagnostics>,
 }
 impl OperatorLifecycle for SummarySource {
     fn name(&self) -> &str {
@@ -295,6 +299,17 @@ impl OperatorLifecycle for SummarySource {
     }
     fn creates_typed_storage(&self) -> bool {
         true
+    }
+    fn bind_runtime_state(
+        &mut self,
+        _state: &crate::runtime::runtime_state::RuntimeState,
+    ) -> ExecutionResult<()> {
+        #[cfg(novarocks_dev_controls)]
+        {
+            self.diagnostics =
+                crate::runtime::writer_diagnostics::WriterDiagnostics::from_runtime(_state);
+        }
+        Ok(())
     }
     fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
         self.factory = Some(factory);
@@ -318,6 +333,31 @@ impl SourceKernel for SummarySource {
     }
     fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         ctx.checkpoint()?;
+        #[cfg(novarocks_dev_controls)]
+        if let Some(scope) = &self.diagnostics {
+            scope.emit("summary_source_poll", || {
+                let reduction = self
+                    .state
+                    .inner
+                    .try_lock()
+                    .ok()
+                    .map(|state| {
+                        format!(
+                            "remaining={} contributors={:?} failed={} output_claimed={}",
+                            state.remaining,
+                            state.contributors,
+                            state.failure.is_some(),
+                            state.output_claimed
+                        )
+                    })
+                    .unwrap_or_else(|| "unavailable".into());
+                format!(
+                    "emitted={} generation={} reduction={reduction}",
+                    self.emitted,
+                    self.state.observable.generation()
+                )
+            });
+        }
         if self.emitted {
             return Ok(StepResult::new(None, NextStep::Finished, 0));
         }
@@ -347,6 +387,10 @@ impl SourceKernel for SummarySource {
                 .ok_or(ConstructionFailure::MissingOwner)?,
         )?;
         self.emitted = true;
+        #[cfg(novarocks_dev_controls)]
+        if let Some(scope) = &self.diagnostics {
+            scope.emit("summary_source_emitted", || format!("counts={counts:?}"));
+        }
         Ok(StepResult::new(Some(output), NextStep::Finished, 0))
     }
 }
@@ -472,6 +516,8 @@ pub(crate) struct SourceBoundSummaryInput {
     layout: StaticLayout,
     schema: Option<ChunkSchemaRef>,
     ended: bool,
+    #[cfg(novarocks_dev_controls)]
+    diagnostics: Option<crate::runtime::writer_diagnostics::WriterDiagnostics>,
 }
 impl SourceBoundSummaryInput {
     pub(crate) fn new(
@@ -490,6 +536,8 @@ impl SourceBoundSummaryInput {
             layout,
             schema: None,
             ended: false,
+            #[cfg(novarocks_dev_controls)]
+            diagnostics: None,
         })
     }
     pub(crate) fn prepare(
@@ -503,6 +551,13 @@ impl SourceBoundSummaryInput {
     }
     pub(crate) fn layout(&self) -> &StaticLayout {
         &self.layout
+    }
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn bind_diagnostics(
+        &mut self,
+        scope: Option<crate::runtime::writer_diagnostics::WriterDiagnostics>,
+    ) {
+        self.diagnostics = scope;
     }
     pub(crate) fn sources(&self) -> ExecutionResult<Arc<SummarySourceIndex>> {
         self.index
@@ -554,6 +609,15 @@ impl SourceBoundSummaryInput {
                 }
                 let counts = LogicalChangeCounts::try_from_wire(wire[0], wire[1], wire[2])
                     .map_err(|e| summary_failure(SummaryFailure::Count(e)))?;
+                #[cfg(novarocks_dev_controls)]
+                if let Some(scope) = &self.diagnostics {
+                    scope.emit("summary_input_handoff", || {
+                        format!(
+                            "source={source:?} counts={counts:?} expected={:?}",
+                            self.expected
+                        )
+                    });
+                }
                 Ok(SummaryRead::Summary(SourceBoundSummary { source, counts }))
             }
             Some(SourcedExchangePopResult::Finished(_)) => {
@@ -561,14 +625,28 @@ impl SourceBoundSummaryInput {
                     .complete_input_consumption(self.expected.len())
                     .map_err(|e| e.into_execution())?;
                 self.ended = true;
+                #[cfg(novarocks_dev_controls)]
+                if let Some(scope) = &self.diagnostics {
+                    scope.emit("summary_input_consumed", || {
+                        format!("expected={:?}", self.expected)
+                    });
+                }
                 Ok(SummaryRead::End)
             }
-            None => Ok(SummaryRead::Pending(WaitFact {
-                reason: WaitReason::Input,
-                observable: event,
-                observed_generation: generation,
-                deadline: None,
-            })),
+            None => {
+                #[cfg(novarocks_dev_controls)]
+                if let Some(scope) = &self.diagnostics {
+                    scope.emit("summary_input_wait", || {
+                        format!("generation={generation} expected={:?}", self.expected)
+                    });
+                }
+                Ok(SummaryRead::Pending(WaitFact {
+                    reason: WaitReason::Input,
+                    observable: event,
+                    observed_generation: generation,
+                    deadline: None,
+                }))
+            }
         }
     }
 }

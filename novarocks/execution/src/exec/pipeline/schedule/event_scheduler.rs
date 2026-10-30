@@ -899,6 +899,8 @@ impl EventScheduler {
             && task.source_name().contains("EXCHANGE");
         #[cfg(novarocks_dev_controls)]
         let exchange_source_name = emit_exchange_marker.then(|| task.source_name().to_owned());
+        #[cfg(novarocks_dev_controls)]
+        let writer_diagnostic = task.writer_diagnostic();
         let key = DriverKey::new(task.fragment_instance_id(), task.driver_id());
         let block_epoch = self
             .next_block_epoch
@@ -969,6 +971,14 @@ impl EventScheduler {
                     )
                 },
             );
+        }
+
+        #[cfg(novarocks_dev_controls)]
+        if let Some((scope, source, sink)) = writer_diagnostic {
+            scope.emit("driver_park", || format!(
+                "finst={:?} driver_id={} source={source:?} sink={sink:?} reason={reason:?} frozen_generation={generation} current_generation={} block_epoch={block_epoch}",
+                key.finst, key.driver_id, observable.generation()
+            ));
         }
 
         // Registration can race with a transition that already made the task
@@ -1229,9 +1239,25 @@ impl EventScheduler {
     fn try_schedule_key(self: &Arc<Self>, key: DriverKey) {
         #[cfg(novarocks_dev_controls)]
         let mut exchange_marker = None;
+        #[cfg(novarocks_dev_controls)]
+        let mut writer_marker = None;
         let task = {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
             let entry = blocked.remove(&key);
+            #[cfg(novarocks_dev_controls)]
+            if let Some(entry) = entry.as_ref()
+                && let Some(scope) = entry.task.writer_diagnostic()
+            {
+                let generations = entry
+                    .observable
+                    .as_ref()
+                    .and_then(|(observable, generation)| {
+                        observable
+                            .upgrade()
+                            .map(|observable| (*generation, observable.generation()))
+                    });
+                writer_marker = Some((scope, generations, entry.block_epoch));
+            }
             #[cfg(novarocks_dev_controls)]
             if let Some(entry) = entry.as_ref()
                 && entry.task.source_name().contains("EXCHANGE")
@@ -1283,6 +1309,13 @@ impl EventScheduler {
                     )
                 },
             );
+        }
+        #[cfg(novarocks_dev_controls)]
+        if let Some(((scope, source, sink), generations, epoch)) = writer_marker {
+            scope.emit("driver_wake", || format!(
+                "finst={:?} driver_id={} source={source:?} sink={sink:?} generations={generations:?} block_epoch={epoch}",
+                key.finst, key.driver_id
+            ));
         }
         let Some((mut task, origin)) = task else {
             return;

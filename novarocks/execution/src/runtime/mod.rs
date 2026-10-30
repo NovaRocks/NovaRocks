@@ -26,6 +26,8 @@ pub mod scan_stream_metrics;
 pub mod table_writer_metrics;
 pub mod task_control;
 pub(crate) mod tracked_state_allocator;
+#[cfg(novarocks_dev_controls)]
+pub(crate) mod writer_diagnostics;
 
 pub use execution_runtime::{
     ExecutionRuntime, ExecutionRuntimeConfig, ExecutionRuntimeConfigError,

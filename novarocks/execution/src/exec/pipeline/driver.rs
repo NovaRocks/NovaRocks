@@ -1006,6 +1006,14 @@ impl PipelineDriver {
             .unwrap_or("unknown")
     }
 
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn sink_name(&self) -> &str {
+        self.operators
+            .last()
+            .map(|op| op.name())
+            .unwrap_or("unknown")
+    }
+
     /// Wait only on operations which can advance an unoccupied output edge or
     /// an actual input delivery. Independent continuations contribute a union
     /// of wake sources; an empty source cannot hide accepted downstream work.

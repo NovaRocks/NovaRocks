@@ -1758,6 +1758,8 @@ impl OperatorFactory for DataStreamSinkFactory {
             exiting: false,
             compiled_control: None,
             error_state: None,
+            #[cfg(novarocks_dev_controls)]
+            writer_diagnostics: None,
             finish_state: Arc::clone(&self.finish_state),
             profile_initialized: false,
             profiles: None,
@@ -1840,6 +1842,8 @@ struct DataStreamSinkOperator {
     end_of_stream_sent: AtomicBool,
     send_observable: Arc<Observable>,
     error_state: Option<Arc<RuntimeErrorState>>,
+    #[cfg(novarocks_dev_controls)]
+    writer_diagnostics: Option<crate::runtime::writer_diagnostics::WriterDiagnostics>,
     finish_state: Arc<DataStreamSinkFinishState>,
     profile_initialized: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
@@ -1900,6 +1904,11 @@ impl OperatorLifecycle for DataStreamSinkOperator {
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.error_state = Some(state.error_state());
+        #[cfg(novarocks_dev_controls)]
+        {
+            self.writer_diagnostics =
+                crate::runtime::writer_diagnostics::WriterDiagnostics::from_runtime(state);
+        }
         let mut control = RuntimeKernelControl::new(state.error_state());
         control.bind_runtime_memory(state);
         if let Some(tracker) = &self.pending_chunks_mem_tracker {
@@ -1977,6 +1986,8 @@ impl OperatorLifecycle for DataStreamSinkOperator {
     }
 
     fn begin_exit(&mut self) -> ExecutionResult<()> {
+        #[cfg(novarocks_dev_controls)]
+        self.emit_writer_diagnostic("sink_begin_exit");
         self.exiting = true;
         if !self.finishing.load(Ordering::Acquire) && !self.aborting.load(Ordering::Acquire) {
             self.cancel();
@@ -1987,6 +1998,8 @@ impl OperatorLifecycle for DataStreamSinkOperator {
         self.begin_exit()
     }
     fn observe_exit(&mut self) -> ExitObservation {
+        #[cfg(novarocks_dev_controls)]
+        self.emit_writer_diagnostic("sink_observe_exit");
         if (self.exiting || self.aborting.load(Ordering::Acquire)) && !self.send_group.is_idle() {
             ExitObservation::pending(FinishWatch::Notify(self.send_observable.clone()))
         } else {
@@ -1994,6 +2007,8 @@ impl OperatorLifecycle for DataStreamSinkOperator {
         }
     }
     fn cancel(&mut self) {
+        #[cfg(novarocks_dev_controls)]
+        self.emit_writer_diagnostic("sink_cancel_enter");
         if self.aborting.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -2005,11 +2020,27 @@ impl OperatorLifecycle for DataStreamSinkOperator {
             *pending = None;
         }
         self.send_group.cancel();
+        #[cfg(novarocks_dev_controls)]
+        self.emit_writer_diagnostic("sink_cancel_after_stop");
         self.send_observable.defer_notify().arm();
     }
 }
 
 impl DataStreamSinkOperator {
+    #[cfg(novarocks_dev_controls)]
+    fn emit_writer_diagnostic(&self, event: &str) {
+        if let Some(scope) = &self.writer_diagnostics {
+            scope.emit(event, || format!(
+                "finst={:?} driver_id={} dest_node={} finishing={} aborting={} exiting={} finished={} finish_counted={} last_driver={} remaining_drivers={} end_sent={} pending_chunks={} pending_payloads={} sender_state={}",
+                self.fragment_instance_id, self.driver_id, self.input.dest_node_id,
+                self.finishing.load(Ordering::Acquire), self.aborting.load(Ordering::Acquire), self.exiting,
+                self.finished.load(Ordering::Acquire), self.finish_counted.load(Ordering::Acquire),
+                self.finish_completed_set.load(Ordering::Acquire), self.finish_state.remaining_drivers.load(Ordering::Acquire),
+                self.end_of_stream_sent.load(Ordering::Acquire), self.pending_chunk_count_total(), self.pending_payload_count(),
+                self.send_group.try_diagnostic_state().unwrap_or_else(|| "unavailable".into())
+            ));
+        }
+    }
     fn stream_for_destination(
         &self,
         destination: &FragmentDestination,
@@ -3102,6 +3133,8 @@ impl DataStreamSinkOperator {
     }
     fn advance_finish(&mut self) -> ExecutionResult<()> {
         use tracing::debug;
+        #[cfg(novarocks_dev_controls)]
+        self.emit_writer_diagnostic("sink_advance_finish_enter");
 
         if self.aborting.load(Ordering::Acquire) {
             return Ok(());
@@ -3218,6 +3251,8 @@ impl DataStreamSinkOperator {
             return Ok(());
         }
         self.send_eos()?;
+        #[cfg(novarocks_dev_controls)]
+        self.emit_writer_diagnostic("sink_end_publication_returned");
         self.maybe_mark_finished();
         Ok(())
     }
