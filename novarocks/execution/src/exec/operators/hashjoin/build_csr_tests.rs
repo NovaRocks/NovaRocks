@@ -38,9 +38,10 @@ use novarocks_type_contract::FunctionValueType;
 use novarocks_value_arrays::decode::ValueConversionContext;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) fn captured_graph(
+pub(crate) fn captured_graph_for(
     pages: &[Vec<Option<i32>>],
     strings: bool,
+    purpose: IndexPurpose,
     work: &BulkWork<'_>,
 ) -> (BulkTaskGraph, Arc<BuildRows>) {
     let ty = FunctionValueType::new(
@@ -51,7 +52,7 @@ pub(crate) fn captured_graph(
         },
         true,
     );
-    let domains = ordinary(&ty, NullPolicy::Unmatchable, IndexPurpose::KeyIds, work);
+    let domains = ordinary(&ty, NullPolicy::Unmatchable, purpose, work);
     let mut receipts = Vec::new();
     for (slot, values) in pages.iter().enumerate() {
         let mut writer = InputRunWriter::new(
@@ -117,8 +118,7 @@ pub(crate) fn captured_graph(
         unreachable!()
     };
     let graph = BulkTaskGraph::begin(
-        keys.into_complete(domain, IndexPurpose::KeyIds, work)
-            .unwrap(),
+        keys.into_complete(domain, purpose, work).unwrap(),
         NonZeroUsize::new(3).unwrap(),
         NonZeroUsize::MIN,
         work,
@@ -126,6 +126,13 @@ pub(crate) fn captured_graph(
     .unwrap();
     collection.complete_begin(&mut lease).unwrap();
     (graph, rows)
+}
+pub(crate) fn captured_graph(
+    pages: &[Vec<Option<i32>>],
+    strings: bool,
+    work: &BulkWork<'_>,
+) -> (BulkTaskGraph, Arc<BuildRows>) {
+    captured_graph_for(pages, strings, IndexPurpose::KeyIds, work)
 }
 fn captured(
     pages: &[Vec<Option<i32>>],
@@ -405,4 +412,45 @@ fn concurrent_scatter_of_one_large_duplicate_class_has_exact_unique_physical_row
         .map(|i| csr.row(i).unwrap())
         .collect::<BTreeSet<_>>();
     assert_eq!(actual, (0..4001).collect());
+}
+
+#[test]
+fn withdrawal_racing_the_last_init_or_assignment_step_settles_without_false_failure() {
+    let (owner, tracker) = fixture();
+    let work = work(owner.as_ref(), &tracker, &Control);
+    let (build, _) = builder(&[vec![Some(2); 700]], false, 3, &work);
+    let CsrClaim::Initialize(mut init) = build.claim(&work).unwrap() else {
+        panic!("original initialization lease");
+    };
+    while init.initialize(7, work.control).unwrap() != SlotsProgress::Initialized {}
+    build.retire().unwrap();
+    assert_eq!(init.settle().unwrap(), SlotsProgress::Retired);
+    drop(init);
+    assert!(build.take_ready().unwrap().is_none());
+    for target in [CsrStage::Count, CsrStage::Prefix, CsrStage::Scatter] {
+        let (build, _) = builder(&[vec![Some(2); 700]], false, 3, &work);
+        let mut lease = loop {
+            match build.claim(&work).unwrap() {
+                CsrClaim::Initialize(mut lease) => {
+                    while lease.initialize(7, work.control).unwrap() != SlotsProgress::Initialized {
+                    }
+                    assert_eq!(lease.settle().unwrap(), SlotsProgress::Initialized);
+                }
+                CsrClaim::Work(mut lease) => {
+                    while lease.advance(13, &work).unwrap() != CsrProgress::Done {}
+                    if lease.stage() == target {
+                        break lease;
+                    }
+                    assert_eq!(lease.settle().unwrap(), CsrProgress::Done);
+                }
+                CsrClaim::Pending | CsrClaim::Progressed => {}
+                _ => panic!("original target stage must be reached"),
+            }
+        };
+        build.retire().unwrap();
+        assert_eq!(lease.settle().unwrap(), CsrProgress::Retired);
+        drop(lease);
+        assert!(build.take_ready().unwrap().is_none());
+        assert!(matches!(build.claim(&work).unwrap(), CsrClaim::Retired));
+    }
 }

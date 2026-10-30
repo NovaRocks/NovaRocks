@@ -42,6 +42,8 @@ pub(crate) struct KeyBuildWorker {
     next: usize,
     observed: u64,
     _storage: ValueTypeStorageLifetime,
+    #[cfg(test)]
+    claims: Vec<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyWorkerStep {
@@ -57,7 +59,13 @@ impl KeyBuildWorker {
             next: 0,
             observed: 0,
             _storage: work.owner.storage_lifetime(),
+            #[cfg(test)]
+            claims: Vec::new(),
         }
+    }
+    #[cfg(test)]
+    pub(super) fn claim_phases(&self) -> &[String] {
+        &self.claims
     }
     pub(crate) fn retained(&self) -> usize {
         self.retained.len()
@@ -98,6 +106,8 @@ impl KeyBuildWorker {
         // using the same actual position. Never gate claim on retained.len().
         let pending = match graph.claim(work)? {
             BulkClaim::Task(task) => {
+                #[cfg(test)]
+                self.claims.push(task.phase_name_for_test());
                 push_owned(
                     &mut self.retained,
                     Retained {

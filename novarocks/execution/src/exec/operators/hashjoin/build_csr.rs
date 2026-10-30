@@ -561,9 +561,20 @@ impl CsrLease {
         })
     }
     pub(crate) fn complete(&mut self) -> ExecutionResult<()> {
+        self.settle_inner(false).map(|_| ())
+    }
+    pub(crate) fn settle(&mut self) -> ExecutionResult<CsrProgress> {
+        self.settle_inner(true)
+    }
+    fn settle_inner(&mut self, allow_retired: bool) -> ExecutionResult<CsrProgress> {
         let result = (|| {
+            let state = self.owner.state()?;
             self.owner.ranges.validate(&self.lease)?;
-            if matches!(&*self.owner.state()?, State::Retired) {
+            if matches!(&*state, State::Retired) && allow_retired {
+                self.owner.ranges.complete(&mut self.lease)?;
+                return Ok(CsrProgress::Retired);
+            }
+            if matches!(&*state, State::Retired) {
                 return Err(build_contract(
                     "CSR worker completed after demand withdrawal",
                 ));
@@ -587,7 +598,8 @@ impl CsrLease {
                 self.owner.sums[self.lease.range().start / self.owner.layout.width.get()]
                     .store(self.sum, Ordering::Relaxed);
             }
-            self.owner.ranges.complete(&mut self.lease)
+            self.owner.ranges.complete(&mut self.lease)?;
+            Ok(CsrProgress::Done)
         })();
         self.owner.changed.notify_observers();
         result.map_err(|cause| self.owner.fail(cause))

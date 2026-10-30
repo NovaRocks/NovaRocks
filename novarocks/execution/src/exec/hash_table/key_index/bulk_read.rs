@@ -198,10 +198,6 @@ impl IndexView {
     pub(crate) fn spec(&self) -> &KeySpec {
         &self.spec
     }
-    #[expect(
-        dead_code,
-        reason = "Frozen K view purpose accessor remains available to handoff consumers."
-    )]
     pub(crate) fn purpose(&self) -> IndexPurpose {
         self.purpose
     }

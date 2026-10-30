@@ -68,6 +68,22 @@ fn real_turn_budget_keeps_large_direct_and_hash_graphs_cooperative() {
         assert!(finished);
         assert!(workers.iter().all(|worker| worker.retained() == 0));
         assert!(claimed.iter().all(|claimed| *claimed));
+        if !strings {
+            for phase in ["Init", "Mark", "Count", "Prefix", "Fill", "Assign"] {
+                let workers = workers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, worker)| {
+                        worker.claim_phases().iter().any(|claimed| claimed == phase)
+                    })
+                    .map(|(id, _)| id)
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert!(
+                    workers.len() > 1,
+                    "actual direct {phase} task claims: {workers:?}"
+                );
+            }
+        }
         let (view, assignments) = graph.take_ready(&work).unwrap().unwrap().into_parts();
         assert_eq!(
             assignments

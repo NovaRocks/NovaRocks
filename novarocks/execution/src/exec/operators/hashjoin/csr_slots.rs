@@ -412,6 +412,14 @@ impl SlotsLease {
         result
     }
     pub(crate) fn complete(&mut self) -> ExecutionResult<()> {
+        self.settle_inner(false).map(|_| ())
+    }
+    /// Resolve completion against the same monotonic retirement lock. A
+    /// withdrawal racing the last initialization step is not an invariant error.
+    pub(crate) fn settle(&mut self) -> ExecutionResult<SlotsProgress> {
+        self.settle_inner(true)
+    }
+    fn settle_inner(&mut self, allow_retired: bool) -> ExecutionResult<SlotsProgress> {
         let notify = self.owner.changed.defer_notify();
         let result = (|| {
             let state = self.owner.state()?;
@@ -421,6 +429,12 @@ impl SlotsLease {
                     .latch(build_contract("join CSR lease was already dropped"))
             })?;
             self.owner.ranges.validate(lease)?;
+            if state.phase == Phase::Retired && allow_retired {
+                drop(state);
+                drop(self.pending.take());
+                self.owner.ranges.complete(lease)?;
+                return Ok(SlotsProgress::Retired);
+            }
             if state.phase != Phase::Initializing {
                 return Err(self
                     .owner
@@ -464,7 +478,8 @@ impl SlotsLease {
                     "join CSR segment was installed more than once",
                 )));
             }
-            self.owner.ranges.complete(lease)
+            self.owner.ranges.complete(lease)?;
+            Ok(SlotsProgress::Initialized)
         })();
         notify.arm();
         result

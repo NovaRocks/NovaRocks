@@ -789,6 +789,10 @@ pub(crate) struct Completion {
 }
 impl Task {
     #[cfg(test)]
+    pub(crate) fn phase_name_for_test(&self) -> String {
+        format!("{:?}", self.phase())
+    }
+    #[cfg(test)]
     pub(super) fn phase(&self) -> Phase {
         self.lease.as_ref().expect("unconsumed task").phase
     }

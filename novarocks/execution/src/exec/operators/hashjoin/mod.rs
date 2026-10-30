@@ -31,6 +31,7 @@ mod build_collection;
 mod build_csr;
 mod build_match_bitmap;
 mod build_pages;
+mod build_projection;
 mod build_requirements;
 pub(crate) mod build_state;
 pub(crate) mod compiled_hash_join;
