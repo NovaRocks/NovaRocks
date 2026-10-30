@@ -2371,7 +2371,15 @@ fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_complet
         CompiledJoinFinalizeSourceFactory::new(Arc::clone(&declaration), Arc::clone(&error));
     assert!(factory.bind_pipeline_dop(2).is_err());
     let mut operators: Vec<_> = (0..3).map(|id| factory.create(3, id)).collect();
-    for operator in &mut operators {
+    let profiles = (0..3)
+        .map(|id| {
+            crate::runtime::profile::OperatorProfiles::new(
+                crate::runtime::profile::RuntimeProfile::new(format!("actual F {id}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (operator, profile) in operators.iter_mut().zip(&profiles) {
+        operator.set_profiles(profile.clone());
         operator.set_mem_tracker(Arc::clone(&tracker));
         operator.set_construction_factory(Arc::clone(&construction));
         operator.prepare().unwrap();
@@ -2393,6 +2401,20 @@ fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_complet
         &frame.completion.observable()
     ));
     assert!(before.output.is_none());
+    assert!(profiles.iter().all(|profile| {
+        profile
+            .unique
+            .counter_value_min_max("JoinKAdvanceCalls")
+            .unwrap()
+            .0
+            == 0
+    }));
+    assert!(profiles.iter().all(|profile| {
+        profile
+            .unique
+            .get_info_string("JoinFullPartitions")
+            .is_none()
+    }));
     let observed = wait.observed_generation;
     // The declaration/layout came through real package compilation. E data
     // is a component fixture; this does not qualify the original Values plan.
@@ -2428,6 +2450,44 @@ fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_complet
         }
     }
     assert!(finished.iter().all(|finished| *finished));
+    let progressing = profiles
+        .iter()
+        .filter(|profile| {
+            profile
+                .unique
+                .counter_value_min_max("JoinKProgressSteps")
+                .unwrap()
+                .0
+                > 0
+        })
+        .count();
+    assert!(
+        progressing > 1,
+        "multiple installed F must perform genuine original K progress"
+    );
+    for profile in &profiles {
+        let calls = profile
+            .unique
+            .counter_value_min_max("JoinKAdvanceCalls")
+            .unwrap()
+            .0;
+        let progress = profile
+            .unique
+            .counter_value_min_max("JoinKProgressSteps")
+            .unwrap()
+            .0;
+        assert!(calls >= progress);
+        let partitions = profile
+            .unique
+            .get_info_string("JoinFullPartitions")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert!(
+            partitions > 0,
+            "P comes from the published original IndexView"
+        );
+    }
     assert_eq!(frame.completion.published().unwrap().unwrap().rows, 600);
     for operator in &mut operators {
         operator.begin_exit().unwrap();

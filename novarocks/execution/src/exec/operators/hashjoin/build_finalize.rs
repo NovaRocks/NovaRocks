@@ -200,6 +200,8 @@ pub(crate) struct FinalizeWorker {
     bitmap: Option<InitLease>,
     next: usize,
     active: Option<Arc<ActiveBuild>>,
+    key_calls: u64,
+    key_progress: u64,
 }
 impl JoinBuildFrame {
     pub(crate) fn new(
@@ -534,9 +536,15 @@ impl JoinBuildFrame {
     }
 }
 impl FinalizeWorker {
+    pub(crate) fn key_work_facts(&self) -> (u64, u64) {
+        (self.key_calls, self.key_progress)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             projections: [None, None],
+            key_calls: 0,
+            key_progress: 0,
             bitmap: None,
             next: 0,
             active: None,
@@ -653,7 +661,16 @@ impl FinalizeWorker {
                 }
                 let worker =
                     self.projections[lane].get_or_insert_with(|| ProjectionWorker::new(work));
-                let step = worker.step(&slot.build, turn, work)?;
+                let before = worker.key_work_facts();
+                let result = worker.step(&slot.build, turn, work);
+                let after = worker.key_work_facts();
+                self.key_calls = self
+                    .key_calls
+                    .saturating_add(after.0.saturating_sub(before.0));
+                self.key_progress = self
+                    .key_progress
+                    .saturating_add(after.1.saturating_sub(before.1));
+                let step = result?;
                 self.next = (lane + 1) % 3;
                 match step {
                     ProjectionStep::Finished => {

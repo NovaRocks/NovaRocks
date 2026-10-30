@@ -40,6 +40,8 @@ pub(crate) struct KeyBuildWorker {
     retained: Vec<Retained>,
     next: usize,
     observed: u64,
+    advance_calls: u64,
+    progress_steps: u64,
     _storage: ValueTypeStorageLifetime,
     #[cfg(test)]
     claims: Vec<String>,
@@ -57,10 +59,15 @@ impl KeyBuildWorker {
             retained: Vec::new(),
             next: 0,
             observed: 0,
+            advance_calls: 0,
+            progress_steps: 0,
             _storage: work.owner.storage_lifetime(),
             #[cfg(test)]
             claims: Vec::new(),
         }
+    }
+    pub(super) fn key_work_facts(&self) -> (u64, u64) {
+        (self.advance_calls, self.progress_steps)
     }
     #[cfg(test)]
     pub(super) fn claim_phases(&self) -> &[String] {
@@ -136,7 +143,15 @@ impl KeyBuildWorker {
         while !self.retained.is_empty() && turn.try_consume(1) {
             let index = self.next % self.retained.len();
             self.next = (index + 1) % self.retained.len();
-            match self.retained[index].task.advance(1, work)? {
+            self.advance_calls = self.advance_calls.saturating_add(1);
+            let advanced = self.retained[index].task.advance(1, work)?;
+            if matches!(
+                advanced,
+                BulkTaskAdvance::Done | BulkTaskAdvance::Progressed
+            ) {
+                self.progress_steps = self.progress_steps.saturating_add(1);
+            }
+            match advanced {
                 BulkTaskAdvance::Done => {
                     let retained = self.retained.swap_remove(index);
                     let mut completion = retained.task.finish()?;

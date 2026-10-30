@@ -79,6 +79,9 @@ impl OperatorFactory for CompiledJoinFinalizeSourceFactory {
             prepare_failure: invalid,
             exit_wait: false,
             exit_failure: None,
+            profiles: None,
+            key_counters: None,
+            partitions_recorded: false,
         }))
     }
 }
@@ -95,8 +98,51 @@ struct JoinFinalizeSource {
     prepare_failure: Option<ExecutionFailure>,
     exit_wait: bool,
     exit_failure: Option<ExecutionFailure>,
+    profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    key_counters: Option<[crate::runtime::profile::CounterRef; 2]>,
+    partitions_recorded: bool,
 }
 impl JoinFinalizeSource {
+    fn record_key_work(&mut self) {
+        if let (Some(worker), Some(counters)) = (&self.worker, &self.key_counters) {
+            let (calls, progress) = worker.key_work_facts();
+            counters[0].set(i64::try_from(calls).unwrap_or(i64::MAX));
+            counters[1].set(i64::try_from(progress).unwrap_or(i64::MAX));
+        }
+        if self.partitions_recorded {
+            return;
+        }
+        let (Some(profile), Some(frame)) = (&self.profiles, &self.frame) else {
+            return;
+        };
+        let published = match frame.completion.published() {
+            Ok(Some(data)) => data,
+            _ => return,
+        };
+        use super::super::build_finalize::BuildLookup;
+        match &published.artifact.lookup {
+            BuildLookup::PayloadOnly => profile.unique.add_info_string("JoinLookup", "PayloadOnly"),
+            BuildLookup::Ordinary(full) => profile.unique.add_info_string(
+                "JoinFullPartitions",
+                full.view.partition_count().to_string(),
+            ),
+            BuildLookup::Naa { group, full, .. } => {
+                profile.unique.add_info_string(
+                    "JoinFullPartitions",
+                    full.view.partition_count().to_string(),
+                );
+                profile.unique.add_info_string(
+                    "JoinGroupPartitions",
+                    group
+                        .as_ref()
+                        .map(|group| group.view.partition_count().to_string())
+                        .unwrap_or_else(|| "none".into()),
+                );
+            }
+        }
+        self.partitions_recorded = true;
+    }
+
     fn frame(&self) -> ExecutionResult<&Arc<JoinBuildFrame>> {
         if let Some(cause) = &self.prepare_failure {
             return Err(cause.clone());
@@ -144,6 +190,13 @@ impl JoinFinalizeSource {
     }
 }
 impl OperatorLifecycle for JoinFinalizeSource {
+    fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
+        self.key_counters = Some([
+            profiles.unique.add_unit_counter("JoinKAdvanceCalls"),
+            profiles.unique.add_unit_counter("JoinKProgressSteps"),
+        ]);
+        self.profiles = Some(profiles);
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -317,6 +370,7 @@ impl SourceKernel for JoinFinalizeSource {
             .as_mut()
             .ok_or_else(|| build_contract("join finalizer polled after its real exit"))?
             .step(&frame, ctx.work(), &work);
+        self.record_key_work();
         let step = match result {
             Ok(step) => step,
             Err(cause) => {

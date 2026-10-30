@@ -347,6 +347,10 @@ impl ProjectionBuild {
     }
 }
 impl ProjectionWorker {
+    pub(crate) fn key_work_facts(&self) -> (u64, u64) {
+        self.keys.key_work_facts()
+    }
+
     pub(crate) fn new(work: &BulkWork<'_>) -> Self {
         Self {
             keys: KeyBuildWorker::new(work),

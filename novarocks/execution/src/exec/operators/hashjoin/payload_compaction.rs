@@ -44,6 +44,7 @@ fn original_value(cause: ValueFailure<ExecutionFailure>) -> ExecutionFailure {
     }
 }
 fn reserve_metadata<T>(count: usize, work: &BulkWork<'_>) -> ExecutionResult<Vec<T>> {
+    check(work)?;
     // This table is covered by the original whole-graph metadata reservation.
     let layout = Layout::array::<T>(count).map_err(|_| arithmetic())?;
     let mut table = Vec::new();
