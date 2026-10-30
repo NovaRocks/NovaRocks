@@ -277,7 +277,27 @@ pub(super) fn oracle(spec: Spec, left: &[Row], right: &[Row]) -> Rows {
                 }
             }
         }
-        JoinKind::FullOuter => unreachable!("not a fixture kind"),
+        JoinKind::FullOuter => {
+            // Independent physical-row oracle: every true pair, plus each
+            // unmatched occurrence on either side. Equal values stay distinct.
+            for &l in left {
+                let mut found = false;
+                for &r in right {
+                    if pair_matches(spec, l, r) {
+                        rows.push(pair(l, r));
+                        found = true;
+                    }
+                }
+                if !found {
+                    rows.push(vec![l.0, l.1, None, None]);
+                }
+            }
+            for &r in right {
+                if !left.iter().any(|&l| pair_matches(spec, l, r)) {
+                    rows.push(vec![None, None, r.0, r.1]);
+                }
+            }
+        }
     }
     rows.sort();
     rows
@@ -2940,3 +2960,6 @@ fn b3_residual_gathers_only_original_referenced_columns_from_published_pages() {
     }
     assert!(runtime.error().is_none());
 }
+
+#[path = "compiled_phased_join_tests.rs"]
+mod phased;

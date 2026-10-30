@@ -40,6 +40,15 @@ enum Column {
     Probe(usize),
     Build(usize),
 }
+/// LocalCompiler's canonical output roles. The compiler assigns fresh output
+/// slots; these explicit roles, rather than matching those names to inputs,
+/// preserve the original positional source contract.
+#[derive(Clone, Copy)]
+pub(crate) enum CanonicalJoinOutput {
+    Pairs,
+    Probe,
+    Build,
+}
 pub(crate) struct PagedJoinGather {
     schema: ChunkSchemaRef,
     columns: Vec<Column>,
@@ -61,7 +70,6 @@ fn binding(
 ) -> Result<(), JoinGatherError> {
     if !source.is_typed()
         || !target.is_typed()
-        || source.slot_id() != target.slot_id()
         || source.nullable() && !target.nullable()
         || !source
             .typed_binding()
@@ -164,6 +172,52 @@ fn null_source(
 }
 
 impl PagedJoinGather {
+    pub(crate) fn new_canonical(
+        schema: ChunkSchemaRef,
+        probe: &ChunkSchema,
+        build: &ChunkSchema,
+        output: CanonicalJoinOutput,
+        owner: &dyn InputConstructionOwner,
+    ) -> Result<Self, JoinGatherError> {
+        let expected = match output {
+            CanonicalJoinOutput::Pairs => probe
+                .slots()
+                .len()
+                .checked_add(build.slots().len())
+                .ok_or_else(crate::exec::operators::hashjoin::join_completion::arithmetic)?,
+            CanonicalJoinOutput::Probe => probe.slots().len(),
+            CanonicalJoinOutput::Build => build.slots().len(),
+        };
+        if schema.slots().len() != expected {
+            return Err(gather_contract(
+                "canonical join output differs from its frozen side roles",
+            )
+            .into());
+        }
+        let mut columns = funded_vec(owner, expected)?;
+        for (ordinal, target) in schema.slots().iter().enumerate() {
+            work(owner, 1)?;
+            let column = match output {
+                CanonicalJoinOutput::Probe => Column::Probe(ordinal),
+                CanonicalJoinOutput::Build => Column::Build(ordinal),
+                CanonicalJoinOutput::Pairs if ordinal < probe.slots().len() => {
+                    Column::Probe(ordinal)
+                }
+                CanonicalJoinOutput::Pairs => Column::Build(ordinal - probe.slots().len()),
+            };
+            let source = match column {
+                Column::Probe(column) => &probe.slots()[column],
+                Column::Build(column) => &build.slots()[column],
+            };
+            binding(source, target, owner)?;
+            columns.push(column);
+        }
+        Ok(Self {
+            schema,
+            columns,
+            _storage: owner.storage_lifetime(),
+        })
+    }
     pub(crate) fn new(
         schema: ChunkSchemaRef,
         probe: &ChunkSchema,

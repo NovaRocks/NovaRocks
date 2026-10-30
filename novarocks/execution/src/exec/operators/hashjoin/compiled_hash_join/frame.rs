@@ -112,6 +112,31 @@ impl CompiledJoinFrame {
             BuildDefinition::PayloadOnly { build, .. } => build,
         }
     }
+    pub(super) fn probe_layout(&self) -> ExecutionResult<&novarocks_local_program::StaticLayout> {
+        match self.program.graph().nodes()[self.node().index()].kind() {
+            ProgramNodeKind::Join { left_layout, .. }
+            | ProgramNodeKind::NestedLoopJoin { left_layout, .. } => Ok(left_layout),
+            _ => Err(build_contract(
+                "join declaration has no original probe layout",
+            )),
+        }
+    }
+    pub(super) fn scope_layout(&self) -> ExecutionResult<&novarocks_local_program::StaticLayout> {
+        match self.program.graph().nodes()[self.node().index()].kind() {
+            ProgramNodeKind::Join {
+                join_scope_layout, ..
+            }
+            | ProgramNodeKind::NestedLoopJoin {
+                join_scope_layout, ..
+            } => Ok(join_scope_layout),
+            _ => Err(build_contract(
+                "join declaration has no original scope layout",
+            )),
+        }
+    }
+    pub(super) fn output_layout(&self) -> &novarocks_local_program::StaticLayout {
+        self.program.graph().nodes()[self.node().index()].output_layout()
+    }
     pub(super) fn payload_only(&self) -> bool {
         matches!(self.definition, BuildDefinition::PayloadOnly { .. })
     }

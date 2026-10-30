@@ -170,13 +170,14 @@ enum State {
     Collecting,
     Installing(Arc<ActiveBuild>),
     Active(Arc<ActiveBuild>),
-    Publishing,
+    Publishing(Arc<ActiveBuild>),
     Published,
     Retiring,
     Retired,
     Failed(ExecutionFailure),
 }
 pub(crate) struct JoinBuildFrame {
+    tail_ranges: OnceLock<ExecutionResult<Arc<super::tail_ranges::TailRanges<FinalizedBuild>>>>,
     pub(crate) domains: ProjectionDomains,
     pub(crate) completion: Arc<JoinCompletion<FinalizedBuild>>,
     pub(crate) inputs: Arc<BuildCollection<BuildInputReceipt, FinalizedBuild>>,
@@ -218,6 +219,7 @@ impl JoinBuildFrame {
         funded_shared(
             work.owner,
             Self {
+                tail_ranges: OnceLock::new(),
                 domains,
                 completion,
                 inputs,
@@ -228,6 +230,22 @@ impl JoinBuildFrame {
                 _storage: work.owner.storage_lifetime(),
             },
         )
+    }
+    pub(crate) fn tails(
+        &self,
+        width: NonZeroUsize,
+        work: &BulkWork<'_>,
+    ) -> ExecutionResult<Arc<super::tail_ranges::TailRanges<FinalizedBuild>>> {
+        self.tail_ranges
+            .get_or_init(|| {
+                super::tail_ranges::TailRanges::new(
+                    self.completion.clone(),
+                    width,
+                    work.owner,
+                    work.control,
+                )
+            })
+            .clone()
     }
     /// Registration belongs to admitted operator activation. Preparation
     /// creates only dormant metadata, never a live subscription.
@@ -265,7 +283,8 @@ impl JoinBuildFrame {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             std::mem::replace(&mut *state, State::Failed(first.clone()))
         };
-        if let State::Active(active) | State::Installing(active) = &old {
+        if let State::Active(active) | State::Installing(active) | State::Publishing(active) = &old
+        {
             active.fail(&first);
         }
         drop(old);
@@ -290,7 +309,9 @@ impl JoinBuildFrame {
             std::mem::replace(&mut *state, State::Retiring)
         };
         let result = (|| {
-            if let State::Active(active) | State::Installing(active) = &old {
+            if let State::Active(active) | State::Installing(active) | State::Publishing(active) =
+                &old
+            {
                 active.retire()?;
             }
             drop(old);
@@ -467,7 +488,7 @@ impl JoinBuildFrame {
             let mut state = self.state()?;
             match &*state {
                 State::Active(current) if Arc::ptr_eq(current, active) => {
-                    *state = State::Publishing;
+                    *state = State::Publishing(Arc::clone(active));
                 }
                 State::Published => return Ok(FinalizeStep::Finished),
                 State::Retiring | State::Retired => return Ok(FinalizeStep::Retired),
@@ -485,16 +506,15 @@ impl JoinBuildFrame {
             },
         )?;
         let publication = self.inputs.publish(data, active.rows.len())?;
-        let next = match publication {
-            PublishResult::Installed => State::Published,
-            PublishResult::NotNeeded(data) => {
-                drop(data);
-                State::Retired
-            }
-        };
+        if let PublishResult::NotNeeded(data) = publication {
+            drop(data);
+            // The original state still retains all nested owners. The sole
+            // retirement transition must close them before exposing Retired.
+            return self.retire();
+        }
         let mut state = self.state()?;
         match &*state {
-            State::Publishing => *state = next,
+            State::Publishing(current) if Arc::ptr_eq(current, active) => *state = State::Published,
             State::Failed(cause) => return Err(cause.clone()),
             State::Retiring | State::Retired => return Ok(FinalizeStep::Retired),
             _ => {
@@ -551,16 +571,18 @@ impl FinalizeWorker {
     /// already recorded failure drops the worker only after fail() latched it.
     pub(crate) fn finish_exit(&mut self, frame: &JoinBuildFrame) -> ExecutionResult<bool> {
         frame.completion.check()?;
-        if frame.completion.remaining_demand()? == RemainingDemand::Released {
-            return self
-                .retired(frame)
-                .map(|next| next == FinalizeStep::Retired);
-        }
         if frame.completion.published()?.is_some() {
+            // Published nested work completed normally. Later output closure
+            // releases these settled cursors; it does not retire ready graphs.
             self.active = None;
             self.projections = [None, None];
             self.bitmap = None;
             return Ok(true);
+        }
+        if frame.completion.remaining_demand()? == RemainingDemand::Released {
+            return self
+                .retired(frame)
+                .map(|next| next == FinalizeStep::Retired);
         }
         Err(build_contract(
             "join finalizer exited before its required build publication",

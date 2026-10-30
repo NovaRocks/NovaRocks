@@ -31,7 +31,7 @@ use crate::runtime::profile::clamp_u128_to_i64;
 use novarocks_type_contract::ValueTypeStorageLifetime;
 
 mod paged;
-pub(crate) use paged::{JoinPairRow, PagedJoinGather, ProjectedJoinGather};
+pub(crate) use paged::{CanonicalJoinOutput, JoinPairRow, PagedJoinGather, ProjectedJoinGather};
 
 #[derive(Debug)]
 pub(crate) enum JoinGatherError {

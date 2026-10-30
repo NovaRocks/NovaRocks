@@ -3233,3 +3233,24 @@ fn b3_input_keeps_required_key_row_failure_and_fails_rf_without_empty_completion
     );
     assert!(frame.completion.published().is_err());
 }
+
+/// Component-only graph: preserve the original compiled roots and bindings,
+/// and re-check the new local node through LocalProgram. This is not evidence
+/// that the still-closed package/compiler admission accepts that join kind.
+pub(super) fn component_join_kind(
+    program: &LocalProgram,
+    next: novarocks_local_program::JoinType,
+) -> Arc<LocalProgram> {
+    let join = join_node(program);
+    let mut kind = program.graph().nodes()[join.index()].kind().clone();
+    let ProgramNodeKind::Join { join_type, .. } = &mut kind else {
+        unreachable!()
+    };
+    *join_type = next;
+    rebuild(
+        program,
+        with_kind(program, join, kind),
+        Additions::default(),
+    )
+    .unwrap()
+}

@@ -48,15 +48,7 @@ mod table;
 mod tests;
 
 pub(crate) use bulk::CompleteInput;
-#[expect(
-    unused_imports,
-    reason = "Names the frozen K batch result contract even when current consumers infer its returned type."
-)]
 pub(crate) use bulk_read::BulkPresenceBatch;
-#[expect(
-    unused_imports,
-    reason = "Names the frozen K batch result contract even when current consumers infer its returned type."
-)]
 pub(crate) use bulk_read::BulkProbeBatch;
 pub(crate) use bulk_read::{BulkKey, BulkMatch, IndexView};
 #[expect(

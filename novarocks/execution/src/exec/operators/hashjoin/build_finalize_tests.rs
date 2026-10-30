@@ -592,3 +592,109 @@ fn naa_two_original_projections_make_progress_without_cross_domain_coordinate_gu
     assert_eq!(full.view.purpose(), IndexPurpose::PresenceOnly);
     assert!(published.artifact.matches.is_none());
 }
+
+#[test]
+fn published_finalizers_release_settled_work_after_the_last_q_normal_completion() {
+    let (owner, tracker) = fixture();
+    let work = work(owner.as_ref(), &tracker, &Control);
+    let frame = build_frame(0, true, &work);
+    input(&frame, 0, vec![Some(1), None, Some(1)], &work);
+    input(&frame, 1, vec![], &work);
+    let mut workers = [
+        FinalizeWorker::new(),
+        FinalizeWorker::new(),
+        FinalizeWorker::new(),
+    ];
+    for _ in 0..100_000 {
+        for worker in &mut workers {
+            worker.step(&frame, &mut turn(), &work).unwrap();
+        }
+        if frame.completion.published().unwrap().is_some() {
+            break;
+        }
+    }
+    assert!(frame.completion.published().unwrap().is_some());
+    frame.completion.normal_after_output(0).unwrap();
+    frame.completion.normal_after_output(1).unwrap();
+    assert_eq!(
+        frame.completion.remaining_demand().unwrap(),
+        RemainingDemand::Released
+    );
+    for worker in &mut workers {
+        assert!(worker.finish_exit(&frame).unwrap());
+        assert!(worker.active.is_none());
+        assert!(worker.projections.iter().all(Option::is_none));
+    }
+    frame.completion.check().unwrap();
+    assert!(frame.completion.published().unwrap().is_some());
+}
+#[test]
+fn publication_losing_all_demand_closes_original_projection_owners_before_retired() {
+    use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct CloseAtPublication<'a> {
+        original: &'a dyn InputConstructionOwner,
+        frame: Arc<JoinBuildFrame>,
+        closed: AtomicBool,
+    }
+    impl InputConstructionOwner for CloseAtPublication<'_> {
+        fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+            self.original.storage_lifetime()
+        }
+        fn request(&self, layout: std::alloc::Layout) -> Result<(), ConstructionFailure> {
+            self.original.request(layout)?;
+            let publishing = matches!(&*self.frame.state.lock().unwrap(), State::Publishing(_));
+            if publishing && !self.closed.swap(true, Ordering::SeqCst) {
+                self.frame.completion.withdraw(0).unwrap();
+                self.frame.completion.withdraw(1).unwrap();
+            }
+            Ok(())
+        }
+        fn observe_opaque_upper_bound(&self, n: usize) -> Result<(), ConstructionFailure> {
+            self.original.observe_opaque_upper_bound(n)
+        }
+        fn observe(
+            &self,
+            n: usize,
+            path: &[crate::exec::chunk::ArrayPathStep],
+            step: crate::exec::chunk::ArrayNormalizationStep<'_>,
+        ) -> Result<(), ConstructionFailure> {
+            self.original.observe(n, path, step)
+        }
+    }
+    let (owner, tracker) = fixture();
+    let initial = work(owner.as_ref(), &tracker, &Control);
+    let frame = build_frame(0, true, &initial);
+    input(&frame, 0, vec![Some(1), None, Some(2)], &initial);
+    input(&frame, 1, vec![Some(1)], &initial);
+    let closing = CloseAtPublication {
+        original: owner.as_ref(),
+        frame: frame.clone(),
+        closed: AtomicBool::new(false),
+    };
+    let work = work(&closing, &tracker, &Control);
+    let mut workers = [
+        FinalizeWorker::new(),
+        FinalizeWorker::new(),
+        FinalizeWorker::new(),
+    ];
+    let mut retired = false;
+    for _ in 0..100_000 {
+        for worker in &mut workers {
+            let step = worker.step(&frame, &mut turn(), &work).unwrap();
+            retired |= step == FinalizeStep::Retired;
+        }
+        if retired {
+            break;
+        }
+    }
+    assert!(closing.closed.load(Ordering::SeqCst));
+    assert!(retired);
+    assert!(matches!(&*frame.state().unwrap(), State::Retired));
+    assert!(frame.completion.published().unwrap().is_none());
+    for worker in &mut workers {
+        assert!(worker.finish_exit(&frame).unwrap());
+        assert!(worker.active.is_none());
+    }
+    frame.completion.check().unwrap();
+}

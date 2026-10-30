@@ -202,6 +202,52 @@ pub(crate) struct CompiledHashJoinPlan {
 
 impl CompiledHashJoinPlan {
     pub(crate) fn try_new(program: &LocalProgram, node: ProgramNodeId) -> ExecutionResult<Self> {
+        let graph_node = program
+            .graph()
+            .nodes()
+            .get(node.index())
+            .ok_or_else(|| hash_join_contract("compiled join node is absent"))?;
+        let ProgramNodeKind::Join {
+            join_type,
+            condition,
+            ..
+        } = graph_node.kind()
+        else {
+            return Err(hash_join_contract("compiled node is not a hash join"));
+        };
+        if !matches!(
+            join_type,
+            novarocks_local_program::JoinType::Inner
+                | novarocks_local_program::JoinType::LeftOuter
+                | novarocks_local_program::JoinType::LeftSemi
+                | novarocks_local_program::JoinType::LeftAnti
+                | novarocks_local_program::JoinType::NullAwareLeftAnti
+        ) {
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "build-preserving join requires the phased runtime",
+            ));
+        }
+        let keys = condition.keys();
+        if condition.is_null_aware()
+            && (keys.len() != 1
+                || keys.iter().any(|key| key.null_safe)
+                || !condition.scope_keys().is_empty()
+                || condition.residual_predicate().is_some())
+        {
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "null-aware candidate evaluation requires the B3 runtime",
+            ));
+        }
+        Self::from_frozen_node(program, node)
+    }
+    /// Frozen metadata for the installed E/F/Q/T factories. The legacy builder
+    /// above keeps its old capability gate until production composition switches.
+    pub(crate) fn from_frozen_node(
+        program: &LocalProgram,
+        node: ProgramNodeId,
+    ) -> ExecutionResult<Self> {
         let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
             program_binding_failure(
                 PlanBindingKind::MissingAssignment,
@@ -230,15 +276,10 @@ impl CompiledHashJoinPlan {
             novarocks_local_program::JoinType::LeftSemi => JoinType::LeftSemi,
             novarocks_local_program::JoinType::LeftAnti => JoinType::LeftAnti,
             novarocks_local_program::JoinType::NullAwareLeftAnti => JoinType::NullAwareLeftAnti,
-            other => {
-                return Err(program_binding_failure(
-                    PlanBindingKind::InvalidAssignment,
-                    format!(
-                        "compiled {other:?} hash join at local node {} publishes build rows and is not executable yet",
-                        node.index()
-                    ),
-                ));
-            }
+            novarocks_local_program::JoinType::RightOuter => JoinType::RightOuter,
+            novarocks_local_program::JoinType::FullOuter => JoinType::FullOuter,
+            novarocks_local_program::JoinType::RightSemi => JoinType::RightSemi,
+            novarocks_local_program::JoinType::RightAnti => JoinType::RightAnti,
         };
         if *distribution_mode != JoinDistributionMode::Broadcast {
             return Err(program_binding_failure(
@@ -250,20 +291,6 @@ impl CompiledHashJoinPlan {
             ));
         }
         let keys = condition.keys();
-        // LocalCompiler admits these shapes only after the candidate runtime
-        // is installed. A directly constructed program must not silently
-        // discard a separate key domain or eligibility root either.
-        if condition.is_null_aware()
-            && (keys.len() != 1
-                || keys.iter().any(|key| key.null_safe)
-                || !condition.scope_keys().is_empty()
-                || condition.residual_predicate().is_some())
-        {
-            return Err(program_binding_failure(
-                PlanBindingKind::InvalidAssignment,
-                "null-aware candidate evaluation requires the B3 runtime",
-            ));
-        }
         if keys.is_empty() {
             return Err(program_binding_failure(
                 PlanBindingKind::InvalidAssignment,
@@ -344,7 +371,9 @@ mod build;
 mod finalize;
 mod frame;
 mod input;
+mod phased_probe;
 mod probe;
+mod tail;
 
 pub(crate) use build::CompiledHashJoinBuildSinkFactory;
 pub(crate) use finalize::CompiledJoinFinalizeSourceFactory;
@@ -352,6 +381,7 @@ pub(crate) use frame::CompiledJoinFrame;
 #[cfg(test)]
 pub(crate) use frame::{frame_fixture_chunks, frame_fixture_inputs};
 pub(crate) use input::CompiledJoinInputSinkFactory;
+pub(crate) use phased_probe::CompiledJoinProbeProcessorFactory;
 pub(crate) use probe::CompiledHashJoinProbeProcessorFactory;
 
 /// The scope retains the probe then build slots and complete frozen fields.
@@ -417,3 +447,5 @@ pub(crate) fn true_mask(truth: &ArrayRef) -> ExecutionResult<BooleanArray> {
             .collect()
     })
 }
+
+pub(crate) use tail::CompiledJoinTailSourceFactory;
