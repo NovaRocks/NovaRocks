@@ -19,15 +19,14 @@
 //! each turn tries the original graph's eager claims before resuming a route.
 
 use super::{build_pages::push_owned, build_state::build_contract};
+#[cfg(test)]
+use crate::runtime::fragment::ExecutionFailure;
 use crate::{
     exec::{
         hash_table::key_index::{BulkClaim, BulkTask, BulkTaskAdvance, BulkTaskGraph, BulkWork},
         pipeline::step_context::TurnWork,
     },
-    runtime::{
-        fragment::{ExecutionFailure, ExecutionResult},
-        observable::Observable,
-    },
+    runtime::{fragment::ExecutionResult, observable::Observable},
 };
 use novarocks_type_contract::ValueTypeStorageLifetime;
 
@@ -66,6 +65,10 @@ impl KeyBuildWorker {
     #[cfg(test)]
     pub(super) fn claim_phases(&self) -> &[String] {
         &self.claims
+    }
+    /// Only the enclosing retired projection may use this normal cleanup port.
+    pub(super) fn release_retired(&mut self) {
+        self.retained.clear();
     }
     pub(crate) fn retained(&self) -> usize {
         self.retained.len()

@@ -437,6 +437,12 @@ impl InitLease {
         result
     }
     pub(crate) fn complete(&mut self) -> ExecutionResult<()> {
+        self.settle_inner(false).map(|_| ())
+    }
+    pub(crate) fn settle(&mut self) -> ExecutionResult<InitProgress> {
+        self.settle_inner(true)
+    }
+    fn settle_inner(&mut self, allow_retired: bool) -> ExecutionResult<InitProgress> {
         let notify = self.owner.changed.defer_notify();
         let result = (|| {
             let state = self.owner.state()?;
@@ -446,6 +452,12 @@ impl InitLease {
                     .latch(build_contract("join bitmap lease was already dropped"))
             })?;
             self.owner.ranges.validate(lease)?;
+            if state.phase == Phase::Retired && allow_retired {
+                drop(state);
+                drop(self.pending.take());
+                self.owner.ranges.complete(lease)?;
+                return Ok(InitProgress::Retired);
+            }
             if state.phase != Phase::Initializing {
                 return Err(self.owner.ranges.latch(build_contract(
                     "join bitmap completed after normal retirement",
@@ -489,7 +501,8 @@ impl InitLease {
                     "join bitmap segment was installed more than once",
                 )));
             }
-            self.owner.ranges.complete(lease)
+            self.owner.ranges.complete(lease)?;
+            Ok(InitProgress::Initialized)
         })();
         notify.arm();
         result

@@ -519,3 +519,16 @@ fn relaxed_bitmap_read_after_original_join_tail_gate_precedes_thread_join() {
     // Joining the thread is after the Relaxed load; it cannot supply that HB.
     worker.join().unwrap();
 }
+
+#[test]
+fn normal_retirement_between_last_initialization_and_settle_is_not_failure() {
+    let (owner, _) = fixture();
+    let init = initializer(129, 2, owner.as_ref());
+    let mut lease = claim(&init, owner.as_ref());
+    while lease.initialize(1, &Control).unwrap() != InitProgress::Initialized {}
+    init.retire().unwrap();
+    assert_eq!(lease.settle().unwrap(), InitProgress::Retired);
+    drop(lease);
+    init.check().unwrap();
+    assert!(matches!(init.try_freeze().unwrap(), BitmapFreeze::Retired));
+}

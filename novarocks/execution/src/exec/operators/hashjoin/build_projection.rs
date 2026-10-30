@@ -306,6 +306,28 @@ impl ProjectionWorker {
             csr: None,
         }
     }
+    /// Synchronous lifecycle retirement needs no new CPU/control capability.
+    /// The original global demand author must have fully retired this build.
+    pub(crate) fn retire_owned(&mut self, build: &ProjectionBuild) -> ExecutionResult<()> {
+        let phase = build.phase()?;
+        if let Phase::Failed(cause) = &*phase {
+            return Err(cause.clone());
+        }
+        if !matches!(&*phase, Phase::Retired) {
+            return Err(build_contract(
+                "join worker retired before the original projection",
+            ));
+        }
+        drop(phase);
+        if let Some(mut pending) = self.csr.take() {
+            match &mut pending {
+                CsrWork::Initialize(lease) => lease.retire()?,
+                CsrWork::Range(lease) => lease.retire()?,
+            }
+        }
+        self.keys.release_retired();
+        Ok(())
+    }
     pub(crate) fn step(
         &mut self,
         build: &ProjectionBuild,

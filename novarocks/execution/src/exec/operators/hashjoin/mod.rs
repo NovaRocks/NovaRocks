@@ -29,6 +29,7 @@ mod build_artifact;
 mod build_capture;
 mod build_collection;
 mod build_csr;
+mod build_finalize;
 mod build_match_bitmap;
 mod build_pages;
 mod build_projection;
