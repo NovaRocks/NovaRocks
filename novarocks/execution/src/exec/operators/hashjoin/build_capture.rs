@@ -369,13 +369,18 @@ impl InputRunWriter {
                 )?;
             }
         }
+        let payload = if self.payload_required {
+            Some(super::payload_compaction::retain_payload(source, work)?)
+        } else {
+            None
+        };
         let page = funded_shared(
             work.owner,
             BuildPageData {
                 start: self.rows,
                 rows,
                 ids,
-                payload: self.payload_required.then(|| source.batch_projection()),
+                payload,
                 values,
                 nulls,
                 _storage: work.owner.storage_lifetime(),

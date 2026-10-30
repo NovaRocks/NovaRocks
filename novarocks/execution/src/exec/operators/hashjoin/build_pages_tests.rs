@@ -295,7 +295,7 @@ fn ordinary_presence_can_omit_payload_without_confusing_empty_lookup_with_physic
 }
 
 #[test]
-fn one_page_projection_and_escaped_buffer_keep_the_original_source_creator() {
+fn compacted_page_detaches_source_and_escaped_buffer_keeps_its_new_creator() {
     use novarocks_functions::{
         EvaluationCheckpoints, SourceBackingOwner, opaque_memory::OpaqueRetainedCharge,
         retain_source_backing, source_custody_prefix_facts,
@@ -352,8 +352,17 @@ fn one_page_projection_and_escaped_buffer_keep_the_original_source_creator() {
     drop(receipt);
     drop(writer);
     drop(source);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "the independent original array alias remains live"
+    );
     drop(values);
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "compacted payload does not hold original source backing"
+    );
     let payload = page.payload().unwrap();
     let column = payload.column(0).unwrap();
     assert_eq!(column.slot.typed_binding().value_type().nullable(), false);
@@ -369,8 +378,16 @@ fn one_page_projection_and_escaped_buffer_keep_the_original_source_creator() {
         &[5, 7]
     );
     drop(page);
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    drop(domains);
+    drop(work);
+    drop(owner);
+    assert!(
+        tracker.current() > 0,
+        "the escaped copied buffer holds its actual finite creator"
+    );
     drop(buffer);
+    assert_eq!(tracker.current(), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 

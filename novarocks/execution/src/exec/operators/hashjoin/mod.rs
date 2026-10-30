@@ -39,6 +39,7 @@ mod join_completion;
 mod key_build_worker;
 mod naa_index;
 pub(crate) mod native_runtime_filter;
+mod payload_compaction;
 mod tail_ranges;
 mod typed_gather;
 

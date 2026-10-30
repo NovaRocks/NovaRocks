@@ -94,7 +94,7 @@ fn copy_error(cause: selected_copy::CopyConstructionError<ConstructionFailure>) 
         selected_copy::CopyConstructionError::Copy(cause) => copy_failure(cause),
     }
 }
-fn copy_column(
+pub(in crate::exec::operators::hashjoin) fn copy_column(
     sources: &[ArrayRef],
     choices: &[(usize, usize)],
     target: &ChunkSlotSchema,

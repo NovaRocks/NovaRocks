@@ -137,7 +137,7 @@ impl novarocks_failure_contract::FailureProjection for GatherKernelFailure {
         }
     }
 }
-fn gather_kernel(cause: arrow::error::ArrowError) -> ExecutionFailure {
+pub(super) fn gather_kernel(cause: arrow::error::ArrowError) -> ExecutionFailure {
     ExecutionFailure::from_domain(GatherKernelFailure(cause))
 }
 fn copy_failure(cause: novarocks_functions::selected_copy::CopyError) -> JoinGatherError {
@@ -209,3 +209,5 @@ fn strict_record_batch(
     .map_err(|cause| crate::exec::chunk::ChunkConstructionFailure::record_batch(cause).into())
     .map_err(JoinGatherError::Source)
 }
+
+pub(super) use paged::copy_column as copy_payload_column;
