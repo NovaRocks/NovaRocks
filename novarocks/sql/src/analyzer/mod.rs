@@ -4496,6 +4496,74 @@ mod tests {
     }
 
     #[test]
+    fn tuple_not_in_keeps_every_value_pair_and_the_original_nullable_author() {
+        use crate::analysis::{ExprKind, Relation, TypedExpr};
+        use crate::common::{BinOp, JoinKind};
+
+        fn pairs(expr: &TypedExpr, result: &mut Vec<(String, String)>) {
+            match &expr.kind {
+                ExprKind::BinaryOp {
+                    left,
+                    op: BinOp::And,
+                    right,
+                    ..
+                } => {
+                    pairs(left, result);
+                    pairs(right, result);
+                }
+                ExprKind::BinaryOp {
+                    left,
+                    op: BinOp::Eq,
+                    right,
+                    ..
+                } => {
+                    let (
+                        ExprKind::ColumnRef { column: left, .. },
+                        ExprKind::ColumnRef { column: right, .. },
+                    ) = (&left.kind, &right.kind)
+                    else {
+                        panic!("the SQL compares the two original column pairs")
+                    };
+                    result.push((left.clone(), right.clone()));
+                }
+                other => panic!("unexpected original comparison {other:?}"),
+            }
+        }
+        for (sql, correlated) in [
+            (
+                "SELECT l1.l_orderkey FROM lineitem l1 WHERE (l1.l_orderkey,l1.l_shipdate) NOT IN (SELECT l2.l_orderkey,l2.l_shipdate FROM lineitem l2)",
+                false,
+            ),
+            (
+                "SELECT l1.l_orderkey FROM lineitem l1 WHERE (l1.l_orderkey,l1.l_shipdate) NOT IN (SELECT l2.l_orderkey,l2.l_shipdate FROM lineitem l2 WHERE l2.l_suppkey=l1.l_suppkey)",
+                true,
+            ),
+        ] {
+            let resolved = parse_and_analyze(sql).expect("analyze tuple NOT IN");
+            let select = select_body(&resolved);
+            let Some(Relation::Join(join)) = &select.from else {
+                panic!("tuple NOT IN has an explicit comparison author")
+            };
+            assert_eq!(join.join_type, JoinKind::NullAwareLeftAnti);
+            let author = join.naa_author.as_ref().expect("original NOT IN roles");
+            let mut actual = Vec::new();
+            pairs(&author.comparison, &mut actual);
+            assert_eq!(
+                actual,
+                [
+                    ("l_orderkey".into(), "l_orderkey".into()),
+                    ("l_shipdate".into(), "l_shipdate".into())
+                ]
+            );
+            // Only the second SQL pair carries NULL. It must still select
+            // NAA and preserve UNKNOWN in the complete original comparison.
+            assert!(author.comparison.value_type.nullable());
+            assert!(join.condition.as_ref().unwrap().value_type.nullable());
+            assert_eq!(author.eligibility.is_some(), correlated);
+        }
+    }
+
+    #[test]
     fn correlated_not_in_nullable_key_rewrites_to_null_aware_left_anti() {
         let sql = "SELECT l1.l_orderkey FROM lineitem l1 \
                    WHERE l1.l_shipdate NOT IN ( \

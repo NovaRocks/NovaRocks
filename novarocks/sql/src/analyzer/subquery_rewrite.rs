@@ -1886,7 +1886,7 @@ impl<'a> AnalyzerContext<'a> {
             return self.rewrite_correlated_in_subquery(
                 select,
                 scope,
-                lhs_typed,
+                lhs_typed_list,
                 resolved_sub,
                 sq_info.id,
                 sq_info.subquery.span,
@@ -2474,7 +2474,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         select: &mut ResolvedSelect,
         scope: &AnalyzerScope,
-        lhs_typed: TypedExpr,
+        lhs_typed: Vec<TypedExpr>,
         resolved_sub: ResolvedQuery,
         sq_id: usize,
         subquery_span: novarocks_parser::Span,
@@ -2490,13 +2490,12 @@ impl<'a> AnalyzerContext<'a> {
             }
         };
 
-        if sub_projection.is_empty() {
+        if sub_projection.is_empty() || lhs_typed.len() != sub_projection.len() {
             return Err(AnalyzeError::invalid_query_shape(
-                "IN subquery must produce a column",
+                "correlated IN subquery comparison arity differs from its projection",
                 subquery_span,
             ));
         }
-        let rhs_expr = sub_projection[0].expr.clone();
         let sub_rel = sub_from.ok_or_else(|| {
             AnalyzeError::unsupported_query_shape(
                 "IN subquery must have a FROM clause",
@@ -2504,25 +2503,51 @@ impl<'a> AnalyzerContext<'a> {
             )
         })?;
 
-        // Keep the key condition as a plain equality so the optimizer can
-        // implement it as a hash join key. For nullable NOT IN semantics,
-        // the join type carries the null-aware anti behavior and evaluates
-        // residual correlation predicates against matching/null-key build
-        // rows.
-        let either_nullable = lhs_typed.value_type.nullable() || rhs_expr.value_type.nullable();
-        let key_cond = TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                DataType::Boolean,
-                either_nullable,
-            ),
+        // Preserve every comparison in tuple order. NULL in a later value
+        // component must still select NAA; retaining only the first pair
+        // changes both equality and the signed three-valued result.
+        let mut comparisons = Vec::with_capacity(lhs_typed.len());
+        let mut either_nullable = false;
+        for (left, right) in lhs_typed.into_iter().zip(sub_projection) {
+            self.check_control()?;
+            let nullable = left.value_type.nullable() || right.expr.value_type.nullable();
+            either_nullable |= nullable;
+            comparisons.push(TypedExpr {
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    nullable,
+                ),
 
-            kind: ExprKind::BinaryOp {
-                left: Box::new(lhs_typed),
-                op: BinOp::Eq,
-                right: Box::new(rhs_expr),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        };
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(left),
+                    op: BinOp::Eq,
+                    right: Box::new(right.expr),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+            });
+        }
+        let mut comparisons = comparisons.into_iter();
+        let mut key_cond = comparisons
+            .next()
+            .expect("non-empty comparison arity was checked");
+        for right in comparisons {
+            self.check_control()?;
+            let nullable = key_cond.value_type.nullable() || right.value_type.nullable();
+            key_cond = TypedExpr {
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    nullable,
+                ),
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(key_cond),
+                    op: BinOp::And,
+                    right: Box::new(right),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+            };
+        }
         let eligibility_author = sub_filter.clone();
         let sub_filter = sub_filter
             .map(|filter| -> Result<TypedExpr, AnalyzeError> {
