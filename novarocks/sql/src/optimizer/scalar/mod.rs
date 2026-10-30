@@ -267,10 +267,11 @@ impl ScalarArena {
             .expect("explicit test scalar interning control")
     }
 
-    /// Canonicalize commutative binary ops by ordering operands by ScalarId, so
-    /// `a AND b` and `b AND a` intern to one id. Mirrors StarRocks
-    /// normalizeChildrenGroup.
-    fn normalize(node: ScalarNode) -> ScalarNode {
+    /// Canonicalize only directly read values. Composed operands retain their
+    /// original evaluation order: Boolean algebra alone does not prove that
+    /// swapping required-error or conditional work is valid. The leaf proof
+    /// is constant work and does not rescan an ever-growing expression tree.
+    fn normalize(&self, node: ScalarNode) -> ScalarNode {
         if let ScalarNode::BinaryOp {
             op,
             left,
@@ -279,7 +280,15 @@ impl ScalarArena {
         } = node
         {
             let commutative = matches!(op, BinOp::And | BinOp::Or | BinOp::Eq);
-            if commutative && left.0 > right.0 {
+            let direct_value = |id: ScalarId| {
+                self.nodes.get(id.0 as usize).is_some_and(|node| {
+                    matches!(
+                        node,
+                        ScalarNode::ColumnRef(_) | ScalarNode::Literal(_) | ScalarNode::Constant(_)
+                    )
+                })
+            };
+            if commutative && left.0 > right.0 && direct_value(left) && direct_value(right) {
                 return ScalarNode::BinaryOp {
                     op,
                     left: right,

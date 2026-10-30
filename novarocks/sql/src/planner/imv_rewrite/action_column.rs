@@ -897,6 +897,7 @@ mod tests {
         let right = scan_plan(delta_scan_with(None));
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: None,
             }),

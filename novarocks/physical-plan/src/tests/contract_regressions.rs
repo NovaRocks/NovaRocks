@@ -255,13 +255,15 @@ fn null_safe_join_filter(
             kind: NodeKind::HashJoin {
                 kind: JoinKind::Inner,
                 build_side: JoinSide::Right,
-                keys: Box::from([JoinKey {
-                    left: left_key,
-                    right: right_key,
-                    null_safe: true,
-                }]),
+                condition: crate::HashJoinCondition::Ordinary {
+                    keys: Box::from([JoinKey {
+                        left: left_key,
+                        right: right_key,
+                        null_safe: true,
+                    }]),
+                    residual: None,
+                },
                 distribution: JoinDistribution::BroadcastBuild,
-                residual: None,
                 null_extended: Box::default(),
             },
         })
@@ -554,14 +556,16 @@ pub(super) fn scan_lineage_filter(
                 },
                 kind: NodeKind::HashJoin {
                     kind: JoinKind::Inner,
-                    keys: Box::from([JoinKey {
-                        left: left_key,
-                        right: right_key,
-                        null_safe: false,
-                    }]),
+                    condition: crate::HashJoinCondition::Ordinary {
+                        keys: Box::from([JoinKey {
+                            left: left_key,
+                            right: right_key,
+                            null_safe: false,
+                        }]),
+                        residual: None,
+                    },
                     build_side: JoinSide::Right,
                     distribution: JoinDistribution::BroadcastBuild,
-                    residual: None,
                     null_extended: Box::default(),
                 },
             })
@@ -616,13 +620,15 @@ pub(super) fn scan_lineage_filter(
             kind: NodeKind::HashJoin {
                 kind: JoinKind::Inner,
                 build_side: JoinSide::Right,
-                keys: Box::from([JoinKey {
-                    left: probe_key,
-                    right: build_key,
-                    null_safe: false,
-                }]),
+                condition: crate::HashJoinCondition::Ordinary {
+                    keys: Box::from([JoinKey {
+                        left: probe_key,
+                        right: build_key,
+                        null_safe: false,
+                    }]),
+                    residual: None,
+                },
                 distribution: JoinDistribution::BroadcastBuild,
-                residual: None,
                 null_extended: Box::default(),
             },
         })
@@ -1707,13 +1713,15 @@ fn append_partitioned_inner_join(
             kind: NodeKind::HashJoin {
                 kind: JoinKind::Inner,
                 build_side: JoinSide::Right,
-                keys: Box::from([JoinKey {
-                    left: left_key,
-                    right: right_key,
-                    null_safe: false,
-                }]),
+                condition: crate::HashJoinCondition::Ordinary {
+                    keys: Box::from([JoinKey {
+                        left: left_key,
+                        right: right_key,
+                        null_safe: false,
+                    }]),
+                    residual: None,
+                },
                 distribution: JoinDistribution::Partitioned,
-                residual: None,
                 null_extended: Box::default(),
             },
         })
@@ -1851,13 +1859,15 @@ fn append_inner_join_with_properties(
             kind: NodeKind::HashJoin {
                 kind: JoinKind::Inner,
                 build_side: JoinSide::Right,
-                keys: Box::from([JoinKey {
-                    left: left_key,
-                    right: right_key,
-                    null_safe: false,
-                }]),
+                condition: crate::HashJoinCondition::Ordinary {
+                    keys: Box::from([JoinKey {
+                        left: left_key,
+                        right: right_key,
+                        null_safe: false,
+                    }]),
+                    residual: None,
+                },
                 distribution: JoinDistribution::BroadcastBuild,
-                residual: None,
                 null_extended: Box::default(),
             },
         })

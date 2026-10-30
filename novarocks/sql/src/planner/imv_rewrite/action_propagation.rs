@@ -1198,6 +1198,7 @@ mod tests {
     fn join_plan(left: LogicalPlanNode, right: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: None,
             }),
@@ -1461,6 +1462,7 @@ mod tests {
         let right = scan_plan(delta_scan());
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: None,
             }),

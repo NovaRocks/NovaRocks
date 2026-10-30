@@ -243,6 +243,7 @@ fn join_cells(
             left: Box::new(left.tree.clone()),
             right: Box::new(right.tree.clone()),
             op: LogicalJoinOp {
+                naa_author: None,
                 join_type: kind,
                 condition,
             },

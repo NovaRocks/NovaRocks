@@ -1257,7 +1257,7 @@ fn rewrite_join(
         return Ok(());
     }
     let condition = match &node.op {
-        Operator::PhysicalHashJoin(join) => join.other_condition,
+        Operator::PhysicalHashJoin(join) => *join.condition.residual(),
         Operator::PhysicalNestLoopJoin(join) => join.condition,
         _ => return Ok(()),
     };
@@ -1309,7 +1309,7 @@ fn rewrite_join(
     }
     let new_condition = substitute(scalars, condition, &subst, control)?;
     match &mut node.op {
-        Operator::PhysicalHashJoin(join) => join.other_condition = Some(new_condition),
+        Operator::PhysicalHashJoin(join) => *join.condition.residual_mut() = Some(new_condition),
         Operator::PhysicalNestLoopJoin(join) => join.condition = Some(new_condition),
         _ => unreachable!("checked join operator above"),
     }
@@ -3659,14 +3659,16 @@ mod tests {
         let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: left_a,
-                    right: right_key,
-                    null_safe: false,
-                }],
-                other_condition: Some(condition),
                 build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![PhysicalHashJoinEqCondition {
+                        left: left_a,
+                        right: right_key,
+                        null_safe: false,
+                    }],
+                    residual: Some(condition),
+                },
             }),
             children: vec![left, right],
             stats: Statistics::default(),
@@ -3702,7 +3704,7 @@ mod tests {
             panic!("expected hash join");
         };
         let ScalarNode::BinaryOp { left, right, .. } =
-            arena.node(join.other_condition.expect("join other condition"))
+            arena.node(join.condition.residual().expect("join other condition"))
         else {
             panic!("expected conjunction");
         };

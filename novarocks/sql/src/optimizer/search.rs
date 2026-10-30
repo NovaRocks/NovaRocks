@@ -845,10 +845,12 @@ mod tests {
             id: 2,
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![eq_condition],
-                other_condition: None,
                 build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Unknown,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![eq_condition],
+                    residual: None,
+                },
             }),
             children: vec![left_group, right_group],
         });
@@ -953,7 +955,7 @@ mod tests {
         let Operator::PhysicalHashJoin(join) = &mut root_expr.op else {
             panic!("fixture root should be a hash join");
         };
-        join.eq_conditions = vec![eq_condition];
+        *join.condition.keys_mut() = vec![eq_condition];
         (memo, root)
     }
 
@@ -994,10 +996,12 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: crate::analysis::JoinKind::Inner,
-                eq_conditions: vec![eq_condition],
-                other_condition: None,
                 build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Unknown,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![eq_condition],
+                    residual: None,
+                },
             }),
             children: vec![left, right],
         });
@@ -1033,10 +1037,12 @@ mod tests {
             id: 1,
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![eq_condition],
-                other_condition: None,
                 build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Unknown,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![eq_condition],
+                    residual: None,
+                },
             }),
             children: vec![child_group],
         });
@@ -1991,10 +1997,12 @@ mod cascaded_derivation_tests {
 
         let shuffle_join = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![eq_cond(&mut memo, col(10), col(10))],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Shuffle,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![eq_cond(&mut memo, col(10), col(10))],
+                residual: None,
+            },
         });
         let g_sj = memo.new_group(MExpr {
             id: 3,
@@ -2004,10 +2012,12 @@ mod cascaded_derivation_tests {
 
         let broadcast_join = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![eq_cond(&mut memo, col(10), col(10))],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![eq_cond(&mut memo, col(10), col(10))],
+                residual: None,
+            },
         });
         let g_bj = memo.new_group(MExpr {
             id: 4,

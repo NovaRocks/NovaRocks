@@ -228,13 +228,14 @@ pub(super) fn eq(
     right: ScalarId,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    let nullable = arena.nullable(left) || arena.nullable(right);
     binary_op(
         arena,
         BinOp::Eq,
         left,
         right,
         DataType::Boolean,
-        false,
+        nullable,
         control,
     )
 }
@@ -842,6 +843,7 @@ pub(super) fn join(
 ) -> OptExpr {
     OptExpr::new(
         Operator::LogicalJoin(LogicalJoinOp {
+            naa_author: None,
             join_type,
             condition,
         }),

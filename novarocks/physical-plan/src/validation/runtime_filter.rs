@@ -1061,10 +1061,12 @@ pub(crate) fn equality_key_value(
     side: crate::JoinSide,
 ) -> Option<ValueId> {
     let node = fragment.nodes().get(&witness.join)?;
-    let NodeKind::HashJoin { keys, .. } = &node.kind else {
+    let NodeKind::HashJoin { condition, .. } = &node.kind else {
         return None;
     };
-    let key = keys.get(usize::try_from(witness.key_ordinal).ok()?)?;
+    let key = condition
+        .keys()
+        .get(usize::try_from(witness.key_ordinal).ok()?)?;
     crate::expression_value(
         fragment.expressions(),
         match side {
@@ -1084,13 +1086,14 @@ pub(crate) fn validate_runtime_filter_equality_witness(
     let valid = fragment.nodes().get(&witness.join).is_some_and(|node| {
         let NodeKind::HashJoin {
             kind,
-            keys,
+            condition,
             build_side,
             ..
         } = &node.kind
         else {
             return false;
         };
+        let keys = condition.keys();
         if witness.fragment != fragment.id() || *build_side != witness.domain_side {
             return false;
         }
@@ -1848,10 +1851,13 @@ fn advance_runtime_filter_lineage_step<'a>(
             }
             let fragment = get_fragment(fragment)?;
             let node = fragment.nodes().get(&node)?;
-            let NodeKind::HashJoin { kind, keys, .. } = &node.kind else {
+            let NodeKind::HashJoin {
+                kind, condition, ..
+            } = &node.kind
+            else {
                 return None;
             };
-            let key = keys.get(usize::try_from(key_ordinal).ok()?)?;
+            let key = condition.keys().get(usize::try_from(key_ordinal).ok()?)?;
             if !kind.key_filter_reaches_side(target_side) || key.null_safe || node.inputs.len() != 2
             {
                 return None;

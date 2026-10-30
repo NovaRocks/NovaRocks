@@ -663,13 +663,26 @@ message JoinKey {
   optional uint32 right_expr_id = 2;
   bool null_safe = 3;
 }
+message OrdinaryHashJoinCondition {
+  repeated JoinKey keys = 1;
+  optional uint32 residual_expr_id = 2;
+}
+message NullAwareEqualHashJoinCondition {
+  repeated JoinKey value_equal_keys = 1;
+  repeated JoinKey scope_keys = 2;
+  optional uint32 eligibility_expr_id = 3;
+}
 message HashJoinNode {
   JoinKind kind = 1;
-  repeated JoinKey keys = 2;
+  reserved 2, 5;
+  reserved "keys", "residual_expr_id";
   JoinSide build_side = 3;
   JoinDistribution distribution = 4;
-  optional uint32 residual_expr_id = 5;
   repeated uint32 null_extended_value_ids = 6;
+  oneof condition {
+    OrdinaryHashJoinCondition ordinary = 7;
+    NullAwareEqualHashJoinCondition null_aware_equal = 8;
+  }
 }
 message NestLoopJoinNode {
   JoinKind kind = 1;

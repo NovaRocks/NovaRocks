@@ -255,6 +255,7 @@ fn build_target_locator_join(
     )?;
     let join = LogicalPlanNode::new(
         LogicalPlanKind::Join(LogicalJoinNode {
+            naa_author: None,
             join_type: JoinKind::LeftOuter,
             condition: Some(target_locator_join_condition(
                 &input,

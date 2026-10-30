@@ -347,6 +347,24 @@ fn add_join(
             )
             .unwrap()
     });
+    let nested_predicate = if matches!(spec.family, Family::NestLoop)
+        && spec.kind == JoinKind::NullAwareLeftAnti
+        && residual.is_none()
+    {
+        // The existing unconditional NOT IN oracle now has an explicit
+        // complete comparison, rather than a missing predicate default.
+        Some(
+            builder
+                .add_expression(
+                    join,
+                    FunctionValueType::new(DataType::Boolean, false),
+                    ExprKind::Literal(LiteralValue::Boolean(true)),
+                )
+                .unwrap(),
+        )
+    } else {
+        residual
+    };
     let mut extend = |of: ValueId| {
         builder
             .add_value(int64(true), ValueOrigin::NullExtended { node: join, of })
@@ -390,15 +408,25 @@ fn add_join(
     let kind = match spec.family {
         Family::Hash { build_side, .. } => NodeKind::HashJoin {
             kind: spec.kind,
-            keys: Box::from([key.unwrap()]),
             build_side,
             distribution: match placement {
                 Placement::Single => JoinDistribution::Singleton,
                 Placement::Broadcast => JoinDistribution::BroadcastBuild,
                 Placement::Partitioned => JoinDistribution::Partitioned,
             },
-            residual,
             null_extended,
+            condition: if spec.kind == JoinKind::NullAwareLeftAnti {
+                novarocks_physical_plan::HashJoinCondition::NullAwareEqual {
+                    value_equal_keys: Box::from([key.unwrap()]),
+                    scope_keys: Box::default(),
+                    eligibility: residual,
+                }
+            } else {
+                novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: Box::from([key.unwrap()]),
+                    residual,
+                }
+            },
         },
         Family::NestLoop => NodeKind::NestLoopJoin {
             kind: spec.kind,
@@ -407,7 +435,7 @@ fn add_join(
                 Placement::Broadcast => NestLoopJoinDistribution::BroadcastRight,
                 Placement::Partitioned => panic!("a nested-loop join is never partitioned"),
             },
-            predicate: residual,
+            predicate: nested_predicate,
             null_extended,
         },
     };
@@ -1306,11 +1334,13 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
             Distribution::Singleton,
             NodeKind::HashJoin {
                 kind: JoinKind::Inner,
-                keys: Box::from([key]),
                 build_side: JoinSide::Right,
                 distribution: JoinDistribution::Singleton,
-                residual,
                 null_extended: Box::default(),
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: Box::from([key]),
+                    residual: residual,
+                },
             },
         )
         .unwrap();

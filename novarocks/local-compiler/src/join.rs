@@ -57,8 +57,8 @@ use novarocks_local_program::{
     DiagnosticSourceNodeId, FilterConsumerAtJoinKey, FilterProducerAtExpr, JoinDistributionMode,
     JoinType, LocalOperatorId, LocalOperatorOrigin, LocalOperatorProvenance, MetricAggregation,
     NestedLoopJoinType, OperatorMetricAggregation, ProgramChannelLayoutRole, ProgramChannelSite,
-    ProgramExprId, ProgramNode, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind,
-    StaticFilterProducer, StaticLayout,
+    ProgramExprId, ProgramJoinCondition, ProgramJoinKey, ProgramNode, ProgramNodeExpressionRole,
+    ProgramNodeId, ProgramNodeKind, StaticFilterProducer, StaticLayout,
 };
 use novarocks_physical_plan::{
     Distribution, ExprId, ExpressionRootRole, Fragment, FragmentPackage, JoinDistribution,
@@ -140,10 +140,22 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
     match &node.kind {
         NodeKind::HashJoin {
             kind,
+            condition,
             build_side,
             distribution,
             ..
         } => {
+            if condition.is_null_aware()
+                && (condition.keys().len() != 1
+                    || condition.keys().iter().any(|key| key.null_safe)
+                    || condition.scope_keys().is_some_and(|keys| !keys.is_empty())
+                    || condition.residual().is_some())
+            {
+                return Err(unsupported(
+                    node,
+                    "null-aware candidate evaluation requires the B3 runtime",
+                ));
+            }
             let (probe_input, local) = match build_side {
                 JoinSide::Right => (
                     0,
@@ -746,7 +758,9 @@ pub(crate) fn root_role(
     role: ExpressionRootRole,
 ) -> Result<(ProgramNodeExpressionRole, ProgramChannelLayoutRole), FragmentCompileError> {
     match (role, planned.orientation.kind) {
-        (ExpressionRootRole::JoinKey { key, side }, LocalJoinKind::Hash(_)) => {
+        (ExpressionRootRole::JoinKey { key, side }, LocalJoinKind::Hash(kind))
+            if kind != JoinType::NullAwareLeftAnti =>
+        {
             Ok(if side == planned.orientation.probe_side() {
                 (
                     ProgramNodeExpressionRole::JoinProbeKey { key },
@@ -759,10 +773,48 @@ pub(crate) fn root_role(
                 )
             })
         }
-        (ExpressionRootRole::HashJoinResidual, LocalJoinKind::Hash(_)) => Ok((
-            ProgramNodeExpressionRole::JoinResidual,
-            ProgramChannelLayoutRole::JoinScope,
-        )),
+        (ExpressionRootRole::HashJoinResidual, LocalJoinKind::Hash(kind))
+            if kind != JoinType::NullAwareLeftAnti =>
+        {
+            Ok((
+                ProgramNodeExpressionRole::JoinResidual,
+                ProgramChannelLayoutRole::JoinScope,
+            ))
+        }
+        (
+            ExpressionRootRole::NaaValueEqualKey { key, side },
+            LocalJoinKind::Hash(JoinType::NullAwareLeftAnti),
+        ) => Ok(if side == planned.orientation.probe_side() {
+            (
+                ProgramNodeExpressionRole::NaaValueProbeKey { key },
+                ProgramChannelLayoutRole::JoinLeft,
+            )
+        } else {
+            (
+                ProgramNodeExpressionRole::NaaValueBuildKey { key },
+                ProgramChannelLayoutRole::JoinRight,
+            )
+        }),
+        (
+            ExpressionRootRole::NaaScopeKey { key, side },
+            LocalJoinKind::Hash(JoinType::NullAwareLeftAnti),
+        ) => Ok(if side == planned.orientation.probe_side() {
+            (
+                ProgramNodeExpressionRole::NaaScopeProbeKey { key },
+                ProgramChannelLayoutRole::JoinLeft,
+            )
+        } else {
+            (
+                ProgramNodeExpressionRole::NaaScopeBuildKey { key },
+                ProgramChannelLayoutRole::JoinRight,
+            )
+        }),
+        (ExpressionRootRole::NaaEligibility, LocalJoinKind::Hash(JoinType::NullAwareLeftAnti)) => {
+            Ok((
+                ProgramNodeExpressionRole::NaaEligibility,
+                ProgramChannelLayoutRole::JoinScope,
+            ))
+        }
         (ExpressionRootRole::NestLoopPredicate, LocalJoinKind::NestLoop(_)) => Ok((
             ProgramNodeExpressionRole::NestedLoopPredicate,
             ProgramChannelLayoutRole::JoinScope,
@@ -1074,56 +1126,62 @@ fn lower_core_with_creation<H>(
         creation,
     )?;
     let kind = match (&node.kind, planned.orientation.kind) {
-        (NodeKind::HashJoin { keys, residual, .. }, LocalJoinKind::Hash(join_type)) => {
-            // Every physical distribution delivers this instance its whole
-            // share of both sides, so the local strategy shares one build per
-            // instance; the local mode records exactly that.
-            let mut probe_keys = Vec::new();
-            reserve_vec(&mut probe_keys, keys.len(), work)?;
-            let mut build_keys = Vec::new();
-            reserve_vec(&mut build_keys, keys.len(), work)?;
-            let mut eq_null_safe = Vec::new();
-            reserve_vec(&mut eq_null_safe, keys.len(), work)?;
-            for key in keys.iter() {
-                let (probe_key, build_key) = if planned.orientation.probe_input == 0 {
-                    (key.left, key.right)
-                } else {
-                    (key.right, key.left)
-                };
-                let probe_type = &fragment
-                    .expressions()
-                    .get(probe_key)
-                    .ok_or(FragmentCompileError::Invalid("missing join key definition"))?
-                    .ty;
-                let build_type = &fragment
-                    .expressions()
-                    .get(build_key)
-                    .ok_or(FragmentCompileError::Invalid("missing join key definition"))?
-                    .ty;
-                // The hash table compares exact carriers; a key pair whose
-                // carriers differ would need a BE cast, which is refused.
-                work.flush()?;
-                let same = probe_type
-                    .same_physical_binding_ignoring_root_nullability_observed(build_type, || {
-                        work.step().map_err(FragmentCompileError::from)
-                    })?;
-                if !same {
-                    return Err((unsupported(node, "join key carriers differ")).into());
+        (NodeKind::HashJoin { condition, .. }, LocalJoinKind::Hash(join_type)) => {
+            let lower_keys = |source_keys: &[novarocks_physical_plan::JoinKey],
+                              work: &mut CompileCheckpoints<'_>|
+             -> Result<Vec<ProgramJoinKey>, FragmentCompileError> {
+                let mut keys = Vec::new();
+                reserve_vec(&mut keys, source_keys.len(), work)?;
+                for key in source_keys {
+                    let (probe_key, build_key) = if planned.orientation.probe_input == 0 {
+                        (key.left, key.right)
+                    } else {
+                        (key.right, key.left)
+                    };
+                    let probe_type = &fragment
+                        .expressions()
+                        .get(probe_key)
+                        .ok_or(FragmentCompileError::Invalid("missing join key definition"))?
+                        .ty;
+                    let build_type = &fragment
+                        .expressions()
+                        .get(build_key)
+                        .ok_or(FragmentCompileError::Invalid("missing join key definition"))?
+                        .ty;
+                    // The hash table compares exact carriers; a key pair whose
+                    // carriers differ would need a BE cast, which is refused.
+                    work.flush()?;
+                    let same = probe_type
+                        .same_physical_binding_ignoring_root_nullability_observed(
+                            build_type,
+                            || work.step().map_err(FragmentCompileError::from),
+                        )?;
+                    if !same {
+                        return Err((unsupported(node, "join key carriers differ")).into());
+                    }
+                    keys.push(ProgramJoinKey {
+                        probe: lowered(expressions, probe_key)?,
+                        build: lowered(expressions, build_key)?,
+                        null_safe: key.null_safe,
+                    });
+                    work.step()?;
                 }
-                probe_keys.push(lowered(expressions, probe_key)?);
-                build_keys.push(lowered(expressions, build_key)?);
-                eq_null_safe.push(key.null_safe);
-                work.step()?;
-            }
+                Ok(keys)
+            };
+            let keys = lower_keys(condition.keys(), work)?;
+            let scope_keys = lower_keys(
+                condition.scope_keys().map_or(&[][..], |keys| keys.as_ref()),
+                work,
+            )?;
             // Each producer observes the build key its witness names.
             let mut producers = Vec::new();
             reserve_vec(&mut producers, runtime_filters.len(), work)?;
             for (key_ordinal, producer) in runtime_filters {
-                let expr_id = *build_keys
-                    .get(key_ordinal)
-                    .ok_or(FragmentCompileError::Invalid(
+                let expr_id = keys.get(key_ordinal).map(|key| key.build).ok_or(
+                    FragmentCompileError::Invalid(
                         "runtime-filter producer names an absent build key",
-                    ))?;
+                    ),
+                )?;
                 producers.push(FilterProducerAtExpr {
                     expr_id,
                     key_ordinal,
@@ -1134,7 +1192,7 @@ fn lower_core_with_creation<H>(
             let mut consumers = Vec::new();
             reserve_vec(&mut consumers, runtime_filter_consumers.len(), work)?;
             for (key_ordinal, expr_id, consumer) in runtime_filter_consumers {
-                if probe_keys.get(key_ordinal) != Some(&expr_id) {
+                if keys.get(key_ordinal).map(|key| key.probe) != Some(expr_id) {
                     return Err((FragmentCompileError::Invalid(
                         "probe consumer differs from its exact key ordinal",
                     ))
@@ -1155,10 +1213,24 @@ fn lower_core_with_creation<H>(
                 left_layout: probe.layout.clone(),
                 right_layout: build.layout.clone(),
                 join_scope_layout: scope,
-                probe_keys,
-                build_keys,
-                eq_null_safe,
-                residual_predicate: residual.map(|id| lowered(expressions, id)).transpose()?,
+                condition: match condition {
+                    novarocks_physical_plan::HashJoinCondition::Ordinary { residual, .. } => {
+                        ProgramJoinCondition::Ordinary {
+                            keys,
+                            residual_predicate: residual
+                                .map(|id| lowered(expressions, id))
+                                .transpose()?,
+                        }
+                    }
+                    novarocks_physical_plan::HashJoinCondition::NullAwareEqual {
+                        eligibility,
+                        ..
+                    } => ProgramJoinCondition::NullAwareEqual {
+                        value_equal_keys: keys,
+                        scope_keys,
+                        eligibility: eligibility.map(|id| lowered(expressions, id)).transpose()?,
+                    },
+                },
                 runtime_filters: producers,
                 runtime_filter_consumers: consumers,
             }

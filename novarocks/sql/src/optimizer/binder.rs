@@ -409,6 +409,7 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: None,
             }),

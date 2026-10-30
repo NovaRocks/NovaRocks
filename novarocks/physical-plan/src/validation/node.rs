@@ -846,13 +846,20 @@ pub(crate) fn validate_node_semantics(
         }
         NodeKind::HashJoin {
             kind,
-            keys,
+            condition,
             build_side,
             distribution,
-            residual,
             null_extended,
             ..
         } => {
+            let keys = condition.keys();
+            let residual = condition.residual();
+            if (*kind == crate::JoinKind::NullAwareLeftAnti) != condition.is_null_aware() {
+                errors.push(ValidationError::new(
+                    path,
+                    "hash join kind and condition variant disagree",
+                ));
+            }
             if *kind == crate::JoinKind::Cross {
                 errors.push(ValidationError::new(
                     path,
@@ -883,7 +890,10 @@ pub(crate) fn validate_node_semantics(
                     "hash join must have at least one key",
                 ));
             }
-            for key in keys {
+            for key in keys
+                .iter()
+                .chain(condition.scope_keys().into_iter().flatten())
+            {
                 if let (Some(left), Some(right)) = (
                     fragment.expressions().get(key.left),
                     fragment.expressions().get(key.right),
@@ -904,7 +914,11 @@ pub(crate) fn validate_node_semantics(
             ) {
                 validate_expression_values_on_port(
                     fragment,
-                    &keys.iter().map(|key| key.left).collect::<Vec<_>>(),
+                    &keys
+                        .iter()
+                        .chain(condition.scope_keys().into_iter().flatten())
+                        .map(|key| key.left)
+                        .collect::<Vec<_>>(),
                     indexes
                         .output(left.id)
                         .expect("every fragment node has one indexed output port"),
@@ -913,7 +927,11 @@ pub(crate) fn validate_node_semantics(
                 );
                 validate_expression_values_on_port(
                     fragment,
-                    &keys.iter().map(|key| key.right).collect::<Vec<_>>(),
+                    &keys
+                        .iter()
+                        .chain(condition.scope_keys().into_iter().flatten())
+                        .map(|key| key.right)
+                        .collect::<Vec<_>>(),
                     indexes
                         .output(right.id)
                         .expect("every fragment node has one indexed output port"),
@@ -1027,6 +1045,12 @@ pub(crate) fn validate_node_semantics(
             predicate,
             null_extended,
         } => {
+            if *kind == crate::JoinKind::NullAwareLeftAnti && predicate.is_none() {
+                errors.push(ValidationError::new(
+                    path,
+                    "null-aware nested-loop join requires its complete predicate",
+                ));
+            }
             if *kind == crate::JoinKind::Cross && (predicate.is_some() || !null_extended.is_empty())
             {
                 errors.push(ValidationError::new(

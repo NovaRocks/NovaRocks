@@ -816,6 +816,7 @@ mod tests {
     fn join_expr() -> OptExpr {
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: None,
             }),
@@ -948,6 +949,7 @@ mod tests {
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         let join = LogicalJoinOp {
+            naa_author: None,
             join_type: JoinKind::Inner,
             condition: Some(condition),
         };

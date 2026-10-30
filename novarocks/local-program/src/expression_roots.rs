@@ -22,8 +22,8 @@
 
 use crate::creation::{ProgramCreation, ProgramCreationFailure};
 use crate::{
-    ImmutableExpressions, JoinType, LocalProgramGraph, NestedLoopJoinType, ProgramControlFlow,
-    ProgramExprId, ProgramNodeId, ProgramNodeKind, StaticExprKind, UnpivotConstant,
+    ImmutableExpressions, LocalProgramGraph, NestedLoopJoinType, ProgramControlFlow, ProgramExprId,
+    ProgramNodeId, ProgramNodeKind, StaticExprKind, UnpivotConstant,
 };
 #[cfg(test)]
 use novarocks_type_contract::ValueSchemaCreation;
@@ -91,6 +91,19 @@ pub enum ProgramNodeExpressionRole {
         key: u32,
     },
     JoinResidual,
+    NaaValueProbeKey {
+        key: u32,
+    },
+    NaaValueBuildKey {
+        key: u32,
+    },
+    NaaScopeProbeKey {
+        key: u32,
+    },
+    NaaScopeBuildKey {
+        key: u32,
+    },
+    NaaEligibility,
     NestedLoopPredicate,
     WindowPartition {
         key: u32,
@@ -620,40 +633,53 @@ impl<H> RootCollector<'_, '_, H> {
                 }
             }
             ProgramNodeKind::Join {
-                probe_keys,
-                build_keys,
-                residual_predicate,
-                join_type,
+                condition,
                 runtime_filter_consumers,
                 ..
             } => {
-                for (key, definition) in probe_keys.iter().enumerate() {
+                for (key, definition) in condition.keys().iter().enumerate() {
+                    let key = ordinal(key)?;
+                    let role = if condition.is_null_aware() {
+                        Role::NaaValueProbeKey { key }
+                    } else {
+                        Role::JoinProbeKey { key }
+                    };
+                    self.node_root(node, role, definition.probe, Value)?;
+                }
+                for (key, definition) in condition.keys().iter().enumerate() {
+                    let key = ordinal(key)?;
+                    let role = if condition.is_null_aware() {
+                        Role::NaaValueBuildKey { key }
+                    } else {
+                        Role::JoinBuildKey { key }
+                    };
+                    self.node_root(node, role, definition.build, Value)?;
+                }
+                for (key, definition) in condition.scope_keys().iter().enumerate() {
+                    let key = ordinal(key)?;
                     self.node_root(
                         node,
-                        Role::JoinProbeKey { key: ordinal(key)? },
-                        *definition,
+                        Role::NaaScopeProbeKey { key },
+                        definition.probe,
                         Value,
                     )?;
                 }
-                for (key, definition) in build_keys.iter().enumerate() {
+                for (key, definition) in condition.scope_keys().iter().enumerate() {
+                    let key = ordinal(key)?;
                     self.node_root(
                         node,
-                        Role::JoinBuildKey { key: ordinal(key)? },
-                        *definition,
+                        Role::NaaScopeBuildKey { key },
+                        definition.build,
                         Value,
                     )?;
                 }
-                if let Some(definition) = residual_predicate {
-                    self.node_root(
-                        node,
-                        Role::JoinResidual,
-                        *definition,
-                        if *join_type == JoinType::NullAwareLeftAnti {
-                            Value
-                        } else {
-                            TruthOnly
-                        },
-                    )?;
+                if let Some(definition) = condition.residual_predicate() {
+                    let (role, demand) = if condition.is_null_aware() {
+                        (Role::NaaEligibility, Value)
+                    } else {
+                        (Role::JoinResidual, TruthOnly)
+                    };
+                    self.node_root(node, role, definition, demand)?;
                 }
                 for (binding, consumer) in runtime_filter_consumers.iter().enumerate() {
                     self.node_root(

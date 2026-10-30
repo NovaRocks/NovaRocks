@@ -97,7 +97,7 @@ pub(crate) fn derive_for_expr(
             if join.join_type == JoinKind::Inner {
                 inherit_from_child(memo, expr, 0, &output_ids, &mut props);
                 inherit_from_child(memo, expr, 1, &output_ids, &mut props);
-                for eq in &join.eq_conditions {
+                for eq in join.condition.keys() {
                     if eq.null_safe {
                         continue;
                     }
@@ -108,7 +108,7 @@ pub(crate) fn derive_for_expr(
                         props.equivalence_classes.merge_pair(left, right);
                     }
                 }
-                if let Some(condition) = &join.other_condition {
+                if let Some(condition) = join.condition.residual() {
                     for (left, right) in collect_strict_column_equalities(&memo.scalars, *condition)
                     {
                         props.equivalence_classes.merge_pair(left, right);
@@ -661,6 +661,7 @@ mod tests {
         let join = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(condition),
             }),
@@ -696,6 +697,7 @@ mod tests {
         let join = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::LeftOuter,
                 condition: Some(condition),
             }),
@@ -737,14 +739,16 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: left_key,
-                    right: right_key,
-                    null_safe: true,
-                }],
-                other_condition: None,
                 build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![PhysicalHashJoinEqCondition {
+                        left: left_key,
+                        right: right_key,
+                        null_safe: true,
+                    }],
+                    residual: None,
+                },
             }),
             children: vec![left, right],
         });
@@ -779,14 +783,16 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: left_key,
-                    right: right_key,
-                    null_safe: false,
-                }],
-                other_condition: None,
                 build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![PhysicalHashJoinEqCondition {
+                        left: left_key,
+                        right: right_key,
+                        null_safe: false,
+                    }],
+                    residual: None,
+                },
             }),
             children: vec![left, right],
         });

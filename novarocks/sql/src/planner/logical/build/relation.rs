@@ -117,6 +117,7 @@ pub(super) fn plan_relation_scoped(
         }
         Relation::Join(join_rel) => {
             let JoinRelation {
+                naa_author,
                 left,
                 right,
                 join_type,
@@ -158,6 +159,7 @@ pub(super) fn plan_relation_scoped(
                     let right = plan_relation_scoped(right, cte_registry, factory, control)?;
                     Ok(LogicalPlanNode::new(
                         LogicalPlanKind::Join(LogicalJoinNode {
+                            naa_author,
                             join_type,
                             condition,
                         }),

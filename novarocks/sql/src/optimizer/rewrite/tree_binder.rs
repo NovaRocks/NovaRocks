@@ -229,6 +229,7 @@ mod tests {
     fn mk_join(left: OptExpr, right: OptExpr) -> OptExpr {
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: None,
             }),

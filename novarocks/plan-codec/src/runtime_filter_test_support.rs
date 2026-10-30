@@ -324,14 +324,16 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
             },
             kind: NodeKind::HashJoin {
                 kind: JoinKind::Inner,
-                keys: Box::from([JoinKey {
-                    left: left_key,
-                    right: right_key,
-                    null_safe: false,
-                }]),
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: Box::from([JoinKey {
+                        left: left_key,
+                        right: right_key,
+                        null_safe: false,
+                    }]),
+                    residual: None,
+                },
                 build_side: JoinSide::Right,
                 distribution: JoinDistribution::Partitioned,
-                residual: None,
                 null_extended: Box::default(),
             },
         })

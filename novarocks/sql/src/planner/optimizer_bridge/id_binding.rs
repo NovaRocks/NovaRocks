@@ -285,13 +285,18 @@ fn verify_hash_join(
     scalars: &ScalarArena,
 ) -> Result<HashSet<ColumnId>, String> {
     let (left, right) = two_children(child_outputs, "PhysicalHashJoin")?;
-    for eq in &op.eq_conditions {
+    for eq in op
+        .condition
+        .keys()
+        .iter()
+        .chain(op.condition.scope_keys().into_iter().flatten())
+    {
         let left_key = materialize(scalars, eq.left);
         let right_key = materialize(scalars, eq.right);
         verify_expr(&left_key, left, "PhysicalHashJoin left key")?;
         verify_expr(&right_key, right, "PhysicalHashJoin right key")?;
     }
-    if let Some(condition) = &op.other_condition {
+    if let Some(condition) = op.condition.residual() {
         let condition = materialize(scalars, *condition);
         verify_expr(
             &condition,

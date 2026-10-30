@@ -154,8 +154,8 @@ fn apply_expr(
 
     let in_key = scalar_utils::eq(arena, lhs, inner_col_ref, control)?;
 
-    let (right, condition) = if a.correlation_column_ids.is_empty() {
-        (apply_right, in_key)
+    let (right, condition, eligibility) = if a.correlation_column_ids.is_empty() {
+        (apply_right, in_key, None)
     } else {
         let Some(lifted) =
             lift_correlated_inner_opt(apply_right, &a.correlation_column_ids, arena, control)?
@@ -174,15 +174,20 @@ fn apply_expr(
         else {
             return Ok(None);
         };
-        (lifted.right, condition)
+        (lifted.right, condition, Some(lifted_pred))
     };
 
-    Ok(Some(scalar_utils::join(
-        apply_left,
-        right,
-        join_type,
-        Some(condition),
-    )))
+    let mut join = scalar_utils::join(apply_left, right, join_type, Some(condition));
+    if join_type == JoinKind::NullAwareLeftAnti {
+        let crate::optimizer::operator::Operator::LogicalJoin(op) = &mut join.op else {
+            unreachable!()
+        };
+        op.naa_author = Some(crate::common::naa::NaaAuthorFacts {
+            comparison: in_key,
+            eligibility,
+        });
+    }
+    Ok(Some(join))
 }
 
 #[cfg(test)]

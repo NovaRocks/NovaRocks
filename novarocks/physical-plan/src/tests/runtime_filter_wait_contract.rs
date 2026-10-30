@@ -180,13 +180,15 @@ fn append_broadcast_join(
             kind: NodeKind::HashJoin {
                 kind: JoinKind::Inner,
                 build_side: JoinSide::Right,
-                keys: Box::from([JoinKey {
-                    left: left_key,
-                    right: right_key,
-                    null_safe: false,
-                }]),
+                condition: crate::HashJoinCondition::Ordinary {
+                    keys: Box::from([JoinKey {
+                        left: left_key,
+                        right: right_key,
+                        null_safe: false,
+                    }]),
+                    residual: None,
+                },
                 distribution: JoinDistribution::BroadcastBuild,
-                residual: None,
                 null_extended: Box::default(),
             },
         })

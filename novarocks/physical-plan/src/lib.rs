@@ -31,6 +31,7 @@ mod failure_projection;
 mod frozen_calls;
 mod frozen_pruning;
 mod identity;
+mod join_condition;
 mod package;
 mod physical_temporal_source;
 mod plan;
@@ -53,6 +54,7 @@ pub use expression_site::*;
 pub use frozen_calls::*;
 pub use frozen_pruning::*;
 pub use identity::*;
+pub use join_condition::*;
 pub use novarocks_connector_contract::{ConnectorWriteRouteId, WriteTargetOrdinal};
 pub use novarocks_constant_contract::{
     ConstantError, ConstantPolicy, ConstantPool, ConstantResourceFacts, ConstantValue,
@@ -93,7 +95,7 @@ pub use write_execution::*;
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 16;
+pub const PLAN_CONTRACT_REVISION: u32 = 17;
 
 #[cfg(test)]
 mod tests;

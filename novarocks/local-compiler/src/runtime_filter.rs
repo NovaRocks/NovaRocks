@@ -515,7 +515,9 @@ fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
             "runtime-filter producer names an absent node",
         ))?;
     let NodeKind::HashJoin {
-        keys, build_side, ..
+        condition,
+        build_side,
+        ..
     } = &join.kind
     else {
         return Err(unsupported(node, "runtime-filter producer outside a hash join").into());
@@ -542,9 +544,12 @@ fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
     }
     let key_ordinal =
         usize::try_from(witness.key_ordinal).map_err(|_| CompileControlError::ResourceExhausted)?;
-    let key = keys.get(key_ordinal).ok_or(FragmentCompileError::Invalid(
-        "runtime-filter witness names an absent join key",
-    ))?;
+    let key = condition
+        .keys()
+        .get(key_ordinal)
+        .ok_or(FragmentCompileError::Invalid(
+            "runtime-filter witness names an absent join key",
+        ))?;
     let build_key = match build_side {
         novarocks_physical_plan::JoinSide::Left => key.left,
         novarocks_physical_plan::JoinSide::Right => key.right,
@@ -764,7 +769,9 @@ fn plan_join_consumer<H, F: ValueSchemaCreationFactory<H>>(
             "join probe consumer has no join",
         ))?;
     let NodeKind::HashJoin {
-        keys, build_side, ..
+        condition,
+        build_side,
+        ..
     } = &join.kind
     else {
         return Err(unsupported(node, "runtime-filter probe consumer outside a hash join").into());
@@ -811,9 +818,12 @@ fn plan_join_consumer<H, F: ValueSchemaCreationFactory<H>>(
     let (contract, null_semantics) = membership_contract(filter, node, factory, work)?;
     let key_ordinal =
         usize::try_from(witness.key_ordinal).map_err(|_| CompileControlError::ResourceExhausted)?;
-    let pair = keys.get(key_ordinal).ok_or(FragmentCompileError::Invalid(
-        "join probe consumer names an absent key",
-    ))?;
+    let pair = condition
+        .keys()
+        .get(key_ordinal)
+        .ok_or(FragmentCompileError::Invalid(
+            "join probe consumer names an absent key",
+        ))?;
     let key = match build_side {
         novarocks_physical_plan::JoinSide::Left => pair.right,
         novarocks_physical_plan::JoinSide::Right => pair.left,

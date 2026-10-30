@@ -308,6 +308,7 @@ mod tests {
     fn join_over(left: LogicalPlanNode, right: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: None,
             }),

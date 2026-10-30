@@ -514,7 +514,7 @@ fn intern_inner(
     forced_fingerprint: Option<u64>,
 ) -> Result<ScalarId, SqlCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-    let node = ScalarArena::normalize(node);
+    let node = arena.normalize(node);
     let result = (|| -> Result<(u64, Option<ScalarId>), InternerError> {
         if let ScalarNode::Constant(value) = &node
             && !value_type.exactly_equals_observed(value.value_type(), || {

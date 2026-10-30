@@ -827,6 +827,7 @@ impl<'a> AnalyzerContext<'a> {
                     self.analyze_from_with_outer(twj, Some(&current_scope))?;
                 current_scope.merge(&right_scope);
                 current_rel = Relation::Join(Box::new(JoinRelation {
+                    naa_author: None,
                     left: current_rel,
                     right: right_rel,
                     join_type: JoinKind::Cross,
@@ -3317,6 +3318,16 @@ fn replace_grouping_markers_in_relation(
                     emitted_marker_count,
                 );
             }
+            join.naa_author = join.naa_author.take().map(|facts| {
+                facts.map(|expr| {
+                    replace_grouping_markers_in_typed_expr(
+                        &expr,
+                        grouping_fn_args,
+                        grouping_fn_ids,
+                        emitted_marker_count,
+                    )
+                })
+            });
         }
         Relation::Unnest(unnest) => {
             for arg in &mut unnest.args {

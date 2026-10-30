@@ -442,6 +442,7 @@ mod tests {
 
         let plan = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: None,
             }),
@@ -598,6 +599,7 @@ mod tests {
 
         let plan = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: None,
             }),

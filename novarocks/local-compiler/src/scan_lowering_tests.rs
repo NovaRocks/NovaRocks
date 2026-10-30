@@ -504,11 +504,13 @@ fn fixture(spec: Spec) -> Fixture {
                 Distribution::Unconstrained,
                 NodeKind::HashJoin {
                     kind: JoinKind::Inner,
-                    keys: Box::from([key]),
                     build_side: JoinSide::Right,
                     distribution: JoinDistribution::BroadcastBuild,
-                    residual: None,
                     null_extended: Box::default(),
+                    condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                        keys: Box::from([key]),
+                        residual: None,
+                    },
                 },
             )
             .unwrap();

@@ -1783,12 +1783,13 @@ fn derive_node_output_properties_from(
         }
         NodeKind::HashJoin {
             kind,
-            keys,
+            condition,
             build_side,
             distribution,
-            residual,
             ..
         } => {
+            let keys = condition.keys();
+            let residual = condition.residual();
             let inputs = node
                 .inputs
                 .iter()
@@ -1830,6 +1831,7 @@ fn derive_node_output_properties_from(
                         fragment,
                         node.id,
                         keys.iter()
+                            .chain(condition.scope_keys().into_iter().flatten())
                             .flat_map(|key| [key.left, key.right])
                             .chain(residual.iter().copied()),
                         true,

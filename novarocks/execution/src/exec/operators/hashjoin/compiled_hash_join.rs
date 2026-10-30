@@ -214,10 +214,7 @@ impl CompiledHashJoinPlan {
             left_layout,
             right_layout,
             join_scope_layout,
-            probe_keys,
-            build_keys,
-            eq_null_safe,
-            residual_predicate,
+            condition,
             ..
         } = graph_node.kind()
         else {
@@ -252,10 +249,22 @@ impl CompiledHashJoinPlan {
                 ),
             ));
         }
-        if probe_keys.is_empty()
-            || probe_keys.len() != build_keys.len()
-            || probe_keys.len() != eq_null_safe.len()
+        let keys = condition.keys();
+        // LocalCompiler admits these shapes only after the candidate runtime
+        // is installed. A directly constructed program must not silently
+        // discard a separate key domain or eligibility root either.
+        if condition.is_null_aware()
+            && (keys.len() != 1
+                || keys.iter().any(|key| key.null_safe)
+                || !condition.scope_keys().is_empty()
+                || condition.residual_predicate().is_some())
         {
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "null-aware candidate evaluation requires the B3 runtime",
+            ));
+        }
+        if keys.is_empty() {
             return Err(program_binding_failure(
                 PlanBindingKind::InvalidAssignment,
                 format!(
@@ -273,12 +282,20 @@ impl CompiledHashJoinPlan {
                 )
             })
         };
-        let mut probe_sites = Vec::with_capacity(probe_keys.len());
-        let mut build_sites = Vec::with_capacity(build_keys.len());
-        for key in 0..probe_keys.len() {
+        let mut probe_sites = Vec::with_capacity(keys.len());
+        let mut build_sites = Vec::with_capacity(keys.len());
+        for key in 0..keys.len() {
             let key = ordinal(key)?;
-            probe_sites.push(site(ProgramNodeExpressionRole::JoinProbeKey { key }));
-            build_sites.push(site(ProgramNodeExpressionRole::JoinBuildKey { key }));
+            probe_sites.push(site(if condition.is_null_aware() {
+                ProgramNodeExpressionRole::NaaValueProbeKey { key }
+            } else {
+                ProgramNodeExpressionRole::JoinProbeKey { key }
+            }));
+            build_sites.push(site(if condition.is_null_aware() {
+                ProgramNodeExpressionRole::NaaValueBuildKey { key }
+            } else {
+                ProgramNodeExpressionRole::JoinBuildKey { key }
+            }));
         }
         let build_key_bindings = build_sites
             .iter()
@@ -288,7 +305,13 @@ impl CompiledHashJoinPlan {
             .iter()
             .map(|site| root_value_type(program, *site).map_err(ExecutionFailure::from))
             .collect::<ExecutionResult<Vec<_>>>()?;
-        let residual = residual_predicate.map(|_| site(ProgramNodeExpressionRole::JoinResidual));
+        let residual = condition.residual_predicate().map(|_| {
+            site(if condition.is_null_aware() {
+                ProgramNodeExpressionRole::NaaEligibility
+            } else {
+                ProgramNodeExpressionRole::JoinResidual
+            })
+        });
         let requirements = required_build_components(join_type, residual.is_some(), true, true);
         Ok(Self {
             node,
@@ -298,7 +321,7 @@ impl CompiledHashJoinPlan {
             build_key_bindings,
             probe_key_bindings,
             residual,
-            eq_null_safe: eq_null_safe.clone(),
+            eq_null_safe: keys.iter().map(|key| key.null_safe).collect(),
             build: right_layout.clone(),
             scope: join_scope_layout.clone(),
             output: graph_node.output_layout().clone(),

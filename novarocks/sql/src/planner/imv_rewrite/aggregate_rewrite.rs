@@ -481,6 +481,7 @@ fn build_relational_aggregate_change_stream(
 
     let join = LogicalPlanNode::new(
         LogicalPlanKind::Join(LogicalJoinNode {
+            naa_author: None,
             join_type: JoinKind::LeftOuter,
             condition: Some(TypedExpr {
                 kind: ExprKind::BinaryOp {
@@ -505,6 +506,7 @@ fn build_relational_aggregate_change_stream(
     let branch_values = change_branch_values(branch_marker.clone());
     let expanded = LogicalPlanNode::new(
         LogicalPlanKind::Join(LogicalJoinNode {
+            naa_author: None,
             join_type: JoinKind::Cross,
             condition: None,
         }),

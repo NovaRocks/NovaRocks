@@ -339,14 +339,16 @@ fn shared_definition_fixture() -> (Fragment, PhysicalRootUses) {
             },
             kind: NodeKind::HashJoin {
                 kind: JoinKind::Inner,
-                keys: Box::from([JoinKey {
-                    left,
-                    right,
-                    null_safe: false,
-                }]),
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: Box::from([JoinKey {
+                        left,
+                        right,
+                        null_safe: false,
+                    }]),
+                    residual: Some(left),
+                },
                 build_side: JoinSide::Right,
                 distribution: JoinDistribution::Singleton,
-                residual: Some(left),
                 null_extended: Box::default(),
             },
         })
@@ -1082,3 +1084,44 @@ fn domain_and_root_count_equality_reaches_shape_checks_but_overflow_does_not_pro
 
 #[path = "failure_tail_tests.rs"]
 mod failure_tail_tests;
+
+#[test]
+fn null_aware_root_sites_keep_role_and_ordinal_and_reject_missing_side() {
+    for role in [
+        ExpressionRootRole::NaaValueEqualKey {
+            key: 7,
+            side: JoinSide::Left,
+        },
+        ExpressionRootRole::NaaValueEqualKey {
+            key: 7,
+            side: JoinSide::Right,
+        },
+        ExpressionRootRole::NaaScopeKey {
+            key: 7,
+            side: JoinSide::Left,
+        },
+        ExpressionRootRole::NaaScopeKey {
+            key: 7,
+            side: JoinSide::Right,
+        },
+        ExpressionRootRole::NaaEligibility,
+    ] {
+        let site = ExpressionRootSite {
+            node: NodeId::new(3),
+            role,
+        };
+        let mut wire_site = encode_site(site);
+        assert_eq!(decode_site(&wire_site).unwrap(), site);
+        match wire_site.role.as_mut() {
+            Some(wire::root_site::Role::NaaValueEqualKey(key))
+            | Some(wire::root_site::Role::NaaScopeKey(key)) => {
+                key.side = 0;
+                assert!(matches!(
+                    decode_site(&wire_site),
+                    Err(ControlCodecError::InvalidShape(_))
+                ));
+            }
+            _ => (),
+        }
+    }
+}

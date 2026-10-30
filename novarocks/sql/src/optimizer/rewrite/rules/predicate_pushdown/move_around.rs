@@ -148,6 +148,7 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
 
         let new_join = OptExpr {
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: join.join_type,
                 condition: join.condition,
             }),
@@ -433,6 +434,7 @@ mod tests {
         .unwrap();
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(cond_id),
             }),
@@ -497,6 +499,7 @@ mod tests {
         .unwrap();
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::LeftOuter,
                 condition: Some(cond_id),
             }),
@@ -601,6 +604,7 @@ mod tests {
         .unwrap();
         let left_child = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::LeftOuter,
                 condition: Some(left_cond_id),
             }),

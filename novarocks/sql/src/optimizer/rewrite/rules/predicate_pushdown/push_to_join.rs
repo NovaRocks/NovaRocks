@@ -322,6 +322,7 @@ fn push_filter_predicates_opt(
 
     let mut new_join = OptExpr::new(
         Operator::LogicalJoin(LogicalJoinOp {
+            naa_author: join.naa_author,
             join_type: new_join_type,
             condition: new_condition,
         }),
@@ -443,6 +444,7 @@ fn push_join_condition_predicates_opt(
 
     let mut result = OptExpr::new(
         Operator::LogicalJoin(LogicalJoinOp {
+            naa_author: join.naa_author,
             join_type: new_join_type,
             condition: new_condition,
         }),
@@ -922,6 +924,7 @@ mod tests {
         .unwrap();
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(join_condition),
             }),
@@ -972,6 +975,7 @@ mod tests {
         .unwrap();
         let input = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(condition),
             }),
@@ -1034,6 +1038,7 @@ mod tests {
             );
             let join = OptExpr::new(
                 Operator::LogicalJoin(LogicalJoinOp {
+                    naa_author: None,
                     join_type: JoinKind::Inner,
                     condition: None,
                 }),

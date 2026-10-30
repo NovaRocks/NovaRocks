@@ -415,7 +415,8 @@ pub(crate) fn derive_statistics(
                     Confidence,
                     Option<(ColumnId, ColumnId)>,
                 )> = join
-                    .eq_conditions
+                    .condition
+                    .keys()
                     .iter()
                     .map(|eq| {
                         let eq_key_pair = extract_column_id_scalar(&memo.scalars, eq.left)
@@ -4553,41 +4554,43 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![
-                    PhysicalHashJoinEqCondition {
-                        left: intern_typed(
-                            &mut memo.scalars,
-                            &col_ref("l_k1"),
-                            crate::optimizer::test_optimizer_control(),
-                        )
-                        .unwrap(),
-                        right: intern_typed(
-                            &mut memo.scalars,
-                            &col_ref("r_k1"),
-                            crate::optimizer::test_optimizer_control(),
-                        )
-                        .unwrap(),
-                        null_safe: false,
-                    },
-                    PhysicalHashJoinEqCondition {
-                        left: intern_typed(
-                            &mut memo.scalars,
-                            &col_ref("l_k2"),
-                            crate::optimizer::test_optimizer_control(),
-                        )
-                        .unwrap(),
-                        right: intern_typed(
-                            &mut memo.scalars,
-                            &col_ref("r_k2"),
-                            crate::optimizer::test_optimizer_control(),
-                        )
-                        .unwrap(),
-                        null_safe: false,
-                    },
-                ],
-                other_condition: None,
                 build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![
+                        PhysicalHashJoinEqCondition {
+                            left: intern_typed(
+                                &mut memo.scalars,
+                                &col_ref("l_k1"),
+                                crate::optimizer::test_optimizer_control(),
+                            )
+                            .unwrap(),
+                            right: intern_typed(
+                                &mut memo.scalars,
+                                &col_ref("r_k1"),
+                                crate::optimizer::test_optimizer_control(),
+                            )
+                            .unwrap(),
+                            null_safe: false,
+                        },
+                        PhysicalHashJoinEqCondition {
+                            left: intern_typed(
+                                &mut memo.scalars,
+                                &col_ref("l_k2"),
+                                crate::optimizer::test_optimizer_control(),
+                            )
+                            .unwrap(),
+                            right: intern_typed(
+                                &mut memo.scalars,
+                                &col_ref("r_k2"),
+                                crate::optimizer::test_optimizer_control(),
+                            )
+                            .unwrap(),
+                            null_safe: false,
+                        },
+                    ],
+                    residual: None,
+                },
             }),
             children: vec![left, right],
         };
@@ -4652,24 +4655,26 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: intern_typed(
-                        &mut memo.scalars,
-                        &col_ref("l_key"),
-                        crate::optimizer::test_optimizer_control(),
-                    )
-                    .unwrap(),
-                    right: intern_typed(
-                        &mut memo.scalars,
-                        &col_ref("r_key"),
-                        crate::optimizer::test_optimizer_control(),
-                    )
-                    .unwrap(),
-                    null_safe: false,
-                }],
-                other_condition: None,
                 build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![PhysicalHashJoinEqCondition {
+                        left: intern_typed(
+                            &mut memo.scalars,
+                            &col_ref("l_key"),
+                            crate::optimizer::test_optimizer_control(),
+                        )
+                        .unwrap(),
+                        right: intern_typed(
+                            &mut memo.scalars,
+                            &col_ref("r_key"),
+                            crate::optimizer::test_optimizer_control(),
+                        )
+                        .unwrap(),
+                        null_safe: false,
+                    }],
+                    residual: None,
+                },
             }),
             children: vec![left, right],
         };
@@ -4741,6 +4746,7 @@ mod tests {
         let join = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(
                     intern_typed(
@@ -4815,6 +4821,7 @@ mod tests {
         let join = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(
                     intern_typed(
@@ -4902,6 +4909,7 @@ mod tests {
         let join = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(
                     intern_typed(
@@ -4961,6 +4969,7 @@ mod tests {
         let join = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(
                     intern_typed(
@@ -5033,6 +5042,7 @@ mod tests {
         let join = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(
                     intern_typed(
@@ -5106,6 +5116,7 @@ mod tests {
         let join = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(
                     intern_typed(
@@ -5196,6 +5207,7 @@ mod tests {
         let join = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(
                     intern_typed(
@@ -5478,6 +5490,7 @@ mod tests {
 
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(cond),
             }),
@@ -5801,24 +5814,26 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: intern_typed(
-                        &mut memo.scalars,
-                        &col_ref_id(701, "customer_id"),
-                        crate::optimizer::test_optimizer_control(),
-                    )
-                    .unwrap(),
-                    right: intern_typed(
-                        &mut memo.scalars,
-                        &col_ref_id(801, "customer_id"),
-                        crate::optimizer::test_optimizer_control(),
-                    )
-                    .unwrap(),
-                    null_safe: false,
-                }],
-                other_condition: None,
                 build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![PhysicalHashJoinEqCondition {
+                        left: intern_typed(
+                            &mut memo.scalars,
+                            &col_ref_id(701, "customer_id"),
+                            crate::optimizer::test_optimizer_control(),
+                        )
+                        .unwrap(),
+                        right: intern_typed(
+                            &mut memo.scalars,
+                            &col_ref_id(801, "customer_id"),
+                            crate::optimizer::test_optimizer_control(),
+                        )
+                        .unwrap(),
+                        null_safe: false,
+                    }],
+                    residual: None,
+                },
             }),
             children: vec![left, right],
         };
@@ -6126,6 +6141,7 @@ mod tests {
         use crate::optimizer::memo::JoinTree;
         use crate::optimizer::operator::LogicalJoinOp;
         let inner = || LogicalJoinOp {
+            naa_author: None,
             join_type: JoinKind::Inner,
             condition: None,
         };
@@ -6609,6 +6625,7 @@ mod tests {
         let group = memo.new_group(MExpr {
             id: id0,
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(two_conjuncts),
             }),
@@ -6620,6 +6637,7 @@ mod tests {
             MExpr {
                 id: id1,
                 op: Operator::LogicalJoin(LogicalJoinOp {
+                    naa_author: None,
                     join_type: JoinKind::Inner,
                     condition: Some(one_conjunct),
                 }),

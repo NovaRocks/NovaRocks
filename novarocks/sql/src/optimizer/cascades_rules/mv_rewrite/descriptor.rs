@@ -1253,6 +1253,7 @@ mod tests {
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Join(crate::planner::logical::LogicalJoinNode {
+                naa_author: None,
                 join_type: kind,
                 condition: on,
             }),

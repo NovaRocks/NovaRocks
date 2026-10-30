@@ -226,19 +226,119 @@ fn wire_partition_capacity(mode: &wire::SortMode) -> Result<usize, Error> {
     }
 }
 /// O(1) root layout/count facts before variable-length counting or lookups.
+type PhysicalHashCondition = p::HashJoinCondition<Box<[p::JoinKey]>, p::ExprId>;
+
+fn physical_join_parts(
+    condition: &PhysicalHashCondition,
+) -> (&[p::JoinKey], &[p::JoinKey], Option<p::ExprId>) {
+    (
+        condition.keys(),
+        condition.scope_keys().map_or(&[][..], |keys| keys.as_ref()),
+        *condition.residual(),
+    )
+}
+
+fn validate_physical_join_condition(
+    kind: p::JoinKind,
+    condition: &PhysicalHashCondition,
+) -> Result<(), Error> {
+    if (kind == p::JoinKind::NullAwareLeftAnti) != condition.is_null_aware() {
+        return Err(invalid("hash join kind and condition variant disagree"));
+    }
+    if condition.is_null_aware() && condition.keys().is_empty() {
+        return Err(invalid("hash join requires non-empty value equality keys"));
+    }
+    Ok(())
+}
+
+fn wire_join_parts(
+    node: &wire::HashJoinNode,
+) -> Result<(&[wire::JoinKey], &[wire::JoinKey], Option<u32>), Error> {
+    match node.condition.as_ref() {
+        Some(wire::hash_join_node::Condition::Ordinary(v)) => {
+            Ok((&v.keys, &[], v.residual_expr_id))
+        }
+        Some(wire::hash_join_node::Condition::NullAwareEqual(v)) => {
+            Ok((&v.value_equal_keys, &v.scope_keys, v.eligibility_expr_id))
+        }
+        None => Err(invalid("hash join condition is absent")),
+    }
+}
+
+fn wire_join_capacity(node: &wire::HashJoinNode) -> Result<usize, Error> {
+    match node.condition.as_ref() {
+        Some(wire::hash_join_node::Condition::Ordinary(v)) => Ok(v.keys.capacity()),
+        Some(wire::hash_join_node::Condition::NullAwareEqual(v)) => {
+            add(v.value_equal_keys.capacity(), v.scope_keys.capacity())
+        }
+        None => Err(invalid("hash join condition is absent")),
+    }
+}
+
+fn validate_wire_join_condition(node: &wire::HashJoinNode) -> Result<(), Error> {
+    let (keys, _, _) = wire_join_parts(node)?;
+    let naa = matches!(
+        node.condition,
+        Some(wire::hash_join_node::Condition::NullAwareEqual(_))
+    );
+    if (node.kind == wire::JoinKind::NullAwareLeftAnti as i32) != naa {
+        return Err(invalid("hash join kind and condition variant disagree"));
+    }
+    if naa && keys.is_empty() {
+        return Err(invalid("hash join requires non-empty value equality keys"));
+    }
+    Ok(())
+}
+
+fn encode_join_keys(
+    keys: &[p::JoinKey],
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<wire::JoinKey>, Error> {
+    let mut output = reserve(keys.len(), w)?;
+    for key in keys {
+        output.push(wire::JoinKey {
+            left_expr_id: Some(key.left.get()),
+            right_expr_id: Some(key.right.get()),
+            null_safe: key.null_safe,
+        });
+        w.step()?;
+    }
+    Ok(output)
+}
+
+fn decode_join_keys(
+    keys: &[wire::JoinKey],
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<Box<[p::JoinKey]>, Error> {
+    let mut output = reserve(keys.len(), w)?;
+    for key in keys {
+        output.push(p::JoinKey {
+            left: p::ExprId::new(required(key.left_expr_id, w)?),
+            right: p::ExprId::new(required(key.right_expr_id, w)?),
+            null_safe: key.null_safe,
+        });
+        w.step()?;
+    }
+    boxed(output, w)
+}
+
 fn physical_outer(input: &p::PhysicalNode) -> Result<(usize, usize), Error> {
     match &input.kind {
         p::NodeKind::HashJoin {
-            keys,
+            condition,
             null_extended,
             ..
-        } => Ok((
-            add(keys.len(), null_extended.len())?,
-            add(
-                bytes::<p::JoinKey>(keys.len())?,
-                bytes::<p::ValueId>(null_extended.len())?,
-            )?,
-        )),
+        } => {
+            let (keys, scopes, _) = physical_join_parts(condition);
+            let count = add(keys.len(), scopes.len())?;
+            Ok((
+                add(count, null_extended.len())?,
+                add(
+                    bytes::<p::JoinKey>(count)?,
+                    bytes::<p::ValueId>(null_extended.len())?,
+                )?,
+            ))
+        }
         p::NodeKind::NestLoopJoin { null_extended, .. } => Ok((
             null_extended.len(),
             bytes::<p::ValueId>(null_extended.len())?,
@@ -279,13 +379,19 @@ fn physical_outer(input: &p::PhysicalNode) -> Result<(usize, usize), Error> {
 }
 fn wire_outer(input: &wire::PhysicalNode) -> Result<(usize, usize), Error> {
     match input.kind.as_ref() {
-        Some(wire::physical_node::Kind::HashJoin(v)) => Ok((
-            add(v.keys.len(), v.null_extended_value_ids.len())?,
-            add(
-                bytes::<wire::JoinKey>(v.keys.capacity())?,
-                bytes::<u32>(v.null_extended_value_ids.capacity())?,
-            )?,
-        )),
+        Some(wire::physical_node::Kind::HashJoin(v)) => {
+            let (keys, scopes, _) = wire_join_parts(v)?;
+            Ok((
+                add(
+                    add(keys.len(), scopes.len())?,
+                    v.null_extended_value_ids.len(),
+                )?,
+                add(
+                    bytes::<wire::JoinKey>(wire_join_capacity(v)?)?,
+                    bytes::<u32>(v.null_extended_value_ids.capacity())?,
+                )?,
+            ))
+        }
         Some(wire::physical_node::Kind::NestLoopJoin(v)) => Ok((
             v.null_extended_value_ids.len(),
             bytes::<u32>(v.null_extended_value_ids.capacity())?,
@@ -393,21 +499,31 @@ fn prepare_encode(
     encode_header_requests(input, &mut model)?;
     let occurrences = match &input.kind {
         p::NodeKind::HashJoin {
-            keys,
-            residual,
+            kind,
+            condition,
             null_extended,
             ..
         } => {
+            validate_physical_join_condition(*kind, condition)?;
+            let (keys, scopes, residual) = physical_join_parts(condition);
             model.request::<wire::JoinKey>(keys.len(), 1)?;
+            model.request::<wire::JoinKey>(scopes.len(), 1)?;
             model.request::<u32>(null_extended.len(), 1)?;
             model.refs = add(model.refs, null_extended.len())?;
-            add(mul(keys.len(), 2)?, usize::from(residual.is_some()))?
+            add(
+                mul(add(keys.len(), scopes.len())?, 2)?,
+                usize::from(residual.is_some()),
+            )?
         }
         p::NodeKind::NestLoopJoin {
+            kind,
             predicate,
             null_extended,
             ..
         } => {
+            if *kind == p::JoinKind::NullAwareLeftAnti && predicate.is_none() {
+                return Err(invalid("null-aware nested-loop predicate is absent"));
+            }
             model.request::<u32>(null_extended.len(), 1)?;
             model.refs = add(model.refs, null_extended.len())?;
             usize::from(predicate.is_some())
@@ -495,17 +611,17 @@ fn prepare_encode(
     }
     match &input.kind {
         p::NodeKind::HashJoin {
-            keys,
-            residual,
+            condition,
             null_extended,
             ..
         } => {
-            for key in keys {
+            let (keys, scopes, residual) = physical_join_parts(condition);
+            for key in keys.iter().chain(scopes) {
                 expression_encode(key.left, expressions, w)?;
                 expression_encode(key.right, expressions, w)?;
             }
             if let Some(residual) = residual {
-                expression_encode(*residual, expressions, w)?;
+                expression_encode(residual, expressions, w)?;
             }
             for id in null_extended {
                 reference(id.get(), values, w)?;
@@ -639,15 +755,21 @@ fn prepare_decode(
     decode_header_requests(input, port, &mut model)?;
     let occurrences = match input.kind.as_ref() {
         Some(wire::physical_node::Kind::HashJoin(v)) => {
-            model.request::<p::JoinKey>(v.keys.len(), 2)?;
+            validate_wire_join_condition(v)?;
+            let (keys, scopes, residual) = wire_join_parts(v)?;
+            model.request::<p::JoinKey>(keys.len(), 2)?;
+            model.request::<p::JoinKey>(scopes.len(), 2)?;
             model.request::<p::ValueId>(v.null_extended_value_ids.len(), 2)?;
             model.refs = add(model.refs, v.null_extended_value_ids.len())?;
             add(
-                mul(v.keys.len(), 2)?,
-                usize::from(v.residual_expr_id.is_some()),
+                mul(add(keys.len(), scopes.len())?, 2)?,
+                usize::from(residual.is_some()),
             )?
         }
         Some(wire::physical_node::Kind::NestLoopJoin(v)) => {
+            if v.kind == wire::JoinKind::NullAwareLeftAnti as i32 && v.predicate_expr_id.is_none() {
+                return Err(invalid("null-aware nested-loop predicate is absent"));
+            }
             model.request::<p::ValueId>(v.null_extended_value_ids.len(), 2)?;
             model.refs = add(model.refs, v.null_extended_value_ids.len())?;
             usize::from(v.predicate_expr_id.is_some())
@@ -738,11 +860,12 @@ fn prepare_decode(
             decode_join_kind(v.kind, w)?;
             decode_join_side(v.build_side, w)?;
             decode_join_distribution(v.distribution, w)?;
-            for key in &v.keys {
+            let (keys, scopes, residual) = wire_join_parts(v)?;
+            for key in keys.iter().chain(scopes) {
                 expression_decode(required(key.left_expr_id, w)?, expressions, w)?;
                 expression_decode(required(key.right_expr_id, w)?, expressions, w)?;
             }
-            if let Some(residual) = v.residual_expr_id {
+            if let Some(residual) = residual {
                 expression_decode(residual, expressions, w)?;
             }
             for id in &v.null_extended_value_ids {
@@ -890,27 +1013,35 @@ fn emit_encode(
     let kind = match &input.kind {
         p::NodeKind::HashJoin {
             kind,
-            keys,
+            condition,
             build_side,
             distribution,
-            residual,
             null_extended,
         } => {
-            let mut output = reserve(keys.len(), w)?;
-            for key in keys {
-                output.push(wire::JoinKey {
-                    left_expr_id: Some(key.left.get()),
-                    right_expr_id: Some(key.right.get()),
-                    null_safe: key.null_safe,
-                });
-                w.step()?;
-            }
+            let condition = match condition {
+                p::HashJoinCondition::Ordinary { keys, residual } => {
+                    wire::hash_join_node::Condition::Ordinary(wire::OrdinaryHashJoinCondition {
+                        keys: encode_join_keys(keys, w)?,
+                        residual_expr_id: residual.map(p::ExprId::get),
+                    })
+                }
+                p::HashJoinCondition::NullAwareEqual {
+                    value_equal_keys,
+                    scope_keys,
+                    eligibility,
+                } => wire::hash_join_node::Condition::NullAwareEqual(
+                    wire::NullAwareEqualHashJoinCondition {
+                        value_equal_keys: encode_join_keys(value_equal_keys, w)?,
+                        scope_keys: encode_join_keys(scope_keys, w)?,
+                        eligibility_expr_id: eligibility.map(p::ExprId::get),
+                    },
+                ),
+            };
             wire::physical_node::Kind::HashJoin(wire::HashJoinNode {
                 kind: encode_join_kind(*kind),
-                keys: output,
+                condition: Some(condition),
                 build_side: encode_join_side(*build_side),
                 distribution: encode_join_distribution(*distribution),
-                residual_expr_id: residual.map(p::ExprId::get),
                 null_extended_value_ids: encode_ids(null_extended, w)?,
             })
         }
@@ -999,21 +1130,27 @@ fn emit_decode(
     let (inputs, required_inputs, output_properties, output) = decode_header(input, source, l, w)?;
     let kind = match input.kind.as_ref() {
         Some(wire::physical_node::Kind::HashJoin(v)) => {
-            let mut output = reserve(v.keys.len(), w)?;
-            for key in &v.keys {
-                output.push(p::JoinKey {
-                    left: p::ExprId::new(required(key.left_expr_id, w)?),
-                    right: p::ExprId::new(required(key.right_expr_id, w)?),
-                    null_safe: key.null_safe,
-                });
-                w.step()?;
-            }
+            let condition = match v.condition.as_ref() {
+                Some(wire::hash_join_node::Condition::Ordinary(v)) => {
+                    p::HashJoinCondition::Ordinary {
+                        keys: decode_join_keys(&v.keys, w)?,
+                        residual: v.residual_expr_id.map(p::ExprId::new),
+                    }
+                }
+                Some(wire::hash_join_node::Condition::NullAwareEqual(v)) => {
+                    p::HashJoinCondition::NullAwareEqual {
+                        value_equal_keys: decode_join_keys(&v.value_equal_keys, w)?,
+                        scope_keys: decode_join_keys(&v.scope_keys, w)?,
+                        eligibility: v.eligibility_expr_id.map(p::ExprId::new),
+                    }
+                }
+                None => return Err(invalid("hash join condition is absent")),
+            };
             p::NodeKind::HashJoin {
                 kind: decode_join_kind(v.kind, w)?,
-                keys: boxed(output, w)?,
+                condition,
                 build_side: decode_join_side(v.build_side, w)?,
                 distribution: decode_join_distribution(v.distribution, w)?,
-                residual: v.residual_expr_id.map(p::ExprId::new),
                 null_extended: decode_ids(&v.null_extended_value_ids, w)?,
             }
         }

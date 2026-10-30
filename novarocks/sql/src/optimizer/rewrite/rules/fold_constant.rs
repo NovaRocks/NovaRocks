@@ -369,15 +369,28 @@ impl<'a, 'control> ConstantFolder<'a, 'control> {
                 }
                 changed
             }
-            Operator::LogicalJoin(join) => self.fold_optional_slot(&mut join.condition)?,
+            Operator::LogicalJoin(join) => {
+                let mut changed = self.fold_optional_slot(&mut join.condition)?;
+                if let Some(author) = &mut join.naa_author {
+                    changed |= self.fold_slot(&mut author.comparison)?;
+                    changed |= self.fold_optional_slot(&mut author.eligibility)?;
+                }
+                changed
+            }
             Operator::PhysicalHashJoin(join) => {
                 self.work.step()?;
                 let mut changed = false;
-                for condition in &mut join.eq_conditions {
+                for condition in join.condition.keys_mut() {
                     changed |= self.fold_slot(&mut condition.left)?;
                     changed |= self.fold_slot(&mut condition.right)?;
                 }
-                changed |= self.fold_optional_slot(&mut join.other_condition)?;
+                if let Some(keys) = join.condition.scope_keys_mut() {
+                    for condition in keys {
+                        changed |= self.fold_slot(&mut condition.left)?;
+                        changed |= self.fold_slot(&mut condition.right)?;
+                    }
+                }
+                changed |= self.fold_optional_slot(join.condition.residual_mut())?;
                 changed
             }
             Operator::PhysicalNestLoopJoin(join) => self.fold_optional_slot(&mut join.condition)?,
@@ -490,7 +503,7 @@ fn operator_has_scalars(op: &Operator) -> bool {
         }
         Operator::LogicalJoin(join) => join.condition.is_some(),
         Operator::PhysicalHashJoin(join) => {
-            !join.eq_conditions.is_empty() || join.other_condition.is_some()
+            !join.condition.keys().is_empty() || join.condition.residual().is_some()
         }
         Operator::PhysicalNestLoopJoin(join) => join.condition.is_some(),
         Operator::LogicalSort(sort) | Operator::PhysicalSort(sort) => {
@@ -2177,6 +2190,7 @@ mod tests {
 
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(sum),
             }),

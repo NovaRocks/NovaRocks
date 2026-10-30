@@ -1711,7 +1711,7 @@ fn join_with_producers(
     let join = join_node(program);
     let mut kind = program.graph().nodes()[join.index()].kind().clone();
     let ProgramNodeKind::Join {
-        build_keys,
+        condition,
         runtime_filters,
         ..
     } = &mut kind
@@ -1722,7 +1722,7 @@ fn join_with_producers(
     for (key_ordinal, producer) in producers {
         requirements.push(requirement(producer.binding_id()));
         runtime_filters.push(FilterProducerAtExpr {
-            expr_id: build_keys[key_ordinal],
+            expr_id: condition.keys()[key_ordinal].build,
             key_ordinal,
             producer,
         });
@@ -1991,7 +1991,7 @@ fn one_runtime_filter_binding_has_exactly_one_program_site() {
     let join = join_node(&base);
     let mut kind = base.graph().nodes()[join.index()].kind().clone();
     let ProgramNodeKind::Join {
-        build_keys,
+        condition,
         runtime_filters,
         ..
     } = &mut kind
@@ -2000,7 +2000,7 @@ fn one_runtime_filter_binding_has_exactly_one_program_site() {
     };
     for _ in 0..2 {
         runtime_filters.push(FilterProducerAtExpr {
-            expr_id: build_keys[0],
+            expr_id: condition.keys()[0].build,
             key_ordinal: 0,
             producer: membership_producer(11, FilterNullSemantics::NeverMatches),
         });
@@ -2179,14 +2179,14 @@ fn join_with_probe_consumers(
     let join = join_node(program);
     let mut kind = program.graph().nodes()[join.index()].kind().clone();
     let ProgramNodeKind::Join {
-        probe_keys,
+        condition,
         runtime_filter_consumers,
         ..
     } = &mut kind
     else {
         unreachable!()
     };
-    let definition = probe_keys[0];
+    let definition = condition.keys()[0].probe;
     let like = site(join, ProgramNodeExpressionRole::JoinProbeKey { key: 0 });
     let snapshot = program
         .checked()

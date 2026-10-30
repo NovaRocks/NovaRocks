@@ -286,7 +286,7 @@ impl PhysicalHashJoinOp {
                 source: HashSource::ShuffleAgg,
             } => DistributionSpec::hash_partitioned(
                 if self.join_type == crate::common::JoinKind::Inner {
-                    expand_with_eq_equivalents(scalars, &cols, &self.eq_conditions)
+                    expand_with_eq_equivalents(scalars, &cols, self.condition.keys())
                 } else {
                     // Outer NULL extension and semi/anti projection do not
                     // publish an equality between both input keys.
@@ -317,8 +317,8 @@ impl PhysicalHashJoinOp {
         // including the key order aligned for the parent's requirements.
         let preserved_side = match self.join_type {
             Inner => {
-                let cols = if shuffle_join_keys_are_supported(scalars, &self.eq_conditions) {
-                    shuffle_join_column_ids(scalars, &self.eq_conditions)
+                let cols = if shuffle_join_keys_are_supported(scalars, self.condition.keys()) {
+                    shuffle_join_column_ids(scalars, self.condition.keys())
                 } else {
                     Vec::new()
                 };
@@ -401,7 +401,7 @@ impl PhysicalHashJoinOp {
         parent_required: &PhysicalPropertySet,
     ) -> ChildRequirementAlternative {
         let (left_keys, right_keys) =
-            aligned_shuffle_keys(scalars, &self.eq_conditions, parent_required);
+            aligned_shuffle_keys(scalars, self.condition.keys(), parent_required);
         debug_assert!(!left_keys.is_empty() && !right_keys.is_empty());
         ChildRequirementAlternative {
             kind: PropertyAlternativeKind::ShuffleJoin,
@@ -441,7 +441,7 @@ impl PhysicalHashJoinOp {
             ])];
         }
 
-        let hash_partitionable = shuffle_join_keys_are_supported(scalars, &self.eq_conditions);
+        let hash_partitionable = shuffle_join_keys_are_supported(scalars, self.condition.keys());
         let partitioned_or_singleton = || {
             if hash_partitionable {
                 self.shuffle_required_alternative(scalars, parent_required)
@@ -461,7 +461,7 @@ impl PhysicalHashJoinOp {
                 // this optional partitioned alternative.
                 if !hash_join_only_broadcast(self.join_type)
                     && self.join_type != crate::common::JoinKind::Cross
-                    && !self.eq_conditions.is_empty()
+                    && !self.condition.keys().is_empty()
                 {
                     alternatives.push(partitioned_or_singleton());
                 }
@@ -629,11 +629,13 @@ mod tests {
             scalars,
             op: PhysicalHashJoinOp {
                 join_type,
-                eq_conditions,
-                other_condition: None,
                 build_side: crate::optimizer::operator::exact_hash_join_build_side(join_type)
                     .expect("hash-join property fixture uses a legal join kind"),
                 distribution,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: eq_conditions,
+                    residual: None,
+                },
             },
         }
     }

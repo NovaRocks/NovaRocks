@@ -60,6 +60,15 @@ pub enum ExpressionRootRole {
         key: u32,
         side: JoinSide,
     },
+    NaaValueEqualKey {
+        key: u32,
+        side: JoinSide,
+    },
+    NaaScopeKey {
+        key: u32,
+        side: JoinSide,
+    },
+    NaaEligibility,
     HashJoinResidual,
     NestLoopPredicate,
     SortOrder {
@@ -457,36 +466,53 @@ impl PhysicalExpressionRoots {
                         }
                         collector.calls(id, calls, false)?;
                     }
-                    NodeKind::HashJoin {
-                        kind,
-                        keys,
-                        residual,
-                        ..
-                    } => {
-                        for (key, definition) in keys.iter().enumerate() {
+                    NodeKind::HashJoin { condition, .. } => {
+                        for (key, definition) in condition.keys().iter().enumerate() {
                             collector.before()?;
                             let key = ordinal(key)?;
-                            collector.add(
-                                id,
-                                JoinKey {
-                                    key,
-                                    side: JoinSide::Left,
-                                },
-                                definition.left,
-                                Value,
-                            )?;
-                            collector.add(
-                                id,
-                                JoinKey {
-                                    key,
-                                    side: JoinSide::Right,
-                                },
-                                definition.right,
-                                Value,
-                            )?;
+                            for (side, expr) in [
+                                (JoinSide::Left, definition.left),
+                                (JoinSide::Right, definition.right),
+                            ] {
+                                let role = if condition.is_null_aware() {
+                                    NaaValueEqualKey { key, side }
+                                } else {
+                                    JoinKey { key, side }
+                                };
+                                collector.add(id, role, expr, Value)?;
+                            }
                         }
-                        if let Some(expr) = residual {
-                            collector.add(id, HashJoinResidual, *expr, join_demand(*kind))?;
+                        if let Some(keys) = condition.scope_keys() {
+                            for (key, definition) in keys.iter().enumerate() {
+                                collector.before()?;
+                                let key = ordinal(key)?;
+                                collector.add(
+                                    id,
+                                    NaaScopeKey {
+                                        key,
+                                        side: JoinSide::Left,
+                                    },
+                                    definition.left,
+                                    Value,
+                                )?;
+                                collector.add(
+                                    id,
+                                    NaaScopeKey {
+                                        key,
+                                        side: JoinSide::Right,
+                                    },
+                                    definition.right,
+                                    Value,
+                                )?;
+                            }
+                        }
+                        if let Some(expr) = condition.residual() {
+                            let (role, demand) = if condition.is_null_aware() {
+                                (NaaEligibility, Value)
+                            } else {
+                                (HashJoinResidual, TruthOnly)
+                            };
+                            collector.add(id, role, *expr, demand)?;
                         }
                     }
                     NodeKind::NestLoopJoin {

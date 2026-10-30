@@ -245,6 +245,60 @@ pub enum JoinType {
     NullAwareLeftAnti,
 }
 
+/// One typed key pair. Its equality mode belongs to this pair, so a parallel
+/// NULL-mode or build/probe vector cannot disagree with its arity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProgramJoinKey {
+    pub probe: ProgramExprId,
+    pub build: ProgramExprId,
+    pub null_safe: bool,
+}
+
+/// The admitted local condition. Value equality and scope equality retain
+/// independent ordered key domains. Eligibility remains the original root,
+/// rather than a predicate reconstructed from the keys.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProgramJoinCondition {
+    Ordinary {
+        keys: Vec<ProgramJoinKey>,
+        residual_predicate: Option<ProgramExprId>,
+    },
+    NullAwareEqual {
+        value_equal_keys: Vec<ProgramJoinKey>,
+        scope_keys: Vec<ProgramJoinKey>,
+        eligibility: Option<ProgramExprId>,
+    },
+}
+
+impl ProgramJoinCondition {
+    /// Keys named by the original join/RF ordinal, never flattened with scope.
+    pub fn keys(&self) -> &[ProgramJoinKey] {
+        match self {
+            Self::Ordinary { keys, .. } => keys,
+            Self::NullAwareEqual {
+                value_equal_keys, ..
+            } => value_equal_keys,
+        }
+    }
+    pub fn scope_keys(&self) -> &[ProgramJoinKey] {
+        match self {
+            Self::Ordinary { .. } => &[],
+            Self::NullAwareEqual { scope_keys, .. } => scope_keys,
+        }
+    }
+    pub fn residual_predicate(&self) -> Option<ProgramExprId> {
+        match self {
+            Self::Ordinary {
+                residual_predicate, ..
+            } => *residual_predicate,
+            Self::NullAwareEqual { eligibility, .. } => *eligibility,
+        }
+    }
+    pub fn is_null_aware(&self) -> bool {
+        matches!(self, Self::NullAwareEqual { .. })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JoinDistributionMode {
     Broadcast,
@@ -542,10 +596,7 @@ pub enum ProgramNodeKind {
         left_layout: StaticLayout,
         right_layout: StaticLayout,
         join_scope_layout: StaticLayout,
-        probe_keys: Vec<ProgramExprId>,
-        build_keys: Vec<ProgramExprId>,
-        eq_null_safe: Vec<bool>,
-        residual_predicate: Option<ProgramExprId>,
+        condition: ProgramJoinCondition,
         runtime_filters: Vec<FilterProducerAtExpr>,
         runtime_filter_consumers: Vec<FilterConsumerAtJoinKey>,
     },
@@ -754,19 +805,21 @@ impl ProgramNodeKind {
                 }
             }
             Self::Join {
-                probe_keys,
-                build_keys,
-                residual_predicate,
+                condition,
                 runtime_filters,
                 runtime_filter_consumers,
                 ..
             } => {
-                for id in probe_keys
-                    .iter()
-                    .chain(build_keys)
-                    .chain(residual_predicate)
-                {
-                    visit(Some(*id))?;
+                for keys in [condition.keys(), condition.scope_keys()] {
+                    for key in keys {
+                        visit(Some(key.probe))?;
+                    }
+                    for key in keys {
+                        visit(Some(key.build))?;
+                    }
+                }
+                if let Some(id) = condition.residual_predicate() {
+                    visit(Some(id))?;
                 }
                 for filter in runtime_filter_consumers {
                     visit(Some(filter.expr_id))?;
@@ -2069,30 +2122,29 @@ fn validate_shape(
         }
         ProgramNodeKind::Join {
             join_type,
-            probe_keys,
-            build_keys,
-            eq_null_safe,
+            condition,
             runtime_filters,
             runtime_filter_consumers,
             ..
         } => {
+            let keys = condition.keys();
             let bad = (!runtime_filter_consumers.is_empty()
                 && !matches!(join_type, JoinType::Inner | JoinType::LeftSemi))
-                || probe_keys.len() != build_keys.len()
-                || probe_keys.len() != eq_null_safe.len();
+                || (*join_type == JoinType::NullAwareLeftAnti) != condition.is_null_aware()
+                || (condition.is_null_aware() && keys.is_empty());
             work.step()?;
             if bad {
                 return Err(LocalProgramError::InvalidNodeShape.into());
             }
             for filter in runtime_filter_consumers {
-                let bad = probe_keys.get(filter.key_ordinal) != Some(&filter.expr_id);
+                let bad = keys.get(filter.key_ordinal).map(|key| key.probe) != Some(filter.expr_id);
                 work.step()?;
                 if bad {
                     return Err(LocalProgramError::InvalidNodeShape.into());
                 }
             }
             for filter in runtime_filters {
-                let bad = build_keys.get(filter.key_ordinal) != Some(&filter.expr_id);
+                let bad = keys.get(filter.key_ordinal).map(|key| key.build) != Some(filter.expr_id);
                 work.step()?;
                 if bad {
                     return Err(LocalProgramError::InvalidNodeShape.into());

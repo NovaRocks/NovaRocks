@@ -245,6 +245,15 @@ fn to_optimizer_expr_unchecked(
             let left = to_optimizer_expr_unchecked(plan.left(), scalars, work)?;
             let right = to_optimizer_expr_unchecked(plan.right(), scalars, work)?;
             let op = Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: node
+                    .naa_author
+                    .as_ref()
+                    .map(|facts| {
+                        facts
+                            .clone()
+                            .try_map(|expr| intern_typed(scalars, &expr, control))
+                    })
+                    .transpose()?,
                 join_type: node.join_type,
                 condition: node
                     .condition
@@ -619,6 +628,9 @@ pub(crate) fn to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlan
             })
         }
         Operator::LogicalJoin(op) => LogicalPlanKind::Join(LogicalJoinNode {
+            naa_author: op
+                .naa_author
+                .map(|facts| facts.map(|id| materialize(arena, id))),
             join_type: op.join_type,
             condition: op.condition.map(|id| materialize(arena, id)),
         }),

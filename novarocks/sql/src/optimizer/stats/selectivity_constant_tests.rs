@@ -294,6 +294,7 @@ fn selected_cv_scan_and_join_consume_bound_source_statistics() {
     let expr = MExpr {
         id: memo.next_expr_id(),
         op: Operator::LogicalJoin(LogicalJoinOp {
+            naa_author: None,
             join_type: JoinKind::Inner,
             condition: Some(predicate),
         }),

@@ -701,6 +701,7 @@ fn build_key_shape_assert_join(
     );
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Join(LogicalJoinNode {
+            naa_author: None,
             join_type: JoinKind::Inner,
             condition: Some(join_condition),
         }),
@@ -764,6 +765,7 @@ fn build_locator_join_shell(
     );
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Join(LogicalJoinNode {
+            naa_author: None,
             join_type: JoinKind::LeftOuter,
             condition: Some(binary(delete_only, BinOp::And, apply_key_eq)),
         }),

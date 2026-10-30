@@ -170,6 +170,7 @@ fn collect_chain(
     };
     match &expr.op {
         Operator::LogicalJoin(LogicalJoinOp {
+            naa_author: _,
             join_type,
             condition,
         }) if matches!(join_type, JoinKind::Inner | JoinKind::Cross)
@@ -481,6 +482,7 @@ mod tests {
 
     fn inner(cond: ScalarId) -> LogicalJoinOp {
         LogicalJoinOp {
+            naa_author: None,
             join_type: JoinKind::Inner,
             condition: Some(cond),
         }
@@ -540,6 +542,7 @@ mod tests {
         let lo = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::LeftOuter,
                 condition: Some(lo_cond),
             }),

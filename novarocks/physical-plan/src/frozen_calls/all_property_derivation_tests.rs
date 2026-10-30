@@ -350,14 +350,16 @@ pub(super) fn single_copy_dag() -> Fixture {
             Distribution::Singleton,
             NodeKind::HashJoin {
                 kind: JoinKind::Inner,
-                keys: Box::from([JoinKey {
-                    left,
-                    right,
-                    null_safe: false,
-                }]),
+                condition: crate::HashJoinCondition::Ordinary {
+                    keys: Box::from([JoinKey {
+                        left,
+                        right,
+                        null_safe: false,
+                    }]),
+                    residual: None,
+                },
                 build_side: JoinSide::Right,
                 distribution: JoinDistribution::Singleton,
-                residual: None,
                 null_extended: Box::default(),
             },
         )

@@ -578,6 +578,7 @@ mod tests {
         });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: cond_id,
             }),

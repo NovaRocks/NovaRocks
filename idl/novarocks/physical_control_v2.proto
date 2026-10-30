@@ -145,6 +145,9 @@ message RootSite {
     uint32 change_predicate = 27;
     ChangeAssignmentRoot change_assignment = 28;
     MappingConstantRoot finish_unpivot_constant = 29;
+    JoinKeyRoot naa_value_equal_key = 30;
+    JoinKeyRoot naa_scope_key = 31;
+    Empty naa_eligibility = 32;
   }
 }
 

@@ -158,6 +158,7 @@ pub(crate) struct LogicalAggregateNode {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalJoinNode {
+    pub naa_author: Option<crate::common::naa::NaaAuthorFacts<TypedExpr>>,
     pub join_type: JoinKind,
     pub condition: Option<TypedExpr>,
 }

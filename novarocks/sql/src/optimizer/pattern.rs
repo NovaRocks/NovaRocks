@@ -300,6 +300,7 @@ mod tests {
         let cases = vec![
             (
                 Operator::LogicalJoin(LogicalJoinOp {
+                    naa_author: None,
                     join_type: JoinKind::Inner,
                     condition: None,
                 }),
@@ -357,6 +358,7 @@ mod tests {
     #[test]
     fn pattern_root_matches_kind_only_not_fields() {
         let left = Operator::LogicalJoin(LogicalJoinOp {
+            naa_author: None,
             join_type: JoinKind::LeftOuter,
             condition: None,
         });
