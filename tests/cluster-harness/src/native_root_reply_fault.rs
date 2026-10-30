@@ -2136,6 +2136,50 @@ fn digest_display(class: &'static str, value: &impl std::fmt::Display) -> Failur
     }
 }
 
+// A remote reset may arrive after the complete request but before response
+// headers. h2 cannot transition that closed stream to AwaitingHeaders again;
+// send_response then reports a user state error rather than a reset error.
+// Observe the original stream's typed reset before attempting that transition.
+async fn recover_exchange_root_cancel_before_headers(
+    class: StreamClass,
+    response: &mut server::SendResponse<Bytes>,
+    inbound: &mut RecvStream,
+    core: &Core,
+) -> bool {
+    if class != StreamClass::NonTarget
+        || response.stream_id() != inbound.stream_id()
+        || !core
+            .state
+            .lock()
+            .expect("root fault state lock")
+            .exchange
+            .occupied()
+    {
+        return false;
+    }
+    let reset = poll_fn(|cx| std::task::Poll::Ready(response.poll_reset(cx))).await;
+    if !matches!(reset, std::task::Poll::Ready(Ok(h2::Reason::CANCEL))) {
+        return false;
+    }
+    // The caller has already authenticated and fully decoded this RootRead.
+    // This actor never sends a local reset for a non-target RootFetch. Require
+    // the original request EOF, or its own actual remote CANCEL, as well.
+    let input = poll_fn(|cx| std::task::Poll::Ready(inbound.poll_data(cx))).await;
+    match input {
+        std::task::Poll::Ready(None) => {}
+        std::task::Poll::Ready(Some(Err(error)))
+            if error.is_reset()
+                && error.is_remote()
+                && error.reason() == Some(h2::Reason::CANCEL) => {}
+        _ => return false,
+    }
+    let mut state = core.state.lock().expect("root fault state lock");
+    state.non_target_peer_cancels = state.non_target_peer_cancels.saturating_add(1);
+    drop(state);
+    core.changed.notify_waiters();
+    true
+}
+
 async fn recover_covered_status_cancel(
     class: StreamClass,
     failure: &anyhow::Error,
@@ -2419,7 +2463,35 @@ async fn forward_stream(
             let response_forward = async {
                 let upstream_response = upstream_response.await?;
                 let (parts, body) = upstream_response.into_parts();
-                let output = response.send_response(Response::from_parts(parts, ()), false)?;
+                if recover_exchange_root_cancel_before_headers(
+                    stream_class,
+                    &mut response,
+                    &mut inbound,
+                    &core,
+                )
+                .await
+                {
+                    return Ok(());
+                }
+                let output = match response.send_response(Response::from_parts(parts, ()), false) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        // A connection owner can observe RST between the first
+                        // probe and sending headers. A failed transition keeps
+                        // h2's original reset reason; observe it independently.
+                        if recover_exchange_root_cancel_before_headers(
+                            stream_class,
+                            &mut response,
+                            &mut inbound,
+                            &core,
+                        )
+                        .await
+                        {
+                            return Ok(());
+                        }
+                        return Err(error).context("root downstream response headers");
+                    }
+                };
                 match copy_body(body, output, core.clone()).await {
                     Err(error) => {
                         if recover_covered_status_cancel(stream_class, &error, &mut inbound, &core)

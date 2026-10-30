@@ -38,7 +38,7 @@ use novarocks_cluster_harness::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -969,6 +969,7 @@ fn await_pressure(
 struct Park {
     driver: i32,
     epoch: u64,
+    generation: u64,
     line: String,
 }
 
@@ -997,37 +998,61 @@ fn parked(
     let text = context
         .handle()
         .be_stdout_contents(candidate.backend_index, usize::MAX)?;
+    current_park(&text, &identity, &source)
+}
+
+fn driver_wakes(text: &str, identity: &str) -> Result<BTreeMap<(i32, u64), (u64, u64)>> {
+    let mut wakes = BTreeMap::new();
+    for line in text.lines().filter(|line| {
+        line.contains("NOVAROCKS_EXCHANGE_SNAPSHOT")
+            && line.contains(identity)
+            && line.contains("event=driver_wake ")
+    }) {
+        let key = (scalar(line, "driver_id")?, scalar(line, "block_epoch")?);
+        let generations = (
+            scalar(line, "blocked_generation")?,
+            scalar(line, "current_generation")?,
+        );
+        ensure!(
+            wakes.insert(key, generations).is_none(),
+            "duplicate actual driver wake epoch"
+        );
+    }
+    Ok(wakes)
+}
+
+fn current_park(text: &str, identity: &str, source: &str) -> Result<Option<Park>> {
     // A dispatcher may publish wake before the registering thread flushes
     // its park line. Pair by the actual epoch, never by log arrival order.
-    let wakes: BTreeSet<_> = text
-        .lines()
-        .filter(|line| {
-            line.contains("NOVAROCKS_EXCHANGE_SNAPSHOT")
-                && line.contains(&identity)
-                && line.contains("event=driver_wake ")
-        })
-        .map(|line| {
-            Ok((
-                scalar::<i32>(line, "driver_id")?,
-                scalar::<u64>(line, "block_epoch")?,
-            ))
-        })
-        .collect::<Result<_>>()?;
+    let wakes = driver_wakes(text, identity)?;
     let mut latest = None;
     for line in text
         .lines()
-        .filter(|line| line.contains("NOVAROCKS_EXCHANGE_SNAPSHOT") && line.contains(&identity))
+        .filter(|line| line.contains("NOVAROCKS_EXCHANGE_SNAPSHOT") && line.contains(identity))
     {
         if line.contains("event=driver_park ")
-            && line.contains(&source)
+            && line.contains(source)
             && line.contains("reason=InputEmpty ")
         {
             let park = Park {
                 driver: scalar(line, "driver_id")?,
                 epoch: scalar(line, "block_epoch")?,
+                generation: scalar(line, "frozen_generation")?,
                 line: line.to_owned(),
             };
-            if !wakes.contains(&(park.driver, park.epoch)) {
+            let current: u64 = scalar(line, "current_generation")?;
+            ensure!(
+                park.driver >= 0 && park.epoch > 0,
+                "invalid actual driver park identity"
+            );
+            if let Some((blocked, _)) = wakes.get(&(park.driver, park.epoch)) {
+                ensure!(
+                    *blocked == park.generation,
+                    "actual wake disagrees with its original parked generation"
+                );
+            } else if park.generation > 0 && current == park.generation {
+                // A zero initial frontier or an already changed endpoint is
+                // not evidence for the requested stable nonzero parked epoch.
                 latest = Some(park);
             }
         }
@@ -1153,14 +1178,13 @@ fn require_wake(
     let text = context
         .handle()
         .be_stdout_contents(candidate.backend_index, usize::MAX)?;
+    let wakes = driver_wakes(&text, &identity)?;
+    let (blocked, current) = wakes
+        .get(&(park.driver, park.epoch))
+        .context("held Source's original driver/block epoch never actually woke")?;
     ensure!(
-        text.lines()
-            .any(|line| line.contains("NOVAROCKS_EXCHANGE_SNAPSHOT")
-                && line.contains("event=driver_wake ")
-                && line.contains(&identity)
-                && scalar::<i32>(line, "driver_id").ok() == Some(park.driver)
-                && scalar::<u64>(line, "block_epoch").ok() == Some(park.epoch)),
-        "held Source's original driver/block epoch never actually woke"
+        *blocked == park.generation && *current > park.generation,
+        "actual Source wake did not advance the original parked driver frontier generation"
     );
     Ok(())
 }
@@ -1237,7 +1261,7 @@ impl ExchangeFlow {
             let idle = await_flow_idle(context)?;
             phase(
                 evidence,
-                json!({"shape":["gather","broadcast","shuffle"][ordinal],"candidate":candidate,
+                json!({"shape": (["gather","broadcast","shuffle"][ordinal]),"candidate":candidate,
                 "actual_pressure":pressure,"concurrent_result":healthy,"result":rows,"fault":receipt,"idle":idle}),
             );
         }
@@ -1620,5 +1644,67 @@ mod tests {
         assert!(metric("m 0\nm 1\n", "m", None).is_err());
         assert!(metric("m NaN\n", "m", None).is_err());
         assert!(metric("m -1\n", "m", None).is_err());
+    }
+
+    #[test]
+    fn source_park_parser_preserves_actual_driver_generation_and_epoch() {
+        let identity = "finst=Some((11, 22))";
+        let source = "source_name=\"EXCHANGE_SOURCE (id=6)\"";
+        let park = "NOVAROCKS_EXCHANGE_SNAPSHOT event=driver_park finst=Some((11, 22)) driver_id=9 reason=InputEmpty frozen_generation=7 current_generation=7 block_epoch=41 source_name=\"EXCHANGE_SOURCE (id=6)\"\n";
+        let wake = "NOVAROCKS_EXCHANGE_SNAPSHOT event=driver_wake finst=Some((11, 22)) driver_id=9 blocked_generation=7 current_generation=8 block_epoch=41\n";
+        let actual = current_park(park, identity, source).unwrap().unwrap();
+        assert_eq!((actual.driver, actual.epoch, actual.generation), (9, 41, 7));
+        assert!(
+            current_park(&format!("{wake}{park}"), identity, source)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            current_park(&format!("{park}{wake}"), identity, source)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            current_park(park, identity, "source_name=\"EXCHANGE_SOURCE (id=5)\"")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            current_park(
+                &park.replace("frozen_generation=7", "frozen_generation=Some(7)"),
+                identity,
+                source
+            )
+            .is_err()
+        );
+        assert!(
+            current_park(
+                &format!(
+                    "{park}{}",
+                    wake.replace("blocked_generation=7", "blocked_generation=6")
+                ),
+                identity,
+                source
+            )
+            .is_err()
+        );
+        assert!(
+            current_park(
+                &park.replace("generation=7", "generation=0"),
+                identity,
+                source
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            current_park(
+                &park.replace("current_generation=7", "current_generation=8"),
+                identity,
+                source
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 }

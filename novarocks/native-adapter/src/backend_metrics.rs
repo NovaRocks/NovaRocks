@@ -1720,7 +1720,7 @@ mod tests {
             serde_json::from_str(&render_metrics_json(&absent).unwrap()).unwrap();
         assert!(absent_rows.as_array().unwrap().iter().any(|row| {
             row["tags"]["metric"] == "novarocks_backend_exchange_flow_snapshot_available"
-                && row["value"] == 0
+                && row["value"].as_f64() == Some(0.0)
         }));
         let mut functions =
             novarocks_execution::runtime::function_set::ExecutionFunctionSetBuilder::new();
@@ -1794,13 +1794,13 @@ mod tests {
             assert!(
                 rows.iter().any(|row| row["tags"]["metric"] == metric
                     && row["tags"][label] == name
-                    && row["value"] == value),
+                    && row["value"].as_f64() == Some(f64::from(value))),
                 "missing {metric}/{name}"
             );
         }
         assert!(rows.iter().any(|row| row["tags"]["metric"]
             == "novarocks_backend_exchange_flow_snapshot_available"
-            && row["value"] == 1));
+            && row["value"].as_f64() == Some(1.0)));
     }
 
     struct UnusedPreparationHost;

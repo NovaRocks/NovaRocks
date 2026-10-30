@@ -705,7 +705,7 @@ fn add_attempt(
     core: Arc<Core>,
 ) -> Result<AttemptOwner> {
     ensure!(
-        capture.attempts.len() < MAX_TARGET_ATTEMPTS,
+        u64::try_from(capture.attempts.len())? < MAX_TARGET_ATTEMPTS,
         "Exchange target exhausted the existing actor attempt evidence positions"
     );
     let index = capture.attempts.len();
@@ -1218,26 +1218,26 @@ async fn forward_grants(
                         },
                     ..
                 }) = capture.candidate.as_ref()
+                    && capture.fired
+                    && expected.pair == *pair
+                    && expected.generation > *generation
                 {
-                    if capture.fired && expected.pair == *pair && expected.generation > *generation
-                    {
-                        if capture.rebuilt_generation.is_none() {
-                            capture.rebuilt_generation = Some(expected.generation.get());
-                        }
+                    if capture.rebuilt_generation.is_none() {
+                        capture.rebuilt_generation = Some(expected.generation.get());
+                    }
 
-                        if capture.rebuilt_generation == Some(expected.generation.get()) {
-                            capture.rebuilt_snapshot_complete |= batch.snapshot_complete;
-                            if let Some(actual) =
-                                batch.states.iter().find(|state| state.stream == *stream)
-                            {
-                                capture.rebuilt_stream = Some(ExchangeFaultTarget::Subscription {
-                                    stream: *stream,
-                                    pair: *pair,
-                                    generation: expected.generation,
-                                });
-                                capture.rebuilt_stream_granted_through =
-                                    Some(actual.facts.granted_through);
-                            }
+                    if capture.rebuilt_generation == Some(expected.generation.get()) {
+                        capture.rebuilt_snapshot_complete |= batch.snapshot_complete;
+                        if let Some(actual) =
+                            batch.states.iter().find(|state| state.stream == *stream)
+                        {
+                            capture.rebuilt_stream = Some(ExchangeFaultTarget::Subscription {
+                                stream: *stream,
+                                pair: *pair,
+                                generation: expected.generation,
+                            });
+                            capture.rebuilt_stream_granted_through =
+                                Some(actual.facts.granted_through);
                         }
                     }
                 }
@@ -1766,7 +1766,7 @@ mod tests {
         control.bind_exchange_peers(peers(stream), Instant::now() + Duration::from_secs(5))?;
         control.begin_exchange_capture(action, Instant::now() + Duration::from_secs(4))?;
         let io = tokio::net::TcpStream::connect(proxy.address()).await?;
-        let (sender, driver) = client::handshake::<_, Bytes>(io).await?;
+        let (sender, driver) = client::handshake(io).await?;
         let driver = tokio::spawn(driver);
         let custody = if action == ExchangeFaultAction::DropAcceptedReply {
             Some(tokio::spawn(grant_rpc(sender.clone(), stream, 1)))
@@ -1967,6 +1967,173 @@ mod tests {
         assert_eq!(fixture_core.bytes.load(Ordering::Acquire), 0);
         Ok(())
     }
+    // The H2 error from trying headers on a reset stream is not evidence of
+    // cancellation. Only the original stream's separately observed reset is.
+    async fn pre_headers_reset_case(
+        class: StreamClass,
+        reason: h2::Reason,
+        after_failed_headers: bool,
+    ) -> Result<()> {
+        let core = super::super::tests::core();
+        let control = RootReplyFaultControl { core: core.clone() };
+        let stream = stream();
+        let caller = FrontendProcessId::new_v7();
+        if class == StreamClass::NonTarget {
+            control.bind_exchange_peers(peers(stream), Instant::now() + Duration::from_secs(5))?;
+            control.begin_exchange_capture(
+                ExchangeFaultAction::HoldDataBeforeForward,
+                Instant::now() + Duration::from_secs(2),
+            )?;
+        } else if class == StreamClass::Target {
+            let mut state = core.state.lock().unwrap();
+            state.frozen_root = Some((stream.destination(), caller));
+            state.frozen_backend_index = Some(1);
+        }
+        let mut drivers = JoinSet::new();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let (client_io, server_io) = tokio::io::duplex(65536);
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+            let server_core = core.clone();
+            drivers.spawn(async move {
+                let mut connection = server::handshake::<_>(server_io).await?;
+                let (request, mut response) = connection
+                    .accept()
+                    .await
+                    .context("pre-header Root request absent")??;
+                let work = async {
+                    assert_eq!(request.uri().path(), ROOT_PATH);
+                    assert_eq!(
+                        authenticated_normal_frontend(&request, &server_core),
+                        Some(caller)
+                    );
+                    let mut inbound = request.into_body();
+                    let (body, trailers) =
+                        read_bounded(&mut inbound, REQUEST_BYTES, server_core.clone()).await?;
+                    assert!(trailers.is_none());
+                    let read = decode_read(
+                        &wire::FetchRootResultRequest::decode(single_message(&body)?)?,
+                        FieldPath::root("pre_header_root_read"),
+                    )?;
+                    assert_eq!(read.root_task(), stream.destination());
+                    drop(body);
+                    let observed_class = classify_frozen_read(
+                        &server_core.state.lock().unwrap(),
+                        read.root_task(),
+                        caller,
+                    );
+                    assert_eq!(observed_class, class);
+                    assert!(
+                        !recover_exchange_root_cancel_before_headers(
+                            observed_class,
+                            &mut response,
+                            &mut inbound,
+                            &server_core
+                        )
+                        .await
+                    );
+                    assert_eq!(server_core.state.lock().unwrap().non_target_peer_cancels, 0);
+                    let _ = ready_tx.send(());
+                    let actual = poll_fn(|cx| response.poll_reset(cx)).await?;
+                    assert_eq!(actual, reason);
+                    if after_failed_headers {
+                        // Reproduce the failed h2 transition, without inspecting
+                        // or converting that error into a cancellation fact.
+                        assert!(response.send_response(Response::new(()), false).is_err());
+                    }
+                    let recovered = recover_exchange_root_cancel_before_headers(
+                        observed_class,
+                        &mut response,
+                        &mut inbound,
+                        &server_core,
+                    )
+                    .await;
+                    let _ = outcome_tx.send(recovered);
+                    std::future::pending::<Result<()>>().await
+                };
+                tokio::select! {
+                    result=work=>result,
+                    _=async {while connection.accept().await.is_some(){}}=>Ok(()),
+                }
+            });
+            let (mut sender, driver) = client::handshake(client_io).await?;
+            drivers.spawn(async move { driver.await.context("pre-header client driver") });
+            let read = RootResultRead::try_new(
+                stream.destination(),
+                RootProfileId::V1,
+                RootOutputKind::ClientRows,
+                NonZeroU64::new(1),
+                0,
+                Duration::from_millis(100),
+            )?;
+            let request = signed_request(
+                ROOT_PATH,
+                core.normal_subject.clone(),
+                NativeProcessIdentity::Frontend(caller),
+            )?;
+            let (reply, mut send) = sender.send_request(request, false)?;
+            send.send_data(
+                encoded(novarocks_task_codec::root_result::encode_read(&read)),
+                true,
+            )?;
+            ready_rx.await?;
+            send.send_reset(reason);
+            let recovered = outcome_rx.await?;
+            assert_eq!(
+                recovered,
+                class == StreamClass::NonTarget && reason == h2::Reason::CANCEL
+            );
+            assert_eq!(
+                control.observation().non_target_peer_cancels,
+                u64::from(recovered)
+            );
+            drop(reply);
+            drop(send);
+            drop(sender);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        // Cleanup still joins every original fixture task when an assertion,
+        // protocol error or deadline fails; no disconnect is called an exit.
+        drivers.abort_all();
+        let mut cleanup_error = None;
+        while let Some(joined) = drivers.join_next().await {
+            let failure = match joined {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(error) if error.is_cancelled() => None,
+                Err(error) => Some(error.into()),
+            };
+            if cleanup_error.is_none() {
+                cleanup_error = failure;
+            }
+        }
+        result.context("pre-header reset fixture deadline")??;
+        if let Some(error) = cleanup_error {
+            return Err(error);
+        }
+
+        assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn non_target_root_reset_remains_observable_after_failed_response_headers() -> Result<()>
+    {
+        pre_headers_reset_case(StreamClass::NonTarget, h2::Reason::CANCEL, true).await
+    }
+    #[tokio::test]
+    async fn unknown_root_reset_does_not_authorize_header_recovery() -> Result<()> {
+        pre_headers_reset_case(StreamClass::Unknown, h2::Reason::CANCEL, true).await
+    }
+    #[tokio::test]
+    async fn original_root_target_reset_does_not_authorize_header_recovery() -> Result<()> {
+        pre_headers_reset_case(StreamClass::Target, h2::Reason::CANCEL, true).await
+    }
+    #[tokio::test]
+    async fn non_cancel_root_reset_does_not_authorize_header_recovery() -> Result<()> {
+        pre_headers_reset_case(StreamClass::NonTarget, h2::Reason::REFUSED_STREAM, true).await
+    }
+
     #[tokio::test]
     async fn accepted_wire_reply_is_lost_once_and_exact_replay_reaches_original_service()
     -> Result<()> {

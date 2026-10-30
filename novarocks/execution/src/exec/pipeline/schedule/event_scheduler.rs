@@ -1368,8 +1368,6 @@ mod tests {
         let events = Arc::new(Events::default());
         let observable = Arc::new(Observable::new());
         observable.notify_observers();
-        let generation = observable.generation();
-        assert!(generation > 0);
         let runtime =
             Arc::new(RuntimeState::default().with_exchange_test_observer(Some(events.clone())));
         let finst = Some((67_900, 65_590));
@@ -1391,6 +1389,24 @@ mod tests {
             driver.process(Duration::from_millis(10)),
             DriverState::Blocked(BlockedReason::InputEmpty)
         ));
+        let (driver_event, first_generation, _) = driver.blocked_observable_snapshot().unwrap();
+        assert!(
+            !Arc::ptr_eq(&driver_event, &observable),
+            "the scheduler parks the driver's frontier endpoint, not its raw source event"
+        );
+        // The first turn installed the real source-to-frontier subscription.
+        // Only a subsequent source notification can advance that endpoint;
+        // notifying before construction does not give the driver a generation.
+        observable.notify_observers();
+        assert!(driver_event.generation() > first_generation);
+        assert!(matches!(
+            driver.process(Duration::from_millis(10)),
+            DriverState::Blocked(BlockedReason::InputEmpty)
+        ));
+        let (reparked_event, generation, _) = driver.blocked_observable_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&driver_event, &reparked_event));
+        assert!(generation > 0);
+        assert_eq!(generation, driver_event.generation());
         let scheduler = Arc::new(EventScheduler::new());
         let executor = Arc::new(ExecutorShared::new());
         assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
@@ -1413,6 +1429,7 @@ mod tests {
         assert!(parked[0].contains(&format!("frozen_generation={generation}")));
         assert!(parked[0].contains(&format!("block_epoch={epoch}")));
         observable.notify_observers();
+        assert!(driver_event.generation() > generation);
         // Drive the actual queued key through the normal scheduling author.
         let queued = scheduler
             .reschedule_queue
@@ -1428,7 +1445,9 @@ mod tests {
         assert_eq!(completed.len(), 2);
         assert!(completed[1].contains("event=driver_wake"));
         assert!(completed[1].contains(&format!("blocked_generation={generation}")));
-        assert!(completed[1].contains(&format!("current_generation={}", observable.generation())));
+        assert!(
+            completed[1].contains(&format!("current_generation={}", driver_event.generation()))
+        );
         assert!(completed[1].contains(&format!("block_epoch={epoch}")));
     }
 
