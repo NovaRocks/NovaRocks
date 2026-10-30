@@ -30,17 +30,16 @@
 //! children's own slot identities.
 //!
 //! Output: the join node publishes a canonical output with frozen nullability
-//! (probe followed by build for Inner and LeftOuter, the probe alone for the
+//! (probe followed by build for ordinary joins, the retained side alone for
 //! semi and anti kinds) under fresh slots. When the physical output is not
 //! exactly that canonical sequence, a compiler-authored selection Project
 //! reads it; a physical NULL extension maps to the canonical ordinal of its
 //! source, whose canonical type is already nullable.
 //!
-//! This milestone admits local Inner, LeftOuter, LeftSemi and LeftAnti, the
-//! hash NullAwareLeftAnti and the nested-loop Cross. Build-preserving local
-//! kinds (RightOuter, FullOuter, RightSemi, RightAnti), a partitioned or
-//! colocated null-aware anti join and a nested-loop null-aware anti join with
-//! a predicate stay explicit refusals.
+//! Local build-preserving kinds use their shared match bitmap and independent
+//! tail. Hash and complete-predicate nested-loop null-aware anti joins retain
+//! their distinct signed conditions. Replicated preserved-build output and
+//! partitioned or colocated null-aware anti joins stay explicit refusals.
 //!
 //! Runtime filters: a hash join owns the build-key membership producers the
 //! runtime-filter plan admitted for it. Producer `k` observes `build_keys[k]`,

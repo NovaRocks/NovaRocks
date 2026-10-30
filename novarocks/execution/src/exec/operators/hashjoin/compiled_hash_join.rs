@@ -35,7 +35,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray};
-use novarocks_functions::KernelFailure;
 use novarocks_local_program::{
     JoinDistributionMode, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
     ProgramNodeId, ProgramNodeKind,

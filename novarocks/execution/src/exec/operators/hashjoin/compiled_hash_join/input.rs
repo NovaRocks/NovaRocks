@@ -216,12 +216,8 @@ impl JoinInputSink {
         let mut reason = RuntimeFilterProducerFailure::UpstreamUnavailable;
         let disposition: ExecutionResult<()> = (|| {
             if let Some(frame) = &self.frame {
-                if self.error.is_stopped() {
-                    self.fail(
-                        self.error
-                            .error()
-                            .unwrap_or_else(|| KernelFailure::Cancelled.into()),
-                    );
+                if let Some(cause) = self.error.error() {
+                    self.fail(cause);
                     reason = RuntimeFilterProducerFailure::ExecutionFailed;
                 }
                 if !self.normal && frame.completion.check().is_ok() {
@@ -376,14 +372,10 @@ impl OperatorLifecycle for JoinInputSink {
         Ok(())
     }
     fn cancel(&mut self) {
-        if self.error.is_stopped()
+        if let Some(cause) = self.error.error()
             && let Some(frame) = &self.frame
         {
-            frame.fail(
-                self.error
-                    .error()
-                    .unwrap_or_else(|| KernelFailure::Cancelled.into()),
-            );
+            frame.fail(cause);
         }
     }
     fn on_driver_failure(&mut self) {

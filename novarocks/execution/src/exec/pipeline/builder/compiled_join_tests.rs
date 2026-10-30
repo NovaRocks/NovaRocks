@@ -2663,8 +2663,12 @@ fn b3_input_sinks_seal_each_real_e_and_leave_construction_to_finalize_sources() 
         step_context::{StepContext, TurnWork},
     };
     use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::task_control::test_support::Owner;
+    use novarocks_execution_contract::{
+        TaskConclusionPort, TaskConclusionProposal, TaskFailurePhase,
+    };
     use std::num::NonZeroU64;
-    for nested in [false, true] {
+    for (nested, task_owned) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut packages = packages(&single_plan_with_dop(
             if nested {
                 Spec::nested(JoinKind::Inner, true)
@@ -2695,7 +2699,23 @@ fn b3_input_sinks_seal_each_real_e_and_leave_construction_to_finalize_sources() 
                     None,
                 )
             });
-            let runtime = RuntimeState::default();
+            let task_owner = task_owned.then(Owner::new);
+            let runtime = if let Some(owner) = &task_owner {
+                RuntimeState::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(
+                        Arc::new(owner.view(TaskFailurePhase::Execution)),
+                    )),
+                )
+            } else {
+                RuntimeState::default()
+            };
             let error = runtime.error_state();
             let tracker = MemTracker::new_root("B3 original E input operators");
             let construction = super::aggregate_fixture::runtime_construction_factory(
@@ -2772,8 +2792,26 @@ fn b3_input_sinks_seal_each_real_e_and_leave_construction_to_finalize_sources() 
                 frame.completion.published().unwrap().unwrap().rows,
                 if empty_second { 300 } else { 600 }
             );
+            if let Some(owner) = &task_owner {
+                // Close the real outstanding Q demands before accepting the
+                // Task's normal conclusion. Its stop flag is then present,
+                // but it has no originating failure to publish during exit.
+                for slot in 0..participants.probes {
+                    frame.completion.withdraw_if_pending(slot).unwrap();
+                }
+                owner.submit(TaskConclusionProposal::Succeeded);
+                assert!(error.is_stopped());
+                assert!(error.error().is_none());
+            }
             for operator in sources.iter_mut().chain(sinks.iter_mut()) {
+                if task_owned {
+                    operator.cancel();
+                }
                 operator.begin_exit().unwrap();
+                assert!(
+                    frame.completion.check().is_ok(),
+                    "normal Task conclusion must not manufacture a join failure"
+                );
                 assert!(matches!(
                     operator.observe_exit().progress,
                     crate::exec::pipeline::operator::ExitProgress::Exited

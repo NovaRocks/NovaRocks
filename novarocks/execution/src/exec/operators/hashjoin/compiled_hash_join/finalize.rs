@@ -185,12 +185,10 @@ impl JoinFinalizeSource {
             self.worker = None;
             return Ok(true);
         };
-        if self.error.is_stopped() {
-            frame.fail(
-                self.error
-                    .error()
-                    .unwrap_or_else(|| KernelFailure::Cancelled.into()),
-            );
+        // A Task's accepted success also raises its conclusion flag. Only
+        // its actual error, if present, supplies a cause for join teardown.
+        if let Some(cause) = self.error.error() {
+            frame.fail(cause);
             self.worker = None;
             return Ok(true);
         }
@@ -305,14 +303,10 @@ impl OperatorLifecycle for JoinFinalizeSource {
         frame.activate(&work).map_err(|cause| frame.fail(cause))
     }
     fn cancel(&mut self) {
-        if self.error.is_stopped()
+        if let Some(cause) = self.error.error()
             && let Some(frame) = &self.frame
         {
-            frame.fail(
-                self.error
-                    .error()
-                    .unwrap_or_else(|| KernelFailure::Cancelled.into()),
-            );
+            frame.fail(cause);
         }
     }
     fn on_driver_failure(&mut self) {
