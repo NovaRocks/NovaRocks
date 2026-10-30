@@ -52,3 +52,5 @@ pub(crate) use join_hash_map::gather::{
 pub(crate) use join_hash_map::gather::{
     MAX_JOIN_OUTPUT_ROWS_PER_BATCH, gather_probe_build_batches_typed,
 };
+
+pub(crate) use join_completion::JoinParticipants;

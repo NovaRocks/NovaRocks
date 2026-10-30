@@ -564,6 +564,14 @@ fn version() -> PlanVersionId {
 
 /// `Values(left) JOIN Values(right) -> Result` in one fragment.
 pub(super) fn single_plan(spec: Spec, left: &[Row], right: &[Row]) -> PhysicalPlan {
+    single_plan_with_dop(spec, left, right, 1)
+}
+fn single_plan_with_dop(
+    spec: Spec,
+    left: &[Row],
+    right: &[Row],
+    pipeline_dop: u32,
+) -> PhysicalPlan {
     let mut builder = FragmentBuilder::new(SINGLE);
     let left_node = builder.reserve_node_id().unwrap();
     let left_values = values(
@@ -592,7 +600,7 @@ pub(super) fn single_plan(spec: Spec, left: &[Row], right: &[Row]) -> PhysicalPl
         .finish_definition(
             join,
             FragmentSink::Result,
-            dop(1),
+            dop(pipeline_dop),
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
@@ -2293,4 +2301,239 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
     assert!(tracker.current() > 0);
     drop(output);
     assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_completion() {
+    use crate::exec::operators::hashjoin::{
+        JoinParticipants,
+        compiled_hash_join::{
+            CompiledHashJoinFinalizeSourceFactory, CompiledHashJoinPlan, CompiledJoinFrame,
+            frame_fixture_inputs,
+        },
+    };
+    use crate::exec::pipeline::{
+        operator_factory::OperatorFactory,
+        step::{NextStep, WaitReason},
+        step_context::{StepContext, TurnWork},
+    };
+    use crate::runtime::mem_tracker::MemTracker;
+    use std::num::NonZeroU64;
+    let mut packages = packages(&single_plan_with_dop(
+        Spec::hash(JoinKind::Inner, false),
+        &LEFT_ROWS,
+        &RIGHT_ROWS,
+        3,
+    ));
+    let program = compile(packages.remove(&SINGLE).unwrap(), 3, true);
+    let node = program
+        .graph()
+        .nodes()
+        .iter()
+        .position(|node| matches!(node.kind(), ProgramNodeKind::Join { .. }))
+        .map(novarocks_local_program::ProgramNodeId::new)
+        .unwrap();
+    let plan = Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap());
+    let declaration = Arc::new(CompiledJoinFrame::new(
+        Arc::clone(&program),
+        plan,
+        JoinParticipants {
+            inputs: 2,
+            finalizers: NonZeroUsize::new(3).unwrap(),
+            probes: 2,
+            tails: 0,
+        },
+        None,
+    ));
+    let runtime = RuntimeState::default();
+    let error = runtime.error_state();
+    let tracker = MemTracker::new_root("original B3 finalize source fixture");
+    let construction = super::aggregate_fixture::runtime_construction_factory(
+        Arc::clone(&tracker),
+        Arc::clone(&error),
+    );
+    let factory =
+        CompiledHashJoinFinalizeSourceFactory::new(Arc::clone(&declaration), Arc::clone(&error));
+    assert!(factory.bind_pipeline_dop(2).is_err());
+    let mut operators: Vec<_> = (0..3).map(|id| factory.create(3, id)).collect();
+    for operator in &mut operators {
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        operator.set_construction_factory(Arc::clone(&construction));
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
+    }
+    let frame = declaration.prepared().unwrap();
+    let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut turn = TurnWork::new(NonZeroU64::MIN, 9);
+    let before = operators[0]
+        .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+        .unwrap();
+    let NextStep::Wait(wait) = before.next else {
+        panic!("missing real E receipts requires a dependency wait");
+    };
+    assert_eq!(wait.reason, WaitReason::Dependency);
+    assert!(Arc::ptr_eq(
+        &wait.observable,
+        &frame.completion.observable()
+    ));
+    assert!(before.output.is_none());
+    let observed = wait.observed_generation;
+    // The declaration/layout came through real package compilation. E data
+    // is a component fixture; this does not qualify the original Values plan.
+    frame_fixture_inputs(&frame, &program, &construction, &tracker, &error).unwrap();
+    assert_ne!(frame.completion.observable().generation(), observed);
+    let mut empty = TurnWork::new(NonZeroU64::MIN, 0);
+    assert!(matches!(
+        operators[0]
+            .drive(&mut StepContext::new(&error, &mut empty, &mut conversions))
+            .unwrap()
+            .next,
+        NextStep::Yield
+    ));
+    assert!(frame.completion.published().unwrap().is_none());
+    let mut finished = [false; 3];
+    for _ in 0..100_000 {
+        for (id, operator) in operators.iter_mut().enumerate() {
+            if finished[id] {
+                continue;
+            }
+            let mut turn = TurnWork::new(NonZeroU64::MIN, 9);
+            let step = operator
+                .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+                .unwrap();
+            assert!(
+                step.output.is_none(),
+                "finalize source emits no synthetic rows"
+            );
+            finished[id] = matches!(step.next, NextStep::Finished);
+        }
+        if finished.iter().all(|finished| *finished) {
+            break;
+        }
+    }
+    assert!(finished.iter().all(|finished| *finished));
+    assert_eq!(frame.completion.published().unwrap().unwrap().rows, 600);
+    for operator in &mut operators {
+        operator.begin_exit().unwrap();
+        assert!(matches!(
+            operator.observe_exit().progress,
+            crate::exec::pipeline::operator::ExitProgress::Exited
+        ));
+        operator.close().unwrap();
+    }
+    assert!(runtime.error().is_none());
+}
+
+#[test]
+fn b3_finalize_source_distinguishes_normal_demand_exit_from_original_failure() {
+    use crate::exec::operators::hashjoin::{
+        JoinParticipants,
+        compiled_hash_join::{
+            CompiledHashJoinFinalizeSourceFactory, CompiledHashJoinPlan, CompiledJoinFrame,
+            frame_fixture_inputs,
+        },
+    };
+    use crate::exec::pipeline::{
+        operator_factory::OperatorFactory,
+        shape::ControlStep,
+        step::NextStep,
+        step_context::{StepContext, TurnWork},
+    };
+    use crate::runtime::mem_tracker::MemTracker;
+    use std::num::NonZeroU64;
+    let mut packages = packages(&single_plan_with_dop(
+        Spec::hash(JoinKind::Inner, false),
+        &LEFT_ROWS,
+        &RIGHT_ROWS,
+        3,
+    ));
+    let program = compile(packages.remove(&SINGLE).unwrap(), 3, true);
+    let node = program
+        .graph()
+        .nodes()
+        .iter()
+        .position(|node| matches!(node.kind(), ProgramNodeKind::Join { .. }))
+        .map(novarocks_local_program::ProgramNodeId::new)
+        .unwrap();
+    for fail in [false, true] {
+        let plan = Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap());
+        let declaration = Arc::new(CompiledJoinFrame::new(
+            Arc::clone(&program),
+            plan,
+            JoinParticipants {
+                inputs: 2,
+                finalizers: NonZeroUsize::new(3).unwrap(),
+                probes: 2,
+                tails: 0,
+            },
+            None,
+        ));
+        let runtime = RuntimeState::default();
+        let error = runtime.error_state();
+        let tracker = MemTracker::new_root("B3 actual source exit");
+        let construction = super::aggregate_fixture::runtime_construction_factory(
+            Arc::clone(&tracker),
+            Arc::clone(&error),
+        );
+        let factory = CompiledHashJoinFinalizeSourceFactory::new(
+            Arc::clone(&declaration),
+            Arc::clone(&error),
+        );
+        let mut operator = factory.create(3, 0);
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        operator.set_construction_factory(Arc::clone(&construction));
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
+        let frame = declaration.prepared().unwrap();
+        if fail {
+            frame_fixture_inputs(&frame, &program, &construction, &tracker, &error).unwrap();
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            for _ in 0..3 {
+                let mut turn = TurnWork::new(NonZeroU64::MIN, 2);
+                operator
+                    .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+                    .unwrap();
+            }
+            assert!(frame.completion.published().unwrap().is_none());
+            let original: crate::runtime::fragment::ExecutionFailure =
+                novarocks_functions::KernelFailure::DeadlineExceeded.into();
+            error.set_error(original.clone());
+            operator.on_driver_failure();
+            operator.begin_exit().unwrap();
+            let observation = operator.observe_exit();
+            assert!(matches!(
+                observation.progress,
+                crate::exec::pipeline::operator::ExitProgress::Exited
+            ));
+            assert!(
+                observation.failure.is_none(),
+                "original required failure was already reported"
+            );
+            assert_eq!(frame.completion.check().unwrap_err(), original);
+            assert_eq!(runtime.error().unwrap(), original);
+        } else {
+            frame.completion.withdraw(0).unwrap();
+            frame.completion.withdraw(1).unwrap();
+            let mut turn = TurnWork::new(NonZeroU64::MIN, 0);
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            let mut context = StepContext::new(&error, &mut turn, &mut conversions);
+            assert!(matches!(
+                operator.poll_control(&mut context).unwrap(),
+                ControlStep::Runnable
+            ));
+            let step = operator.drive(&mut context).unwrap();
+            assert!(matches!(step.next, NextStep::Finished));
+            assert!(step.output.is_none());
+            operator.begin_exit().unwrap();
+            assert!(matches!(
+                operator.observe_exit().progress,
+                crate::exec::pipeline::operator::ExitProgress::Exited
+            ));
+            assert!(frame.completion.published().unwrap().is_none());
+            assert!(runtime.error().is_none());
+        }
+        operator.close().unwrap();
+    }
 }

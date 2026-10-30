@@ -532,6 +532,25 @@ impl FinalizeWorker {
         }
         Ok(next)
     }
+    /// Real synchronous exit, independent of output EOS. A caller with an
+    /// already recorded failure drops the worker only after fail() latched it.
+    pub(crate) fn finish_exit(&mut self, frame: &JoinBuildFrame) -> ExecutionResult<bool> {
+        frame.completion.check()?;
+        if frame.completion.remaining_demand()? == RemainingDemand::Released {
+            return self
+                .retired(frame)
+                .map(|next| next == FinalizeStep::Retired);
+        }
+        if frame.completion.published()?.is_some() {
+            self.active = None;
+            self.projections = [None, None];
+            self.bitmap = None;
+            return Ok(true);
+        }
+        Err(build_contract(
+            "join finalizer exited before its required build publication",
+        ))
+    }
     pub(crate) fn step(
         &mut self,
         frame: &JoinBuildFrame,
