@@ -608,7 +608,7 @@ mod tests {
     };
     use crate::exec::pipeline::operator::Operator;
     use crate::runtime::fragment::io::ExchangeReceiverPort;
-    use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
+    use crate::runtime::fragment::io::exchange::test_support::Fixture;
     use crate::runtime::runtime_state::RuntimeState;
     use novarocks_types::SlotId;
 
@@ -626,7 +626,7 @@ mod tests {
         )
     }
 
-    fn register_int32_receiver(binding: &ExchangeBinding) {
+    fn register_int32_receiver(binding: &ExchangeBinding, fixture: &Fixture, sources: &[UniqueId]) {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let layout = crate::exec::chunk::typed_fixture::layout(
             schema,
@@ -636,11 +636,7 @@ mod tests {
                 false,
             )],
         );
-        let creation_factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-            crate::runtime::mem_tracker::MemTracker::new_root("exchange source receiver fixture"),
-            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
-        ).unwrap();
+        let creation_factory = fixture.creation(receiver_key(binding.key).fragment_instance_id);
         let expected_chunk_schema = creation_factory
             .create_compiled_chunk_schema(&layout)
             .unwrap();
@@ -654,6 +650,7 @@ mod tests {
                 creation_factory,
             })
             .expect("register typed receiver");
+        fixture.bind(receiver_key(binding.key), sources);
     }
 
     fn int32_values(chunk: &Chunk) -> Vec<i32> {
@@ -667,8 +664,65 @@ mod tests {
         (0..ints.len()).map(|row| ints.value(row)).collect()
     }
 
-    fn runtime_state() -> RuntimeState {
-        RuntimeState::default()
+    fn deliver_fixture_unit(
+        fixture: &Fixture,
+        binding: &ExchangeBinding,
+        source: UniqueId,
+        ordinal: u32,
+        chunk: Option<Chunk>,
+        end: bool,
+    ) {
+        use crate::runtime::fragment::io::exchange_unit::{
+            ExchangeDemandEntry, ExchangeDemandOperation, ExchangeUnitDemand, ExchangeUnitItem,
+            ExchangeUnitReceiverFrame, ExchangeUnitSequence,
+        };
+        let key = receiver_key(binding.key);
+        let stream = fixture.stream(source, key.fragment_instance_id, key.node_id, ordinal);
+        let (item, payload) = if let Some(chunk) = chunk {
+            let payload = exchange::encode_chunks(&[chunk], true).unwrap();
+            let demand = ExchangeUnitDemand {
+                sequence: ExchangeUnitSequence::FIRST,
+                wire_bytes: payload.len() as u64,
+            };
+            binding
+                .receiver_port
+                .register_unit_demand(
+                    key,
+                    ExchangeDemandEntry {
+                        stream,
+                        operation: ExchangeDemandOperation::Register(demand),
+                    },
+                )
+                .unwrap();
+            (
+                ExchangeUnitItem::Unit {
+                    demand,
+                    end_after_unit: end,
+                },
+                bytes::Bytes::from(payload),
+            )
+        } else {
+            assert!(end, "the empty fixture message is an explicit End");
+            (
+                ExchangeUnitItem::End(ExchangeUnitSequence::FIRST),
+                bytes::Bytes::new(),
+            )
+        };
+        binding
+            .receiver_port
+            .receive_unit(
+                key,
+                ExchangeUnitReceiverFrame {
+                    stream,
+                    sender_count: u32::try_from(binding.expected_senders).unwrap(),
+                    sender_id: i32::try_from(ordinal).unwrap(),
+                    backend_number: 0,
+                    item,
+                    payload,
+                    next_demand: None,
+                },
+            )
+            .unwrap();
     }
 
     struct CountingSink {
@@ -718,6 +772,7 @@ mod tests {
     }
 
     struct TimeoutPipeline {
+        fixture: Arc<Fixture>,
         state: Arc<RuntimeState>,
         observable: Arc<Observable>,
         rows: Arc<AtomicUsize>,
@@ -728,14 +783,15 @@ mod tests {
     }
 
     fn timeout_pipeline(key: exchange::ExchangeKey, timeout: Duration) -> TimeoutPipeline {
+        let fixture = Fixture::new();
         let binding = ExchangeBinding {
             key,
             expected_senders: 1,
-            receiver_port: in_process_test_exchange_receiver_port(),
+            receiver_port: fixture.port.clone(),
         };
-        register_int32_receiver(&binding);
+        register_int32_receiver(&binding, &fixture, &[UniqueId::new(92_000, 1)]);
         let factory = ExchangeSourceFactory::new_compiled(key.node_id, timeout, binding.clone());
-        let state = Arc::new(runtime_state());
+        let state = fixture.state(receiver_key(key).fragment_instance_id);
         let (mut source, observable) = factory.create_source(0);
         source.prepare().expect("prepare exchange source");
         source
@@ -752,6 +808,7 @@ mod tests {
             None,
         ));
         TimeoutPipeline {
+            fixture,
             state,
             observable,
             rows,
@@ -821,6 +878,7 @@ mod tests {
             node_id: 92_003,
         };
         let TimeoutPipeline {
+            fixture: _fixture,
             state,
             observable,
             rows,
@@ -862,6 +920,7 @@ mod tests {
             node_id: 92_013,
         };
         let TimeoutPipeline {
+            fixture,
             state,
             observable,
             rows,
@@ -886,11 +945,12 @@ mod tests {
         }
         assert!(parked.is_in_blocked(), "source did not park");
         let after_park = observable.generation();
-        binding.receiver_port.push_local(
-            receiver_key(key),
+        deliver_fixture_unit(
+            &fixture,
+            &binding,
+            UniqueId::new(92_000, 1),
             0,
-            0,
-            vec![int32_chunk(vec![7])],
+            Some(int32_chunk(vec![7])),
             false,
         );
 
@@ -926,19 +986,20 @@ mod tests {
             node_id: 92_023,
         };
         let timeout = Duration::from_secs(1);
+        let fixture = Fixture::new();
         let binding = ExchangeBinding {
             key,
             expected_senders: 1,
-            receiver_port: in_process_test_exchange_receiver_port(),
+            receiver_port: fixture.port.clone(),
         };
-        register_int32_receiver(&binding);
+        register_int32_receiver(&binding, &fixture, &[UniqueId::new(92_020, 1)]);
         let factory = ExchangeSourceFactory::new_compiled(key.node_id, timeout, binding.clone());
         let mut first = factory.create(2, 0);
         let mut second = factory.create(2, 1);
         first.prepare().expect("prepare first exchange source");
         second.prepare().expect("prepare second exchange source");
 
-        let state = runtime_state();
+        let state = fixture.state(receiver_key(key).fragment_instance_id);
         first.bind_runtime_state(&state).unwrap();
         second.bind_runtime_state(&state).unwrap();
         let first_before = idle_deadline(&mut first, &state);
@@ -946,11 +1007,12 @@ mod tests {
         assert_eq!(first_before.token(), 1);
         assert_eq!(second_before.token(), 1);
 
-        binding.receiver_port.push_local(
-            receiver_key(key),
+        deliver_fixture_unit(
+            &fixture,
+            &binding,
+            UniqueId::new(92_020, 1),
             0,
-            0,
-            vec![int32_chunk(vec![11])],
+            Some(int32_chunk(vec![11])),
             false,
         );
         let output = source_step(&mut first, &state)
@@ -977,14 +1039,20 @@ mod tests {
             node_id: 92_033,
         };
         let timeout = Duration::from_secs(1);
+        let fixture = Fixture::new();
+        let sources = [
+            UniqueId::new(92_030, 1),
+            UniqueId::new(92_030, 2),
+            UniqueId::new(92_030, 3),
+        ];
         let binding = ExchangeBinding {
             key,
             expected_senders: 3,
-            receiver_port: in_process_test_exchange_receiver_port(),
+            receiver_port: fixture.port.clone(),
         };
-        register_int32_receiver(&binding);
+        register_int32_receiver(&binding, &fixture, &sources);
         let factory = ExchangeSourceFactory::new_compiled(key.node_id, timeout, binding.clone());
-        let state = Arc::new(runtime_state());
+        let state = fixture.state(receiver_key(key).fragment_instance_id);
         let fragment = Arc::new(FragmentContext::new(
             None,
             Arc::clone(&state),
@@ -1038,12 +1106,13 @@ mod tests {
             "every high-DOP exchange driver must be parked before EOS"
         );
 
-        for sender in 0..3 {
-            binding.receiver_port.push_local(
-                receiver_key(key),
-                100 + sender,
-                sender,
-                Vec::new(),
+        for (ordinal, source) in sources.into_iter().enumerate() {
+            deliver_fixture_unit(
+                &fixture,
+                &binding,
+                source,
+                u32::try_from(ordinal).unwrap(),
+                None,
                 true,
             );
         }
@@ -1074,10 +1143,11 @@ mod tests {
             finst_id_lo: 88_002,
             node_id: 5,
         };
+        let fixture = Fixture::new();
         let binding = ExchangeBinding {
             key,
             expected_senders: 4,
-            receiver_port: in_process_test_exchange_receiver_port(),
+            receiver_port: fixture.port.clone(),
         };
         let factory = ExchangeSourceFactory::new_compiled(5, Duration::from_secs(60), binding);
         assert!(

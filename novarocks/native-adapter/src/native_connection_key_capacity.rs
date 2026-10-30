@@ -95,13 +95,11 @@ fn full() -> io::Error {
 
 fn limits(key: InlineNativeChannelIdentity) -> io::Result<Limits> {
     match (key.peer(), key.method()) {
-        (Some(_), NativeRpcMethod::ExchangeUnary | NativeRpcMethod::DeliverExchangeUnit) => {
-            Ok(Limits {
-                live: GEOMETRY.transport_exchange_connections_per_peer as usize,
-                connecting: GEOMETRY.transport_exchange_connecting_positions_per_peer as usize,
-                closing: GEOMETRY.transport_exchange_closing_positions_per_peer as usize,
-            })
-        }
+        (Some(_), NativeRpcMethod::DeliverExchangeUnit) => Ok(Limits {
+            live: GEOMETRY.transport_exchange_connections_per_peer as usize,
+            connecting: GEOMETRY.transport_exchange_connecting_positions_per_peer as usize,
+            closing: GEOMETRY.transport_exchange_closing_positions_per_peer as usize,
+        }),
         (Some(_), NativeRpcMethod::TransmitRuntimeFilterEnvelope) => Ok(Limits {
             live: GEOMETRY.transport_runtime_filter_connections_per_peer as usize,
             connecting: GEOMETRY.transport_runtime_filter_connecting_positions_per_peer as usize,
@@ -306,7 +304,7 @@ mod tests {
     }
 
     fn exchange(peer: u8, port: u16) -> InlineNativeChannelIdentity {
-        key(Some(peer), NativeRpcMethod::ExchangeUnary, port)
+        key(Some(peer), NativeRpcMethod::DeliverExchangeUnit, port)
     }
     fn filter(peer: u8, port: u16) -> InlineNativeChannelIdentity {
         key(

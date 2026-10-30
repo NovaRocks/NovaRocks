@@ -19,7 +19,7 @@
 // writer, exact Theta requests, compiler, recorder and independent wire oracle.
 mod logical_finish_graph {
     use super::*;
-    use crate::runtime::fragment::io::exchange::fixture_stream;
+    use crate::runtime::fragment::io::ExchangeReceiverKey;
     use novarocks_physical_plan as p;
     use novarocks_spi::connector::write_stack::RootRowKind;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -179,7 +179,7 @@ mod logical_finish_graph {
         .expect("the independently checked logical finish package validates")
     }
 
-    fn tiny_state() -> Arc<RuntimeState> {
+    fn tiny_fixture() -> Arc<Fixture> {
         let runtime = Arc::new(
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
@@ -202,20 +202,7 @@ mod logical_finish_graph {
             )
             .unwrap(),
         );
-        Arc::new(RuntimeState::for_local_execution(
-            Some(crate::runtime::query_options::QueryOptions {
-                query_timeout: Some(5),
-                ..Default::default()
-            }),
-            None,
-            None,
-            None,
-            None,
-            Some(crate::runtime::mem_tracker::MemTracker::new_root(
-                "logical finish graph",
-            )),
-            Some(runtime),
-        ))
+        Fixture::with_runtime(runtime)
     }
 
     /// Read-only transport observation; actual encoding/admission is still
@@ -225,13 +212,46 @@ mod logical_finish_graph {
         data: Arc<AtomicUsize>,
     }
     impl ExchangeFrameTransmitter for CountFrames {
-        fn transmit(&self, frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
-            let data = !frame.eos && !frame.payload.is_empty();
-            self.loopback.transmit(frame)?;
+        fn deliver_unit(
+            &self,
+            frame: crate::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+            stop: tokio_util::sync::CancellationToken,
+            activity: crate::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
+            done: crate::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+        ) {
+            let data = !frame.receiver.payload.is_empty();
+            self.loopback.deliver_unit(frame, stop, activity, done);
             if data {
                 self.data.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(())
+        }
+        fn register_unit_demands(
+            &self,
+            destination: RuntimeEndpoint,
+            entries: Vec<crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry>,
+            stop: tokio_util::sync::CancellationToken,
+            done: crate::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+        ) {
+            self.loopback
+                .register_unit_demands(destination, entries, stop, done)
+        }
+        fn watch_unit_facts(
+            &self,
+            destination: RuntimeEndpoint,
+            stream: novarocks_execution_contract::ExchangeStreamIdentity,
+            wake: crate::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+        ) -> Result<(), novarocks_failure_contract::FailureFact> {
+            self.loopback.watch_unit_facts(destination, stream, wake)
+        }
+        fn forget_unit_facts(&self, stream: novarocks_execution_contract::ExchangeStreamIdentity) {
+            self.loopback.forget_unit_facts(stream)
+        }
+        fn schedule_unit_retry(
+            &self,
+            delay: Duration,
+            task: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Result<(), novarocks_failure_contract::FailureFact> {
+            self.loopback.schedule_unit_retry(delay, task)
         }
     }
 
@@ -254,8 +274,9 @@ mod logical_finish_graph {
             novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
         );
         let summary_layout = compiled.finish.graph().nodes()[summary_id.index()].output_layout();
-        let port = in_process_test_exchange_receiver_port();
-        let creation = crate::runtime::fragment::exchange::test_receiver_creation_factory();
+        let fixture = tiny_fixture();
+        let port = fixture.port.clone();
+        let creation = fixture.creation(FINISH_FINST);
         let CompiledExchangeReceivers {
             registrations,
             bindings,
@@ -277,7 +298,16 @@ mod logical_finish_graph {
         )
         .unwrap();
         for registration in registrations {
+            let key = registration.key;
             port.register(registration).unwrap();
+            fixture.bind(
+                key,
+                &[if key.node_id == summary_node {
+                    SUMMARY_FINST
+                } else {
+                    WRITER_FINST
+                }],
+            );
         }
         let summary_key = ExchangeReceiverKey {
             fragment_instance_id: FINISH_FINST,
@@ -287,37 +317,51 @@ mod logical_finish_graph {
             fragment_instance_id: FINISH_FINST,
             node_id: i32::try_from(compiled.receiver.get()).unwrap(),
         };
-        let summary_stream = fixture_stream(SUMMARY_FINST, FINISH_FINST, summary_node, 0);
-        let writer_stream = fixture_stream(WRITER_FINST, FINISH_FINST, writer_key.node_id, 0);
-        let state = tiny_state();
-        let recorded = Arc::new(Mutex::new(Recorded::default()));
-        let data_frames = Arc::new(AtomicUsize::new(0));
-        let writer_sink = materialize_compiled_sink(
-            &compiled.writer,
-            &FragmentSinkAssignment::StreamDestinations {
-                destinations: vec![
-                    FragmentDestination::new(
-                        FINISH_FINST,
-                        RuntimeEndpoint::new("127.0.0.1", 9030).unwrap(),
-                        WRITER_FINST,
-                        0,
-                        1,
-                    )
-                    .unwrap(),
-                ],
-                sender_id: None,
-            },
-            WRITER_FINST,
-            Arc::new(CountFrames {
-                loopback: LoopbackTransmitter {
-                    port: Arc::clone(&port),
-                },
-                data: Arc::clone(&data_frames),
+        let summary_stream = fixture.stream(SUMMARY_FINST, FINISH_FINST, summary_node, 0);
+        let writer_stream = fixture.stream(WRITER_FINST, FINISH_FINST, writer_key.node_id, 0);
+        let baseline = fixture.state(WRITER_FINST);
+        let state = Arc::new(RuntimeState::new(
+            Some(crate::runtime::query_options::QueryOptions {
+                query_timeout: Some(5),
+                ..Default::default()
             }),
             None,
             None,
-        )
-        .unwrap();
+            Some(WRITER_FINST),
+            None,
+            baseline.mem_tracker(),
+            Some(fixture.runtime.clone()),
+            baseline.error_state().clone(),
+        ));
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let data_frames = Arc::new(AtomicUsize::new(0));
+        let writer_sink = fixture
+            .sink(
+                &compiled.writer,
+                &FragmentSinkAssignment::StreamDestinations {
+                    destinations: vec![
+                        FragmentDestination::new(
+                            FINISH_FINST,
+                            RuntimeEndpoint::new("127.0.0.1", 9030).unwrap(),
+                            WRITER_FINST,
+                            0,
+                            1,
+                        )
+                        .unwrap(),
+                    ],
+                    sender_id: None,
+                },
+                WRITER_FINST,
+                Arc::new(CountFrames {
+                    loopback: LoopbackTransmitter {
+                        unit: fixture.transport.clone(),
+                    },
+                    data: Arc::clone(&data_frames),
+                }),
+                None,
+                None,
+            )
+            .unwrap();
         let writer = prepare_compiled_program_pipeline_execution_with_profiler(
             Arc::clone(&compiled.writer),
             Duration::from_millis(2),
@@ -370,18 +414,24 @@ mod logical_finish_graph {
             )
             .unwrap();
             let payload = crate::runtime::exchange::encode_chunks(&[chunk], true).unwrap();
-            port.push(
+            let demand = crate::runtime::fragment::io::exchange_unit::ExchangeUnitDemand {
+                sequence: crate::runtime::fragment::io::exchange_unit::ExchangeUnitSequence::FIRST,
+                wire_bytes: payload.len() as u64,
+            };
+            port.register_unit_demand(summary_key, crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry { stream: summary_stream, operation: crate::runtime::fragment::io::exchange_unit::ExchangeDemandOperation::Register(demand) }).unwrap();
+            port.receive_unit(
                 summary_key,
-                ExchangeReceiverFrame {
+                crate::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame {
                     stream: summary_stream,
-                    source_fragment_instance_id: SUMMARY_FINST,
-                    sender_ordinal: 0,
                     sender_count: 1,
                     sender_id: 0,
                     backend_number: 0,
-                    sequence: 0,
-                    eos: true,
-                    payload,
+                    item: crate::runtime::fragment::io::exchange_unit::ExchangeUnitItem::Unit {
+                        demand,
+                        end_after_unit: true,
+                    },
+                    payload: bytes::Bytes::from(payload),
+                    next_demand: None,
                 },
             )
             .unwrap();
@@ -399,6 +449,20 @@ mod logical_finish_graph {
             )
             .unwrap();
         let output = ResultSinkHandle::new();
+        let finish_original = fixture.state(FINISH_FINST);
+        let finish_state = Arc::new(RuntimeState::new(
+            Some(crate::runtime::query_options::QueryOptions {
+                query_timeout: Some(5),
+                ..Default::default()
+            }),
+            None,
+            None,
+            Some(FINISH_FINST),
+            None,
+            finish_original.mem_tracker(),
+            Some(fixture.runtime.clone()),
+            finish_original.error_state().clone(),
+        ));
         let prepared = prepare_compiled_program_pipeline_execution_with_profiler(
             Arc::clone(&compiled.finish),
             Duration::from_millis(2),
@@ -409,7 +473,7 @@ mod logical_finish_graph {
             Some((FINISH_FINST.high(), FINISH_FINST.low())),
             None,
             finish_dop as i32,
-            Arc::clone(&state),
+            finish_state,
             Arc::new(NoopFragmentEventSink),
         )
         .unwrap();

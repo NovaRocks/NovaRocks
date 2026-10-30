@@ -832,40 +832,46 @@ mod tests {
         use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
         use crate::exec::pipeline::operator::BlockedReason;
         use crate::runtime::exchange::ExchangeKey;
-        use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
+        use crate::runtime::fragment::io::exchange::test_support::Fixture;
         use std::time::Duration;
 
-        let state = Arc::new(RuntimeState::default());
+        let fixture = Fixture::new();
         let exchanger = LocalExchanger::new(1, 1, LocalExchangePartitionSpec::Single);
         let sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let local_source = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
-        let schema = chunk_of(&[1]).chunk_schema_ref();
         let key = ExchangeKey {
             finst_id_hi: 97001,
             finst_id_lo: 97002,
             node_id: 97003,
         };
-        let receiver_port = in_process_test_exchange_receiver_port();
-        let creation_factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-            crate::runtime::mem_tracker::MemTracker::new_root("local exchange remote receiver fixture"),
-            state.error_state(),
-        ).unwrap();
+        let receiver_key = crate::runtime::fragment::io::ExchangeReceiverKey {
+            fragment_instance_id: novarocks_types::UniqueId::new(key.finst_id_hi, key.finst_id_lo),
+            node_id: key.node_id,
+        };
+        let state = fixture.state(receiver_key.fragment_instance_id);
+        let receiver_port = fixture.port.clone();
+        let creation_factory = fixture.creation(receiver_key.fragment_instance_id);
+        let layout = crate::exec::chunk::typed_fixture::layout(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+            &[SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                false,
+            )],
+        );
+        let schema = creation_factory
+            .create_compiled_chunk_schema(&layout)
+            .unwrap();
         receiver_port
             .register(crate::runtime::fragment::io::ExchangeReceiverRegistration {
-                key: crate::runtime::fragment::io::ExchangeReceiverKey {
-                    fragment_instance_id: novarocks_types::UniqueId::new(
-                        key.finst_id_hi,
-                        key.finst_id_lo,
-                    ),
-                    node_id: key.node_id,
-                },
+                key: receiver_key,
                 expected_senders: 1,
                 expected_chunk_schema: schema,
                 column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
                 creation_factory,
             })
             .expect("register remote receiver");
+        fixture.bind(receiver_key, &[novarocks_types::UniqueId::new(97000, 1)]);
         let remote = ExchangeSourceFactory::new_compiled(
             key.node_id,
             Duration::from_secs(60),

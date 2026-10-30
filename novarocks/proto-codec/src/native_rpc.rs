@@ -65,7 +65,6 @@ pub enum NativeRpcMethod {
     GetFinalTaskInfo,
     Heartbeat,
     PruneCatalogs,
-    ExchangeUnary,
     DeliverExchangeUnit,
     RegisterExchangeDemand,
     SubscribeExchangeGrants,
@@ -97,7 +96,7 @@ macro_rules! contract {
 }
 use FrontendNativeLane::{LifecycleControl, Observation, ResultData, Submission};
 use NativeTrafficClass::Frontend;
-pub const NATIVE_METHODS: [NativeMethodContract; 17] = [
+pub const NATIVE_METHODS: [NativeMethodContract; 16] = [
     contract!(
         FetchTaskResult,
         "FetchTaskResult",
@@ -171,14 +170,6 @@ pub const NATIVE_METHODS: [NativeMethodContract; 17] = [
         Unary
     ),
     contract!(
-        ExchangeUnary,
-        "ExchangeUnary",
-        NativeTrafficClass::Exchange,
-        BackendData,
-        BackendToBackend,
-        Unary
-    ),
-    contract!(
         DeliverExchangeUnit,
         "DeliverExchangeUnit",
         NativeTrafficClass::Exchange,
@@ -219,20 +210,20 @@ pub const NATIVE_METHODS: [NativeMethodContract; 17] = [
         Unary
     ),
     contract!(
-        RetiredFetchResult,
-        "FetchResult",
-        NativeTrafficClass::Retired,
-        BackendData,
-        FrontendToBackend,
-        Unary
-    ),
-    contract!(
         RetiredExchange,
         "Exchange",
         NativeTrafficClass::Retired,
         BackendData,
         BackendToBackend,
         RetiredStream
+    ),
+    contract!(
+        RetiredFetchResult,
+        "FetchResult",
+        NativeTrafficClass::Retired,
+        BackendData,
+        FrontendToBackend,
+        Unary
     ),
 ];
 impl NativeRpcMethod {
@@ -320,10 +311,45 @@ mod tests {
             NativeRpcMethod::FetchRootResult.contract().traffic,
             NativeTrafficClass::Frontend(FrontendNativeLane::ResultData)
         );
-        assert!(!NativeRpcMethod::RetiredExchange.is_allowed_at(NativeEndpointDomain::BackendData));
+        assert_eq!(
+            NativeRpcMethod::from_path("/novarocks.NovaRocksGrpc/ExchangeUnary"),
+            None
+        );
     }
     #[test]
+    fn retired_entrypoints_remain_known_and_are_never_admitted() {
+        for (name, method) in [
+            ("Exchange", NativeRpcMethod::RetiredExchange),
+            ("FetchResult", NativeRpcMethod::RetiredFetchResult),
+        ] {
+            assert_eq!(
+                NativeRpcMethod::from_path(&format!("/novarocks.NovaRocksGrpc/{name}")),
+                Some(method)
+            );
+            assert_eq!(method.contract().traffic, NativeTrafficClass::Retired);
+            for endpoint in [
+                NativeEndpointDomain::BackendData,
+                NativeEndpointDomain::BackendControl,
+                NativeEndpointDomain::FrontendMembership,
+            ] {
+                assert!(!method.is_allowed_at(endpoint));
+            }
+        }
+        assert_eq!(
+            NativeRpcMethod::RetiredExchange.contract().body,
+            NativeBodyKind::RetiredStream
+        );
+    }
+
+    #[test]
     fn unit_methods_share_exchange_routing_and_keep_the_subscription_streaming() {
+        assert_eq!(
+            NATIVE_METHODS
+                .iter()
+                .filter(|entry| entry.traffic == NativeTrafficClass::Exchange)
+                .count(),
+            3
+        );
         for method in [
             NativeRpcMethod::DeliverExchangeUnit,
             NativeRpcMethod::RegisterExchangeDemand,

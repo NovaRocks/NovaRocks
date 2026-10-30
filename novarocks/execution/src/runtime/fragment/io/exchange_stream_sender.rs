@@ -394,6 +394,9 @@ struct SenderState {
     refreshing: bool,
     refresh_again: bool,
     cleanup_started: bool,
+    // Monotonic call-publication fact, independent of current activity. Set
+    // under this lock before any demand, subscription or delivery can escape.
+    peer_contact_started: bool,
     stop_obligation: ExchangeSenderStopState,
     stop_active: bool,
     stop_retry_waiting: bool,
@@ -470,6 +473,7 @@ impl ExchangeStreamSender {
                 refreshing: false,
                 refresh_again: false,
                 cleanup_started: false,
+                peer_contact_started: false,
                 stop_obligation: ExchangeSenderStopState::NotRequired,
                 stop_active: false,
                 stop_retry_waiting: false,
@@ -585,7 +589,11 @@ impl ExchangeStreamSender {
                 false
             } else {
                 state.cleanup_started = true;
-                state.stop_obligation = ExchangeSenderStopState::Pending;
+                if state.stop_obligation == ExchangeSenderStopState::NotRequired
+                    && state.peer_contact_started
+                {
+                    state.stop_obligation = ExchangeSenderStopState::Pending;
+                }
                 state.kernel.seal();
                 state.payloads.clear();
                 state.pending = None;
@@ -658,8 +666,7 @@ impl ExchangeStreamSender {
                     };
                     match result {
                         Ok(facts) if facts.sender_stopped || facts.receiver_closed.is_some() => {
-                            state.stop_obligation = ExchangeSenderStopState::Confirmed;
-                            None
+                            self.merge_locked(&mut state, facts).err()
                         }
                         Ok(_) => Some(contract_failure()),
                         Err(failure) => Some(failure),
@@ -711,17 +718,15 @@ impl ExchangeStreamSender {
         self.terminate(ExchangeStreamSenderStatus::Failed(failure));
     }
 
-    fn merge_locked(
+    // Validate against the immutable publication/offer history even after local
+    // cleanup sealed the kernel. A late stop proof releases only its stop debt;
+    // it never replays an ACK into a sealed stream or revives retained data.
+    fn validate_facts_locked(
         &self,
-        state: &mut SenderState,
+        state: &SenderState,
         facts: ExchangeStreamFacts,
-    ) -> Result<(), FailureFact> {
-        if !matches!(
-            state.status,
-            ExchangeStreamSenderStatus::Open | ExchangeStreamSenderStatus::CustodyComplete
-        ) {
-            return Ok(());
-        }
+    ) -> Result<u64, FailureFact> {
+        let snapshot = state.kernel.snapshot();
         let mut custody_through = facts.custody_through;
         if let Some(closed) = facts.receiver_closed {
             match closed {
@@ -729,37 +734,64 @@ impl ExchangeStreamSender {
                     if self.config.delivery == ExchangeDeliveryRequirement::MustDrain {
                         return Err(contract_failure());
                     }
-                    state.status = ExchangeStreamSenderStatus::Withdrawn;
                 }
                 ExchangeUnitCloseDisposition::Consumed { final_sequence } => {
-                    if state.kernel.snapshot().end_sequence != Some(final_sequence.get()) {
+                    if snapshot.end_sequence != Some(final_sequence.get()) {
                         return Err(contract_failure());
                     }
                     custody_through = custody_through.max(final_sequence.get());
                 }
             }
         }
-        if facts.sender_stopped {
-            state.status = ExchangeStreamSenderStatus::Stopped;
-            return Ok(());
+        if custody_through > snapshot.offered_through {
+            return Err(contract_failure());
         }
-        state
-            .kernel
-            .acknowledge(custody_through)
-            .map_err(|_| contract_failure())?;
-        let custody = state.kernel.snapshot().consumed_through;
-        state.payloads.retain(|sequence, _| *sequence > custody);
-        state.replay_due.retain(|sequence| *sequence > custody);
-        state.retry_pending.retain(|sequence| *sequence > custody);
-        state.granted = state.granted.max(facts.granted_through);
-        if state
-            .kernel
-            .snapshot()
-            .end_sequence
-            .is_some_and(|end| end <= custody)
-            && state.status == ExchangeStreamSenderStatus::Open
+        Ok(custody_through)
+    }
+
+    fn merge_locked(
+        &self,
+        state: &mut SenderState,
+        facts: ExchangeStreamFacts,
+    ) -> Result<(), FailureFact> {
+        let custody_through = self.validate_facts_locked(state, facts)?;
+        let confirms_stop = facts.sender_stopped || facts.receiver_closed.is_some();
+        if matches!(
+            state.status,
+            ExchangeStreamSenderStatus::Open | ExchangeStreamSenderStatus::CustodyComplete
+        ) {
+            state
+                .kernel
+                .acknowledge(custody_through)
+                .map_err(|_| contract_failure())?;
+            let custody = state.kernel.snapshot().consumed_through;
+            state.payloads.retain(|sequence, _| *sequence > custody);
+            state.replay_due.retain(|sequence| *sequence > custody);
+            state.retry_pending.retain(|sequence| *sequence > custody);
+            state.granted = state.granted.max(facts.granted_through);
+            if facts.sender_stopped {
+                state.status = ExchangeStreamSenderStatus::Stopped;
+            } else if facts.receiver_closed == Some(ExchangeUnitCloseDisposition::Withdrawn) {
+                state.status = ExchangeStreamSenderStatus::Withdrawn;
+            } else if state
+                .kernel
+                .snapshot()
+                .end_sequence
+                .is_some_and(|end| end <= custody)
+                && state.status == ExchangeStreamSenderStatus::Open
+            {
+                state.status = ExchangeStreamSenderStatus::CustodyComplete;
+            }
+        }
+        // Publish confirmation only after every fallible merge check. Keep
+        // failure/route-retirement conclusions intact, including on late facts.
+        if confirms_stop
+            && matches!(
+                state.stop_obligation,
+                ExchangeSenderStopState::NotRequired | ExchangeSenderStopState::Pending
+            )
         {
-            state.status = ExchangeStreamSenderStatus::CustodyComplete;
+            state.stop_obligation = ExchangeSenderStopState::Confirmed;
         }
         Ok(())
     }
@@ -849,6 +881,9 @@ impl ExchangeStreamSender {
                 }
                 if forget {
                     state.watching = false;
+                }
+                if demand.is_some() || watch {
+                    state.peer_contact_started = true;
                 }
                 (demand, watch, terminal, forget)
             };
@@ -999,6 +1034,7 @@ impl ExchangeStreamSender {
                             .expect("exchange call identity exhausted");
                         let call = state.next_call_id;
                         state.active.insert(candidate.sequence, call);
+                        state.peer_contact_started = true;
                         state.replay_due.remove(&candidate.sequence);
                         if state.pending == Some(candidate.sequence) {
                             state.pending = None;

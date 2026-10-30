@@ -71,6 +71,17 @@ impl ProbeService {
 
 #[tonic::async_trait]
 impl NovaRocksGrpc for ProbeService {
+    type ExchangeStream = tokio_stream::Empty<Result<proto::ExchangeResponse, tonic::Status>>;
+
+    async fn exchange(
+        &self,
+        _request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
+    ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange is retired; use DeliverExchangeUnit",
+        ))
+    }
+
     type SubscribeExchangeGrantsStream = std::pin::Pin<
         Box<
             dyn tokio_stream::Stream<Item = Result<proto::ExchangeGrantBatch, tonic::Status>>
@@ -106,21 +117,9 @@ impl NovaRocksGrpc for ProbeService {
         ))
     }
 
-    type ExchangeStream = tokio_stream::Empty<Result<proto::ExchangeResponse, tonic::Status>>;
     type SubscribeTaskStatusStream =
         tokio_stream::Empty<Result<proto::TaskStatusStreamEvent, tonic::Status>>;
-    async fn exchange(
-        &self,
-        _request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
-    ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
-        panic!("unexpected generated handler: exchange")
-    }
-    async fn exchange_unary(
-        &self,
-        _request: tonic::Request<proto::ExchangeRequest>,
-    ) -> Result<tonic::Response<proto::ExchangeResponse>, tonic::Status> {
-        panic!("unexpected generated handler: exchange_unary")
-    }
+
     async fn transmit_runtime_filter_envelope(
         &self,
         _request: tonic::Request<filter::RuntimeFilterEnvelope>,

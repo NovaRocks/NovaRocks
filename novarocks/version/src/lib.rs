@@ -679,6 +679,25 @@ mod tests {
         assert_eq!(NATIVE_COMPAT_EPOCH, 12);
     }
     #[test]
+    fn receiver_authorized_exchange_isolates_the_previous_write_runtime_and_test_island() {
+        let at = |epoch| {
+            derive_native_compatibility_material(
+                b"same-descriptor",
+                carriers(),
+                [0x31; 32],
+                1,
+                COMPILED,
+                epoch,
+            )
+            .unwrap()
+        };
+        for previous in [10, 11] {
+            assert_ne!(NATIVE_COMPAT_EPOCH, previous);
+            assert_ne!(at(NATIVE_COMPAT_EPOCH).id(), at(previous).id());
+        }
+    }
+
+    #[test]
     fn arrow_selection_and_time_semantics_cut_off_the_previous_epoch() {
         let at = |epoch| {
             derive_native_compatibility_material(

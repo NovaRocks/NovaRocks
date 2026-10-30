@@ -5,9 +5,8 @@ use std::time::Duration;
 use crate::exec::pipeline::global_driver_executor::GlobalDriverExecutor;
 use crate::runtime::exchange::ExecutionExchangeRegistry;
 use crate::runtime::execution_services::ExecutionServices;
-use crate::runtime::fragment::io::exchange_queue::ExchangeSendQueue;
+use crate::runtime::fragment::io::exchange_stream_sender::ExchangeUnitSendScheduler;
 use crate::runtime::function_set::SealedExecutionFunctionSet;
-use crate::runtime::io::IoExecutor;
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 use novarocks_memory::MemoryAuthority;
 
@@ -170,7 +169,7 @@ pub struct ExecutionRuntime {
     mem_root: Arc<MemTracker>,
     exchange_registry: Arc<ExecutionExchangeRegistry>,
     driver_executor: Arc<GlobalDriverExecutor>,
-    exchange_send_queue: Arc<ExchangeSendQueue>,
+    exchange_unit_scheduler: Arc<ExchangeUnitSendScheduler>,
 }
 
 /// A real, small memory authority for tests that need to build an
@@ -215,11 +214,17 @@ impl ExecutionRuntime {
         let services =
             ExecutionServices::new(&config).map_err(ExecutionRuntimeConfigError::runtime)?;
         let driver_executor = Arc::new(GlobalDriverExecutor::new(config.driver_threads));
-        let exchange_io_executor = Arc::new(IoExecutor::new(config.exchange_io_threads));
-        let exchange_send_queue = Arc::new(ExchangeSendQueue::new(
+        let peer_calls = usize::try_from(
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1
+                .transport_exchange_inflight_per_peer,
+        )
+        .map_err(|error| ExecutionRuntimeConfigError::runtime(error.to_string()))?;
+        let exchange_unit_scheduler = ExchangeUnitSendScheduler::try_new(
             config.exchange_io_max_inflight_bytes,
-            exchange_io_executor,
-        ));
+            peer_calls,
+            novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+        )
+        .map_err(|error| ExecutionRuntimeConfigError::runtime(error.to_string()))?;
         Ok(Self {
             execution_health: Arc::new(crate::runtime::execution_health::ExecutionHealth::default()),
             config,
@@ -231,9 +236,11 @@ impl ExecutionRuntime {
             // hierarchy, never a second root: a disconnected root makes every
             // charge under it invisible to the process memory boundary.
             mem_root: MemTracker::new_child("execution", &process_mem_tracker()),
-            exchange_registry: Arc::new(ExecutionExchangeRegistry::default()),
+            exchange_registry: Arc::new(ExecutionExchangeRegistry::with_flow_limits(
+                exchange_flow_limits,
+            )),
             driver_executor,
-            exchange_send_queue,
+            exchange_unit_scheduler,
         })
     }
 
@@ -285,8 +292,8 @@ impl ExecutionRuntime {
         self.driver_executor.shutdown()
     }
 
-    pub fn exchange_send_queue(&self) -> Arc<ExchangeSendQueue> {
-        Arc::clone(&self.exchange_send_queue)
+    pub fn exchange_unit_scheduler(&self) -> Arc<ExchangeUnitSendScheduler> {
+        Arc::clone(&self.exchange_unit_scheduler)
     }
 }
 

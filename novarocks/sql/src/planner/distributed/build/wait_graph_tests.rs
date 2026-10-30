@@ -644,3 +644,95 @@ fn required_rf_wait_is_rejected_when_its_own_cycle_remains() {
         Err(WaitGraphError::UnresolvableFilterConsumer(required))
     );
 }
+
+#[test]
+fn summary_backpressure_does_not_stop_the_computing_root() {
+    // The provider route drains the computing root. The independent summary
+    // is read only afterwards. Blocking its delivery must not block that drain.
+    let root = operator(0, 0);
+    let writer = operator(1, 0);
+    let summary_receiver = operator(2, 0);
+    let consumer = operator(2, 1);
+    let mut graph = WaitGraph::default();
+    for operator in [root, writer, summary_receiver, consumer] {
+        graph.add_edge(
+            WaitNode::Completion(operator),
+            WaitNode::Backpressure(operator),
+            WaitEdgeKind::DataWait,
+        );
+    }
+    graph.add_operator_input(writer, root, true);
+    graph.add_operator_input(consumer, writer, false);
+    graph.add_operator_input(consumer, summary_receiver, true);
+    graph.add_summary_output(root);
+    graph.add_summary_input(summary_receiver, root.fragment);
+    graph.add_edge(
+        WaitNode::Backpressure(summary_receiver),
+        WaitNode::Completion(writer),
+        WaitEdgeKind::DataWait,
+    );
+    assert!(graph.resolve().unwrap().is_acyclic());
+    // If summary were aliased to the relational root, as it was before the
+    // separate B1b output port existed, this same gate would falsely cycle.
+    graph.add_edge(
+        WaitNode::Backpressure(root),
+        WaitNode::SummaryBackpressure(root.fragment),
+        WaitEdgeKind::Backpressure,
+    );
+    let resolution = graph.resolve().unwrap();
+    assert_real_cycles(&graph, &resolution);
+}
+
+#[test]
+fn graph_resolution_observes_the_original_control_and_latches_its_first_refusal() {
+    struct StopOnWork {
+        cause: CompileControlError,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl novarocks_type_contract::PureCompileControl for StopOnWork {
+        fn checkpoint(
+            &self,
+            _phase: novarocks_type_contract::CompilePhase,
+            units: u32,
+        ) -> Result<(), CompileControlError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if units == 0 {
+                Ok(())
+            } else {
+                Err(self.cause.clone())
+            }
+        }
+    }
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let mut fixture = Fixture::default();
+        fixture.values(0, 0);
+        for node in 1..1024 {
+            fixture.project(0, node, node - 1);
+        }
+        let mut graph = fixture.finish(&[]);
+        let control = StopOnWork {
+            cause: cause.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut work =
+            CompileCheckpoints::try_new(&control, novarocks_type_contract::CompilePhase::Validate)
+                .unwrap();
+        let result = graph.resolve_observed(&mut work);
+        assert_eq!(result, Err(WaitGraphError::Control(cause.clone())));
+        let calls = control.calls.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            work.finish_result(result, WaitGraphError::Control),
+            Err(WaitGraphError::Control(cause))
+        );
+        assert_eq!(
+            control.calls.load(std::sync::atomic::Ordering::Relaxed),
+            calls,
+            "an originating refusal must not call the caller control again"
+        );
+    }
+}

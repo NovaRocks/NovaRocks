@@ -257,7 +257,7 @@ async fn served_stream_position_outlives_the_handler_and_returns_at_body_eof() {
             NativeRpcMethod::SubscribeTaskStatus,
             NativeLane::Observation,
         ),
-        (NativeRpcMethod::ExchangeUnary, NativeLane::Exchange),
+        (NativeRpcMethod::DeliverExchangeUnit, NativeLane::Exchange),
     ] {
         let (service, mut senders) = ingress(&admission);
         // The handler has returned and Tonic's response future resolved.
@@ -502,6 +502,17 @@ type TaskStatusEvents = Pin<
 
 #[tonic::async_trait]
 impl NovaRocksGrpc for LaneProbe {
+    type ExchangeStream = tokio_stream::Empty<Result<proto::ExchangeResponse, tonic::Status>>;
+
+    async fn exchange(
+        &self,
+        _request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
+    ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange is retired; use DeliverExchangeUnit",
+        ))
+    }
+
     type SubscribeExchangeGrantsStream = std::pin::Pin<
         Box<
             dyn tokio_stream::Stream<Item = Result<proto::ExchangeGrantBatch, tonic::Status>>
@@ -537,20 +548,8 @@ impl NovaRocksGrpc for LaneProbe {
         ))
     }
 
-    type ExchangeStream = tokio_stream::Empty<Result<proto::ExchangeResponse, tonic::Status>>;
     type SubscribeTaskStatusStream = TaskStatusEvents;
-    async fn exchange(
-        &self,
-        _request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
-    ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("probe"))
-    }
-    async fn exchange_unary(
-        &self,
-        _request: tonic::Request<proto::ExchangeRequest>,
-    ) -> Result<tonic::Response<proto::ExchangeResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("probe"))
-    }
+
     async fn transmit_runtime_filter_envelope(
         &self,
         _request: tonic::Request<filter::RuntimeFilterEnvelope>,

@@ -4884,10 +4884,48 @@ mod tests {
     }
 
     #[test]
+    fn cyclic_cte_is_refused_before_query_or_explain_completion() {
+        // Both join inputs share one producer. The probe cannot drain until
+        // the build completes, but its backpressure can stop that producer.
+        // EXPLAIN must retain the same planning capability refusal as Query.
+        let sql = "with c(x) as (values (1), (2)) select a.x from c a join c b on a.x = b.x";
+        for intent in [
+            SqlCompileIntent::Query,
+            SqlCompileIntent::Explain {
+                level: ExplainLevel::Verbose,
+                analyze: false,
+            },
+        ] {
+            let error = match request(sql, intent, 49).try_into_completion() {
+                Ok(_) => panic!("the shared join inputs need decoupled retained output"),
+                Err(error) => error,
+            };
+            let SqlCompileError::CompilationSource(source) = error else {
+                panic!("the data wait cycle must keep its nominal SQL source: {error}");
+            };
+            assert!(
+                source
+                    .downcast_ref::<crate::compiler::StructuralWaitCycle>()
+                    .is_some()
+            );
+            let fact = novarocks_failure_contract::FailureProjection::failure_fact(&source);
+            assert_eq!(
+                fact.class(),
+                novarocks_failure_contract::FailureClass::Unsupported
+            );
+            assert_eq!(
+                fact.reason(),
+                novarocks_failure_contract::sql_reason::STRUCTURAL_WAIT_CYCLE
+            );
+        }
+    }
+
+    #[test]
     fn cte_outer_join_and_set_operation_publish_distinct_complete_structures() {
         let cases = [
             (
-                "with c(x) as (values (1), (2)) select a.x from c a join c b on a.x = b.x",
+                // UNION ALL drains both shared branches without a build gate.
+                "with c(x) as (values (1), (2)) select a.x from c a union all select b.x from c b",
                 "cte-multicast",
             ),
             (
@@ -4898,22 +4936,54 @@ mod tests {
         ];
         let mut outputs = Vec::new();
         for (ordinal, (sql, token)) in cases.into_iter().enumerate() {
-            let rendered = completed_sql(
+            let completed = completed_sql(
                 sql,
                 SqlCompileIntent::Explain {
                     level: ExplainLevel::Verbose,
                     analyze: false,
                 },
                 50 + ordinal as u8,
-            )
-            .render_explain_lines()
-            .expect("completed structural explain")
-            .join("\n");
+            );
+            if ordinal == 0 {
+                let plan = completed.plan();
+                let cte_edges = plan
+                    .edges()
+                    .values()
+                    .filter(|edge| edge.kind == novarocks_physical_plan::EdgeKind::CteMulticast)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    cte_edges.len(),
+                    2,
+                    "both CTE occurrences must remain shared"
+                );
+                assert_eq!(cte_edges[0].source.fragment, cte_edges[1].source.fragment);
+                let producer = &plan.fragments()[&cte_edges[0].source.fragment];
+                let FragmentSink::Multicast { edges } = producer.sink() else {
+                    panic!("the shared CTE must retain its multicast producer");
+                };
+                assert_eq!(edges.len(), 2);
+                assert!(plan.fragments().values().any(|fragment| {
+                    fragment.nodes().values().any(|node| {
+                        matches!(
+                            &node.kind,
+                            NodeKind::SetOp {
+                                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
+                                ..
+                            }
+                        )
+                    })
+                }));
+            }
+            let rendered = completed
+                .render_explain_lines()
+                .expect("completed structural explain")
+                .join("\n");
             assert!(rendered.contains(token), "missing {token}: {rendered}");
             outputs.push(rendered);
         }
         assert_ne!(outputs[0], outputs[1]);
         assert_ne!(outputs[1], outputs[2]);
+        assert_ne!(outputs[0], outputs[2]);
     }
 
     #[test]

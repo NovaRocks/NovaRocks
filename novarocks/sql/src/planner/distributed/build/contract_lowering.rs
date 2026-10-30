@@ -1301,221 +1301,68 @@ fn materialize_runtime_filter(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum RuntimeFilterWaitNode {
-    Physical(FragmentId, NodeId),
-    Filter(RuntimeFilterId),
+fn wait_graph_error(error: super::wait_graph::WaitGraphError) -> ContractLoweringError {
+    match error {
+        super::wait_graph::WaitGraphError::Control(cause) => ContractLoweringError::Control(cause),
+        other => ContractLoweringError::InvalidWaitGraph {
+            detail: other.to_string(),
+        },
+    }
 }
 
+#[cfg(test)]
 fn resolve_runtime_filter_activations(
     filters: &mut [RuntimeFilter],
     fragments: &BTreeMap<FragmentId, Fragment>,
     edges: &BTreeMap<EdgeId, Edge>,
-) {
-    let mut dependencies =
-        BTreeMap::<RuntimeFilterWaitNode, BTreeSet<RuntimeFilterWaitNode>>::new();
-    for fragment in fragments.values() {
-        for node in fragment.nodes().values() {
-            let current = RuntimeFilterWaitNode::Physical(fragment.id(), node.id);
-            let current_dependencies = dependencies.entry(current).or_default();
-            current_dependencies.extend(
-                node.inputs
-                    .iter()
-                    .map(|input| RuntimeFilterWaitNode::Physical(fragment.id(), *input)),
-            );
-            if let NodeKind::ExchangeSource { edge, .. } = node.kind
-                && let Some(edge) = edges.get(&edge)
-                && let Some(source) = fragments.get(&edge.source.fragment)
-            {
-                current_dependencies
-                    .insert(RuntimeFilterWaitNode::Physical(source.id(), source.root()));
-            }
-        }
-    }
-    for filter in filters.iter() {
-        let filter_node = RuntimeFilterWaitNode::Filter(filter.id);
-        dependencies.entry(filter_node).or_default();
-        for producer in &filter.producers {
-            let Some(fragment) = fragments.get(&producer.endpoint.fragment) else {
-                continue;
-            };
-            let Some(node) = fragment.nodes().get(&producer.endpoint.node) else {
-                continue;
-            };
-            let producer_root = match (&producer.target, &node.kind) {
-                (
-                    RuntimeFilterProducerTarget::JoinBuildKey { .. },
-                    NodeKind::HashJoin { build_side, .. },
-                ) => usize::try_from(build_side.input_ordinal())
-                    .ok()
-                    .and_then(|ordinal| node.inputs.get(ordinal))
-                    .copied(),
-                (
-                    RuntimeFilterProducerTarget::AggregateTopNKey { .. },
-                    NodeKind::Aggregate { .. },
-                ) => node.inputs.first().copied(),
-                _ => None,
-            };
-            if let Some(producer_root) = producer_root {
-                dependencies.entry(filter_node).or_default().insert(
-                    RuntimeFilterWaitNode::Physical(fragment.id(), producer_root),
-                );
-            }
-        }
-        for consumer in &filter.consumers {
-            if consumer.activation == RuntimeFilterConsumerActivation::BlockingSnapshot {
-                dependencies
-                    .entry(RuntimeFilterWaitNode::Physical(
-                        consumer.endpoint.fragment,
-                        consumer.endpoint.node,
-                    ))
-                    .or_default()
-                    .insert(filter_node);
-            }
-        }
-    }
-    let downstream = edges.values().fold(
-        BTreeMap::<FragmentId, BTreeSet<FragmentId>>::new(),
-        |mut index, edge| {
-            index
-                .entry(edge.source.fragment)
-                .or_default()
-                .insert(edge.destination.fragment);
-            index
-        },
-    );
-    let mut multicast_waits = BTreeSet::new();
-    for source in fragments.values() {
-        let FragmentSink::Multicast { edges: branches } = source.sink() else {
-            continue;
-        };
-        if branches.len() < 2 {
-            continue;
-        }
-        let mut reachable = BTreeSet::new();
-        let mut pending = branches
-            .iter()
-            .filter_map(|edge| edges.get(edge).map(|edge| edge.destination.fragment))
-            .collect::<Vec<_>>();
-        while let Some(fragment) = pending.pop() {
-            if !reachable.insert(fragment) {
-                continue;
-            }
-            pending.extend(downstream.get(&fragment).into_iter().flatten().copied());
-        }
-        for consumer in filters
-            .iter()
-            .flat_map(|filter| &filter.consumers)
-            .filter(|consumer| {
-                consumer.activation == RuntimeFilterConsumerActivation::BlockingSnapshot
-                    && reachable.contains(&consumer.endpoint.fragment)
-            })
-        {
-            let source_node = RuntimeFilterWaitNode::Physical(source.id(), source.root());
-            let consumer_node =
-                RuntimeFilterWaitNode::Physical(consumer.endpoint.fragment, consumer.endpoint.node);
-            dependencies
-                .entry(source_node)
-                .or_default()
-                .insert(consumer_node);
-            multicast_waits.insert((source_node, consumer_node));
-        }
-    }
+) -> Result<(), ContractLoweringError> {
+    let control = crate::compiler::SqlCompileControl::unbounded();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate)?;
+    let result = resolve_runtime_filter_activations_observed(filters, fragments, edges, &mut work);
+    work.finish_result(result, ContractLoweringError::Control)
+}
 
-    let mut reverse = BTreeMap::<RuntimeFilterWaitNode, BTreeSet<RuntimeFilterWaitNode>>::new();
-    for (node, node_dependencies) in &dependencies {
-        reverse.entry(*node).or_default();
-        for dependency in node_dependencies {
-            reverse.entry(*dependency).or_default().insert(*node);
-        }
-    }
-    let nodes = reverse.keys().copied().collect::<Vec<_>>();
-    let mut visited = BTreeSet::new();
-    let mut finish_order = Vec::with_capacity(nodes.len());
-    for start in nodes {
-        if visited.contains(&start) {
-            continue;
-        }
-        let mut stack = vec![(start, false)];
-        while let Some((node, exiting)) = stack.pop() {
-            if exiting {
-                finish_order.push(node);
-                continue;
-            }
-            if !visited.insert(node) {
-                continue;
-            }
-            stack.push((node, true));
-            if let Some(next) = dependencies.get(&node) {
-                stack.extend(next.iter().rev().map(|dependency| (*dependency, false)));
-            }
-        }
-    }
-    let mut component_by_node = BTreeMap::new();
-    let mut next_component = 0_u32;
-    while let Some(start) = finish_order.pop() {
-        if component_by_node.contains_key(&start) {
-            continue;
-        }
-        let mut stack = vec![start];
-        while let Some(node) = stack.pop() {
-            if component_by_node.contains_key(&node) {
-                continue;
-            }
-            component_by_node.insert(node, next_component);
-            if let Some(next) = reverse.get(&node) {
-                stack.extend(next.iter().rev().copied());
-            }
-        }
-        next_component = next_component.saturating_add(1);
-    }
-
-    for filter in filters {
-        let filter_component = component_by_node
-            .get(&RuntimeFilterWaitNode::Filter(filter.id))
-            .copied();
-        for consumer in &mut filter.consumers {
-            if consumer.activation != RuntimeFilterConsumerActivation::BlockingSnapshot {
-                continue;
-            }
-            let consumer_component = component_by_node
-                .get(&RuntimeFilterWaitNode::Physical(
-                    consumer.endpoint.fragment,
-                    consumer.endpoint.node,
+/// Resolve optional filter waits and mandatory input order in one graph before
+/// a completed plan can escape. A required data cycle needs decoupled retained
+/// output; treating it as a slow source would deadlock bounded receivers.
+fn resolve_runtime_filter_activations_observed(
+    filters: &mut [RuntimeFilter],
+    fragments: &BTreeMap<FragmentId, Fragment>,
+    edges: &BTreeMap<EdgeId, Edge>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ContractLoweringError> {
+    let mut graph = super::wait_graph::WaitGraph::build_observed(fragments, edges, filters, work)
+        .map_err(wait_graph_error)?;
+    let resolution = graph.resolve_observed(work).map_err(wait_graph_error)?;
+    if !resolution.is_acyclic() {
+        let witness = resolution
+            .data_cycles
+            .first()
+            .expect("a cyclic resolution retains its witness");
+        return Err(ContractLoweringError::UnsupportedWaitCycle(
+            crate::compiler::StructuralWaitCycle::new(
+                novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+                    "structural wait cycle requires decoupled retained output (B4): {witness:?}"
                 ))
-                .copied();
-            let consumer_node =
-                RuntimeFilterWaitNode::Physical(consumer.endpoint.fragment, consumer.endpoint.node);
-            // A multicast may itself wait on a blocked downstream consumer,
-            // even when that consumer's own filter has an independent build.
-            // Break that physical cycle as well as filter-containing cycles.
-            let multicast_cycle = consumer_component.is_some()
-                && multicast_waits.iter().any(|(source, target)| {
-                    *target == consumer_node
-                        && component_by_node.get(source).copied() == consumer_component
-                });
-            if (filter_component.is_some() && filter_component == consumer_component)
-                || multicast_cycle
-            {
-                if matches!(
-                    consumer.target,
-                    RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
-                ) {
-                    continue;
-                }
-                // A membership filter is applied a batch at a time, by every
-                // operator that applies one: a scan reading through it, an
-                // exchange source standing where that scan's rows arrive, and
-                // a join probe all see rows in batches. Finer granularities
-                // belong to the ordered filters, which narrow what is read
-                // rather than which rows survive.
-                consumer.activation =
-                    RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
-                        late_apply: novarocks_physical_plan::LateApplyGranularity::Batch,
-                    };
-            }
-        }
+                .into_string(),
+            ),
+        ));
     }
+    let mut filter_indices = BTreeMap::new();
+    for (ordinal, filter) in filters.iter().enumerate() {
+        work.step()?;
+        filter_indices.insert(filter.id, ordinal);
+    }
+    for consumer in &resolution.filter_downgrades {
+        work.step()?;
+        let filter = &mut filters[filter_indices[&consumer.filter]];
+        filter.consumers[consumer.ordinal].activation =
+            RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+                late_apply: novarocks_physical_plan::LateApplyGranularity::Batch,
+            };
+    }
+    work.flush()?;
+    Ok(())
 }
 
 impl<'a> ContractLoweringVisitor<'a> {
@@ -2283,7 +2130,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        resolve_runtime_filter_activations(&mut filters, fragments, &self.edges);
+        resolve_runtime_filter_activations_observed(
+            &mut filters,
+            fragments,
+            &self.edges,
+            &mut self.work,
+        )?;
         Ok(filters)
     }
 
@@ -12995,6 +12847,10 @@ pub(crate) enum ContractLoweringError {
         id: i32,
         detail: String,
     },
+    InvalidWaitGraph {
+        detail: String,
+    },
+    UnsupportedWaitCycle(crate::compiler::StructuralWaitCycle),
     UnsupportedSortMode {
         detail: &'static str,
     },
@@ -13160,6 +13016,10 @@ impl fmt::Display for ContractLoweringError {
             Self::InvalidRuntimeFilter { id, detail } => {
                 write!(formatter, "runtime filter {id} is invalid: {detail}")
             }
+            Self::InvalidWaitGraph { detail } => {
+                write!(formatter, "invalid physical wait graph: {detail}")
+            }
+            Self::UnsupportedWaitCycle(cause) => cause.fmt(formatter),
             Self::UnsupportedSortMode { detail } => {
                 write!(formatter, "unsupported final Sort mode: {detail}")
             }
@@ -13255,6 +13115,7 @@ impl std::error::Error for ContractLoweringError {
         match self {
             Self::ComparisonCoercion(cause) => Some(cause),
             Self::ConstantSource(cause) => Some(cause),
+            Self::UnsupportedWaitCycle(cause) => Some(cause),
             _ => None,
         }
     }
@@ -13385,6 +13246,9 @@ impl From<ContractLoweringError> for crate::compiler::SqlCompileError {
                 Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(cause))
             }
             ContractLoweringError::ConstantSource(cause) => Self::from(cause),
+            ContractLoweringError::UnsupportedWaitCycle(cause) => {
+                Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(cause))
+            }
             error => Self::Compilation(error.to_string()),
         }
     }
@@ -14930,6 +14794,10 @@ mod tests {
             .clone();
 
             assert_eq!(plan.fragments().len(), 4);
+            let mut graph =
+                super::super::wait_graph::WaitGraph::build(plan.fragments(), plan.edges(), &[])
+                    .unwrap();
+            assert!(graph.resolve().unwrap().is_acyclic());
             let (router_fragment, summary) = plan
                 .fragments()
                 .values()
@@ -17435,7 +17303,7 @@ mod tests {
             },
         }];
 
-        resolve_runtime_filter_activations(&mut filters, plan.fragments(), plan.edges());
+        resolve_runtime_filter_activations(&mut filters, plan.fragments(), plan.edges()).unwrap();
 
         assert_eq!(
             filters[0].consumers[0].activation,
@@ -18871,6 +18739,56 @@ mod tests {
     }
 
     #[test]
+    fn cte_self_join_rejects_the_data_wait_cycle_before_publication() {
+        for build_side in [
+            PhysicalHashJoinBuildSide::Left,
+            PhysicalHashJoinBuildSide::Right,
+        ] {
+            let cte_id = 80;
+            let shared = column(1, "shared", DataType::Int64, false);
+            let produce = cte_produce(
+                cte_id,
+                vec![shared.clone()],
+                values(vec![shared.clone()], vec![vec![literal_int(9)]]),
+            );
+            let left = column(10, "left_alias", DataType::Int64, false);
+            let right = column(20, "right_alias", DataType::Int64, false);
+            let branch = |column: &OutputColumn, alias| {
+                redistribute(
+                    cte_consume(cte_id, alias, vec![column.clone()], vec![shared.column_id]),
+                    RedistributeMode::Gather,
+                )
+            };
+            let join = hash_join(
+                crate::common::JoinKind::Inner,
+                build_side,
+                SqlJoinDistribution::Singleton,
+                Some(JoinExecutionMode::Singleton),
+                branch(&left, "left_cte"),
+                branch(&right, "right_cte"),
+                vec![left.clone(), right.clone()],
+            );
+            let error = finish_for_test(&cte_anchor(cte_id, produce, join)).unwrap_err();
+            let ContractLoweringError::UnsupportedWaitCycle(cause) = &error else {
+                panic!("shared producer must be rejected for its data wait cycle: {error}");
+            };
+            assert!(cause.to_string().contains("decoupled retained output (B4)"));
+            let expected = cause.clone();
+            let crate::compiler::SqlCompileError::CompilationSource(source) = error.into() else {
+                panic!("the planning capability must retain its original source");
+            };
+            assert_eq!(
+                source.downcast_ref::<crate::compiler::StructuralWaitCycle>(),
+                Some(&expected)
+            );
+            assert_eq!(
+                novarocks_failure_contract::FailureProjection::failure_fact(&source).reason(),
+                novarocks_failure_contract::sql_reason::STRUCTURAL_WAIT_CYCLE
+            );
+        }
+    }
+
+    #[test]
     fn cte_multicast_has_one_exact_edge_per_consumer() {
         let cte_id = 8;
         let producer_column = column(1, "producer", DataType::Int64, false);
@@ -18930,7 +18848,7 @@ mod tests {
     }
 
     #[test]
-    fn multicast_physical_wait_cycle_late_applies_only_its_blocked_consumers() {
+    fn multicast_with_independent_builds_keeps_blocking_runtime_filters() {
         let cte_id = 81;
         let producer_column = column(1, "shared_key", DataType::Int64, false);
         let produce = cte_produce(
@@ -19005,9 +18923,7 @@ mod tests {
             assert_eq!(filter.consumers.len(), 1);
             assert_eq!(
                 filter.consumers[0].activation,
-                RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
-                    late_apply: novarocks_physical_plan::LateApplyGranularity::Batch,
-                }
+                RuntimeFilterConsumerActivation::BlockingSnapshot
             );
         }
         assert_eq!(

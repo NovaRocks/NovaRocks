@@ -22,9 +22,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use novarocks_execution_contract::ExchangeStreamIdentity;
-use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason, domain};
+use novarocks_execution_contract::failure::FailureFact;
 pub use novarocks_execution_contract::ordered_retained_stream::exchange::{
     ExchangeAdmissionVerdict, ExchangeStreamFacts, ExchangeUnitDemand, ExchangeUnitItem,
+    ExchangeUnitSequence,
 };
 
 use crate::runtime::endpoint::RuntimeEndpoint;
@@ -139,13 +140,4 @@ pub type ExchangeGrantWake = Arc<dyn Fn(ExchangeGrantNotice) + Send + Sync + 'st
 /// or coalesce by exact stream; the receiver's cumulative state is authoritative.
 pub trait ExchangeUnitStateListener: Send + Sync + 'static {
     fn changed(&self, observation: ExchangeStreamObservation);
-}
-
-/// Named incremental-stage refusal; removed with the old trait surface at
-/// cutover. It is never projected as an unknown transport result.
-pub fn unit_transport_not_installed() -> FailureFact {
-    FailureFact::new(
-        FailureClass::Unsupported,
-        FailureReason::new(domain::EXCHANGE, std::num::NonZeroU16::new(400).unwrap()),
-    )
 }

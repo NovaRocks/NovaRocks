@@ -189,7 +189,7 @@ async fn actual_cached_channels_separate_process_endpoint_and_manifest_method() 
     let other = Server::start(100).await;
     let old = BackendProcessId::new_v7();
     let replacement = BackendProcessId::new_v7();
-    let exchange = NativeRpcMethod::ExchangeUnary;
+    let exchange = NativeRpcMethod::DeliverExchangeUnit;
     let filter = NativeRpcMethod::TransmitRuntimeFilterEnvelope;
     let old_exchange = NativeChannelKey::new(Some(old), first.endpoint.clone(), exchange).unwrap();
     let new_exchange =
@@ -245,7 +245,10 @@ async fn actual_cached_channels_separate_process_endpoint_and_manifest_method() 
 fn channel_key_refuses_missing_or_foreign_peer_domains_and_frontend_methods() {
     let endpoint = NativeEndpoint::from_host_port("127.0.0.1", 9010).unwrap();
     let process = BackendProcessId::new_v7();
-    assert!(NativeChannelKey::new(None, endpoint.clone(), NativeRpcMethod::ExchangeUnary).is_err());
+    assert!(
+        NativeChannelKey::new(None, endpoint.clone(), NativeRpcMethod::DeliverExchangeUnit)
+            .is_err()
+    );
     assert!(
         NativeChannelKey::new(
             None,
@@ -266,7 +269,7 @@ fn channel_key_refuses_missing_or_foreign_peer_domains_and_frontend_methods() {
         NativeRpcMethod::FetchTaskResult,
         NativeRpcMethod::ApplyTaskOperations,
         NativeRpcMethod::Heartbeat,
-        NativeRpcMethod::RetiredExchange,
+        NativeRpcMethod::RetiredFetchResult,
     ] {
         assert!(NativeChannelKey::new(Some(process), endpoint.clone(), method).is_err());
         assert!(NativeChannelKey::new(None, endpoint.clone(), method).is_err());
@@ -319,7 +322,7 @@ async fn funded_singleflight_nine_real_callers_share_one_dial_and_exact_peer_key
     let other = Server::start(100).await;
     let old = BackendProcessId::new_v7();
     let replacement = BackendProcessId::new_v7();
-    let exchange = NativeRpcMethod::ExchangeUnary;
+    let exchange = NativeRpcMethod::DeliverExchangeUnit;
     let filter = NativeRpcMethod::TransmitRuntimeFilterEnvelope;
     let key = NativeChannelKey::new(Some(old), first.endpoint.clone(), exchange).unwrap();
     let gate = Arc::new(Barrier::new(10));

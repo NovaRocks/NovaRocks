@@ -326,7 +326,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `novarocks/execution/src/runtime/function_set.rs`
   只封存真实 EngineFunctionCatalog metadata；不持有旧实现 map、legacy registry 或 implementation manifest。
-  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 10；旧执行实现摘要不再参与，
+  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 12、test-only 为 13；旧执行实现摘要不再参与，
   函数目录、pure 目录、descriptor、plan contract 与 Provider/carrier 事实仍保持 exact-island 判定。
 
 - `novarocks/execution/src/exec/operators/**`
@@ -376,21 +376,23 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 ### 4.6 Exchange and Runtime
 
-- `novarocks/execution/src/runtime/exchange.rs`
-  Exchange receiver registry, chunk encode/decode, sender completion tracking.
+- `novarocks/execution/src/runtime/{exchange.rs,exchange/unit_ingress.rs,exchange_slots.rs}`
+  接收 registry、原队列与结构 slot owner。唯一解码资格、提交、真实移交和退休由同一实例串行化；
+  roster 与原 Task failure owner 在 Installed 前冻结，slot 只数单元，不是内存容量。
 
 - `novarocks/execution/src/runtime/fragment/io/**`
-  Fragment I/O edges: `exchange_edge.rs` (the Installed/normal-close gated open
-  barrier), `exchange_queue.rs` (outbound queue and backpressure),
-  `exchange_receiver.rs` (application-hosted ingress for one receiver),
-  `result.rs`, `commit.rs`.
+  `exchange_edge.rs` 拥有 Installed/正常撤回门；`exchange_sender_group.rs` 将同一 factory 的
+  drivers 接到逐流 `exchange_stream_sender.rs`，留存与实际 RPC 活动分开。driver 单 payload
+  和待授予位置决定输入背压；进程活动额度只在授予后取得。`exchange_retained_payload.rs`
+  让原 Vec 的 accounting 随所有 Bytes 别名到最后实际退出。
+  `exchange_receiver.rs` 是应用接收 port；另有 `result.rs`、`commit.rs`。旧发送队列已删除。
 
 - `novarocks/execution/src/exec/operators/exchange_source.rs`
   Source operator for an exchange node: reconstructs chunks and tracks sender
   completion.
 
 - `novarocks/native-adapter/src/{exchange_data_plane.rs,exchange_transmitter.rs,fragment_exchange_receiver.rs}`
-  Native exchange wire projection, route settlement and transmission.
+  Native 三方法的线路投影与传输，准确路由始终由 Worker `with_claimed_stream` 作者准入。
 
 - `novarocks/worker/src/result_buffer.rs`
   BE-local result buffering, retained budget and fetch behavior.
@@ -494,18 +496,17 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 ### 5.2 Exchange Path
 
-1. Sender-side operators encode chunks into
-   `novarocks/execution/src/runtime/fragment/io/exchange_queue.rs`, which owns the
-   outbound queue and backpressure, and transmit through
-   `novarocks/native-adapter/src/exchange_transmitter.rs`.
+1. driver 编码一次并保留单 payload；同一 factory 的逐流 owner 通过 M07 内核发布 Unit/End。
+   满待授予位置返回背压，不消耗新序号、不重新编码。授予后才公平取得实际请求的共享额度；
+   请求未知则保原项重放，custody 与实际 RPC/Bytes 退出分别观察。
 2. An exchange edge starts Closed and opens only after every frozen destination
    has an Installed fact or has normally withdrawn its exact input demand
    (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no frame
    can precede the receiver that counts it.
-3. Receiver side (`novarocks/native-adapter/src/exchange_data_plane.rs`) projects
-   the wire payload and pushes into
-   `novarocks/execution/src/runtime/fragment/io/exchange_receiver.rs` and the
-   registry in `novarocks/execution/src/runtime/exchange.rs`.
+3. Native 的活动 Exchange 数据路径仅有 `DeliverExchangeUnit`、`RegisterExchangeDemand`、`SubscribeExchangeGrants`。
+   旧双向 `Exchange` 保留 Retired 空入口并直接返回 `unimplemented`；`ExchangeUnary` 已删除，旧消息字段永久 reserved。
+   adapter 经 Worker 准确 claim 后接原接收 port：先拿唯一资格再运行原 decoder，重复只读累计事实；
+   解码失败即使原 RPC 应答未知也交原 Task owner。退休不提前回收仍在解码的 slot。
 4. The exchange source operator
    (`novarocks/execution/src/exec/operators/exchange_source.rs`) waits for every
    sender and authors Consumed only after the actual input consumes its final
@@ -1049,6 +1050,9 @@ suspected case against a clean server before attributing it to the change.
 - **SQL / parser / planner changes**: start with `novarocks/parser/src/**`,
   `novarocks/sql/src/{analysis,analyzer,semantic}/**`,
   `novarocks/sql/src/optimizer/**` and `novarocks/sql/src/planner/**`.
+  完成物理计划的结构性等待图由
+  `novarocks/sql/src/planner/distributed/build/wait_graph.rs` 拥有；
+  同目录 `contract_lowering.rs` 在冻结前统一分析 RF 等待与必需数据环。
 - **Package decode / compiled preparation**：从 `novarocks/plan-codec/src/physical_package_v2/**`、
   `novarocks/native-adapter/src/backend_task_execution/{compiled_package.rs,execution_host.rs}`
   与 `novarocks/local-compiler/src/**` 开始；Task 能力投影见 `compiled_scan_binding.rs`、

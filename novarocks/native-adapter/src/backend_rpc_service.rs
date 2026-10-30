@@ -25,14 +25,13 @@ use std::time::Instant;
 
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::native_control_executor::NativeControlExecutor;
 use crate::native_ingress::NativeIngressOwnership;
 use crate::{
     backend_heartbeat::BackendHeartbeatResponder,
     catalog_prune_rpc::{CatalogReachabilityAuthority, handle_prune_catalogs},
-    exchange_data_plane::{NativeExchangeDataPlane, TaskInboundCapabilitiesRouteAuthority},
+    exchange_data_plane::NativeExchangeDataPlane,
     generated::nova_rocks_grpc_server::NovaRocksGrpc,
     runtime_filter_rpc::{BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope},
     task_protocol::{TaskExecutionIngress, TaskIngressTiming, TaskStatusEventStream},
@@ -70,11 +69,9 @@ impl BackendRpcService {
             heartbeat,
             exchange_data_plane: NativeExchangeDataPlane::new(
                 exchange_receiver_port,
-                vec![Arc::new(TaskInboundCapabilitiesRouteAuthority::new(
-                    Arc::clone(&task_inbound_capabilities),
-                ))],
-            )
-            .with_unit_capabilities(task_inbound_capabilities, unit_backend),
+                task_inbound_capabilities,
+                unit_backend,
+            ),
             runtime_filter_ingress,
             control_executor,
             #[cfg(novarocks_dev_controls)]
@@ -104,6 +101,17 @@ fn retired_fetch_result_status() -> tonic::Status {
 
 #[tonic::async_trait]
 impl NovaRocksGrpc for BackendRpcService {
+    type ExchangeStream = tokio_stream::Empty<Result<proto::ExchangeResponse, tonic::Status>>;
+
+    async fn exchange(
+        &self,
+        _request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
+    ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange is retired; use DeliverExchangeUnit",
+        ))
+    }
+
     type SubscribeExchangeGrantsStream = std::pin::Pin<
         Box<
             dyn tokio_stream::Stream<Item = Result<proto::ExchangeGrantBatch, tonic::Status>>
@@ -170,13 +178,6 @@ impl NovaRocksGrpc for BackendRpcService {
         Ok(tonic::Response::new(Box::pin(stream)))
     }
 
-    type ExchangeStream = std::pin::Pin<
-        Box<
-            dyn tokio_stream::Stream<Item = Result<proto::ExchangeResponse, tonic::Status>>
-                + Send
-                + 'static,
-        >,
-    >;
     type SubscribeTaskStatusStream = TaskStatusEventStream;
 
     async fn announce_backend(
@@ -186,83 +187,6 @@ impl NovaRocksGrpc for BackendRpcService {
         Err(tonic::Status::unimplemented(
             "backend announce is accepted only by the frontend native ingress",
         ))
-    }
-
-    async fn exchange(
-        &self,
-        request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
-    ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
-        let mut inbound = request.into_inner();
-        let (tx, rx) = tokio::sync::mpsc::channel(4096);
-        let kernel = self.exchange_data_plane.clone();
-        tokio::spawn(async move {
-            loop {
-                let request = match inbound.message().await {
-                    Ok(Some(request)) => request,
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = tx
-                            .send(Err(tonic::Status::internal(format!(
-                                "exchange recv failed: {error}"
-                            ))))
-                            .await;
-                        break;
-                    }
-                };
-                let kernel = kernel.clone();
-                let queued_at = Instant::now();
-                let response = match tokio::task::spawn_blocking(move || {
-                    crate::backend_metrics::native_blocking_queue_wait(
-                        "exchange_stream",
-                        queued_at.elapsed(),
-                    );
-                    kernel.transmit(request)
-                })
-                .await
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        let _ = tx
-                            .send(Err(tonic::Status::internal(format!(
-                                "exchange handler panicked: {error}"
-                            ))))
-                            .await;
-                        break;
-                    }
-                };
-                let failed = response
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.code != 0);
-                if tx.send(Ok(response)).await.is_err() || failed {
-                    break;
-                }
-            }
-        });
-        Ok(tonic::Response::new(Box::pin(ReceiverStream::new(rx))))
-    }
-
-    async fn exchange_unary(
-        &self,
-        request: tonic::Request<proto::ExchangeRequest>,
-    ) -> Result<tonic::Response<proto::ExchangeResponse>, tonic::Status> {
-        let kernel = self.exchange_data_plane.clone();
-        let ownership = ingress_ownership(&request);
-        let raw = request.into_inner();
-        let queued_at = Instant::now();
-        let response = tokio::task::spawn_blocking(move || {
-            crate::backend_metrics::native_blocking_queue_wait(
-                "exchange_unary",
-                queued_at.elapsed(),
-            );
-            let _ownership = ownership;
-            kernel.transmit(raw)
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("exchange_unary handler panicked: {error}"))
-        })?;
-        Ok(tonic::Response::new(response))
     }
 
     async fn transmit_runtime_filter_envelope(

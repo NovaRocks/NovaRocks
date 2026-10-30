@@ -4256,12 +4256,21 @@ mod tests {
         }
     }
 
-    type EmptyExchangeStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::ExchangeResponse, Status>> + Send>>;
     type StatusStream = ReceiverStream<Result<proto::TaskStatusStreamEvent, Status>>;
 
     #[tonic::async_trait]
     impl NovaRocksGrpc for TaskWirePeer {
+        type ExchangeStream = tokio_stream::Empty<Result<proto::ExchangeResponse, tonic::Status>>;
+
+        async fn exchange(
+            &self,
+            _request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
+        ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "Exchange is retired; use DeliverExchangeUnit",
+            ))
+        }
+
         type SubscribeExchangeGrantsStream = std::pin::Pin<
             Box<
                 dyn tokio_stream::Stream<Item = Result<proto::ExchangeGrantBatch, tonic::Status>>
@@ -4297,7 +4306,6 @@ mod tests {
             ))
         }
 
-        type ExchangeStream = EmptyExchangeStream;
         type SubscribeTaskStatusStream = StatusStream;
 
         async fn apply_task_operations(
@@ -4429,20 +4437,6 @@ mod tests {
             _request: Request<proto::FetchRootResultRequest>,
         ) -> Result<Response<proto::FetchRootResultResponse>, Status> {
             Err(Self::rejected("FetchRootResult"))
-        }
-
-        async fn exchange(
-            &self,
-            _request: Request<tonic::Streaming<proto::ExchangeRequest>>,
-        ) -> Result<Response<Self::ExchangeStream>, Status> {
-            Err(Self::rejected("Exchange"))
-        }
-
-        async fn exchange_unary(
-            &self,
-            _request: Request<proto::ExchangeRequest>,
-        ) -> Result<Response<proto::ExchangeResponse>, Status> {
-            Err(Self::rejected("ExchangeUnary"))
         }
 
         async fn transmit_runtime_filter_envelope(

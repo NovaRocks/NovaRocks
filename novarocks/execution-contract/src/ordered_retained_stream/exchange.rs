@@ -29,6 +29,8 @@ use std::num::{NonZeroU64, NonZeroUsize};
 pub struct ExchangeUnitSequence(NonZeroU64);
 
 impl ExchangeUnitSequence {
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
+
     pub fn try_new(value: u64) -> Result<Self, ExchangeReceiptError> {
         NonZeroU64::new(value)
             .map(Self)
@@ -72,8 +74,9 @@ impl ExchangeUnitItem {
     }
 }
 
-/// The new unit domain is separate from the zero-based frame carrier until the
-/// production cutover migrates every old consumer together.
+/// Authored by actual input exhaustion, not inferred from Task status or ACK.
+/// Consumed covers every item through the stream's final End sequence, including
+/// data carried by the end-after-unit case.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExchangeUnitCloseDisposition {
     Consumed {
@@ -207,6 +210,59 @@ impl fmt::Display for ExchangeReceiptError {
 }
 
 impl std::error::Error for ExchangeReceiptError {}
+impl novarocks_failure_contract::FailureProjection for ExchangeReceiptError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        // Exchange receipt transitions own 200..=215 in the Exchange domain.
+        // A full owner position is control, never authorization to fail a
+        // legitimate backpressured query as a resource or capability error.
+        let (class, code) = match self {
+            Self::ZeroSequence => (FailureClass::Data, 200),
+            Self::SequenceOverflow => (FailureClass::Representation, 201),
+            Self::InvalidPositionLimit => (FailureClass::Invariant, 202),
+            Self::PositionLimit => (FailureClass::Control, 203),
+            Self::InvalidWireBytes => (FailureClass::Data, 204),
+            Self::UnitTooLarge { .. } => (FailureClass::Resource, 205),
+            Self::DemandGap => (FailureClass::Data, 206),
+            Self::DemandConflict => (FailureClass::Data, 207),
+            Self::MissingGrant => (FailureClass::Data, 208),
+            Self::UnitConflict => (FailureClass::Data, 209),
+            Self::EndConflict => (FailureClass::Data, 210),
+            Self::InvalidDecodeToken => (FailureClass::Invariant, 211),
+            Self::HandoffGap => (FailureClass::Invariant, 212),
+            Self::NotAdmitted => (FailureClass::Invariant, 213),
+            Self::InputNotConsumed => (FailureClass::Invariant, 214),
+            Self::CloseConflict => (FailureClass::Invariant, 215),
+        };
+        let fact = FailureFact::new(
+            class,
+            FailureReason::new(domain::EXCHANGE, std::num::NonZeroU16::new(code).unwrap()),
+        );
+        match self {
+            Self::UnitTooLarge { requested, limit } => fact.with_resource(ResourceFacts {
+                request_scope: Some(ResourceScope::Request),
+                constraint_scope: Some(ResourceScope::Request),
+                dimension: ResourceDimension::Bytes,
+                requested: Some(*requested),
+                required_growth: None,
+                limit: Some(*limit),
+                live: None,
+                committed: None,
+            }),
+            Self::SequenceOverflow => fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::MinimumUnit,
+                layout: RepresentationLayout {
+                    domain: domain::EXCHANGE,
+                    code: std::num::NonZeroU16::new(1003).unwrap(),
+                },
+                required: None,
+                extent_limit: Some(u64::MAX),
+                representable_prefix: None,
+            }),
+            _ => fact,
+        }
+    }
+}
 
 /// Pure, bounded metadata for one exact stream. The caller serializes every
 /// transition with the containing instance's slot and queue transition.

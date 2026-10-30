@@ -74,14 +74,11 @@ use crate::runtime::fragment::exchange::{
 use crate::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentSinkAssignment,
 };
-use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
+use crate::runtime::fragment::io::exchange::test_support::{Fixture, UnitLoopback};
 use crate::runtime::fragment::io::{
-    ExchangeFrame, ExchangeFrameTransmitter, ExchangeReceiverFrame, ExchangeReceiverKey,
-    ExchangeReceiverPort, ExchangeTransmitRejection, FragmentIoError, FragmentIoErrorKind,
-    FragmentIoOperation, NoopFragmentEventSink,
+    ExchangeFrameTransmitter, ExchangeReceiverPort, NoopFragmentEventSink,
 };
 use crate::runtime::fragment::sink::materialize_compiled_sink;
-use crate::runtime::runtime_state::RuntimeState;
 
 const SOURCE: FragmentId = FragmentId::new(1);
 const PARTIAL: FragmentId = FragmentId::new(2);
@@ -594,7 +591,7 @@ fn compile(package: FragmentPackage, pipeline_dop: usize, result: bool) -> Arc<L
 /// labels, `labels` stands in for that step: it re-encodes each payload with
 /// the destination's frozen receiver fields, the same columns and slot ids.
 struct RecordingTransmitter {
-    port: Arc<dyn ExchangeReceiverPort>,
+    unit: Arc<UnitLoopback>,
     rows: Mutex<BTreeMap<(UniqueId, UniqueId), Vec<Row>>>,
 }
 
@@ -610,12 +607,17 @@ impl RecordingTransmitter {
 }
 
 impl ExchangeFrameTransmitter for RecordingTransmitter {
-    fn transmit(&self, frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
+    fn deliver_unit(
+        &self,
+        frame: crate::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+        stop: tokio_util::sync::CancellationToken,
+        activity: crate::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
+        done: crate::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+    ) {
         let mut carried = Vec::new();
-        let payload = frame.payload;
-        if !payload.is_empty() {
-            let chunks = decode_chunks(&payload).expect("recorded exchange payload");
-            for chunk in &chunks {
+        if !frame.receiver.payload.is_empty() {
+            for chunk in &decode_chunks(&frame.receiver.payload).expect("recorded exchange payload")
+            {
                 carried.extend(rows_of(chunk));
             }
         }
@@ -623,43 +625,40 @@ impl ExchangeFrameTransmitter for RecordingTransmitter {
             .lock()
             .unwrap()
             .entry((
-                frame.sender_fragment_instance_id,
-                frame.destination_fragment_instance_id,
+                frame.receiver.stream.source().fragment_instance_id(),
+                frame.receiver.stream.destination_fragment_instance_id(),
             ))
             .or_default()
             .extend(carried);
-        self.port
-            .push(
-                ExchangeReceiverKey {
-                    fragment_instance_id: frame.destination_fragment_instance_id,
-                    node_id: frame.destination_node_id,
-                },
-                ExchangeReceiverFrame {
-                    stream: frame.stream.unwrap_or_else(|| {
-                        crate::runtime::fragment::io::exchange::fixture_stream(
-                            frame.sender_fragment_instance_id,
-                            frame.destination_fragment_instance_id,
-                            frame.destination_node_id,
-                            frame.sender_ordinal,
-                        )
-                    }),
-                    source_fragment_instance_id: frame.sender_fragment_instance_id,
-                    sender_ordinal: frame.sender_ordinal,
-                    sender_count: frame.sender_count,
-                    sender_id: frame.sender_id,
-                    backend_number: frame.backend_number,
-                    sequence: frame.sequence,
-                    eos: frame.eos,
-                    payload,
-                },
-            )
-            .map_err(|error| {
-                ExchangeTransmitRejection::Failed(FragmentIoError::new(
-                    FragmentIoOperation::ExchangeTransmit,
-                    FragmentIoErrorKind::RemoteRejected,
-                    error.to_string(),
-                ))
-            })
+        self.unit.deliver_unit(frame, stop, activity, done);
+    }
+    fn register_unit_demands(
+        &self,
+        destination: RuntimeEndpoint,
+        entries: Vec<crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry>,
+        stop: tokio_util::sync::CancellationToken,
+        done: crate::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+    ) {
+        self.unit
+            .register_unit_demands(destination, entries, stop, done)
+    }
+    fn watch_unit_facts(
+        &self,
+        destination: RuntimeEndpoint,
+        stream: novarocks_execution_contract::ExchangeStreamIdentity,
+        wake: crate::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+    ) -> Result<(), novarocks_failure_contract::FailureFact> {
+        self.unit.watch_unit_facts(destination, stream, wake)
+    }
+    fn forget_unit_facts(&self, stream: novarocks_execution_contract::ExchangeStreamIdentity) {
+        self.unit.forget_unit_facts(stream)
+    }
+    fn schedule_unit_retry(
+        &self,
+        delay: Duration,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), novarocks_failure_contract::FailureFact> {
+        self.unit.schedule_unit_retry(delay, task)
     }
 }
 
@@ -680,21 +679,8 @@ fn rows_of(chunk: &Chunk) -> Vec<Row> {
         .collect()
 }
 
-fn runtime_state() -> Arc<RuntimeState> {
-    Arc::new(RuntimeState::for_local_execution(
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(crate::runtime::mem_tracker::MemTracker::new_root(
-            "compiled topn split tests",
-        )),
-        Some(crate::runtime::execution_runtime::test_execution_runtime()),
-    ))
-}
-
 fn run(
+    fixture: &Fixture,
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     bindings: ExchangeBindings,
@@ -708,7 +694,7 @@ fn run(
         bindings,
         Some((instance.high(), instance.low())),
         dop,
-        runtime_state(),
+        fixture.state(instance),
         Arc::new(NoopFragmentEventSink),
     )
     .expect("compiled split fragment prepares drivers")
@@ -720,9 +706,10 @@ fn run(
 /// The single receiver of `program`, registered for `instance` with
 /// `senders` expected senders.
 fn register(
+    fixture: &Fixture,
     program: &LocalProgram,
     instance: UniqueId,
-    senders: usize,
+    sources: &[UniqueId],
     port: &Arc<dyn ExchangeReceiverPort>,
 ) -> ExchangeBindings {
     let (_, input) = program
@@ -739,14 +726,16 @@ fn register(
         instance,
         &ExchangeInputAssignments::new(BTreeMap::from([(
             receiver,
-            ExchangeInputAssignment::new(NonZeroUsize::new(senders).unwrap()),
+            ExchangeInputAssignment::new(NonZeroUsize::new(sources.len()).unwrap()),
         )])),
         Arc::clone(port),
-        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
+        Some(&fixture.creation(instance)),
     )
     .expect("compiled receivers");
     for registration in registrations {
+        let key = registration.key;
         port.register(registration).expect("register receiver");
+        fixture.bind(key, sources);
     }
     bindings
 }
@@ -768,23 +757,25 @@ fn destination(
 }
 
 fn stream_sink(
+    fixture: &Fixture,
     program: &Arc<LocalProgram>,
     instance: UniqueId,
     destinations: Vec<FragmentDestination>,
     transmitter: &Arc<RecordingTransmitter>,
 ) -> Box<dyn OperatorFactory> {
-    materialize_compiled_sink(
-        program,
-        &FragmentSinkAssignment::StreamDestinations {
-            destinations,
-            sender_id: None,
-        },
-        instance,
-        Arc::clone(transmitter) as Arc<dyn ExchangeFrameTransmitter>,
-        None,
-        None,
-    )
-    .expect("compiled stream sink")
+    fixture
+        .sink(
+            program,
+            &FragmentSinkAssignment::StreamDestinations {
+                destinations,
+                sender_id: None,
+            },
+            instance,
+            Arc::clone(transmitter) as Arc<dyn ExchangeFrameTransmitter>,
+            None,
+            None,
+        )
+        .expect("compiled stream sink")
 }
 
 /// What one split run observed.
@@ -829,16 +820,19 @@ fn run_split(keys: &[Key], limit: u64, offset: u64) -> SplitRun {
     );
     assert_eq!(partial.graph().profile().pipeline_dop().get(), PARTIAL_DOP);
 
-    let port = in_process_test_exchange_receiver_port();
+    let fixture = Fixture::new();
+    let port = fixture.port.clone();
     let transmitter = Arc::new(RecordingTransmitter {
-        port: Arc::clone(&port),
+        unit: fixture.transport.clone(),
         rows: Mutex::default(),
     });
-    let partial_bindings = PARTIAL_FINSTS.map(|instance| register(&partial, instance, 1, &port));
+    let partial_bindings = PARTIAL_FINSTS
+        .map(|instance| register(&fixture, &partial, instance, &[SOURCE_FINST], &port));
     // Both partial instances send to the one Final.
-    let final_bindings = register(&last, FINAL_FINST, PARTIAL_FINSTS.len(), &port);
+    let final_bindings = register(&fixture, &last, FINAL_FINST, &PARTIAL_FINSTS, &port);
 
     let sink = stream_sink(
+        &fixture,
         &source,
         SOURCE_FINST,
         PARTIAL_FINSTS
@@ -847,12 +841,19 @@ fn run_split(keys: &[Key], limit: u64, offset: u64) -> SplitRun {
             .collect(),
         &transmitter,
     );
-    run(&source, sink, ExchangeBindings::default(), SOURCE_FINST);
+    run(
+        &fixture,
+        &source,
+        sink,
+        ExchangeBindings::default(),
+        SOURCE_FINST,
+    );
 
     for (ordinal, (instance, bindings)) in
         PARTIAL_FINSTS.into_iter().zip(partial_bindings).enumerate()
     {
         let sink = stream_sink(
+            &fixture,
             &partial,
             instance,
             vec![destination(
@@ -863,7 +864,7 @@ fn run_split(keys: &[Key], limit: u64, offset: u64) -> SplitRun {
             )],
             &transmitter,
         );
-        run(&partial, sink, bindings, instance);
+        run(&fixture, &partial, sink, bindings, instance);
     }
 
     let output = ResultSinkHandle::new();
@@ -876,7 +877,7 @@ fn run_split(keys: &[Key], limit: u64, offset: u64) -> SplitRun {
         None,
     )
     .expect("compiled result sink");
-    run(&last, sink, final_bindings, FINAL_FINST);
+    run(&fixture, &last, sink, final_bindings, FINAL_FINST);
 
     SplitRun {
         partial_inputs: PARTIAL_FINSTS.map(|instance| transmitter.rows(SOURCE_FINST, instance)),

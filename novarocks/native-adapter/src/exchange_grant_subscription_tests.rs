@@ -20,8 +20,7 @@ use novarocks_execution::runtime::exchange::{
     ExchangeFailure, ExchangeReceiverHandle, ExchangeReceiverSnapshot,
 };
 use novarocks_execution::runtime::fragment::io::{
-    ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverRegistration,
-    UnavailableExchangeReceiverPort,
+    ExchangeReceiverKey, ExchangeReceiverRegistration, UnavailableExchangeReceiverPort,
 };
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitSequence;
@@ -80,6 +79,16 @@ impl TestPort {
 }
 
 impl ExchangeReceiverPort for TestPort {
+    fn bind_unit_receiver(
+        &self,
+        key: ExchangeReceiverKey,
+        streams: Vec<ExchangeStreamIdentity>,
+        control: Arc<novarocks_execution::runtime::runtime_state::RuntimeErrorState>,
+        grantable: u64,
+    ) -> Result<(), ExchangeFailure> {
+        UnavailableExchangeReceiverPort.bind_unit_receiver(key, streams, control, grantable)
+    }
+
     fn register_unit_demand(
         &self,
         _: ExchangeReceiverKey,
@@ -163,13 +172,7 @@ impl ExchangeReceiverPort for TestPort {
     fn register(&self, registration: ExchangeReceiverRegistration) -> Result<(), ExchangeFailure> {
         UnavailableExchangeReceiverPort.register(registration)
     }
-    fn push(
-        &self,
-        key: ExchangeReceiverKey,
-        frame: ExchangeReceiverFrame,
-    ) -> Result<(), ExchangeFailure> {
-        UnavailableExchangeReceiverPort.push(key, frame)
-    }
+
     fn cancel(&self, _: ExchangeReceiverKey) {}
     fn remove(&self, _: ExchangeReceiverKey) {}
     fn cancel_fragment(&self, _: UniqueId) {}
@@ -180,6 +183,15 @@ impl ExchangeReceiverPort for TestPort {
     ) -> Result<ExchangeReceiverHandle, ExchangeFailure> {
         UnavailableExchangeReceiverPort.receiver_handle(key, count)
     }
+    fn stream_close_facts(
+        &self,
+        key: ExchangeReceiverKey,
+        streams: &[ExchangeStreamIdentity],
+    ) -> Result<Vec<novarocks_execution_contract::ExchangeStreamClose>, ExchangeFailure> {
+        // This subscription script has no actual consuming input and therefore
+        // cannot author a close disposition from its observation-only states.
+        UnavailableExchangeReceiverPort.stream_close_facts(key, streams)
+    }
     fn ensure_mem_tracker(
         &self,
         key: ExchangeReceiverKey,
@@ -187,25 +199,16 @@ impl ExchangeReceiverPort for TestPort {
     ) -> Result<Arc<MemTracker>, ExchangeFailure> {
         UnavailableExchangeReceiverPort.ensure_mem_tracker(key, root)
     }
-    fn push_local(
-        &self,
-        _: ExchangeReceiverKey,
-        _: i32,
-        _: i32,
-        _: Vec<novarocks_execution::exec::chunk::Chunk>,
-        _: bool,
-    ) {
-    }
+
     fn snapshot(&self, _: ExchangeReceiverKey) -> Option<ExchangeReceiverSnapshot> {
         None
     }
 }
 
 fn base_stream() -> ExchangeStreamIdentity {
-    crate::exchange_transmitter::tests::frame_and_proof()
-        .0
+    crate::exchange_transmitter::tests::unit_frame()
+        .receiver
         .stream
-        .unwrap()
 }
 fn sibling(base: ExchangeStreamIdentity, node: usize) -> ExchangeStreamIdentity {
     ExchangeStreamIdentity::try_new(
@@ -605,11 +608,11 @@ fn installed_plane(
     let capabilities = novarocks_worker::TaskInboundCapabilities::new();
     capabilities.install(Arc::new(descriptor)).unwrap();
     (
-        crate::exchange_data_plane::NativeExchangeDataPlane::new(port, Vec::new())
-            .with_unit_capabilities(
-                capabilities.clone(),
-                stream.destination().backend_process_id(),
-            ),
+        crate::exchange_data_plane::NativeExchangeDataPlane::new(
+            port,
+            capabilities.clone(),
+            stream.destination().backend_process_id(),
+        ),
         capabilities,
     )
 }
@@ -716,15 +719,15 @@ fn worker_exact_route_authorizes_unit_piggyback_demand_and_stop_roundtrips() {
 }
 
 #[test]
-fn subscription_validates_authenticated_pair_zero_generation_and_missing_capability() {
+fn subscription_validates_authenticated_pair_zero_generation_and_missing_receiver_owner() {
     let base = base_stream();
     let sender = base.source().task().backend_process_id();
     let port = Arc::new(TestPort::default());
-    let plane = crate::exchange_data_plane::NativeExchangeDataPlane::new(port, Vec::new())
-        .with_unit_capabilities(
-            novarocks_worker::TaskInboundCapabilities::new(),
-            base.destination().backend_process_id(),
-        );
+    let plane = crate::exchange_data_plane::NativeExchangeDataPlane::new(
+        port,
+        novarocks_worker::TaskInboundCapabilities::new(),
+        base.destination().backend_process_id(),
+    );
     let request = codec::encode_grant_subscription(subscription(base, 1));
     assert_eq!(
         plane
@@ -744,33 +747,19 @@ fn subscription_validates_authenticated_pair_zero_generation_and_missing_capabil
             .code(),
         Code::InvalidArgument
     );
-    let legacy = crate::exchange_data_plane::NativeExchangeDataPlane::new(
+    let unavailable = crate::exchange_data_plane::NativeExchangeDataPlane::new(
         Arc::new(UnavailableExchangeReceiverPort),
-        Vec::new(),
-    );
-    assert_eq!(
-        legacy
-            .subscribe_unit_grants(request.clone(), sender, None)
-            .err()
-            .unwrap()
-            .code(),
-        Code::FailedPrecondition
-    );
-    let unsupported = legacy.with_unit_capabilities(
         novarocks_worker::TaskInboundCapabilities::new(),
         base.destination().backend_process_id(),
     );
-    let error = unsupported
+    let error = unavailable
         .subscribe_unit_grants(request, sender, None)
         .err()
         .unwrap();
-    assert_eq!(
-        status_failure(&error),
-        Some(
-            novarocks_execution::runtime::fragment::io::exchange_unit::unit_transport_not_installed(
-            )
-        )
-    );
+    let expected = UnavailableExchangeReceiverPort
+        .unit_sender_states(sender, None, 1)
+        .unwrap_err();
+    assert_eq!(status_failure(&error), Some(expected));
 }
 
 #[test]
@@ -944,7 +933,7 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
         Arc::new(UnusedIngress),
         Arc::new(UnusedIngress),
         port.clone(),
-        capabilities,
+        capabilities.clone(),
         crate::backend_heartbeat::BackendHeartbeatResponder::new(
             descriptor,
             Arc::new(novarocks_worker::WorkerDrainState::new()),
@@ -1053,6 +1042,75 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
         assert!(!released_at_notification);
         exit_rx.await.unwrap();
 
+        // Retained Worker close facts answer late data, End and demand on the
+        // real authenticated Native service without reentering the live port.
+        use novarocks_execution_contract::{
+            ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeInbound,
+            ExchangeStreamClose, ExchangeTopology, TaskDescriptor, TaskIdentity,
+        };
+        let deliveries = port.deliveries.load(Ordering::Relaxed);
+        for (ordinal, delivery, disposition) in [
+            (41, ExchangeDeliveryRequirement::MustDrain,
+                ExchangeCloseDisposition::Consumed { final_sequence: ExchangeUnitSequence::try_new(2).unwrap() }),
+            (42, ExchangeDeliveryRequirement::DemandDriven, ExchangeCloseDisposition::Withdrawn),
+        ] {
+            let destination = TaskIdentity::new(
+                stream.destination().query_execution_id(), stream.destination().stage_id(),
+                novarocks_types::TaskId::new(ordinal).unwrap(), stream.destination().backend_process_id(),
+            );
+            let closed = ExchangeStreamIdentity::try_new(
+                stream.source(), destination, UniqueId::new(91844, i64::from(ordinal)), stream.destination_node(),
+            ).unwrap();
+            let descriptor = TaskDescriptor::try_new(
+                destination, closed.destination_fragment_instance_id(), std::num::NonZeroUsize::new(1).unwrap(),
+                Vec::new(), ExchangeTopology::try_new(Vec::new(), vec![ExchangeInbound::try_new(
+                    closed.destination_node(), vec![closed.source()], delivery,
+                ).unwrap()]).unwrap(),
+            ).unwrap();
+            capabilities.install(Arc::new(descriptor.clone())).unwrap();
+            if delivery == ExchangeDeliveryRequirement::MustDrain {
+                assert!(capabilities.close_normally_with_facts(&descriptor, vec![ExchangeStreamClose {
+                    stream: closed, disposition: ExchangeCloseDisposition::Withdrawn,
+                }], || panic!("strict withdrawal must not retire the receiver")).is_err());
+            }
+            capabilities.close_normally_with_facts(&descriptor, vec![ExchangeStreamClose {
+                stream: closed, disposition,
+            }], || {}).unwrap();
+            let expected = ExchangeStreamFacts {
+                receiver_closed: Some(disposition),
+                ..if matches!(disposition, ExchangeCloseDisposition::Consumed { .. }) { facts(2, 1) } else { facts(0, 0) }
+            };
+            for item in [ExchangeUnitItem::Unit { demand: first, end_after_unit: false },
+                ExchangeUnitItem::End(ExchangeUnitSequence::try_new(2).unwrap())] {
+                let payload = if matches!(item, ExchangeUnitItem::Unit { .. }) { Bytes::from_static(b"abc") } else { Bytes::new() };
+                let reply = client.deliver_exchange_unit_async(codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
+                    stream: closed, sender_count: 1, sender_id: 0, backend_number: 0,
+                    item, payload, next_demand: None,
+                }), Duration::from_secs(2), CancellationToken::new()).await.unwrap();
+                assert!(matches!(codec::decode_delivery_response(&reply, closed, item.sequence(), FieldPath::root("test")).unwrap(),
+                    codec::DecodedExchangeDeliveryOutcome::Observed { verdict: novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeAdmissionVerdict::Idempotent, facts } if facts == expected));
+            }
+            for operation in [codec::ExchangeDemandOperation::Demand(first), codec::ExchangeDemandOperation::StopSender] {
+                let entry = codec::DecodedExchangeDemandEntry { stream: closed, operation };
+                let reply = client.register_exchange_demand_async(codec::encode_demand_request(&[entry], FieldPath::root("test")).unwrap(),
+                    Duration::from_secs(2), CancellationToken::new()).await.unwrap();
+                assert_eq!(codec::decode_demand_response(&reply, &[closed], FieldPath::root("test")).unwrap()[0].outcome, Ok(expected));
+            }
+            let reply = client.deliver_exchange_unit_async(codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
+                stream: closed, sender_count: 2, sender_id: 0, backend_number: 0,
+                item: ExchangeUnitItem::End(ExchangeUnitSequence::try_new(2).unwrap()), payload: Bytes::new(), next_demand: None,
+            }), Duration::from_secs(2), CancellationToken::new()).await.unwrap();
+            assert!(matches!(codec::decode_delivery_response(&reply, closed, ExchangeUnitSequence::try_new(2).unwrap(), FieldPath::root("test")).unwrap(),
+                codec::DecodedExchangeDeliveryOutcome::Refused(_)));
+            let absent = sibling(closed, closed.destination_node().get() as usize + 1);
+            let reply = client.register_exchange_demand_async(codec::encode_demand_request(&[
+                codec::DecodedExchangeDemandEntry { stream: absent, operation: codec::ExchangeDemandOperation::Demand(first) },
+            ], FieldPath::root("test")).unwrap(), Duration::from_secs(2), CancellationToken::new()).await.unwrap();
+            assert!(codec::decode_demand_response(&reply, &[absent], FieldPath::root("test")).unwrap()[0].outcome.is_err());
+            assert!(!port.states.lock().unwrap().contains_key(&closed));
+        }
+        assert_eq!(port.deliveries.load(Ordering::Relaxed), deliveries);
+
     }).await;
     server.stop().unwrap();
     result.expect("native unit fixture exceeded its failure watchdog");
@@ -1091,4 +1149,339 @@ fn all_three_unit_methods_share_one_frozen_exchange_connection_quota() {
     capacity.exit(third).unwrap();
     capacity.exit(second).unwrap();
     capacity.exit(first).unwrap();
+}
+
+/// This observer holds the actual receiver only after its unique decode lease
+/// exists. It never supplies a decoder result or an exchange acknowledgement.
+#[cfg(novarocks_dev_controls)]
+#[derive(Default)]
+struct RealUnitDecodeObservation {
+    hold: Arc<DeliveryHold>,
+    starts: AtomicU64,
+    exits: AtomicU64,
+    exited: Notify,
+}
+#[cfg(novarocks_dev_controls)]
+impl std::fmt::Debug for RealUnitDecodeObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealUnitDecodeObservation")
+            .finish_non_exhaustive()
+    }
+}
+#[cfg(novarocks_dev_controls)]
+impl novarocks_execution::runtime::exchange::TestEventObserver for RealUnitDecodeObservation {
+    fn is_active(&self) -> bool {
+        true
+    }
+    fn observe(&self, event: &str) {
+        if event.contains("event=unit_decode_begin ") {
+            let previous = self.starts.fetch_add(1, Ordering::AcqRel);
+            assert_eq!(previous, 0, "replay must not enter a second decoder");
+            self.hold.block();
+        } else if event.contains("event=unit_decode_exited ") {
+            self.exits.fetch_add(1, Ordering::AcqRel);
+            self.exited.notify_one();
+        }
+    }
+}
+
+#[cfg(novarocks_dev_controls)]
+#[tokio::test]
+async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_decoder_failure() {
+    use crate::native_transport_admission::{NativeTransportAdmission, TransportClass};
+    use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
+    use novarocks_execution::exec::pipeline::operator::InputConstructionFactory;
+    use novarocks_execution::runtime::exchange::{
+        ExchangeColumnBinding, ExchangeKey, encode_chunks,
+    };
+    use novarocks_execution::runtime::execution_runtime::{
+        ExecutionRuntime, ExecutionRuntimeConfig,
+    };
+    use novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort;
+    use novarocks_execution::runtime::runtime_state::RuntimeErrorState;
+    use novarocks_execution::runtime::task_control::TaskExecutionControl;
+    use novarocks_execution_contract::ordered_retained_stream::exchange::{
+        ExchangeAdmissionVerdict, ExchangeUnitDemand, ExchangeUnitItem,
+    };
+    use novarocks_execution_contract::{
+        ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeInbound, ExchangeTopology,
+        TaskConclusionPort, TaskDescriptor, TaskFailurePhase,
+    };
+    use novarocks_native_trust::{NativeIncomingAdapter, NativeProcessIdentity};
+    use novarocks_proto_codec::native_rpc::NativeEndpointDomain;
+    use novarocks_worker::{
+        METRIC_PUBLISH_MIN_INTERVAL, ProcessMonotonicClock, TaskStatusOwner, TaskStatusSource,
+    };
+
+    struct Control;
+    impl novarocks_type_contract::PureCompileControl for Control {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+    fn schema(
+        factory: &dyn InputConstructionFactory,
+        ty: arrow::datatypes::DataType,
+    ) -> ChunkSchemaRef {
+        let binding = novarocks_type_contract::FunctionValueType::new(ty.clone(), false);
+        let declaration = novarocks_local_program::StaticLayout::try_new_typed_for_compile(
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("v", ty, false),
+            ])),
+            Arc::from([novarocks_types::SlotId::new(1)]),
+            vec![(binding.typed_binding().clone(), None)],
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &Control,
+        )
+        .unwrap();
+        factory.create_compiled_chunk_schema(&declaration).unwrap()
+    }
+    // If an assertion unwinds, release the actual blocking handler before the
+    // Native server's own Drop joins it. This does not author receiver closure.
+    struct ReleaseDecode(Arc<DeliveryHold>);
+    impl Drop for ReleaseDecode {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    let base = base_stream();
+    let stream = ExchangeStreamIdentity::try_new(
+        ExchangeSource::new(
+            base.source().task(),
+            base.source().fragment_instance_id(),
+            0,
+        ),
+        base.destination(),
+        base.destination_fragment_instance_id(),
+        base.destination_node(),
+    )
+    .unwrap();
+    let mut functions =
+        novarocks_execution::runtime::function_set::ExecutionFunctionSetBuilder::new();
+    novarocks_sql::compiler::contribute_builtin_functions(functions.catalog_builder_mut()).unwrap();
+    let execution = Arc::new(
+        ExecutionRuntime::new(
+            ExecutionRuntimeConfig {
+                driver_threads: 1,
+                exchange_wait_ms: 120_000,
+                exchange_io_threads: 1,
+                exchange_io_max_inflight_bytes: 1,
+                exchange_max_transmit_batched_bytes: 1,
+                operator_buffer_chunks: 1,
+                local_exchange_buffer_mem_limit_per_driver: 1,
+                local_exchange_max_buffered_rows: 1,
+                runtime_filter_scan_wait_time_ms_override: None,
+                runtime_filter_wait_timeout_ms_override: None,
+                sink_io_worker_threads: 1,
+                sink_io_max_blocking_threads: 1,
+            },
+            Arc::new(functions.seal().unwrap()),
+            crate::backend_test_support::test_memory_authority(),
+        )
+        .unwrap(),
+    );
+    let owner = Arc::new(TaskStatusOwner::new(
+        stream.destination(),
+        Arc::new(TaskStatusSource::new()),
+        Arc::new(ProcessMonotonicClock::new()),
+        METRIC_PUBLISH_MIN_INTERVAL,
+        execution.execution_health(),
+    ));
+    owner.release_to_observers();
+    owner.note_installed();
+    let failure = Arc::new(RuntimeErrorState::for_task(Arc::new(
+        TaskExecutionControl::new(
+            stream.destination(),
+            owner.clone(),
+            TaskFailurePhase::Execution,
+        )
+        .unwrap(),
+    )));
+    let factory = novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        MemTracker::new_root("real native receiver decoder"), failure.clone(),
+    ).unwrap();
+    let port = Arc::new(ExecutionRuntimeExchangeReceiverPort::new(execution.clone()));
+    let key = ExchangeReceiverKey {
+        fragment_instance_id: stream.destination_fragment_instance_id(),
+        node_id: stream.destination_node().get(),
+    };
+    port.register(ExchangeReceiverRegistration {
+        key,
+        expected_senders: 1,
+        expected_chunk_schema: schema(factory.as_ref(), arrow::datatypes::DataType::Int64),
+        column_binding: ExchangeColumnBinding::Positional,
+        creation_factory: factory.clone(),
+    })
+    .unwrap();
+    port.bind_unit_receiver(key, vec![stream], failure.clone(), 64 * 1024 * 1024)
+        .unwrap();
+    let registry = execution.exchange_registry();
+    let registry_key = ExchangeKey {
+        finst_id_hi: key.fragment_instance_id.high(),
+        finst_id_lo: key.fragment_instance_id.low(),
+        node_id: key.node_id,
+    };
+    let observation = Arc::new(RealUnitDecodeObservation::default());
+    registry
+        .install_test_observer(registry_key, observation.clone())
+        .unwrap();
+    let receiver = port.receiver_handle(key, 1).unwrap();
+    // An actual, well-formed IPC Int32 field violates the receiver's frozen
+    // Int64 declaration. The original reader, rather than a test callback,
+    // must reject it after the first RPC's outcome has become unknown.
+    let chunk = Chunk::try_new_with_columns(
+        schema(factory.as_ref(), arrow::datatypes::DataType::Int32),
+        vec![Arc::new(arrow::array::Int32Array::from(vec![7]))],
+    )
+    .unwrap();
+    let payload = Bytes::from(encode_chunks(&[chunk], true).unwrap());
+    let demand = ExchangeUnitDemand {
+        sequence: ExchangeUnitSequence::FIRST,
+        wire_bytes: payload.len() as u64,
+    };
+    let frame = codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
+        stream,
+        sender_count: 1,
+        sender_id: 0,
+        backend_number: 0,
+        item: ExchangeUnitItem::Unit {
+            demand,
+            end_after_unit: false,
+        },
+        payload,
+        next_demand: None,
+    });
+    let descriptor = TaskDescriptor::try_new(
+        stream.destination(),
+        key.fragment_instance_id,
+        std::num::NonZeroUsize::new(1).unwrap(),
+        Vec::new(),
+        ExchangeTopology::try_new(
+            Vec::new(),
+            vec![
+                ExchangeInbound::try_new(
+                    stream.destination_node(),
+                    vec![stream.source()],
+                    ExchangeDeliveryRequirement::MustDrain,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let capabilities = novarocks_worker::TaskInboundCapabilities::new();
+    capabilities.install(Arc::new(descriptor)).unwrap();
+    let trust = crate::backend_test_support::test_backend_native_trust();
+    trust
+        .bind_process_identity(NativeProcessIdentity::Backend(
+            stream.source().task().backend_process_id(),
+        ))
+        .unwrap();
+    let receiver_trust = crate::backend_test_support::test_backend_native_trust();
+    receiver_trust
+        .bind_process_identity(NativeProcessIdentity::Backend(
+            stream.destination().backend_process_id(),
+        ))
+        .unwrap();
+    let backend = novarocks_execution_contract::BackendProcessDescriptor::try_new(
+        stream.destination().backend_process_id(),
+        RuntimeEndpoint::new("127.0.0.1", 9090).unwrap(),
+        RuntimeEndpoint::new("127.0.0.1", 9091).unwrap(),
+        "test",
+        "test",
+        novarocks_types::NativeCompatibilityId::new([1; 32]),
+        1,
+    )
+    .unwrap();
+    let service = crate::backend_rpc_service::BackendRpcService::new(
+        Arc::new(UnusedIngress),
+        Arc::new(UnusedIngress),
+        Arc::new(UnusedIngress),
+        port.clone(),
+        capabilities,
+        crate::backend_heartbeat::BackendHeartbeatResponder::new(
+            backend,
+            Arc::new(novarocks_worker::WorkerDrainState::new()),
+            Arc::new(UnusedIngress),
+        ),
+        crate::native_control_executor::NativeControlExecutor::start(1, 4).unwrap(),
+    );
+    let mut server = crate::NativeRpcServerHandle::start_with_admission(
+        "127.0.0.1",
+        0,
+        service,
+        receiver_trust,
+        NativeIncomingAdapter::plaintext(),
+        "real-exchange-unit-test",
+        NativeEndpointDomain::BackendData,
+        "real-exchange-unit-test",
+        || {},
+        || {},
+        crate::native_server::NativeIngressConfig {
+            worker_threads: 2,
+            ..Default::default()
+        },
+        NativeTransportAdmission::new().unwrap(),
+        TransportClass::Data,
+        None,
+    )
+    .unwrap();
+    let release_on_exit = ReleaseDecode(observation.hold.clone());
+    let runtime = BackendDataRuntime::new(
+        tokio::runtime::Handle::current(),
+        trust,
+        crate::BackendNativeTransport::Plaintext,
+    );
+    let client = Arc::new(NativeRpcClient::new_backend_endpoint(
+        runtime,
+        RuntimeEndpoint::from_socket_addr(server.bound_addr())
+            .native_endpoint()
+            .clone(),
+        stream.destination().backend_process_id(),
+    ));
+    let result = tokio::time::timeout(Duration::from_secs(8), async {
+        let reply = client.register_exchange_demand_async(codec::encode_demand_request(&[
+            codec::DecodedExchangeDemandEntry { stream, operation: codec::ExchangeDemandOperation::Demand(demand) },
+        ], FieldPath::root("real_test")).unwrap(), Duration::from_secs(2), CancellationToken::new()).await.unwrap();
+        assert_eq!(codec::decode_demand_response(&reply, &[stream], FieldPath::root("real_test")).unwrap()[0].outcome, Ok(facts(0, 1)));
+        let first_client = client.clone();
+        let first_frame = frame.clone();
+        let first = tokio::spawn(async move {
+            first_client.deliver_exchange_unit_async(first_frame, Duration::from_millis(150), CancellationToken::new()).await
+        });
+        observation.hold.entered.notified().await;
+        assert!(matches!(first.await.unwrap(), Err(crate::native_client::ExchangeRpcFailure::Unknown(_))));
+        assert!(owner.accepted().is_none());
+        // This request must return while the original still owns Decoding.
+        // Its response is custody0, rather than a false admission/consumption.
+        let replay = client.deliver_exchange_unit_async(frame, Duration::from_secs(2), CancellationToken::new()).await.unwrap();
+        assert!(matches!(codec::decode_delivery_response(&replay, stream, demand.sequence, FieldPath::root("real_test")).unwrap(),
+            codec::DecodedExchangeDeliveryOutcome::Observed { verdict: ExchangeAdmissionVerdict::Idempotent, facts: state } if state == facts(0, 1)));
+        assert_eq!(observation.starts.load(Ordering::Acquire), 1);
+        assert_eq!(observation.exits.load(Ordering::Acquire), 0);
+        assert!(owner.accepted().is_none());
+        observation.hold.release();
+        observation.exited.notified().await;
+        let accepted = owner.accepted().expect("real decoder failure must reach the original Task owner despite Unknown");
+        let original = accepted.originating_failure().expect("an originating decoder failure");
+        let projected = failure.error().unwrap();
+        assert!(std::ptr::eq(projected.cause(), original.cause()));
+        assert!(original.detail().contains("expected=Int64") && original.detail().contains("actual=Int32"), "the original IPC field type guard must author the failure: {original}");
+        assert_eq!(observation.exits.load(Ordering::Acquire), 1);
+        assert!(receiver.try_pop_next_with_stats(1).unwrap().is_none());
+        assert_eq!(registry.unit_sender_states(stream.source().task().backend_process_id(), None, 1)[0].facts.custody_through, 0);
+        assert_eq!(port.stream_close_facts(key, &[stream]).unwrap()[0].disposition, ExchangeCloseDisposition::Withdrawn);
+    }).await;
+    drop(release_on_exit);
+    port.cancel(key);
+    server.stop().unwrap();
+    result.expect("real native decoder regression exceeded its failure watchdog");
 }

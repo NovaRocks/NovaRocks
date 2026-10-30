@@ -320,76 +320,6 @@ impl NativeRpcClient {
             Ok(response)
         })
     }
-
-    pub fn exchange_unary(
-        &self,
-        stream: novarocks_execution_contract::ExchangeStreamIdentity,
-        sender_count: u32,
-        sender_id: i32,
-        be_number: i32,
-        eos: bool,
-        sequence: i64,
-        payload: Vec<u8>,
-        timeout: Duration,
-        stop: CancellationToken,
-    ) -> Result<Option<proto::ExchangeNormalClosed>, String> {
-        let request = proto::ExchangeRequest {
-            stream: Some(novarocks_task_codec::exchange_flow_codec::encode_stream(
-                stream,
-            )),
-            finst_id_hi: stream.destination_fragment_instance_id().high(),
-            finst_id_lo: stream.destination_fragment_instance_id().low(),
-            node_id: stream.destination_node().get(),
-            source_finst_id_hi: stream.source().fragment_instance_id().high(),
-            source_finst_id_lo: stream.source().fragment_instance_id().low(),
-            sender_ordinal: stream.source().sender_ordinal(),
-            sender_count,
-            sender_id,
-            be_number,
-            eos,
-            sequence,
-            payload,
-        };
-        self.runtime.block_on(async {
-            tokio::select! {
-                biased;
-                _ = stop.cancelled() => Err("exchange send cancelled by task stop".to_string()),
-                result = async {
-            let deadline_at = tokio::time::Instant::now() + timeout;
-            let mut client = self
-                .make_deadline_async_client("exchange", NativeRpcMethod::ExchangeUnary, deadline_at)
-                .await?;
-            let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err("exchange deadline exceeded before unary RPC submission".to_string());
-            }
-            let mut request = Request::new(request);
-            request.set_timeout(remaining);
-            let response = client
-                .exchange_unary(request);
-            let response = tokio::time::timeout_at(deadline_at, response)
-                .await
-                .map_err(|_| "exchange deadline exceeded during unary RPC".to_string())?
-                .map_err(|error| format!("exchange rpc failed: {error}"))?
-                .into_inner();
-            if response.ack_sequence != sequence {
-                return Err("exchange rpc returned a different request sequence".to_string());
-            }
-            let status = response.status.as_ref().ok_or_else(||
-                "exchange rpc omitted its status".to_string()
-            )?;
-            if status.code != 0 {
-                return Err(if status.message.is_empty() {
-                    format!("exchange rpc returned status_code={}", status.code)
-                } else {
-                    format!("exchange rpc failed: {}", status.message)
-                });
-            }
-            Ok(response.normal_closed)
-                } => result,
-            }
-        })
-    }
 }
 
 fn channel_endpoint(
@@ -492,39 +422,50 @@ async fn get_or_create_channel(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
     use std::time::{Duration, Instant};
 
     use tokio_util::sync::CancellationToken;
 
-    use super::{NativeRpcClient, channel_endpoint};
+    use super::{ExchangeRpcFailure, NativeRpcClient, channel_endpoint};
 
     fn send_to_test_endpoint(
         port: u16,
         timeout: Duration,
         stop: CancellationToken,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExchangeRpcFailure> {
+        use novarocks_execution_contract::ordered_retained_stream::exchange::{
+            ExchangeUnitItem, ExchangeUnitSequence,
+        };
+        use novarocks_task_codec::exchange_unit_codec::{
+            DecodedExchangeUnitFrame, encode_delivery_request,
+        };
+
         let client = NativeRpcClient::new_backend_endpoint(
             crate::backend_test_support::test_backend_data_runtime(),
             novarocks_types::NativeEndpoint::from_host_port("127.0.0.1", port).unwrap(),
             novarocks_types::BackendProcessId::new_v7(),
         );
+        let frame = DecodedExchangeUnitFrame {
+            stream: crate::exchange_transmitter::tests::unit_frame()
+                .receiver
+                .stream,
+            sender_count: 2,
+            sender_id: 0,
+            backend_number: 0,
+            item: ExchangeUnitItem::End(ExchangeUnitSequence::FIRST),
+            payload: bytes::Bytes::new(),
+            next_demand: None,
+        };
         client
-            .exchange_unary(
-                crate::exchange_transmitter::tests::frame_and_proof()
-                    .0
-                    .stream
-                    .unwrap(),
-                2,
-                0,
-                0,
-                false,
-                0,
-                Vec::new(),
+            .runtime
+            .block_on(client.deliver_exchange_unit_async(
+                encode_delivery_request(frame),
                 timeout,
                 stop,
-            )
+            ))
             .map(|_| ())
     }
 
@@ -535,7 +476,10 @@ mod tests {
         let started = Instant::now();
         let error = send_to_test_endpoint(1, Duration::from_secs(10), stop)
             .expect_err("cancelled task cannot start a send");
-        assert!(error.contains("cancelled by task stop"), "{error}");
+        assert!(
+            matches!(error, ExchangeRpcFailure::NotProcessed(_)),
+            "{error:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -551,7 +495,7 @@ mod tests {
         let send =
             thread::spawn(move || send_to_test_endpoint(port, Duration::from_secs(3), worker_stop));
         let accept_deadline = Instant::now() + Duration::from_secs(1);
-        let accepted = loop {
+        let mut accepted = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -561,6 +505,32 @@ mod tests {
                 Err(error) => panic!("blackhole accept failed: {error}"),
             }
         };
+        accepted
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("bound blackhole request observation");
+        let mut preface = [0; 24];
+        accepted.read_exact(&mut preface).expect("HTTP/2 preface");
+        assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        accepted
+            .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+            .expect("accept HTTP/2 setup without answering the RPC");
+        // Observe the actual request stream before stopping; accepting TCP
+        // alone would still race cancellation during channel acquisition.
+        loop {
+            let mut header = [0; 9];
+            accepted
+                .read_exact(&mut header)
+                .expect("HTTP/2 frame header");
+            let length = u32::from_be_bytes([0, header[0], header[1], header[2]]);
+            let mut payload = vec![0; length as usize];
+            accepted
+                .read_exact(&mut payload)
+                .expect("HTTP/2 frame payload");
+            let stream_id = u32::from_be_bytes(header[5..9].try_into().unwrap()) & 0x7fff_ffff;
+            if header[3] == 1 && stream_id != 0 {
+                break;
+            }
+        }
         let started = Instant::now();
         stop.cancel();
         let error = send
@@ -568,7 +538,7 @@ mod tests {
             .expect("exchange worker did not panic")
             .expect_err("stalled exchange should stop");
         drop(accepted);
-        assert!(error.contains("cancelled by task stop"), "{error}");
+        assert!(matches!(error, ExchangeRpcFailure::Unknown(_)), "{error:?}");
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -580,10 +550,7 @@ mod tests {
         let error =
             send_to_test_endpoint(port, Duration::from_millis(30), CancellationToken::new())
                 .expect_err("blackhole exchange must time out");
-        assert!(
-            error.contains("deadline exceeded") || error.contains("Timeout expired"),
-            "{error}"
-        );
+        assert!(matches!(error, ExchangeRpcFailure::Unknown(_)), "{error:?}");
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -623,6 +590,7 @@ mod exchange_unit_call_tests {
             ));
         }
         for code in [
+            tonic::Code::Cancelled,
             tonic::Code::DeadlineExceeded,
             tonic::Code::Unavailable,
             tonic::Code::Internal,

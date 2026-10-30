@@ -321,9 +321,7 @@ pub(crate) enum ExecutionReason {
     RootStorageOwner = 352,
     RootStorageByteBound = 353,
     RootStorageWorkBound = 354,
-    ExchangeQueueOwnerStopped = 355,
-    ExchangeObservationPoisoned = 356,
-    ExchangeObservationRebound = 357,
+    // 355..=357 retired with the old Exchange send queue; never reuse.
     ExchangeStreamContract = 358,
     ExchangePartitionAllocation = 359,
     ExchangePartitionOffset = 360,

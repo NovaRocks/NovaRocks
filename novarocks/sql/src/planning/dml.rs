@@ -583,10 +583,7 @@ impl DmlWritePlanInput {
 fn final_lowering_error(
     error: crate::planner::distributed::build::ContractLoweringError,
 ) -> crate::compiler::SqlCompileError {
-    match error {
-        crate::planner::distributed::build::ContractLoweringError::Control(error) => error.into(),
-        other => crate::compiler::SqlCompileError::Compilation(other.to_string()),
-    }
+    error.into()
 }
 
 fn final_plan_publication_error(
@@ -2911,6 +2908,29 @@ pub(crate) fn statistics_final_context_for_test() -> DmlFinalPlanContext {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn structural_wait_cycle_keeps_its_nominal_source_through_dml_lowering() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let cause = crate::compiler::StructuralWaitCycle::new(
+            "structural wait cycle requires decoupled retained output (B4)".into(),
+        );
+        let expected = cause.failure_fact();
+        let error = super::final_lowering_error(
+            crate::planner::distributed::build::ContractLoweringError::UnsupportedWaitCycle(
+                cause.clone(),
+            ),
+        );
+        let crate::compiler::SqlCompileError::CompilationSource(source) = error else {
+            panic!("DML must preserve the authored capability source");
+        };
+        assert_eq!(
+            source.downcast_ref::<crate::compiler::StructuralWaitCycle>(),
+            Some(&cause)
+        );
+        assert_eq!(source.failure_fact(), expected);
+        assert_eq!(expected.class(), FailureClass::Unsupported);
+    }
+
     use super::{
         DmlChangeStreamRoute, DmlChangeStreamStatisticsTarget, DmlStatisticsSnapshot,
         DmlWritePlanInput, dml_change_stream_optimizer_settings, evidence_to_base_statistics,

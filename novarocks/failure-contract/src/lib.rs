@@ -27,6 +27,8 @@ use std::{fmt, num::NonZeroU16};
 pub mod local_compiler_reason;
 /// The compiled-package encoder's original reason used by its public consumer.
 pub mod plan_codec_reason;
+/// SQL-authored compiled-plan capability identities used at the public boundary.
+pub mod sql_reason;
 
 /// Bound for retained diagnostics. Size and redaction are separate claims.
 pub const DIAGNOSTIC_MAX_BYTES: usize = 512;

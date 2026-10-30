@@ -88,7 +88,26 @@ impl fmt::Display for ExchangeSlotError {
         }
     }
 }
-impl std::error::Error for ExchangeSlotError {}
+impl std::error::Error for ExchangeSlotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Receipt(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ExchangeSlotError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        match self {
+            Self::Receipt(source) => source.failure_fact(),
+            _ => FailureFact::new(
+                FailureClass::Invariant,
+                super::fragment::ExecutionReason::ExchangeStreamContract.reason(),
+            ),
+        }
+    }
+}
 
 /// All identities come from the frozen Task and route; counts cannot mint them.
 #[derive(Clone, Debug)]

@@ -20,7 +20,6 @@ use crate::runtime::fragment::io::exchange_unit::{
     ExchangeAdmissionVerdict, ExchangeDeliveryCallback, ExchangeDemandCallback, ExchangeGrantWake,
     ExchangeUnitReceipt,
 };
-use crate::runtime::fragment::io::{ExchangeFrame, ExchangeTransmitRejection};
 use novarocks_execution_contract::{ExchangeSource, FragmentNodeId, TaskIdentity};
 use novarocks_types::UniqueId;
 use novarocks_types::identity::{AttemptId, QueryExecutionId, QueryId, StageId, TaskId};
@@ -86,9 +85,6 @@ impl Scripted {
     }
 }
 impl ExchangeFrameTransmitter for Scripted {
-    fn transmit(&self, _frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
-        Ok(())
-    }
     fn deliver_unit(
         &self,
         frame: ExchangeUnitFrame,
@@ -711,6 +707,8 @@ fn authoritative_route_retirement_ends_stop_retries_without_forging_confirmation
         1,
         ExchangeDeliveryRequirement::DemandDriven,
     );
+    publish(&sender, b"one", false);
+    transport.take().complete(0, 1);
     transport
         .stop_replies
         .lock()
@@ -727,7 +725,16 @@ fn authoritative_route_retirement_ends_stop_retries_without_forging_confirmation
         sender.snapshot().stop_obligation,
         ExchangeSenderStopState::RouteRetired
     );
-    assert_eq!(transport.demands.lock().unwrap().len(), 1);
+    assert_eq!(
+        transport
+            .demands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.operation == ExchangeDemandOperation::StopSender)
+            .count(),
+        1,
+    );
 }
 
 #[test]
@@ -866,6 +873,7 @@ fn final_owner_exit_removes_watch_and_does_not_restart_queued_retries() {
         ExchangeDeliveryRequirement::DemandDriven,
         1,
     );
+    publish(&stopped, b"one", false);
     transport
         .stop_replies
         .lock()
@@ -935,4 +943,438 @@ fn peer_blocked_large_unit_does_not_block_healthy_peer_with_available_bytes() {
     first.stop();
     blocked.stop();
     healthy.stop();
+}
+
+#[test]
+fn validated_remote_stop_proofs_avoid_redundant_stop_without_forging_activity_exit() {
+    let proofs = [
+        ExchangeStreamFacts {
+            receiver_closed: Some(ExchangeUnitCloseDisposition::Withdrawn),
+            ..Default::default()
+        },
+        ExchangeStreamFacts {
+            sender_stopped: true,
+            ..Default::default()
+        },
+        ExchangeStreamFacts {
+            custody_through: 1,
+            granted_through: 1,
+            receiver_closed: Some(ExchangeUnitCloseDisposition::Consumed {
+                final_sequence: ExchangeUnitSequence::try_new(2).unwrap(),
+            }),
+            ..Default::default()
+        },
+    ];
+    for facts in proofs {
+        let transport = Scripted::granting();
+        let scheduler = scheduler(16);
+        let sender = sender(
+            transport.clone(),
+            scheduler.clone(),
+            1,
+            if matches!(
+                facts.receiver_closed,
+                Some(ExchangeUnitCloseDisposition::Consumed { .. })
+            ) {
+                ExchangeDeliveryRequirement::MustDrain
+            } else {
+                ExchangeDeliveryRequirement::DemandDriven
+            },
+        );
+        publish(&sender, b"one", true);
+        let call = transport.take();
+        transport
+            .stop_replies
+            .lock()
+            .unwrap()
+            .push_back(ExchangeDemandCallOutcome::Unknown(
+                "redundant stop must not run".into(),
+            ));
+        (call.done)(ExchangeCallOutcome::Observed(ExchangeUnitReceipt {
+            verdict: ExchangeAdmissionVerdict::Idempotent,
+            facts,
+        }));
+        assert_eq!(
+            sender.snapshot().stop_obligation,
+            ExchangeSenderStopState::Confirmed
+        );
+        assert_eq!(sender.snapshot().active_calls, 1);
+        assert_eq!(scheduler.snapshot().bytes, 3);
+        assert_eq!(
+            sender.snapshot().retention.consumed_through,
+            if matches!(
+                facts.receiver_closed,
+                Some(ExchangeUnitCloseDisposition::Consumed { .. })
+            ) {
+                2
+            } else {
+                0
+            },
+        );
+        // Later local cleanup must preserve the already validated proof too.
+        sender.stop();
+        assert_eq!(
+            sender.snapshot().stop_obligation,
+            ExchangeSenderStopState::Confirmed
+        );
+        assert!(
+            transport
+                .demands
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.operation != ExchangeDemandOperation::StopSender)
+        );
+        assert!(transport.retries.lock().unwrap().is_empty());
+        assert_eq!(sender.snapshot().active_calls, 1);
+        drop(call.activity);
+        assert_eq!(sender.snapshot().active_calls, 0);
+        assert_eq!(scheduler.snapshot().calls, 0);
+    }
+}
+
+#[test]
+fn late_remote_stop_proof_confirms_unknown_stop_without_replaying_custody_or_retry() {
+    for closed in [
+        None,
+        Some(ExchangeUnitCloseDisposition::Withdrawn),
+        Some(ExchangeUnitCloseDisposition::Consumed {
+            final_sequence: ExchangeUnitSequence::try_new(2).unwrap(),
+        }),
+    ] {
+        let transport = Scripted::granting();
+        let scheduler = scheduler(16);
+        let sender = sender(
+            transport.clone(),
+            scheduler.clone(),
+            1,
+            if matches!(closed, Some(ExchangeUnitCloseDisposition::Consumed { .. })) {
+                ExchangeDeliveryRequirement::MustDrain
+            } else {
+                ExchangeDeliveryRequirement::DemandDriven
+            },
+        );
+        publish(&sender, b"one", true);
+        let call = transport.take();
+        transport
+            .stop_replies
+            .lock()
+            .unwrap()
+            .push_back(ExchangeDemandCallOutcome::Unknown("stop reply lost".into()));
+        sender.stop();
+        let stopped = sender.snapshot();
+        assert_eq!(stopped.stop_obligation, ExchangeSenderStopState::Pending);
+        assert_eq!(stopped.retention.consumed_through, 0);
+        (call.done)(ExchangeCallOutcome::Observed(ExchangeUnitReceipt {
+            verdict: ExchangeAdmissionVerdict::Idempotent,
+            facts: ExchangeStreamFacts {
+                custody_through: if matches!(
+                    closed,
+                    Some(ExchangeUnitCloseDisposition::Consumed { .. })
+                ) {
+                    2
+                } else {
+                    0
+                },
+                granted_through: 1,
+                sender_stopped: closed.is_none(),
+                receiver_closed: closed,
+            },
+        }));
+        let confirmed = sender.snapshot();
+        assert_eq!(
+            confirmed.stop_obligation,
+            ExchangeSenderStopState::Confirmed
+        );
+        assert_eq!(confirmed.status, ExchangeStreamSenderStatus::Stopped);
+        assert_eq!(confirmed.retention, stopped.retention);
+        assert_eq!(confirmed.active_calls, 1);
+        assert_eq!(scheduler.snapshot().bytes, 3);
+        assert_eq!(
+            sender.publish(&Bytes::from_static(b"late"), false),
+            Err(ExchangeUnitSenderError::Stopped)
+        );
+        transport.retry();
+        assert_eq!(
+            transport
+                .demands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.operation == ExchangeDemandOperation::StopSender)
+                .count(),
+            1
+        );
+        assert!(transport.retries.lock().unwrap().is_empty());
+        drop(call.activity);
+        assert_eq!(sender.snapshot().active_calls, 0);
+        assert_eq!(scheduler.snapshot().calls, 0);
+    }
+}
+
+fn invalid_stop_proofs() -> [ExchangeStreamFacts; 3] {
+    [
+        ExchangeStreamFacts {
+            receiver_closed: Some(ExchangeUnitCloseDisposition::Withdrawn),
+            ..Default::default()
+        },
+        ExchangeStreamFacts {
+            custody_through: 1,
+            granted_through: 1,
+            receiver_closed: Some(ExchangeUnitCloseDisposition::Consumed {
+                final_sequence: ExchangeUnitSequence::try_new(1).unwrap(),
+            }),
+            ..Default::default()
+        },
+        ExchangeStreamFacts {
+            custody_through: 3,
+            granted_through: 3,
+            sender_stopped: true,
+            ..Default::default()
+        },
+    ]
+}
+
+#[test]
+fn invalid_late_stop_proofs_fail_without_confirming_or_reviving_the_sealed_stream() {
+    for facts in invalid_stop_proofs() {
+        let transport = Scripted::granting();
+        let scheduler = scheduler(16);
+        let sender = sender(
+            transport.clone(),
+            scheduler.clone(),
+            1,
+            ExchangeDeliveryRequirement::MustDrain,
+        );
+        publish(&sender, b"one", true);
+        let call = transport.take();
+        transport
+            .stop_replies
+            .lock()
+            .unwrap()
+            .push_back(ExchangeDemandCallOutcome::Unknown("stop reply lost".into()));
+        sender.stop();
+        let stopped = sender.snapshot();
+        (call.done)(ExchangeCallOutcome::Observed(ExchangeUnitReceipt {
+            verdict: ExchangeAdmissionVerdict::Idempotent,
+            facts,
+        }));
+        assert_eq!(sender.failure(), Some(contract_failure()));
+        assert_eq!(
+            sender.snapshot().stop_obligation,
+            ExchangeSenderStopState::Pending
+        );
+        assert_eq!(sender.snapshot().retention, stopped.retention);
+        assert_eq!(sender.snapshot().active_calls, 1);
+        assert_eq!(scheduler.snapshot().bytes, 3);
+        drop(call.activity);
+        assert_eq!(sender.snapshot().active_calls, 0);
+    }
+}
+
+#[test]
+fn stop_rpc_proofs_require_the_same_delivery_end_and_custody_validation() {
+    for facts in invalid_stop_proofs() {
+        let transport = Scripted::granting();
+        let sender = sender(
+            transport.clone(),
+            scheduler(16),
+            1,
+            ExchangeDeliveryRequirement::MustDrain,
+        );
+        publish(&sender, b"one", true);
+        let call = transport.take();
+        transport
+            .stop_replies
+            .lock()
+            .unwrap()
+            .push_back(ExchangeDemandCallOutcome::Observed(vec![(
+                sender.config.stream,
+                Ok(facts),
+            )]));
+        sender.stop();
+        assert_eq!(sender.failure(), Some(contract_failure()));
+        assert_eq!(
+            sender.snapshot().stop_obligation,
+            ExchangeSenderStopState::Refused(contract_failure())
+        );
+        assert_eq!(sender.snapshot().retention.consumed_through, 0);
+        assert_eq!(sender.snapshot().active_calls, 1);
+        drop(call);
+        assert_eq!(sender.snapshot().active_calls, 0);
+    }
+}
+
+#[test]
+fn invalid_active_stop_proofs_do_not_confirm_before_the_full_merge_commits() {
+    for facts in invalid_stop_proofs() {
+        let transport = Scripted::granting();
+        let scheduler = scheduler(16);
+        let sender = sender(
+            transport.clone(),
+            scheduler.clone(),
+            1,
+            ExchangeDeliveryRequirement::MustDrain,
+        );
+        publish(&sender, b"one", true);
+        let call = transport.take();
+        transport
+            .stop_replies
+            .lock()
+            .unwrap()
+            .push_back(ExchangeDemandCallOutcome::Unknown(
+                "cleanup stop reply lost".into(),
+            ));
+        (call.done)(ExchangeCallOutcome::Observed(ExchangeUnitReceipt {
+            verdict: ExchangeAdmissionVerdict::Idempotent,
+            facts,
+        }));
+        assert_eq!(sender.failure(), Some(contract_failure()));
+        assert_eq!(
+            sender.snapshot().stop_obligation,
+            ExchangeSenderStopState::Pending
+        );
+        assert_eq!(sender.snapshot().retention.consumed_through, 0);
+        assert_eq!(sender.snapshot().retention.data_positions, 0);
+        assert_eq!(sender.snapshot().active_calls, 1);
+        assert_eq!(scheduler.snapshot().bytes, 3);
+        drop(call.activity);
+        assert_eq!(sender.snapshot().active_calls, 0);
+    }
+}
+
+#[test]
+fn stopping_an_uncontacted_stream_creates_no_remote_stop_obligation() {
+    let transport = Scripted::granting();
+    let sender = sender(
+        transport.clone(),
+        scheduler(16),
+        1,
+        ExchangeDeliveryRequirement::DemandDriven,
+    );
+    sender.stop();
+    sender.stop();
+    assert_eq!(
+        sender.snapshot().status,
+        ExchangeStreamSenderStatus::Stopped
+    );
+    assert_eq!(
+        sender.snapshot().stop_obligation,
+        ExchangeSenderStopState::NotRequired
+    );
+    assert_eq!(sender.failure(), None);
+    assert_eq!(
+        sender.publish(&Bytes::from_static(b"late"), false),
+        Err(ExchangeUnitSenderError::Stopped)
+    );
+    assert_eq!(sender.finish(), Err(ExchangeUnitSenderError::Stopped));
+    assert!(transport.demands.lock().unwrap().is_empty());
+    assert!(transport.watches.lock().unwrap().is_empty());
+    assert!(transport.retries.lock().unwrap().is_empty());
+    assert_eq!(transport.queued(), 0);
+}
+
+#[test]
+fn reentrant_stop_after_local_publication_but_before_contact_creates_no_remote_debt() {
+    for end_only in [false, true] {
+        let transport = Scripted::granting();
+        let scheduler = scheduler(16);
+        let sender = sender(
+            transport.clone(),
+            scheduler.clone(),
+            1,
+            ExchangeDeliveryRequirement::DemandDriven,
+        );
+        let weak = Arc::downgrade(&sender);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_in_callback = stopped.clone();
+        sender.observable().add_observer(Arc::new(move || {
+            if !stopped_in_callback.swap(true, Ordering::AcqRel) {
+                weak.upgrade().expect("publication owner is live").stop();
+            }
+        }));
+        if end_only {
+            assert_eq!(sender.finish().unwrap().end_sequence, Some(1));
+        } else {
+            assert_eq!(publish(&sender, b"one", true).end_sequence, Some(2));
+        }
+        assert!(stopped.load(Ordering::Acquire));
+        let snapshot = sender.snapshot();
+        assert_eq!(snapshot.status, ExchangeStreamSenderStatus::Stopped);
+        assert_eq!(
+            snapshot.stop_obligation,
+            ExchangeSenderStopState::NotRequired
+        );
+        assert_eq!(snapshot.retention.offered_through, 0);
+        assert_eq!(snapshot.retention.consumed_through, 0);
+        assert!(snapshot.retention.sealed);
+        assert_eq!(snapshot.retention.payload_bytes, 0);
+        assert_eq!(snapshot.active_calls, 0);
+        assert!(transport.demands.lock().unwrap().is_empty());
+        assert!(transport.watches.lock().unwrap().is_empty());
+        assert!(transport.retries.lock().unwrap().is_empty());
+        assert_eq!(transport.queued(), 0);
+        assert_eq!(scheduler.snapshot().calls, 0);
+    }
+}
+
+#[test]
+fn unknown_demand_contact_requires_stop_even_after_all_local_activity_is_idle() {
+    let transport = Scripted::granting();
+    let sender = sender(
+        transport.clone(),
+        scheduler(16),
+        1,
+        ExchangeDeliveryRequirement::DemandDriven,
+    );
+    transport
+        .demand_replies
+        .lock()
+        .unwrap()
+        .push_back(ExchangeDemandCallOutcome::Unknown(
+            "first demand reply lost".into(),
+        ));
+    publish(&sender, b"one", false);
+    assert_eq!(sender.snapshot().active_calls, 0);
+    assert_eq!(sender.snapshot().retention.offered_through, 0);
+    assert_eq!(transport.queued(), 0);
+    transport
+        .stop_replies
+        .lock()
+        .unwrap()
+        .push_back(ExchangeDemandCallOutcome::Unknown("stop reply lost".into()));
+    sender.stop();
+    assert_eq!(
+        sender.snapshot().stop_obligation,
+        ExchangeSenderStopState::Pending
+    );
+    // The old demand retry cannot re-open a locally stopped stream. The stop
+    // retry remains required because the first demand may have been accepted.
+    transport.retry();
+    assert_eq!(
+        sender.snapshot().stop_obligation,
+        ExchangeSenderStopState::Pending
+    );
+    transport.retry();
+    assert_eq!(
+        sender.snapshot().stop_obligation,
+        ExchangeSenderStopState::Confirmed
+    );
+    let demands = transport.demands.lock().unwrap();
+    assert_eq!(
+        demands
+            .iter()
+            .filter(|entry| matches!(entry.operation, ExchangeDemandOperation::Register(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        demands
+            .iter()
+            .filter(|entry| entry.operation == ExchangeDemandOperation::StopSender)
+            .count(),
+        2
+    );
+    assert!(transport.retries.lock().unwrap().is_empty());
+    assert_eq!(transport.queued(), 0);
 }

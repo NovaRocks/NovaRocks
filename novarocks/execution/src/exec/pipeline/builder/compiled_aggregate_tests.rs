@@ -41,13 +41,13 @@ use novarocks_types::UniqueId;
 use super::aggregate_fixture::{
     Bound, CallSpec, LoopbackTransmitter, add_aggregate, bind, compile, destination, edge,
     extrema_catalog, finish, hash, packages, receive, register, result_sink, stream_sink, try_run,
-    values,
+    try_run_in_fixture, values,
 };
 use super::family_fixture::{FixtureControl, cell, int64, int64_rows};
 use crate::exec::chunk::Chunk;
 use crate::exec::operators::ResultSinkHandle;
 use crate::exec::pipeline::binding::ExchangeBindings;
-use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
+use crate::runtime::fragment::io::exchange::test_support::Fixture;
 
 const SOURCE: FragmentId = FragmentId::new(1);
 const PARTIAL: FragmentId = FragmentId::new(2);
@@ -380,15 +380,18 @@ fn try_run_two_phase(
     } else {
         &FINAL_FINSTS[..1]
     };
-    let port = in_process_test_exchange_receiver_port();
-    let transmitter = LoopbackTransmitter::new(std::sync::Arc::clone(&port));
-    let partial_bindings = PARTIAL_FINSTS.map(|instance| register(&partial, instance, 1, &port));
+    let fixture = Fixture::new();
+    let port = fixture.port.clone();
+    let transmitter = LoopbackTransmitter::new(fixture.transport.clone());
+    let partial_bindings = PARTIAL_FINSTS
+        .map(|instance| register(&fixture, &partial, instance, &[SOURCE_FINST], &port));
     let final_bindings = finals
         .iter()
-        .map(|instance| register(&last, *instance, PARTIAL_FINSTS.len(), &port))
+        .map(|instance| register(&fixture, &last, *instance, &PARTIAL_FINSTS, &port))
         .collect::<Vec<_>>();
 
     let sink = stream_sink(
+        &fixture,
         &source,
         SOURCE_FINST,
         PARTIAL_FINSTS
@@ -397,12 +400,19 @@ fn try_run_two_phase(
             .collect(),
         &transmitter,
     );
-    try_run(&source, sink, ExchangeBindings::default(), SOURCE_FINST)
-        .unwrap_or_else(|error| panic!("source runs: {error}"));
+    try_run_in_fixture(
+        &fixture,
+        &source,
+        sink,
+        ExchangeBindings::default(),
+        SOURCE_FINST,
+    )
+    .unwrap_or_else(|error| panic!("source runs: {error}"));
     for (ordinal, (instance, bindings)) in
         PARTIAL_FINSTS.into_iter().zip(partial_bindings).enumerate()
     {
         let sink = stream_sink(
+            &fixture,
             &partial,
             instance,
             finals
@@ -418,13 +428,14 @@ fn try_run_two_phase(
                 .collect(),
             &transmitter,
         );
-        try_run(&partial, sink, bindings, instance)
+        try_run_in_fixture(&fixture, &partial, sink, bindings, instance)
             .unwrap_or_else(|error| panic!("partial runs: {error}"));
     }
     let mut results = Vec::new();
     for (instance, bindings) in finals.iter().zip(final_bindings) {
         let output = ResultSinkHandle::new();
-        try_run(
+        try_run_in_fixture(
+            &fixture,
             &last,
             result_sink(&last, *instance, &output),
             bindings,
@@ -879,7 +890,6 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
     };
     use novarocks_connector_contract::FrozenConnectorRead;
     use novarocks_physical_plan::ProviderReadOccurrenceId;
-    use std::sync::Arc;
     let catalog = aggregate_catalog(&[
         (
             "count",
@@ -967,10 +977,11 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
                 dop as usize,
                 true,
             );
-            let port = in_process_test_exchange_receiver_port();
-            let transmitter = LoopbackTransmitter::new(Arc::clone(&port));
+            let fixture = Fixture::new();
+            let port = fixture.port.clone();
+            let transmitter = LoopbackTransmitter::new(fixture.transport.clone());
             let final_instance = FINAL_FINSTS[0];
-            let bindings = register(&last, final_instance, PARTIAL_FINSTS.len(), &port);
+            let bindings = register(&fixture, &last, final_instance, &PARTIAL_FINSTS, &port);
             let keys = bindings
                 .node_ids()
                 .map(
@@ -995,6 +1006,7 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
                     op.clone(),
                 );
                 let sink = stream_sink(
+                    &fixture,
                     &partial,
                     instance,
                     vec![destination(
@@ -1006,6 +1018,7 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
                     &transmitter,
                 );
                 try_run_with_scans(
+                    &fixture,
                     &partial,
                     sink,
                     ExchangeBindings::default(),
@@ -1030,7 +1043,8 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
                 );
             }
             let output = ResultSinkHandle::new();
-            try_run(
+            try_run_in_fixture(
+                &fixture,
                 &last,
                 result_sink(&last, final_instance, &output),
                 bindings,

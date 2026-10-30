@@ -33,10 +33,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
+use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
+
 use novarocks_physical_plan::{
-    Edge, EdgeId, Fragment, FragmentId, NodeId, NodeKind, PhysicalNode, RuntimeFilter,
-    RuntimeFilterApplyPoint, RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget,
-    RuntimeFilterId, RuntimeFilterProducerTarget, SetOperationKind,
+    Edge, EdgeId, Fragment, FragmentId, FragmentOutputPort, FragmentSink, NodeId, NodeKind,
+    PhysicalNode, RuntimeFilter, RuntimeFilterApplyPoint, RuntimeFilterConsumerActivation,
+    RuntimeFilterConsumerTarget, RuntimeFilterId, RuntimeFilterProducerTarget, SetOperationKind,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -55,6 +57,8 @@ pub(super) struct FilterConsumerRef {
 pub(super) enum WaitNode {
     Completion(OperatorRef),
     Backpressure(OperatorRef),
+    SummaryCompletion(FragmentId),
+    SummaryBackpressure(FragmentId),
     InputPrefix {
         operator: OperatorRef,
         ordinal: usize,
@@ -124,9 +128,11 @@ pub(super) fn input_consumption(kind: &NodeKind, ordinal: usize) -> InputConsump
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum WaitGraphError {
+    Control(CompileControlError),
     MissingNode(OperatorRef),
     MissingEdge(EdgeId),
     MissingFragment(FragmentId),
+    InvalidSummaryOutput(EdgeId),
     InvalidInput {
         operator: OperatorRef,
         ordinal: usize,
@@ -141,10 +147,17 @@ pub(super) enum WaitGraphError {
 impl fmt::Display for WaitGraphError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Control(cause) => cause.fmt(f),
             Self::MissingNode(node) => write!(f, "wait graph refers to missing operator {node:?}"),
             Self::MissingEdge(edge) => write!(f, "wait graph refers to missing edge {edge:?}"),
             Self::MissingFragment(fragment) => {
                 write!(f, "wait graph refers to missing fragment {fragment:?}")
+            }
+            Self::InvalidSummaryOutput(edge) => {
+                write!(
+                    f,
+                    "wait graph edge {edge:?} has no matching logical summary output"
+                )
             }
             Self::InvalidInput { operator, ordinal } => {
                 write!(f, "wait graph operator {operator:?} has no input {ordinal}")
@@ -167,6 +180,12 @@ impl fmt::Display for WaitGraphError {
 
 impl std::error::Error for WaitGraphError {}
 
+impl From<CompileControlError> for WaitGraphError {
+    fn from(cause: CompileControlError) -> Self {
+        Self::Control(cause)
+    }
+}
+
 type Dependencies = BTreeMap<WaitNode, BTreeMap<WaitNode, BTreeSet<WaitEdgeKind>>>;
 
 #[derive(Clone, Debug, Default)]
@@ -176,15 +195,38 @@ pub(super) struct WaitGraph {
 }
 
 impl WaitGraph {
+    #[cfg(test)]
     pub fn build(
         fragments: &BTreeMap<FragmentId, Fragment>,
         edges: &BTreeMap<EdgeId, Edge>,
         filters: &[RuntimeFilter],
     ) -> Result<Self, WaitGraphError> {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut work =
+            CompileCheckpoints::try_new(&control, novarocks_type_contract::CompilePhase::Validate)?;
+        let result = Self::build_observed(fragments, edges, filters, &mut work);
+        work.finish_result(result, WaitGraphError::Control)
+    }
+
+    pub fn build_observed(
+        fragments: &BTreeMap<FragmentId, Fragment>,
+        edges: &BTreeMap<EdgeId, Edge>,
+        filters: &[RuntimeFilter],
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, WaitGraphError> {
+        work.flush()?;
         let plan = PlanView { fragments, edges };
         let mut graph = Self::default();
         for fragment in fragments.values() {
+            work.step()?;
+            if matches!(fragment.sink(), FragmentSink::Router { .. }) {
+                graph.add_summary_output(OperatorRef {
+                    fragment: fragment.id(),
+                    node: fragment.root(),
+                });
+            }
             for node in fragment.nodes().values() {
+                work.step()?;
                 let operator = OperatorRef {
                     fragment: fragment.id(),
                     node: node.id,
@@ -195,6 +237,7 @@ impl WaitGraph {
                     WaitEdgeKind::DataWait,
                 );
                 for ordinal in 0..node.inputs.len() {
+                    work.step()?;
                     let input = plan.input(operator, ordinal)?;
                     plan.node(input)?;
                     graph.add_operator_input(
@@ -203,9 +246,16 @@ impl WaitGraph {
                         input_consumption(&node.kind, ordinal) == InputConsumption::Pipelined,
                     );
                 }
-                if let Some(source) = plan.exchange_input(node)? {
+                if let Some((source, port)) = plan.exchange_input(node)? {
                     plan.node(source)?;
-                    graph.add_operator_input(operator, source, true);
+                    match port {
+                        FragmentOutputPort::Root => {
+                            graph.add_operator_input(operator, source, true)
+                        }
+                        FragmentOutputPort::LogicalSummary => {
+                            graph.add_summary_input(operator, source.fragment);
+                        }
+                    }
                 }
                 match &node.kind {
                     NodeKind::HashJoin { build_side, .. } => {
@@ -220,15 +270,17 @@ impl WaitGraph {
                     NodeKind::SetOp {
                         kind: SetOperationKind::Intersect | SetOperationKind::Except,
                         ..
-                    } => graph.add_ordered_prefix(&plan, operator, node.inputs.len())?,
+                    } => graph.add_ordered_prefix(&plan, operator, node.inputs.len(), work)?,
                     _ => {}
                 }
             }
         }
         for filter in filters {
+            work.step()?;
             let filter_node = WaitNode::Filter(filter.id);
             graph.dependencies.entry(filter_node).or_default();
             for producer in &filter.producers {
+                work.step()?;
                 let operator = OperatorRef {
                     fragment: producer.endpoint.fragment,
                     node: producer.endpoint.node,
@@ -258,6 +310,7 @@ impl WaitGraph {
                 );
             }
             for (ordinal, consumer) in filter.consumers.iter().enumerate() {
+                work.step()?;
                 if consumer.activation != RuntimeFilterConsumerActivation::BlockingSnapshot {
                     continue;
                 }
@@ -293,6 +346,7 @@ impl WaitGraph {
                 }
             }
         }
+        work.flush()?;
         Ok(graph)
     }
 
@@ -309,6 +363,35 @@ impl WaitGraph {
                 WaitEdgeKind::Backpressure,
             );
         }
+    }
+
+    fn add_summary_output(&mut self, root: OperatorRef) {
+        // Summary is emitted by a separate pipeline after every actual
+        // computing driver finishes. Its downstream backpressure never
+        // stops those computing drivers or their provider routes.
+        self.add_edge(
+            WaitNode::SummaryCompletion(root.fragment),
+            WaitNode::Completion(root),
+            WaitEdgeKind::DataWait,
+        );
+        self.add_edge(
+            WaitNode::SummaryCompletion(root.fragment),
+            WaitNode::SummaryBackpressure(root.fragment),
+            WaitEdgeKind::DataWait,
+        );
+    }
+
+    fn add_summary_input(&mut self, operator: OperatorRef, source: FragmentId) {
+        self.add_edge(
+            WaitNode::Completion(operator),
+            WaitNode::SummaryCompletion(source),
+            WaitEdgeKind::DataWait,
+        );
+        self.add_edge(
+            WaitNode::SummaryBackpressure(source),
+            WaitNode::Backpressure(operator),
+            WaitEdgeKind::Backpressure,
+        );
     }
 
     fn add_input_gate(
@@ -339,9 +422,11 @@ impl WaitGraph {
         plan: &PlanView<'_>,
         operator: OperatorRef,
         inputs: usize,
+        work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), WaitGraphError> {
         let mut previous = None;
         for ordinal in 0..inputs {
+            work.step()?;
             let root = plan.input(operator, ordinal)?;
             let prefix = WaitNode::InputPrefix { operator, ordinal };
             self.add_edge(prefix, WaitNode::Completion(root), WaitEdgeKind::DataWait);
@@ -372,19 +457,34 @@ impl WaitGraph {
             .insert(kind);
     }
 
+    #[cfg(test)]
+    pub fn resolve(&mut self) -> Result<WaitResolution, WaitGraphError> {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut work =
+            CompileCheckpoints::try_new(&control, novarocks_type_contract::CompilePhase::Validate)?;
+        let result = self.resolve_observed(&mut work);
+        work.finish_result(result, WaitGraphError::Control)
+    }
+
     /// Remove only optional RF waits occurring inside a cyclic component,
     /// then recompute the whole graph. Required data waits are never removed.
-    pub fn resolve(&mut self) -> Result<WaitResolution, WaitGraphError> {
-        let components = self.components();
+    pub fn resolve_observed(
+        &mut self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<WaitResolution, WaitGraphError> {
+        work.flush()?;
+        let components = self.components(work)?;
         let mut component_by_node = BTreeMap::new();
         for (ordinal, component) in components.iter().enumerate() {
             for node in component {
+                work.step()?;
                 component_by_node.insert(*node, ordinal);
             }
         }
         let mut downgrades = BTreeSet::new();
         for (from, destinations) in &self.dependencies {
             for (to, kinds) in destinations {
+                work.step()?;
                 if component_by_node[from] == component_by_node[to] {
                     for kind in kinds {
                         if let WaitEdgeKind::FilterWait(consumer) = kind
@@ -397,20 +497,24 @@ impl WaitGraph {
             }
         }
         for destinations in self.dependencies.values_mut() {
-            destinations.retain(|_, kinds| {
+            for (target, mut kinds) in std::mem::take(destinations) {
+                work.step()?;
                 kinds.retain(|kind| match kind {
                     WaitEdgeKind::FilterWait(consumer) => !downgrades.contains(consumer),
                     WaitEdgeKind::Backpressure | WaitEdgeKind::DataWait => true,
                 });
-                !kinds.is_empty()
-            });
+                if !kinds.is_empty() {
+                    destinations.insert(target, kinds);
+                }
+            }
         }
-        let remaining = self.components();
+        let remaining = self.components(work)?;
         // A required RF wait can share a component with an optional wait which
         // breaks its cycle. Reject only after removing all optional waits.
         for component in &remaining {
             for node in component {
                 for (target, kinds) in &self.dependencies[node] {
+                    work.step()?;
                     if component.contains(target) {
                         for kind in kinds {
                             if let WaitEdgeKind::FilterWait(consumer) = kind {
@@ -421,10 +525,13 @@ impl WaitGraph {
                 }
             }
         }
-        let data_cycles = remaining
-            .into_iter()
-            .filter_map(|component| self.cycle_witness(&component))
-            .collect::<Vec<_>>();
+        let mut data_cycles = Vec::new();
+        for component in remaining {
+            if let Some(witness) = self.cycle_witness(&component, work)? {
+                data_cycles.push(witness);
+            }
+        }
+        work.flush()?;
         Ok(WaitResolution {
             filter_downgrades: downgrades
                 .into_iter()
@@ -435,22 +542,29 @@ impl WaitGraph {
     }
 
     /// Iterative Kosaraju traversal keeps physical-plan depth off the Rust stack.
-    fn components(&self) -> Vec<BTreeSet<WaitNode>> {
+    fn components(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Vec<BTreeSet<WaitNode>>, WaitGraphError> {
         let mut reverse = BTreeMap::<WaitNode, BTreeSet<WaitNode>>::new();
         for (node, dependencies) in &self.dependencies {
+            work.step()?;
             reverse.entry(*node).or_default();
             for dependency in dependencies.keys() {
+                work.step()?;
                 reverse.entry(*dependency).or_default().insert(*node);
             }
         }
         let mut visited = BTreeSet::new();
         let mut finish_order = Vec::with_capacity(reverse.len());
         for start in self.dependencies.keys() {
+            work.step()?;
             if visited.contains(start) {
                 continue;
             }
             let mut stack = vec![(*start, false)];
             while let Some((node, exiting)) = stack.pop() {
+                work.step()?;
                 if exiting {
                     finish_order.push(node);
                     continue;
@@ -460,48 +574,70 @@ impl WaitGraph {
                 }
                 stack.push((node, true));
                 if let Some(next) = self.dependencies.get(&node) {
-                    stack.extend(next.keys().rev().map(|dependency| (*dependency, false)));
+                    for dependency in next.keys().rev() {
+                        work.step()?;
+                        stack.push((*dependency, false));
+                    }
                 }
             }
         }
         let mut assigned = BTreeSet::new();
         let mut components = Vec::new();
         while let Some(start) = finish_order.pop() {
+            work.step()?;
             if assigned.contains(&start) {
                 continue;
             }
             let mut component = BTreeSet::new();
             let mut stack = vec![start];
             while let Some(node) = stack.pop() {
+                work.step()?;
                 if !assigned.insert(node) {
                     continue;
                 }
                 component.insert(node);
                 if let Some(next) = reverse.get(&node) {
-                    stack.extend(next.iter().rev().copied());
+                    for dependency in next.iter().rev() {
+                        work.step()?;
+                        stack.push(*dependency);
+                    }
                 }
             }
             components.push(component);
         }
-        components
+        Ok(components)
     }
 
-    fn cycle_witness(&self, component: &BTreeSet<WaitNode>) -> Option<CycleWitness> {
-        let start = *component.first()?;
-        let next = self
-            .dependencies
-            .get(&start)?
-            .keys()
-            .copied()
-            .find(|node| component.contains(node))?;
+    fn cycle_witness(
+        &self,
+        component: &BTreeSet<WaitNode>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<CycleWitness>, WaitGraphError> {
+        work.step()?;
+        let Some(start) = component.first().copied() else {
+            return Ok(None);
+        };
+        let mut next = None;
+        for node in self.dependencies[&start].keys() {
+            work.step()?;
+            if component.contains(node) {
+                next = Some(*node);
+                break;
+            }
+        }
+        let Some(next) = next else {
+            return Ok(None);
+        };
         let mut previous = BTreeMap::new();
         let mut pending = VecDeque::from([next]);
         let mut visited = BTreeSet::from([next]);
         while let Some(node) = pending.pop_front() {
+            work.step()?;
             if node == start {
                 break;
             }
             for destination in self.dependencies[&node].keys() {
+                work.step()?;
                 if component.contains(destination) && visited.insert(*destination) {
                     previous.insert(*destination, node);
                     pending.push_back(*destination);
@@ -511,19 +647,21 @@ impl WaitGraph {
         let mut path = vec![start];
         let mut current = start;
         while current != next {
+            work.step()?;
             current = previous[&current];
             path.push(current);
         }
         path.reverse();
         path.insert(0, start);
-        let edges = path
-            .windows(2)
-            .map(|pair| self.dependencies[&pair[0]][&pair[1]].clone())
-            .collect::<Vec<_>>();
-        Some(CycleWitness {
+        let mut edges = Vec::new();
+        for pair in path.windows(2) {
+            work.step()?;
+            edges.push(self.dependencies[&pair[0]][&pair[1]].clone());
+        }
+        Ok(Some(CycleWitness {
             nodes: path.into_boxed_slice(),
             edges: edges.into_boxed_slice(),
-        })
+        }))
     }
 }
 
@@ -552,7 +690,10 @@ impl PlanView<'_> {
         })
     }
 
-    fn exchange_input(&self, node: &PhysicalNode) -> Result<Option<OperatorRef>, WaitGraphError> {
+    fn exchange_input(
+        &self,
+        node: &PhysicalNode,
+    ) -> Result<Option<(OperatorRef, FragmentOutputPort)>, WaitGraphError> {
         let NodeKind::ExchangeSource { edge, .. } = &node.kind else {
             return Ok(None);
         };
@@ -564,10 +705,18 @@ impl PlanView<'_> {
             .fragments
             .get(&edge.source.fragment)
             .ok_or(WaitGraphError::MissingFragment(edge.source.fragment))?;
-        Ok(Some(OperatorRef {
-            fragment: source.id(),
-            node: source.root(),
-        }))
+        if edge.source.port == FragmentOutputPort::LogicalSummary
+            && !matches!(source.sink(), FragmentSink::Router { summary, .. } if summary.edge == edge.id)
+        {
+            return Err(WaitGraphError::InvalidSummaryOutput(edge.id));
+        }
+        Ok(Some((
+            OperatorRef {
+                fragment: source.id(),
+                node: source.root(),
+            },
+            edge.source.port,
+        )))
     }
 }
 

@@ -153,26 +153,26 @@ mod tests {
         let key = InlineNativeChannelIdentity::from_parts(
             Some(peer(1)),
             &endpoint,
-            NativeRpcMethod::ExchangeUnary,
+            NativeRpcMethod::DeliverExchangeUnit,
         )
         .unwrap();
         for other in [
             InlineNativeChannelIdentity::from_parts(
                 Some(peer(2)),
                 &endpoint,
-                NativeRpcMethod::ExchangeUnary,
+                NativeRpcMethod::DeliverExchangeUnit,
             )
             .unwrap(),
             InlineNativeChannelIdentity::from_parts(
                 Some(peer(1)),
                 &other_port,
-                NativeRpcMethod::ExchangeUnary,
+                NativeRpcMethod::DeliverExchangeUnit,
             )
             .unwrap(),
             InlineNativeChannelIdentity::from_parts(
                 Some(peer(1)),
                 &other_host,
-                NativeRpcMethod::ExchangeUnary,
+                NativeRpcMethod::DeliverExchangeUnit,
             )
             .unwrap(),
             InlineNativeChannelIdentity::from_parts(
@@ -191,7 +191,7 @@ mod tests {
         assert_eq!(key.host(), "example.com");
         assert_eq!(key.host_bytes(), b"example.com");
         assert_eq!(key.port(), 9000);
-        assert_eq!(key.method(), NativeRpcMethod::ExchangeUnary);
+        assert_eq!(key.method(), NativeRpcMethod::DeliverExchangeUnit);
     }
 
     #[test]
@@ -208,13 +208,13 @@ mod tests {
                 InlineNativeChannelIdentity::from_parts(
                     Some(peer(1)),
                     &first,
-                    NativeRpcMethod::ExchangeUnary
+                    NativeRpcMethod::DeliverExchangeUnit
                 )
                 .unwrap(),
                 InlineNativeChannelIdentity::from_parts(
                     Some(peer(1)),
                     &second,
-                    NativeRpcMethod::ExchangeUnary
+                    NativeRpcMethod::DeliverExchangeUnit
                 )
                 .unwrap(),
             );
@@ -234,13 +234,13 @@ mod tests {
         let ip = InlineNativeChannelIdentity::from_parts(
             Some(peer(1)),
             &ip,
-            NativeRpcMethod::ExchangeUnary,
+            NativeRpcMethod::DeliverExchangeUnit,
         )
         .unwrap();
         let dns = InlineNativeChannelIdentity::from_parts(
             Some(peer(1)),
             &dns,
-            NativeRpcMethod::ExchangeUnary,
+            NativeRpcMethod::DeliverExchangeUnit,
         )
         .unwrap();
         assert_ne!(ip, dns);
@@ -263,8 +263,7 @@ mod tests {
             let without_peer =
                 InlineNativeChannelIdentity::from_parts(None, &endpoint, entry.method);
             match entry.method {
-                NativeRpcMethod::ExchangeUnary
-                | NativeRpcMethod::DeliverExchangeUnit
+                NativeRpcMethod::DeliverExchangeUnit
                 | NativeRpcMethod::RegisterExchangeDemand
                 | NativeRpcMethod::SubscribeExchangeGrants
                 | NativeRpcMethod::TransmitRuntimeFilterEnvelope => {
@@ -305,7 +304,7 @@ mod tests {
         let key = InlineNativeChannelIdentity::from_parts(
             Some(peer(1)),
             &endpoint,
-            NativeRpcMethod::ExchangeUnary,
+            NativeRpcMethod::DeliverExchangeUnit,
         )
         .unwrap();
         assert_eq!(key.host_bytes(), host.as_bytes());

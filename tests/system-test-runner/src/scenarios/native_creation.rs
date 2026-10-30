@@ -862,6 +862,7 @@ pub(super) struct RawCreate {
     pub(super) initial_domains: Vec<proto::TaskDomainUpdate>,
     pub(super) max_wait_millis: u64,
     pub(super) exchange_input: bool,
+    pub(super) exchange_source_backend: Option<BackendProcessId>,
 }
 
 impl RawCreate {
@@ -883,6 +884,7 @@ impl RawCreate {
             initial_domains: Vec::new(),
             max_wait_millis: 15_000,
             exchange_input: false,
+            exchange_source_backend: None,
         }
     }
 
@@ -940,7 +942,12 @@ impl RawCreate {
                                     query_execution_id: Some(execution),
                                     stage_id: 2,
                                     task_id: self.task_id,
-                                    backend_process_id: self.context.backend_process_id.clone(),
+                                    backend_process_id: self
+                                        .exchange_source_backend
+                                        .map(|process| proto::BackendProcessId {
+                                            value: process.to_bytes().to_vec(),
+                                        })
+                                        .or_else(|| self.context.backend_process_id.clone()),
                                 }),
                                 fragment_instance_id: Some(common::UniqueId {
                                     hi: 0x5c,
@@ -1630,14 +1637,19 @@ impl Scenario for NormalCloseCapacity {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
-        let exchange_authorization =
-            authorization_header(&context.handle().native_backend_probe_trust()?)?;
+        let exchange_trust = context.handle().native_backend_probe_trust()?;
+        let exchange_authorization = authorization_header(&exchange_trust)?;
+        let source_process = match exchange_trust.local_process_identity() {
+            Some(novarocks_native_trust::NativeProcessIdentity::Backend(process)) => process,
+            _ => bail!("Exchange probe requires its authenticated backend process"),
+        };
         let retained = RawBackendSession::establish(context, 0)?;
         let live = RawBackendSession::establish(context, 0)?;
         let receiver = |session: &RawBackendSession, id| {
             let mut create = RawCreate::values(session, id);
             create.pipeline_dop = 1;
             create.exchange_input = true;
+            create.exchange_source_backend = Some(source_process);
             create
         };
         let first = receiver(&retained, 1);
@@ -1683,11 +1695,7 @@ impl Scenario for NormalCloseCapacity {
         // neither evicts that route nor lets a new Create overtake it.
         let response = exchange_probe(&live, &active[0], true, &exchange_authorization)?;
         ensure!(
-            response
-                .status
-                .as_ref()
-                .is_some_and(|status| status.code == 0)
-                && response.normal_closed.is_none(),
+            matches!(response,novarocks_task_codec::exchange_unit_codec::DecodedExchangeDeliveryOutcome::Observed{facts,..} if facts.receiver_closed.is_none()),
             "active receiver was evicted or closed under capacity pressure: {response:?}"
         );
         context.action("one Context retained exact typed normal-close evidence while another active receiver still accepted its exact sender EOS; new admission stayed refused");
@@ -1734,11 +1742,12 @@ impl Scenario for NormalCloseCapacity {
         await_installed(context, &recovered, &recovered_create)?;
         let forgotten = exchange_probe(&retained, &first, false, &exchange_authorization)?;
         ensure!(
-            forgotten.normal_closed.is_none()
-                && forgotten
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.code != 0),
+            matches!(
+                forgotten,
+                novarocks_task_codec::exchange_unit_codec::DecodedExchangeDeliveryOutcome::Refused(
+                    _
+                )
+            ),
             "expired Context still retained normal-close evidence: {forgotten:?}"
         );
         recovered.release_when_ready(context)?;
@@ -1806,7 +1815,7 @@ fn exchange_probe(
     create: &RawCreate,
     eos: bool,
     exchange_authorization: &str,
-) -> Result<proto::ExchangeResponse> {
+) -> Result<novarocks_task_codec::exchange_unit_codec::DecodedExchangeDeliveryOutcome> {
     use prost::Message;
     let Some(proto::task_operation::Operation::CreateTask(request)) = create.operation().operation
     else {
@@ -1847,27 +1856,53 @@ fn exchange_probe(
             .lo,
         destination_node_id: inbound.destination_node_id,
     };
-    raw_unary(
+    use novarocks_execution_contract::ordered_retained_stream::exchange::{
+        ExchangeUnitDemand, ExchangeUnitItem, ExchangeUnitSequence,
+    };
+    use novarocks_task_codec::exchange_unit_codec as codec;
+    let stream = novarocks_task_codec::exchange_flow_codec::decode_stream(
+        &stream,
+        novarocks_proto_codec::FieldPath::root("probe_stream"),
+    )?;
+    let sequence = ExchangeUnitSequence::FIRST;
+    let item = if eos {
+        ExchangeUnitItem::End(sequence)
+    } else {
+        ExchangeUnitItem::Unit {
+            demand: ExchangeUnitDemand {
+                sequence,
+                wire_bytes: 1,
+            },
+            end_after_unit: false,
+        }
+    };
+    let response: proto::DeliverExchangeUnitResponse = raw_unary(
         session.connector.clone(),
-        "/novarocks.NovaRocksGrpc/ExchangeUnary",
+        "/novarocks.NovaRocksGrpc/DeliverExchangeUnit",
         exchange_authorization,
-        proto::ExchangeRequest {
-            stream: Some(stream),
-            finst_id_hi: 0x5b,
-            finst_id_lo: create.kernel_key_low,
-            node_id: 10,
+        codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
+            stream,
+            sender_count: u32::try_from(inbound.sources.len())?,
             sender_id: 0,
-            be_number: 0,
-            eos,
-            sequence: 0,
-            payload: Vec::new(),
-            source_finst_id_hi: 0x5c,
-            source_finst_id_lo: create.kernel_key_low,
-            sender_ordinal: 0,
-            sender_count: 1,
-        },
+            backend_number: 0,
+            item,
+            payload: if eos {
+                bytes::Bytes::new()
+            } else {
+                bytes::Bytes::from_static(&[0xff])
+            },
+            next_demand: None,
+        }),
         session.original_deadline,
-    )
+    )?;
+    // Decode binds the response to this original Create's complete Task,
+    // kernel, source ordinal and item identity; a close for another route fails.
+    Ok(codec::decode_delivery_response(
+        &response,
+        stream,
+        sequence,
+        novarocks_proto_codec::FieldPath::root("exchange_probe"),
+    )?)
 }
 
 fn assert_normal_close(
@@ -1877,33 +1912,8 @@ fn assert_normal_close(
 ) -> Result<()> {
     let response = exchange_probe(session, create, false, exchange_authorization)?;
     ensure!(
-        response
-            .status
-            .as_ref()
-            .is_some_and(|status| status.code == 0),
-        "late frame normal close failed: {response:?}"
-    );
-    let proof = response
-        .normal_closed
-        .context("late frame omitted typed normal close")?;
-    ensure!(
-        proof
-            .destination_task
-            .as_ref()
-            .is_some_and(
-                |task| task.query_execution_id == create.context.query_execution_id
-                    && task.stage_id == 1
-                    && task.task_id == create.task_id
-                    && task.backend_process_id == create.context.backend_process_id
-            )
-            && proof.destination_finst_id_hi == 0x5b
-            && proof.destination_finst_id_lo == create.kernel_key_low
-            && proof.destination_node_id == 10
-            && proof.source_finst_id_hi == 0x5c
-            && proof.source_finst_id_lo == create.kernel_key_low
-            && proof.sender_ordinal == 0
-            && proof.sender_count == 1,
-        "normal close proof disagrees with the frozen exact route: {proof:?}"
+        matches!(response,novarocks_task_codec::exchange_unit_codec::DecodedExchangeDeliveryOutcome::Observed {facts,..} if facts.receiver_closed.is_some()),
+        "late Unit must retain this exact frozen route's typed normal close: {response:?}"
     );
     Ok(())
 }

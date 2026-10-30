@@ -6183,6 +6183,7 @@ mod tests {
         for summary_first in [true, false] {
             let state = RuntimeState::default();
             let shared = UnionAllSharedState::new_with_limits(1, 901, 1, 1);
+            let state = IngressFixture::task_state(&state);
             let ingress = IngressFixture::new(1, &state);
             shared
                 .push_chunk(
@@ -6212,7 +6213,7 @@ mod tests {
             if summary_first {
                 ingress.send(
                     0,
-                    0,
+                    1,
                     Some(novarocks_local_program::LogicalChangeCounts::try_new(2, 3, 4).unwrap()),
                     true,
                 );
@@ -6234,7 +6235,7 @@ mod tests {
             } else {
                 ingress.send(
                     0,
-                    0,
+                    1,
                     Some(novarocks_local_program::LogicalChangeCounts::try_new(2, 3, 4).unwrap()),
                     true,
                 );
@@ -6273,6 +6274,7 @@ mod tests {
         let (fixture, state, schema) = composite_fixture(2, 1, 1);
         let state = Arc::new(state);
         let shared = UnionAllSharedState::new_with_limits(1, 902, 1, 1);
+        let state = IngressFixture::task_state(&state);
         let ingress = Arc::new(IngressFixture::new(1, &state));
         // Each legal partial is larger than the whole local waterline. The
         // producer cannot reach its logical summary until finish dequeues it.
@@ -6350,7 +6352,7 @@ mod tests {
                 shared.producer_finished();
                 ingress.send(
                     0,
-                    0,
+                    1,
                     Some(novarocks_local_program::LogicalChangeCounts::try_new(2, 3, 4).unwrap()),
                     true,
                 );
@@ -6403,13 +6405,14 @@ mod tests {
         for abandoned in [false, true] {
             let state = RuntimeState::default();
             let shared = UnionAllSharedState::new_with_limits(1, 903, 1024, 1024);
+            let state = IngressFixture::task_state(&state);
             let ingress = IngressFixture::new(1, &state);
             if abandoned {
                 shared.producer_abandoned();
             } else {
                 shared.producer_finished();
             }
-            ingress.send(0, 0, None, true);
+            ingress.send(0, 1, None, true);
             let mut source = factory(1)
                 .with_logical_input(shared, ingress.input())
                 .create(1, 0);
@@ -6427,9 +6430,10 @@ mod tests {
         }
         let state = RuntimeState::default();
         let shared = UnionAllSharedState::new_with_limits(1, 904, 1024, 1024);
+        let state = IngressFixture::task_state(&state);
         let ingress = IngressFixture::new(1, &state);
         shared.producer_finished();
-        ingress.send(0, 0, None, true);
+        ingress.send(0, 1, None, true);
         let mut source = factory(1)
             .with_logical_input(shared, ingress.input())
             .create(1, 0);
@@ -6458,6 +6462,7 @@ mod tests {
         use crate::exec::pipeline::step_context::TurnWork;
         let (fixture, state, schema) = composite_fixture(2, 1, 1);
         let shared = UnionAllSharedState::new_with_limits(1, 905, 1, 1);
+        let state = IngressFixture::task_state(&state);
         let ingress = IngressFixture::new(1, &state);
         shared
             .push_chunk(
@@ -6500,7 +6505,7 @@ mod tests {
         shared.producer_finished();
         ingress.send(
             0,
-            0,
+            1,
             Some(novarocks_local_program::LogicalChangeCounts::try_new(2, 3, 4).unwrap()),
             true,
         );

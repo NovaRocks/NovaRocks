@@ -61,6 +61,11 @@ impl From<ExecutionFailure> for ExchangeFailure {
         Self::Execution(source)
     }
 }
+impl From<crate::runtime::exchange_slots::ExchangeSlotError> for ExchangeFailure {
+    fn from(source: crate::runtime::exchange_slots::ExchangeSlotError) -> Self {
+        Self::Source(SharedDomainFailure::new(source))
+    }
+}
 impl From<ConstructionFailure> for ExchangeFailure {
     fn from(source: ConstructionFailure) -> Self {
         Self::Execution(source.into())
