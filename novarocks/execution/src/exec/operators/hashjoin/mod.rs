@@ -26,12 +26,15 @@
 
 pub(crate) mod broadcast_join_shared;
 mod build_artifact;
+mod build_collection;
 mod build_requirements;
 pub(crate) mod build_state;
 pub(crate) mod compiled_hash_join;
+mod join_completion;
 mod join_hash_map;
 mod join_hash_table;
 pub(crate) mod native_runtime_filter;
+mod tail_ranges;
 
 pub(crate) use join_hash_map::gather::{
     JoinGatherError, TypedJoinBatch, filter_probe_typed, gather_join_batch_typed,
