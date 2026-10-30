@@ -4198,16 +4198,28 @@ mod tests {
         version_byte: u8,
         guarantee: PredicateGuaranteeKind,
     ) -> SqlCompletedPlan {
-        let seed = request(
+        completed_external_sql_with_tables(
             sql,
+            version_byte,
+            guarantee,
             SqlCompileIntent::Explain {
                 level: ExplainLevel::Verbose,
                 analyze: false,
             },
-            version_byte,
+            resolved_table,
         )
-        .try_into_completion()
-        .expect("completion request");
+    }
+
+    fn completed_external_sql_with_tables(
+        sql: &str,
+        version_byte: u8,
+        guarantee: PredicateGuaranteeKind,
+        intent: SqlCompileIntent,
+        table: fn(&CatalogRelationNeed) -> ResolvedAnalyzerTable,
+    ) -> SqlCompletedPlan {
+        let seed = request(sql, intent, version_byte)
+            .try_into_completion()
+            .expect("completion request");
         let catalog = incomplete(
             SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
                 .expect("catalog need"),
@@ -4219,8 +4231,7 @@ mod tests {
         let catalog_facts = catalog_needs
             .iter()
             .map(|need| {
-                CatalogRelationFact::resolved(need, resolved_table(need))
-                    .expect("catalog relation fact")
+                CatalogRelationFact::resolved(need, table(need)).expect("catalog relation fact")
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -4281,6 +4292,109 @@ mod tests {
             panic!("provider facts must complete the plan");
         };
         completed
+    }
+
+    #[test]
+    fn original_cte_join_on_in_subquery_resolves_optional_runtime_filter_waits() {
+        let original = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/sql/correctness/cte/sql/cte_in_where_subquery.sql"
+        ));
+        let sql = original
+            .split("-- query 6\n")
+            .nth(1)
+            .expect("original native query 6")
+            .split("-- query 7\n")
+            .next()
+            .unwrap()
+            .replace("${case_db}", "db");
+        fn table(need: &CatalogRelationNeed) -> ResolvedAnalyzerTable {
+            let relation = need.relation();
+            let (binding, names) = match relation.table.as_str() {
+                "t_cte_0" => (101, ["v1", "v2", "v3"]),
+                "t_cte_1" => (102, ["v4", "v5", "v6"]),
+                other => panic!("unexpected original query relation: {other}"),
+            };
+            ResolvedAnalyzerTable::from_planner(
+                Some(&relation.catalog),
+                &relation.namespace,
+                TableDef {
+                    name: relation.table.clone(),
+                    columns: names
+                        .into_iter()
+                        .map(|name| novarocks_types::schema::ColumnDef {
+                            name: name.to_owned(),
+                            data_type: DataType::Int64,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        })
+                        .collect(),
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: ScanSource::Sql(SqlScanSource::new(
+                        SqlTableBindingId::new_for_test(binding),
+                        SqlTableIdentity::try_new(
+                            relation.catalog.clone(),
+                            relation.namespace.clone(),
+                            relation.table.clone(),
+                        )
+                        .unwrap(),
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    )),
+                },
+            )
+        }
+        let completed = completed_external_sql_with_tables(
+            &sql,
+            85,
+            PredicateGuaranteeKind::Exact,
+            SqlCompileIntent::Query,
+            table,
+        );
+        let plan = completed.plan();
+        let shared = plan
+            .fragments()
+            .values()
+            .filter_map(|fragment| match fragment.sink() {
+                FragmentSink::Multicast { edges } => Some(edges),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shared.len(), 1, "the original CTE remains shared");
+        assert_eq!(
+            shared[0].len(),
+            3,
+            "IN null semantics use three CTE branches"
+        );
+        for edge in shared[0].iter() {
+            let branch = &plan.fragments()[&plan.edges()[edge].destination.fragment];
+            assert!(
+                branch
+                    .nodes()
+                    .values()
+                    .any(|node| matches!(node.kind, NodeKind::Aggregate { .. })),
+                "each shared branch drains its CTE input before publishing output"
+            );
+        }
+        assert!(
+            !plan.runtime_filters().is_empty(),
+            "the original equijoins must retain their optional runtime filters"
+        );
+        for filter in plan.runtime_filters().values() {
+            for consumer in &filter.consumers {
+                assert_eq!(
+                    consumer.activation,
+                    novarocks_physical_plan::RuntimeFilterConsumerActivation::BlockingSnapshot,
+                    "absorbing all shared branches lets the filter build finish independently"
+                );
+                assert_eq!(
+                    consumer.apply_point,
+                    novarocks_physical_plan::RuntimeFilterApplyPoint::ScanSource
+                );
+            }
+        }
     }
 
     fn exact_profile(

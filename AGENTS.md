@@ -1053,9 +1053,11 @@ suspected case against a clean server before attributing it to the change.
 - **SQL / parser / planner changes**: start with `novarocks/parser/src/**`,
   `novarocks/sql/src/{analysis,analyzer,semantic}/**`,
   `novarocks/sql/src/optimizer/**` and `novarocks/sql/src/planner/**`.
-  完成物理计划的结构性等待图由
-  `novarocks/sql/src/planner/distributed/build/wait_graph.rs` 拥有；
-  同目录 `contract_lowering.rs` 在冻结前统一分析 RF 等待与必需数据环。
+  完成物理计划的 C/B 等待图、输入消费分类与 SCC 的单一作者是
+  `novarocks/physical-plan/src/wait_graph.rs`；SQL 原 `distributed/build/wait_graph.rs`
+  保留 facade，`contract_lowering.rs` 在冻结前解除可选 RF 等待或准确拒绝必需数据环。
+  FrozenPlan 验证使用同一作者重新核对实际 activation，不静默解除等待；观察式入口的图阶段
+  沿原调用者 checkpoint，不能回落到 plain 验证或宣称其他 legacy 验证遍历也已受控。
 - **Package decode / compiled preparation**：从 `novarocks/plan-codec/src/physical_package_v2/**`、
   `novarocks/native-adapter/src/backend_task_execution/{compiled_package.rs,execution_host.rs}`
   与 `novarocks/local-compiler/src/**` 开始；Task 能力投影见 `compiled_scan_binding.rs`、

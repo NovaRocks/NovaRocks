@@ -20,8 +20,7 @@
 //! stated producer/input order, not from the graph implementation's output.
 
 use super::*;
-use arrow::datatypes::DataType;
-use novarocks_physical_plan::{
+use crate::{
     AggregateGrouping, DeliveryRequirement, Distribution, EdgeDestination, EdgeKind,
     EdgePartitioning, EdgeSource, ExprKind, FragmentBuilder, FragmentOutputPort, FragmentSink,
     JoinDistribution, JoinKey, JoinKind, JoinSide, LiteralValue, NestLoopJoinDistribution,
@@ -33,6 +32,7 @@ use novarocks_physical_plan::{
     RuntimeFilterProducerProgress, RuntimeFilterReduction, RuntimeFilterWitnessId,
     StagePlacementPolicy, ValueType,
 };
+use arrow_schema::DataType;
 
 fn properties() -> PhysicalProperties {
     PhysicalProperties {
@@ -735,4 +735,37 @@ fn graph_resolution_observes_the_original_control_and_latches_its_first_refusal(
             "an originating refusal must not call the caller control again"
         );
     }
+}
+
+#[test]
+fn frozen_wait_inspection_keeps_every_optional_rf_edge_until_planning_resolves_it() {
+    let mut fixture = Fixture::default();
+    fixture.values(0, 0);
+    fixture.values(0, 1);
+    fixture.hash_join(0, 2, 0, 1, JoinSide::Right);
+    fixture.values(0, 3);
+    fixture.hash_join(0, 4, 2, 3, JoinSide::Left);
+    let mut filter = membership_filter(44, operator(0, 4), operator(0, 2));
+    filter.producers[0].apply_point = RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 };
+    filter.consumers[0].apply_point = RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 };
+    let mut graph = fixture.finish(&[filter]);
+    let before = graph.dependencies.clone();
+    let mut work = CompileCheckpoints::try_new(
+        &TestCompileControl,
+        novarocks_type_contract::CompilePhase::Validate,
+    )
+    .unwrap();
+    let cycles = graph.active_cycles_observed(&mut work).unwrap();
+    work.finish().unwrap();
+    assert!(cycles.filter);
+    assert_eq!(graph.dependencies, before);
+    let resolution = graph.resolve().unwrap();
+    assert_eq!(
+        resolution.filter_downgrades.as_ref(),
+        &[FilterConsumerRef {
+            filter: RuntimeFilterId::new(44),
+            ordinal: 0,
+        }]
+    );
+    assert!(resolution.is_acyclic());
 }

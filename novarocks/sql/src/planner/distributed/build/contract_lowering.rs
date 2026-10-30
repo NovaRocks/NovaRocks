@@ -1331,8 +1331,9 @@ fn resolve_runtime_filter_activations_observed(
     edges: &BTreeMap<EdgeId, Edge>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ContractLoweringError> {
-    let mut graph = super::wait_graph::WaitGraph::build_observed(fragments, edges, filters, work)
-        .map_err(wait_graph_error)?;
+    let mut graph =
+        super::wait_graph::WaitGraph::build_observed(fragments, edges, filters.iter(), work)
+            .map_err(wait_graph_error)?;
     let resolution = graph.resolve_observed(work).map_err(wait_graph_error)?;
     if !resolution.is_acyclic() {
         let witness = resolution
@@ -14794,10 +14795,17 @@ mod tests {
             .clone();
 
             assert_eq!(plan.fragments().len(), 4);
-            let mut graph =
-                super::super::wait_graph::WaitGraph::build(plan.fragments(), plan.edges(), &[])
-                    .unwrap();
-            assert!(graph.resolve().unwrap().is_acyclic());
+            let control = crate::compiler::SqlCompileControl::unbounded();
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+            let mut graph = super::super::wait_graph::WaitGraph::build_observed(
+                plan.fragments(),
+                plan.edges(),
+                &[],
+                &mut work,
+            )
+            .unwrap();
+            assert!(graph.resolve_observed(&mut work).unwrap().is_acyclic());
+            work.finish().unwrap();
             let (router_fragment, summary) = plan
                 .fragments()
                 .values()
