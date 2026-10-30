@@ -18,7 +18,28 @@
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 
-use crate::exec::chunk::{Chunk, ChunkSourceAuthorityRef};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSourceAuthorityRef};
+
+/// Data-only column coordinates and their actual metadata creator. The caller
+/// funds the vector and shared header before publishing this original map.
+pub(crate) struct InputColumnProjection {
+    ordinals: Vec<usize>,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl InputColumnProjection {
+    pub(crate) fn from_owned(
+        ordinals: Vec<usize>,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    ) -> Self {
+        Self {
+            ordinals,
+            _storage: storage,
+        }
+    }
+    pub(crate) fn ordinals(&self) -> &[usize] {
+        &self.ordinals
+    }
+}
 
 /// One synchronous input. The Chunk variant structurally pairs its own batch
 /// and attached owners, without cloning either or accepting another batch.
@@ -26,6 +47,14 @@ use crate::exec::chunk::{Chunk, ChunkSourceAuthorityRef};
 pub(crate) enum CompiledInputLoan<'a> {
     RecordBatch(&'a RecordBatch),
     Chunk(&'a Chunk),
+    /// An explicit physical column projection of the original frozen port.
+    /// Ordinals map compact columns back to that declaration; absent columns
+    /// have no Array at all and cannot be read by a Slot.
+    Projected {
+        chunk: &'a Chunk,
+        declared: &'a ChunkSchema,
+        projection: &'a std::sync::Arc<InputColumnProjection>,
+    },
     #[cfg(test)]
     Observed {
         input: &'a CompiledInputLoan<'a>,
@@ -36,6 +65,56 @@ pub(crate) enum CompiledInputLoan<'a> {
 impl<'a> CompiledInputLoan<'a> {
     pub(crate) fn from_chunk(chunk: &'a Chunk) -> Self {
         Self::Chunk(chunk)
+    }
+
+    pub(crate) fn from_projected_chunk(
+        chunk: &'a Chunk,
+        declared: &'a ChunkSchema,
+        projection: &'a std::sync::Arc<InputColumnProjection>,
+        control: &dyn novarocks_functions::KernelEvaluationControl,
+    ) -> Result<Self, novarocks_functions::KernelFailure> {
+        let ordinals = projection.ordinals();
+        if !chunk.chunk_schema().is_typed()
+            || !declared.is_typed()
+            || chunk.columns().len() != ordinals.len()
+        {
+            return Err(super::invalid(
+                "projected input lacks its exact typed column map",
+            ));
+        }
+        let actual = chunk.record_batch().schema();
+        let frozen = declared.arrow_schema_ref();
+        let mut previous = None;
+        for (physical, &original) in ordinals.iter().enumerate() {
+            control.checkpoint(1)?;
+            if previous.is_some_and(|p| p >= original)
+                || original >= frozen.fields().len()
+                || chunk.chunk_schema().slots()[physical].slot_id()
+                    != declared.slots()[original].slot_id()
+                || !chunk.chunk_schema().slots()[physical]
+                    .typed_binding()
+                    .borrowed()
+                    .same_physical_binding_ignoring_root_nullability_observed(
+                        declared.slots()[original].typed_binding().borrowed(),
+                        || control.checkpoint(1),
+                    )?
+                || !novarocks_type_contract::arrow_fields_exact_observed(
+                    actual.field(physical),
+                    frozen.field(original),
+                    || control.checkpoint(1),
+                )?
+            {
+                return Err(super::invalid(
+                    "projected input column differs from its original frozen ordinal",
+                ));
+            }
+            previous = Some(original);
+        }
+        Ok(Self::Projected {
+            chunk,
+            declared,
+            projection,
+        })
     }
 
     #[cfg(test)]
@@ -52,7 +131,7 @@ impl<'a> CompiledInputLoan<'a> {
     fn chunk(self) -> Option<&'a Chunk> {
         match self {
             Self::RecordBatch(_) => None,
-            Self::Chunk(chunk) => Some(chunk),
+            Self::Chunk(chunk) | Self::Projected { chunk, .. } => Some(chunk),
             #[cfg(test)]
             Self::Observed { input, .. } => input.chunk(),
         }
@@ -126,10 +205,51 @@ impl<'a> CompiledInputLoan<'a> {
     pub(crate) fn batch(self) -> &'a RecordBatch {
         match self {
             Self::RecordBatch(batch) => batch,
-            Self::Chunk(chunk) => chunk.record_batch(),
+            Self::Chunk(chunk) | Self::Projected { chunk, .. } => chunk.record_batch(),
             #[cfg(test)]
             Self::Observed { input, .. } => input.batch(),
         }
+    }
+
+    pub(crate) fn num_rows(self) -> usize {
+        self.batch().num_rows()
+    }
+    pub(crate) fn schema(self) -> arrow::datatypes::SchemaRef {
+        match self {
+            Self::Projected { declared, .. } => declared.arrow_schema_ref(),
+            #[cfg(test)]
+            Self::Observed { input, .. } => input.schema(),
+            _ => self.batch().schema(),
+        }
+    }
+    fn projection(self) -> Option<&'a std::sync::Arc<InputColumnProjection>> {
+        match self {
+            Self::Projected { projection, .. } => Some(projection),
+            #[cfg(test)]
+            Self::Observed { input, .. } => input.projection(),
+            _ => None,
+        }
+    }
+    fn projected_ordinals(self) -> Option<&'a [usize]> {
+        self.projection().map(|projection| projection.ordinals())
+    }
+    pub(crate) fn is_projected(self) -> bool {
+        self.projection().is_some()
+    }
+    /// Inspect only the explicit coordinates, without reporting a Slot read.
+    pub(crate) fn has_materialized_column(self, ordinal: usize) -> bool {
+        match self.projected_ordinals() {
+            Some(map) => map.binary_search(&ordinal).is_ok(),
+            None => ordinal < self.batch().num_columns(),
+        }
+    }
+    pub(crate) fn columns_with_ordinals(self) -> impl Iterator<Item = (usize, &'a ArrayRef)> {
+        let ordinals = self.projected_ordinals();
+        self.batch()
+            .columns()
+            .iter()
+            .enumerate()
+            .map(move |(physical, array)| (ordinals.map_or(physical, |map| map[physical]), array))
     }
 
     /// Called only after the original Frame has checked the lexical input
@@ -141,14 +261,18 @@ impl<'a> CompiledInputLoan<'a> {
             observer(column);
             return Some(column);
         }
-        let array = self.batch().columns().get(ordinal)?;
+        let physical = match self.projected_ordinals() {
+            Some(map) => map.binary_search(&ordinal).ok()?,
+            None => ordinal,
+        };
+        let array = self.batch().columns().get(physical)?;
         let source = match self {
             Self::RecordBatch(_) => BorrowedInputSource::NoChunkProvided,
             #[cfg(test)]
             Self::Observed { .. } => {
                 unreachable!("observed input returned its original checked column")
             }
-            Self::Chunk(chunk) => {
+            Self::Chunk(chunk) | Self::Projected { chunk, .. } => {
                 let authority = chunk.source_authority();
                 if authority.is_attached() {
                     BorrowedInputSource::Attached(authority)
@@ -158,13 +282,6 @@ impl<'a> CompiledInputLoan<'a> {
             }
         };
         Some(BorrowedInputColumn { array, source })
-    }
-}
-
-impl std::ops::Deref for CompiledInputLoan<'_> {
-    type Target = RecordBatch;
-    fn deref(&self) -> &Self::Target {
-        self.batch()
     }
 }
 
@@ -427,6 +544,7 @@ pub(super) struct ActualInvocationDomain {
     batch: RecordBatch,
     batch_rows: usize,
     rows: Vec<usize>,
+    projection: Option<std::sync::Arc<InputColumnProjection>>,
 }
 impl ActualInvocationDomain {
     pub(super) fn root(
@@ -462,6 +580,7 @@ impl ActualInvocationDomain {
             batch,
             batch_rows: actual.batch_rows(),
             rows,
+            projection: input.projection().cloned(),
         })
     }
     fn mask(
@@ -522,13 +641,18 @@ impl ActualInvocationDomain {
             batch,
             batch_rows: self.batch_rows,
             rows: mapped,
+            projection: self.projection.clone(),
         }))
     }
     pub(super) fn rows(&self) -> &[usize] {
         &self.rows
     }
     pub(super) fn column(&self, ordinal: usize) -> Option<&ArrayRef> {
-        self.batch.columns().get(ordinal)
+        let physical = match &self.projection {
+            Some(projection) => projection.ordinals().binary_search(&ordinal).ok()?,
+            None => ordinal,
+        };
+        self.batch.columns().get(physical)
     }
     pub(super) fn selection(
         &self,

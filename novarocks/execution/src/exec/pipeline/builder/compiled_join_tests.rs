@@ -2759,3 +2759,184 @@ fn b3_input_and_finalize_operators_preserve_the_first_prepare_refusal() {
         }
     }
 }
+
+#[test]
+fn b3_residual_gathers_only_original_referenced_columns_from_published_pages() {
+    use crate::exec::{
+        expr::compiled_program::CompiledExpressionInstance,
+        operators::{
+            compiled_expression::{RuntimeKernelControl, evaluate_projected_chunk_all},
+            hashjoin::{
+                JoinPairRow, JoinParticipants, ProjectedJoinGather,
+                compiled_hash_join::{
+                    CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
+                    CompiledJoinInputSinkFactory, frame_fixture_chunks,
+                },
+            },
+        },
+        pipeline::operator_factory::OperatorFactory,
+    };
+    use crate::runtime::mem_tracker::MemTracker;
+    use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
+    let mut packages = packages(&single_plan_with_dop(
+        Spec::hash(JoinKind::Inner, true),
+        &LEFT_ROWS,
+        &RIGHT_ROWS,
+        3,
+    ));
+    let program = compile(packages.remove(&SINGLE).unwrap(), 3, true);
+    let node = program.graph().root();
+    let declaration = Arc::new(CompiledJoinFrame::new(
+        Arc::clone(&program),
+        Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap()),
+        JoinParticipants {
+            inputs: 2,
+            finalizers: NonZeroUsize::new(3).unwrap(),
+            probes: 1,
+            tails: 0,
+        },
+        None,
+    ));
+    let runtime = RuntimeState::default();
+    let error = runtime.error_state();
+    let tracker = MemTracker::new_root("B3 real minimal residual projection");
+    let factory = super::aggregate_fixture::runtime_construction_factory(
+        Arc::clone(&tracker),
+        Arc::clone(&error),
+    );
+    let inputs =
+        CompiledJoinInputSinkFactory::new(Arc::clone(&declaration), Arc::clone(&error), None);
+    let finalize =
+        CompiledJoinFinalizeSourceFactory::new(Arc::clone(&declaration), Arc::clone(&error));
+    let mut sources: Vec<_> = (0..3).map(|id| finalize.create(3, id)).collect();
+    let mut sinks: Vec<_> = (0..2).map(|id| inputs.create(2, id)).collect();
+    for operator in sources.iter_mut().chain(sinks.iter_mut()) {
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        operator.set_construction_factory(Arc::clone(&factory));
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
+    }
+    for (sink, chunk) in sinks
+        .iter_mut()
+        .zip(frame_fixture_chunks(&program, &factory).unwrap())
+    {
+        let mut driver = TestDriver::new(sink.as_mut(), &runtime);
+        driver.input_without_output(chunk).unwrap();
+        driver.signal_eos().unwrap();
+        driver.advance_to_boundary().unwrap();
+    }
+    for source in &mut sources {
+        assert!(
+            TestDriver::new(source.as_mut(), &runtime)
+                .collect_until_finished()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let frame = declaration.prepared().unwrap();
+    let published = frame.completion.published().unwrap().unwrap();
+    let ProgramNodeKind::Join {
+        left_layout,
+        right_layout,
+        join_scope_layout,
+        ..
+    } = program.graph().nodes()[node.index()].kind()
+    else {
+        panic!("original join");
+    };
+    let probe_schema = factory.create_compiled_chunk_schema(left_layout).unwrap();
+    let build_schema = factory.create_compiled_chunk_schema(right_layout).unwrap();
+    let scope = factory
+        .create_compiled_chunk_schema(join_scope_layout)
+        .unwrap();
+    let owner = factory.begin_typed_construction(&scope).unwrap();
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(vec![Some(1), None, Some(9)])),
+        Arc::new(Int64Array::from(vec![Some(10), None, Some(300)])),
+    ];
+    let probe = crate::exec::chunk::Chunk::try_new_typed_with_columns_owned_observed::<
+        crate::exec::pipeline::operator::ConstructionFailure,
+        _,
+    >(
+        probe_schema.clone(),
+        columns,
+        3,
+        owner.storage_lifetime(),
+        |step| owner.observe(0, &[], step),
+    )
+    .unwrap();
+    let mut control = RuntimeKernelControl::new(Arc::clone(&error));
+    control.bind_mem_tracker(Arc::clone(&tracker));
+    control.bind_construction_factory(Arc::clone(&factory));
+    control.bind_runtime_memory(&runtime);
+    let host = control.allocator().unwrap();
+    let site = ProgramExpressionRootSite::Node {
+        node,
+        role: ProgramNodeExpressionRole::JoinResidual,
+    };
+    let mut instance = CompiledExpressionInstance::try_new_with_allocator(
+        Arc::clone(&program),
+        site,
+        &control,
+        Some(Arc::clone(&host)),
+    )
+    .unwrap();
+    let projection = ProjectedJoinGather::new(
+        scope,
+        &probe_schema,
+        &build_schema,
+        &instance,
+        owner.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(projection.projection().ordinals(), [1, 3]);
+    let pairs = [
+        JoinPairRow {
+            probe: Some(0),
+            build: Some(published.artifact.rows.row(20).unwrap()),
+        },
+        JoinPairRow {
+            probe: Some(1),
+            build: Some(published.artifact.rows.row(305).unwrap()),
+        },
+        JoinPairRow {
+            probe: Some(2),
+            build: Some(published.artifact.rows.row(70).unwrap()),
+        },
+    ];
+    let compact = projection
+        .gather(
+            &probe,
+            &published.artifact.rows,
+            &pairs,
+            owner.as_ref(),
+            &host,
+            &control,
+        )
+        .unwrap();
+    assert_eq!(compact.columns().len(), 2);
+    assert_eq!(projection.declared().slots().len(), 4);
+    let mask = evaluate_projected_chunk_all(
+        &mut instance,
+        site,
+        &compact,
+        projection.declared(),
+        projection.projection(),
+        &control,
+    )
+    .unwrap();
+    assert_eq!(
+        mask.as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(true), None, Some(false)]
+    );
+    for operator in sources.iter_mut().chain(sinks.iter_mut()) {
+        operator.begin_exit().unwrap();
+        operator.close().unwrap();
+    }
+    assert!(runtime.error().is_none());
+}

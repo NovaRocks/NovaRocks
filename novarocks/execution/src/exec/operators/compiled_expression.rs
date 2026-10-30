@@ -261,6 +261,32 @@ pub(crate) fn evaluate_chunk_all(
     )
 }
 
+/// The same root evaluator over an explicitly mapped, physically compact port.
+/// The complete frozen declaration remains independent of its materialized
+/// columns. No placeholder Array is constructed for an unreferenced channel.
+pub(crate) fn evaluate_projected_chunk_all(
+    instance: &mut CompiledExpressionInstance,
+    site: ProgramExpressionRootSite,
+    input: &Chunk,
+    declared: &ChunkSchema,
+    projection: &Arc<crate::exec::expr::compiled_program::input_source::InputColumnProjection>,
+    control: &RuntimeKernelControl,
+) -> ExecutionResult<ArrayRef> {
+    let loan = CompiledInputLoan::from_projected_chunk(input, declared, projection, control)?;
+    evaluate_selection(
+        instance,
+        site,
+        loan,
+        Selection::all(input.len()),
+        if input.is_empty() {
+            novarocks_functions::ScalarInvocationActivation::ValidateOnly
+        } else {
+            novarocks_functions::ScalarInvocationActivation::Activated
+        },
+        control,
+    )
+}
+
 /// Evaluate one root over exactly the strictly increasing batch rows `rows`
 /// and return one value per selected row, in selection order. Unselected rows
 /// are never evaluated, so they raise no row error; a selected row's error is

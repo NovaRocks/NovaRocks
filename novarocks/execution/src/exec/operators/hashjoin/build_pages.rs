@@ -242,6 +242,20 @@ impl PayloadPageLoan<'_> {
     pub(crate) fn schema(&self) -> &ChunkSchema {
         self.0.chunk_schema()
     }
+    /// Continue the original finite holders without retaining this page's
+    /// RecordBatch or the entire build artifact in an output alias.
+    pub(crate) fn source_storage_lifetime_observed<
+        E: From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+    >(
+        &self,
+        storage: ValueTypeStorageLifetime,
+        request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+    ) -> Result<ValueTypeStorageLifetime, E> {
+        self.0
+            .clone()
+            .into_chunk()
+            .source_storage_lifetime_observed(storage, request)
+    }
     pub(crate) fn column(&self, column: usize) -> ExecutionResult<TypedPayloadColumnLoan<'_>> {
         let array = self
             .0
