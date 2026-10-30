@@ -27,7 +27,6 @@
 //! SharedBuild is a local layout, independent of the network distribution.
 //! Runtime-filter producers receive each key once from the actual E participants.
 
-use super::join_hash_map::build_store::BuildStoreChunkProjection;
 use crate::exec::fragment::error::{
     FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
 };
@@ -42,33 +41,19 @@ use novarocks_local_program::{
     ProgramNodeId, ProgramNodeKind,
 };
 
-use super::build_artifact::{BuildView, JoinBuildArtifact};
-use super::build_requirements::{
-    BuildComponentRequirements, NullKeyRequirement, required_build_components,
-};
-use super::join_hash_map::build_store::BuildStoreBuilder;
-use super::join_hash_map::finalize::is_all_match_one;
-use super::join_hash_map::gather::{
-    JoinGatherError, MAX_JOIN_OUTPUT_ROWS_PER_BATCH, TypedJoinBatch, filter_probe_typed,
-    gather_left_with_null_right_typed, gather_probe_build_batches_typed,
-};
-use super::join_hash_map::method::{JoinCursorFailure, JoinHashMap, JoinKeyBuild, JoinPairCursor};
-use super::join_hash_map::search::JoinSelection;
+use super::build_requirements::{BuildComponentRequirements, required_build_components};
 use super::native_runtime_filter::{
     NativeRuntimeFilterProducerFactory, NativeRuntimeFilterProducerSet,
 };
+use super::typed_gather::JoinGatherError;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::hash_table::partition_keys::source_key_owner;
-use crate::exec::hash_table::{
-    allocation::AggregateAllocator,
-    key_index::{BulkWork, PreparedKeyBatch},
-};
+use crate::exec::hash_table::{allocation::AggregateAllocator, key_index::BulkWork};
 use crate::exec::node::join::JoinType;
 use crate::exec::operators::compiled_expression::{
-    RuntimeKernelControl, evaluate_all, instances, root_value_type,
+    RuntimeKernelControl, instances, root_value_type,
 };
-use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };

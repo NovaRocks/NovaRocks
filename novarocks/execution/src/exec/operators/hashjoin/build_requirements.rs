@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::exec::node::join::JoinType;
-use crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapBuildPurpose;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LookupRequirement {
@@ -62,14 +61,6 @@ impl BuildComponentRequirements {
             self.lookup,
             LookupRequirement::Membership | LookupRequirement::RowMatches
         )
-    }
-
-    pub(crate) fn join_hash_map_purpose(self) -> Option<JoinHashMapBuildPurpose> {
-        match self.lookup {
-            LookupRequirement::NotNeeded => None,
-            LookupRequirement::Membership => Some(JoinHashMapBuildPurpose::PresenceOnly),
-            LookupRequirement::RowMatches => Some(JoinHashMapBuildPurpose::RowMatches),
-        }
     }
 }
 
@@ -129,8 +120,8 @@ pub(crate) fn required_build_components(
                 NullKeyRequirement::NullKeyRows,
             ),
             JoinType::NullAwareLeftAnti => BuildComponentRequirements {
-                // Current probe code calls lookup_group_ids() in the no-residual NAAJ path,
-                // so membership-only DirectIntSet is not sufficient here.
+                // General NAA retains physical candidate topology even without E;
+                // signed linear modes decide membership without scanning it.
                 lookup: LookupRequirement::RowMatches,
                 row_payload: RowPayloadRequirement::NotNeeded,
                 match_flags: MatchFlagRequirement::NotNeeded,
@@ -157,10 +148,6 @@ mod tests {
         assert_eq!(req.lookup, LookupRequirement::Membership);
         assert_eq!(req.row_payload, RowPayloadRequirement::NotNeeded);
         assert_eq!(req.match_flags, MatchFlagRequirement::NotNeeded);
-        assert_eq!(
-            req.join_hash_map_purpose(),
-            Some(JoinHashMapBuildPurpose::PresenceOnly)
-        );
     }
 
     #[test]
@@ -169,10 +156,6 @@ mod tests {
         assert_eq!(req.lookup, LookupRequirement::Membership);
         assert_eq!(req.row_payload, RowPayloadRequirement::NotNeeded);
         assert_eq!(req.match_flags, MatchFlagRequirement::NotNeeded);
-        assert_eq!(
-            req.join_hash_map_purpose(),
-            Some(JoinHashMapBuildPurpose::PresenceOnly)
-        );
     }
 
     #[test]
@@ -180,10 +163,6 @@ mod tests {
         let req = required_build_components(JoinType::LeftSemi, true, true, true);
         assert_eq!(req.lookup, LookupRequirement::RowMatches);
         assert_eq!(req.row_payload, RowPayloadRequirement::Required);
-        assert_eq!(
-            req.join_hash_map_purpose(),
-            Some(JoinHashMapBuildPurpose::RowMatches)
-        );
     }
 
     #[test]
@@ -200,10 +179,6 @@ mod tests {
         assert_eq!(req.lookup, LookupRequirement::RowMatches);
         assert_eq!(req.row_payload, RowPayloadRequirement::NotNeeded);
         assert_eq!(req.null_keys, NullKeyRequirement::HasAnyNullKey);
-        assert_eq!(
-            req.join_hash_map_purpose(),
-            Some(JoinHashMapBuildPurpose::RowMatches)
-        );
     }
 
     #[test]
@@ -219,7 +194,6 @@ mod tests {
         let req = required_build_components(JoinType::Inner, false, true, false);
         assert_eq!(req.lookup, LookupRequirement::NotNeeded);
         assert_eq!(req.row_payload, RowPayloadRequirement::Required);
-        assert_eq!(req.join_hash_map_purpose(), None);
     }
 
     #[test]

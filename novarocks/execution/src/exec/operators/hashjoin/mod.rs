@@ -24,7 +24,6 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-mod build_artifact;
 mod build_capture;
 mod build_collection;
 mod build_csr;
@@ -37,20 +36,20 @@ pub(crate) mod build_state;
 pub(crate) mod compiled_hash_join;
 mod csr_slots;
 mod join_completion;
-mod join_hash_map;
-mod join_hash_table;
 mod key_build_worker;
 mod naa_index;
 pub(crate) mod native_runtime_filter;
 mod tail_ranges;
+mod typed_gather;
 
-pub(crate) use join_hash_map::gather::{
-    CanonicalJoinOutput, JoinGatherError, JoinPairRow, PagedJoinGather, ProjectedJoinGather,
-    TypedJoinBatch, filter_probe_typed, gather_join_batch_typed, gather_left_with_null_right_typed,
-};
-#[cfg(test)]
-pub(crate) use join_hash_map::gather::{
-    MAX_JOIN_OUTPUT_ROWS_PER_BATCH, gather_probe_build_batches_typed,
+pub(crate) use typed_gather::{
+    CanonicalJoinOutput, JoinPairRow, PagedJoinGather, ProjectedJoinGather,
 };
 
 pub(crate) use join_completion::JoinParticipants;
+
+#[cfg(test)]
+pub(crate) use build_pages::tests::paged_fixture_rows;
+
+#[cfg(test)]
+pub(crate) use typed_gather::JoinGatherError;

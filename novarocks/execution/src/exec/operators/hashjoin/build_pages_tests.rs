@@ -421,3 +421,32 @@ fn directory_refusal_retains_the_original_cause_and_cannot_publish_partial_rows(
     assert!(cause.same_occurrence(&original));
     assert!(begin.fail(cause).same_occurrence(&original));
 }
+
+pub(crate) fn paged_fixture_rows(
+    source: &crate::exec::chunk::Chunk,
+    owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    tracker: &Arc<crate::runtime::mem_tracker::MemTracker>,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> Arc<crate::exec::operators::hashjoin::build_pages::BuildRows> {
+    use crate::exec::operators::hashjoin::{
+        build_capture::InputRunWriter,
+        build_pages::{
+            B3RunId, BuildRows,
+            tests::{collect, work},
+        },
+        build_state::ProjectionDomains,
+    };
+    let work = work(owner, tracker, control);
+    let domains = ProjectionDomains::PayloadOnly;
+    let mut writer = InputRunWriter::new(
+        &domains,
+        B3RunId::from_input_slot(0, 1).unwrap(),
+        true,
+        &work,
+    )
+    .unwrap();
+    writer.push_payload(source, &work).unwrap();
+    let receipt = writer.seal(&work).unwrap();
+    let (inputs, _lease) = collect(vec![receipt], &work);
+    BuildRows::from_inputs(inputs, &domains, &work).unwrap().0
+}

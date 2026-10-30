@@ -20,7 +20,7 @@
 
 use super::*;
 use crate::exec::{
-    chunk::{ChunkSchemaRef, ChunkSlotSchema},
+    chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema},
     expr::compiled_program::{CompiledExpressionInstance, input_source::InputColumnProjection},
     operators::hashjoin::{
         build_pages::{B3RunId, BuildPageAddress, BuildPageProjection, BuildRowId, BuildRows},

@@ -1804,9 +1804,7 @@ fn join_nested_fixture_source(id: u32, json: bool) -> crate::exec::chunk::Chunk 
 
 #[test]
 fn compiled_join_gather_rejects_nested_domain_and_child_null_drift() {
-    use crate::exec::operators::hashjoin::{
-        JoinGatherError, gather_join_batch_typed, gather_probe_build_batches_typed,
-    };
+    use crate::exec::operators::hashjoin::{JoinGatherError, PagedJoinGather};
     use crate::runtime::mem_tracker::MemTracker;
     use novarocks_type_contract::ValueTypeStorageLifetime;
     let left = join_nested_fixture_source(901, true);
@@ -1816,9 +1814,6 @@ fn compiled_join_gather_rejects_nested_domain_and_child_null_drift() {
         tracker.clone(),
         Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
     );
-    let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::new(
-        crate::runtime::runtime_state::RuntimeErrorState::default(),
-    ));
     for (left_id, json, child_nullable) in
         [(901, false, true), (901, true, false), (903, true, true)]
     {
@@ -1833,34 +1828,12 @@ fn compiled_join_gather_rejects_nested_domain_and_child_null_drift() {
             .unwrap(),
         );
         let owner = factory.begin_typed_construction(&declared).unwrap();
-        let scratch = factory.begin_typed_construction(&declared).unwrap();
-        // Both real consumers use the same complete declaration author, before
-        // any take allocation or nullable repair can hide source drift.
         assert!(matches!(
-            gather_join_batch_typed(
-                &left,
-                &right,
-                &[0],
-                &[0],
-                &declared,
-                owner.as_ref(),
-                scratch.as_ref(),
-                &control
-            ),
-            Err(JoinGatherError::Source(_))
-        ));
-        assert!(matches!(
-            gather_probe_build_batches_typed(
-                &left,
-                &right,
-                &[0],
-                &[0],
-                &declared,
-                true,
-                false,
-                owner.as_ref(),
-                scratch.as_ref(),
-                &control
+            PagedJoinGather::new(
+                declared,
+                &left.chunk_schema(),
+                &right.chunk_schema(),
+                owner.as_ref()
             ),
             Err(JoinGatherError::Source(_))
         ));
@@ -1871,7 +1844,9 @@ fn compiled_join_gather_rejects_nested_domain_and_child_null_drift() {
 
 #[test]
 fn compiled_join_gather_null_extension_requires_declared_nullable_binding() {
-    use crate::exec::operators::hashjoin::{JoinGatherError, gather_left_with_null_right_typed};
+    use crate::exec::operators::hashjoin::{
+        CanonicalJoinOutput, JoinGatherError, JoinPairRow, PagedJoinGather,
+    };
     use crate::runtime::mem_tracker::MemTracker;
     use novarocks_type_contract::ValueTypeStorageLifetime;
     let left = join_nested_fixture_source(901, true);
@@ -1895,20 +1870,32 @@ fn compiled_join_gather_null_extension_requires_declared_nullable_binding() {
         .unwrap(),
     );
     let owner = factory.begin_typed_construction(&required).unwrap();
-    let scratch = factory.begin_typed_construction(&required).unwrap();
+    let rows = crate::exec::operators::hashjoin::paged_fixture_rows(
+        &right,
+        owner.as_ref(),
+        &tracker,
+        &control,
+    );
+    let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
+    let pairs = [JoinPairRow {
+        probe: Some(0),
+        build: None,
+    }];
+    let gather = PagedJoinGather::new_canonical(
+        required,
+        &left.chunk_schema(),
+        &right.chunk_schema(),
+        CanonicalJoinOutput::Pairs,
+        owner.as_ref(),
+    )
+    .unwrap();
     assert!(matches!(
-        gather_left_with_null_right_typed(
-            &left,
-            &[0],
-            &right.chunk_schema_ref(),
-            &required,
-            owner.as_ref(),
-            scratch.as_ref(),
-            &control
-        ),
+        gather.gather(Some(&left), &rows, &pairs, owner.as_ref(), &host, &control),
         Err(JoinGatherError::Source(_))
     ));
-    drop(scratch);
+    drop(gather);
+    drop(rows);
     drop(owner);
     let nullable = Arc::new(
         crate::exec::chunk::ChunkSchema::try_new_typed(
@@ -1921,18 +1908,23 @@ fn compiled_join_gather_null_extension_requires_declared_nullable_binding() {
         .unwrap(),
     );
     let owner = factory.begin_typed_construction(&nullable).unwrap();
-    let scratch = factory.begin_typed_construction(&nullable).unwrap();
-    let batch = gather_left_with_null_right_typed(
-        &left,
-        &[0],
-        &right.chunk_schema_ref(),
-        &nullable,
+    let rows = crate::exec::operators::hashjoin::paged_fixture_rows(
+        &right,
         owner.as_ref(),
-        scratch.as_ref(),
+        &tracker,
         &control,
+    );
+    let gather = PagedJoinGather::new_canonical(
+        nullable,
+        &left.chunk_schema(),
+        &right.chunk_schema(),
+        CanonicalJoinOutput::Pairs,
+        owner.as_ref(),
     )
-    .unwrap()
     .unwrap();
+    let batch = gather
+        .gather(Some(&left), &rows, &pairs, owner.as_ref(), &host, &control)
+        .unwrap();
     let chunk = batch.into_chunk(owner.as_ref()).unwrap();
     assert_eq!(chunk.record_batch().column(1).null_count(), 1);
     assert!(chunk.chunk_schema().slots()[1].typed_binding().nullable());
@@ -1950,7 +1942,8 @@ fn compiled_join_gather_null_extension_requires_declared_nullable_binding() {
             .value_type()
             .child_type_at(0)
     );
-    drop(scratch);
+    drop(gather);
+    drop(rows);
     drop(owner);
     drop(factory);
     assert!(tracker.current() > 0);
@@ -2203,7 +2196,6 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
 #[test]
 fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_cursor() {
     use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::operators::hashjoin::MAX_JOIN_OUTPUT_ROWS_PER_BATCH;
     use crate::exec::pipeline::{
         input::RawInput,
         step::{AdmissionNext, InputResult, NextStep},
@@ -2310,11 +2302,6 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
     assert!(
         output.len() > 1,
         "duplicate occurrences must survive multiple transferred pages"
-    );
-    assert!(
-        output
-            .iter()
-            .all(|page| page.len() <= MAX_JOIN_OUTPUT_ROWS_PER_BATCH)
     );
     assert_eq!(
         sorted(int64_rows(&output)),
