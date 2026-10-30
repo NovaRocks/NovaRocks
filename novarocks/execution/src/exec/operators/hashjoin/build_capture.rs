@@ -76,6 +76,8 @@ pub(crate) struct InputRunWriter {
     captures: Option<OpenCaptures>,
     pages: Vec<Arc<BuildPageData>>,
     rows: usize,
+    ordinary_nulls: Option<usize>,
+    ordinary_null_pages: Vec<usize>,
     summary: ProjectionRunSummary,
     payload_required: bool,
     failed: Option<ExecutionFailure>,
@@ -142,6 +144,8 @@ impl InputRunWriter {
             captures: Some(captures),
             pages: Vec::new(),
             rows: 0,
+            ordinary_nulls: matches!(domains, ProjectionDomains::Naa { .. }).then_some(0),
+            ordinary_null_pages: Vec::new(),
             summary,
             payload_required,
             failed: None,
@@ -349,6 +353,22 @@ impl InputRunWriter {
         let rows = source.len();
         let end = self.rows.checked_add(rows).ok_or_else(arithmetic)?;
         record_ids(&mut self.summary, ids, self.pages.len())?;
+        if let Some(total) = &mut self.ordinary_nulls {
+            let facts = nulls
+                .as_ref()
+                .ok_or_else(|| build_contract("NAA page has no original NULL observation"))?;
+            if !facts.ordinary_row_indices().is_empty() {
+                *total = total
+                    .checked_add(facts.ordinary_row_indices().len())
+                    .ok_or_else(arithmetic)?;
+                push_owned(
+                    &mut self.ordinary_null_pages,
+                    self.pages.len(),
+                    &mut self.table_storage,
+                    work,
+                )?;
+            }
+        }
         let page = funded_shared(
             work.owner,
             BuildPageData {
@@ -418,6 +438,8 @@ impl InputRunWriter {
                 run: self.run,
                 pages: std::mem::take(&mut self.pages),
                 rows: self.rows,
+                ordinary_nulls: self.ordinary_nulls,
+                ordinary_null_pages: std::mem::take(&mut self.ordinary_null_pages),
                 summary: self.summary,
                 _table_storage: self.table_storage.clone(),
                 _header_storage: work.owner.storage_lifetime(),
@@ -533,6 +555,7 @@ fn value_nulls(
         }
     }
     let mut facts = Vec::new();
+    let mut ordinary_rows = Vec::new();
     let mut storage = work.owner.storage_lifetime();
     for row in 0..rows {
         checkpoint(row, work)?;
@@ -546,10 +569,14 @@ fn value_nulls(
                 &mut storage,
                 work,
             )?;
+            if ordinary[row] {
+                push_owned(&mut ordinary_rows, row, &mut storage, work)?;
+            }
         }
     }
     Ok(ValueNullFacts {
         rows: facts,
+        ordinary_rows,
         _storage: storage,
     })
 }

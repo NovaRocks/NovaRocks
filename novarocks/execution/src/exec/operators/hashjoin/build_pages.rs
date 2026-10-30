@@ -159,6 +159,7 @@ impl ValueNullRow {
 }
 pub(crate) struct ValueNullFacts {
     pub(super) rows: Vec<ValueNullRow>,
+    pub(super) ordinary_rows: Vec<usize>,
     pub(super) _storage: ValueTypeStorageLifetime,
 }
 impl ValueNullFacts {
@@ -169,10 +170,10 @@ impl ValueNullFacts {
         !self.rows.is_empty()
     }
     pub(crate) fn ordinary_rows(&self) -> impl Iterator<Item = usize> + '_ {
-        self.rows
-            .iter()
-            .filter(|row| row.ordinary)
-            .map(|row| row.row)
+        self.ordinary_rows.iter().copied()
+    }
+    pub(crate) fn ordinary_row_indices(&self) -> &[usize] {
+        &self.ordinary_rows
     }
     pub(crate) fn nullsafe_only_rows(&self) -> impl Iterator<Item = usize> + '_ {
         self.rows
@@ -194,12 +195,19 @@ pub(crate) struct PayloadRunPages {
     pub(super) run: B3RunId,
     pub(super) pages: Vec<Arc<BuildPageData>>,
     pub(super) rows: usize,
+    pub(super) ordinary_nulls: Option<usize>,
+    pub(super) ordinary_null_pages: Vec<usize>,
     pub(super) summary: ProjectionRunSummary,
     // Page-vector backing and this Arc header may have different creators.
     pub(super) _table_storage: ValueTypeStorageLifetime,
     pub(super) _header_storage: ValueTypeStorageLifetime,
 }
 impl PayloadRunPages {
+    pub(crate) fn ordinary_null_pages(&self) -> ExecutionResult<&[usize]> {
+        self.ordinary_nulls
+            .ok_or_else(|| build_contract("join run has no original NAA NULL directory"))?;
+        Ok(&self.ordinary_null_pages)
+    }
     pub(crate) fn len(&self) -> usize {
         self.rows
     }
@@ -342,6 +350,7 @@ impl ProjectionRunMap {
 pub(crate) struct BuildRows {
     runs: Vec<Option<RunEntry>>,
     rows: usize,
+    ordinary_nulls: Option<usize>,
     ordinary: Option<ProjectionRunMap>,
     group: Option<ProjectionRunMap>,
     full: Option<ProjectionRunMap>,
@@ -417,6 +426,7 @@ impl BuildRows {
             .transpose()?;
         let mut full_captures = funded_vec(work.owner, if full.is_some() { count } else { 0 })?;
         let mut moved = 0;
+        let mut ordinary_nulls = matches!(domains, ProjectionDomains::Naa { .. }).then_some(0usize);
         while let Some(receipt) = inputs.pop() {
             checkpoint(moved, work)?;
             moved += 1;
@@ -427,6 +437,12 @@ impl BuildRows {
             } = receipt;
             if run.index() != count - moved || run != pages.run {
                 return Err(build_contract("join receipt and page run differ"));
+            }
+            if let Some(total) = &mut ordinary_nulls {
+                let count = pages
+                    .ordinary_nulls
+                    .ok_or_else(|| build_contract("NAA E receipt has no original NULL count"))?;
+                *total = total.checked_add(count).ok_or_else(arithmetic)?;
             }
             let slot = runs
                 .get_mut(run.0)
@@ -551,6 +567,7 @@ impl BuildRows {
             Self {
                 runs,
                 rows,
+                ordinary_nulls,
                 ordinary,
                 group,
                 full,
@@ -565,6 +582,12 @@ impl BuildRows {
     }
     pub(crate) fn run_count(&self) -> usize {
         self.runs.len()
+    }
+    /// Only the actual no-group physical domain may use this whole-build
+    /// summary. Scoped consumers must query their original group NULL CSR.
+    pub(crate) fn ordinary_null_count(&self) -> ExecutionResult<usize> {
+        self.ordinary_nulls
+            .ok_or_else(|| build_contract("join data has no original NAA NULL summary"))
     }
     fn entry(&self, run: B3RunId) -> ExecutionResult<&RunEntry> {
         self.runs
@@ -618,6 +641,14 @@ impl BuildRows {
         }
         Ok(BuildRowId(entry.start + page.start + address.row))
     }
+    pub(crate) fn row_in_page(
+        &self,
+        run: B3RunId,
+        page: usize,
+        row: usize,
+    ) -> ExecutionResult<BuildRowId> {
+        self.row_id(BuildPageAddress { run, page, row })
+    }
     /// Original E observation, not a value comparison or a per-column posting.
     pub(crate) fn has_ordinary_value_null(
         &self,
@@ -629,10 +660,9 @@ impl BuildRows {
             build_contract("NAA NULL row selection has no original value observation")
         })?;
         Ok(facts
-            .rows
-            .binary_search_by_key(&address.row, |row| row.row)
-            .ok()
-            .is_some_and(|index| facts.rows[index].ordinary))
+            .ordinary_row_indices()
+            .binary_search(&address.row)
+            .is_ok())
     }
     pub(crate) fn address_for_assignment(
         &self,

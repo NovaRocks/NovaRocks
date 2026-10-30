@@ -29,7 +29,7 @@ use super::{
         IndexedBuild, ProjectionBuild, ProjectionCapture, ProjectionStep, ProjectionWorker,
         ProjectionWorkers,
     },
-    build_state::{ProjectionDomains, build_contract},
+    build_state::{NaaValueMode, ProjectionDomains, build_contract},
     join_completion::{
         JoinCompletion, JoinParticipants, PublishResult, RemainingDemand, funded_shared,
     },
@@ -55,6 +55,7 @@ pub(crate) enum BuildLookup {
     PayloadOnly,
     Ordinary(Arc<IndexedBuild>),
     Naa {
+        value_mode: NaaValueMode,
         group: Option<Arc<IndexedBuild>>,
         full: Arc<IndexedBuild>,
     },
@@ -100,6 +101,7 @@ enum Projections {
     PayloadOnly,
     Ordinary(ProjectionSlot),
     Naa {
+        value_mode: NaaValueMode,
         group: Option<ProjectionSlot>,
         full: ProjectionSlot,
     },
@@ -116,12 +118,17 @@ impl Projections {
         match self {
             Self::PayloadOnly => Some(BuildLookup::PayloadOnly),
             Self::Ordinary(slot) => Some(BuildLookup::Ordinary(Arc::clone(slot.ready.get()?))),
-            Self::Naa { group, full } => {
+            Self::Naa {
+                value_mode,
+                group,
+                full,
+            } => {
                 let group = match group {
                     Some(slot) => Some(Arc::clone(slot.ready.get()?)),
                     None => None,
                 };
                 Some(BuildLookup::Naa {
+                    value_mode: *value_mode,
                     group,
                     full: Arc::clone(full.ready.get()?),
                 })
@@ -344,6 +351,7 @@ impl JoinBuildFrame {
                 ) => Projections::Ordinary(make(keys, domain, *purpose, ProjectionKind::Ordinary)?),
                 (
                     ProjectionDomains::Naa {
+                        value_mode,
                         group: group_domain,
                         full: full_domain,
                         full_purpose,
@@ -366,6 +374,7 @@ impl JoinBuildFrame {
                         }
                     };
                     Projections::Naa {
+                        value_mode: *value_mode,
                         group,
                         full: make(full, full_domain, *full_purpose, ProjectionKind::Full)?,
                     }

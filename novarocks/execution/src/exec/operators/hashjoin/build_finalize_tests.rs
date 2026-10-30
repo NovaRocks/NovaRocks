@@ -499,6 +499,7 @@ fn naa_two_original_projections_make_progress_without_cross_domain_coordinate_gu
     let BuildLookup::Naa {
         group: Some(group),
         full,
+        ..
     } = &published.artifact.lookup
     else {
         panic!("two authored NAA projections");

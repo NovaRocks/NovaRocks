@@ -127,9 +127,12 @@ fn naa_value_null_facts_exclude_scope_null_and_separate_ordinary_from_nullsafe_o
     assert!(values.column(2).is_err());
     assert_eq!(values.prepared(&work).unwrap().len(), 5);
     let receipt = writer.seal(&work).unwrap();
+    assert_eq!(receipt.pages.ordinary_nulls, Some(2));
+    assert_eq!(receipt.pages.ordinary_null_pages().unwrap(), [0]);
     let (inputs, _begin) = collect(vec![receipt], &work);
     let (rows, captures) = BuildRows::from_inputs(inputs, &domains, &work).unwrap();
     assert_eq!(rows.len(), 5);
+    assert_eq!(rows.ordinary_null_count().unwrap(), 2);
     let CapturesForGraphs::Naa {
         group: Some(group),
         full,
@@ -152,6 +155,95 @@ fn naa_value_null_facts_exclude_scope_null_and_separate_ordinary_from_nullsafe_o
     let _full = full
         .into_complete(full_domain, *full_purpose, &work)
         .unwrap();
+}
+
+#[test]
+fn no_scope_null_directory_skips_nonnull_and_nullsafe_only_pages_without_value_copies() {
+    let (owner, tracker) = fixture();
+    let work = work(owner.as_ref(), &tracker, &Control);
+    let types = [
+        FunctionValueType::new(DataType::Int32, true),
+        FunctionValueType::new(DataType::Int32, true),
+    ];
+    let domains = naa(
+        &types,
+        &[NullPolicy::Unmatchable, NullPolicy::Equal],
+        0..2,
+        &[],
+        IndexPurpose::PresenceOnly,
+        &work,
+    );
+    let mut receipts = Vec::new();
+    for (slot, pages) in [
+        vec![
+            (vec![Some(1); 4], vec![None; 4]),
+            (vec![], vec![]),
+            (
+                vec![None, Some(1), Some(2), None],
+                vec![Some(0), None, None, None],
+            ),
+        ],
+        vec![(vec![Some(4)], vec![None]), (vec![None], vec![Some(5)])],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut writer = InputRunWriter::new(
+            &domains,
+            B3RunId::from_input_slot(slot, 2).unwrap(),
+            false,
+            &work,
+        )
+        .unwrap();
+        for (ordinary, safe) in pages {
+            let arrays: Vec<ArrayRef> = vec![
+                Arc::new(Int32Array::from(ordinary)),
+                Arc::new(Int32Array::from(safe)),
+            ];
+            let page = writer
+                .push_evaluated(
+                    &source(arrays[0].len()),
+                    EvaluatedJoinKeyPage::Naa {
+                        scope: EvaluatedKeyProjection {
+                            arrays: &[],
+                            bindings: &[],
+                        },
+                        values: EvaluatedKeyProjection {
+                            arrays: &arrays,
+                            bindings: &types,
+                        },
+                    },
+                    &mut ValueConversionContext::default(),
+                    &work,
+                )
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                page.values().unwrap().column(0).unwrap().0,
+                &arrays[0]
+            ));
+        }
+        let receipt = writer.seal(&work).unwrap();
+        assert_eq!(
+            receipt.pages.ordinary_null_pages().unwrap(),
+            if slot == 0 { &[2][..] } else { &[1][..] }
+        );
+        receipts.push(receipt);
+    }
+    let (inputs, _lease) = collect(receipts, &work);
+    let (rows, _) = BuildRows::from_inputs(inputs, &domains, &work).unwrap();
+    assert_eq!(rows.len(), 10);
+    assert_eq!(rows.ordinary_null_count().unwrap(), 3);
+    let mut actual = Vec::new();
+    for slot in 0..2 {
+        let run = B3RunId::from_input_slot(slot, 2).unwrap();
+        for &index in rows.run(run).unwrap().ordinary_null_pages().unwrap() {
+            let page = rows.page(run, index).unwrap();
+            for &row in page.value_nulls().unwrap().ordinary_row_indices() {
+                actual.push(rows.row_in_page(run, index, row).unwrap().index());
+            }
+        }
+    }
+    assert_eq!(actual, [4, 7, 9]);
 }
 
 #[test]

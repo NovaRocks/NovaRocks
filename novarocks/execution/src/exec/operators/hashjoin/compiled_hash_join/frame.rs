@@ -21,7 +21,7 @@
 use super::super::{
     build_finalize::{FinalizeOptions, JoinBuildFrame},
     build_requirements::{LookupRequirement, MatchFlagRequirement},
-    build_state::{ProjectionDomains, build_contract},
+    build_state::{NaaValueMode, ProjectionDomains, build_contract},
     join_completion::{JoinParticipants, funded_vec},
 };
 use super::*;
@@ -214,7 +214,7 @@ impl CompiledJoinFrame {
             .ok_or_else(super::super::join_completion::arithmetic)?;
         let mut types = funded_vec(work.owner, width)?;
         let mut modes = funded_vec(work.owner, width)?;
-        let mut columns = funded_vec(work.owner, scope.len())?;
+        let mut columns = funded_vec(work.owner, width)?;
         for (column, key) in scope.iter().enumerate() {
             work.control.checkpoint(1)?;
             let key_ordinal = u32::try_from(column).map_err(|_| {
@@ -233,13 +233,36 @@ impl CompiledJoinFrame {
             types.push(ty.clone());
             modes.push(mode(key.null_safe));
         }
-        let group = if scope.is_empty() {
+        let value_mode = NaaValueMode::from_signed_values(
+            &plan.probe_key_bindings,
+            &plan.build_key_bindings,
+            &plan.eq_null_safe,
+            condition.residual_predicate().is_some(),
+            work.control,
+        )?;
+        if let NaaValueMode::SingleNullable { value } = value_mode {
+            for column in 0..values.len() {
+                work.control.checkpoint(1)?;
+                if column != value {
+                    columns.push(scope.len() + column);
+                }
+            }
+        }
+        let group = if columns.is_empty() {
             None
         } else {
-            Some(domain(&types[..scope.len()], &modes[..scope.len()])?)
+            let mut group_types = funded_vec(work.owner, columns.len())?;
+            let mut group_modes = funded_vec(work.owner, columns.len())?;
+            for &column in &columns {
+                work.control.checkpoint(1)?;
+                group_types.push(types[column].clone());
+                group_modes.push(modes[column]);
+            }
+            Some(domain(&group_types, &group_modes)?)
         };
         let full = domain(&types, &modes)?;
         Ok(ProjectionDomains::Naa {
+            value_mode,
             group,
             full,
             group_full_components: columns,

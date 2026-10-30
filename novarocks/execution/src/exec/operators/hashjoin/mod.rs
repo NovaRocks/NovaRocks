@@ -41,6 +41,7 @@ mod join_completion;
 mod join_hash_map;
 mod join_hash_table;
 mod key_build_worker;
+mod naa_index;
 pub(crate) mod native_runtime_filter;
 mod tail_ranges;
 

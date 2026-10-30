@@ -95,6 +95,7 @@ pub(crate) fn naa(
     let mut group_full_components = funded_vec(work.owner, indices.len()).unwrap();
     group_full_components.extend_from_slice(indices);
     ProjectionDomains::Naa {
+        value_mode: super::super::build_state::NaaValueMode::General,
         group,
         full,
         group_full_components,
