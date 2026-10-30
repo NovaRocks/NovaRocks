@@ -196,6 +196,12 @@ impl IndexView {
         self.purpose
     }
 
+    /// Observe the immutable layout already selected by original K. This
+    /// grants no strategy-selection, mutation, or scheduling authority.
+    pub(crate) fn is_direct(&self) -> bool {
+        matches!(self.backend, Backend::Direct(_))
+    }
+
     /// Immutable local coordinates selected by this original K build. These
     /// metadata reads do not enumerate input rows or mint new class IDs.
     pub(crate) fn partition_count(&self) -> usize {

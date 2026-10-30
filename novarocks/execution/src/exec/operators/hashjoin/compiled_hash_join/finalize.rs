@@ -81,6 +81,7 @@ impl OperatorFactory for CompiledJoinFinalizeSourceFactory {
             exit_failure: None,
             profiles: None,
             key_counters: None,
+            reports_partitions: driver_id == 0,
             partitions_recorded: false,
         }))
     }
@@ -99,7 +100,10 @@ struct JoinFinalizeSource {
     exit_wait: bool,
     exit_failure: Option<ExecutionFailure>,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
-    key_counters: Option<[crate::runtime::profile::CounterRef; 2]>,
+    key_counters: Option<[crate::runtime::profile::CounterRef; 3]>,
+    // Count the shared artifact once in the original additive task projection.
+    // This diagnostic role grants no scheduling or construction authority.
+    reports_partitions: bool,
     partitions_recorded: bool,
 }
 impl JoinFinalizeSource {
@@ -108,6 +112,7 @@ impl JoinFinalizeSource {
             let (calls, progress) = worker.key_work_facts();
             counters[0].set(i64::try_from(calls).unwrap_or(i64::MAX));
             counters[1].set(i64::try_from(progress).unwrap_or(i64::MAX));
+            counters[2].set(i64::from(progress != 0));
         }
         if self.partitions_recorded {
             return;
@@ -119,25 +124,49 @@ impl JoinFinalizeSource {
             Ok(Some(data)) => data,
             _ => return,
         };
+        let record_partition = |name, direct_name, partitions: usize, direct: bool| {
+            profile.unique.add_info_string(name, partitions.to_string());
+            if self.reports_partitions {
+                profile
+                    .unique
+                    .add_unit_counter(name)
+                    .set(i64::try_from(partitions).unwrap_or(i64::MAX));
+                profile
+                    .unique
+                    .add_unit_counter(direct_name)
+                    .set(i64::from(direct));
+            }
+        };
         use super::super::build_finalize::BuildLookup;
         match &published.artifact.lookup {
             BuildLookup::PayloadOnly => profile.unique.add_info_string("JoinLookup", "PayloadOnly"),
-            BuildLookup::Ordinary(full) => profile.unique.add_info_string(
-                "JoinFullPartitions",
-                full.view.partition_count().to_string(),
-            ),
-            BuildLookup::Naa { group, full, .. } => {
-                profile.unique.add_info_string(
+            BuildLookup::Ordinary(full) => {
+                record_partition(
                     "JoinFullPartitions",
-                    full.view.partition_count().to_string(),
+                    "JoinFullDirect",
+                    full.view.partition_count(),
+                    full.view.is_direct(),
                 );
-                profile.unique.add_info_string(
-                    "JoinGroupPartitions",
-                    group
-                        .as_ref()
-                        .map(|group| group.view.partition_count().to_string())
-                        .unwrap_or_else(|| "none".into()),
+            }
+            BuildLookup::Naa { group, full, .. } => {
+                record_partition(
+                    "JoinFullPartitions",
+                    "JoinFullDirect",
+                    full.view.partition_count(),
+                    full.view.is_direct(),
                 );
+                if let Some(group) = group {
+                    record_partition(
+                        "JoinGroupPartitions",
+                        "JoinGroupDirect",
+                        group.view.partition_count(),
+                        group.view.is_direct(),
+                    );
+                } else {
+                    profile
+                        .unique
+                        .add_info_string("JoinGroupPartitions", "none");
+                }
             }
         }
         self.partitions_recorded = true;
@@ -194,6 +223,7 @@ impl OperatorLifecycle for JoinFinalizeSource {
         self.key_counters = Some([
             profiles.unique.add_unit_counter("JoinKAdvanceCalls"),
             profiles.unique.add_unit_counter("JoinKProgressSteps"),
+            profiles.unique.add_unit_counter("JoinKProgressWorkers"),
         ]);
         self.profiles = Some(profiles);
     }

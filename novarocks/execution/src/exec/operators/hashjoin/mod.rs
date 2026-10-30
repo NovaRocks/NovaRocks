@@ -28,6 +28,8 @@ mod build_capture;
 mod build_collection;
 mod build_csr;
 mod build_finalize;
+#[cfg(test)]
+pub(crate) use build_finalize::BuildLookup;
 mod build_match_bitmap;
 mod build_pages;
 mod build_projection;

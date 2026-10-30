@@ -2372,9 +2372,12 @@ fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_complet
     assert!(factory.bind_pipeline_dop(2).is_err());
     let mut operators: Vec<_> = (0..3).map(|id| factory.create(3, id)).collect();
     let profiles = (0..3)
-        .map(|id| {
+        .map(|_| {
             crate::runtime::profile::OperatorProfiles::new(
-                crate::runtime::profile::RuntimeProfile::new(format!("actual F {id}")),
+                crate::runtime::profile::RuntimeProfile::new(format!(
+                    "COMPILED_JOIN_FINALIZE (id={})",
+                    node.index()
+                )),
             )
         })
         .collect::<Vec<_>>();
@@ -2489,6 +2492,40 @@ fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_complet
         );
     }
     assert_eq!(frame.completion.published().unwrap().unwrap().rows, 600);
+    // Exercise the original native projection: it drops info strings and
+    // sums counters across drivers. P must remain the artifact's actual P,
+    // while contributors must count only F that really advanced K.
+    let task_profile = crate::runtime::profile::RuntimeProfile::new("actual task");
+    for (id, profile) in profiles.iter().enumerate() {
+        task_profile
+            .child(format!("actual driver {id}"))
+            .add_child(profile.operator.clone());
+    }
+    let projection = crate::runtime::operator_statistics::project_operator_statistics(
+        &task_profile.to_native_tree(),
+    );
+    let [statistics] = projection.statistics() else {
+        panic!("original task projection must merge copies of the same F operator");
+    };
+    let counter = |name| {
+        statistics
+            .counters()
+            .iter()
+            .find(|counter| counter.name().as_str() == name)
+            .unwrap()
+            .value()
+    };
+    let published = frame.completion.published().unwrap().unwrap();
+    let crate::exec::operators::hashjoin::BuildLookup::Ordinary(full) = &published.artifact.lookup
+    else {
+        panic!("fixture has an ordinary original K index");
+    };
+    assert_eq!(
+        counter("JoinFullPartitions"),
+        full.view.partition_count() as i64
+    );
+    assert_eq!(counter("JoinKProgressWorkers"), progressing as i64);
+    assert_eq!(counter("JoinFullDirect"), i64::from(full.view.is_direct()));
     for operator in &mut operators {
         operator.begin_exit().unwrap();
         assert!(matches!(
