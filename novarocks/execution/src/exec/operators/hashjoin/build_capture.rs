@@ -58,6 +58,7 @@ pub(crate) enum EvaluatedJoinKeyPage<'a> {
     },
 }
 enum OpenCaptures {
+    PayloadOnly,
     Ordinary {
         writer: CaptureBuilder,
     },
@@ -90,6 +91,14 @@ impl InputRunWriter {
     ) -> ExecutionResult<Self> {
         validate_domains(domains, work)?;
         let (captures, summary) = match domains {
+            ProjectionDomains::PayloadOnly => {
+                if !payload_required {
+                    return Err(build_contract(
+                        "nested-loop input must retain its physical payload",
+                    ));
+                }
+                (OpenCaptures::PayloadOnly, ProjectionRunSummary::PayloadOnly)
+            }
             ProjectionDomains::Ordinary { keys, .. } => (
                 OpenCaptures::Ordinary {
                     writer: keys.begin_capture(&capture_work(work))?,
@@ -157,6 +166,23 @@ impl InputRunWriter {
         self.pages = Vec::new();
         original
     }
+    /// Direct NL page append: no K input, hashes, occurrence vector or router.
+    pub(crate) fn push_payload(
+        &mut self,
+        source: &Chunk,
+        work: &BulkWork<'_>,
+    ) -> ExecutionResult<BuildPageProjection> {
+        let result = (|| {
+            self.check(work)?;
+            if !matches!(self.captures, Some(OpenCaptures::PayloadOnly)) {
+                return Err(build_contract(
+                    "keyed join input cannot omit its evaluated keys",
+                ));
+            }
+            self.append_page(source, PageProjectionIds::PayloadOnly, None, None, work)
+        })();
+        result.map_err(|cause| self.latch(cause))
+    }
     pub(crate) fn push_evaluated(
         &mut self,
         source: &Chunk,
@@ -176,7 +202,6 @@ impl InputRunWriter {
     ) -> ExecutionResult<BuildPageProjection> {
         self.check(work)?;
         let rows = source.len();
-        let end = self.rows.checked_add(rows).ok_or_else(arithmetic)?;
         let mut occurrences = funded_vec(work.owner, rows)?;
         for row in 0..rows {
             checkpoint(row, work)?;
@@ -311,6 +336,18 @@ impl InputRunWriter {
                 ));
             }
         };
+        self.append_page(source, ids, values, nulls, work)
+    }
+    fn append_page(
+        &mut self,
+        source: &Chunk,
+        ids: PageProjectionIds,
+        values: Option<RetainedNaaValues>,
+        nulls: Option<ValueNullFacts>,
+        work: &BulkWork<'_>,
+    ) -> ExecutionResult<BuildPageProjection> {
+        let rows = source.len();
+        let end = self.rows.checked_add(rows).ok_or_else(arithmetic)?;
         record_ids(&mut self.summary, ids, self.pages.len())?;
         let page = funded_shared(
             work.owner,
@@ -347,6 +384,7 @@ impl InputRunWriter {
             .as_mut()
             .ok_or_else(|| build_contract("join input capture state is missing"))?
         {
+            OpenCaptures::PayloadOnly => InputCaptures::PayloadOnly,
             OpenCaptures::Ordinary { writer } => {
                 let capture = writer.seal(&capture_work(work))?;
                 if capture.input_rows() != self.rows {
@@ -414,6 +452,7 @@ fn record_ids(
     page: usize,
 ) -> ExecutionResult<()> {
     match (summary, ids) {
+        (ProjectionRunSummary::PayloadOnly, PageProjectionIds::PayloadOnly) => Ok(()),
         (ProjectionRunSummary::Ordinary(run), PageProjectionIds::Ordinary(id)) => {
             record_one(run, id, page)
         }

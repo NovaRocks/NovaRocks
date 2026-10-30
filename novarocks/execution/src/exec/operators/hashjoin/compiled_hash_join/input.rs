@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One installed E input. It evaluates each original key root once per page,
-//! captures the page in the shared original domains and seals on real input EOS.
+//! One installed E input. A hash input evaluates its original roots once per
+//! page and captures in the shared original domains. NL appends payload only.
+//! Both seal their own physical pages on real input EOS.
 //! No index/CSR construction runs on this input's finish continuation.
 
 use super::super::{
@@ -35,31 +36,29 @@ use crate::exec::{
         shape::{ControlStep, SinkKernel, SinkStep},
     },
 };
+use novarocks_functions::KernelEvaluationControl;
 
-pub(crate) struct CompiledHashJoinInputSinkFactory {
+pub(crate) struct CompiledJoinInputSinkFactory {
     name: String,
     declaration: Arc<CompiledJoinFrame>,
     error: Arc<RuntimeErrorState>,
     producers: Option<Arc<NativeRuntimeFilterProducerFactory>>,
 }
-impl CompiledHashJoinInputSinkFactory {
+impl CompiledJoinInputSinkFactory {
     pub(crate) fn new(
         declaration: Arc<CompiledJoinFrame>,
         error: Arc<RuntimeErrorState>,
         producers: Option<Arc<NativeRuntimeFilterProducerFactory>>,
     ) -> Self {
         Self {
-            name: format!(
-                "COMPILED_HASH_JOIN_INPUT (node={})",
-                declaration.plan.node.index()
-            ),
+            name: format!("COMPILED_JOIN_INPUT (node={})", declaration.node().index()),
             declaration,
             error,
             producers,
         }
     }
 }
-impl OperatorFactory for CompiledHashJoinInputSinkFactory {
+impl OperatorFactory for CompiledJoinInputSinkFactory {
     fn name(&self) -> &str {
         &self.name
     }
@@ -145,6 +144,54 @@ struct JoinInputSink {
     _prepared_storage: Option<ValueTypeStorageLifetime>,
 }
 impl JoinInputSink {
+    fn validate_payload(&self, chunk: &Chunk) -> ExecutionResult<()> {
+        use novarocks_functions::{
+            EvaluatedArgument, Selection, validate_evaluated_argument_observed,
+        };
+        use novarocks_local_program::{ProgramChannelLayoutRole, ProgramChannelSite};
+        use novarocks_type_contract::arrow_fields_exact_observed;
+        let actual = chunk.record_batch().schema();
+        let frozen = self.declaration.build_layout().schema();
+        self.control.checkpoint(0)?;
+        if actual.metadata() != frozen.metadata() || actual.fields().len() != frozen.fields().len()
+        {
+            return Err(build_contract(
+                "nested-loop payload differs from its frozen build layout",
+            ));
+        }
+        for (actual, frozen) in actual.fields().iter().zip(frozen.fields()) {
+            if !arrow_fields_exact_observed(actual, frozen, || self.control.checkpoint(1))? {
+                return Err(build_contract(
+                    "nested-loop payload field differs from its frozen declaration",
+                ));
+            }
+        }
+        for (column, array) in chunk.columns().iter().enumerate() {
+            let ordinal = u32::try_from(column).map_err(|_| {
+                build_contract("join build channel exceeds its frozen u32 representation")
+            })?;
+            let binding = self
+                .declaration
+                .program
+                .checked()
+                .channels()
+                .channel_type(ProgramChannelSite::Layout {
+                    node: self.declaration.node(),
+                    role: ProgramChannelLayoutRole::JoinRight,
+                    ordinal,
+                })
+                .ok_or_else(|| {
+                    build_contract("nested-loop payload has no original signed channel")
+                })?;
+            validate_evaluated_argument_observed(
+                EvaluatedArgument::Column(array),
+                Selection::all(chunk.len()),
+                binding,
+                &self.control,
+            )?;
+        }
+        Ok(())
+    }
     fn frame(&self) -> ExecutionResult<&Arc<JoinBuildFrame>> {
         if let Some(cause) = &self.prepare_failure {
             return Err(cause.clone());
@@ -239,7 +286,7 @@ impl OperatorLifecycle for JoinInputSink {
                 .construction
                 .as_ref()
                 .ok_or(ConstructionFailure::MissingOwner)?
-                .create_compiled_chunk_schema(&self.declaration.plan.build)?;
+                .create_compiled_chunk_schema(self.declaration.build_layout())?;
             let owner = self.control.construction_owner(&schema)?;
             let tracker = self
                 .tracker
@@ -255,8 +302,18 @@ impl OperatorLifecycle for JoinInputSink {
                 control: &self.control,
             };
             let frame = self.declaration.prepare(&work)?;
+            if self.declaration.payload_only() {
+                if self.producers.is_some() {
+                    return Err(build_contract(
+                        "nested-loop payload input cannot publish a keyed runtime filter",
+                    ));
+                }
+                self.schema = Some(schema);
+                self.frame = Some(frame);
+                return Ok(());
+            }
             let ProgramNodeKind::Join { condition, .. } =
-                self.declaration.program.graph().nodes()[self.declaration.plan.node.index()].kind()
+                self.declaration.program.graph().nodes()[self.declaration.node().index()].kind()
             else {
                 return Err(build_contract("join input has no original condition"));
             };
@@ -267,7 +324,7 @@ impl OperatorLifecycle for JoinInputSink {
                     build_contract("join scope root ordinal exceeds its frozen u32 representation")
                 })?;
                 let site = ProgramExpressionRootSite::Node {
-                    node: self.declaration.plan.node,
+                    node: self.declaration.node(),
                     role: ProgramNodeExpressionRole::NaaScopeBuildKey { key },
                 };
                 bindings.push(root_value_type(&self.declaration.program, site)?);
@@ -394,19 +451,47 @@ impl SinkKernel for JoinInputSink {
                 .control
                 .allocator()
                 .ok_or(ConstructionFailure::MissingOwner)?;
+            let work = BulkWork {
+                owner: owner.as_ref(),
+                allocator: AggregateAllocator::new(Arc::clone(tracker)),
+                host,
+                control: &self.control,
+            };
+            if self.declaration.payload_only() {
+                self.validate_payload(&chunk)?;
+                if self.writer.is_none() {
+                    self.writer = Some(InputRunWriter::new(
+                        &frame.domains,
+                        B3RunId::from_input_slot(
+                            self.slot.ok_or_else(|| {
+                                build_contract("join input has no installed E slot")
+                            })?,
+                            self.declaration.participants.inputs,
+                        )?,
+                        self.declaration.requires_payload(),
+                        &work,
+                    )?);
+                }
+                self.writer
+                    .as_mut()
+                    .expect("actual payload E writer")
+                    .push_payload(&chunk, &work)?;
+                return Ok(());
+            }
+            let plan = self.declaration.hash_plan()?;
             instances(
                 &mut self.values,
                 &self.declaration.program,
-                &self.declaration.plan.build_sites,
+                &plan.build_sites,
                 &self.control,
             )?;
-            let mut values = funded_vec(owner.as_ref(), self.declaration.plan.build_sites.len())?;
+            let mut values = funded_vec(owner.as_ref(), plan.build_sites.len())?;
             for (instance, site) in self
                 .values
                 .as_mut()
                 .expect("actual value instances")
                 .iter_mut()
-                .zip(&self.declaration.plan.build_sites)
+                .zip(&plan.build_sites)
             {
                 values.push(evaluate_chunk_all(instance, *site, &chunk, &self.control)?);
             }
@@ -426,14 +511,6 @@ impl SinkKernel for JoinInputSink {
             {
                 scopes.push(evaluate_chunk_all(instance, *site, &chunk, &self.control)?);
             }
-            let work = BulkWork {
-                owner: owner.as_ref(),
-                allocator: AggregateAllocator::new(Arc::clone(tracker)),
-                host,
-                control: &self.control,
-            };
-            // Capture construction performs source continuation exactly once.
-            // Do not wrap this work in a second source_key_owner.
             if self.writer.is_none() {
                 self.writer = Some(InputRunWriter::new(
                     &frame.domains,
@@ -442,13 +519,15 @@ impl SinkKernel for JoinInputSink {
                             .ok_or_else(|| build_contract("join input has no installed E slot"))?,
                         self.declaration.participants.inputs,
                     )?,
-                    self.declaration.plan.requirements.requires_row_payload(),
+                    self.declaration.requires_payload(),
                     &work,
                 )?);
             }
+            // Capture construction performs source continuation exactly once.
+            // Do not wrap this work in a second source_key_owner.
             let values_projection = EvaluatedKeyProjection {
                 arrays: &values,
-                bindings: &self.declaration.plan.build_key_bindings,
+                bindings: &plan.build_key_bindings,
             };
             let page = if matches!(
                 &frame.domains,
@@ -520,7 +599,7 @@ impl SinkKernel for JoinInputSink {
                         })?,
                         self.declaration.participants.inputs,
                     )?,
-                    self.declaration.plan.requirements.requires_row_payload(),
+                    self.declaration.requires_payload(),
                     &work,
                 )?);
             }

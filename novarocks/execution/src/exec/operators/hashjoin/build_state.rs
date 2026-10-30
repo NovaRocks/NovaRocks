@@ -37,6 +37,8 @@ use std::ops::Range;
 /// required value components without changing their SQL expression roles.
 /// Each producer captures the same evaluated arrays in these original domains.
 pub(crate) enum ProjectionDomains {
+    /// Nested-loop input has physical payload pages and no K domain at all.
+    PayloadOnly,
     Ordinary {
         keys: BulkDomain,
         purpose: IndexPurpose,

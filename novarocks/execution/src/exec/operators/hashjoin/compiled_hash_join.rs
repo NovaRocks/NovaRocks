@@ -347,11 +347,11 @@ mod input;
 mod probe;
 
 pub(crate) use build::CompiledHashJoinBuildSinkFactory;
-pub(crate) use finalize::CompiledHashJoinFinalizeSourceFactory;
+pub(crate) use finalize::CompiledJoinFinalizeSourceFactory;
 pub(crate) use frame::CompiledJoinFrame;
 #[cfg(test)]
 pub(crate) use frame::{frame_fixture_chunks, frame_fixture_inputs};
-pub(crate) use input::CompiledHashJoinInputSinkFactory;
+pub(crate) use input::CompiledJoinInputSinkFactory;
 pub(crate) use probe::CompiledHashJoinProbeProcessorFactory;
 
 /// The scope retains the probe then build slots and complete frozen fields.

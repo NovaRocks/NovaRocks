@@ -2916,7 +2916,7 @@ fn b3_each_actual_input_contributes_and_the_empty_input_closes_its_own_rf_partit
     use crate::exec::operators::hashjoin::{
         JoinParticipants,
         compiled_hash_join::{
-            CompiledHashJoinInputSinkFactory, CompiledHashJoinPlan, CompiledJoinFrame,
+            CompiledHashJoinPlan, CompiledJoinFrame, CompiledJoinInputSinkFactory,
             frame_fixture_chunks,
         },
         native_runtime_filter::NativeRuntimeFilterProducerFactory,
@@ -2986,7 +2986,7 @@ fn b3_each_actual_input_contributes_and_the_empty_input_closes_its_own_rf_partit
             Arc::clone(&tracker),
             Arc::clone(&error),
         );
-        let factory = CompiledHashJoinInputSinkFactory::new(
+        let factory = CompiledJoinInputSinkFactory::new(
             Arc::clone(&declaration),
             Arc::clone(&error),
             Some(rf),
@@ -3147,7 +3147,7 @@ fn b3_input_keeps_required_key_row_failure_and_fails_rf_without_empty_completion
     use crate::exec::operators::hashjoin::{
         JoinParticipants,
         compiled_hash_join::{
-            CompiledHashJoinInputSinkFactory, CompiledHashJoinPlan, CompiledJoinFrame,
+            CompiledHashJoinPlan, CompiledJoinFrame, CompiledJoinInputSinkFactory,
             frame_fixture_chunks,
         },
         native_runtime_filter::NativeRuntimeFilterProducerFactory,
@@ -3191,11 +3191,8 @@ fn b3_input_keeps_required_key_row_failure_and_fails_rf_without_empty_completion
         Arc::clone(&tracker),
         Arc::clone(&error),
     );
-    let factory = CompiledHashJoinInputSinkFactory::new(
-        Arc::clone(&declaration),
-        Arc::clone(&error),
-        Some(rf),
-    );
+    let factory =
+        CompiledJoinInputSinkFactory::new(Arc::clone(&declaration), Arc::clone(&error), Some(rf));
     let mut input = factory.create(1, 0);
     input.set_mem_tracker(Arc::clone(&tracker));
     input.set_construction_factory(Arc::clone(&construction));

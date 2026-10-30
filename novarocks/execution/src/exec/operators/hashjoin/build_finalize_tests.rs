@@ -155,6 +155,102 @@ fn exact_e_receipts_gate_real_k_csr_and_one_bitmap_before_publication() {
 }
 
 #[test]
+fn payload_only_e_pages_publish_without_k_graphs_or_assignment_arrays() {
+    for bits in [false, true] {
+        let (owner, tracker) = fixture();
+        let work = work(owner.as_ref(), &tracker, &Control);
+        let frame = JoinBuildFrame::new(
+            ProjectionDomains::PayloadOnly,
+            FinalizeOptions {
+                participants: JoinParticipants {
+                    inputs: 3,
+                    finalizers: NonZeroUsize::new(3).unwrap(),
+                    probes: 2,
+                    tails: 0,
+                },
+                handoff: None,
+                live_slots: NonZeroUsize::MIN,
+                match_bits: bits,
+            },
+            &work,
+        )
+        .unwrap();
+        let mut workers: Vec<_> = (0..3).map(|_| FinalizeWorker::new()).collect();
+        for (slot, pages) in [(2, vec![2, 0, 2]), (0, vec![3, 0, 4]), (1, vec![])] {
+            let mut writer = InputRunWriter::new(
+                &frame.domains,
+                B3RunId::from_input_slot(slot, 3).unwrap(),
+                true,
+                &work,
+            )
+            .unwrap();
+            for rows in pages {
+                let chunk = source(rows);
+                let page = writer.push_payload(&chunk, &work).unwrap();
+                assert!(page.values().is_none());
+                assert!(page.value_nulls().is_none());
+                assert!(page.projection_id(ProjectionKind::Ordinary).is_none());
+                assert!(page.projection_id(ProjectionKind::Full).is_none());
+            }
+            frame
+                .inputs
+                .normal_input(slot, writer.seal(&work).unwrap())
+                .unwrap();
+            if slot != 1 {
+                for worker in &mut workers {
+                    assert_eq!(
+                        worker.step(&frame, &mut turn(), &work).unwrap(),
+                        FinalizeStep::Blocked
+                    );
+                }
+                assert!(frame.completion.published().unwrap().is_none());
+            }
+        }
+        for _ in 0..1000 {
+            for worker in &mut workers {
+                worker.step(&frame, &mut turn(), &work).unwrap();
+                assert!(worker.projections.iter().all(Option::is_none));
+            }
+            if frame.completion.published().unwrap().is_some() {
+                break;
+            }
+        }
+        let published = frame
+            .completion
+            .published()
+            .unwrap()
+            .expect("real payload publication");
+        assert_eq!(published.rows, 11);
+        assert!(matches!(
+            published.artifact.lookup,
+            BuildLookup::PayloadOnly
+        ));
+        assert_eq!(published.artifact.matches.is_some(), bits);
+        let rows = Arc::clone(&published.artifact.rows);
+        drop(workers);
+        drop(frame);
+        let actual = (0..rows.len())
+            .map(|flat| {
+                let id = rows.row(flat).unwrap();
+                let address = rows.locate(id).unwrap();
+                assert_eq!(rows.row_id(address).unwrap(), id);
+                let page = rows.page(address.run(), address.page()).unwrap();
+                let payload = page.payload().unwrap();
+                payload
+                    .column(0)
+                    .unwrap()
+                    .array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(address.row_in_page())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, vec![0, 1, 2, 0, 1, 2, 3, 0, 1, 0, 1]);
+    }
+}
+
+#[test]
 fn normal_demand_withdrawal_settles_every_workers_original_partial_storage() {
     let (owner, tracker) = fixture();
     let work = work(owner.as_ref(), &tracker, &Control);

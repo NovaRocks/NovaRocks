@@ -33,10 +33,18 @@ use std::sync::OnceLock;
 
 pub(crate) struct CompiledJoinFrame {
     pub(super) program: Arc<LocalProgram>,
-    pub(super) plan: Arc<CompiledHashJoinPlan>,
+    definition: BuildDefinition,
     pub(super) participants: JoinParticipants,
     handoff: Option<Arc<LocalExchanger>>,
     value: OnceLock<ExecutionResult<Arc<JoinBuildFrame>>>,
+}
+enum BuildDefinition {
+    Hash(Arc<CompiledHashJoinPlan>),
+    PayloadOnly {
+        node: ProgramNodeId,
+        build: novarocks_local_program::StaticLayout,
+        match_bits: bool,
+    },
 }
 impl CompiledJoinFrame {
     pub(crate) fn new(
@@ -47,10 +55,86 @@ impl CompiledJoinFrame {
     ) -> Self {
         Self {
             program,
-            plan,
+            definition: BuildDefinition::Hash(plan),
             participants,
             handoff,
             value: OnceLock::new(),
+        }
+    }
+    pub(crate) fn new_nested_loop(
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        participants: JoinParticipants,
+        handoff: Option<Arc<LocalExchanger>>,
+    ) -> ExecutionResult<Self> {
+        let Some(graph_node) = program.graph().nodes().get(node.index()) else {
+            return Err(build_contract("nested-loop build has no original node"));
+        };
+        let ProgramNodeKind::NestedLoopJoin {
+            join_type,
+            left_layout,
+            right_layout,
+            join_scope_layout,
+            ..
+        } = graph_node.kind()
+        else {
+            return Err(build_contract(
+                "payload-only build requires its original nested-loop node",
+            ));
+        };
+        validate_join_scope(node, left_layout, right_layout, join_scope_layout)?;
+        let definition = BuildDefinition::PayloadOnly {
+            node,
+            build: right_layout.clone(),
+            match_bits: matches!(
+                join_type,
+                novarocks_local_program::NestedLoopJoinType::RightOuter
+                    | novarocks_local_program::NestedLoopJoinType::FullOuter
+            ),
+        };
+        Ok(Self {
+            program,
+            definition,
+            participants,
+            handoff,
+            value: OnceLock::new(),
+        })
+    }
+    pub(super) fn node(&self) -> ProgramNodeId {
+        match &self.definition {
+            BuildDefinition::Hash(plan) => plan.node,
+            BuildDefinition::PayloadOnly { node, .. } => *node,
+        }
+    }
+    pub(super) fn build_layout(&self) -> &novarocks_local_program::StaticLayout {
+        match &self.definition {
+            BuildDefinition::Hash(plan) => &plan.build,
+            BuildDefinition::PayloadOnly { build, .. } => build,
+        }
+    }
+    pub(super) fn payload_only(&self) -> bool {
+        matches!(self.definition, BuildDefinition::PayloadOnly { .. })
+    }
+    pub(super) fn requires_payload(&self) -> bool {
+        match &self.definition {
+            BuildDefinition::Hash(plan) => plan.requirements.requires_row_payload(),
+            BuildDefinition::PayloadOnly { .. } => true,
+        }
+    }
+    pub(super) fn hash_plan(&self) -> ExecutionResult<&CompiledHashJoinPlan> {
+        match &self.definition {
+            BuildDefinition::Hash(plan) => Ok(plan),
+            BuildDefinition::PayloadOnly { .. } => {
+                Err(build_contract("payload-only join has no hash plan"))
+            }
+        }
+    }
+    fn match_bits(&self) -> bool {
+        match &self.definition {
+            BuildDefinition::Hash(plan) => {
+                plan.requirements.match_flags == MatchFlagRequirement::Needed
+            }
+            BuildDefinition::PayloadOnly { match_bits, .. } => *match_bits,
         }
     }
     pub(super) fn prepare(&self, work: &BulkWork<'_>) -> ExecutionResult<Arc<JoinBuildFrame>> {
@@ -65,8 +149,7 @@ impl CompiledJoinFrame {
                         // This is the existing K sketch preference, not a row/count
                         // admission quota. Larger streams produce more partials.
                         live_slots: NonZeroUsize::MIN,
-                        match_bits: self.plan.requirements.match_flags
-                            == MatchFlagRequirement::Needed,
+                        match_bits: self.match_bits(),
                     },
                     work,
                 )
@@ -80,8 +163,12 @@ impl CompiledJoinFrame {
             .ok_or(ConstructionFailure::MissingOwner)?
     }
     pub(super) fn domains(&self, work: &BulkWork<'_>) -> ExecutionResult<ProjectionDomains> {
+        if self.payload_only() {
+            return Ok(ProjectionDomains::PayloadOnly);
+        }
+        let plan = self.hash_plan()?;
         let ProgramNodeKind::Join { condition, .. } =
-            self.program.graph().nodes()[self.plan.node.index()].kind()
+            self.program.graph().nodes()[plan.node.index()].kind()
         else {
             return Err(build_contract(
                 "compiled join declaration has no original join node",
@@ -101,7 +188,7 @@ impl CompiledJoinFrame {
             BulkDomain::new(&spec, work.owner, work.control)
         };
         if !condition.is_null_aware() {
-            let purpose = match self.plan.requirements.lookup {
+            let purpose = match plan.requirements.lookup {
                 LookupRequirement::Membership => IndexPurpose::PresenceOnly,
                 LookupRequirement::RowMatches => IndexPurpose::KeyIds,
                 LookupRequirement::NotNeeded => {
@@ -110,12 +197,12 @@ impl CompiledJoinFrame {
                     ));
                 }
             };
-            let mut modes = funded_vec(work.owner, self.plan.eq_null_safe.len())?;
-            for &safe in &self.plan.eq_null_safe {
+            let mut modes = funded_vec(work.owner, plan.eq_null_safe.len())?;
+            for &safe in &plan.eq_null_safe {
                 modes.push(mode(safe));
             }
             return Ok(ProjectionDomains::Ordinary {
-                keys: domain(&self.plan.build_key_bindings, &modes)?,
+                keys: domain(&plan.build_key_bindings, &modes)?,
                 purpose,
             });
         }
@@ -134,14 +221,14 @@ impl CompiledJoinFrame {
                 build_contract("join scope root ordinal exceeds its frozen u32 representation")
             })?;
             let site = ProgramExpressionRootSite::Node {
-                node: self.plan.node,
+                node: plan.node,
                 role: ProgramNodeExpressionRole::NaaScopeBuildKey { key: key_ordinal },
             };
             types.push(root_value_type(&self.program, site)?);
             modes.push(mode(key.null_safe));
             columns.push(column);
         }
-        for (ty, key) in self.plan.build_key_bindings.iter().zip(values) {
+        for (ty, key) in plan.build_key_bindings.iter().zip(values) {
             work.control.checkpoint(1)?;
             types.push(ty.clone());
             modes.push(mode(key.null_safe));
@@ -179,7 +266,8 @@ pub(crate) fn frame_fixture_chunks(
         .nodes()
         .iter()
         .find_map(|node| match node.kind() {
-            ProgramNodeKind::Join { right_layout, .. } => Some(right_layout),
+            ProgramNodeKind::Join { right_layout, .. }
+            | ProgramNodeKind::NestedLoopJoin { right_layout, .. } => Some(right_layout),
             _ => None,
         })
         .ok_or_else(|| build_contract("join fixture has no original build layout"))?;

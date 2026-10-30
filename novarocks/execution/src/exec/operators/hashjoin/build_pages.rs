@@ -87,6 +87,7 @@ pub(crate) enum ProjectionKind {
 }
 #[derive(Clone, Copy)]
 pub(super) enum PageProjectionIds {
+    PayloadOnly,
     Ordinary(CapturedPageId),
     Naa {
         group: Option<CapturedPageId>,
@@ -105,6 +106,7 @@ impl PageProjectionIds {
 }
 #[derive(Clone, Copy)]
 pub(super) enum ProjectionRunSummary {
+    PayloadOnly,
     Ordinary(Option<usize>),
     Naa {
         group: Option<usize>,
@@ -112,6 +114,7 @@ pub(super) enum ProjectionRunSummary {
     },
 }
 pub(super) enum InputCaptures {
+    PayloadOnly,
     Ordinary(SealedCapture),
     Naa {
         group: Option<SealedCapture>,
@@ -332,6 +335,7 @@ pub(crate) struct BuildRows {
     _header_storage: ValueTypeStorageLifetime,
 }
 pub(crate) enum CapturesForGraphs {
+    PayloadOnly,
     Ordinary {
         keys: CapturedInputRun,
     },
@@ -417,6 +421,11 @@ impl BuildRows {
                 return Err(build_contract("join input run arrived twice"));
             }
             match (domains, captures, pages.summary) {
+                (
+                    ProjectionDomains::PayloadOnly,
+                    InputCaptures::PayloadOnly,
+                    ProjectionRunSummary::PayloadOnly,
+                ) => {}
                 (
                     ProjectionDomains::Ordinary { .. },
                     InputCaptures::Ordinary(capture),
@@ -505,6 +514,7 @@ impl BuildRows {
         check(work)?;
         let storage = work.owner.storage_lifetime();
         let captures = match domains {
+            ProjectionDomains::PayloadOnly => CapturesForGraphs::PayloadOnly,
             ProjectionDomains::Ordinary { .. } => CapturesForGraphs::Ordinary {
                 keys: CapturedInputRun {
                     captures: keys,

@@ -2308,7 +2308,7 @@ fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_complet
     use crate::exec::operators::hashjoin::{
         JoinParticipants,
         compiled_hash_join::{
-            CompiledHashJoinFinalizeSourceFactory, CompiledHashJoinPlan, CompiledJoinFrame,
+            CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
             frame_fixture_inputs,
         },
     };
@@ -2353,7 +2353,7 @@ fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_complet
         Arc::clone(&error),
     );
     let factory =
-        CompiledHashJoinFinalizeSourceFactory::new(Arc::clone(&declaration), Arc::clone(&error));
+        CompiledJoinFinalizeSourceFactory::new(Arc::clone(&declaration), Arc::clone(&error));
     assert!(factory.bind_pipeline_dop(2).is_err());
     let mut operators: Vec<_> = (0..3).map(|id| factory.create(3, id)).collect();
     for operator in &mut operators {
@@ -2430,7 +2430,7 @@ fn b3_finalize_source_distinguishes_normal_demand_exit_from_original_failure() {
     use crate::exec::operators::hashjoin::{
         JoinParticipants,
         compiled_hash_join::{
-            CompiledHashJoinFinalizeSourceFactory, CompiledHashJoinPlan, CompiledJoinFrame,
+            CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
             frame_fixture_inputs,
         },
     };
@@ -2476,10 +2476,8 @@ fn b3_finalize_source_distinguishes_normal_demand_exit_from_original_failure() {
             Arc::clone(&tracker),
             Arc::clone(&error),
         );
-        let factory = CompiledHashJoinFinalizeSourceFactory::new(
-            Arc::clone(&declaration),
-            Arc::clone(&error),
-        );
+        let factory =
+            CompiledJoinFinalizeSourceFactory::new(Arc::clone(&declaration), Arc::clone(&error));
         let mut operator = factory.create(3, 0);
         operator.set_mem_tracker(Arc::clone(&tracker));
         operator.set_construction_factory(Arc::clone(&construction));
@@ -2543,8 +2541,8 @@ fn b3_input_sinks_seal_each_real_e_and_leave_construction_to_finalize_sources() 
     use crate::exec::operators::hashjoin::{
         JoinParticipants,
         compiled_hash_join::{
-            CompiledHashJoinFinalizeSourceFactory, CompiledHashJoinInputSinkFactory,
-            CompiledHashJoinPlan, CompiledJoinFrame, frame_fixture_chunks,
+            CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
+            CompiledJoinInputSinkFactory, frame_fixture_chunks,
         },
     };
     use crate::exec::pipeline::{
@@ -2554,118 +2552,124 @@ fn b3_input_sinks_seal_each_real_e_and_leave_construction_to_finalize_sources() 
     };
     use crate::runtime::mem_tracker::MemTracker;
     use std::num::NonZeroU64;
-    let mut packages = packages(&single_plan_with_dop(
-        Spec::hash(JoinKind::Inner, false),
-        &LEFT_ROWS,
-        &RIGHT_ROWS,
-        3,
-    ));
-    let program = compile(packages.remove(&SINGLE).unwrap(), 3, true);
-    let node = program
-        .graph()
-        .nodes()
-        .iter()
-        .position(|node| matches!(node.kind(), ProgramNodeKind::Join { .. }))
-        .map(novarocks_local_program::ProgramNodeId::new)
-        .unwrap();
-    for empty_second in [false, true] {
-        let declaration = Arc::new(CompiledJoinFrame::new(
-            Arc::clone(&program),
-            Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap()),
-            JoinParticipants {
+    for nested in [false, true] {
+        let mut packages = packages(&single_plan_with_dop(
+            if nested {
+                Spec::nested(JoinKind::Inner, true)
+            } else {
+                Spec::hash(JoinKind::Inner, false)
+            },
+            &LEFT_ROWS,
+            &RIGHT_ROWS,
+            3,
+        ));
+        let program = compile(packages.remove(&SINGLE).unwrap(), 3, true);
+        let node = program.graph().root();
+        for empty_second in [false, true] {
+            let participants = JoinParticipants {
                 inputs: 2,
                 finalizers: NonZeroUsize::new(3).unwrap(),
                 probes: 2,
                 tails: 0,
-            },
-            None,
-        ));
-        let runtime = RuntimeState::default();
-        let error = runtime.error_state();
-        let tracker = MemTracker::new_root("B3 original E input operators");
-        let construction = super::aggregate_fixture::runtime_construction_factory(
-            Arc::clone(&tracker),
-            Arc::clone(&error),
-        );
-        let inputs = CompiledHashJoinInputSinkFactory::new(
-            Arc::clone(&declaration),
-            Arc::clone(&error),
-            None,
-        );
-        assert!(inputs.bind_pipeline_dop(1).is_err());
-        let finalize = CompiledHashJoinFinalizeSourceFactory::new(
-            Arc::clone(&declaration),
-            Arc::clone(&error),
-        );
-        let mut sources: Vec<_> = (0..3).map(|id| finalize.create(3, id)).collect();
-        let mut sinks: Vec<_> = (0..2).map(|id| inputs.create(2, id)).collect();
-        for operator in sources.iter_mut().chain(sinks.iter_mut()) {
-            operator.set_mem_tracker(Arc::clone(&tracker));
-            operator.set_construction_factory(Arc::clone(&construction));
-            operator.prepare().unwrap();
-            operator.bind_runtime_state(&runtime).unwrap();
-            operator.activate(&runtime).unwrap();
-        }
-        let frame = declaration.prepared().unwrap();
-        let mut chunks = frame_fixture_chunks(&program, &construction).unwrap();
-        if empty_second {
-            chunks.pop();
-        }
-        for (index, chunk) in chunks.into_iter().enumerate() {
-            let mut driver = TestDriver::new(sinks[index].as_mut(), &runtime);
-            driver.accept_without_output(chunk).unwrap();
-            driver.signal_eos().unwrap();
-            assert!(matches!(
-                driver.advance_to_boundary().unwrap().next,
-                NextStep::Finished
-            ));
-            assert!(
-                frame.completion.published().unwrap().is_none(),
-                "E finish never drives the K graph"
+            };
+            let declaration = Arc::new(if nested {
+                CompiledJoinFrame::new_nested_loop(Arc::clone(&program), node, participants, None)
+                    .unwrap()
+            } else {
+                CompiledJoinFrame::new(
+                    Arc::clone(&program),
+                    Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap()),
+                    participants,
+                    None,
+                )
+            });
+            let runtime = RuntimeState::default();
+            let error = runtime.error_state();
+            let tracker = MemTracker::new_root("B3 original E input operators");
+            let construction = super::aggregate_fixture::runtime_construction_factory(
+                Arc::clone(&tracker),
+                Arc::clone(&error),
             );
-        }
-        if empty_second {
-            // No input chunk, but the actual E still seals a real empty run.
-            let mut driver = TestDriver::new(sinks[1].as_mut(), &runtime);
-            driver.signal_eos().unwrap();
-            assert!(matches!(
-                driver.advance_to_boundary().unwrap().next,
-                NextStep::Finished
-            ));
-        }
-        assert!(frame.completion.published().unwrap().is_none());
-        let mut finished = [false; 3];
-        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-        for _ in 0..100_000 {
-            for (id, source) in sources.iter_mut().enumerate() {
-                if finished[id] {
-                    continue;
+            let inputs = CompiledJoinInputSinkFactory::new(
+                Arc::clone(&declaration),
+                Arc::clone(&error),
+                None,
+            );
+            assert!(inputs.bind_pipeline_dop(1).is_err());
+            let finalize = CompiledJoinFinalizeSourceFactory::new(
+                Arc::clone(&declaration),
+                Arc::clone(&error),
+            );
+            let mut sources: Vec<_> = (0..3).map(|id| finalize.create(3, id)).collect();
+            let mut sinks: Vec<_> = (0..2).map(|id| inputs.create(2, id)).collect();
+            for operator in sources.iter_mut().chain(sinks.iter_mut()) {
+                operator.set_mem_tracker(Arc::clone(&tracker));
+                operator.set_construction_factory(Arc::clone(&construction));
+                operator.prepare().unwrap();
+                operator.bind_runtime_state(&runtime).unwrap();
+                operator.activate(&runtime).unwrap();
+            }
+            let frame = declaration.prepared().unwrap();
+            let mut chunks = frame_fixture_chunks(&program, &construction).unwrap();
+            if empty_second {
+                chunks.pop();
+            }
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                let mut driver = TestDriver::new(sinks[index].as_mut(), &runtime);
+                driver.accept_without_output(chunk).unwrap();
+                driver.signal_eos().unwrap();
+                assert!(matches!(
+                    driver.advance_to_boundary().unwrap().next,
+                    NextStep::Finished
+                ));
+                assert!(
+                    frame.completion.published().unwrap().is_none(),
+                    "E finish never drives the K graph"
+                );
+            }
+            if empty_second {
+                // No input chunk, but the actual E still seals a real empty run.
+                let mut driver = TestDriver::new(sinks[1].as_mut(), &runtime);
+                driver.signal_eos().unwrap();
+                assert!(matches!(
+                    driver.advance_to_boundary().unwrap().next,
+                    NextStep::Finished
+                ));
+            }
+            assert!(frame.completion.published().unwrap().is_none());
+            let mut finished = [false; 3];
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            for _ in 0..100_000 {
+                for (id, source) in sources.iter_mut().enumerate() {
+                    if finished[id] {
+                        continue;
+                    }
+                    let mut turn = TurnWork::new(NonZeroU64::MIN, 11);
+                    let step = source
+                        .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+                        .unwrap();
+                    assert!(step.output.is_none());
+                    finished[id] = matches!(step.next, NextStep::Finished);
                 }
-                let mut turn = TurnWork::new(NonZeroU64::MIN, 11);
-                let step = source
-                    .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
-                    .unwrap();
-                assert!(step.output.is_none());
-                finished[id] = matches!(step.next, NextStep::Finished);
+                if finished.iter().all(|done| *done) {
+                    break;
+                }
             }
-            if finished.iter().all(|done| *done) {
-                break;
+            assert!(finished.iter().all(|done| *done));
+            assert_eq!(
+                frame.completion.published().unwrap().unwrap().rows,
+                if empty_second { 300 } else { 600 }
+            );
+            for operator in sources.iter_mut().chain(sinks.iter_mut()) {
+                operator.begin_exit().unwrap();
+                assert!(matches!(
+                    operator.observe_exit().progress,
+                    crate::exec::pipeline::operator::ExitProgress::Exited
+                ));
+                operator.close().unwrap();
             }
+            assert!(runtime.error().is_none());
         }
-        assert!(finished.iter().all(|done| *done));
-        assert_eq!(
-            frame.completion.published().unwrap().unwrap().rows,
-            if empty_second { 300 } else { 600 }
-        );
-        for operator in sources.iter_mut().chain(sinks.iter_mut()) {
-            operator.begin_exit().unwrap();
-            assert!(matches!(
-                operator.observe_exit().progress,
-                crate::exec::pipeline::operator::ExitProgress::Exited
-            ));
-            operator.close().unwrap();
-        }
-        assert!(runtime.error().is_none());
     }
 }
 
@@ -2674,8 +2678,8 @@ fn b3_input_and_finalize_operators_preserve_the_first_prepare_refusal() {
     use crate::exec::operators::hashjoin::{
         JoinParticipants,
         compiled_hash_join::{
-            CompiledHashJoinFinalizeSourceFactory, CompiledHashJoinInputSinkFactory,
-            CompiledHashJoinPlan, CompiledJoinFrame, frame_fixture_chunks,
+            CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
+            CompiledJoinInputSinkFactory, frame_fixture_chunks,
         },
     };
     use crate::exec::pipeline::{
@@ -2713,13 +2717,10 @@ fn b3_input_and_finalize_operators_preserve_the_first_prepare_refusal() {
                 .unwrap()
                 .remove(0);
             let mut operator = if source {
-                CompiledHashJoinFinalizeSourceFactory::new(
-                    Arc::clone(&declaration),
-                    Arc::clone(&error),
-                )
-                .create(1, 0)
+                CompiledJoinFinalizeSourceFactory::new(Arc::clone(&declaration), Arc::clone(&error))
+                    .create(1, 0)
             } else {
-                CompiledHashJoinInputSinkFactory::new(
+                CompiledJoinInputSinkFactory::new(
                     Arc::clone(&declaration),
                     Arc::clone(&error),
                     None,

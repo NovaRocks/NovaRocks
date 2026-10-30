@@ -31,24 +31,21 @@ use crate::exec::pipeline::{
 };
 use novarocks_functions::KernelEvaluationControl;
 
-pub(crate) struct CompiledHashJoinFinalizeSourceFactory {
+pub(crate) struct CompiledJoinFinalizeSourceFactory {
     name: String,
     frame: Arc<CompiledJoinFrame>,
     error: Arc<RuntimeErrorState>,
 }
-impl CompiledHashJoinFinalizeSourceFactory {
+impl CompiledJoinFinalizeSourceFactory {
     pub(crate) fn new(frame: Arc<CompiledJoinFrame>, error: Arc<RuntimeErrorState>) -> Self {
         Self {
-            name: format!(
-                "COMPILED_HASH_JOIN_FINALIZE (node={})",
-                frame.plan.node.index()
-            ),
+            name: format!("COMPILED_JOIN_FINALIZE (node={})", frame.node().index()),
             frame,
             error,
         }
     }
 }
-impl OperatorFactory for CompiledHashJoinFinalizeSourceFactory {
+impl OperatorFactory for CompiledJoinFinalizeSourceFactory {
     fn name(&self) -> &str {
         &self.name
     }
@@ -173,7 +170,7 @@ impl OperatorLifecycle for JoinFinalizeSource {
                 .construction
                 .as_ref()
                 .ok_or(ConstructionFailure::MissingOwner)?;
-            let schema = factory.create_compiled_chunk_schema(&self.declaration.plan.build)?;
+            let schema = factory.create_compiled_chunk_schema(self.declaration.build_layout())?;
             let owner = self.control.construction_owner(&schema)?;
             let tracker = self
                 .tracker

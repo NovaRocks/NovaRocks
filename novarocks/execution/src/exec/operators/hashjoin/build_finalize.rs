@@ -52,6 +52,7 @@ use std::{
 };
 
 pub(crate) enum BuildLookup {
+    PayloadOnly,
     Ordinary(Arc<IndexedBuild>),
     Naa {
         group: Option<Arc<IndexedBuild>>,
@@ -96,6 +97,7 @@ impl ProjectionSlot {
     }
 }
 enum Projections {
+    PayloadOnly,
     Ordinary(ProjectionSlot),
     Naa {
         group: Option<ProjectionSlot>,
@@ -112,6 +114,7 @@ impl Projections {
     }
     fn ready(&self) -> Option<BuildLookup> {
         match self {
+            Self::PayloadOnly => Some(BuildLookup::PayloadOnly),
             Self::Ordinary(slot) => Some(BuildLookup::Ordinary(Arc::clone(slot.ready.get()?))),
             Self::Naa { group, full } => {
                 let group = match group {
@@ -329,6 +332,9 @@ impl JoinBuildFrame {
                 .map(ProjectionSlot::new)
             };
             let projections = match (&self.domains, captures) {
+                (ProjectionDomains::PayloadOnly, CapturesForGraphs::PayloadOnly) => {
+                    Projections::PayloadOnly
+                }
                 (
                     ProjectionDomains::Ordinary {
                         keys: domain,
