@@ -591,6 +591,10 @@ impl HashSeed {
         })
     }
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Done transfers the original funded task output by value without adding a heap allocation to the handoff."
+)]
 pub(super) enum HashAdvance {
     Done(HashOutput),
     Progressed,

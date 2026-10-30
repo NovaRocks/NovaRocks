@@ -61,10 +61,8 @@ impl NaaValueMode {
             if safe {
                 return Ok(Self::General);
             }
-            if probe.nullable() || build.nullable() {
-                if nullable.replace(value).is_some() {
-                    return Ok(Self::General);
-                }
+            if (probe.nullable() || build.nullable()) && nullable.replace(value).is_some() {
+                return Ok(Self::General);
             }
         }
         Ok(match nullable {
@@ -183,7 +181,12 @@ mod tests {
             NaaValueMode::General
         );
         assert_eq!(
-            classify(&[nn.clone()], &[nn], &[false], true),
+            classify(
+                std::slice::from_ref(&nn),
+                std::slice::from_ref(&nn),
+                &[false],
+                true
+            ),
             NaaValueMode::General
         );
         assert!(NaaValueMode::from_signed_values(&[], &[], &[], false, &control).is_err());

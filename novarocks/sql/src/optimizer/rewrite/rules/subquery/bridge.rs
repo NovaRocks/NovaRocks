@@ -92,7 +92,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             naa_author: op
                 .naa_author
                 .clone()
-                .map(|facts| facts.map(|id| materialize(arena, id))),
+                .map(|facts| Box::new(facts.map(|id| materialize(arena, id)))),
             join_type: op.join_type,
             condition: op.condition.map(|id| materialize(arena, id)),
         }),

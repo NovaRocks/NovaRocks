@@ -251,9 +251,9 @@ fn validate_physical_join_condition(
     Ok(())
 }
 
-fn wire_join_parts(
-    node: &wire::HashJoinNode,
-) -> Result<(&[wire::JoinKey], &[wire::JoinKey], Option<u32>), Error> {
+type WireJoinParts<'a> = (&'a [wire::JoinKey], &'a [wire::JoinKey], Option<u32>);
+
+fn wire_join_parts(node: &wire::HashJoinNode) -> Result<WireJoinParts<'_>, Error> {
     match node.condition.as_ref() {
         Some(wire::hash_join_node::Condition::Ordinary(v)) => {
             Ok((&v.keys, &[], v.residual_expr_id))

@@ -18,11 +18,13 @@
 //! One actual E-owned writer for evaluated projections and physical pages.
 //! Group columns are an explicit K projection, never reconstructed SQL roles.
 
+#[cfg(test)]
+use super::build_pages::ValueNullRow;
 use super::{
     build_pages::{
         B3RunId, BuildInputReceipt, BuildPageData, BuildPageProjection, InputCaptures,
         PageProjectionIds, PayloadRunPages, ProjectionRunSummary, RetainedNaaValues,
-        ValueNullFacts, ValueNullRow, capture_work, check, checkpoint, push_owned,
+        ValueNullFacts, capture_work, check, checkpoint, push_owned,
     },
     build_state::{ProjectionDomains, build_contract},
     join_completion::{arithmetic, funded_shared, funded_vec},
@@ -57,6 +59,10 @@ pub(crate) enum EvaluatedJoinKeyPage<'a> {
         values: EvaluatedKeyProjection<'a>,
     },
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The E writer owns both original K capture builders inline; indirection would add another funded allocation to capture admission."
+)]
 enum OpenCaptures {
     PayloadOnly,
     Ordinary {
@@ -525,15 +531,18 @@ fn value_nulls(
     rows: usize,
     work: &BulkWork<'_>,
 ) -> ExecutionResult<ValueNullFacts> {
+    #[cfg(test)]
     let mut any = funded_vec(work.owner, rows)?;
     let mut ordinary = funded_vec(work.owner, rows)?;
     let mut scratch = funded_vec(work.owner, rows)?;
     for row in 0..rows {
         checkpoint(row, work)?;
+        #[cfg(test)]
         any.push(false);
         ordinary.push(false);
         scratch.push(false);
     }
+    #[cfg(test)]
     input
         .component_range_root_nulls_observed(values.clone(), 0..rows, &mut any, &|| check(work))?;
     let mut component = values.start;
@@ -559,27 +568,30 @@ fn value_nulls(
             ordinary[row] |= scratch[row];
         }
     }
+    #[cfg(test)]
     let mut facts = Vec::new();
     let mut ordinary_rows = Vec::new();
     let mut storage = work.owner.storage_lifetime();
-    for row in 0..rows {
+    for (row, &ordinary_null) in ordinary.iter().enumerate() {
         checkpoint(row, work)?;
+        #[cfg(test)]
         if any[row] {
             push_owned(
                 &mut facts,
                 ValueNullRow {
                     row,
-                    ordinary: ordinary[row],
+                    ordinary: ordinary_null,
                 },
                 &mut storage,
                 work,
             )?;
-            if ordinary[row] {
-                push_owned(&mut ordinary_rows, row, &mut storage, work)?;
-            }
+        }
+        if ordinary_null {
+            push_owned(&mut ordinary_rows, row, &mut storage, work)?;
         }
     }
     Ok(ValueNullFacts {
+        #[cfg(test)]
         rows: facts,
         ordinary_rows,
         _storage: storage,

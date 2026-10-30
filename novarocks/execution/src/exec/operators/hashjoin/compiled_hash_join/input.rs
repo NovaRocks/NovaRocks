@@ -202,9 +202,12 @@ impl JoinInputSink {
     }
     fn fail(&self, cause: ExecutionFailure) -> ExecutionFailure {
         let cause = self.control.project_required_failure(cause);
-        self.frame
-            .as_ref()
-            .map_or(cause.clone(), |frame| frame.fail(cause))
+        self.frame.as_ref().map_or(cause.clone(), |frame| {
+            self.slot.map_or_else(
+                || frame.fail(cause.clone()),
+                |slot| frame.fail_input(slot, cause.clone()),
+            )
+        })
     }
     fn end_owned(&mut self) -> ExecutionResult<()> {
         if self.exited {
@@ -214,7 +217,7 @@ impl JoinInputSink {
         let disposition: ExecutionResult<()> = (|| {
             if let Some(frame) = &self.frame {
                 if self.error.is_stopped() {
-                    frame.fail(
+                    self.fail(
                         self.error
                             .error()
                             .unwrap_or_else(|| KernelFailure::Cancelled.into()),
@@ -223,7 +226,7 @@ impl JoinInputSink {
                 }
                 if !self.normal && frame.completion.check().is_ok() {
                     if frame.completion.remaining_demand()? != RemainingDemand::Released {
-                        let cause = frame.fail(build_contract(
+                        let cause = self.fail(build_contract(
                             "join input exited before its normal sealed EOS",
                         ));
                         self.exit_failure.get_or_insert(cause);

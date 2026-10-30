@@ -137,7 +137,6 @@ struct PipelineBuildResult {
 }
 
 struct PipelineBuildContext {
-    dep_manager: DependencyManager,
     runtime_filter_execution: PipelineRuntimeFilterExecution,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,

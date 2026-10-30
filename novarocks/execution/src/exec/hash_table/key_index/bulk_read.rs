@@ -189,12 +189,6 @@ impl IndexView {
             _storage: owner.storage_lifetime(),
         })
     }
-    /// Observe the real selected production layout from owner correctness
-    /// tests without exposing geometry or a mutable strategy choice.
-    #[cfg(test)]
-    pub(crate) fn is_direct_for_test(&self) -> bool {
-        matches!(self.backend, Backend::Direct(_))
-    }
     pub(crate) fn spec(&self) -> &KeySpec {
         &self.spec
     }

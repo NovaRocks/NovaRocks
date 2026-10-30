@@ -193,15 +193,15 @@ impl<I, A> BuildCollection<I, A> {
         }
     }
     pub(crate) fn fail_input(&self, input: usize, cause: ExecutionFailure) -> ExecutionFailure {
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(slot) = state.inputs.get_mut(input) {
-                if matches!(slot, InputSlot::Pending) {
-                    *slot = InputSlot::Failed;
-                }
-            }
+        if let Ok(mut state) = self.state.lock()
+            && let Some(slot) = state.inputs.get_mut(input)
+            && matches!(slot, InputSlot::Pending)
+        {
+            *slot = InputSlot::Failed;
         }
         self.completion.fail(cause)
     }
+    #[cfg(test)]
     pub(crate) fn inputs_sealed(&self) -> ExecutionResult<bool> {
         self.check()?;
         let state = self.state()?;

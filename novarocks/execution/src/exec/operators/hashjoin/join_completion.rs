@@ -222,6 +222,7 @@ impl<A> JoinCompletion<A> {
     pub(crate) fn normal_after_output(&self, probe: usize) -> ExecutionResult<()> {
         self.settle(probe, ProbeState::NormalCompleted)
     }
+    #[cfg(test)]
     pub(crate) fn withdraw(&self, probe: usize) -> ExecutionResult<()> {
         self.settle(probe, ProbeState::Withdrawn)
     }
@@ -278,10 +279,10 @@ impl<A> JoinCompletion<A> {
         let notify = self.changed.defer_notify();
         let result = match self.state.lock() {
             Ok(mut state) => {
-                if let Some(slot) = state.probes.get_mut(probe) {
-                    if *slot == ProbeState::Pending {
-                        *slot = ProbeState::Failed;
-                    }
+                if let Some(slot) = state.probes.get_mut(probe)
+                    && *slot == ProbeState::Pending
+                {
+                    *slot = ProbeState::Failed;
                 }
                 state.failure.get_or_insert(cause).clone()
             }

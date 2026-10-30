@@ -120,12 +120,12 @@ impl NaaCandidateStore {
                 "NAA publication disagrees with original value/eligibility roles",
             ));
         }
-        if let Some(group) = group {
-            if group.groups.is_none() || group.ordinary_nulls.is_none() {
-                return Err(build_contract(
-                    "NAA group has no complete physical/NULL CSR",
-                ));
-            }
+        if let Some(group) = group
+            && (group.groups.is_none() || group.ordinary_nulls.is_none())
+        {
+            return Err(build_contract(
+                "NAA group has no complete physical/NULL CSR",
+            ));
         }
         build.rows.ordinary_null_count()?;
         Ok(Self {

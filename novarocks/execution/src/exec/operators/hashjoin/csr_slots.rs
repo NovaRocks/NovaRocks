@@ -204,15 +204,6 @@ impl CsrSlotsInit {
                 .latch(build_contract("join CSR initialization state was poisoned"))
         })
     }
-    pub(crate) fn fail(&self, cause: ExecutionFailure) -> ExecutionFailure {
-        let notify = self.changed.defer_notify();
-        let cause = self.ranges.latch(cause);
-        notify.arm();
-        cause
-    }
-    pub(crate) fn check(&self) -> ExecutionResult<()> {
-        self.ranges.check()
-    }
     /// Allocation is charged to this actual claim worker, not initializer F0.
     /// It reserves the segment's backing without an O(cells) initialization.
     pub(crate) fn claim(
@@ -325,16 +316,6 @@ impl CsrSlotsInit {
     }
 }
 impl SlotsLease {
-    pub(crate) fn cells(&self) -> Range<usize> {
-        self.cells.clone()
-    }
-    /// Actual Vec length is the only cursor. A retired/settled lease has no
-    /// pending initialization work; this does not certify that it initialized.
-    pub(crate) fn remaining_cells(&self) -> usize {
-        self.pending
-            .as_ref()
-            .map_or(0, |segment| self.cells.len() - segment.cells.len())
-    }
     pub(crate) fn initialize(
         &mut self,
         quota: usize,
@@ -411,6 +392,7 @@ impl SlotsLease {
         }
         result
     }
+    #[cfg(test)]
     pub(crate) fn complete(&mut self) -> ExecutionResult<()> {
         self.settle_inner(false).map(|_| ())
     }

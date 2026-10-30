@@ -37,42 +37,23 @@ pub(crate) enum MatchFlagRequirement {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NullKeyRequirement {
-    NotNeeded,
-    HasAnyNullKey,
-    NullKeyRows,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BuildComponentRequirements {
     pub(crate) lookup: LookupRequirement,
     pub(crate) row_payload: RowPayloadRequirement,
     pub(crate) match_flags: MatchFlagRequirement,
-    pub(crate) null_keys: NullKeyRequirement,
 }
 
 impl BuildComponentRequirements {
     pub(crate) fn requires_row_payload(self) -> bool {
         self.row_payload == RowPayloadRequirement::Required
     }
-
-    pub(crate) fn requires_lookup_table(self) -> bool {
-        matches!(
-            self.lookup,
-            LookupRequirement::Membership | LookupRequirement::RowMatches
-        )
-    }
 }
 
-fn row_matches(
-    match_flags: MatchFlagRequirement,
-    null_keys: NullKeyRequirement,
-) -> BuildComponentRequirements {
+fn row_matches(match_flags: MatchFlagRequirement) -> BuildComponentRequirements {
     BuildComponentRequirements {
         lookup: LookupRequirement::RowMatches,
         row_payload: RowPayloadRequirement::Required,
         match_flags,
-        null_keys,
     }
 }
 
@@ -83,49 +64,32 @@ pub(crate) fn required_build_components(
     has_equi_keys: bool,
 ) -> BuildComponentRequirements {
     let mut requirements = if !probe_is_left {
-        row_matches(
-            MatchFlagRequirement::NotNeeded,
-            NullKeyRequirement::NotNeeded,
-        )
+        row_matches(MatchFlagRequirement::NotNeeded)
     } else {
         match join_type {
-            JoinType::Inner | JoinType::LeftOuter => row_matches(
-                MatchFlagRequirement::NotNeeded,
-                NullKeyRequirement::NotNeeded,
-            ),
-            JoinType::RightOuter | JoinType::FullOuter => {
-                row_matches(MatchFlagRequirement::Needed, NullKeyRequirement::NotNeeded)
-            }
+            JoinType::Inner | JoinType::LeftOuter => row_matches(MatchFlagRequirement::NotNeeded),
+            JoinType::RightOuter | JoinType::FullOuter => row_matches(MatchFlagRequirement::Needed),
             JoinType::LeftSemi if !has_residual_predicate => BuildComponentRequirements {
                 lookup: LookupRequirement::Membership,
                 row_payload: RowPayloadRequirement::NotNeeded,
                 match_flags: MatchFlagRequirement::NotNeeded,
-                null_keys: NullKeyRequirement::NotNeeded,
             },
             JoinType::LeftAnti if !has_residual_predicate => BuildComponentRequirements {
                 lookup: LookupRequirement::Membership,
                 row_payload: RowPayloadRequirement::NotNeeded,
                 match_flags: MatchFlagRequirement::NotNeeded,
-                null_keys: NullKeyRequirement::NotNeeded,
             },
-            JoinType::LeftSemi | JoinType::LeftAnti => row_matches(
-                MatchFlagRequirement::NotNeeded,
-                NullKeyRequirement::NotNeeded,
-            ),
-            JoinType::RightSemi | JoinType::RightAnti => {
-                row_matches(MatchFlagRequirement::Needed, NullKeyRequirement::NotNeeded)
+            JoinType::LeftSemi | JoinType::LeftAnti => row_matches(MatchFlagRequirement::NotNeeded),
+            JoinType::RightSemi | JoinType::RightAnti => row_matches(MatchFlagRequirement::Needed),
+            JoinType::NullAwareLeftAnti if has_residual_predicate => {
+                row_matches(MatchFlagRequirement::NotNeeded)
             }
-            JoinType::NullAwareLeftAnti if has_residual_predicate => row_matches(
-                MatchFlagRequirement::NotNeeded,
-                NullKeyRequirement::NullKeyRows,
-            ),
             JoinType::NullAwareLeftAnti => BuildComponentRequirements {
                 // General NAA retains physical candidate topology even without E;
                 // signed linear modes decide membership without scanning it.
                 lookup: LookupRequirement::RowMatches,
                 row_payload: RowPayloadRequirement::NotNeeded,
                 match_flags: MatchFlagRequirement::NotNeeded,
-                null_keys: NullKeyRequirement::HasAnyNullKey,
             },
         }
     };
@@ -178,7 +142,6 @@ mod tests {
         let req = required_build_components(JoinType::NullAwareLeftAnti, false, true, true);
         assert_eq!(req.lookup, LookupRequirement::RowMatches);
         assert_eq!(req.row_payload, RowPayloadRequirement::NotNeeded);
-        assert_eq!(req.null_keys, NullKeyRequirement::HasAnyNullKey);
     }
 
     #[test]
@@ -186,7 +149,6 @@ mod tests {
         let req = required_build_components(JoinType::NullAwareLeftAnti, true, true, true);
         assert_eq!(req.lookup, LookupRequirement::RowMatches);
         assert_eq!(req.row_payload, RowPayloadRequirement::Required);
-        assert_eq!(req.null_keys, NullKeyRequirement::NullKeyRows);
     }
 
     #[test]

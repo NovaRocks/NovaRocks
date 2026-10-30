@@ -1171,7 +1171,7 @@ fn lower_core_with_creation<H>(
                             || work.step().map_err(FragmentCompileError::from),
                         )?;
                     if !same {
-                        return Err((unsupported(node, "join key carriers differ")).into());
+                        return Err(unsupported(node, "join key carriers differ"));
                     }
                     keys.push(ProgramJoinKey {
                         probe: lowered(expressions, probe_key)?,

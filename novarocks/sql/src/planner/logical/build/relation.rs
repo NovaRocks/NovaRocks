@@ -159,7 +159,7 @@ pub(super) fn plan_relation_scoped(
                     let right = plan_relation_scoped(right, cte_registry, factory, control)?;
                     Ok(LogicalPlanNode::new(
                         LogicalPlanKind::Join(LogicalJoinNode {
-                            naa_author,
+                            naa_author: naa_author.map(Box::new),
                             join_type,
                             condition,
                         }),

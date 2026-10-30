@@ -181,6 +181,7 @@ impl CompiledJoinFrame {
             })
             .clone()
     }
+    #[cfg(test)]
     pub(crate) fn prepared(&self) -> ExecutionResult<Arc<JoinBuildFrame>> {
         self.value
             .get()

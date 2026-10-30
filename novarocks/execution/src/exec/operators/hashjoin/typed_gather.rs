@@ -164,9 +164,11 @@ pub(crate) struct TypedJoinBatch {
     storage: ValueTypeStorageLifetime,
 }
 impl TypedJoinBatch {
+    #[cfg(test)]
     pub(crate) fn record_batch(&self) -> &RecordBatch {
         &self.batch
     }
+    #[cfg(test)]
     pub(crate) fn num_rows(&self) -> usize {
         self.batch.num_rows()
     }

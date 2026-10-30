@@ -98,6 +98,7 @@ pub(crate) struct BuildMatchBitmap {
     _storage: ValueTypeStorageLifetime,
 }
 impl BuildMatchBitmap {
+    #[cfg(test)]
     pub(crate) fn rows(&self) -> usize {
         self.rows
     }
@@ -235,6 +236,7 @@ impl BuildMatchBitmapInit {
         notify.arm();
         cause
     }
+    #[cfg(test)]
     pub(crate) fn check(&self) -> ExecutionResult<()> {
         self.ranges.check()
     }
@@ -350,11 +352,13 @@ impl BuildMatchBitmapInit {
     }
 }
 impl InitLease {
+    #[cfg(test)]
     pub(crate) fn words(&self) -> Range<usize> {
         self.words.clone()
     }
     /// Actual Vec length is the only cursor. A retired/settled lease has no
     /// pending initialization work; this does not certify that it initialized.
+    #[cfg(test)]
     pub(crate) fn remaining_words(&self) -> usize {
         self.pending
             .as_ref()
@@ -436,6 +440,7 @@ impl InitLease {
         }
         result
     }
+    #[cfg(test)]
     pub(crate) fn complete(&mut self) -> ExecutionResult<()> {
         self.settle_inner(false).map(|_| ())
     }

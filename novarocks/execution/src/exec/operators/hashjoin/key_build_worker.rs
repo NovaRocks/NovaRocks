@@ -77,6 +77,7 @@ impl KeyBuildWorker {
     pub(super) fn release_retired(&mut self) {
         self.retained.clear();
     }
+    #[cfg(test)]
     pub(crate) fn retained(&self) -> usize {
         self.retained.len()
     }

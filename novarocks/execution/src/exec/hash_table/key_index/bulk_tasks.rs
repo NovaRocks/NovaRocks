@@ -19,8 +19,10 @@
 //! a caller spends its original turn allowance on `advance`, and owns wakeups
 //! and actual driver exit. A completed data cursor is not a phase barrier.
 
+#[cfg(test)]
+use super::KeyInput;
 use super::{
-    IndexPurpose, KeyInput, PreparedKeyBatch,
+    IndexPurpose, PreparedKeyBatch,
     bulk::CapturedRuns,
     bulk::CompleteInput,
     bulk_read::{BulkKey, BulkMatch, IndexView},
@@ -899,6 +901,7 @@ struct AssignmentPage {
 struct AssignCursor {
     view: Arc<IndexView>,
     runs: CapturedRuns,
+    #[cfg(test)]
     input: KeyInput,
     page: CapturedPageId,
     position: usize,
@@ -913,6 +916,7 @@ impl AssignCursor {
             .as_ref()
             .cloned()
             .ok_or_else(|| invariant(ValueViolation::RowTransaction))?;
+        #[cfg(test)]
         let input = shared.runs.page(range.page)?.input().clone();
         let output = AssignmentPage {
             start: range.occurrences.start,
@@ -922,6 +926,7 @@ impl AssignCursor {
         Ok(Self {
             view,
             runs: shared.runs.clone(),
+            #[cfg(test)]
             input,
             page: range.page,
             position: range.occurrences.start,
@@ -970,6 +975,7 @@ impl AssignCursor {
         }
         Ok(AssignmentNode {
             page: self.page,
+            #[cfg(test)]
             input: self.input,
             assignment: self.output,
             _storage: owner.storage_lifetime(),
@@ -979,6 +985,7 @@ impl AssignCursor {
 
 struct AssignmentNode {
     page: CapturedPageId,
+    #[cfg(test)]
     input: KeyInput,
     assignment: AssignmentPage,
     _storage: ValueTypeStorageLifetime,
@@ -1161,6 +1168,7 @@ impl BulkAssignments {
     ) -> ExecutionResult<AssignmentChunk<'_>> {
         self.0.get(page, start)
     }
+    #[cfg(test)]
     pub(crate) fn iter(&self) -> Assignments<'_> {
         self.0.iter()
     }
@@ -1303,6 +1311,7 @@ impl AssignmentChunk<'_> {
     pub(crate) fn matches(&self) -> &[BulkMatch] {
         &self.0.assignment.matches
     }
+    #[cfg(test)]
     pub(crate) fn row(&self, ordinal: usize) -> ExecutionResult<usize> {
         if ordinal >= self.matches().len() {
             return Err(invariant(ValueViolation::Bounds));

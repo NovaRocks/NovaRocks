@@ -1378,7 +1378,7 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
                 null_extended: Box::default(),
                 condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
                     keys: Box::from([key]),
-                    residual: residual,
+                    residual,
                 },
             },
         )
@@ -1831,8 +1831,8 @@ fn compiled_join_gather_rejects_nested_domain_and_child_null_drift() {
         assert!(matches!(
             PagedJoinGather::new(
                 declared,
-                &left.chunk_schema(),
-                &right.chunk_schema(),
+                left.chunk_schema(),
+                right.chunk_schema(),
                 owner.as_ref()
             ),
             Err(JoinGatherError::Source(_))
@@ -1884,8 +1884,8 @@ fn compiled_join_gather_null_extension_requires_declared_nullable_binding() {
     }];
     let gather = PagedJoinGather::new_canonical(
         required,
-        &left.chunk_schema(),
-        &right.chunk_schema(),
+        left.chunk_schema(),
+        right.chunk_schema(),
         CanonicalJoinOutput::Pairs,
         owner.as_ref(),
     )
@@ -1916,8 +1916,8 @@ fn compiled_join_gather_null_extension_requires_declared_nullable_binding() {
     );
     let gather = PagedJoinGather::new_canonical(
         nullable,
-        &left.chunk_schema(),
-        &right.chunk_schema(),
+        left.chunk_schema(),
+        right.chunk_schema(),
         CanonicalJoinOutput::Pairs,
         owner.as_ref(),
     )

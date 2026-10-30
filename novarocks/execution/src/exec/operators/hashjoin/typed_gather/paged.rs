@@ -281,19 +281,16 @@ impl PagedJoinGather {
             if pair.probe.is_none() && pair.build.is_none() {
                 return Err(gather_contract("join pair has no original physical side").into());
             }
-            if let Some(row) = pair.probe {
-                if probe.is_none_or(|probe| row >= probe.len()) {
-                    return Err(gather_contract(
-                        "join probe selection is outside its original batch",
-                    )
-                    .into());
-                }
+            if let Some(row) = pair.probe
+                && probe.is_none_or(|probe| row >= probe.len())
+            {
+                return Err(
+                    gather_contract("join probe selection is outside its original batch").into(),
+                );
             }
             let address = pair.build.map(|row| build.locate(row)).transpose()?;
-            if needs_build {
-                if let Some(address) = address {
-                    keys.push((address.run().index(), address.page()));
-                }
+            if needs_build && let Some(address) = address {
+                keys.push((address.run().index(), address.page()));
             }
             addresses.push(address);
         }

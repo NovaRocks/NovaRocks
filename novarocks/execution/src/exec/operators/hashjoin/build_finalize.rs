@@ -279,6 +279,10 @@ impl JoinBuildFrame {
                 .fail(build_contract("join finalization state was poisoned"))
         })
     }
+    pub(crate) fn fail_input(&self, input: usize, cause: ExecutionFailure) -> ExecutionFailure {
+        let first = self.inputs.fail_input(input, cause);
+        self.fail(first)
+    }
     pub(crate) fn fail(&self, cause: ExecutionFailure) -> ExecutionFailure {
         let first = self.completion.fail(cause);
         let old = {

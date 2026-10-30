@@ -365,7 +365,7 @@ fn compacted_page_detaches_source_and_escaped_buffer_keeps_its_new_creator() {
     );
     let payload = page.payload().unwrap();
     let column = payload.column(0).unwrap();
-    assert_eq!(column.slot.typed_binding().value_type().nullable(), false);
+    assert!(!column.slot.typed_binding().value_type().nullable());
     let buffer = column.array.to_data().buffers()[0].clone();
     assert_eq!(
         column

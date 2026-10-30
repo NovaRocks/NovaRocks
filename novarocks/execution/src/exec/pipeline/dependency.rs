@@ -88,6 +88,7 @@ impl Dependency {
         self.ready.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(crate) fn observable(&self) -> Arc<Observable> {
         self.observable.clone()
     }

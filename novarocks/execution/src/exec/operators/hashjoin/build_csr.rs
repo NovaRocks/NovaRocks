@@ -92,6 +92,7 @@ struct Bases {
     _storage: ValueTypeStorageLifetime,
 }
 impl BuildCsr {
+    #[cfg(test)]
     pub(crate) fn row_count(&self) -> usize {
         self.rows.len()
     }
@@ -499,9 +500,11 @@ impl CsrBuilder {
     }
 }
 impl CsrLease {
+    #[cfg(test)]
     pub(crate) fn stage(&self) -> CsrStage {
         self.stage
     }
+    #[cfg(test)]
     pub(crate) fn range(&self) -> Range<usize> {
         self.lease.range()
     }
@@ -628,6 +631,7 @@ impl CsrLease {
             CsrProgress::Progressed
         })
     }
+    #[cfg(test)]
     pub(crate) fn complete(&mut self) -> ExecutionResult<()> {
         self.settle_inner(false).map(|_| ())
     }

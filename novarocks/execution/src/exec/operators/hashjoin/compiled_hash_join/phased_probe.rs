@@ -617,7 +617,7 @@ impl TransformKernel for JoinProbe {
                     .map_err(JoinGatherError::into_execution)?,
                 );
             }
-            let source_owner = source_key_owner(&chunk, owner.as_ref())?;
+            let source_owner = source_key_owner(chunk, owner.as_ref())?;
             let work = BulkWork {
                 owner: source_owner.as_ref(),
                 allocator: AggregateAllocator::new(
@@ -636,7 +636,7 @@ impl TransformKernel for JoinProbe {
                 self.roots.as_mut().expect("installed roots"),
                 self.loaded.as_ref().expect("published build"),
                 self.frame.as_ref().expect("prepared frame"),
-                &chunk,
+                chunk,
                 &mut self.conversions,
                 &work,
                 &self.control,

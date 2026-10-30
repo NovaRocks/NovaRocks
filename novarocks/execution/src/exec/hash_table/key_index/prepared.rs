@@ -345,6 +345,7 @@ impl KeyInput {
     /// Observe root SQL NULL through the same already-prepared tuple author,
     /// including dictionary bottom NULL and logical NULL carriers. Occurrence
     /// coordinates retain their original source-row mapping and duplicates.
+    #[cfg(test)]
     pub(crate) fn row_has_null_observed(
         &self,
         occurrence: usize,

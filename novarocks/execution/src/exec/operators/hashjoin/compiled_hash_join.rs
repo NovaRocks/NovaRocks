@@ -35,7 +35,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray};
-use novarocks_functions::{KernelDiagnostic, KernelFailure};
+use novarocks_functions::KernelFailure;
 use novarocks_local_program::{
     JoinDistributionMode, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
     ProgramNodeId, ProgramNodeKind,
@@ -71,64 +71,6 @@ use crate::runtime_filter::RuntimeFilterProducerFailure;
 use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
 use novarocks_value_arrays::decode::ValueConversionContext;
 
-#[derive(Debug)]
-struct HashJoinContractFailure(novarocks_failure_contract::BoundedDetail);
-impl std::fmt::Display for HashJoinContractFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-impl std::error::Error for HashJoinContractFailure {}
-impl novarocks_failure_contract::FailureProjection for HashJoinContractFailure {
-    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        novarocks_failure_contract::FailureFact::new(
-            novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::HashJoinExecutionContract.reason(),
-        )
-    }
-}
-fn hash_join_contract(detail: &'static str) -> ExecutionFailure {
-    ExecutionFailure::from_domain(HashJoinContractFailure(
-        novarocks_failure_contract::BoundedDetail::truncating(detail),
-    ))
-}
-#[derive(Debug)]
-struct JoinBuildCountOverflow {
-    current: usize,
-    incoming: usize,
-}
-impl std::fmt::Display for JoinBuildCountOverflow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "hash join build cannot add {} rows to {}",
-            self.incoming, self.current
-        )
-    }
-}
-impl std::error::Error for JoinBuildCountOverflow {}
-impl novarocks_failure_contract::FailureProjection for JoinBuildCountOverflow {
-    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::{
-            FailureClass, FailureFact, ResourceDimension, ResourceFacts, ResourceScope,
-        };
-        FailureFact::new(
-            FailureClass::Resource,
-            crate::runtime::fragment::ExecutionReason::JoinBuildCountExtent.reason(),
-        )
-        .with_resource(ResourceFacts {
-            request_scope: Some(ResourceScope::Operator),
-            constraint_scope: Some(ResourceScope::Operator),
-            dimension: ResourceDimension::Positions,
-            requested: u64::try_from(self.incoming).ok(),
-            required_growth: u64::try_from(self.incoming).ok(),
-            limit: u64::try_from(usize::MAX).ok(),
-            live: u64::try_from(self.current).ok(),
-            committed: None,
-        })
-    }
-}
-
 /// Runtime role schemas retain their own finite source/new storage holds.
 /// They never retain the declaring plan, program or creating factory.
 pub(crate) struct PreparedJoinSchemas {
@@ -156,16 +98,12 @@ pub(crate) fn prepare_join_schemas(
 /// The frozen facts of one compiled Join node that both sides share.
 pub(crate) struct CompiledHashJoinPlan {
     node: ProgramNodeId,
-    join_type: JoinType,
     probe_sites: Vec<ProgramExpressionRootSite>,
     build_sites: Vec<ProgramExpressionRootSite>,
     build_key_bindings: Vec<FunctionValueType>,
     probe_key_bindings: Vec<FunctionValueType>,
-    residual: Option<ProgramExpressionRootSite>,
     eq_null_safe: Vec<bool>,
     build: novarocks_local_program::StaticLayout,
-    scope: novarocks_local_program::StaticLayout,
-    output: novarocks_local_program::StaticLayout,
     requirements: BuildComponentRequirements,
 }
 
@@ -265,16 +203,12 @@ impl CompiledHashJoinPlan {
         let requirements = required_build_components(join_type, residual.is_some(), true, true);
         Ok(Self {
             node,
-            join_type,
             probe_sites,
             build_sites,
             build_key_bindings,
             probe_key_bindings,
-            residual,
             eq_null_safe: keys.iter().map(|key| key.null_safe).collect(),
             build: right_layout.clone(),
-            scope: join_scope_layout.clone(),
-            output: graph_node.output_layout().clone(),
             requirements,
         })
     }
@@ -345,26 +279,6 @@ pub(crate) fn validate_join_scope(
             ),
         ))
     }
-}
-
-/// TRUE rows of a Boolean root: FALSE and NULL are both excluded.
-pub(crate) fn true_mask(truth: &ArrayRef) -> ExecutionResult<BooleanArray> {
-    let truth = truth
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| {
-            ExecutionFailure::from(KernelFailure::InvalidProgram(KernelDiagnostic::new(
-                "compiled join predicate is not Boolean",
-            )))
-        })?;
-    Ok(if truth.null_count() == 0 {
-        truth.clone()
-    } else {
-        truth
-            .iter()
-            .map(|value| Some(value == Some(true)))
-            .collect()
-    })
 }
 
 pub(crate) use tail::CompiledJoinTailSourceFactory;

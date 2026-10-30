@@ -247,7 +247,7 @@ fn to_optimizer_expr_unchecked(
             let op = Operator::LogicalJoin(LogicalJoinOp {
                 naa_author: node
                     .naa_author
-                    .as_ref()
+                    .as_deref()
                     .map(|facts| {
                         facts
                             .clone()
@@ -630,7 +630,7 @@ pub(crate) fn to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlan
         Operator::LogicalJoin(op) => LogicalPlanKind::Join(LogicalJoinNode {
             naa_author: op
                 .naa_author
-                .map(|facts| facts.map(|id| materialize(arena, id))),
+                .map(|facts| Box::new(facts.map(|id| materialize(arena, id)))),
             join_type: op.join_type,
             condition: op.condition.map(|id| materialize(arena, id)),
         }),

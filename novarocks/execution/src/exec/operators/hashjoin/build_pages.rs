@@ -25,7 +25,7 @@ use super::{
 };
 use crate::{
     exec::{
-        chunk::{ChunkBatchProjection, ChunkSchema, ChunkSlotSchema},
+        chunk::{ChunkBatchProjection, ChunkSlotSchema},
         hash_table::key_index::{
             BulkDomain, BulkInput, BulkWork, CaptureWork, CapturedPageId, CompleteInput,
             IndexPurpose, KeyInput, KeySpec, PreparedKeyBatch, SealedCapture,
@@ -35,7 +35,9 @@ use crate::{
     runtime::fragment::{ExecutionFailure, ExecutionResult},
 };
 use arrow::array::ArrayRef;
-use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+#[cfg(test)]
+use novarocks_type_contract::FunctionValueType;
+use novarocks_type_contract::ValueTypeStorageLifetime;
 use std::{ops::Range, sync::Arc};
 
 #[cfg(test)]
@@ -127,12 +129,15 @@ pub(crate) struct BuildInputReceipt {
     pub(super) pages: Arc<PayloadRunPages>,
 }
 impl BuildInputReceipt {
+    #[cfg(test)]
     pub(crate) fn run(&self) -> B3RunId {
         self.run
     }
+    #[cfg(test)]
     pub(crate) fn rows(&self) -> usize {
         self.pages.rows
     }
+    #[cfg(test)]
     pub(crate) fn page_count(&self) -> usize {
         self.pages.pages.len()
     }
@@ -145,10 +150,12 @@ pub(super) struct RetainedNaaValues {
     // This is the actual neutral source holder also used by K capture.
     pub(super) _source: ValueTypeStorageLifetime,
 }
+#[cfg(test)]
 pub(crate) struct ValueNullRow {
     pub(super) row: usize,
     pub(super) ordinary: bool,
 }
+#[cfg(test)]
 impl ValueNullRow {
     pub(crate) fn row_in_page(&self) -> usize {
         self.row
@@ -158,23 +165,24 @@ impl ValueNullRow {
     }
 }
 pub(crate) struct ValueNullFacts {
+    #[cfg(test)]
     pub(super) rows: Vec<ValueNullRow>,
     pub(super) ordinary_rows: Vec<usize>,
     pub(super) _storage: ValueTypeStorageLifetime,
 }
 impl ValueNullFacts {
+    #[cfg(test)]
     pub(crate) fn rows(&self) -> &[ValueNullRow] {
         &self.rows
     }
-    pub(crate) fn has_any_value_null(&self) -> bool {
-        !self.rows.is_empty()
-    }
+    #[cfg(test)]
     pub(crate) fn ordinary_rows(&self) -> impl Iterator<Item = usize> + '_ {
         self.ordinary_rows.iter().copied()
     }
     pub(crate) fn ordinary_row_indices(&self) -> &[usize] {
         &self.ordinary_rows
     }
+    #[cfg(test)]
     pub(crate) fn nullsafe_only_rows(&self) -> impl Iterator<Item = usize> + '_ {
         self.rows
             .iter()
@@ -208,9 +216,7 @@ impl PayloadRunPages {
             .ok_or_else(|| build_contract("join run has no original NAA NULL directory"))?;
         Ok(&self.ordinary_null_pages)
     }
-    pub(crate) fn len(&self) -> usize {
-        self.rows
-    }
+    #[cfg(test)]
     pub(crate) fn page_count(&self) -> usize {
         self.pages.len()
     }
@@ -247,9 +253,6 @@ pub(crate) struct TypedPayloadColumnLoan<'a> {
     pub(crate) slot: &'a ChunkSlotSchema,
 }
 impl PayloadPageLoan<'_> {
-    pub(crate) fn schema(&self) -> &ChunkSchema {
-        self.0.chunk_schema()
-    }
     /// Continue the original finite holders without retaining this page's
     /// RecordBatch or the entire build artifact in an output alias.
     pub(crate) fn source_storage_lifetime_observed<
@@ -287,6 +290,7 @@ impl NaaValuePageLoan<'_> {
     pub(crate) fn source_row(&self, occurrence: usize) -> ExecutionResult<usize> {
         self.0.input.row(occurrence)
     }
+    #[cfg(test)]
     pub(crate) fn column(&self, value: usize) -> ExecutionResult<(&ArrayRef, &FunctionValueType)> {
         let column = self
             .0

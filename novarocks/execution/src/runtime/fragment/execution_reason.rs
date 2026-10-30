@@ -44,13 +44,25 @@ pub(crate) enum ExecutionReason {
     SetInvalidStage = 25,
     SetDuplicateCompletion = 26,
     ReceiverInputAfterFinish = 27,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     JoinGroupUnavailable = 28,
     #[expect(
         dead_code,
         reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
     )]
     JoinBuildRowUnavailable = 29,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     JoinPresenceOnly = 30,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     JoinRowIdExtent = 31,
     LocalExchangeMissingBinding = 32,
     AsyncSinkInvalidCapacity = 40,
@@ -134,11 +146,35 @@ pub(crate) enum ExecutionReason {
     QueryMemoryMissingRuntime = 174,
     ValuesEmptyPort = 175,
     ValuesColumnAssembly = 176,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     NestedLoopBuildNotReady = 177,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     NestedLoopBuildNotLoaded = 178,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     NestedLoopMissingProbe = 179,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     NestedLoopMissingPredicate = 180,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     NestedLoopUnsupportedJoin = 181,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     NestedLoopRowIdExtent = 182,
     ChunkMissingSlot = 183,
     ChunkInvalidColumnIndex = 184,
@@ -282,7 +318,15 @@ pub(crate) enum ExecutionReason {
     #[cfg(test)]
     AssertRowsDisplay = 320,
     FinalIdentityInput = 321,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     HashJoinExecutionContract = 322,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     JoinBuildCountExtent = 323,
     #[expect(
         dead_code,
@@ -393,27 +437,65 @@ pub(crate) enum ExecutionReason {
         reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
     )]
     JoinRowIndexCapacity = 412,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     JoinMapContract = 413,
     #[expect(
         dead_code,
         reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
     )]
     JoinMapExtent = 414,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     JoinSelectionContract = 415,
     JoinGatherContract = 416,
     JoinGatherAllocation = 417,
     JoinGatherOffset = 418,
     JoinGatherUnexpected = 419,
     JoinGatherArrow = 420,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     JoinArtifactContract = 422,
     #[cfg(test)]
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+        )
+    )]
     JoinMatchContract = 423,
     #[cfg(test)]
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+        )
+    )]
     JoinFinalizeContract = 424,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     JoinStoreContract = 425,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     JoinStoreRows = 426,
     JoinBuildStateContract = 428,
     MissingCompiledSchemaSite = 459,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     NlJoinContract = 460,
     DistinctSetZeroColumns = 465,
     #[expect(
