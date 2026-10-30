@@ -737,6 +737,24 @@ impl<'a> PreparedKeyBatch<'a> {
         self.preparation.bytes(column)
     }
 
+    /// Value-demand comparison of original signed components, independent of
+    /// hash routing and the index's ordinary-NULL exclusion policy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compare_value_pairs(
+        &self,
+        components: std::ops::Range<usize>,
+        left_rows: &[usize],
+        other: &PreparedKeyBatch<'_>,
+        right_rows: &[usize],
+        output: &mut [Option<bool>],
+        owner: &dyn InputConstructionOwner,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
+        super::pairs::compare_value_pairs(
+            self, components, left_rows, other, right_rows, output, owner, checkpoint,
+        )
+    }
+
     /// Bind a materialization subset once, borrowing the same decoded source.
     /// The subset does not authorize rows outside this input's readable domain.
     pub(super) fn byte_subset<'b>(

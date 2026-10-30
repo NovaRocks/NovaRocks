@@ -123,9 +123,10 @@ impl BuildCsr {
 }
 
 struct Source {
-    assignments: BulkAssignments,
+    assignments: Arc<BulkAssignments>,
     rows: Arc<BuildRows>,
     projection: ProjectionKind,
+    ordinary_nulls_only: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CsrStage {
@@ -198,6 +199,52 @@ impl CsrBuilder {
         changed: Arc<Observable>,
         work: &BulkWork<'_>,
     ) -> ExecutionResult<Arc<Self>> {
+        let assignments = funded_shared(work.owner, assignments)?;
+        Self::new_shared(
+            view,
+            assignments,
+            rows,
+            projection,
+            false,
+            workers,
+            changed,
+            work,
+        )
+    }
+    /// A second row selection consumes the SAME original assignment directory.
+    /// The coordinator clones one Arc, never a page/row-sized directory.
+    pub(crate) fn ordinary_null_rows(
+        &self,
+        view: &IndexView,
+        work: &BulkWork<'_>,
+    ) -> ExecutionResult<Arc<Self>> {
+        if self.source.ordinary_nulls_only || self.source.projection != ProjectionKind::Group {
+            return Err(build_contract(
+                "NAA NULL CSR requires its original whole group selection",
+            ));
+        }
+        Self::new_shared(
+            view,
+            Arc::clone(&self.source.assignments),
+            Arc::clone(&self.source.rows),
+            self.source.projection,
+            true,
+            self.workers,
+            Arc::clone(&self.changed),
+            work,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn new_shared(
+        view: &IndexView,
+        assignments: Arc<BulkAssignments>,
+        rows: Arc<BuildRows>,
+        projection: ProjectionKind,
+        ordinary_nulls_only: bool,
+        workers: NonZeroUsize,
+        changed: Arc<Observable>,
+        work: &BulkWork<'_>,
+    ) -> ExecutionResult<Arc<Self>> {
         work.control.checkpoint(0)?;
         let mut partitions = funded_vec(work.owner, view.partition_count())?;
         let mut keys = 0usize;
@@ -249,6 +296,7 @@ impl CsrBuilder {
                     assignments,
                     rows,
                     projection,
+                    ordinary_nulls_only,
                 },
                 sums,
                 workers,
@@ -488,7 +536,7 @@ impl CsrLease {
                 let count = layout
                     .count(&self.cells, self.cursor)?
                     .load(Ordering::Relaxed);
-                if count == 0 {
+                if count == 0 && !self.owner.source.ordinary_nulls_only {
                     return Err(build_contract("K emitted an unassigned dense class ID"));
                 }
                 layout
@@ -519,6 +567,27 @@ impl CsrLease {
                 }
                 BulkMatch::Unmatchable => {}
                 BulkMatch::Found(key) => {
+                    let address = if self.owner.source.ordinary_nulls_only
+                        || self.stage == CsrStage::Scatter
+                    {
+                        Some(self.owner.source.rows.address_for_assignment(
+                            self.owner.source.projection,
+                            chunk.page(),
+                            chunk.start() + self.cursor,
+                        )?)
+                    } else {
+                        None
+                    };
+                    if self.owner.source.ordinary_nulls_only
+                        && !self
+                            .owner
+                            .source
+                            .rows
+                            .has_ordinary_value_null(address.expect("original selected address"))?
+                    {
+                        self.cursor += 1;
+                        continue;
+                    }
                     let cell = layout.cell(key)?;
                     if self.stage == CsrStage::Count {
                         layout
@@ -541,12 +610,11 @@ impl CsrLease {
                         let start = bases.values[cell / layout.width.get()]
                             .checked_add(layout.offset(&self.cells, cell)?.load(Ordering::Relaxed))
                             .ok_or_else(arithmetic)?;
-                        let address = self.owner.source.rows.address_for_assignment(
-                            self.owner.source.projection,
-                            chunk.page(),
-                            chunk.start() + self.cursor,
-                        )?;
-                        let row = self.owner.source.rows.row_id(address)?;
+                        let row = self
+                            .owner
+                            .source
+                            .rows
+                            .row_id(address.expect("original scatter address"))?;
                         rows.at(start.checked_add(ordinal).ok_or_else(arithmetic)?)?
                             .store(row.index(), Ordering::Relaxed);
                     }

@@ -50,6 +50,241 @@ fn capture(
     )
     .unwrap()
 }
+
+#[test]
+fn original_component_range_value_comparison_keeps_unknown_false_and_equality_modes() {
+    use arrow::datatypes::Int32Type;
+    let mut cases: Vec<(FunctionValueType, ArrayRef, ArrayRef)> = vec![
+        (
+            FunctionValueType::new(DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![None, Some(2)])),
+            Arc::new(Int64Array::from(vec![Some(2), Some(2), None])),
+        ),
+        (
+            FunctionValueType::new(DataType::Utf8, true),
+            Arc::new(StringArray::from(vec![None, Some("two")])),
+            Arc::new(StringViewArray::from(vec![Some("two"), Some("two"), None])),
+        ),
+    ];
+    cases.push((
+        FunctionValueType::new(DataType::Utf8, true),
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 1]),
+                Arc::new(StringArray::from(vec![None, Some("two")])),
+            )
+            .unwrap(),
+        ),
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 0, 1]),
+                Arc::new(StringArray::from(vec![Some("two"), None])),
+            )
+            .unwrap(),
+        ),
+    ));
+    cases.push((
+        FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ),
+        Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            None,
+            Some(vec![Some(2), None]),
+        ])),
+        Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(2), None]),
+            Some(vec![Some(2), None]),
+            None,
+        ])),
+    ));
+    for (case, (ty, left_value, right_value)) in cases.into_iter().enumerate() {
+        for null_safe in [false, true] {
+            let (owner, tracker) = owner_with_tracker();
+            let types = [
+                FunctionValueType::new(DataType::Int32, false),
+                ty.clone(),
+                FunctionValueType::new(DataType::Int32, false),
+            ];
+            let modes = [
+                NullPolicy::Equal,
+                if null_safe {
+                    NullPolicy::Equal
+                } else {
+                    NullPolicy::Unmatchable
+                },
+                NullPolicy::Unmatchable,
+            ];
+            let spec = KeySpec::new(&types, &modes, owner.as_ref(), &|| Ok(())).unwrap();
+            let left_arrays: Vec<ArrayRef> = vec![
+                Arc::new(Int32Array::from(vec![7, 8])),
+                Arc::clone(&left_value),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ];
+            let right_arrays: Vec<ArrayRef> = vec![
+                Arc::new(Int32Array::from(vec![999, 888, 777])),
+                Arc::clone(&right_value),
+                Arc::new(Int32Array::from(vec![1, 2, 1])),
+            ];
+            let mut right_types = types.clone();
+            if case == 1 {
+                // V can compare UTF8 and VIEW, but the incoming VIEW still
+                // has its own actual signed carrier declaration.
+                right_types[1] = FunctionValueType::new(DataType::Utf8View, true);
+            }
+            let checked_capture = |arrays: &[ArrayRef],
+                                   bindings: &[FunctionValueType],
+                                   rows: &[usize],
+                                   side| {
+                KeyInput::new_for_spec(
+                    &spec,
+                    arrays,
+                    bindings,
+                    &readable(arrays[0].len()),
+                    rows,
+                    &mut ValueConversionContext::default(),
+                    owner.as_ref(),
+                    &|| Ok(()),
+                )
+                .unwrap_or_else(|cause| {
+                    panic!("value pair fixture {case}/{null_safe}/{side} failed capture: {cause:?}")
+                })
+            };
+            let left = checked_capture(&left_arrays, &types, &[0, 1], "left");
+            let right = checked_capture(&right_arrays, &right_types, &[0, 1, 2], "right");
+            let a = PreparedKeyBatch::from_captured(
+                &spec,
+                &left,
+                AggregateAllocator::new(tracker.clone()),
+                &|| Ok(()),
+            )
+            .unwrap();
+            let b = PreparedKeyBatch::from_captured(
+                &spec,
+                &right,
+                AggregateAllocator::new(tracker),
+                &|| Ok(()),
+            )
+            .unwrap();
+            let mut actual = [Some(false); 5];
+            a.compare_value_pairs(
+                1..3,
+                &[0, 0, 1, 1, 0],
+                &b,
+                &[0, 1, 0, 1, 2],
+                &mut actual,
+                owner.as_ref(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(
+                actual,
+                [
+                    if null_safe { Some(false) } else { None },
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                    if null_safe { Some(true) } else { None }
+                ]
+            );
+            // The scope prefix is excluded explicitly, never guessed by roles.
+            a.compare_value_pairs(
+                0..3,
+                &[0, 0, 1, 1, 0],
+                &b,
+                &[0, 1, 0, 1, 2],
+                &mut actual,
+                owner.as_ref(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(actual, [Some(false); 5]);
+            a.compare_value_pairs(
+                1..1,
+                &[0, 0, 1, 1, 0],
+                &b,
+                &[0, 1, 0, 1, 2],
+                &mut actual,
+                owner.as_ref(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(actual, [Some(true); 5]);
+            let original: ExecutionFailure = KernelFailure::DeadlineExceeded.into();
+            let failure = a
+                .compare_value_pairs(
+                    1..3,
+                    &[0, 0, 1, 1, 0],
+                    &b,
+                    &[0, 1, 0, 1, 2],
+                    &mut actual,
+                    owner.as_ref(),
+                    &|| Err(original.clone()),
+                )
+                .unwrap_err();
+            assert_eq!(failure, original);
+            assert_eq!(actual, [Some(true); 5]);
+        }
+    }
+}
+
+#[test]
+fn value_comparison_uses_original_native_float_canonical_equality() {
+    let (owner, tracker) = owner_with_tracker();
+    let types = [FunctionValueType::new(DataType::Float64, true)];
+    let spec = KeySpec::new(&types, &[NullPolicy::Unmatchable], owner.as_ref(), &|| {
+        Ok(())
+    })
+    .unwrap();
+    let left = capture(
+        &spec,
+        &[Arc::new(Float64Array::from(vec![
+            Some(-0.0),
+            Some(f64::from_bits(0x7ff8_0000_0000_0001)),
+            None,
+        ]))],
+        &types,
+        &[0, 1, 2],
+        owner.as_ref(),
+    );
+    let right = capture(
+        &spec,
+        &[Arc::new(Float64Array::from(vec![
+            Some(0.0),
+            Some(f64::from_bits(0x7ff8_0000_0000_0021)),
+            None,
+        ]))],
+        &types,
+        &[0, 1, 2],
+        owner.as_ref(),
+    );
+    let a = PreparedKeyBatch::from_captured(
+        &spec,
+        &left,
+        AggregateAllocator::new(tracker.clone()),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let b = PreparedKeyBatch::from_captured(
+        &spec,
+        &right,
+        AggregateAllocator::new(tracker),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut output = [Some(false); 3];
+    a.compare_value_pairs(
+        0..1,
+        &[0, 1, 2],
+        &b,
+        &[0, 1, 2],
+        &mut output,
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(output, [Some(true), Some(true), None]);
+}
 fn captured_hash(
     spec: &KeySpec,
     input: &KeyInput,

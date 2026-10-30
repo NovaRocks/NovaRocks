@@ -47,12 +47,14 @@ use std::{
 pub(crate) struct IndexedBuild {
     pub(crate) view: Arc<IndexView>,
     pub(crate) groups: Option<BuildCsr>,
+    pub(crate) ordinary_nulls: Option<BuildCsr>,
 }
 enum Phase {
     Keys(Arc<BulkTaskGraph>),
     Csr {
         view: Arc<IndexView>,
         build: Arc<CsrBuilder>,
+        all_groups: Option<BuildCsr>,
     },
     Ready(Option<IndexedBuild>),
     Transition,
@@ -272,7 +274,11 @@ impl ProjectionBuild {
         let (view, assignments) = ready.into_parts();
         let next = if view.purpose() == IndexPurpose::PresenceOnly {
             drop(assignments);
-            Phase::Ready(Some(IndexedBuild { view, groups: None }))
+            Phase::Ready(Some(IndexedBuild {
+                view,
+                groups: None,
+                ordinary_nulls: None,
+            }))
         } else {
             let build = CsrBuilder::new(
                 &view,
@@ -283,21 +289,31 @@ impl ProjectionBuild {
                 Arc::clone(&self.changed),
                 work,
             )?;
-            Phase::Csr { view, build }
+            Phase::Csr {
+                view,
+                build,
+                all_groups: None,
+            }
         };
         self.install(next)
     }
-    fn csr_ready(&self, build: &Arc<CsrBuilder>) -> ExecutionResult<ProjectionStep> {
-        let view = {
+    fn csr_ready(
+        &self,
+        build: &Arc<CsrBuilder>,
+        work: &BulkWork<'_>,
+    ) -> ExecutionResult<ProjectionStep> {
+        let (view, all_groups) = {
             let mut phase = self.phase()?;
-            match &*phase {
+            match &mut *phase {
                 Phase::Csr {
                     view,
                     build: current,
+                    all_groups,
                 } if Arc::ptr_eq(current, build) => {
                     let view = Arc::clone(view);
+                    let all_groups = all_groups.take();
                     *phase = Phase::Transition;
-                    view
+                    (view, all_groups)
                 }
                 Phase::Failed(cause) => return Err(cause.clone()),
                 Phase::Retiring | Phase::Retired => return Ok(ProjectionStep::Retired),
@@ -307,10 +323,27 @@ impl ProjectionBuild {
         let groups = build
             .take_ready()?
             .ok_or_else(|| build_contract("CSR barrier finished without its unique data"))?;
-        self.install(Phase::Ready(Some(IndexedBuild {
-            view,
-            groups: Some(groups),
-        })))
+        let next = if let Some(all_groups) = all_groups {
+            Phase::Ready(Some(IndexedBuild {
+                view,
+                groups: Some(all_groups),
+                ordinary_nulls: Some(groups),
+            }))
+        } else if self.projection == ProjectionKind::Group {
+            let nulls = build.ordinary_null_rows(&view, work)?;
+            Phase::Csr {
+                view,
+                build: nulls,
+                all_groups: Some(groups),
+            }
+        } else {
+            Phase::Ready(Some(IndexedBuild {
+                view,
+                groups: Some(groups),
+                ordinary_nulls: None,
+            }))
+        };
+        self.install(next)
     }
 }
 impl ProjectionWorker {
@@ -400,7 +433,7 @@ impl ProjectionWorker {
             match csr.claim(work)? {
                 CsrClaim::Initialize(lease) => self.csr = Some(CsrWork::Initialize(lease)),
                 CsrClaim::Work(lease) => self.csr = Some(CsrWork::Range(lease)),
-                CsrClaim::Ready => return build.csr_ready(&csr),
+                CsrClaim::Ready => return build.csr_ready(&csr, work),
                 CsrClaim::Progressed => return Ok(ProjectionStep::Progressed),
                 CsrClaim::Pending => return Ok(ProjectionStep::Blocked),
                 CsrClaim::Retired => return Ok(ProjectionStep::Retired),

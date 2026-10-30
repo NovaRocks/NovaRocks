@@ -504,6 +504,89 @@ fn naa_two_original_projections_make_progress_without_cross_domain_coordinate_gu
         panic!("two authored NAA projections");
     };
     assert_eq!(group.groups.as_ref().unwrap().row_count(), 2804);
+    let nulls = group
+        .ordinary_nulls
+        .as_ref()
+        .expect("original group NULL selection");
+    let actual = (0..nulls.row_count())
+        .map(|position| nulls.row(position).unwrap())
+        .collect::<BTreeSet<_>>();
+    let expected = (0..2804)
+        .filter(|row| row % 701 % 11 == 0)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(nulls.row_count(), 256);
+    assert_eq!(actual, expected);
+    // Query actual K coordinates, then compare each CSR class to an
+    // independent physical-row oracle. This includes empty NULL classes and
+    // the null-safe scope bucket; full/group K run IDs remain unrelated.
+    let scopes = std::iter::once(None)
+        .chain((0..43).map(Some))
+        .collect::<Vec<_>>();
+    let arrays: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(scopes.clone()))];
+    let readable = novarocks_value_arrays::reachability::ReachableRows::all(scopes.len())
+        .materialize_observed(
+            &mut |layout| owner.request(layout).map_err(ExecutionFailure::from),
+            &mut |_| Ok::<_, ExecutionFailure>(()),
+        )
+        .unwrap();
+    let occurrences = (0..scopes.len()).collect::<Vec<_>>();
+    let input = crate::exec::hash_table::key_index::KeyInput::new_for_spec(
+        group.view.spec(),
+        &arrays,
+        &types[..1],
+        &readable,
+        &occurrences,
+        &mut ValueConversionContext::default(),
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let input = crate::exec::hash_table::key_index::PreparedKeyBatch::from_captured(
+        group.view.spec(),
+        &input,
+        work.allocator.clone(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let lookup = group
+        .view
+        .probe(&input, None, owner.as_ref(), &Control)
+        .unwrap();
+    let mut empty_null_classes = 0;
+    for (scope, found) in scopes.iter().zip(lookup.matches()) {
+        let crate::exec::hash_table::key_index::BulkMatch::Found(key) = found else {
+            panic!("every actual scope exists");
+        };
+        let expected = (0..2804)
+            .filter(|row| {
+                let i = row % 701;
+                (if i % 13 == 0 {
+                    None
+                } else {
+                    Some(i as i32 % 43)
+                }) == *scope
+            })
+            .collect::<BTreeSet<_>>();
+        let all = group.groups.as_ref().unwrap();
+        let actual = all
+            .group(*key)
+            .unwrap()
+            .map(|position| all.row(position).unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        let expected = expected
+            .into_iter()
+            .filter(|row| row % 701 % 11 == 0)
+            .collect::<BTreeSet<_>>();
+        let actual = nulls
+            .group(*key)
+            .unwrap()
+            .map(|position| nulls.row(position).unwrap())
+            .collect::<BTreeSet<_>>();
+        empty_null_classes += usize::from(expected.is_empty());
+        assert_eq!(actual, expected);
+    }
+    assert!(empty_null_classes > 0);
     assert!(full.groups.is_none());
     assert_eq!(full.view.purpose(), IndexPurpose::PresenceOnly);
     assert!(published.artifact.matches.is_none());

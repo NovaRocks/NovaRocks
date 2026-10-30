@@ -136,6 +136,158 @@ pub(super) fn compare_prepared_pairs(
     checkpoint()
 }
 
+/// Compare an explicit value-component range through the original K/V
+/// authors. This does not add a third index NULL policy: ordinary value NULL
+/// is UNKNOWN here, while the index still excludes it. The consumer interprets
+/// the conjunction; FALSE dominates UNKNOWN. Outputs are discarded on error.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn compare_value_pairs(
+    left: &PreparedKeyBatch<'_>,
+    components: std::ops::Range<usize>,
+    left_rows: &[usize],
+    right: &PreparedKeyBatch<'_>,
+    right_rows: &[usize],
+    output: &mut [Option<bool>],
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<()> {
+    checkpoint()?;
+    if !left.spec.same_instance(&right.spec)
+        || components.start > components.end
+        || components.end > left.spec.types().len()
+        || left_rows.len() != right_rows.len()
+        || output.len() != left_rows.len()
+    {
+        return Err(invariant(ValueViolation::Layout));
+    }
+    for (i, ((&a, &b), result)) in left_rows
+        .iter()
+        .zip(right_rows)
+        .zip(output.iter_mut())
+        .enumerate()
+    {
+        checkpoint_at(i, checkpoint)?;
+        if !left.input.selected().contains(a) || !right.input.selected().contains(b) {
+            return Err(invariant(ValueViolation::UndefinedRow));
+        }
+        *result = Some(true);
+    }
+    if components.is_empty() {
+        return checkpoint();
+    }
+    let mut values = vector(owner, output.len())?;
+    let mut fixed = vector(owner, output.len())?;
+    for i in 0..output.len() {
+        checkpoint_at(i, checkpoint)?;
+        values.push(Some(true));
+        fixed.push(1);
+    }
+    for column in components {
+        checkpoint()?;
+        let nulls = left.spec.nulls()[column];
+        match (left.bytes(column)?, right.bytes(column)?) {
+            (Some(a), Some(b)) => {
+                compare_pairs_into(
+                    &a,
+                    left_rows,
+                    &b,
+                    right_rows,
+                    if nulls == NullPolicy::Equal {
+                        NullEquality::Equal
+                    } else {
+                        NullEquality::Unknown
+                    },
+                    &mut values,
+                    &mut |_| checkpoint(),
+                )
+                .map_err(original)?;
+            }
+            (None, None) => {
+                let (a, am) = left.tuples().physical_component(column)?;
+                let (b, bm) = right.tuples().physical_component(column)?;
+                if super::prepared::is_fixed(left.spec.types()[column].data_type()) {
+                    for (i, (slot, previous)) in fixed.iter_mut().zip(output.iter()).enumerate() {
+                        checkpoint_at(i, checkpoint)?;
+                        *slot = u8::from(*previous != Some(false));
+                    }
+                    // Keep the same native canonical comparison, including
+                    // signed zero/NaN and exact FixedSizeBinary width.
+                    compare_fixed_pairs(
+                        a,
+                        am,
+                        left_rows,
+                        b,
+                        bm,
+                        right_rows,
+                        NullPolicy::Equal,
+                        &mut fixed,
+                        checkpoint,
+                    )?;
+                    for (i, ((&ar, &br), result)) in left_rows
+                        .iter()
+                        .zip(right_rows)
+                        .zip(values.iter_mut())
+                        .enumerate()
+                    {
+                        checkpoint_at(i, checkpoint)?;
+                        let ap = physical_row(am, ar)?;
+                        let bp = physical_row(bm, br)?;
+                        *result = if nulls == NullPolicy::Unmatchable
+                            && (a.is_null(ap) || b.is_null(bp))
+                        {
+                            None
+                        } else {
+                            Some(fixed[i] != 0)
+                        };
+                    }
+                } else {
+                    for (i, ((&ar, &br), result)) in left_rows
+                        .iter()
+                        .zip(right_rows)
+                        .zip(values.iter_mut())
+                        .enumerate()
+                    {
+                        checkpoint_at(i, checkpoint)?;
+                        if output[i] == Some(false) {
+                            *result = Some(false);
+                            continue;
+                        }
+                        let ap = physical_row(am, ar)?;
+                        let bp = physical_row(bm, br)?;
+                        *result = if a.is_null(ap) || b.is_null(bp) {
+                            if nulls == NullPolicy::Equal {
+                                Some(a.is_null(ap) && b.is_null(bp))
+                            } else {
+                                None
+                            }
+                        } else {
+                            let expected = left.tuples().encode_component_row(
+                                column,
+                                ar,
+                                left.allocator.clone(),
+                                checkpoint,
+                            )?;
+                            Some(canonical_nullable_equals_observed(
+                                b, bp, &expected, checkpoint,
+                            )?)
+                        };
+                    }
+                }
+            }
+            _ => return Err(invariant(ValueViolation::Carrier)),
+        }
+        for (i, (result, value)) in output.iter_mut().zip(&values).enumerate() {
+            checkpoint_at(i, checkpoint)?;
+            *result = match (*result, *value) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (None, _) | (_, None) => None,
+                _ => Some(true),
+            };
+        }
+    }
+    checkpoint()
+}
+
 pub(super) fn physical_row(mapping: Option<&[usize]>, row: usize) -> ExecutionResult<usize> {
     match mapping {
         Some(mapping) => mapping

@@ -618,6 +618,22 @@ impl BuildRows {
         }
         Ok(BuildRowId(entry.start + page.start + address.row))
     }
+    /// Original E observation, not a value comparison or a per-column posting.
+    pub(crate) fn has_ordinary_value_null(
+        &self,
+        address: BuildPageAddress,
+    ) -> ExecutionResult<bool> {
+        self.row_id(address)?;
+        let page = self.page(address.run, address.page)?;
+        let facts = page.value_nulls().ok_or_else(|| {
+            build_contract("NAA NULL row selection has no original value observation")
+        })?;
+        Ok(facts
+            .rows
+            .binary_search_by_key(&address.row, |row| row.row)
+            .ok()
+            .is_some_and(|index| facts.rows[index].ordinary))
+    }
     pub(crate) fn address_for_assignment(
         &self,
         kind: ProjectionKind,
