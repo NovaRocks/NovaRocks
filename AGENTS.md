@@ -388,8 +388,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `exchange_receiver.rs` 是应用接收 port；另有 `result.rs`、`commit.rs`。旧发送队列已删除。
 
 - `novarocks/execution/src/exec/operators/exchange_source.rs`
-  Source operator for an exchange node: reconstructs chunks and tracks sender
-  completion.
+  Source operator for an exchange node: consumes receiver-decoded chunks,
+  records actual Unit/End handoff, and observes sender completion without an
+  input idle deadline.
 
 - `novarocks/native-adapter/src/{exchange_data_plane.rs,exchange_transmitter.rs,fragment_exchange_receiver.rs}`
   Native 三方法的线路投影与传输，准确路由始终由 Worker `with_claimed_stream` 作者准入。
@@ -643,7 +644,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   boundary; NWT-4 protocol slimming remains separate follow-up work.
 
 - `[runtime]`
-  `exchange_wait_ms`, `exchange_io_threads`, `exchange_io_max_inflight_bytes`,
+  `exchange_instance_floor_slots`, `exchange_instance_max_slots`,
+  `exchange_floating_slots`, `exchange_stream_window`,
+  `exchange_transport_timeout_ms`, `exchange_io_max_inflight_bytes`,
   `pipeline_exec_thread_pool_thread_num`, `scan_io_*`, `scan_range_*`, `prefetch_*`, `cache.*`
 
 - `[iceberg]`

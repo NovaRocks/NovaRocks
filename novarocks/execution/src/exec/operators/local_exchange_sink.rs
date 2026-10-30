@@ -874,7 +874,6 @@ mod tests {
         fixture.bind(receiver_key, &[novarocks_types::UniqueId::new(97000, 1)]);
         let remote = ExchangeSourceFactory::new_compiled(
             key.node_id,
-            Duration::from_secs(60),
             ExchangeBinding {
                 key,
                 expected_senders: 1,
@@ -900,7 +899,10 @@ mod tests {
         );
         let (wait, generation, deadline) =
             producer.blocked_observable_snapshot().expect("input wait");
-        assert!(deadline.is_some(), "remote idle deadline is preserved");
+        assert!(
+            deadline.is_none(),
+            "remote receive waits have no idle deadline"
+        );
         let (control_wait, control_generation) =
             producer.blocked_terminal_snapshot().expect("control wait");
         let source_observers = source_observable.num_observers();

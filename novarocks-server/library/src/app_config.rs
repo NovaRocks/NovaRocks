@@ -1330,12 +1330,8 @@ pub struct RuntimeConfig {
     pub exchange_stream_window: usize,
     #[serde(default = "default_exchange_transport_timeout_ms")]
     pub exchange_transport_timeout_ms: u64,
-    #[serde(default = "default_exchange_wait_ms")]
-    pub exchange_wait_ms: u64,
     #[serde(default = "default_exchange_max_transmit_batched_bytes")]
     pub exchange_max_transmit_batched_bytes: usize,
-    #[serde(default = "default_exchange_io_threads")]
-    pub exchange_io_threads: usize,
     #[serde(default = "default_exchange_io_max_inflight_bytes")]
     pub exchange_io_max_inflight_bytes: usize,
     #[serde(default = "default_catalog_prune_interval_ms")]
@@ -1924,16 +1920,8 @@ fn default_exchange_transport_timeout_ms() -> u64 {
     duration_millis(ExchangeFlowLimits::default().transport_timeout())
 }
 
-fn default_exchange_wait_ms() -> u64 {
-    120_000
-}
-
 fn default_exchange_max_transmit_batched_bytes() -> usize {
     262_144 // 256KB, aligned with StarRocks `max_transmit_batched_bytes`
-}
-
-fn default_exchange_io_threads() -> usize {
-    4
 }
 
 fn default_exchange_io_max_inflight_bytes() -> usize {
@@ -2696,9 +2684,7 @@ impl Default for RuntimeConfig {
             exchange_floating_slots: default_exchange_floating_slots(),
             exchange_stream_window: default_exchange_stream_window(),
             exchange_transport_timeout_ms: default_exchange_transport_timeout_ms(),
-            exchange_wait_ms: default_exchange_wait_ms(),
             exchange_max_transmit_batched_bytes: default_exchange_max_transmit_batched_bytes(),
-            exchange_io_threads: default_exchange_io_threads(),
             exchange_io_max_inflight_bytes: default_exchange_io_max_inflight_bytes(),
             catalog_prune_interval_ms: default_catalog_prune_interval_ms(),
             catalog_prune_rpc_timeout_ms: default_catalog_prune_rpc_timeout_ms(),
@@ -3282,6 +3268,28 @@ mod tests {
             expected.transport_timeout(),
             std::time::Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn retired_exchange_idle_and_thread_settings_are_rejected_as_unknown_fields() {
+        let current = "exchange_transport_timeout_ms = 71\noperator_buffer_chunks = 3\n";
+        let runtime = toml::from_str::<RuntimeConfig>(current).expect("current settings parse");
+        assert_eq!(
+            runtime.exchange_flow_limits().unwrap().transport_timeout(),
+            std::time::Duration::from_millis(71)
+        );
+        assert_eq!(runtime.operator_buffer_chunks, 3);
+        for legacy in ["exchange_wait_ms", "exchange_io_threads"] {
+            let settings = format!("{current}{legacy} = 1\n");
+            let error = match toml::from_str::<RuntimeConfig>(&settings) {
+                Ok(_) => panic!("retired exchange setting was accepted: {legacy}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("unknown field") && error.contains(legacy),
+                "{error}"
+            );
+        }
     }
 
     #[test]

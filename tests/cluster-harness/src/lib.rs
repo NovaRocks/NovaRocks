@@ -9271,7 +9271,8 @@ static_file_path = "catalogs.toml"
 
     #[test]
     fn be_config_overlay_rejects_out_of_range_index() {
-        let overrides = BTreeMap::from([(2, "[runtime]\nexchange_wait_ms = 1\n".to_string())]);
+        let overrides =
+            BTreeMap::from([(2, "[runtime]\noperator_buffer_chunks = 1\n".to_string())]);
         let error = validate_be_config_overrides(&overrides, 2)
             .expect_err("out of range config overlay must fail");
         assert!(format!("{error:#}").contains("out of bounds"));
@@ -9293,15 +9294,15 @@ static_file_path = "catalogs.toml"
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
             overlays: vec![
-                "[runtime]\nexchange_wait_ms = 11\n",
-                "[runtime]\nexchange_wait_ms = 29\n",
+                "[runtime]\noperator_buffer_chunks = 11\n",
+                "[runtime]\noperator_buffer_chunks = 29\n",
             ],
             native_trust_fixture: &fixture,
         })
         .expect("render BE config with ordered overlays");
         let rendered: Value = rendered.parse().expect("parse BE config");
         assert_eq!(
-            rendered["runtime"]["exchange_wait_ms"].as_integer(),
+            rendered["runtime"]["operator_buffer_chunks"].as_integer(),
             Some(29)
         );
     }
@@ -9334,14 +9335,17 @@ static_file_path = "catalogs.toml"
         let root = config.as_table_mut().expect("config root");
         merge_safe_config_overlay(
             root,
-            "[standalone_server]\nmv_refresh_scheduler_enabled = true\n[runtime]\nexchange_wait_ms = 42\n",
+            "[standalone_server]\nmv_refresh_scheduler_enabled = true\n[runtime]\noperator_buffer_chunks = 42\n",
         )
         .expect("merge safe overlay");
         assert_eq!(
             root["standalone_server"]["mv_refresh_scheduler_enabled"].as_bool(),
             Some(true)
         );
-        assert_eq!(root["runtime"]["exchange_wait_ms"].as_integer(), Some(42));
+        assert_eq!(
+            root["runtime"]["operator_buffer_chunks"].as_integer(),
+            Some(42)
+        );
         merge_safe_config_overlay(
             root,
             "[[connector.credentials]]\npurpose = 'object-store-data'\nname = 'test-data'\ngeneration = 'v1'\nkind = 's3'\naccess_key_id = '${ENV:SCENARIO_ACCESS_KEY}'\naccess_key_secret = '${ENV:SCENARIO_SECRET_KEY}'\n",

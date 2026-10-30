@@ -1080,8 +1080,6 @@ fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntim
     let runtime = &config.runtime;
     ExecutionRuntimeConfig {
         driver_threads: runtime.actual_exec_threads(),
-        exchange_wait_ms: runtime.exchange_wait_ms,
-        exchange_io_threads: runtime.exchange_io_threads.max(1),
         exchange_io_max_inflight_bytes: runtime.exchange_io_max_inflight_bytes.max(1),
         exchange_max_transmit_batched_bytes: runtime.exchange_max_transmit_batched_bytes.max(1),
         operator_buffer_chunks: runtime.operator_buffer_chunks.max(1),

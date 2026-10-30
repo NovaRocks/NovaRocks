@@ -1298,7 +1298,6 @@ mod owner_tests {
         let id = UniqueId::new(84_500, 1);
         // The existing fixture publishes a real distributed SQL gather package
         // and compiles its ExchangeSource through the production local compiler.
-        // Its exchange wait remains the original one-second bound.
         let program = super::compiled_prepare::tests::sql_gather_receiver_program();
         assert_eq!(program.exchange_inputs().len(), 1);
         let (&compiled_node, input) = program.exchange_inputs().iter().next().unwrap();

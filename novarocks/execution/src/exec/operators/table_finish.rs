@@ -2618,8 +2618,6 @@ mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    exchange_wait_ms: 120_000,
-                    exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1024,
                     exchange_max_transmit_batched_bytes: 1024,
                     operator_buffer_chunks: 1,
@@ -6155,7 +6153,6 @@ mod tests {
                         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
                         kernel_abi: KernelAbiVersion::CURRENT,
                         constants: constants(),
-                        exchange_wait: Duration::from_secs(120),
                     },
                     &FixtureControl,
                 )

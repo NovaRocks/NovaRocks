@@ -22,8 +22,7 @@ use crate::{
         chunk::{Chunk, ChunkSchemaRef},
         pipeline::{
             operator::{
-                ConstructionFailure, DriverBlockDeadline, InputConstructionFactory, Operator,
-                OperatorLifecycle,
+                ConstructionFailure, InputConstructionFactory, Operator, OperatorLifecycle,
             },
             operator_factory::OperatorFactory,
             shape::{Source, SourceKernel},
@@ -47,7 +46,6 @@ use novarocks_local_program::{LogicalChangeCounts, StaticLayout};
 use std::{
     alloc::Layout,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
 };
 
 #[derive(Debug)]
@@ -62,7 +60,6 @@ pub(crate) enum SummaryFailure {
     DuplicateSource,
     MissingSource,
     WithdrawnWriter,
-    Timeout,
 }
 impl std::fmt::Display for SummaryFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -77,7 +74,6 @@ impl std::fmt::Display for SummaryFailure {
             Self::DuplicateSource => f.write_str("logical summary source contributed more than once"),
             Self::MissingSource => f.write_str("normal logical summary EOS has incomplete source coverage"),
             Self::WithdrawnWriter => f.write_str("writer-results input withdrew before normal exhaustion"),
-            Self::Timeout => f.write_str("logical summary exchange timed out waiting for input"),
         }
     }
 }
@@ -86,11 +82,7 @@ impl novarocks_failure_contract::FailureProjection for SummaryFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::{FailureClass, FailureFact};
         FailureFact::new(
-            if matches!(self, Self::Timeout) {
-                FailureClass::Dependency
-            } else {
-                FailureClass::Invariant
-            },
+            FailureClass::Invariant,
             if matches!(self, Self::Count(_)) {
                 ExecutionReason::LogicalChangeCount
             } else {
@@ -479,8 +471,6 @@ pub(crate) struct SourceBoundSummaryInput {
     index: Option<Arc<SummarySourceIndex>>,
     layout: StaticLayout,
     schema: Option<ChunkSchemaRef>,
-    timeout: Duration,
-    deadline: Option<DriverBlockDeadline>,
     ended: bool,
 }
 impl SourceBoundSummaryInput {
@@ -488,7 +478,6 @@ impl SourceBoundSummaryInput {
         receiver: ExchangeReceiverHandle,
         expected: Arc<[ExchangeSource]>,
         layout: StaticLayout,
-        timeout: Duration,
     ) -> ExecutionResult<Self> {
         validate_layout(&layout)?;
         if expected.is_empty() {
@@ -500,8 +489,6 @@ impl SourceBoundSummaryInput {
             index: None,
             layout,
             schema: None,
-            timeout,
-            deadline: None,
             ended: false,
         })
     }
@@ -526,9 +513,7 @@ impl SourceBoundSummaryInput {
         self.receiver.observable()
     }
     pub(crate) fn ready(&self) -> bool {
-        self.ended
-            || self.receiver.has_output_or_finished(self.expected.len())
-            || self.deadline.is_some_and(|d| d.at() <= Instant::now())
+        self.ended || self.receiver.has_output_or_finished(self.expected.len())
     }
     pub(crate) fn poll(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<SummaryRead> {
         ctx.checkpoint()?;
@@ -543,7 +528,6 @@ impl SourceBoundSummaryInput {
             .map_err(|e| e.into_execution())?
         {
             Some(SourcedExchangePopResult::Chunk(item)) => {
-                self.deadline = None;
                 let (source, chunk) = item.into_parts();
                 let index = self
                     .index
@@ -579,20 +563,12 @@ impl SourceBoundSummaryInput {
                 self.ended = true;
                 Ok(SummaryRead::End)
             }
-            None => {
-                let deadline = *self.deadline.get_or_insert_with(|| {
-                    DriverBlockDeadline::new(Instant::now() + self.timeout, 1)
-                });
-                if deadline.at() <= Instant::now() {
-                    return Err(summary_failure(SummaryFailure::Timeout));
-                }
-                Ok(SummaryRead::Pending(WaitFact {
-                    reason: WaitReason::Input,
-                    observable: event,
-                    observed_generation: generation,
-                    deadline: Some(deadline),
-                }))
-            }
+            None => Ok(SummaryRead::Pending(WaitFact {
+                reason: WaitReason::Input,
+                observable: event,
+                observed_generation: generation,
+                deadline: None,
+            })),
         }
     }
 }
@@ -769,7 +745,6 @@ pub(crate) mod tests {
                     .collect::<Vec<_>>()
                     .into(),
                 self.layout.clone(),
-                Duration::from_secs(120),
             )
             .unwrap()
         }
@@ -897,6 +872,128 @@ pub(crate) mod tests {
         assert!(second.finish().is_err());
         assert!(state.result().is_err());
     }
+    #[test]
+    fn logical_change_summary_wait_outlives_transport_deadline_and_real_data_end_complete() {
+        let owner = crate::runtime::fragment::io::exchange::test_support::Fixture::with_runtime(
+            crate::exec::operators::exchange_source::test_support::runtime_with_transport_timeout(
+                std::time::Duration::from_millis(10),
+            ),
+        );
+        let runtime = owner.state(UniqueId::new(946801, 946802));
+        let fixture = IngressFixture::new(1, &runtime);
+        let mut input = fixture.input();
+        input
+            .prepare(
+                fixture.factory.as_ref(),
+                MemTracker::new_root("long-wait summary source index"),
+            )
+            .unwrap();
+        let mut coverage = SummaryCoverage::new(
+            input.sources().unwrap(),
+            MemTracker::new_root("long-wait summary coverage"),
+        )
+        .unwrap();
+        let errors = runtime.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&errors, &mut work, &mut conversions);
+        let SummaryRead::Pending(before) = input.poll(&mut ctx).unwrap() else {
+            panic!("summary input must actually wait")
+        };
+        assert!(before.deadline.is_none());
+        assert!(!input.ready());
+        assert!(
+            coverage.finish().is_err(),
+            "idle input cannot invent a zero summary"
+        );
+        std::thread::sleep(
+            owner
+                .runtime
+                .exchange_flow_limits()
+                .transport_timeout()
+                .saturating_mul(20),
+        );
+        assert!(
+            !input.ready(),
+            "elapsed time cannot make an empty summary receiver ready"
+        );
+        let SummaryRead::Pending(after) = input.poll(&mut ctx).unwrap() else {
+            panic!("summary input must still wait")
+        };
+        assert!(after.deadline.is_none());
+        assert!(Arc::ptr_eq(&before.observable, &after.observable));
+        assert_eq!(after.observable.generation(), before.observed_generation);
+        assert!(runtime.error().is_none());
+        fixture.send(
+            0,
+            1,
+            Some(LogicalChangeCounts::try_new(2, 3, 4).unwrap()),
+            false,
+        );
+        assert!(after.observable.generation() > after.observed_generation);
+        assert!(input.ready());
+        let SummaryRead::Summary(summary) = input.poll(&mut ctx).unwrap() else {
+            panic!("actual summary DATA")
+        };
+        assert_eq!(summary.source, fixture.streams[0].source());
+        coverage.accept(summary).unwrap();
+        assert_eq!(coverage.finish().unwrap().affected_rows(), 9);
+        let SummaryRead::Pending(before_end) = input.poll(&mut ctx).unwrap() else {
+            panic!("summary DATA is not End")
+        };
+        assert!(before_end.deadline.is_none());
+        assert!(!input.ready());
+        fixture.send(0, 2, None, true);
+        assert!(before_end.observable.generation() > before_end.observed_generation);
+        assert!(input.ready());
+        assert!(matches!(input.poll(&mut ctx).unwrap(), SummaryRead::End));
+        assert!(runtime.error().is_none());
+        assert!(
+            fixture
+                .registry
+                .stream_close_facts(fixture.key, &fixture.streams)
+                .unwrap()
+                .iter()
+                .all(|fact| matches!(
+                    fact.disposition,
+                    novarocks_execution_contract::ExchangeCloseDisposition::Consumed { .. }
+                ))
+        );
+    }
+
+    #[test]
+    fn logical_change_summary_pending_input_preserves_original_task_failure() {
+        let runtime = IngressFixture::task_state(&RuntimeState::default());
+        let fixture = IngressFixture::new(1, &runtime);
+        let mut input = fixture.input();
+        input
+            .prepare(
+                fixture.factory.as_ref(),
+                MemTracker::new_root("failed-task summary input"),
+            )
+            .unwrap();
+        let errors = runtime.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&errors, &mut work, &mut conversions);
+        let SummaryRead::Pending(wait) = input.poll(&mut ctx).unwrap() else {
+            panic!("summary must be pending")
+        };
+        assert!(wait.deadline.is_none());
+        let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new(
+                "original Task failure while waiting for a logical summary",
+            ),
+        ));
+        errors.set_error(original.clone());
+        let failure = match input.poll(&mut ctx) {
+            Err(error) => error,
+            Ok(_) => panic!("Task failure must terminate the summary input wait"),
+        };
+        assert!(failure.same_occurrence(&original));
+        assert!(runtime.error().unwrap().same_occurrence(&original));
+    }
+
     #[test]
     fn logical_change_summary_sources_are_receiver_bound_and_end_is_not_a_summary_row() {
         let runtime = IngressFixture::task_state(&RuntimeState::default());

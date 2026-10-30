@@ -200,8 +200,7 @@ fn build_logical_finish(
     if receiver.expected_senders != binding.sources.len() {
         return Err(invalid());
     }
-    let ProgramNodeKind::ExchangeSource { timeout, .. } =
-        program.graph().nodes()[summary.index()].kind()
+    let ProgramNodeKind::ExchangeSource { .. } = program.graph().nodes()[summary.index()].kind()
     else {
         return Err(invalid());
     };
@@ -222,7 +221,6 @@ fn build_logical_finish(
         handle,
         binding.sources,
         layout.clone(),
-        *timeout,
     )?;
     let mut child = build_node(program, writer, ctx, error, ordered)?;
     let producers = usize::try_from(child.pipeline.dop)

@@ -41,7 +41,7 @@ use novarocks_type_contract::{
     ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
     ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, control_argument_semantics,
 };
-use std::{num::NonZeroUsize, time::Duration};
+use std::num::NonZeroUsize;
 
 const WRITER_FRAGMENT: FragmentId = FragmentId::new(1);
 const FINISH_FRAGMENT: FragmentId = FragmentId::new(2);
@@ -675,7 +675,6 @@ fn options(pipeline_dop: usize, root_sink_dop: Option<usize>) -> LocalCompileOpt
         pipeline_dop: NonZeroUsize::new(pipeline_dop).unwrap(),
         root_sink_dop: root_sink_dop.map(|dop| NonZeroUsize::new(dop).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        exchange_wait: Duration::from_millis(1_000),
         // Explicit fixture admission; these values are not production defaults.
         constants: ConstantPolicy {
             max_rows: 16,

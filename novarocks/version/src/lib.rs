@@ -118,7 +118,6 @@ impl StaticPlanInterpreter {
 /// boundary under the synchronous creation and direct release contract, so
 /// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-
 pub const NATIVE_COMPAT_EPOCH: u64 = 12;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.

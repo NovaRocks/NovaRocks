@@ -573,7 +573,6 @@ fn compile(package: FragmentPackage, pipeline_dop: usize, result: bool) -> Arc<L
         root_sink_dop: result.then(|| NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
         constants: constant_policy(),
-        exchange_wait: Duration::from_secs(120),
     };
     Arc::new(
         compile_fragment(validated, &functions, options, &FixtureControl)

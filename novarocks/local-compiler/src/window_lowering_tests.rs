@@ -784,7 +784,6 @@ fn try_compile(shape: &Shape) -> Result<LocalProgram, FragmentCompileError> {
             root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
             kernel_abi: KernelAbiVersion::CURRENT,
             constants: constant_policy(),
-            exchange_wait: std::time::Duration::from_secs(120),
         },
         &Control,
     )
@@ -1246,7 +1245,6 @@ fn compile_hosted_window_output(
             root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
             kernel_abi: KernelAbiVersion::CURRENT,
             constants: constant_policy(),
-            exchange_wait: std::time::Duration::from_secs(120),
         },
         &Control,
         host,

@@ -394,7 +394,6 @@ fn options(root_sink_dop: Option<NonZeroUsize>) -> LocalCompileOptions {
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         },
-        exchange_wait: Duration::from_secs(120),
     }
 }
 

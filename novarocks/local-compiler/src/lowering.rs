@@ -55,7 +55,6 @@ use std::{
     fmt,
     num::NonZeroUsize,
     sync::Arc,
-    time::Duration,
 };
 
 /// Host-admitted values are explicit; the compiler authors the actual layout
@@ -66,9 +65,6 @@ pub struct LocalCompileOptions {
     pub root_sink_dop: Option<NonZeroUsize>,
     pub kernel_abi: KernelAbiVersion,
     pub constants: ConstantPolicy,
-    /// Host-admitted receive wait copied into every compiled ExchangeSource.
-    /// The compiler never defaults it or derives it from the plan.
-    pub exchange_wait: Duration,
 }
 
 #[derive(Debug)]
@@ -1329,7 +1325,6 @@ fn lower_with_creation<
                     package,
                     node,
                     &planned.slots,
-                    options.exchange_wait,
                     work.control(),
                     creation,
                 )?;

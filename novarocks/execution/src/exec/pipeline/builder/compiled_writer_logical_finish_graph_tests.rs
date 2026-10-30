@@ -184,8 +184,6 @@ mod logical_finish_graph {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    exchange_wait_ms: 5_000,
-                    exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 64 * 1024 * 1024,
                     // Keep real partial/count/commit outputs in separate data frames.
                     exchange_max_transmit_batched_bytes: 1,

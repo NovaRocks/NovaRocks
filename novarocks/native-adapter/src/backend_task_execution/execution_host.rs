@@ -49,7 +49,6 @@ use super::prepared_owner::{
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
 
 use novarocks_execution::connector::{
     SplitQueueConfig, SplitQueueError, SplitQueueErrorKind, SplitQueueRegistry,
@@ -662,9 +661,6 @@ impl NativeTaskExecutionHost {
             carrier.package(),
             CompiledTaskOptions {
                 pipeline_dop: descriptor.pipeline_dop(),
-                exchange_wait: Duration::from_millis(
-                    self.execution_runtime.config().exchange_wait_ms,
-                ),
             },
             &mut creation,
             &type_scopes,
@@ -3616,8 +3612,6 @@ pub(crate) mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    exchange_wait_ms: 120_000,
-                    exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1,
                     exchange_max_transmit_batched_bytes: 1,
                     operator_buffer_chunks: 1,
@@ -9714,7 +9708,6 @@ pub(crate) mod tests {
                     &bytes,
                     CompiledTaskOptions {
                         pipeline_dop: NonZeroUsize::MIN,
-                        exchange_wait: Duration::from_millis(1),
                     },
                     &mut creation,
                     &scopes,
@@ -10436,7 +10429,6 @@ pub(crate) mod tests {
                     &bytes,
                     CompiledTaskOptions {
                         pipeline_dop: NonZeroUsize::MIN,
-                        exchange_wait: Duration::from_millis(1),
                     },
                     &mut creation,
                     &scopes,
@@ -10503,7 +10495,6 @@ pub(crate) mod tests {
                     &bytes,
                     CompiledTaskOptions {
                         pipeline_dop: NonZeroUsize::MIN,
-                        exchange_wait: Duration::from_millis(1),
                     },
                     &mut creation,
                     &scopes,
@@ -10773,7 +10764,6 @@ pub(crate) mod tests {
                 &bytes,
                 CompiledTaskOptions {
                     pipeline_dop: NonZeroUsize::MIN,
-                    exchange_wait: Duration::from_millis(1),
                 },
                 &mut creation,
                 &scopes,
@@ -10841,7 +10831,6 @@ pub(crate) mod tests {
                 &bytes,
                 CompiledTaskOptions {
                     pipeline_dop: NonZeroUsize::MIN,
-                    exchange_wait: Duration::from_millis(1),
                 },
                 &mut creation,
                 &scopes,

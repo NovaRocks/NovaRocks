@@ -24,7 +24,6 @@ use novarocks_local_program::{CompiledExchangeInput, ProgramNodeKind, StaticLayo
 use novarocks_physical_plan::{Distribution, EdgeKind, FragmentPackage, NodeKind, PhysicalNode};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use novarocks_types::SlotId;
-use std::time::Duration;
 
 pub(crate) struct LoweredExchangeSource {
     pub kind: ProgramNodeKind,
@@ -36,12 +35,11 @@ pub(crate) fn lower_exchange_source_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     slots: &[SlotId],
-    exchange_wait: Duration,
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<LoweredExchangeSource, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core_with_creation(package, node, slots, exchange_wait, &mut work, creation);
+    let result = lower_core_with_creation(package, node, slots, &mut work, creation);
     crate::creation::finish_attempt(result, work)
 }
 
@@ -49,7 +47,6 @@ fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     slots: &[SlotId],
-    exchange_wait: Duration,
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<LoweredExchangeSource, crate::FragmentCreationError<H>> {
@@ -260,7 +257,6 @@ fn lower_core_with_creation<H>(
     work.flush()?;
     Ok(LoweredExchangeSource {
         kind: ProgramNodeKind::ExchangeSource {
-            timeout: exchange_wait,
             runtime_filters: Vec::new().into(),
             hash_partition_exprs: Vec::new(),
         },

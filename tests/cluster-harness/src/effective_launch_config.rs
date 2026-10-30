@@ -665,7 +665,7 @@ mod tests {
             "[server]\nhost = \"127.0.0.1\"\nhttp_port = {http}\ngrpc_port = {grpc}\n{control}\
              [standalone_server]\n{mysql}\n{trino}\n\
              [cluster]\nrole = \"{role}\"\n{role_fields}\
-             [runtime]\nexchange_wait_ms = 1000\n{extra}\n\
+             [runtime]\noperator_buffer_chunks = 1000\n{extra}\n\
              [native_trust]\ndeployment_id = \"novarocks-system-tests\"\nshared_secret = \"${{ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}}\"\n\
              [native_trust.transport]\nmode = \"{transport_mode}\"\n"
         )

@@ -912,7 +912,6 @@ mod scan_split {
         collections::BTreeMap,
         num::{NonZeroU64, NonZeroUsize},
         sync::Arc,
-        time::Duration,
     };
 
     const PRODUCER: FragmentId = FragmentId::new(1);
@@ -1334,7 +1333,6 @@ mod scan_split {
                 pipeline_dop: NonZeroUsize::new(1).unwrap(),
                 root_sink_dop: root_sink_dop.map(|dop| NonZeroUsize::new(dop).unwrap()),
                 kernel_abi: KernelAbiVersion::CURRENT,
-                exchange_wait: Duration::from_millis(1_000),
                 constants: super::policy(),
             },
             &Good,

@@ -453,17 +453,16 @@ impl ExchangeSenderGroup {
                             }
                         }
                     }
-                    if entry.gate.state() == EdgeSendState::NormallyCanceled {
-                        if entry.config.delivery == ExchangeDeliveryRequirement::DemandDriven
-                            && snapshot.status == ExchangeStreamSenderStatus::Open
-                        {
-                            entry.sender.stop();
-                        }
-                        // Normal withdrawal is not route retirement. An unknown
-                        // Stop remains Pending until precise receiver evidence or
-                        // a separate authoritative lifecycle retirement arrives.
-                        // MustDrain keeps observing already published delivery
-                        // until the receiver's exact Consumed/Withdrawn facts.
+                    // Normal withdrawal is not route retirement. An unknown
+                    // Stop remains Pending until precise receiver evidence or
+                    // a separate authoritative lifecycle retirement arrives.
+                    // MustDrain keeps observing already published delivery
+                    // until the receiver's exact Consumed/Withdrawn facts.
+                    if entry.gate.state() == EdgeSendState::NormallyCanceled
+                        && entry.config.delivery == ExchangeDeliveryRequirement::DemandDriven
+                        && snapshot.status == ExchangeStreamSenderStatus::Open
+                    {
+                        entry.sender.stop();
                     }
                 }
             }

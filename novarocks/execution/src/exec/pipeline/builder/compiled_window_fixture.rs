@@ -1046,7 +1046,6 @@ pub(super) fn try_compile(
             root_sink_dop: Some(std::num::NonZeroUsize::new(1).unwrap()),
             kernel_abi: novarocks_local_program::KernelAbiVersion::CURRENT,
             constants: constant_policy(),
-            exchange_wait: std::time::Duration::from_secs(120),
         },
         &FixtureControl,
     )

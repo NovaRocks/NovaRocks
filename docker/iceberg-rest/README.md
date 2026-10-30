@@ -129,6 +129,8 @@ runtime/<env-id>/
   frontend-state.sqlite
 ```
 
+生成的 FE/BE 配置只使用当前 runtime schema。Exchange 的 `exchange_wait_ms` 与 `exchange_io_threads` 已退役，配置解析会准确拒绝这些旧键；单次传输期限由 `exchange_transport_timeout_ms` 独立配置，不恢复接收空闲失败。角色配置 renderer 升版后，普通 `up.sh` 在核验并附着 ready 机器时发布新的不可变入口，保留原 publication 与稳定 SQLite。不要原地编辑既有 publication；已启动消费者仍固定原入口，后续消费者须重新解析新的 `published`。
+
 完整文件集合先落盘，再原子替换一次 `published`。重复附着同配置复用相同内容与env；version/generation改变会改变输入。锁序为worktree入口→机器维护锁，机器维护不反向拿worktree锁。消费者启动时解析一次：
 
 ```bash

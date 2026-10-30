@@ -852,7 +852,6 @@ fn try_compile_with_providers<E: std::error::Error + 'static>(
         root_sink_dop: result.then(|| NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
         constants: constant_policy(),
-        exchange_wait: Duration::from_secs(120),
     };
     compile_fragment(validated, catalog, options, &FixtureControl)
         .map(Arc::new)

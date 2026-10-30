@@ -27,8 +27,6 @@ mod tests {
     fn execution_runtime() -> Arc<ExecutionRuntime> {
         let config = ExecutionRuntimeConfig {
             driver_threads: 1,
-            exchange_wait_ms: 1,
-            exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1,
             exchange_max_transmit_batched_bytes: 1,
             operator_buffer_chunks: 1,

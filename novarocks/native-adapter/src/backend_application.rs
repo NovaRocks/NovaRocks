@@ -597,7 +597,7 @@ fn compose_backend_application_services(
         Arc::clone(&inbound_capabilities),
         novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
             data_runtime.clone(),
-            Duration::from_millis(execution_runtime.config().exchange_wait_ms),
+            execution_runtime.exchange_flow_limits().transport_timeout(),
             #[cfg(novarocks_dev_controls)]
             test_session.and_then(|session| session.observation.clone()),
         ),
@@ -1389,8 +1389,6 @@ mod tests {
     fn execution_runtime_config() -> ExecutionRuntimeConfig {
         ExecutionRuntimeConfig {
             driver_threads: 1,
-            exchange_wait_ms: 1,
-            exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1,
             exchange_max_transmit_batched_bytes: 1,
             operator_buffer_chunks: 1,

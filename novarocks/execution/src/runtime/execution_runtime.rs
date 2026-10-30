@@ -17,9 +17,6 @@ use novarocks_memory::MemoryAuthority;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionRuntimeConfig {
     pub driver_threads: usize,
-    /// How long an exchange source waits for its senders before failing.
-    pub exchange_wait_ms: u64,
-    pub exchange_io_threads: usize,
     pub exchange_io_max_inflight_bytes: usize,
     pub exchange_max_transmit_batched_bytes: usize,
     pub operator_buffer_chunks: usize,
@@ -35,7 +32,6 @@ impl ExecutionRuntimeConfig {
     pub fn validate(&self) -> Result<(), ExecutionRuntimeConfigError> {
         for (name, value) in [
             ("driver_threads", self.driver_threads),
-            ("exchange_io_threads", self.exchange_io_threads),
             (
                 "exchange_io_max_inflight_bytes",
                 self.exchange_io_max_inflight_bytes,
@@ -308,8 +304,6 @@ pub(crate) fn test_execution_runtime() -> Arc<ExecutionRuntime> {
         ExecutionRuntime::new(
             ExecutionRuntimeConfig {
                 driver_threads: 1,
-                exchange_wait_ms: 120_000,
-                exchange_io_threads: 1,
                 exchange_io_max_inflight_bytes: 1024,
                 exchange_max_transmit_batched_bytes: 1024,
                 operator_buffer_chunks: 1,
@@ -389,8 +383,6 @@ mod tests {
     fn config() -> ExecutionRuntimeConfig {
         ExecutionRuntimeConfig {
             driver_threads: 1,
-            exchange_wait_ms: 120_000,
-            exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1,
             exchange_max_transmit_batched_bytes: 1,
             operator_buffer_chunks: 1,

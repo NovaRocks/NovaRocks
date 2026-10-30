@@ -45,7 +45,6 @@ use std::{
     collections::{BTreeSet, HashMap},
     num::{NonZeroU64, NonZeroUsize},
     sync::Mutex,
-    time::Duration,
 };
 
 const PRODUCER: FragmentId = FragmentId::new(1);
@@ -1017,7 +1016,6 @@ pub(super) fn options(root_sink_dop: Option<usize>) -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: root_sink_dop.map(|dop| NonZeroUsize::new(dop).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        exchange_wait: Duration::from_millis(1_000),
         // Explicit fixture admission; these values are not production defaults.
         constants: ConstantPolicy {
             max_rows: 16,

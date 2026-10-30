@@ -431,12 +431,12 @@ impl ExecutionExchangeRegistry {
             .expect("exchange lock")
             .get(&key)
             .cloned();
-        if let Some(receiver) = receiver {
-            if let Err(error) = receiver.retire_units() {
-                let owner = receiver.unit_owner();
-                if let Some(owner) = owner {
-                    owner.report_failure(error);
-                }
+        if let Some(receiver) = receiver
+            && let Err(error) = receiver.retire_units()
+        {
+            let owner = receiver.unit_owner();
+            if let Some(owner) = owner {
+                owner.report_failure(error);
             }
         }
         self.receivers.lock().expect("exchange lock").remove(&key);

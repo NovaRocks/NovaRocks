@@ -1963,7 +1963,6 @@ mod conditional_compiled_selection {
                     pipeline_dop: NonZeroUsize::MIN,
                     root_sink_dop: Some(NonZeroUsize::MIN),
                     kernel_abi: KernelAbiVersion::CURRENT,
-                    exchange_wait: Duration::from_secs(120),
                     constants: ConstantPolicy {
                         max_rows: 16,
                         max_array_nodes: 128,
