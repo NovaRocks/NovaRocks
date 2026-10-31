@@ -54,6 +54,10 @@ code-anchors:
 5. **结构等待唯一算法规则。** 精确区分消费等待与反压传播，在实际输入 occurrence 上建图；SQL 在冻结前仅对允许的可选 RF 等待降级，必要数据环明确拒绝。无共享产出计划的既有 RF 结果保持不变。完成计划使用同一纯图只读检查，不重新选择 activation，不以运行时 timeout 放宽静态证明。ADR-0001/0003 的静态分层与默认 blocking 原则保留。
 6. **观察无授权规则。** 指标只读取原 ledger、原 scheduler 和实际 Runtime。Busy 表达 unavailable，不能零化；分时快照不得拼成跨 owner 的原子退出或内存上界。故障注入必须绑定真实角色、准确工作身份与有限测试会话；控制结束、helper join、实际角色退出分别取证。
 
+Task RPC 从原 typed source 收到远端 `GOAWAY(NO_ERROR)` 时，即使 Tonic 投影为 `Internal`，仍保留远端效果未知，沿原 `TransportUnknown` 重发同一个不可变请求。只失效仍匹配原 acquired slot/generation 的连接；不重规划、不换 Task 身份，也不推断 Worker 未执行。消息文字不授予恢复权：无本地 typed cause 的远端 `Internal`、`PROTOCOL_ERROR` 和回复 grammar 预检拒绝继续保留各自原裁决。
+
+故障 Actor 处理 peer CANCEL 时，原 H2 handle 的实际 `Ready(CANCEL)`、当前身份和 scope 始终需要独立核对。仅设置 `released` 不结束故障义务；原 custody guard 析构、准确重放/完整 snapshot 与相应原回调退出共同确证义务完成后，才能将对应 GRANTS 视为非目标。义务完成不作者化 Consumed，也不替代全部 H2 别名、传输与角色的实际退出；原错误、overflow、unfired 及组 join 继续保留。
+
 仅部分替代 ADR-0208 对当前“不重放、transport unknown 即失败”的传输阶段描述、重复项拒绝和跳号即失败规则：相同项可重放，授予内可乱序接纳；逻辑写计数、物理路由、严格消费和 publication 所有权继续有效。仅部分替代 ADR-0027 将等待图算法置于 SQL 私有闭包的物理位置：纯算法进入中立 PhysicalPlan，规划策略、候选、封存和运行时安装仍各守原 owner，BE 不重建可变规划图。
 
 ## 接受的妥协（诚实记录）

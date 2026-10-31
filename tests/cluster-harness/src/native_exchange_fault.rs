@@ -861,6 +861,101 @@ enum GrantCancelRejection {
     ProtectedSubscriptionPair,
 }
 
+fn same_signed_target(a: &ExchangeFaultCandidate, b: &ExchangeFaultCandidate) -> bool {
+    a.target == b.target
+        && a.backend_index == b.backend_index
+        && a.caller == b.caller
+        && a.request_sha256 == b.request_sha256
+}
+
+fn observed_open_unit_exited(attempt: &ExchangeFaultAttempt) -> bool {
+    attempt.request_forwarded_at_millis.is_some()
+        && attempt.admission_observed_at_millis.is_some()
+        && matches!(attempt.verdict, Some("Applied" | "Idempotent"))
+        && attempt.receiver_closed == Some(false)
+        && attempt.sender_stopped == Some(false)
+        && !attempt.peer_cancelled
+        && attempt.stream_future_exited_at_millis.is_some()
+}
+
+fn fault_attempts_exited(capture: &CaptureReceipt) -> bool {
+    !capture.attempts.is_empty()
+        && capture.active == 0
+        && capture
+            .attempts
+            .iter()
+            .all(|attempt| attempt.stream_future_exited_at_millis.is_some())
+}
+
+// These facts end only the actor's fault obligation. They do not retire the
+// capture, prove Consumed, refund bytes or replace the original group join.
+fn dropped_reply_obligation_completed(capture: &CaptureReceipt) -> bool {
+    let Some(candidate) = capture.candidate.as_ref() else {
+        return false;
+    };
+    matches!(candidate.target, ExchangeFaultTarget::Unit { .. })
+        && capture.armed && capture.fired && fault_attempts_exited(capture)
+        && capture.custody_batches_held > 0 && capture.custody_released_after_replay
+        // Only the original CustodyBatchOwner destructor decrements this field.
+        && capture.active_custody_batches_held == 0
+        && capture.attempts.iter().any(|attempt|
+            same_signed_target(&attempt.candidate, candidate) && !attempt.replay
+                && attempt.reply_dropped && attempt.verdict == Some("Applied")
+                && observed_open_unit_exited(attempt))
+        && capture.attempts.iter().any(|attempt|
+            same_signed_target(&attempt.candidate, candidate) && attempt.replay
+                && !attempt.reply_dropped && attempt.verdict == Some("Idempotent")
+                && observed_open_unit_exited(attempt))
+}
+
+fn cut_subscription_obligation_completed(
+    capture: &CaptureReceipt,
+    scope: VerifiedGrantHeaderScope,
+) -> bool {
+    let Some(candidate) = capture.candidate.as_ref() else {
+        return false;
+    };
+    let ExchangeFaultTarget::Subscription {
+        stream,
+        pair,
+        generation,
+    } = candidate.target
+    else {
+        return false;
+    };
+    let Some(ExchangeFaultTarget::Subscription {
+        stream: rebuilt,
+        pair: rebuilt_pair,
+        generation: rebuilt_generation,
+    }) = capture.rebuilt_stream
+    else {
+        return false;
+    };
+    let Some(unit) = capture.cut_unit.as_ref() else {
+        return false;
+    };
+    capture.armed && capture.fired && fault_attempts_exited(capture)
+        && capture.active_custody_batches_held == 0
+        && scope.caller == candidate.caller && scope.backend_index == candidate.backend_index
+        && pair == scope.expected.pair && rebuilt_pair == pair && rebuilt == stream
+        && rebuilt_generation > generation
+        // Bind the actual decoded snapshot to this exact verified logical watch,
+        // not every later generation on the same pair or an H2 numeric ordering.
+        && Some(rebuilt_generation.get()) == capture.rebuilt_generation
+        && scope.expected.generation == rebuilt_generation
+        && capture.rebuilt_snapshot_complete
+        && capture.rebuilt_stream_granted_through.is_some_and(|grant| grant > 0)
+        && matches!(unit.target, ExchangeFaultTarget::Unit { stream: held, .. } if held == stream)
+        && capture.attempts.iter().any(|attempt|
+            same_signed_target(&attempt.candidate, candidate) && attempt.subscription_cut
+                && !attempt.peer_cancelled && attempt.request_forwarded_at_millis.is_some()
+                && attempt.stream_future_exited_at_millis.is_some())
+        && capture.attempts.iter().any(|attempt|
+            same_signed_target(&attempt.candidate, unit)
+                && attempt.data_forward_held_at_millis.is_some()
+                && observed_open_unit_exited(attempt))
+}
+
 fn non_target_grant_headers(
     state: &ExchangeState,
     scope: VerifiedGrantHeaderScope,
@@ -913,7 +1008,11 @@ fn non_target_grant_headers(
                     Ok(())
                 }
                 Some(ExchangeFaultTarget::Unit { .. }) => {
-                    Err(GrantCancelRejection::ProtectedCustodyPair)
+                    if dropped_reply_obligation_completed(capture) {
+                        Ok(())
+                    } else {
+                        Err(GrantCancelRejection::ProtectedCustodyPair)
+                    }
                 }
                 Some(_) => Err(GrantCancelRejection::InvalidCandidateKind),
                 None => Err(GrantCancelRejection::UnknownCandidate),
@@ -929,7 +1028,11 @@ fn non_target_grant_headers(
                     Ok(())
                 }
                 Some(ExchangeFaultTarget::Subscription { .. }) => {
-                    Err(GrantCancelRejection::ProtectedSubscriptionPair)
+                    if cut_subscription_obligation_completed(capture, scope) {
+                        Ok(())
+                    } else {
+                        Err(GrantCancelRejection::ProtectedSubscriptionPair)
+                    }
                 }
                 Some(_) => Err(GrantCancelRejection::InvalidCandidateKind),
                 None => Err(GrantCancelRejection::UnknownCandidate),
@@ -2244,6 +2347,7 @@ mod tests {
     use novarocks_secret::SecretValue;
     use novarocks_types::{AttemptId, QueryId, StageId, TaskId, UniqueId};
     use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicBool;
 
     fn stream() -> ExchangeStreamIdentity {
         let query =
@@ -2564,6 +2668,9 @@ mod tests {
         root_requests: AtomicUsize,
         root_arrived: Notify,
         root_release: Notify,
+        pause_unit_reply: AtomicBool,
+        unit_reply_release: Notify,
+        partial_snapshot: AtomicBool,
     }
     async fn reply_message(mut reply: server::SendResponse<Bytes>, body: Bytes) -> Result<()> {
         let mut output = reply.send_response(Response::new(()), false)?;
@@ -2597,6 +2704,7 @@ mod tests {
                                 let decoded=codec::decode_delivery_request(wire::DeliverExchangeUnitRequest::decode(single_message(&body)?)?,FieldPath::root("real_h2_test"))?;
                                 assert_eq!(decoded.stream,stream);let sequence=decoded.item.sequence();
                                 let applied=state.seen.lock().unwrap().insert(sequence.get());state.received.fetch_add(1,Ordering::AcqRel);state.applied.notify_waiters();
+                                if state.pause_unit_reply.load(Ordering::Acquire) {state.unit_reply_release.notified().await;}
                                 reply_message(reply,encoded(codec::encode_delivery_response(stream,sequence,DecodedExchangeDeliveryOutcome::Observed {
                                     verdict:if applied {ExchangeAdmissionVerdict::Applied}else{ExchangeAdmissionVerdict::Idempotent},
                                     facts:novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeStreamFacts{custody_through:sequence.get(),..Default::default()}}))).await?;
@@ -2607,7 +2715,7 @@ mod tests {
                                     loop {let changed=state.applied.notified();tokio::pin!(changed);changed.as_mut().enable();if !state.seen.lock().unwrap().is_empty(){break}changed.await;}
                                 }
                                 let custody=u64::from(state.seen.lock().unwrap().contains(&1));
-                                let batch=codec::DecodedExchangeGrantBatch{generation:expected.generation,snapshot:true,snapshot_complete:true,states:vec![codec::DecodedExchangeStreamState{stream,
+                                let batch=codec::DecodedExchangeGrantBatch{generation:expected.generation,snapshot:true,snapshot_complete:!state.partial_snapshot.load(Ordering::Acquire),states:vec![codec::DecodedExchangeStreamState{stream,
                                     facts:novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeStreamFacts{custody_through:custody,granted_through:1,..Default::default()}}]};
                                 reply_message(reply,encoded(codec::encode_grant_batch(&batch,expected.pair,FieldPath::root("real_h2_grant_batch"))?)).await?;
                             },
@@ -2632,6 +2740,58 @@ mod tests {
         Ok(())
     }
     async fn unit_case(action: ExchangeFaultAction) -> Result<()> {
+        unit_case_with_obligation_probe(action, false).await
+    }
+
+    async fn probe_original_fault_grant_cancel(
+        control: &RootReplyFaultControl,
+        stream: ExchangeStreamIdentity,
+        generation: u64,
+        recover: bool,
+    ) -> Result<()> {
+        grant_reset_wire(
+            control.core.clone(),
+            stream,
+            DecodedExchangeGrantSubscription {
+                pair: ExchangeProcessPair::for_stream(stream),
+                generation: NonZeroU64::new(generation).unwrap(),
+            },
+            GrantHeaderCase::HeldUnit,
+            h2::Reason::CANCEL,
+            GrantResetPhase::Body(GrantBodyPart::Message),
+            GrantResetExpectation {
+                recover,
+                original_actors_live: true,
+            },
+        )
+        .await
+    }
+
+    async fn wait_original_fault_callbacks(control: &RootReplyFaultControl) {
+        loop {
+            let changed = control.core.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let observed = control.exchange_observation();
+            if observed.active_target_streams == 0
+                && observed.active_custody_batches_held == 0
+                && observed
+                    .attempts
+                    .iter()
+                    .all(|attempt| attempt.stream_future_exited_at_millis.is_some())
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    // Additional pure H2 scopes share this original Core only in this explicit
+    // mixed component mode. They grant no Native/32 or zero-standalone result.
+    async fn unit_case_with_obligation_probe(
+        action: ExchangeFaultAction,
+        probe: bool,
+    ) -> Result<()> {
         let stream = stream();
         let fixture_core = super::super::tests::core();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2693,7 +2853,30 @@ mod tests {
             }
             let custody = custody.unwrap();
             assert!(!custody.is_finished());
-            let reply = exchange_rpc(sender.clone(), stream, data(stream)).await?;
+            if probe {
+                assert!(control.exchange_observation().active_custody_batches_held > 0);
+                probe_original_fault_grant_cancel(&control, stream, 1, false).await?;
+                state.pause_unit_reply.store(true, Ordering::Release);
+            }
+            let reply = if probe {
+                let replay = tokio::spawn(exchange_rpc(sender.clone(), stream, data(stream)));
+                loop {
+                    let changed = state.applied.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if state.received.load(Ordering::Acquire) == 2 {
+                        break;
+                    }
+                    changed.await;
+                }
+                assert!(control.exchange_observation().active_target_streams > 0);
+                probe_original_fault_grant_cancel(&control, stream, 1, false).await?;
+                state.pause_unit_reply.store(false, Ordering::Release);
+                state.unit_reply_release.notify_one();
+                replay.await??
+            } else {
+                exchange_rpc(sender.clone(), stream, data(stream)).await?
+            };
             let reply = wire::DeliverExchangeUnitResponse::decode(single_message(&reply)?)?;
             assert!(matches!(
                 codec::decode_delivery_response(
@@ -2726,6 +2909,11 @@ mod tests {
             assert_eq!(observed.active_custody_batches_held, 0);
             assert_eq!(state.received.load(Ordering::Acquire), 2);
             assert_eq!(state.seen.lock().unwrap().len(), 1);
+            if probe {
+                wait_original_fault_callbacks(&control).await;
+                assert!(!control.exchange_observation().released);
+                probe_original_fault_grant_cancel(&control, stream, 1, true).await?;
+            }
         } else if action == ExchangeFaultAction::CutGrantSubscription {
             let failure = first
                 .await?
@@ -2749,7 +2937,34 @@ mod tests {
             }
             assert_eq!(state.received.load(Ordering::Acquire), 0);
             assert!(!unit.is_finished());
+            if probe {
+                probe_original_fault_grant_cancel(&control, stream, 2, false).await?;
+                state.partial_snapshot.store(true, Ordering::Release);
+                grant_rpc(sender.clone(), stream, 2).await?;
+                assert_eq!(control.exchange_observation().rebuilt_generation, Some(2));
+                assert!(!control.exchange_observation().rebuilt_snapshot_complete);
+                assert!(!unit.is_finished());
+                probe_original_fault_grant_cancel(&control, stream, 2, false).await?;
+                state.partial_snapshot.store(false, Ordering::Release);
+                state.pause_unit_reply.store(true, Ordering::Release);
+            }
             grant_rpc(sender.clone(), stream, 2).await?;
+            if probe {
+                loop {
+                    let changed = state.applied.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if state.received.load(Ordering::Acquire) == 1 {
+                        break;
+                    }
+                    changed.await;
+                }
+                assert!(control.exchange_observation().rebuilt_snapshot_complete);
+                assert!(control.exchange_observation().active_target_streams > 0);
+                probe_original_fault_grant_cancel(&control, stream, 2, false).await?;
+                state.pause_unit_reply.store(false, Ordering::Release);
+                state.unit_reply_release.notify_one();
+            }
             unit.await??;
             let observed = control.exchange_observation();
             assert_eq!(observed.subscriptions_cut, 1);
@@ -2758,6 +2973,13 @@ mod tests {
             assert_eq!(observed.rebuilt_stream.unwrap().stream(), stream);
             assert_eq!(observed.rebuilt_stream_granted_through, Some(1));
             assert_eq!(state.received.load(Ordering::Acquire), 1);
+            if probe {
+                wait_original_fault_callbacks(&control).await;
+                assert!(!control.exchange_observation().released);
+                probe_original_fault_grant_cancel(&control, stream, 1, false).await?;
+                probe_original_fault_grant_cancel(&control, stream, 3, false).await?;
+                probe_original_fault_grant_cancel(&control, stream, 2, true).await?;
+            }
         } else {
             assert_eq!(state.received.load(Ordering::Acquire), 0);
             first.abort();
@@ -2873,10 +3095,17 @@ mod tests {
             actors.connection_bound_buffer_charges,
             actors.connection_bound_buffer_drops
         );
-        assert_eq!(
-            actors.standalone_buffer_charges, 0,
-            "every real Exchange/Root allocation stays bound to its original connection"
-        );
+        if probe {
+            assert!(
+                actors.standalone_buffer_charges > 0,
+                "mixed pure H2 probes explicitly report their standalone allocations"
+            );
+        } else {
+            assert_eq!(
+                actors.standalone_buffer_charges, 0,
+                "every real Exchange/Root allocation stays bound to its original connection"
+            );
+        }
         assert!(actors.shutdown_joined);
         assert!(actors.failures.is_empty(), "{:?}", actors.failures);
         assert_eq!(fixture_core.bytes.load(Ordering::Acquire), 0);
@@ -3358,6 +3587,41 @@ mod tests {
         }
         let should_recover = matches!(case, GrantHeaderCase::HeldUnit | GrantHeaderCase::HeldReply)
             && reason == h2::Reason::CANCEL;
+        grant_reset_wire(
+            core,
+            stream,
+            expected,
+            case,
+            reason,
+            phase,
+            GrantResetExpectation {
+                recover: should_recover,
+                original_actors_live: false,
+            },
+        )
+        .await
+    }
+
+    struct GrantResetExpectation {
+        recover: bool,
+        original_actors_live: bool,
+    }
+
+    async fn grant_reset_wire(
+        core: Arc<Core>,
+        stream: ExchangeStreamIdentity,
+        expected: DecodedExchangeGrantSubscription,
+        case: GrantHeaderCase,
+        reason: h2::Reason,
+        phase: GrantResetPhase,
+        expectation: GrantResetExpectation,
+    ) -> Result<()> {
+        let GrantResetExpectation {
+            recover: should_recover,
+            original_actors_live,
+        } = expectation;
+        let control = RootReplyFaultControl { core: core.clone() };
+        let initial_peer_cancels = control.exchange_observation().peer_cancels;
         let mut drivers = JoinSet::new();
         let result = tokio::time::timeout(Duration::from_secs(3), async {
             let (up_client, up_server) = tokio::io::duplex(65536);
@@ -3470,7 +3734,7 @@ mod tests {
                             .live_capture()
                             .unwrap()
                             .peer_cancels,
-                        0
+                        initial_peer_cancels
                     );
                     let _ = ready_tx.send(());
                     let actual = if let Some(output) = output.as_mut() {
@@ -3612,10 +3876,12 @@ mod tests {
                     Err(tokio::sync::oneshot::error::TryRecvError::Empty)
                 ));
             }
-            assert_eq!(
-                control.exchange_observation().peer_cancels,
-                u64::from(should_recover)
-            );
+            let peer_cancels = control.exchange_observation().peer_cancels;
+            if original_actors_live {
+                assert!(peer_cancels >= initial_peer_cancels + u64::from(should_recover));
+            } else {
+                assert_eq!(peer_cancels, initial_peer_cancels + u64::from(should_recover));
+            }
             assert!(control.observation().failures.is_empty());
             drop(reply);
             drop(send);
@@ -3659,7 +3925,9 @@ mod tests {
         if let Some(error) = cleanup_error {
             return Err(error);
         }
-        assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+        if !original_actors_live {
+            assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+        }
         Ok(())
     }
 
@@ -3981,6 +4249,28 @@ mod tests {
         )
         .await
         .context("real H2 preforward test deadline")?
+    }
+
+    #[tokio::test]
+    async fn real_dropped_reply_guard_and_exact_replay_exit_allow_later_grant_cancel() -> Result<()>
+    {
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            unit_case_with_obligation_probe(ExchangeFaultAction::DropAcceptedReply, true),
+        )
+        .await
+        .context("completed drop obligation component fixture deadline")?
+    }
+
+    #[tokio::test]
+    async fn real_cut_snapshot_and_held_unit_exit_allow_only_the_exact_rebuilt_grant_scope()
+    -> Result<()> {
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            unit_case_with_obligation_probe(ExchangeFaultAction::CutGrantSubscription, true),
+        )
+        .await
+        .context("completed cut obligation component fixture deadline")?
     }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum DeliveryResetCase {
