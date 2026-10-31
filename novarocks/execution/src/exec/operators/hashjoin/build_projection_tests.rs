@@ -172,6 +172,62 @@ fn normal_global_withdrawal_retires_real_csr_cursors_without_ready_or_failure() 
 }
 
 #[test]
+fn normal_withdrawal_between_projection_snapshot_and_k_claim_is_not_failure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct WithdrawBeforeKClaim<'a> {
+        build: &'a ProjectionBuild,
+        checkpoints: AtomicUsize,
+    }
+    impl novarocks_functions::KernelEvaluationControl for WithdrawBeforeKClaim<'_> {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            if self.checkpoints.fetch_add(1, Ordering::Relaxed) == 1 {
+                // ProjectionWorker has borrowed the actual K graph. Withdraw
+                // at KeyBuildWorker's entry, before it claims from that graph.
+                // The original K graph authors its own cancellation receipt.
+                self.build.retire().unwrap();
+            }
+            Ok(())
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+            panic!("deterministic withdrawal does not sleep")
+        }
+    }
+
+    let (owner, tracker) = fixture();
+    let initial_work = work(owner.as_ref(), &tracker, &Control);
+    for strings in [false, true] {
+        let pages = vec![(0..4001).map(|i| Some(i % 51)).collect()];
+        let (graph, rows) = captured_graph(&pages, strings, &initial_work);
+        let build = ProjectionBuild::from_graph(
+            graph,
+            rows,
+            ProjectionKind::Ordinary,
+            NonZeroUsize::new(3).unwrap(),
+            Arc::new(Observable::new()),
+            &initial_work,
+        )
+        .unwrap();
+        let mut worker = ProjectionWorker::new(&initial_work);
+        let control = WithdrawBeforeKClaim {
+            build: &build,
+            checkpoints: AtomicUsize::new(0),
+        };
+        let withdrawing_work = work(owner.as_ref(), &tracker, &control);
+        let mut turn = TurnWork::new(NonZeroU64::MIN, 11);
+        assert_eq!(
+            worker.step(&build, &mut turn, &withdrawing_work).unwrap(),
+            ProjectionStep::Retired
+        );
+        assert!(control.checkpoints.load(Ordering::Relaxed) >= 2);
+        assert!(matches!(&*build.phase().unwrap(), Phase::Retired));
+        worker.retire_owned(&build).unwrap();
+        assert_eq!(worker.keys.retained(), 0);
+        assert!(build.take_ready().unwrap().is_none());
+    }
+}
+
+#[test]
 fn withdrawing_retained_k_work_preserves_control_and_any_earlier_failure() {
     let (owner, tracker) = fixture();
     let work = work(owner.as_ref(), &tracker, &Control);

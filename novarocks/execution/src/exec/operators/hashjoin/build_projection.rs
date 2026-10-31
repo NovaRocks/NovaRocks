@@ -385,8 +385,28 @@ impl ProjectionWorker {
         turn: &mut TurnWork,
         work: &BulkWork<'_>,
     ) -> ExecutionResult<ProjectionStep> {
-        self.step_inner(build, turn, work)
-            .map_err(|cause| build.fail(cause))
+        let result = self.step_inner(build, turn, work);
+        if let Err(cause) = &result
+            && matches!(
+                cause.cause(),
+                ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
+            )
+        {
+            let phase = build.phase()?;
+            match &*phase {
+                // The original demand author closes K while a worker may
+                // still hold its graph. Its private cancellation receipt is
+                // not a new required-work failure after normal retirement.
+                Phase::Retiring => return Ok(ProjectionStep::Blocked),
+                Phase::Retired => {
+                    drop(phase);
+                    self.retire_owned(build)?;
+                    return Ok(ProjectionStep::Retired);
+                }
+                _ => {}
+            }
+        }
+        result.map_err(|cause| build.fail(cause))
     }
     fn step_inner(
         &mut self,
