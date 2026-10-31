@@ -5,7 +5,7 @@ domain: [join-execution]
 status: active
 supersedes: []
 superseded-by: null
-partially-superseded-by: [ADR-0205]
+partially-superseded-by: [ADR-0205, ADR-0209]
 date: 2026-07-24
 provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/368 (selection-path join core rewrite)"
@@ -16,7 +16,7 @@ provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/420 (DirectInt duplicate-row storage removal)"
   - "discussion: 2026-06-23 TPC-H q18 执行热点归因与向量化 join core 总设计（design vault）"
 code-anchors:
-  - "novarocks/execution/src/exec/operators/hashjoin/join_hash_map/mod.rs (module)"
+  - "novarocks/execution/src/exec/operators/hashjoin/build_csr.rs (consumer-owned physical row topology)"
 ---
 
 ## 问题

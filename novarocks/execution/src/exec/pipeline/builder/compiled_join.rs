@@ -17,16 +17,16 @@
 
 //! Compiled join pipelines.
 //!
-//! Both join families share one build per instance: the build input is
-//! captured by its installed E drivers, finalized by independent F workers, and the probe runs at
-//! its own pipeline width against it. Every physical distribution has already
-//! delivered this instance its whole share of both sides, so this local
-//! strategy is correct for each of them. The probe is the program's left input
-//! and the build its right input; the compiler normalized that orientation.
-//! The build pipeline is an extra pipeline that ends in its build sink.
+//! Both join families share one build per admitted instance. Actual E drivers
+//! capture input, independent F workers finalize it, Q drivers probe it, and
+//! required build-preserving output has independent T sources. The compiler
+//! normalizes the probe to the program's left input and the build to its right.
+//! Frozen physical placement and LocalCompiler admission remain authoritative.
 //!
-//! A hash join's membership runtime-filter producers observe its build keys
-//! in the build sink. The one build driver is their one local partition.
+//! Membership RF producers observe each actual E contribution. K chooses its
+//! own partitions. Only T>0 installs the original Q+T producer Handoff; T=0
+//! keeps probe and downstream fused.
+// Design: ADR-0209 (docs/adr/ADR-0209-shared-join-stages-and-exact-demand-retirement.md)
 
 use super::super::program_failure;
 use super::*;

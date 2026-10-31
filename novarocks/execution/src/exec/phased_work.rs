@@ -19,6 +19,7 @@
 //! The caller funds the shared owner and supplies its original invariant cause.
 //! Dropping unfinished work returns its lease but never reissues its range or
 //! permits publication; the same first failure remains visible to every user.
+// Design: ADR-0209 (docs/adr/ADR-0209-shared-join-stages-and-exact-demand-retirement.md)
 
 use std::{
     num::NonZeroUsize,
