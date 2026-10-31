@@ -828,6 +828,13 @@ async fn wait_gate(
 }
 
 fn peer_cancel(error: &anyhow::Error) -> bool {
+    // A scoped send has already checked its original output handle and
+    // current scope. The older generic catch must not override that refusal.
+    if error.downcast_ref::<DeliveryOutputFailure>().is_some()
+        || error.downcast_ref::<GrantOutputFailure>().is_some()
+    {
+        return false;
+    }
     error.downcast_ref::<h2::Error>().is_some_and(|error|error.is_reset() && error.is_remote() && error.reason()==Some(h2::Reason::CANCEL))
         || error.downcast_ref::<CapacityClosed>().is_some_and(|closed|
             matches!(closed.reset,CapacityResetObservation::Reason(reason) if reason==u32::from(h2::Reason::CANCEL)))
@@ -1107,6 +1114,404 @@ async fn forward_grant_output(
     }
 }
 
+/// Only the original authenticated, decoded delivery with request EOF creates
+/// this metadata. It retains neither the request payload nor an attempt owner.
+#[derive(Clone, Copy, Debug)]
+struct VerifiedDeliveryScope {
+    stream: ExchangeStreamIdentity,
+    item: ExchangeUnitItem,
+    caller: BackendProcessId,
+    backend_index: usize,
+    downstream: u32,
+    session_deadline: Instant,
+    capture: Option<(Instant, Instant)>,
+    tracked_attempt: bool,
+}
+
+fn verified_delivery_scope(
+    core: &Core,
+    frame: &codec::DecodedExchangeUnitFrame,
+    caller: BackendProcessId,
+    backend_index: usize,
+    downstream: u32,
+    tracked_attempt: bool,
+) -> Result<VerifiedDeliveryScope> {
+    require_pair(
+        core,
+        ExchangeProcessPair::for_stream(frame.stream),
+        caller,
+        backend_index,
+    )?;
+    let state = core.state.lock().expect("root fault state lock");
+    Ok(VerifiedDeliveryScope {
+        stream: frame.stream,
+        item: frame.item,
+        caller,
+        backend_index,
+        downstream,
+        session_deadline: state
+            .exchange
+            .session_deadline
+            .context("delivery scope has no original session")?,
+        capture: state
+            .exchange
+            .live_capture()
+            .map(|capture| (capture.started, capture.deadline)),
+        tracked_attempt,
+    })
+}
+
+#[derive(Debug)]
+enum DeliveryCancelRejection {
+    ExpiredSession,
+    RetiredScope,
+    ChangedCapture,
+    ExpiredCapture,
+    InvalidLivePair,
+    UnknownCandidate,
+    InvalidCandidateKind,
+    ProtectedOriginalAttempt,
+    ProtectedSelectedStream,
+    ProtectedCustodyPair,
+    ProtectedSubscriptionPair,
+}
+
+fn non_target_delivery_output(
+    state: &ExchangeState,
+    scope: VerifiedDeliveryScope,
+) -> std::result::Result<(), DeliveryCancelRejection> {
+    if state.session_deadline != Some(scope.session_deadline)
+        || scope.session_deadline <= Instant::now()
+    {
+        return Err(DeliveryCancelRejection::ExpiredSession);
+    }
+    if matches!(state.capture, Some(CaptureState::RetiredReceipt(_))) {
+        return Err(DeliveryCancelRejection::RetiredScope);
+    }
+    let pair = ExchangeProcessPair::for_stream(scope.stream);
+    if scope.caller != pair.sender
+        || !state
+            .peers
+            .iter()
+            .any(|(_, _, process)| *process == scope.caller)
+        || !state
+            .peers
+            .iter()
+            .any(|(index, _, process)| *index == scope.backend_index && *process == pair.receiver)
+    {
+        return Err(DeliveryCancelRejection::InvalidLivePair);
+    }
+    let current = state.live_capture();
+    if current.map(|capture| (capture.started, capture.deadline)) != scope.capture {
+        return Err(DeliveryCancelRejection::ChangedCapture);
+    }
+    if scope.tracked_attempt {
+        return Err(DeliveryCancelRejection::ProtectedOriginalAttempt);
+    }
+    let Some(capture) = current else {
+        return Ok(());
+    };
+    if capture.deadline <= Instant::now() {
+        return Err(DeliveryCancelRejection::ExpiredCapture);
+    }
+    let Some(candidate) = capture.candidate.as_ref() else {
+        return Err(DeliveryCancelRejection::UnknownCandidate);
+    };
+    match capture.action {
+        ExchangeFaultAction::HoldDataBeforeForward
+        | ExchangeFaultAction::HoldReplyAfterAdmission => match candidate.target {
+            ExchangeFaultTarget::Unit { stream, .. } if stream != scope.stream => Ok(()),
+            ExchangeFaultTarget::Unit { .. } => {
+                Err(DeliveryCancelRejection::ProtectedSelectedStream)
+            }
+            _ => Err(DeliveryCancelRejection::InvalidCandidateKind),
+        },
+        ExchangeFaultAction::DropAcceptedReply => match candidate.target {
+            ExchangeFaultTarget::Unit { stream, .. }
+                if ExchangeProcessPair::for_stream(stream) != pair =>
+            {
+                Ok(())
+            }
+            ExchangeFaultTarget::Unit { .. } => Err(DeliveryCancelRejection::ProtectedCustodyPair),
+            _ => Err(DeliveryCancelRejection::InvalidCandidateKind),
+        },
+        ExchangeFaultAction::CutGrantSubscription => match candidate.target {
+            ExchangeFaultTarget::Subscription { pair: selected, .. }
+                if selected != pair
+                    && capture.cut_unit.as_ref().is_none_or(|unit| {
+                        ExchangeProcessPair::for_stream(unit.target.stream()) != pair
+                    }) =>
+            {
+                Ok(())
+            }
+            ExchangeFaultTarget::Subscription { .. } => {
+                Err(DeliveryCancelRejection::ProtectedSubscriptionPair)
+            }
+            _ => Err(DeliveryCancelRejection::InvalidCandidateKind),
+        },
+    }
+}
+
+// Only a real original H2 handle's Ready(CANCEL) constructs this observation.
+struct ObservedDeliveryPeerCancel(VerifiedDeliveryScope);
+
+fn settle_delivery_peer_cancel(
+    core: &Core,
+    observed: ObservedDeliveryPeerCancel,
+    sending: &mut SendStream<Bytes>,
+) -> std::result::Result<(), DeliveryCancelRejection> {
+    let mut state = core.state.lock().expect("root fault state lock");
+    non_target_delivery_output(&state.exchange, observed.0)?;
+    sending.send_reset(h2::Reason::CANCEL);
+    if let Some(capture) = state.exchange.live_capture_mut() {
+        capture.peer_cancels = capture.peer_cancels.saturating_add(1);
+    }
+    drop(state);
+    core.changed.notify_waiters();
+    Ok(())
+}
+
+#[derive(Debug)]
+enum DeliveryCancelProbe {
+    Settled,
+    StreamMismatch,
+    RequestNotEnded,
+    Pending,
+    ReadyOther(u32),
+    ObservationError(FailureDigest),
+    ReadyCancelRejected(DeliveryCancelRejection),
+}
+impl std::fmt::Display for DeliveryCancelProbe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Settled => formatter.write_str("Ready(CANCEL) settled"),
+            Self::StreamMismatch => formatter.write_str("stream-mismatch"),
+            Self::RequestNotEnded => formatter.write_str("request-not-ended"),
+            Self::Pending => formatter.write_str("Pending"),
+            Self::ReadyOther(reason) => write!(formatter, "Ready(reason={reason})"),
+            Self::ObservationError(error) => write!(formatter, "observation-error({error:?})"),
+            Self::ReadyCancelRejected(reason) => {
+                write!(formatter, "Ready(CANCEL) rejected={reason:?}")
+            }
+        }
+    }
+}
+
+enum DeliveryResetHandle<'a> {
+    Headers(&'a mut server::SendResponse<Bytes>, &'a mut RecvStream),
+    Body(&'a mut SendStream<Bytes>),
+}
+
+async fn recover_delivery_output_cancel(
+    core: &Core,
+    scope: VerifiedDeliveryScope,
+    handle: DeliveryResetHandle<'_>,
+    sending: &mut SendStream<Bytes>,
+) -> DeliveryCancelProbe {
+    let reset = match handle {
+        DeliveryResetHandle::Headers(response, inbound) => {
+            if response.stream_id().as_u32() != scope.downstream
+                || inbound.stream_id() != response.stream_id()
+            {
+                return DeliveryCancelProbe::StreamMismatch;
+            }
+            let reset = poll_fn(|cx| std::task::Poll::Ready(response.poll_reset(cx))).await;
+            if matches!(reset, std::task::Poll::Ready(Ok(h2::Reason::CANCEL))) {
+                match poll_fn(|cx| std::task::Poll::Ready(inbound.poll_data(cx))).await {
+                    std::task::Poll::Ready(None) => {}
+                    std::task::Poll::Ready(Some(Err(error)))
+                        if error.is_reset()
+                            && error.is_remote()
+                            && error.reason() == Some(h2::Reason::CANCEL) => {}
+                    _ => return DeliveryCancelProbe::RequestNotEnded,
+                }
+            }
+            reset
+        }
+        DeliveryResetHandle::Body(output) => {
+            if output.stream_id().as_u32() != scope.downstream {
+                return DeliveryCancelProbe::StreamMismatch;
+            }
+            poll_fn(|cx| std::task::Poll::Ready(output.poll_reset(cx))).await
+        }
+    };
+    match reset {
+        std::task::Poll::Pending => DeliveryCancelProbe::Pending,
+        std::task::Poll::Ready(Err(error)) => {
+            DeliveryCancelProbe::ObservationError(digest_display("delivery-output-reset", &error))
+        }
+        std::task::Poll::Ready(Ok(reason)) if reason != h2::Reason::CANCEL => {
+            DeliveryCancelProbe::ReadyOther(u32::from(reason))
+        }
+        std::task::Poll::Ready(Ok(_)) => {
+            match settle_delivery_peer_cancel(core, ObservedDeliveryPeerCancel(scope), sending) {
+                Ok(()) => DeliveryCancelProbe::Settled,
+                Err(reason) => DeliveryCancelProbe::ReadyCancelRejected(reason),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DeliveryOutputFailure {
+    stage: &'static str,
+    scope: VerifiedDeliveryScope,
+    reset: DeliveryCancelProbe,
+}
+impl std::fmt::Display for DeliveryOutputFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Exchange delivery stage={} scope={:?} item={:?} reset={}",
+            self.stage, self.scope, self.scope.item, self.reset
+        )
+    }
+}
+
+async fn delivery_response_headers(
+    core: &Core,
+    scope: VerifiedDeliveryScope,
+    response: &mut server::SendResponse<Bytes>,
+    inbound: &mut RecvStream,
+    sending: &mut SendStream<Bytes>,
+    parts: http::response::Parts,
+) -> Result<Option<SendStream<Bytes>>> {
+    if matches!(
+        recover_delivery_output_cancel(
+            core,
+            scope,
+            DeliveryResetHandle::Headers(response, inbound),
+            sending
+        )
+        .await,
+        DeliveryCancelProbe::Settled
+    ) {
+        return Ok(None);
+    }
+    match response.send_response(Response::from_parts(parts, ()), false) {
+        Ok(output) => Ok(Some(output)),
+        Err(error) => {
+            let reset = recover_delivery_output_cancel(
+                core,
+                scope,
+                DeliveryResetHandle::Headers(response, inbound),
+                sending,
+            )
+            .await;
+            if matches!(reset, DeliveryCancelProbe::Settled) {
+                return Ok(None);
+            }
+            Err(error).context(DeliveryOutputFailure {
+                stage: "response-headers",
+                scope,
+                reset,
+            })
+        }
+    }
+}
+
+async fn forward_delivery_output(
+    core: &Core,
+    scope: VerifiedDeliveryScope,
+    output: &mut SendStream<Bytes>,
+    sending: &mut SendStream<Bytes>,
+    part: GrantOutput,
+) -> Result<bool> {
+    let (stage, result) = match part {
+        GrantOutput::Message(bytes) => ("send-message", send_bytes(output, bytes).await),
+        GrantOutput::Trailers(trailers) => (
+            "send-trailers",
+            output.send_trailers(trailers).map_err(anyhow::Error::from),
+        ),
+        GrantOutput::End => (
+            "send-eof",
+            output
+                .send_data(Bytes::new(), true)
+                .map_err(anyhow::Error::from),
+        ),
+    };
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let reset = recover_delivery_output_cancel(
+                core,
+                scope,
+                DeliveryResetHandle::Body(output),
+                sending,
+            )
+            .await;
+            if matches!(reset, DeliveryCancelProbe::Settled) {
+                return Ok(false);
+            }
+            Err(error).context(DeliveryOutputFailure {
+                stage,
+                scope,
+                reset,
+            })
+        }
+    }
+}
+
+async fn copy_delivery_body(
+    core: &Core,
+    scope: VerifiedDeliveryScope,
+    mut input: RecvStream,
+    mut output: SendStream<Bytes>,
+    sending: &mut SendStream<Bytes>,
+    buffers: BufferContext,
+) -> Result<()> {
+    while let Some(bytes) = input.data().await {
+        let bytes = bytes
+            .with_context(|| format!("Exchange delivery stage=read-message scope={scope:?}"))?;
+        ensure!(
+            bytes.len() <= FRAME_BYTES,
+            "delivery forwarding received oversized DATA frame"
+        );
+        let mut copy = OwnedBuffer::new(buffers.clone(), FRAME_BYTES)?;
+        copy.append(&bytes)?;
+        input.flow_control().release_capacity(bytes.len())?;
+        drop(bytes);
+        if !forward_delivery_output(
+            core,
+            scope,
+            &mut output,
+            sending,
+            GrantOutput::Message(copy.into_bytes()),
+        )
+        .await?
+        {
+            return Ok(());
+        }
+    }
+    let trailers = input
+        .trailers()
+        .await
+        .with_context(|| format!("Exchange delivery stage=read-trailers scope={scope:?}"))?;
+    forward_delivery_output(
+        core,
+        scope,
+        &mut output,
+        sending,
+        trailers.map_or(GrantOutput::End, GrantOutput::Trailers),
+    )
+    .await?;
+    Ok(())
+}
+
+fn delivery_stage<T, E: Into<anyhow::Error>>(
+    result: std::result::Result<T, E>,
+    scope: Option<VerifiedDeliveryScope>,
+    stage: &'static str,
+) -> Result<T> {
+    let result: Result<T> = result.map_err(Into::into);
+    match scope {
+        Some(scope) => {
+            result.with_context(|| format!("Exchange delivery stage={stage} scope={scope:?}"))
+        }
+        None => result,
+    }
+}
+
 pub(super) async fn forward(
     request: Request<RecvStream>,
     mut response: server::SendResponse<Bytes>,
@@ -1115,7 +1520,12 @@ pub(super) async fn forward(
     buffers: BufferContext,
 ) -> Result<()> {
     let core = buffers.core.clone();
-    let caller = authenticate(&core, &request, backend_index)?;
+    let caller = match authenticate(&core, &request, backend_index) {
+        Err(error) if request.uri().path() == DELIVER => {
+            return Err(error).context("Exchange delivery stage=authenticate scope=unverified");
+        }
+        result => result?,
+    };
     let path = request.uri().path().to_owned();
     let downstream = response.stream_id().as_u32();
     require_uncompressed(request.headers())?;
@@ -1123,26 +1533,38 @@ pub(super) async fn forward(
     let mut verified = false;
     let mut owner: Option<AttemptOwner> = None;
     let work = async {
-        let (body, trailers) = unary_body(&mut inbound, buffers.clone()).await?;
+        let (body, trailers) = match unary_body(&mut inbound, buffers.clone()).await {
+            Err(error) if path == DELIVER => {
+                return Err(error).context("Exchange delivery stage=read-request scope=unverified");
+            }
+            result => result?,
+        };
         ensure!(
             trailers.as_ref().is_none_or(HeaderMap::is_empty),
             "Exchange request contains unexpected trailers"
         );
         let mut unit = None;
         let mut subscription = None;
+        let mut delivery = None;
         match path.as_str() {
             DELIVER => {
-                let wire = wire::DeliverExchangeUnitRequest::decode(single_message(&body)?)?;
+                let wire =
+                    wire::DeliverExchangeUnitRequest::decode(single_message(&body).context(
+                        "Exchange delivery stage=decode-request-envelope scope=unverified",
+                    )?)
+                    .context("Exchange delivery stage=decode-request-protobuf scope=unverified")?;
                 let frame = codec::decode_delivery_request(
                     wire,
                     FieldPath::root("exchange_fault_delivery_request"),
-                )?;
+                )
+                .context("Exchange delivery stage=decode-request-frame scope=unverified")?;
                 require_pair(
                     &core,
                     ExchangeProcessPair::for_stream(frame.stream),
                     caller,
                     backend_index,
-                )?;
+                )
+                .context("Exchange delivery stage=verify-request-pair scope=unverified")?;
                 if matches!(frame.item, ExchangeUnitItem::Unit { .. }) {
                     owner = select_unit(
                         &core,
@@ -1158,6 +1580,14 @@ pub(super) async fn forward(
                         },
                     )?;
                 }
+                delivery = Some(verified_delivery_scope(
+                    &core,
+                    &frame,
+                    caller,
+                    backend_index,
+                    downstream,
+                    owner.is_some(),
+                )?);
                 unit = Some(frame);
             }
             DEMAND => {
@@ -1208,8 +1638,12 @@ pub(super) async fn forward(
                 return Ok(());
             }
         }
-        let mut sender = sender.ready().await?;
-        let (reply, mut sending) = sender.send_request(Request::from_parts(parts, ()), false)?;
+        let mut sender = delivery_stage(sender.ready().await, delivery, "upstream-ready")?;
+        let (reply, mut sending) = delivery_stage(
+            sender.send_request(Request::from_parts(parts, ()), false),
+            delivery,
+            "send-request-headers",
+        )?;
         let upstream = sending.stream_id().as_u32();
         let dispatched = Instant::now();
         if let Some(owner) = owner.as_ref() {
@@ -1218,16 +1652,29 @@ pub(super) async fn forward(
                 attempt.request_forwarded_at_millis = Some(now);
             });
         }
-        send_bytes(&mut sending, body.clone()).await?;
-        sending.send_data(Bytes::new(), true)?;
+        delivery_stage(
+            send_bytes(&mut sending, body.clone()).await,
+            delivery,
+            "send-request-message",
+        )?;
+        delivery_stage(
+            sending.send_data(Bytes::new(), true),
+            delivery,
+            "send-request-eof",
+        )?;
         // Only connection/response establishment has the original forward bound.
         // A live grant subscription has no invented actor idle timeout.
-        let upstream_response = tokio::time::timeout(
-            Duration::from_millis(core.bounds.forward_timeout_millis),
-            reply,
-        )
-        .await
-        .context("Exchange upstream response establishment deadline")??;
+        let upstream_response = delivery_stage(
+            tokio::time::timeout(
+                Duration::from_millis(core.bounds.forward_timeout_millis),
+                reply,
+            )
+            .await
+            .context("Exchange upstream response establishment deadline")
+            .and_then(|reply| reply.map_err(anyhow::Error::from)),
+            delivery,
+            "await-upstream-headers",
+        )?;
         let (reply_parts, mut reply_body) = upstream_response.into_parts();
         if let Some(scope) = subscription {
             if recover_grant_cancel_before_headers(
@@ -1279,23 +1726,40 @@ pub(super) async fn forward(
             .with_context(|| format!("Exchange grant stage=response-body scope={scope:?}"));
         }
         if let Some(owner) = owner.as_ref() {
-            let (reply_bytes, reply_trailers) =
-                unary_body(&mut reply_body, buffers.clone()).await?;
+            let scope = delivery.context("Exchange delivery output has no verified scope")?;
+            let (reply_bytes, reply_trailers) = unary_body(&mut reply_body, buffers.clone())
+                .await
+                .with_context(|| {
+                    format!("Exchange delivery stage=read-unary-response scope={scope:?}")
+                })?;
             let frame = unit.as_ref().context("Exchange target has no Unit frame")?;
             // Header-only RPC failures remain the real upstream RPC outcome.
             // They never authorize an accepted-receipt mutation.
             if !reply_parts.headers.contains_key("grpc-status") {
-                success_status(&reply_parts.headers, reply_trailers.as_ref())?;
-                let decoded =
-                    wire::DeliverExchangeUnitResponse::decode(single_message(&reply_bytes)?)?;
-                if let DecodedExchangeDeliveryOutcome::Observed { verdict, facts } =
+                delivery_stage(
+                    success_status(&reply_parts.headers, reply_trailers.as_ref()),
+                    Some(scope),
+                    "validate-upstream-status",
+                )?;
+                let decoded = delivery_stage(
+                    wire::DeliverExchangeUnitResponse::decode(delivery_stage(
+                        single_message(&reply_bytes),
+                        Some(scope),
+                        "decode-response-envelope",
+                    )?),
+                    Some(scope),
+                    "decode-response-protobuf",
+                )?;
+                if let DecodedExchangeDeliveryOutcome::Observed { verdict, facts } = delivery_stage(
                     codec::decode_delivery_response(
                         &decoded,
                         frame.stream,
                         frame.item.sequence(),
                         FieldPath::root("exchange_fault_delivery_response"),
-                    )?
-                {
+                    ),
+                    Some(scope),
+                    "decode-response-receipt",
+                )? {
                     owner.update(|attempt, now| {
                         attempt.admission_observed_at_millis = Some(now);
                         attempt.custody_through = Some(facts.custody_through);
@@ -1349,14 +1813,59 @@ pub(super) async fn forward(
                     }
                 }
             }
-            let mut output =
-                response.send_response(Response::from_parts(reply_parts, ()), false)?;
-            send_bytes(&mut output, reply_bytes).await?;
-            if let Some(trailers) = reply_trailers {
-                output.send_trailers(trailers)?;
-            } else {
-                output.send_data(Bytes::new(), true)?;
+            let Some(mut output) = delivery_response_headers(
+                &core,
+                scope,
+                &mut response,
+                &mut inbound,
+                &mut sending,
+                reply_parts,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            if !forward_delivery_output(
+                &core,
+                scope,
+                &mut output,
+                &mut sending,
+                GrantOutput::Message(reply_bytes),
+            )
+            .await?
+            {
+                return Ok(());
             }
+            forward_delivery_output(
+                &core,
+                scope,
+                &mut output,
+                &mut sending,
+                reply_trailers.map_or(GrantOutput::End, GrantOutput::Trailers),
+            )
+            .await?;
+        } else if let Some(scope) = delivery {
+            let Some(output) = delivery_response_headers(
+                &core,
+                scope,
+                &mut response,
+                &mut inbound,
+                &mut sending,
+                reply_parts,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            copy_delivery_body(
+                &core,
+                scope,
+                reply_body,
+                output,
+                &mut sending,
+                buffers.clone(),
+            )
+            .await?;
         } else {
             let output = response.send_response(Response::from_parts(reply_parts, ()), false)?;
             copy_body(reply_body, output, buffers.clone()).await?;
@@ -3011,6 +3520,7 @@ mod tests {
                                 assert!(control.exchange_observation().released,
                                     "release alone must not discharge the protected pair");
                             }
+                            let is_message = matches!(part, GrantBodyPart::Message);
                             let (part, stage) = match part {
                                 GrantBodyPart::Message => {
                                     let batch = codec::DecodedExchangeGrantBatch {
@@ -3042,6 +3552,11 @@ mod tests {
                                 Err(error) => {
                                     let diagnostic = error.downcast_ref::<GrantOutputFailure>()
                                         .context("grant output lost its typed send/reset diagnostic")?;
+                                    assert!(!peer_cancel(&error), "the original catch cannot override a scoped grant rejection");
+                                    if is_message {
+                                        assert!(error.downcast_ref::<CapacityClosed>().is_some(),
+                                            "the real closed H2 output must retain its original capacity/reset cause");
+                                    }
                                     assert_eq!(diagnostic.stage, stage);
                                     assert_eq!(diagnostic.scope.expected, expected);
                                     if reason == h2::Reason::CANCEL {
@@ -3226,12 +3741,9 @@ mod tests {
             GrantHeaderCase::Rebuild,
             GrantHeaderCase::UnknownSubscription,
         ] {
-            grant_reset_case(
-                case,
-                h2::Reason::CANCEL,
-                GrantResetPhase::Body(GrantBodyPart::Trailers),
-            )
-            .await?;
+            for part in [GrantBodyPart::Message, GrantBodyPart::Trailers] {
+                grant_reset_case(case, h2::Reason::CANCEL, GrantResetPhase::Body(part)).await?;
+            }
         }
         Ok(())
     }
@@ -3469,5 +3981,371 @@ mod tests {
         )
         .await
         .context("real H2 preforward test deadline")?
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum DeliveryResetCase {
+        NonTarget,
+        Selected,
+        SameStreamEnd,
+        SameStreamSuccessor,
+        Custody,
+        Subscription,
+        Unknown,
+        ChangedCapture,
+        Expired,
+        ReplacedPeer,
+    }
+
+    // The original request, JWT, decoder, EOF and both reset handles are real.
+    // This qualifies the actor's output proof, not a Native receiver or SQL.
+    async fn delivery_reset_case(
+        case: DeliveryResetCase,
+        reason: h2::Reason,
+        phase: GrantResetPhase,
+    ) -> Result<()> {
+        let core = super::super::tests::core();
+        let control = RootReplyFaultControl { core: core.clone() };
+        let selected = stream();
+        let request_stream = if matches!(
+            case,
+            DeliveryResetCase::Selected
+                | DeliveryResetCase::SameStreamEnd
+                | DeliveryResetCase::SameStreamSuccessor
+        ) {
+            selected
+        } else {
+            ExchangeStreamIdentity::try_new(
+                selected.source(),
+                selected.destination(),
+                selected.destination_fragment_instance_id(),
+                FragmentNodeId::new(selected.destination_node().get() + 1),
+            )?
+        };
+        control.bind_exchange_peers(peers(selected), Instant::now() + Duration::from_secs(5))?;
+        let action = match case {
+            DeliveryResetCase::Custody => ExchangeFaultAction::DropAcceptedReply,
+            DeliveryResetCase::Subscription | DeliveryResetCase::Unknown => {
+                ExchangeFaultAction::CutGrantSubscription
+            }
+            _ => ExchangeFaultAction::HoldDataBeforeForward,
+        };
+        control.begin_exchange_capture(action, Instant::now() + Duration::from_secs(2))?;
+        if case != DeliveryResetCase::Unknown {
+            let candidate = ExchangeFaultCandidate {
+                target: if case == DeliveryResetCase::Subscription {
+                    ExchangeFaultTarget::Subscription {
+                        stream: selected,
+                        pair: ExchangeProcessPair::for_stream(selected),
+                        generation: NonZeroU64::new(7).unwrap(),
+                    }
+                } else {
+                    ExchangeFaultTarget::Unit {
+                        stream: selected,
+                        sequence: ExchangeUnitSequence::FIRST,
+                    }
+                },
+                backend_index: 1,
+                caller: selected.source().task().backend_process_id(),
+                downstream_stream: 1,
+                request_sha256: hash(&data(selected)),
+            };
+            core.state
+                .lock()
+                .unwrap()
+                .exchange
+                .live_capture_mut()
+                .unwrap()
+                .candidate = Some(candidate.clone());
+            control.arm_exchange_exact(&candidate)?;
+        }
+        let mut request_body = data(request_stream);
+        if matches!(
+            case,
+            DeliveryResetCase::SameStreamEnd | DeliveryResetCase::SameStreamSuccessor
+        ) {
+            let mut frame = codec::decode_delivery_request(
+                wire::DeliverExchangeUnitRequest::decode(single_message(&request_body)?)?,
+                FieldPath::root("delivery_reset_request_fixture"),
+            )?;
+            let sequence = ExchangeUnitSequence::try_new(2)?;
+            if case == DeliveryResetCase::SameStreamEnd {
+                frame.item = ExchangeUnitItem::End(sequence);
+                frame.payload = Bytes::new();
+            } else {
+                frame.item = ExchangeUnitItem::Unit { demand:
+                    novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitDemand {
+                        sequence, wire_bytes: frame.payload.len() as u64 }, end_after_unit: false };
+            }
+            request_body = encoded(codec::encode_delivery_request(frame));
+        }
+        let should_recover = case == DeliveryResetCase::NonTarget && reason == h2::Reason::CANCEL;
+        let mut drivers = JoinSet::new();
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            let (up_client, up_server) = tokio::io::duplex(65536);
+            let upstream_core = core.clone();
+            let (up_reset_tx, mut up_reset_rx) = tokio::sync::oneshot::channel();
+            drivers.spawn(async move {
+                let mut connection = server::handshake::<_>(up_server).await?;
+                let (request, mut response) = connection.accept().await.context("delivery upstream request absent")??;
+                let work = async {
+                    assert_eq!(request.uri().path(), DELIVER);
+                    let caller = authenticate(&upstream_core, &request, 1)?;
+                    let (body, _) = unary_body(&mut request.into_body(), BufferContext::standalone(upstream_core.clone())).await?;
+                    let frame = codec::decode_delivery_request(
+                        wire::DeliverExchangeUnitRequest::decode(single_message(&body)?)?,
+                        FieldPath::root("delivery_reset_upstream_request"))?;
+                    require_pair(&upstream_core, ExchangeProcessPair::for_stream(frame.stream), caller, 1)?;
+                    assert_eq!(frame.stream, request_stream);
+                    let mut output = response.send_response(Response::new(()), false)?;
+                    let observed = poll_fn(|cx| output.poll_reset(cx)).await?;
+                    let _ = up_reset_tx.send(observed);
+                    std::future::pending::<Result<()>>().await
+                };
+                let healthy = async {
+                    let (request, mut response) = connection.accept().await.context("delivery healthy upstream request absent")??;
+                    assert_eq!(request.uri().path(), "/healthy-upstream");
+                    response.send_response(Response::new(()), true)?;
+                    while connection.accept().await.is_some() {}
+                    Ok::<_, anyhow::Error>(())
+                };
+                tokio::join!(work, healthy).1
+            });
+            let (up_sender, up_driver) = client::handshake(up_client).await?;
+            let mut up_keep_alive = up_sender.clone();
+            drivers.spawn(async move { up_driver.await.context("delivery upstream driver") });
+            let (down_client, down_server) = tokio::io::duplex(65536);
+            let downstream_core = core.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+            drivers.spawn(async move {
+                let mut connection = server::handshake::<_>(down_server).await?;
+                let (request, mut response) = connection.accept().await.context("delivery downstream request absent")??;
+                let work = async {
+                    assert_eq!(request.uri().path(), DELIVER);
+                    let caller = authenticate(&downstream_core, &request, 1)?;
+                    require_uncompressed(request.headers())?;
+                    let (parts, mut inbound) = request.into_parts();
+                    let (body, trailers) = unary_body(&mut inbound, BufferContext::standalone(downstream_core.clone())).await?;
+                    assert!(trailers.is_none());
+                    let frame = codec::decode_delivery_request(
+                        wire::DeliverExchangeUnitRequest::decode(single_message(&body)?)?,
+                        FieldPath::root("delivery_reset_downstream_request"))?;
+                    let scope = verified_delivery_scope(&downstream_core, &frame, caller, 1,
+                        response.stream_id().as_u32(), false)?;
+                    let mut sender = up_sender.ready().await?;
+                    let (reply, mut sending) = sender.send_request(Request::from_parts(parts, ()), false)?;
+                    sending.send_data(body, true)?;
+                    let _upstream_body = reply.await?.into_body();
+                    let mut output = match phase {
+                        GrantResetPhase::Headers(_) => None,
+                        GrantResetPhase::Body(_) => Some(response.send_response(Response::new(()), false)?),
+                    };
+                    let pending = if let Some(output) = output.as_mut() {
+                        recover_delivery_output_cancel(&downstream_core, scope,
+                            DeliveryResetHandle::Body(output), &mut sending).await
+                    } else {
+                        recover_delivery_output_cancel(&downstream_core, scope,
+                            DeliveryResetHandle::Headers(&mut response, &mut inbound), &mut sending).await
+                    };
+                    assert!(matches!(pending, DeliveryCancelProbe::Pending));
+                    assert_eq!(RootReplyFaultControl { core: downstream_core.clone() }.exchange_observation().peer_cancels, 0);
+                    let _ = ready_tx.send(());
+                    let actual = if let Some(output) = output.as_mut() {
+                        poll_fn(|cx| output.poll_reset(cx)).await?
+                    } else { poll_fn(|cx| response.poll_reset(cx)).await? };
+                    assert_eq!(actual, reason);
+                    let control = RootReplyFaultControl { core: downstream_core.clone() };
+                    match case {
+                        DeliveryResetCase::ChangedCapture => {
+                            control.release_exchange();
+                            control.begin_exchange_capture(ExchangeFaultAction::CutGrantSubscription,
+                                Instant::now() + Duration::from_secs(1))?;
+                        }
+                        DeliveryResetCase::Expired => {
+                            downstream_core.state.lock().unwrap().exchange.session_deadline = Some(Instant::now());
+                        }
+                        DeliveryResetCase::ReplacedPeer => {
+                            let mut state = downstream_core.state.lock().unwrap();
+                            state.exchange.peers.iter_mut().find(|(index, _, _)| *index == 1).unwrap().2 = BackendProcessId::new_v7();
+                        }
+                        DeliveryResetCase::Selected | DeliveryResetCase::SameStreamEnd |
+                        DeliveryResetCase::SameStreamSuccessor | DeliveryResetCase::Custody | DeliveryResetCase::Subscription | DeliveryResetCase::Unknown => {
+                            control.release_exchange();
+                            assert!(control.exchange_observation().released, "release is not a protected obligation receipt");
+                        }
+                        _ => {},
+                    }
+                    let result = match phase {
+                        GrantResetPhase::Headers(after_failed_headers) => {
+                            if after_failed_headers {
+                                assert!(response.send_response(Response::new(()), false).is_err());
+                            }
+                            delivery_response_headers(&downstream_core, scope, &mut response,
+                                &mut inbound, &mut sending, Response::new(()).into_parts().0).await.map(|output| output.is_none())
+                        }
+                        GrantResetPhase::Body(part) => {
+                            let part = match part {
+                                GrantBodyPart::Message => GrantOutput::Message(encoded(codec::encode_delivery_response(
+                                    frame.stream, frame.item.sequence(), DecodedExchangeDeliveryOutcome::Observed {
+                                        verdict: ExchangeAdmissionVerdict::Applied,
+                                        facts: novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeStreamFacts {
+                                            custody_through: frame.item.sequence().get(), ..Default::default() },
+                                    }))),
+                                GrantBodyPart::Trailers => {
+                                    let mut trailers = HeaderMap::new();
+                                    trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                                    GrantOutput::Trailers(trailers)
+                                }
+                                GrantBodyPart::End => GrantOutput::End,
+                            };
+                            forward_delivery_output(&downstream_core, scope, output.as_mut().unwrap(), &mut sending, part).await.map(|forwarded| !forwarded)
+                        }
+                    };
+                    let recovered = match result {
+                        Ok(recovered) => { assert!(recovered); true },
+                        Err(error) => {
+                            let diagnostic = error.downcast_ref::<DeliveryOutputFailure>().context("delivery output lost scope/reset diagnostic")?;
+                            assert!(!peer_cancel(&error), "the original outer catch cannot override a scoped delivery rejection");
+                            if matches!(phase, GrantResetPhase::Body(GrantBodyPart::Message)) {
+                                assert!(error.downcast_ref::<CapacityClosed>().is_some(),
+                                    "the real closed H2 output must retain its original capacity/reset cause");
+                            }
+                            assert_eq!(diagnostic.scope.stream, request_stream);
+                            assert_eq!(diagnostic.scope.item.sequence(), frame.item.sequence());
+                            assert_eq!(diagnostic.stage, match phase {
+                                GrantResetPhase::Headers(_) => "response-headers",
+                                GrantResetPhase::Body(GrantBodyPart::Message) => "send-message",
+                                GrantResetPhase::Body(GrantBodyPart::Trailers) => "send-trailers",
+                                GrantResetPhase::Body(GrantBodyPart::End) => "send-eof",
+                            });
+                            if reason == h2::Reason::CANCEL {
+                                assert!(matches!(diagnostic.reset, DeliveryCancelProbe::ReadyCancelRejected(_)));
+                            } else {
+                                assert!(matches!(diagnostic.reset, DeliveryCancelProbe::ReadyOther(actual) if actual == u32::from(reason)));
+                            }
+                            false
+                        }
+                    };
+                    let _ = outcome_tx.send(recovered);
+                    std::future::pending::<Result<()>>().await
+                };
+                let healthy = async {
+                    let (request, mut response) = connection.accept().await.context("delivery healthy downstream request absent")??;
+                    assert_eq!(request.uri().path(), "/healthy-next");
+                    response.send_response(Response::new(()), true)?;
+                    while connection.accept().await.is_some() {}
+                    Ok::<_, anyhow::Error>(())
+                };
+                tokio::join!(work, healthy).1
+            });
+            let (mut sender, driver) = client::handshake(down_client).await?;
+            drivers.spawn(async move { driver.await.context("delivery downstream driver") });
+            let request = signed_request(DELIVER, peers(selected)[0].1.clone(),
+                NativeProcessIdentity::Backend(request_stream.source().task().backend_process_id()))?;
+            let (reply, mut send) = sender.send_request(request, false)?;
+            send.send_data(request_body, true)?;
+            ready_rx.await?;
+            assert!(matches!(up_reset_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+            send.send_reset(reason);
+            assert_eq!(outcome_rx.await?, should_recover);
+            if should_recover { assert_eq!(up_reset_rx.await?, h2::Reason::CANCEL); }
+            else { assert!(matches!(up_reset_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty))); }
+            assert_eq!(control.exchange_observation().peer_cancels, u64::from(should_recover));
+            drop(reply); drop(send);
+            sender = sender.ready().await?;
+            let (next, next_send) = sender.send_request(Request::builder().uri("http://localhost/healthy-next").body(())?, true)?;
+            assert_eq!(next.await?.status(), http::StatusCode::OK);
+            up_keep_alive = up_keep_alive.ready().await?;
+            let (next_up, next_up_send) = up_keep_alive.send_request(Request::builder().uri("http://localhost/healthy-upstream").body(())?, true)?;
+            assert_eq!(next_up.await?.status(), http::StatusCode::OK);
+            drop(next_send); drop(next_up_send); drop(sender); drop(up_keep_alive);
+            Ok::<_, anyhow::Error>(())
+        }).await;
+        drivers.abort_all();
+        let mut cleanup_error = None;
+        while let Some(joined) = drivers.join_next().await {
+            let failure = match joined {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(error) if error.is_cancelled() => None,
+                Err(error) => Some(error.into()),
+            };
+            if cleanup_error.is_none() {
+                cleanup_error = failure;
+            }
+        }
+        result.context("delivery reset real H2 fixture deadline")??;
+        if let Some(error) = cleanup_error {
+            return Err(error);
+        }
+        assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_target_delivery_cancel_uses_real_header_and_body_handles_and_keeps_both_connections_healthy()
+    -> Result<()> {
+        for phase in [
+            GrantResetPhase::Headers(false),
+            GrantResetPhase::Headers(true),
+            GrantResetPhase::Body(GrantBodyPart::Message),
+            GrantResetPhase::Body(GrantBodyPart::Trailers),
+            GrantResetPhase::Body(GrantBodyPart::End),
+        ] {
+            delivery_reset_case(DeliveryResetCase::NonTarget, h2::Reason::CANCEL, phase).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delivery_cancel_cannot_discharge_selected_stream_custody_cut_or_unknown_scope_after_release()
+    -> Result<()> {
+        for case in [
+            DeliveryResetCase::Selected,
+            DeliveryResetCase::SameStreamEnd,
+            DeliveryResetCase::SameStreamSuccessor,
+            DeliveryResetCase::Custody,
+            DeliveryResetCase::Subscription,
+            DeliveryResetCase::Unknown,
+        ] {
+            delivery_reset_case(case, h2::Reason::CANCEL, GrantResetPhase::Headers(true)).await?;
+            delivery_reset_case(
+                case,
+                h2::Reason::CANCEL,
+                GrantResetPhase::Body(GrantBodyPart::Message),
+            )
+            .await?;
+            delivery_reset_case(
+                case,
+                h2::Reason::CANCEL,
+                GrantResetPhase::Body(GrantBodyPart::Trailers),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delivery_output_rechecks_original_scope_live_pair_and_actual_non_cancel_reason()
+    -> Result<()> {
+        for phase in [
+            GrantResetPhase::Headers(true),
+            GrantResetPhase::Body(GrantBodyPart::Trailers),
+        ] {
+            delivery_reset_case(
+                DeliveryResetCase::NonTarget,
+                h2::Reason::REFUSED_STREAM,
+                phase,
+            )
+            .await?;
+            for case in [
+                DeliveryResetCase::ChangedCapture,
+                DeliveryResetCase::Expired,
+                DeliveryResetCase::ReplacedPeer,
+            ] {
+                delivery_reset_case(case, h2::Reason::CANCEL, phase).await?;
+            }
+        }
+        Ok(())
     }
 }

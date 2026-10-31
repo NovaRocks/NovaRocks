@@ -1751,6 +1751,8 @@ async fn send_operations_in(
         Ok(result) => result.map(tonic::Response::into_inner).map_err(|status| {
             let outcome = classify_apply_status(&status);
             tracing::warn!(
+                method = ?method,
+                channel_slot = ?acquired.slot(),
                 code = ?status.code(),
                 detail = status.message(),
                 "task operation rpc failed"

@@ -402,7 +402,7 @@ impl QueryJob {
             .handle()
             .await_query_lifecycle_statement_observation(
                 &self.observation,
-                matches!(expected, Outcome::Rows),
+                matches!(expected, Outcome::Rows) && primary.is_ok(),
                 self.deadline,
             );
         cleanup = combine(cleanup, terminal.map(|_| ()));
