@@ -812,16 +812,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:function/function_round",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags)); terminal_round=read=AttemptFailed write=attempt failed contexts_established=true tasks_cr; owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:function/function_str_to_map",
       "failure": {
         "class": "error_code",
@@ -929,16 +919,6 @@
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/__struct_subfield/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 2; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
       "owner": "UEA-5E B7a",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-compatibility/spark_rest_minio_v3_mv_refresh",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged complete native case now reaches the LocalCompiler build-preserving hash join refusal, exact feature `build-preserving hash join kind (merged build match flags)` (reason 19:1, NodeId(2), pipeline_dop=5). This is the observed B3 join capability, not the old change-stream Router refusal. Public UnsupportedCompiledShape alone cannot establish this handoff: original target planning, exact Native Task/query/feature and the serial case correlation limits are retained in the linked mapping. Raw case remains FAIL at step 6; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B3",
       "expires": "2026-12-15"
     },
     {
@@ -1502,16 +1482,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:join/join_apply_to_join",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving nested-loop join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:join/join_bucket_shuffle_right_outer_equivalence",
       "failure": {
         "class": "error_code",
@@ -1542,16 +1512,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:join/join_eliminate_with_constant",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:join/join_fixed_size",
       "failure": {
         "class": "error_code",
@@ -1569,16 +1529,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/uuid/()->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
       "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_force_partition_hash",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
       "expires": "2026-12-15"
     },
     {
@@ -1652,16 +1602,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:join/join_null_aware_anti",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: nested-loop null-aware anti join with a predicate; owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:join/join_one_key",
       "failure": {
         "class": "error_code",
@@ -1679,26 +1619,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/uuid/()->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
       "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_predicate_expr_reuse",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving nested-loop join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_predicate_move_around",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving nested-loop join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
       "expires": "2026-12-15"
     },
     {
@@ -1732,36 +1652,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:join/join_self_join_nljoin",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving nested-loop join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_skew_v2",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_test_nest_loop_join",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving nested-loop join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:join/join_using_comprehensive",
       "failure": {
         "class": "error_code",
@@ -1773,16 +1663,6 @@
     },
     {
       "unit": "sql-case:join/join_with_using",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/push_topn_through_outer_join_result",
       "failure": {
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
@@ -2169,16 +2049,6 @@
       },
       "reason": "Decimal128(38,15) native IN-list source outside installed signed integer/Utf8 profile. Actual clean fffbffe8 step13; no executed independent oracle failed. B8 restores the original Decimal128 native IN-list profile, coordinating F3 helper ownership, then this entire unchanged case passes all original result/expected-error oracles; review any new first failure independently. Native b722 and TST-G9b1 c30 both refuse unchanged step 13; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
       "owner": "B8",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:decimal/test_decimal256_subquery_cte",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Observed on clean f1227548a4a8ca0cfbd000698f9d0e69e54f0395, step 7, substatement 1/1, sha256=704e614a0a5af704e90ea5b6b1020f44ebc2abc00460879efd41b850e393b1c9: build-preserving hash join requiring merged build match flags. No failed independent expectation. P00 same-statement detail plus current exact owner predicate identifies the capability; current sanitized message alone is not a recipe trace. Exit: B3 implements build-preserving hash join requiring merged build match flags; the original entire decimal/test_decimal256_subquery_cte native case passes with all required oracles, then remove this disposition. Unreached suffixes remain unverified until that run. Re-observed same exact statement and actual code on clean fffbffe8; no executed independent oracle failed and no secondary cleanup failure observed.",
-      "owner": "B3 join full-shape capability",
       "expires": "2026-12-15"
     },
     {
