@@ -154,6 +154,19 @@ mod owner_tests {
             self.registrations.lock().unwrap().push(registration);
             Ok(())
         }
+        fn register_with_close_observer(
+            &self,
+            registration: ExchangeReceiverRegistration,
+        ) -> Result<
+            crate::runtime::exchange::ExchangeReceiverCloseObserver,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
+            let observer = self
+                .delegate
+                .register_with_close_observer(registration.clone())?;
+            self.registrations.lock().unwrap().push(registration);
+            Ok(observer)
+        }
         fn push(
             &self,
             key: ExchangeReceiverKey,
