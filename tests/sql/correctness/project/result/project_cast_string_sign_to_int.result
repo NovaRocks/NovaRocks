@@ -1,39 +1,49 @@
 -- query 1
+-- types	tinyint
 CAST('-' AS TINYINT)
 NULL
 
 -- query 2
+-- types	smallint
 CAST('-' AS SMALLINT)
 NULL
 
 -- query 3
+-- types	integer
 CAST('-' AS INT)
 NULL
 
 -- query 4
+-- types	bigint
 CAST('-' AS BIGINT)
 NULL
 
 -- query 5
+-- types	varchar
 CAST('-' AS LARGEINT)
 NULL
 
 -- query 6
+-- types	tinyint
 CAST('+' AS TINYINT)
 NULL
 
 -- query 7
+-- types	smallint
 CAST('+' AS SMALLINT)
 NULL
 
 -- query 8
+-- types	integer
 CAST('+' AS INT)
 NULL
 
 -- query 9
+-- types	bigint
 CAST('+' AS BIGINT)
 NULL
 
 -- query 10
+-- types	varchar
 CAST('+' AS LARGEINT)
 NULL

@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	bigint	bigint
 l_shipmode	high_line_count	low_line_count
 MAIL	6328	9395
 REG AIR	6223	9349

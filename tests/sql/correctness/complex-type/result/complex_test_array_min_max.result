@@ -1,4 +1,5 @@
 -- query 4
+-- legacy
 id	result
 1	0
 2	NULL
@@ -13,6 +14,7 @@ id	result
 11	NULL
 
 -- query 5
+-- legacy
 id	result
 1	0
 3	0
@@ -26,6 +28,7 @@ id	result
 11	NULL
 
 -- query 7
+-- legacy
 id	result
 1	1
 2	3
@@ -40,6 +43,7 @@ id	result
 11	NULL
 
 -- query 8
+-- legacy
 id	result
 1	1
 2	3
@@ -54,6 +58,7 @@ id	result
 11	NULL
 
 -- query 10
+-- legacy
 id	result
 1	100
 2	400
@@ -68,6 +73,7 @@ id	result
 11	NULL
 
 -- query 11
+-- legacy
 id	result
 1	100
 2	400
@@ -82,6 +88,7 @@ id	result
 11	NULL
 
 -- query 13
+-- legacy
 id	result
 1	10
 2	40
@@ -96,6 +103,7 @@ id	result
 11	NULL
 
 -- query 14
+-- legacy
 id	result
 1	10
 2	40
@@ -110,6 +118,7 @@ id	result
 11	NULL
 
 -- query 16
+-- legacy
 id	result
 1	1000
 2	3000
@@ -124,6 +133,7 @@ id	result
 11	NULL
 
 -- query 17
+-- legacy
 id	result
 1	1000
 2	3000
@@ -138,6 +148,7 @@ id	result
 11	NULL
 
 -- query 19
+-- legacy
 id	result
 1	1234567890123456789
 2	987654321987654321
@@ -152,6 +163,7 @@ id	result
 11	NULL
 
 -- query 20
+-- legacy
 id	result
 1	1234567890123456789
 2	987654321987654321
@@ -166,6 +178,7 @@ id	result
 11	NULL
 
 -- query 22
+-- legacy
 id	result
 1	1.23
 2	1.23
@@ -180,6 +193,7 @@ id	result
 11	NULL
 
 -- query 23
+-- legacy
 id	result
 1	1.23
 2	1.23
@@ -194,6 +208,7 @@ id	result
 11	NULL
 
 -- query 25
+-- legacy
 id	result
 1	123.45
 2	234.56
@@ -208,6 +223,7 @@ id	result
 11	NULL
 
 -- query 26
+-- legacy
 id	result
 1	123.45
 2	234.56
@@ -222,6 +238,7 @@ id	result
 11	NULL
 
 -- query 28
+-- legacy
 id	result
 1	9876543.21
 2	34567890.12
@@ -236,6 +253,7 @@ id	result
 11	NULL
 
 -- query 29
+-- legacy
 id	result
 1	9876543.21
 2	34567890.12
@@ -250,6 +268,7 @@ id	result
 11	NULL
 
 -- query 31
+-- legacy
 id	result
 1	1234567890.1234567890
 2	2345678901.2345678901
@@ -264,6 +283,7 @@ id	result
 11	NULL
 
 -- query 32
+-- legacy
 id	result
 1	1234567890.1234567890
 2	2345678901.2345678901
@@ -278,6 +298,7 @@ id	result
 11	NULL
 
 -- query 34
+-- legacy
 id	result
 1	123.456
 2	123.456
@@ -292,6 +313,7 @@ id	result
 11	NULL
 
 -- query 35
+-- legacy
 id	result
 1	123.456
 2	123.456
@@ -306,6 +328,7 @@ id	result
 11	NULL
 
 -- query 37
+-- legacy
 id	result
 1	12345.67
 2	45678.12
@@ -320,6 +343,7 @@ id	result
 11	NULL
 
 -- query 38
+-- legacy
 id	result
 1	12345.67
 2	45678.12
@@ -334,6 +358,7 @@ id	result
 11	NULL
 
 -- query 40
+-- legacy
 id	result
 1	2025-01-01
 2	2024-12-30
@@ -348,6 +373,7 @@ id	result
 11	NULL
 
 -- query 41
+-- legacy
 id	result
 1	2025-01-01
 2	2024-12-30
@@ -362,6 +388,7 @@ id	result
 11	NULL
 
 -- query 43
+-- legacy
 id	result
 1	2025-01-01 12:00:00
 2	2024-12-30 12:00:00
@@ -376,6 +403,7 @@ id	result
 11	NULL
 
 -- query 44
+-- legacy
 id	result
 1	2025-01-01 12:00:00
 2	2024-12-30 12:00:00
@@ -390,6 +418,7 @@ id	result
 11	NULL
 
 -- query 46
+-- legacy
 id	result
 1	hello
 2	array
@@ -404,6 +433,7 @@ id	result
 11	NULL
 
 -- query 47
+-- legacy
 id	result
 1	hello
 2	array
@@ -418,6 +448,7 @@ id	result
 11	NULL
 
 -- query 49
+-- legacy
 id	result
 1	1
 2	NULL
@@ -432,6 +463,7 @@ id	result
 11	NULL
 
 -- query 50
+-- legacy
 id	result
 1	1
 3	1
@@ -445,6 +477,7 @@ id	result
 11	NULL
 
 -- query 52
+-- legacy
 id	result
 1	2
 2	5
@@ -459,6 +492,7 @@ id	result
 11	NULL
 
 -- query 53
+-- legacy
 id	result
 1	2
 2	5
@@ -473,6 +507,7 @@ id	result
 11	NULL
 
 -- query 55
+-- legacy
 id	result
 1	200
 2	500
@@ -487,6 +522,7 @@ id	result
 11	NULL
 
 -- query 56
+-- legacy
 id	result
 1	200
 2	500
@@ -501,6 +537,7 @@ id	result
 11	NULL
 
 -- query 58
+-- legacy
 id	result
 1	20
 2	50
@@ -515,6 +552,7 @@ id	result
 11	NULL
 
 -- query 59
+-- legacy
 id	result
 1	20
 2	50
@@ -529,6 +567,7 @@ id	result
 11	NULL
 
 -- query 61
+-- legacy
 id	result
 1	2000
 2	5000
@@ -543,6 +582,7 @@ id	result
 11	NULL
 
 -- query 62
+-- legacy
 id	result
 1	2000
 2	5000
@@ -557,6 +597,7 @@ id	result
 11	NULL
 
 -- query 64
+-- legacy
 id	result
 1	1234567890123456789
 2	987654321987654321
@@ -571,6 +612,7 @@ id	result
 11	NULL
 
 -- query 65
+-- legacy
 id	result
 1	1234567890123456789
 2	987654321987654321
@@ -585,6 +627,7 @@ id	result
 11	NULL
 
 -- query 67
+-- legacy
 id	result
 1	4.56
 2	2.34
@@ -599,6 +642,7 @@ id	result
 11	NULL
 
 -- query 68
+-- legacy
 id	result
 1	4.56
 2	2.34
@@ -613,6 +657,7 @@ id	result
 11	NULL
 
 -- query 70
+-- legacy
 id	result
 1	678.90
 2	345.67
@@ -627,6 +672,7 @@ id	result
 11	NULL
 
 -- query 71
+-- legacy
 id	result
 1	678.90
 2	345.67
@@ -641,6 +687,7 @@ id	result
 11	NULL
 
 -- query 73
+-- legacy
 id	result
 1	12345678.90
 2	56789012.34
@@ -655,6 +702,7 @@ id	result
 11	NULL
 
 -- query 74
+-- legacy
 id	result
 1	12345678.90
 2	56789012.34
@@ -669,6 +717,7 @@ id	result
 11	NULL
 
 -- query 76
+-- legacy
 id	result
 1	1234567890.1234567890
 2	2345678901.2345678901
@@ -683,6 +732,7 @@ id	result
 11	NULL
 
 -- query 77
+-- legacy
 id	result
 1	1234567890.1234567890
 2	2345678901.2345678901
@@ -697,6 +747,7 @@ id	result
 11	NULL
 
 -- query 79
+-- legacy
 id	result
 1	789.012
 2	234.567
@@ -711,6 +762,7 @@ id	result
 11	NULL
 
 -- query 80
+-- legacy
 id	result
 1	789.012
 2	234.567
@@ -725,6 +777,7 @@ id	result
 11	NULL
 
 -- query 82
+-- legacy
 id	result
 1	89012.34
 2	56789.01
@@ -739,6 +792,7 @@ id	result
 11	NULL
 
 -- query 83
+-- legacy
 id	result
 1	89012.34
 2	56789.01
@@ -753,6 +807,7 @@ id	result
 11	NULL
 
 -- query 85
+-- legacy
 id	result
 1	2025-01-02
 2	2024-12-31
@@ -767,6 +822,7 @@ id	result
 11	NULL
 
 -- query 86
+-- legacy
 id	result
 1	2025-01-02
 2	2024-12-31
@@ -781,6 +837,7 @@ id	result
 11	NULL
 
 -- query 88
+-- legacy
 id	result
 1	2025-01-02 14:00:00
 2	2024-12-31 23:59:59
@@ -795,6 +852,7 @@ id	result
 11	NULL
 
 -- query 89
+-- legacy
 id	result
 1	2025-01-02 14:00:00
 2	2024-12-31 23:59:59
@@ -809,6 +867,7 @@ id	result
 11	NULL
 
 -- query 91
+-- legacy
 id	result
 1	starrocks
 2	test

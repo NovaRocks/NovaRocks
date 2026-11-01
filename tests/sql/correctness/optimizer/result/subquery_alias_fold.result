@@ -1,4 +1,5 @@
 -- query 5
+-- types	varchar
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
@@ -24,6 +25,7 @@ PLAN FRAGMENT 1
            predicates: CAST(v AS Int64) > 10
 
 -- query 6
+-- types	varchar
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
@@ -49,12 +51,14 @@ PLAN FRAGMENT 1
            min-max stats
 
 -- query 7
+-- types	integer
 renamed_k
 1
 2
 3
 
 -- query 8
+-- types	varchar
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1

@@ -1,9 +1,11 @@
 -- query 2
+-- types	integer	bigint
 order_id	amount
 1	10
 2	20
 
 -- query 19
+-- types	integer	bigint
 order_id	amount
 1	10
 2	20

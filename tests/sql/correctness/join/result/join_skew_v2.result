@@ -1,4 +1,5 @@
 -- query 11
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -8,6 +9,7 @@ c_key	c_key
 6	3
 
 -- query 12
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -17,6 +19,7 @@ c_key	c_key
 6	3
 
 -- query 17
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -26,6 +29,7 @@ c_key	c_key
 6	3
 
 -- query 18
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -35,6 +39,7 @@ c_key	c_key
 6	3
 
 -- query 23
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -44,6 +49,7 @@ c_key	c_key
 6	3
 
 -- query 24
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -53,6 +59,7 @@ c_key	c_key
 6	3
 
 -- query 29
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -62,6 +69,7 @@ c_key	c_key
 6	3
 
 -- query 30
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -71,6 +79,7 @@ c_key	c_key
 6	3
 
 -- query 35
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -80,6 +89,7 @@ c_key	c_key
 6	3
 
 -- query 36
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -89,6 +99,7 @@ c_key	c_key
 6	3
 
 -- query 41
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -98,6 +109,7 @@ c_key	c_key
 6	3
 
 -- query 42
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -107,6 +119,7 @@ c_key	c_key
 6	3
 
 -- query 47
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -116,6 +129,7 @@ c_key	c_key
 6	3
 
 -- query 48
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -125,26 +139,32 @@ c_key	c_key
 6	3
 
 -- query 49
+-- types	integer	integer
 c_key	c_key
 1	1
 
 -- query 50
+-- types	integer	integer
 c_key	c_key
 1	1
 
 -- query 55
+-- types	bigint
 count(*)
 4
 
 -- query 56
+-- types	bigint
 count(*)
 4
 
 -- query 61
+-- types	integer	integer
 c_key	c_key
 1	1
 
 -- query 62
+-- types	integer	integer
 c_key	c_key
 1	1
 2	NULL
@@ -154,22 +174,26 @@ c_key	c_key
 6	NULL
 
 -- query 63
+-- types	integer	integer
 c_key	c_key
 NULL	2
 NULL	3
 1	1
 
 -- query 64
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
 
 -- query 65
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
 
 -- query 66
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -179,6 +203,7 @@ c_key	c_key
 6	3
 
 -- query 67
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -188,6 +213,7 @@ c_key	c_key
 6	3
 
 -- query 68
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -197,6 +223,7 @@ c_key	c_key
 6	3
 
 -- query 69
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -206,6 +233,7 @@ c_key	c_key
 6	3
 
 -- query 72
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -215,6 +243,7 @@ c_key	c_key
 6	3
 
 -- query 73
+-- types	integer	integer
 c_key	c_key
 1	1
 2	1
@@ -225,6 +254,7 @@ c_key	c_key
 7	NULL
 
 -- query 74
+-- types	integer	integer
 c_key	c_key
 NULL	4
 1	1
@@ -235,97 +265,121 @@ NULL	4
 6	3
 
 -- query 75
+-- types	bigint	bigint
 sum(t1.c_key)	c_bigint
 6	1
 
 -- query 76
+-- types	bigint	bigint
 sum(t2.c_key)	c_bigint
 10	NULL
 
 -- query 77
+-- types	bigint	bigint
 sum(t1.c_key)	c_bigint
 6	1
 
 -- query 78
+-- types	bigint	bigint
 sum(t1.c_key)	c_bigint
 21	NULL
 
 -- query 79
+-- types	bigint	bigint
 sum(t1.c_key)	c_bigint
 28	NULL
 
 -- query 86
+-- types	bigint
 count(1)
 8190
 
 -- query 87
+-- types	bigint
 count(1)
 8190
 
 -- query 88
+-- types	bigint
 count(1)
 8190
 
 -- query 89
+-- types	bigint
 count(1)
 132750
 
 -- query 90
+-- types	bigint
 count(1)
 8190
 
 -- query 91
+-- types	bigint
 count(1)
 8190
 
 -- query 92
+-- types	bigint
 count(1)
 16380
 
 -- query 93
+-- legacy
 count(1)
 8190
 
 -- query 94
+-- types	bigint
 count(1)
 16380
 
 -- query 95
+-- types	bigint
 count(1)
 16380
 
 -- query 96
+-- types	bigint
 count(1)
 16380
 
 -- query 115
+-- types	bigint
 count(*)
 74985
 
 -- query 116
+-- types	bigint
 count(*)
 74985
 
 -- query 118
+-- types	bigint
 count(*)
 74985
 
 -- query 121
+-- types	bigint
 count(*)
 74985
 
 -- query 124
+-- types	bigint
 count(*)
 74985
 
 -- query 137
+-- types	bigint
 count(*)
 20000
 
 -- query 138
+-- legacy
 count(*)
 21998
 
 -- query 153
+-- types	bigint
 count(*)
 22000

@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	decimal(38, 2)	decimal(38, 2)	decimal(38, 4)	decimal(38, 6)	decimal(38, 8)	decimal(38, 8)	decimal(38, 8)	bigint
 l_returnflag	l_linestatus	sum_qty	sum_base_price	sum_disc_price	sum_charge	avg_qty	avg_price	avg_disc	count_order
 A	F	37734107.00	56586554400.73	53758257134.8700	55909065222.827692	25.52200585	38273.12973462	0.04998530	1478493
 N	F	991417.00	1487504710.38	1413082168.0541	1469649223.194375	25.51647192	38284.46776085	0.05009343	38854

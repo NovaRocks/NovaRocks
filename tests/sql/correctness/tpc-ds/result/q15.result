@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	decimal(38, 2)
 ca_zip	sum(cs_sales_price)
 NULL	4723.12
 30059	688.80

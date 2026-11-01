@@ -1,9 +1,11 @@
 -- query 14
+-- types	varchar	bigint
 region	total
 east	30
 west	7
 
 -- query 18
+-- types	varchar	bigint
 region	rows_in
 east	2
 west	1

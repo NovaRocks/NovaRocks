@@ -1,2 +1,3 @@
 -- query 2
+-- types	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar
 Name	Database	StorageEngine	RefreshMode	LastRefreshTime	LastRefreshRows	BaseTables	SelectText	Dependencies	RefreshPaused	NextRefreshTime	LastSchedulerError	MaxStalenessMs	RefreshState	RetryAfterTime	Manageability

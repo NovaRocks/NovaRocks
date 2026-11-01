@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	integer	bigint
 p_brand	p_type	p_size	supplier_cnt
 Brand#45	MEDIUM BRUSHED BRASS	31	32
 Brand#34	STANDARD BURNISHED NICKEL	43	28

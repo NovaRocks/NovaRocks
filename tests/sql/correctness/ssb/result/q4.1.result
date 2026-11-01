@@ -1,3 +1,5 @@
+-- query 1
+-- types	integer	varchar	bigint
 d_year	c_nation	profit
 1992	ARGENTINA	9671947837
 1992	BRAZIL	9241877689

@@ -78,10 +78,10 @@ impl ResultHandoffControl {
     pub(crate) async fn before_protocol(
         &self,
         actual: StatementToken,
-        nominated: Option<(String, StatementToken, u32)>,
+        nominated: Option<(String, StatementToken)>,
         failure: Option<ResultFailureView>,
     ) -> Result<(), String> {
-        let Some((run_token, nominated, connection_id)) = nominated else {
+        let Some((run_token, nominated)) = nominated else {
             return Ok(());
         };
         if run_token != self.run_token {
@@ -144,9 +144,8 @@ impl ResultHandoffControl {
         state.hit = true;
         drop(state);
         eprintln!(
-            "NOVAROCKS_RESULT_HANDOFF_TERMINAL_OBSERVED token={} statement={}:{}:{}",
+            "NOVAROCKS_RESULT_HANDOFF_TERMINAL_OBSERVED token={} statement={}:{}",
             self.run_token.escape_default(),
-            connection_id,
             actual.session().key().get(),
             actual.generation()
         );
@@ -272,8 +271,8 @@ mod tests {
             9,
         )
     }
-    fn nomination(actual: StatementToken) -> Option<(String, StatementToken, u32)> {
-        Some(("selected".into(), actual, 7))
+    fn nomination(actual: StatementToken) -> Option<(String, StatementToken)> {
+        Some(("selected".into(), actual))
     }
     fn pending<F: Future>(future: std::pin::Pin<&mut F>) {
         assert!(matches!(
@@ -389,7 +388,7 @@ mod tests {
         let actual = statement();
         control.before_protocol(actual, None, None).await.unwrap();
         control
-            .before_protocol(actual, Some(("another-run".into(), actual, 7)), None)
+            .before_protocol(actual, Some(("another-run".into(), actual)), None)
             .await
             .unwrap();
         let foreign = StatementToken::new(actual.session(), actual.generation() + 1);

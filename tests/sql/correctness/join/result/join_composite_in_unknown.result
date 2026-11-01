@@ -1,20 +1,25 @@
 -- query 1
+-- legacy
 unknown_pair	definite_mismatch
 NULL	0
 
 -- query 2
+-- legacy
 match_wins	not_match_wins
 1	0
 
 -- query 3
+-- legacy
 outer_null
 NULL
 
 -- query 4
+-- legacy
 empty_in	empty_not_in
 0	1
 
 -- query 5
+-- legacy
 pk	member	nonmember
 1	NULL	NULL
 1	NULL	NULL
@@ -23,47 +28,58 @@ pk	member	nonmember
 4	NULL	NULL
 
 -- query 6
+-- legacy
 unknown_pair	definite_mismatch
 NULL	0
 
 -- query 7
+-- legacy
 unknown_pair	definite_mismatch
 NULL	0
 
 -- query 8
+-- legacy
 unknown_pair	match
 NULL	1
 
 -- query 9
+-- legacy
 text_differs
 0
 
 -- query 10
+-- legacy
 pk
 2
 3
 
 -- query 11
+-- legacy
 unknown_pair	definite_mismatch
 NULL	0
 
 -- query 12
+-- legacy
 x	n
 1	2
 
 -- query 13
+-- legacy
 x	membership
 1	1
 2	0
 
 -- query 14
+-- legacy
 x	n
 1	2
 
 -- query 15
+-- legacy
 membership
 1
 
 -- query 16
+-- legacy
 n
 2

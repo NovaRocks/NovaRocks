@@ -94,6 +94,7 @@ impl Scenario for TrinoInterop {
                     "novarocks/native-adapter/**",
                     "novarocks/connector/iceberg/**",
                     "novarocks-server/**",
+                    "tests/trino-client/**",
                     "tests/cluster-harness/**",
                     "tests/test-support/**",
                     "novarocks/failpoint/**",

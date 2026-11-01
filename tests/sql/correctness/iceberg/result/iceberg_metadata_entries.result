@@ -1,11 +1,14 @@
 -- query 5
+-- types	boolean
 has_entries
-1
+true
 
 -- query 6
+-- types	boolean
 has_seq
-1
+true
 
 -- query 7
+-- types	boolean
 has_added
-1
+true

@@ -1,11 +1,14 @@
 -- query 3
+-- types	bigint	bigint	varchar
 id	amount	name
 200	200	keep
 
 -- query 5
+-- types	bigint	bigint	varchar
 id	amount	name
 200	200	keep
 
 -- query 7
+-- types	bigint	bigint	varchar
 id	amount	name
 200	200	keep

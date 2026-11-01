@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	boolean	decimal(38, 2)	decimal(38, 2)	decimal(38, 2)
 channel	id	sales	returns	profit
 NULL	NULL	13343451.50	687196.48	-4060382.36
 catalog channel	NULL	4456215.06	230287.89	-614823.52

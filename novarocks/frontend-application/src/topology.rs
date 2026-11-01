@@ -112,9 +112,52 @@ impl BackendIslandSnapshot {
     }
 }
 
+/// One backend's read-only runtime facts, shared by SQL and management projection.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct BackendTopologyRow {
+    pub process_id: String,
+    pub endpoint: String,
+    pub lease_valid: bool,
+    pub identity_verified: bool,
+    pub reported_state: String,
+    pub compatible: bool,
+    pub endpoint_owned: bool,
+    pub eligible: bool,
+    pub scheduled_fragments: u64,
+    pub last_announce_ms: i64,
+    pub last_heartbeat_ms: i64,
+    pub build_identity: String,
+    pub native_compatibility_id: String,
+    pub diagnostic_status: String,
+    pub status_detail: String,
+}
+
+impl BackendTopologyRow {
+    fn into_show_backends_row(self) -> Vec<String> {
+        vec![
+            self.process_id,
+            self.endpoint,
+            self.lease_valid.to_string(),
+            self.identity_verified.to_string(),
+            self.reported_state,
+            self.compatible.to_string(),
+            self.endpoint_owned.to_string(),
+            self.eligible.to_string(),
+            self.scheduled_fragments.to_string(),
+            self.last_announce_ms.to_string(),
+            self.last_heartbeat_ms.to_string(),
+            self.build_identity,
+            self.native_compatibility_id,
+            self.diagnostic_status,
+            self.status_detail,
+        ]
+    }
+}
+
 /// Read-only topology capability used only by the Frontend management surface.
 pub trait BackendIslandSnapshotReader: Send + Sync {
     fn backend_island_snapshot(&self) -> BackendIslandSnapshot;
+    fn backend_rows(&self) -> Result<Vec<BackendTopologyRow>, String>;
 }
 
 /// Starts management observability with the Server-materialized local identity,
@@ -152,6 +195,15 @@ impl BackendIslandSnapshotReader for LateBoundBackendIslandSnapshotReader {
             .expect("frontend island reader lock poisoned")
             .as_ref()
             .map_or(self.starting, |reader| reader.backend_island_snapshot())
+    }
+
+    fn backend_rows(&self) -> Result<Vec<BackendTopologyRow>, String> {
+        self.reader
+            .read()
+            .map_err(|_| "frontend island reader lock poisoned".to_string())?
+            .as_ref()
+            .ok_or_else(|| "frontend topology reader is not installed".to_string())?
+            .backend_rows()
     }
 }
 
@@ -766,13 +818,7 @@ impl ClusterBackendService {
 
     fn refresh_expired_announce_leases(&self, now: std::time::Instant) -> bool {
         let mut state = self.state.lock().unwrap();
-        let before = revision_members(&state);
-        for facts in state.processes.values_mut() {
-            if facts.announce_lease_valid && facts.announce_lease_expires_at <= now {
-                facts.announce_lease_valid = false;
-            }
-        }
-        let changed = advance_if_membership_changed(&mut state, before).unwrap_or(false);
+        let changed = expire_announce_leases(&mut state, now);
         drop(state);
         if changed {
             self.publish_snapshot();
@@ -793,6 +839,47 @@ impl ClusterBackendService {
             });
         }
         BackendTopologySnapshot::try_new(state.revision, live_targets(&state))
+    }
+
+    /// Refreshes leases and captures all row fields from one topology observation.
+    pub fn backend_rows(&self) -> Result<Vec<BackendTopologyRow>, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "lock frontend topology failed".to_string())?;
+        let changed = expire_announce_leases(&mut state, std::time::Instant::now());
+        let rows = state
+            .processes
+            .iter()
+            .map(|(process_id, facts)| {
+                let endpoint = facts.descriptor.endpoint();
+                BackendTopologyRow {
+                    process_id: process_id.to_string(),
+                    endpoint: format!("{}:{}", endpoint.host(), endpoint.port()),
+                    lease_valid: facts.announce_lease_valid,
+                    identity_verified: facts.exact_identity_verified,
+                    reported_state: format!("{:?}", facts.reported_state),
+                    compatible: facts.compatibility.is_compatible(),
+                    endpoint_owned: facts.endpoint_owned,
+                    eligible: facts.eligible(),
+                    scheduled_fragments: facts.scheduled_fragments,
+                    last_announce_ms: facts.last_announce_ms,
+                    last_heartbeat_ms: facts.last_heartbeat_ms,
+                    build_identity: facts.descriptor.build_identity().to_string(),
+                    native_compatibility_id: facts.descriptor.native_compatibility_id().to_string(),
+                    diagnostic_status: diagnostic_status(facts),
+                    status_detail: facts
+                        .last_err
+                        .clone()
+                        .unwrap_or_else(|| facts.compatibility.detail().to_string()),
+                }
+            })
+            .collect();
+        drop(state);
+        if changed {
+            self.publish_snapshot();
+        }
+        Ok(rows)
     }
 
     fn island_snapshot_inner(&self) -> BackendIslandSnapshot {
@@ -823,6 +910,10 @@ impl BackendIslandSnapshotReader for ClusterBackendService {
     fn backend_island_snapshot(&self) -> BackendIslandSnapshot {
         self.refresh_expired_announce_leases(std::time::Instant::now());
         self.island_snapshot_inner()
+    }
+
+    fn backend_rows(&self) -> Result<Vec<BackendTopologyRow>, String> {
+        ClusterBackendService::backend_rows(self)
     }
 }
 
@@ -949,11 +1040,6 @@ impl BackendTopologyPort for ClusterBackendService {
 
 impl BackendTopologyCommandPort for ClusterBackendService {
     fn show_backends(&self) -> Result<QueryResult, String> {
-        self.refresh_expired_announce_leases(std::time::Instant::now());
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| "lock frontend topology failed".to_string())?;
         let names = [
             "ProcessId",
             "Endpoint",
@@ -971,32 +1057,10 @@ impl BackendTopologyCommandPort for ClusterBackendService {
             "DiagnosticStatus",
             "StatusDetail",
         ];
-        let mut columns = vec![Vec::new(); names.len()];
-        for (process_id, facts) in &state.processes {
-            let endpoint = facts.descriptor.endpoint();
-            columns[0].push(process_id.to_string());
-            columns[1].push(format!("{}:{}", endpoint.host(), endpoint.port()));
-            columns[2].push(facts.announce_lease_valid.to_string());
-            columns[3].push(facts.exact_identity_verified.to_string());
-            columns[4].push(format!("{:?}", facts.reported_state));
-            columns[5].push(facts.compatibility.is_compatible().to_string());
-            columns[6].push(facts.endpoint_owned.to_string());
-            columns[7].push(facts.eligible().to_string());
-            columns[8].push(facts.scheduled_fragments.to_string());
-            columns[9].push(facts.last_announce_ms.to_string());
-            columns[10].push(facts.last_heartbeat_ms.to_string());
-            columns[11].push(facts.descriptor.build_identity().to_string());
-            columns[12].push(facts.descriptor.native_compatibility_id().to_string());
-            columns[13].push(diagnostic_status(facts));
-            columns[14].push(
-                facts
-                    .last_err
-                    .clone()
-                    .unwrap_or_else(|| facts.compatibility.detail().to_string()),
-            );
-        }
-        let rows = (0..state.processes.len())
-            .map(|row| columns.iter().map(|column| column[row].clone()).collect())
+        let rows = self
+            .backend_rows()?
+            .into_iter()
+            .map(BackendTopologyRow::into_show_backends_row)
             .collect();
         build_utf8_query_result(&names, rows)
             .map_err(|error| format!("build SHOW BACKENDS result failed: {error}"))
@@ -1115,6 +1179,16 @@ fn live_targets(state: &TopologyState) -> Vec<LiveBackendTarget> {
         })
         .collect()
 }
+fn expire_announce_leases(state: &mut TopologyState, now: std::time::Instant) -> bool {
+    let before = revision_members(state);
+    for facts in state.processes.values_mut() {
+        if facts.announce_lease_valid && facts.announce_lease_expires_at <= now {
+            facts.announce_lease_valid = false;
+        }
+    }
+    advance_if_membership_changed(state, before).unwrap_or(false)
+}
+
 fn metrics_snapshot(state: &TopologyState) -> BackendTopologyMetricsSnapshot {
     let mut metrics = BackendTopologyMetricsSnapshot {
         entries: state.processes.len(),
@@ -1864,6 +1938,122 @@ mod tests {
         assert_eq!(
             retired_row.status_detail, REFUSED_RETIRED_HEARTBEAT,
             "the refusal stays where it explains something: on the process it was aimed at"
+        );
+    }
+
+    #[test]
+    fn backend_rows_preserve_show_backends_names_order_and_text() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let announced = descriptor("127.0.0.1:9070".parse().unwrap());
+        service
+            .record_announce(announced.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &announced);
+        let rows = service.backend_rows().expect("typed topology rows");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        let result = service.show_backends().expect("SHOW BACKENDS projection");
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name())
+                .collect::<Vec<_>>(),
+            vec![
+                "ProcessId",
+                "Endpoint",
+                "LeaseValid",
+                "IdentityVerified",
+                "ReportedState",
+                "Compatible",
+                "EndpointOwned",
+                "Eligible",
+                "ScheduledFragments",
+                "LastAnnounceAt",
+                "LastHeartbeatAt",
+                "BuildIdentity",
+                "NativeCompatibilityId",
+                "DiagnosticStatus",
+                "StatusDetail",
+            ]
+        );
+        let expected = vec![
+            announced.process_id().to_string(),
+            "127.0.0.1:9070".to_string(),
+            "true".to_string(),
+            "true".to_string(),
+            "Running".to_string(),
+            "true".to_string(),
+            "true".to_string(),
+            "true".to_string(),
+            "0".to_string(),
+            row.last_announce_ms.to_string(),
+            "1".to_string(),
+            "fixture-build".to_string(),
+            "71".repeat(32),
+            "Live".to_string(),
+            String::new(),
+        ];
+        assert!(row.last_announce_ms > 0);
+        let projected = result.batches[0]
+            .columns()
+            .iter()
+            .map(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("SHOW BACKENDS Utf8 column")
+                    .value(0)
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(projected, expected);
+        let json = serde_json::to_value(row).expect("serialize typed row");
+        assert_eq!(json["lease_valid"], true);
+        assert_eq!(json["identity_verified"], true);
+        assert_eq!(json["eligible"], true);
+        assert_eq!(json["scheduled_fragments"], 0);
+        assert_eq!(json["last_heartbeat_ms"], 1);
+    }
+
+    #[test]
+    fn backend_rows_refresh_expired_leases_without_losing_process_facts() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let announced = descriptor("127.0.0.1:9070".parse().unwrap());
+        service
+            .record_announce(announced.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &announced);
+        service
+            .state
+            .lock()
+            .unwrap()
+            .processes
+            .get_mut(&announced.process_id())
+            .unwrap()
+            .announce_lease_expires_at = std::time::Instant::now();
+        let rows = service.backend_rows().expect("expired topology row");
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].lease_valid);
+        assert!(!rows[0].eligible);
+        assert!(rows[0].identity_verified);
+        assert_eq!(rows[0].process_id, announced.process_id().to_string());
+        assert_eq!(rows[0].last_heartbeat_ms, 1);
+    }
+
+    #[test]
+    fn backend_rows_are_unavailable_until_topology_owner_is_installed() {
+        let reader = super::LateBoundBackendIslandSnapshotReader::new(
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+        );
+        assert!(reader.backend_rows().unwrap_err().contains("not installed"));
+        let service = Arc::new(ClusterBackendService::new_transient_for_test(1));
+        reader.install(service).expect("install topology reader");
+        assert!(
+            reader
+                .backend_rows()
+                .expect("installed topology")
+                .is_empty()
         );
     }
 

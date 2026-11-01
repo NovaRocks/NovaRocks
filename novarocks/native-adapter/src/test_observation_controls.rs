@@ -843,7 +843,6 @@ mod tests {
                 target_session_id: self.role.scope().session_id().into(),
                 statement_run_token: run_token.into(),
                 frontend_process_id: self.role.scope().process().process_id(),
-                connection_id: 7,
                 session_key: 1,
                 statement_generation: generation,
             }
@@ -859,7 +858,6 @@ mod tests {
                 target_launch_id: self.role.scope().launch_id().into(),
                 statement_run_token: nomination.statement_run_token.clone(),
                 frontend_process_id: nomination.frontend_process_id.clone(),
-                connection_id: nomination.connection_id,
                 session_key: nomination.session_key,
                 sql_sha256: Sha256::digest(sql.as_bytes()).into(),
             }
@@ -1400,13 +1398,19 @@ mod tests {
         assert!(session.role.scope().observations().is_empty());
         let mut replacements = vec![session.nomination("statement-run", 2), a.clone(), a.clone()];
         replacements[1].session_key = 2;
-        replacements[2].connection_id = 8;
-        for b in replacements {
-            assert!(
+        replacements[2].frontend_process_id =
+            novarocks_types::FrontendProcessId::new_v7().to_string();
+        let expected_errors = [
+            "Native nominated statement generation replacement refused",
+            "Native original statement input replacement refused",
+            "Native nomination belongs to another FE session",
+        ];
+        for (b, expected_error) in replacements.into_iter().zip(expected_errors) {
+            assert_eq!(
                 controls
                     .nominate_statement(&session.input(&b, "SELECT 1"), &b)
-                    .unwrap_err()
-                    .contains("replacement")
+                    .unwrap_err(),
+                expected_error
             );
             assert!(
                 controls
@@ -1477,10 +1481,6 @@ mod tests {
         for changed in [
             replacement_input.clone(),
             different_sql.clone(),
-            StatementInputNomination {
-                connection_id: 8,
-                ..input.clone()
-            },
             StatementInputNomination {
                 target_launch_id: "another-launch".into(),
                 ..input.clone()

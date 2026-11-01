@@ -103,10 +103,10 @@ from ${case_db}.t1
 order by k1;
 
 -- query 8
-select k1, c_tinyint * 0, c_int * 0, c_bigint * 0, c_largeint * 0 from ${case_db}.t1 order by k1;
+select k1, c_tinyint * 0, c_int * 0, c_bigint * 0, CAST(c_largeint * 0 AS VARCHAR) AS `c_largeint * 0` from ${case_db}.t1 order by k1;
 
 -- query 9
-select k1, c_tinyint * 1, c_int * 1, c_bigint * 1, c_largeint * 1 from ${case_db}.t1 order by k1;
+select k1, c_tinyint * 1, c_int * 1, c_bigint * 1, CAST(c_largeint * 1 AS VARCHAR) AS `c_largeint * 1` from ${case_db}.t1 order by k1;
 
 -- query 10
 select k1, cast(c_tinyint * 0 as decimal(38, 0)), cast(c_int * 0 as decimal(38, 0)), cast(c_bigint * 0 as decimal(38, 0)), cast(c_largeint * 0 as decimal(38, 0)) from ${case_db}.t1 order by k1;

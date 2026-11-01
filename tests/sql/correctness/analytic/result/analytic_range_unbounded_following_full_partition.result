@@ -1,3 +1,5 @@
+-- query 3
+-- types	varchar	integer	integer	bigint	bigint
 grp	ord_key	v	cnt_all_non_null	sum_all
 A	1	10	3	60
 A	2	20	3	60

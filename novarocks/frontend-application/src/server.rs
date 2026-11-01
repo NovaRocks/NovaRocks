@@ -366,9 +366,18 @@ async fn build_frontend_role_products(
     {
         // Retain the same actual session owner used by QueryControlService.
         // Each arm snapshots its token once; replacement never refreshes it.
+        let observer = Arc::downgrade(owner);
+        query_application_control
+            .install_client_statement_observer(Arc::new(move |query, session| {
+                if let Some(observer) = observer.upgrade() {
+                    observer.on_client_statement_session_registered(query, session);
+                }
+            }))
+            .map_err(FrontendApplicationError::server)?;
+        let session_control = query_application_control.clone();
         owner
             .install_session_resolver(Arc::new(move |connection_id| {
-                query_application_control.current_session_for_test_controls(connection_id)
+                session_control.current_session_for_test_controls(connection_id)
             }))
             .map_err(FrontendApplicationError::server)?;
     }
@@ -2447,7 +2456,8 @@ mod tests {
                 .arm(
                     crate::preparation_diagnostics::StatementObservationArmRequest {
                         run_token: token.to_owned(),
-                        connection_id,
+                        connection_id: Some(connection_id),
+                        client_query_id: None,
                         sql_sha256: hex::encode(Sha256::digest(sql.as_bytes())),
                     },
                 )

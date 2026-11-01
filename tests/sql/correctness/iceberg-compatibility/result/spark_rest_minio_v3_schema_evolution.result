@@ -1,3 +1,5 @@
+-- query 2
+-- types	bigint	varchar	varchar	integer
 id	label	category	metric
 1	before-a	NULL	10
 2	before-b	NULL	20

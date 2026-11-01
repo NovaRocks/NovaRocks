@@ -1,3 +1,5 @@
+-- query 2
+-- types	bigint	varchar	integer
 id	label	metric
 1	base-a	10
 2	updated-b	120

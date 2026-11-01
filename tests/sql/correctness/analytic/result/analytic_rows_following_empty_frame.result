@@ -1,3 +1,5 @@
+-- query 3
+-- types	varchar	integer	integer	bigint	bigint
 grp	ts	v	sum_follow	cnt_follow
 A	1	10	40	1
 A	2	20	40	1

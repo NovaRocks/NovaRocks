@@ -114,15 +114,9 @@ impl NamespaceGuard {
         guard.deadline = deadline;
         guard
     }
-    pub fn connection_context(&self, base: &ConnectionConfig) -> ConnectionConfig {
-        ConnectionConfig {
-            catalog: self.catalog.clone(),
-            db: self.namespace.clone(),
-            ..base.clone()
-        }
-    }
-    pub fn set_database(&mut self, value: &str) {
-        self.namespace = Some(value.to_string());
+    pub fn set_session_context(&mut self, catalog: Option<String>, schema: Option<String>) {
+        self.catalog = catalog;
+        self.namespace = schema;
     }
     fn catalog_fact(&self, name: &str) -> Result<Option<Catalog>> {
         Ok(self
@@ -459,11 +453,12 @@ mod tests {
             Some(&storage),
             CatalogFacts::default(),
             &ConnectionConfig {
-                mysql: "mysql".into(),
+                time_zone: "Asia/Shanghai".into(),
+
                 host: "127.0.0.1".into(),
                 port: "0".into(),
                 user: "root".into(),
-                password: None,
+
                 catalog: Some("catalog".into()),
                 db: None,
             },

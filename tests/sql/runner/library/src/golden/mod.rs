@@ -15,5 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! SQL client uses the neutral socket deadline owner.
-pub(crate) use novarocks_test_support::SocketDeadlineOwner;
+//! Canonical, typed SQL expectations and their temporary migration blocks.
+// Design: ADR-0210 (docs/adr/ADR-0210-sql-golden-is-canonical-rendering-of-typed-trino-results.md)
+mod cell;
+mod grammar;
+mod java_float;
+mod trino_type;
+
+pub use cell::{parse_cell, parse_text, render_cell, render_text};
+pub use grammar::{Block, GoldenFile, Section};
+pub use trino_type::parse_type;
+
+#[cfg(test)]
+mod tests;
+
+pub mod legacy;
+
+pub mod execution;
+pub mod migration;

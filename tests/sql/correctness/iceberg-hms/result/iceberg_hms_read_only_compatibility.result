@@ -1,53 +1,64 @@
 -- query 3
+-- types	bigint	integer
 id	p
 1	1
 2	2
 3	1
 
 -- query 4
+-- types	bigint	integer
 id	p
 2	2
 3	1
 
 -- query 5
+-- types	bigint	integer
 id	p
 2	2
 3	1
 
 -- query 6
+-- types	bigint
 snapshots
 2
 
 -- query 7
+-- types	integer	bigint
 content	files
 0	1
 1	1
 
 -- query 8
+-- types	integer	bigint
 content	files
 0	2
 1	1
 
 -- query 9
+-- types	bigint	integer
 id	p
 2	2
 3	1
 
 -- query 10
+-- types	bigint	integer
 id	p
 2	2
 3	1
 
 -- query 12
+-- types	bigint	integer
 id	p
 1	1
 2	2
 3	1
 
 -- query 56
+-- types	bigint	integer
 id	p
 2	2
 3	1
 
 -- query 57
+-- types	varchar
 TABLE_NAME

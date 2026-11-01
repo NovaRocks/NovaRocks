@@ -1,917 +1,1125 @@
 -- query 4
+-- types	bigint	bigint
 count(DISTINCT c5)	c2
 1250	3
 
 -- query 5
+-- types	bigint	bigint
 count(DISTINCT c5)	count((c3 + c1) + 3)
 1250	1250
 
 -- query 6
+-- types	bigint	bigint
 count(DISTINCT c0, c5)	sum(c3)
 1250	5000
 
 -- query 7
+-- types	bigint	double
 count(DISTINCT c1, c2, c3)	avg(c3)
-1	4
+1	4.0
 
 -- query 8
+-- legacy
 count(DISTINCT c0)	bitmap_union_count(to_bitmap(c0 + c3))
 1246	1246
 
 -- query 9
+-- types	bigint	bigint
 sum(DISTINCT c3)	c2
 4	3
 
 -- query 10
+-- types	bigint	bigint
 sum(DISTINCT c0)	c2
 6867924984	3
 
 -- query 11
+-- types	bigint	bigint
 sum(DISTINCT c0)	approx_count_distinct(c3)
 6867924984	1
 
 -- query 12
+-- types	bigint	bigint
 sum(DISTINCT c0)	approx_count_distinct(c3)
 6867924984	1
 
 -- query 13
+-- types	bigint	bigint
 count(DISTINCT c5)	max(c2)
 1250	3
 
 -- query 14
+-- types	bigint	bigint
 count(DISTINCT c5)	count((c3 + c1) + 3)
 1250	1250
 
 -- query 15
+-- types	bigint	bigint
 count(DISTINCT c0, c5)	sum(c3)
 1250	5000
 
 -- query 16
+-- types	bigint	double
 count(DISTINCT c1, c2, c3)	avg(c3)
-1	4
+1	4.0
 
 -- query 17
+-- legacy
 count(DISTINCT c0)	bitmap_union_count(to_bitmap(c0 + c3))
 1246	1246
 
 -- query 18
+-- types	bigint	double
 sum(DISTINCT c3)	avg(c2)
-4	3
+4	3.0
 
 -- query 19
+-- types	bigint	bigint
 sum(DISTINCT c0)	min(c2)
 6867924984	3
 
 -- query 20
+-- types	bigint	bigint
 sum(DISTINCT c0)	approx_count_distinct(c3)
 6867924984	1
 
 -- query 21
+-- types	bigint	bigint
 sum(DISTINCT c0)	approx_count_distinct(c3)
 6867924984	1
 
 -- query 22
+-- types	bigint	bigint
 count(DISTINCT c5)	max(c2)
 1250	3
 
 -- query 23
+-- types	bigint	bigint
 count(DISTINCT c5)	count((c3 + c1) + 3)
 1250	1250
 
 -- query 24
+-- types	bigint	bigint
 count(DISTINCT c0, c5)	sum(c3)
 1250	5000
 
 -- query 25
+-- types	bigint	double
 count(DISTINCT c1, c2, c3)	avg(c3)
-1	4
+1	4.0
 
 -- query 26
+-- legacy
 count(DISTINCT c0)	bitmap_union_count(to_bitmap(c0 + c3))
 1246	1246
 
 -- query 27
+-- types	bigint	double
 sum(DISTINCT c3)	avg(c2)
-4	3
+4	3.0
 
 -- query 28
+-- types	bigint	bigint
 sum(DISTINCT c0)	min(c2)
 6867924984	3
 
 -- query 29
+-- types	bigint	bigint
 sum(DISTINCT c0)	approx_count_distinct(c3)
 6867924984	1
 
 -- query 30
+-- types	bigint	bigint
 sum(DISTINCT c0)	approx_count_distinct(c3)
 6867924984	1
 
 -- query 31
+-- types	double	bigint
 avg(DISTINCT c1)	count(c2)
-2	1250
+2.0	1250
 
 -- query 32
+-- types	double	bigint
 avg(DISTINCT c1)	count(c2)
-2	1250
+2.0	1250
 
 -- query 33
+-- types	double	bigint
 avg(DISTINCT c1)	count(c2)
-2	1250
+2.0	1250
 
 -- query 34
+-- legacy
 fingerprint
 -5714598445053
 
 -- query 35
+-- legacy
 fingerprint
 -5714598445053
 
 -- query 36
+-- legacy
 fingerprint
 -5714598445053
 
 -- query 37
+-- legacy
 fingerprint
 -5714598445053
 
 -- query 38
+-- legacy
 fingerprint
 -12031151387514
 
 -- query 39
+-- legacy
 fingerprint
 -12031151387514
 
 -- query 40
+-- legacy
 fingerprint
 -12031151387514
 
 -- query 41
+-- legacy
 fingerprint
 -12031151387514
 
 -- query 42
+-- legacy
 array_length(array_agg(a1))	cnt
 1	1
 
 -- query 43
+-- legacy
 array_length(array_agg(a1))	cnt
 1	1
 
 -- query 44
+-- legacy
 cnt
 1
 
 -- query 45
+-- legacy
 cnt
 1
 
 -- query 46
+-- types	bigint
 count(DISTINCT c1, c2)
 1
 
 -- query 47
+-- types	bigint
 count(DISTINCT c1, c2, c3)
 1
 
 -- query 48
+-- types	bigint	bigint	bigint
 count(DISTINCT c1, c2)	count(DISTINCT c2, c3)	sum(c2)
 1	1	3750
 
 -- query 49
+-- types	bigint	bigint	bigint
 count(DISTINCT c1, c2, c3)	count(DISTINCT c2, c3)	sum(c2)
 1	1	3750
 
 -- query 50
+-- types	bigint	bigint
 count(DISTINCT t1.c1, if(c3 IS NULL, 1, 0))	sum(c2 + (if(c3 IS NULL, 1, 0)))
 1	5000
 
 -- query 53
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 54
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 55
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 56
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 57
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 58
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 59
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 60
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 3A	[4]	630
 3A	[4]	630
 
 -- query 61
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT 1 SEPARATOR ',')	array_agg(DISTINCT 2)	sum(c3)
 1	[2]	5000
 1	[2]	5000
 1	[2]	5000
 
 -- query 62
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 63
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 64
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 65
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 3	[3]	1	5000
 3	[3]	1	5000
 
 -- query 68
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 69
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 70
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 71
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 72
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 73
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 74
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 75
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 3A	[4]	630
 3A	[4]	630
 
 -- query 76
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT 1 SEPARATOR ',')	array_agg(DISTINCT 2)	sum(c3)
 1	[2]	5000
 1	[2]	5000
 1	[2]	5000
 
 -- query 77
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 78
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 79
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 80
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 3	[3]	1	5000
 3	[3]	1	5000
 
 -- query 83
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 84
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 85
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 86
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 87
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 88
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 89
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 90
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 3A	[4]	630
 3A	[4]	630
 
 -- query 91
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT 1 SEPARATOR ',')	array_agg(DISTINCT 2)	sum(c3)
 1	[2]	5000
 1	[2]	5000
 1	[2]	5000
 
 -- query 92
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 93
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 94
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 95
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 3	[3]	1	5000
 3	[3]	1	5000
 
 -- query 98
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 99
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 100
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 101
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 102
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 103
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 104
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 105
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 3A	[4]	630
 3A	[4]	630
 
 -- query 106
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT 1 SEPARATOR ',')	array_agg(DISTINCT 2)	sum(c3)
 1	[2]	5000
 1	[2]	5000
 1	[2]	5000
 
 -- query 107
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 108
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 109
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 110
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 3	[3]	1	5000
 3	[3]	1	5000
 
 -- query 111
+-- types	array(bigint)	bigint	bigint
 array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 [3]	1	5000
 [3]	1	5000
 [3]	1	5000
 
 -- query 114
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 115
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 116
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 117
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 118
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 119
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 120
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 121
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 3A	[4]	630
 3A	[4]	630
 
 -- query 122
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 123
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 124
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 125
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 3	[3]	1	5000
 3	[3]	1	5000
 
 -- query 128
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 129
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 130
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 131
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 132
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 133
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 134
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 135
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 3A	[4]	630
 3A	[4]	630
 
 -- query 136
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 137
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 138
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 139
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 3	[3]	1	5000
 3	[3]	1	5000
 
 -- query 142
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 143
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 144
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 145
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 146
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 147
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 148
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 149
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 3A	[4]	630
 3A	[4]	630
 
 -- query 150
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 151
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 152
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 153
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 3	[3]	1	5000
 3	[3]	1	5000
 
 -- query 156
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 157
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 158
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 159
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 160
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 161
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 162
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 163
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 3A	[4]	630
 3A	[4]	630
 
 -- query 164
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 165
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 166
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 167
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 3	[3]	1	5000
 3	[3]	1	5000
 
 -- query 168
+-- types	array(bigint)	bigint	bigint
 array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 [3]	1	5000
 [3]	1	5000
 [3]	1	5000
 
 -- query 171
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 172
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 173
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 174
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 175
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 176
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 177
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 178
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 3A	[4]	630
 3A	[4]	630
 
 -- query 179
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 180
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 181
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 182
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 3	[3]	1	5000
 3	[3]	1	5000
 
 -- query 185
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 186
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 187
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 188
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 189
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 190
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 191
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 192
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 3A	[4]	630
 3A	[4]	630
 
 -- query 193
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 194
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 195
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 196
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 3	[3]	1	5000
 3	[3]	1	5000
 
 -- query 199
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 200
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 201
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 202
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 203
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 204
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 205
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 206
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 3A	[4]	630
 3A	[4]	630
 
 -- query 207
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 208
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 209
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 210
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 3	[3]	1	5000
 3	[3]	1	5000
 
 -- query 213
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 214
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 215
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 216
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 3A	[4,4,4,4,4,4,4,4,4,4]	11
 
 -- query 217
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 218
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 219
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 
 -- query 220
+-- types	varchar	array(bigint)	bigint
 group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
 3A	[4]	630
 3A	[4]	630
 3A	[4]	630
 
 -- query 221
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 222
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 223
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 
 -- query 224
+-- types	varchar	array(bigint)	bigint	bigint
 group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 3	[3]	1	5000
 3	[3]	1	5000
 3	[3]	1	5000
 
 -- query 225
+-- types	array(bigint)	bigint	bigint
 array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
 [3]	1	5000
 [3]	1	5000
 [3]	1	5000
 
 -- query 227
+-- types	bigint	bigint	varchar
 count(c2)	count(DISTINCT c3)	a
 1562500	1	a
 
 -- query 228
+-- types	bigint	varchar
 count(c2)	a
 1562500	a
 
 -- query 229
+-- types	bigint	bigint	varchar
 sum(c2)	count(DISTINCT c3)	a
 4687500	1	a
 
 -- query 230
+-- types	bigint	varchar
 sum(c2)	a
 4687500	a
 
 -- query 232
+-- types	bigint	bigint	varchar
 count(c2)	count(DISTINCT c3)	a
 1562500	1	a
 
 -- query 233
+-- types	bigint	varchar
 count(c2)	a
 1562500	a
 
 -- query 234
+-- types	bigint	bigint	varchar
 sum(c2)	count(DISTINCT c3)	a
 4687500	1	a
 
 -- query 235
+-- types	bigint	varchar
 sum(c2)	a
 4687500	a
 
 -- query 237
+-- types	bigint	bigint
 sum(c0)	count(DISTINCT c2, c3)
 480816	1
 
 -- query 238
+-- types	bigint	bigint	bigint	varchar	bigint
 count(DISTINCT 1, 2)	count(DISTINCT 1)	count(DISTINCT NULL)	group_concat(DISTINCT 'a','b' SEPARATOR ',')	count(DISTINCT c2)
 1	1	0	ab	1

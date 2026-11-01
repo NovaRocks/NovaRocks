@@ -83,7 +83,7 @@ fn variant_producer_command() -> Result<Regex> {
 // refer to a declaration from the same source; they never mint another scope.
 fn hms_producer_command() -> Result<Regex> {
     Ok(Regex::new(
-        r#"^\s*python3\s+"\$\{NOVAROCKS_WORKSPACE_ROOT:-\.\}/tests/sql/fixtures/iceberg-hms/fixture\.py"\s+(prepare|before|after|cleanup)\s+([A-Za-z0-9_${}]+)\s*$"#,
+        r#"^\s*python3\s+"\$\{NOVAROCKS_WORKSPACE_ROOT:-\.\}/tests/sql/fixtures/iceberg-hms/fixture\.py"\s+(prepare|verify-prepared|before|after|cleanup)\s+([A-Za-z0-9_${}]+)(?:\s+--receipt\s+.+)?\s*$"#,
     )?)
 }
 fn trino_producer_command() -> Result<Regex> {
@@ -135,9 +135,17 @@ pub(crate) fn namespace_declarations(source: &str) -> Result<BTreeSet<String>> {
     Ok(declared)
 }
 impl RunNames {
+    #[cfg(test)]
     pub fn prepare(
         run: &RunBudget,
         suites: &BTreeMap<String, Vec<std::path::PathBuf>>,
+    ) -> Result<Self> {
+        Self::prepare_with_case_inputs(run, suites, &BTreeSet::new())
+    }
+    pub fn prepare_with_case_inputs(
+        run: &RunBudget,
+        suites: &BTreeMap<String, Vec<std::path::PathBuf>>,
+        case_inputs: &BTreeSet<(String, String)>,
     ) -> Result<Self> {
         ensure!(
             suites.len() <= CAPACITY,
@@ -159,7 +167,10 @@ impl RunNames {
                     "ambiguous SQL case identity {suite}/{case}"
                 );
                 let source = std::fs::read_to_string(file)?;
-                let declared = namespace_declarations(&source)?;
+                let mut declared = namespace_declarations(&source)?;
+                if case_inputs.contains(&(suite.clone(), case.to_string())) {
+                    crate::hms_case_input::add_recipe_names(&source, &mut declared)?;
+                }
                 if let Some(projection) = metadata_projection(&source) {
                     let columns = metadata_columns(&source);
                     let duplicate_data_column = projection.split(',').any(|part| {
@@ -238,6 +249,7 @@ impl RunNames {
         suites: &BTreeMap<String, SuiteConfig>,
     ) -> Result<()> {
         let mut rendered = Vec::new();
+        let mut deferred_hms_catalog_uses = Vec::new();
         let machine = config
             .values
             .get("fixture_env_file")
@@ -250,7 +262,13 @@ impl RunNames {
             .transpose()?
             .unwrap_or(false);
         let hms = hms_producer_command()?;
+        let input_meta = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$")?;
+        let input_marker = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$")?;
         for (suite, files) in sources {
+            if machine && suites[suite].manifest.case_input.is_some() {
+                self.hms_warehouses
+                    .insert(suite.clone(), format!("{}/hms", self.scope));
+            }
             if machine {
                 for file in files {
                     let source = std::fs::read_to_string(file)?;
@@ -284,10 +302,29 @@ impl RunNames {
                     .and_then(|v| v.to_str())
                     .context("invalid case identity")?;
                 let variables = crate::config::case_placeholder_variables(&variables, case)?;
-                rendered.push(render_expected(&std::fs::read_to_string(file)?, &variables));
+                if suites[suite].manifest.case_input.is_some() {
+                    ensure!(
+                        suite == crate::hms_case_input::SUITE
+                            && case == crate::hms_case_input::CASE,
+                        "HMS declaration projection escaped its closed unit"
+                    );
+                    let definition =
+                        crate::hms_case_input::Definition::load(file, &input_meta, &input_marker)?;
+                    let projection = definition.catalog_definition_projection()?;
+                    deferred_hms_catalog_uses.push(projection.referenced_catalog(&variables)?);
+                    rendered.push(render_expected(projection.source(), &variables));
+                } else {
+                    rendered.push(render_expected(&std::fs::read_to_string(file)?, &variables));
+                }
             }
         }
         self.catalogs = crate::catalog_symbol::CatalogSymbols::seal(&self.run_id, &rendered)?;
+        for catalog in deferred_hms_catalog_uses {
+            ensure!(
+                self.catalogs.lookup(&catalog).is_some(),
+                "HMS deferred q12 catalog must be owned by its actual q2 declaration"
+            );
+        }
         Ok(())
     }
     pub fn extend_suite_variables(
@@ -626,7 +663,7 @@ pub(crate) fn rewrite_namespaces(
     result.push_str(&rewrite_sql_identifiers(&sql, &mapping));
     result = rewrite_delta_namespace_refs(&result, &mapping)?;
     let mut shell = false;
-    let families: Vec<_> = source
+    let mut families: Vec<_> = source
         .lines()
         .filter_map(|line| {
             shell_line(line, &mut shell)
@@ -635,6 +672,32 @@ pub(crate) fn rewrite_namespaces(
                 .map(|capture| capture[2].to_string())
         })
         .collect();
+    // The fixed manifest recipe declares this family. A verifier command by
+    // itself is still read-only and never grants producer ownership.
+    if variables
+        .get("__hms_case_input_kind")
+        .is_some_and(|kind| kind == crate::hms_case_input::KIND)
+    {
+        ensure!(
+            variables
+                .get("case_id")
+                .is_some_and(|case| case == crate::hms_case_input::CASE),
+            "HMS URI family recipe escaped its closed case"
+        );
+        let original_family = format!(
+            "iru7_{}",
+            variables
+                .get("uuid0")
+                .context("HMS URI family omitted original UUID")?
+        );
+        ensure!(
+            mapping.contains_key(&original_family),
+            "HMS URI family has no original namespace mapping"
+        );
+        if !families.contains(&original_family) {
+            families.push(original_family);
+        }
+    }
     if !families.is_empty()
         && let Some(warehouse) = variables.get("iceberg_hms_warehouse")
     {
@@ -768,7 +831,25 @@ pub(crate) fn namespace_mapping(
         }
     }
     let mut mapping = BTreeMap::new();
-    for name in namespace_declarations(source)? {
+    let mut declared = namespace_declarations(source)?;
+    if variables
+        .get("__hms_case_input_kind")
+        .is_some_and(|v| v == crate::hms_case_input::KIND)
+    {
+        ensure!(
+            case == crate::hms_case_input::CASE,
+            "HMS input namespace recipe escaped its case"
+        );
+        crate::hms_case_input::add_recipe_names(source, &mut declared)?;
+    }
+    if let Some(bound) = crate::hms_case_input::bound_namespace_mapping(variables)? {
+        ensure!(
+            declared == bound.keys().cloned().collect::<BTreeSet<_>>(),
+            "HMS bound namespace declarations differ from original registration"
+        );
+        return Ok(bound);
+    }
+    for name in declared {
         if name.starts_with(&format!("{run}_")) {
             ensure!(name.len() <= 63, "owned SQL namespace exceeds 63 bytes");
             continue;
@@ -823,18 +904,153 @@ pub(crate) fn rewrite_metadata_filters(sql: &str, mapping: &BTreeMap<String, Str
     })
     .into_owned()
 }
+/// Typed files have already expanded placeholders before canonical validation.
+/// Legacy binding keeps its old flattened owner. Typed metadata waits for the
+/// actual statement/result pairing; the whole step cannot identify its author.
 pub(crate) fn render_expected_result(
     sql: &str,
     result: &mut crate::types::ResultSet,
     variables: &HashMap<String, String>,
     mapping: &BTreeMap<String, String>,
 ) -> Result<()> {
-    for cell in result
-        .header
-        .iter_mut()
-        .chain(result.rows.iter_mut().flatten())
+    use crate::golden::Block;
+    let Some(mut golden) = result.golden.clone() else {
+        return render_expected_flat(sql, result, variables, mapping, true);
+    };
+    for block in &mut golden.expanded.blocks {
+        match block {
+            Block::Legacy { names, rows } => {
+                let mut flat = crate::types::ResultSet {
+                    golden: None,
+                    header: names
+                        .iter()
+                        .map(|cell| crate::results::unescape_cell(cell))
+                        .collect(),
+                    rows: rows
+                        .iter()
+                        .map(|row| {
+                            row.iter()
+                                .map(|cell| crate::results::unescape_cell(cell))
+                                .collect()
+                        })
+                        .collect(),
+                };
+                render_expected_flat(sql, &mut flat, variables, mapping, false)?;
+                *names = flat
+                    .header
+                    .iter()
+                    .map(|cell| crate::results::escape_cell(cell))
+                    .collect();
+                *rows = flat
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|cell| crate::results::escape_cell(cell))
+                            .collect()
+                    })
+                    .collect();
+            }
+            Block::Typed { .. } | Block::Shell { .. } => {}
+        }
+    }
+    commit_expanded_golden(result, golden)
+}
+
+/// Bind typed metadata using the exact submitted statement paired with each
+/// row-bearing result. Legacy blocks have already followed their old owner.
+pub(crate) fn render_expected_for_execution(
+    _sql: &str,
+    result: &mut crate::types::ResultSet,
+    variables: &HashMap<String, String>,
+    mapping: &BTreeMap<String, String>,
+    statements: &[String],
+) -> Result<()> {
+    use crate::golden::{Block, parse_cell, parse_type, render_cell};
+    use novarocks_test_trino_client::TrinoValue;
+    let Some(mut golden) = result.golden.clone() else {
+        return Ok(());
+    };
+    if !golden
+        .expanded
+        .blocks
+        .iter()
+        .any(|block| matches!(block, Block::Typed { .. }))
     {
-        *cell = render_expected(cell, variables);
+        return Ok(());
+    }
+    anyhow::ensure!(
+        golden.expanded.blocks.len() == statements.len(),
+        "ambiguous typed metadata binding: {} expected blocks differ from {} actual result statements",
+        golden.expanded.blocks.len(),
+        statements.len()
+    );
+    for (block, statement) in golden.expanded.blocks.iter_mut().zip(statements) {
+        let Block::Typed { types, names, rows } = block else {
+            continue;
+        };
+        let signatures = types
+            .iter()
+            .map(|ty| parse_type(ty))
+            .collect::<Result<Vec<_>>>()?;
+        let mut contents = rows.clone();
+        for row in &mut contents {
+            for (cell, sig) in row.iter_mut().zip(&signatures) {
+                if let TrinoValue::Text(value) = parse_cell(sig, cell)? {
+                    *cell = value;
+                }
+            }
+        }
+        let mut flat = crate::types::ResultSet {
+            golden: None,
+            header: names.clone(),
+            rows: contents,
+        };
+        render_expected_flat(statement, &mut flat, variables, mapping, false)?;
+        for (original, content) in rows.iter_mut().zip(flat.rows) {
+            for ((cell, text), sig) in original.iter_mut().zip(content).zip(&signatures) {
+                // The flat sentinel "NULL" cannot establish string ownership.
+                // Only an original text value may accept a metadata rewrite.
+                if matches!(parse_cell(sig, cell)?, TrinoValue::Text(_)) {
+                    *cell = render_cell(sig, &TrinoValue::Text(text))?;
+                }
+            }
+        }
+        *names = flat.header;
+    }
+    commit_expanded_golden(result, golden)
+}
+
+fn commit_expanded_golden(
+    result: &mut crate::types::ResultSet,
+    golden: crate::types::GoldenSection,
+) -> Result<()> {
+    crate::golden::GoldenFile {
+        sections: vec![golden.expanded.clone()],
+    }
+    .render()?;
+    let projected = crate::results::project_golden_blocks(&golden.expanded.blocks)?;
+    result.header = projected.header;
+    result.rows = projected.rows;
+    result.golden = Some(golden);
+    Ok(())
+}
+
+fn render_expected_flat(
+    sql: &str,
+    result: &mut crate::types::ResultSet,
+    variables: &HashMap<String, String>,
+    mapping: &BTreeMap<String, String>,
+    expand: bool,
+) -> Result<()> {
+    if expand {
+        for cell in result
+            .header
+            .iter_mut()
+            .chain(result.rows.iter_mut().flatten())
+        {
+            *cell = render_expected(cell, variables);
+        }
     }
     let columns = metadata_columns(sql);
     let upper = sql.trim().to_ascii_uppercase();
@@ -1155,6 +1371,135 @@ pub(crate) fn test_variables(cases: &[&str]) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn typed_expected(source: &str) -> crate::types::ResultSet {
+        let section = crate::golden::GoldenFile::parse(source)
+            .unwrap()
+            .sections
+            .remove(0);
+        let mut result = crate::results::project_golden_blocks(&section.blocks).unwrap();
+        result.golden = Some(crate::types::GoldenSection {
+            source: section.clone(),
+            expanded: section,
+        });
+        result
+    }
+
+    #[test]
+    fn typed_metadata_retains_sql_null_and_rewrites_only_the_string_null() {
+        let mut result =
+            typed_expected("-- query 1\n-- types\tvarchar\nDatabase\nNULL\n\"NULL\"\n");
+        let source = result.golden.as_ref().unwrap().source.clone();
+        let mapping = BTreeMap::from([("NULL".into(), "owned_namespace".into())]);
+        render_expected_result("SHOW DATABASES", &mut result, &HashMap::new(), &mapping).unwrap();
+        assert_eq!(result.golden.as_ref().unwrap().expanded, source);
+        render_expected_for_execution(
+            "SHOW DATABASES",
+            &mut result,
+            &HashMap::new(),
+            &mapping,
+            &["SHOW DATABASES".into()],
+        )
+        .unwrap();
+        let golden = result.golden.unwrap();
+        assert_eq!(golden.source, source);
+        let crate::golden::Block::Typed { rows, .. } = &golden.expanded.blocks[0] else {
+            panic!("typed expected")
+        };
+        assert_eq!(
+            rows,
+            &[
+                vec!["NULL".to_string()],
+                vec!["owned_namespace".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_metadata_uses_each_exact_result_statement_owner() {
+        let sql = "SHOW DATABASES; SELECT 'logical_db' AS Database;";
+        let mut result = typed_expected(
+            "-- query 1\n-- types\tvarchar\nDatabase\nlogical_db\n-- types\tvarchar\nDatabase\nlogical_db\n",
+        );
+        let source = result.golden.as_ref().unwrap().source.clone();
+        let mapping = BTreeMap::from([("logical_db".into(), "owned_namespace".into())]);
+        render_expected_result(sql, &mut result, &HashMap::new(), &mapping).unwrap();
+        assert_eq!(result.golden.as_ref().unwrap().expanded, source);
+        render_expected_for_execution(
+            sql,
+            &mut result,
+            &HashMap::new(),
+            &mapping,
+            &[
+                "SHOW DATABASES".into(),
+                "SELECT 'logical_db' AS Database".into(),
+            ],
+        )
+        .unwrap();
+        let golden = result.golden.unwrap();
+        assert_eq!(golden.source, source);
+        let crate::golden::Block::Typed { rows: metadata, .. } = &golden.expanded.blocks[0] else {
+            panic!("typed expected")
+        };
+        let crate::golden::Block::Typed { rows: literal, .. } = &golden.expanded.blocks[1] else {
+            panic!("typed expected")
+        };
+        assert_eq!(metadata, &[vec!["owned_namespace".to_string()]]);
+        assert_eq!(literal, &[vec!["logical_db".to_string()]]);
+    }
+
+    #[test]
+    fn typed_metadata_rejects_ambiguous_result_binding_without_mutation() {
+        let mut result = typed_expected("-- query 1\n-- types\tvarchar\nv\nx\n");
+        let before = result.clone();
+        let error = render_expected_for_execution(
+            "SELECT 1",
+            &mut result,
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous typed metadata binding")
+        );
+        assert_eq!(result, before);
+    }
+
+    #[test]
+    fn runtime_typed_binding_does_not_bind_legacy_metadata_twice() {
+        let sql = "SHOW DATABASES; SELECT 'logical_db' AS Database;";
+        let mut result = typed_expected(
+            "-- query 1\n-- legacy\nDatabase\nlogical_db\n-- types\tvarchar\nDatabase\nlogical_db\n",
+        );
+        let mapping = BTreeMap::from([
+            ("logical_db".into(), "owned_namespace".into()),
+            ("owned_namespace".into(), "wrong_second_binding".into()),
+        ]);
+        render_expected_result(sql, &mut result, &HashMap::new(), &mapping).unwrap();
+        render_expected_for_execution(
+            sql,
+            &mut result,
+            &HashMap::new(),
+            &mapping,
+            &[
+                "SHOW DATABASES".into(),
+                "SELECT 'logical_db' AS Database".into(),
+            ],
+        )
+        .unwrap();
+        let golden = result.golden.unwrap();
+        let crate::golden::Block::Legacy { rows: legacy, .. } = &golden.expanded.blocks[0] else {
+            panic!("legacy expected")
+        };
+        let crate::golden::Block::Typed { rows: typed, .. } = &golden.expanded.blocks[1] else {
+            panic!("typed expected")
+        };
+        assert_eq!(legacy, &[vec!["owned_namespace".to_string()]]);
+        assert_eq!(typed, &[vec!["logical_db".to_string()]]);
+    }
+
     #[test]
     fn native_mv_management_status_cases_use_the_owned_namespace() {
         for (case, source, catalog) in [
@@ -1289,6 +1634,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn closed_hms_input_keeps_add_files_family_without_promoting_a_verifier() {
+        let mut vars = crate::config::case_placeholder_variables(
+            &test_variables(&[crate::hms_case_input::CASE]),
+            crate::hms_case_input::CASE,
+        )
+        .unwrap();
+        vars.insert(
+            "iceberg_hms_warehouse".into(),
+            "s3://novarocks/unit/hms".into(),
+        );
+        let base = format!("iru7_{}", vars["uuid0"]);
+        let original_uri = format!("s3://novarocks/unit/hms/iru7/{base}/v1/data");
+        let source = format!(
+            r#"-- query 1
+shell: python3 "${{NOVAROCKS_WORKSPACE_ROOT:-.}}/tests/sql/fixtures/iceberg-hms/fixture.py" verify-prepared {base} --receipt 'not-executed'
+-- query 2
+ALTER TABLE c.{base}.v2 ADD FILES FROM '{original_uri}';
+SELECT '{original_uri}';
+"#
+        );
+        assert!(namespace_declarations(&source).unwrap().is_empty());
+        assert_eq!(rewrite_namespaces(&source, &vars).unwrap(), source);
+        vars.insert(
+            "__hms_case_input_kind".into(),
+            crate::hms_case_input::KIND.into(),
+        );
+        let mapping = namespace_mapping(&source, &vars).unwrap();
+        let rewritten = rewrite_namespaces(&source, &vars).unwrap();
+        assert!(rewritten.contains(&format!(
+            "verify-prepared {} --receipt 'not-executed' --new-namespace {}",
+            mapping[&base],
+            mapping[&format!("{base}_new")]
+        )));
+        assert!(rewritten.contains(&format!(
+            "ADD FILES FROM 's3://novarocks/unit/hms/iru7/{}/v1/data'",
+            mapping[&base]
+        )));
+        assert!(
+            rewritten.contains(&format!("SELECT '{original_uri}';")),
+            "ordinary strings must remain unchanged"
+        );
+    }
     #[test]
     fn exact_hms_pair_and_trino_writer_bind_references_without_new_observer_ownership() {
         let mut vars =
@@ -1658,6 +2046,7 @@ print(json.dumps({'complete':True,'catalog_barrier':{context['identity']['run_id
         assert!(rewritten.contains(&format!("catalog.{expected};")));
         assert!(rewritten.contains("SELECT DATABASE(), raw_namespace FROM t"));
         let mut result = crate::types::ResultSet {
+            golden: None,
             header: vec!["schema_name".into(), "value".into()],
             rows: vec![vec!["raw_namespace".into(), "raw_namespace".into()]],
         };
@@ -1706,6 +2095,7 @@ print(json.dumps({'complete':True,'catalog_barrier':{context['identity']['run_id
             "SELECT 'old_ns' FROM ordinary WHERE schema_name = 'old_ns'"
         );
         let mut result = crate::types::ResultSet {
+            golden: None,
             header: vec!["schema_name".into(), "data_value".into()],
             rows: vec![vec!["old_ns".into(), "old_ns".into()]],
         };

@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::results::parse_output;
 use crate::types::QueryExecution;
 use std::process::Command;
 use std::time::Instant;
@@ -87,8 +86,34 @@ pub(crate) fn execute_shell_step_with_group_observation(
         storage,
         false,
         None,
-        Some((work_deadline, complete_deadline)),
+        Some(GroupObservation::Lifetime(work_deadline, complete_deadline)),
     )
+}
+
+/// D21 only: preserve the original shell clock while observing its actual group.
+pub(crate) fn execute_hms_shell_step_observed(
+    sql: &str,
+    deadline: Instant,
+    context: Option<&str>,
+    storage: Option<&str>,
+    cleanup: bool,
+    writer_exit: &std::sync::atomic::AtomicBool,
+) -> (ShellExecution, bool) {
+    execute_shell_step_core(
+        sql,
+        Some(deadline),
+        context,
+        storage,
+        cleanup,
+        Some(writer_exit),
+        Some(GroupObservation::Until(deadline)),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum GroupObservation {
+    Lifetime(Instant, Instant),
+    Until(Instant),
 }
 
 fn execute_shell_step_core(
@@ -98,9 +123,11 @@ fn execute_shell_step_core(
     storage: Option<&str>,
     cleanup: bool,
     writer_exit: Option<&std::sync::atomic::AtomicBool>,
-    lifetime: Option<(Instant, Instant)>,
+    observation: Option<GroupObservation>,
 ) -> (ShellExecution, bool) {
     let mut group_exit_observed = false;
+    let mut hms_host_control_confirmed = false;
+    let require_group = matches!(observation, Some(GroupObservation::Until(_)));
     let result = (|| -> ShellExecution {
         let Some(deadline) = deadline else {
             return execute_shell_step(sql);
@@ -125,8 +152,14 @@ fn execute_shell_step_core(
                 Err(error) => return (false, None, format!("prepare shell output: {error}")),
             };
             let mut command = novarocks_test_support::ManagedCommand::new("sh");
-            if let Some((work, complete)) = lifetime {
-                command.terminate_at(work, complete);
+            match observation {
+                Some(GroupObservation::Lifetime(work, complete)) => {
+                    command.terminate_at(work, complete);
+                }
+                Some(GroupObservation::Until(complete)) => {
+                    command.observe_group_exit_until(complete);
+                }
+                None => {}
             }
             command.arg("-c").arg(
                 sql.trim_start()
@@ -172,6 +205,12 @@ fn execute_shell_step_core(
                     group_exit_observed = outcome.group_exit_observed();
                     let timed_out = outcome.timed_out || Instant::now() >= deadline;
                     let failures = &outcome.failures;
+                    if require_group {
+                        hms_host_control_confirmed = group_exit_observed
+                            && !timed_out
+                            && failures.is_empty()
+                            && Instant::now() < deadline;
+                    }
                     // A failed producer may have reported an unknown remote writer
                     // outcome even after its host CLI exited. Keep files until its
                     // original owner can supply a successful completion fact.
@@ -181,6 +220,21 @@ fn execute_shell_step_core(
                         observed.store(false, std::sync::atomic::Ordering::Release);
                     }
                     let result = render_command_output(&outcome.output, started.elapsed());
+                    if require_group && !hms_host_control_confirmed {
+                        if let Some(observed) = writer_exit {
+                            observed.store(false, std::sync::atomic::Ordering::Release);
+                        }
+                        let path = directory.keep();
+                        return (
+                            false,
+                            result.1,
+                            format!(
+                                "HMS shell timely host completion unconfirmed (actual_group_exit={group_exit_observed}, capture_timeout={timed_out}); original result: {}; actual output retained at {}",
+                                result.2,
+                                path.display()
+                            ),
+                        );
+                    }
                     if timed_out || Instant::now() >= deadline || !failures.is_empty() {
                         let path = directory.keep();
                         return (
@@ -230,7 +284,14 @@ fn execute_shell_step_core(
             }
         }
     })();
-    (result, group_exit_observed)
+    (
+        result,
+        if require_group {
+            hms_host_control_confirmed
+        } else {
+            group_exit_observed
+        },
+    )
 }
 
 fn render_command_output(
@@ -240,17 +301,23 @@ fn render_command_output(
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let stdout_trimmed = stdout.trim_end_matches('\n');
-    let text = if stdout_trimmed.is_empty() {
+    let text = if stdout.is_empty() {
         code.to_string()
     } else {
-        format!("{code}\n{stdout_trimmed}")
+        format!("{code}\n{stdout}")
     };
-    let (header, rows) = parse_output(&text);
+    let block = crate::golden::execution::shell_block(&text);
+    let text_output = crate::golden::execution::blocks_text(std::slice::from_ref(&block))
+        .expect("shell text is always representable");
+    let projected = crate::results::project_golden_blocks(std::slice::from_ref(&block))
+        .expect("shell result projection");
     let execution = QueryExecution {
-        text_output: text,
-        header,
-        rows,
+        shell_result: Some(block),
+        result_statements: Vec::new(),
+        typed_results: Vec::new(),
+        text_output,
+        header: projected.header,
+        rows: projected.rows,
         elapsed,
     };
     if out.status.success() {

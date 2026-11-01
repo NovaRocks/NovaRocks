@@ -1,23 +1,29 @@
 -- query 5
+-- types	bigint
 count(DISTINCT c0)
 30000
 
 -- query 6
+-- types	bigint
 count(DISTINCT c1)
 30000
 
 -- query 7
+-- types	bigint
 count(DISTINCT c2)
 30000
 
 -- query 8
+-- types	bigint
 count(DISTINCT c3)
 30000
 
 -- query 9
+-- types	bigint
 count(DISTINCT c0)
 1
 
 -- query 10
+-- types	bigint
 count(DISTINCT c2)
 1

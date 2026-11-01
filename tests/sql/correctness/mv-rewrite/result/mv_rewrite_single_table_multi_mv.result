@@ -1,4 +1,5 @@
 -- query 10
+-- types	integer	bigint
 user_id	cnt
 0	600
 1	600
@@ -7,6 +8,7 @@ user_id	cnt
 4	600
 
 -- query 12
+-- types	integer	varchar	bigint
 user_id	user_name	cnt
 0	u0	120
 0	u10	120
@@ -35,6 +37,7 @@ user_id	user_name	cnt
 4	u9	120
 
 -- query 16
+-- types	integer	bigint
 user_id	cnt
 0	600
 1	600
@@ -43,6 +46,7 @@ user_id	cnt
 4	600
 
 -- query 18
+-- types	integer	bigint
 user_id	total
 0	1804
 1	1798

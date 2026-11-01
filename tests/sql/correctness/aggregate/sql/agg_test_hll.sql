@@ -67,18 +67,30 @@ USE ${case_db};
 select c2,approx_count_distinct_hll_sketch(c1) from t1 group by c2 order by c2 limit 10;
 
 -- query 11
+-- @expect_sql_code=sql.admit.client_type_unsupported
+-- @expect_sql_phase=Admit
+-- @expect_error=has type Opaque(Hll)
 USE ${case_db};
 select hll_union(hll_hash(c1)) from t1;
 
 -- query 12
+-- @expect_sql_code=sql.admit.client_type_unsupported
+-- @expect_sql_phase=Admit
+-- @expect_error=has type Opaque(Hll)
 USE ${case_db};
 select c2, hll_union(hll_hash(c1)) from t1 group by c2 order by c2 limit 10;
 
 -- query 13
+-- @expect_sql_code=sql.admit.client_type_unsupported
+-- @expect_sql_phase=Admit
+-- @expect_error=has type Opaque(Hll)
 USE ${case_db};
 select hll_raw_agg(hll_hash(c1)) from t1;
 
 -- query 14
+-- @expect_sql_code=sql.admit.client_type_unsupported
+-- @expect_sql_phase=Admit
+-- @expect_error=has type Opaque(Hll)
 USE ${case_db};
 select c2, hll_raw_agg(hll_hash(c1)) from t1 group by c2 order by c2 limit 10;
 

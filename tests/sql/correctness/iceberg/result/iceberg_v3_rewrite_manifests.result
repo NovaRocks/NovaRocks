@@ -1,8 +1,10 @@
 -- query 7
+-- types	bigint
 n
 5
 
 -- query 9
+-- types	integer	varchar
 id	v
 1	a
 2	b
@@ -11,40 +13,48 @@ id	v
 5	e
 
 -- query 12
+-- types	bigint
 n
 3
 
 -- query 14
+-- types	bigint
 n
 3
 
 -- query 16
+-- types	bigint
 n
 0
 
 -- query 18
+-- types	bigint
 n
 0
 
 -- query 24
+-- types	integer	varchar
 id	v
 1	p
 2	q
 3	r
 
 -- query 29
+-- types	integer	bigint
 id	_row_id
 10	0
 20	1
 30	2
 
 -- query 31
+-- types	integer	bigint
 id	_row_id
 10	0
 20	1
 30	2
 
 -- query 40
+-- types	integer	varchar
 id	v
 1	a
 3	c
@@ -52,6 +62,7 @@ id	v
 5	e
 
 -- query 42
+-- types	integer	varchar
 id	v
 1	a
 3	c
@@ -59,6 +70,7 @@ id	v
 5	e
 
 -- query 49
+-- types	integer	varchar
 id	v
 1	first
 2	second
@@ -66,15 +78,18 @@ id	v
 4	fourth
 
 -- query 50
+-- types	bigint
 n
 4
 
 -- query 57
+-- types	integer	varchar
 id	v
 1	one
 2	two
 3	three
 
 -- query 58
+-- types	bigint
 n
 3

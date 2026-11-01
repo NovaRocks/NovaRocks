@@ -1,5 +1,8 @@
 -- query 4
+-- types	varchar	bigint
 region	amount
 east	10
+
 -- query 5
+-- types	varchar
 TABLE_NAME

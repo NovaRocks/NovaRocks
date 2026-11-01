@@ -804,8 +804,10 @@ mod tests {
     fn node_local_mode_and_generation_have_distinct_canonical_domains() {
         let node = node_local_data_binding("blue");
         let fixed = static_data_binding("blue");
-        let node_bytes = canonical_catalog_credential_binding_bytes(&[node.clone()]).unwrap();
-        let fixed_bytes = canonical_catalog_credential_binding_bytes(&[fixed.clone()]).unwrap();
+        let node_bytes =
+            canonical_catalog_credential_binding_bytes(std::slice::from_ref(&node)).unwrap();
+        let fixed_bytes =
+            canonical_catalog_credential_binding_bytes(std::slice::from_ref(&fixed)).unwrap();
         let mode_offset = CREDENTIAL_BINDING_DOMAIN.len() + std::mem::size_of::<u32>() + 2;
         assert_eq!(fixed_bytes[mode_offset], 0);
         assert_eq!(node_bytes[mode_offset], 2);

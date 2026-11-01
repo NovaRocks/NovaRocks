@@ -293,12 +293,12 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 
 ## SQL Regression Tests
 
-The SQL test runner expects a MySQL-compatible NovaRocks standalone server.
+SQL runner 的全部会话经 Trino HTTP 协议连接 NovaRocks FE，结果保存完整类型与规范文本。配置使用 [cluster] 的 host、trino_port、user；生成环境导出 NOVA_ENV_TRINO_PORT，命令行覆盖为 --trino-port。格式与迁移规则见 [SQL README](tests/sql/README.md#golden-格式)。
 
 ```bash
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --suite <suite> \
-  --mode <verify|record|diff> \
+  --mode <verify|record> \
   --query-timeout 60 \
   -j 4
 ```

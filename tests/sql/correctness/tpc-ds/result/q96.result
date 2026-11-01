@@ -1,2 +1,4 @@
+-- query 1
+-- types	bigint
 count(*)
 870

@@ -1,3 +1,5 @@
+-- query 1
+-- legacy
 c_customer_id	c_salutation	c_first_name	c_last_name	c_preferred_cust_flag	c_birth_day	c_birth_month	c_birth_year	c_birth_country	c_login	c_email_address	c_last_review_date	ctr_total_return
 AAAAAAAAAAAIBAAA	Mr.	Eduardo	Goodwin	Y	24	11	1950	GHANA	NULL	Eduardo.Goodwin@rolemn2xusv5Ot0.edu	2452312	3838.00
 AAAAAAAAABHAAAAA	Sir	Robert	Thornton	Y	24	5	1924	HONG KONG	NULL	Robert.Thornton@jas.edu	2452431	2434.58

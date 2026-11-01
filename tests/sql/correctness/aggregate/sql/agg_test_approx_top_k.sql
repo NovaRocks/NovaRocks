@@ -132,7 +132,59 @@ SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_bigint
 
 -- query 8
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_largeint) FROM t_without_null;
+SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/
+       CASE WHEN __topk_a IS NULL THEN CAST(NULL AS VARCHAR)
+            ELSE CONCAT('[',
+                 CASE WHEN __topk_n >= 1 THEN CASE WHEN element_at(__topk_a, 1) IS NULL THEN 'null'
+             ELSE CONCAT('{"item":',
+                  CASE WHEN element_at(__topk_items, 1) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_items, 1) AS VARCHAR) END,
+                  ',"count":',
+                  CASE WHEN element_at(__topk_counts, 1) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_counts, 1) AS VARCHAR) END,
+                  '}') END ELSE '' END,
+                 CASE WHEN __topk_n >= 2 THEN CONCAT(',', CASE WHEN element_at(__topk_a, 2) IS NULL THEN 'null'
+             ELSE CONCAT('{"item":',
+                  CASE WHEN element_at(__topk_items, 2) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_items, 2) AS VARCHAR) END,
+                  ',"count":',
+                  CASE WHEN element_at(__topk_counts, 2) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_counts, 2) AS VARCHAR) END,
+                  '}') END) ELSE '' END,
+                 CASE WHEN __topk_n >= 3 THEN CONCAT(',', CASE WHEN element_at(__topk_a, 3) IS NULL THEN 'null'
+             ELSE CONCAT('{"item":',
+                  CASE WHEN element_at(__topk_items, 3) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_items, 3) AS VARCHAR) END,
+                  ',"count":',
+                  CASE WHEN element_at(__topk_counts, 3) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_counts, 3) AS VARCHAR) END,
+                  '}') END) ELSE '' END,
+                 CASE WHEN __topk_n >= 4 THEN CONCAT(',', CASE WHEN element_at(__topk_a, 4) IS NULL THEN 'null'
+             ELSE CONCAT('{"item":',
+                  CASE WHEN element_at(__topk_items, 4) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_items, 4) AS VARCHAR) END,
+                  ',"count":',
+                  CASE WHEN element_at(__topk_counts, 4) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_counts, 4) AS VARCHAR) END,
+                  '}') END) ELSE '' END,
+                 CASE WHEN __topk_n >= 5 THEN CONCAT(',', CASE WHEN element_at(__topk_a, 5) IS NULL THEN 'null'
+             ELSE CONCAT('{"item":',
+                  CASE WHEN element_at(__topk_items, 5) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_items, 5) AS VARCHAR) END,
+                  ',"count":',
+                  CASE WHEN element_at(__topk_counts, 5) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_counts, 5) AS VARCHAR) END,
+                  '}') END) ELSE '' END,
+                 ']') END AS `approx_top_k(c_largeint)`
+FROM (
+    SELECT __original.__topk_a,
+           cardinality(__original.__topk_a) AS __topk_n,
+           __array_struct_subfield(__original.__topk_a, 'item') AS __topk_items,
+           __array_struct_subfield(__original.__topk_a, 'count') AS __topk_counts
+    FROM (
+        SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_largeint) AS __topk_a FROM t_without_null
+    ) AS __original
+) AS __projection;
 
 -- query 9
 USE ${case_db};
@@ -180,7 +232,43 @@ SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPRO
 
 -- query 20
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_largeint, 3) FROM t_without_null;
+SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/
+       CASE WHEN __topk_a IS NULL THEN CAST(NULL AS VARCHAR)
+            ELSE CONCAT('[',
+                 CASE WHEN __topk_n >= 1 THEN CASE WHEN element_at(__topk_a, 1) IS NULL THEN 'null'
+             ELSE CONCAT('{"item":',
+                  CASE WHEN element_at(__topk_items, 1) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_items, 1) AS VARCHAR) END,
+                  ',"count":',
+                  CASE WHEN element_at(__topk_counts, 1) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_counts, 1) AS VARCHAR) END,
+                  '}') END ELSE '' END,
+                 CASE WHEN __topk_n >= 2 THEN CONCAT(',', CASE WHEN element_at(__topk_a, 2) IS NULL THEN 'null'
+             ELSE CONCAT('{"item":',
+                  CASE WHEN element_at(__topk_items, 2) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_items, 2) AS VARCHAR) END,
+                  ',"count":',
+                  CASE WHEN element_at(__topk_counts, 2) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_counts, 2) AS VARCHAR) END,
+                  '}') END) ELSE '' END,
+                 CASE WHEN __topk_n >= 3 THEN CONCAT(',', CASE WHEN element_at(__topk_a, 3) IS NULL THEN 'null'
+             ELSE CONCAT('{"item":',
+                  CASE WHEN element_at(__topk_items, 3) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_items, 3) AS VARCHAR) END,
+                  ',"count":',
+                  CASE WHEN element_at(__topk_counts, 3) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_counts, 3) AS VARCHAR) END,
+                  '}') END) ELSE '' END,
+                 ']') END AS `approx_top_k(c_largeint, 3)`
+FROM (
+    SELECT __original.__topk_a,
+           cardinality(__original.__topk_a) AS __topk_n,
+           __array_struct_subfield(__original.__topk_a, 'item') AS __topk_items,
+           __array_struct_subfield(__original.__topk_a, 'count') AS __topk_counts
+    FROM (
+        SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_largeint, 3) AS __topk_a FROM t_without_null
+    ) AS __original
+) AS __projection;
 
 -- query 21
 USE ${case_db};
@@ -228,7 +316,43 @@ SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP
 
 -- query 32
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_largeint, 3, 10) FROM t_without_null;
+SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/
+       CASE WHEN __topk_a IS NULL THEN CAST(NULL AS VARCHAR)
+            ELSE CONCAT('[',
+                 CASE WHEN __topk_n >= 1 THEN CASE WHEN element_at(__topk_a, 1) IS NULL THEN 'null'
+             ELSE CONCAT('{"item":',
+                  CASE WHEN element_at(__topk_items, 1) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_items, 1) AS VARCHAR) END,
+                  ',"count":',
+                  CASE WHEN element_at(__topk_counts, 1) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_counts, 1) AS VARCHAR) END,
+                  '}') END ELSE '' END,
+                 CASE WHEN __topk_n >= 2 THEN CONCAT(',', CASE WHEN element_at(__topk_a, 2) IS NULL THEN 'null'
+             ELSE CONCAT('{"item":',
+                  CASE WHEN element_at(__topk_items, 2) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_items, 2) AS VARCHAR) END,
+                  ',"count":',
+                  CASE WHEN element_at(__topk_counts, 2) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_counts, 2) AS VARCHAR) END,
+                  '}') END) ELSE '' END,
+                 CASE WHEN __topk_n >= 3 THEN CONCAT(',', CASE WHEN element_at(__topk_a, 3) IS NULL THEN 'null'
+             ELSE CONCAT('{"item":',
+                  CASE WHEN element_at(__topk_items, 3) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_items, 3) AS VARCHAR) END,
+                  ',"count":',
+                  CASE WHEN element_at(__topk_counts, 3) IS NULL THEN 'null'
+                       ELSE CAST(element_at(__topk_counts, 3) AS VARCHAR) END,
+                  '}') END) ELSE '' END,
+                 ']') END AS `approx_top_k(c_largeint, 3, 10)`
+FROM (
+    SELECT __original.__topk_a,
+           cardinality(__original.__topk_a) AS __topk_n,
+           __array_struct_subfield(__original.__topk_a, 'item') AS __topk_items,
+           __array_struct_subfield(__original.__topk_a, 'count') AS __topk_counts
+    FROM (
+        SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_largeint, 3, 10) AS __topk_a FROM t_without_null
+    ) AS __original
+) AS __projection;
 
 -- query 33
 USE ${case_db};

@@ -1,37 +1,45 @@
 -- query 3
+-- legacy
 region	any_true	c
 east	1	5
 west	0	2
 
 -- query 4
+-- types	varchar	boolean	bigint
 region	any_true	c
-east	1	5
-west	0	2
+east	true	5
+west	false	2
 
 -- query 6
+-- legacy
 region	any_true	c
 east	0	4
 west	0	2
 
 -- query 7
+-- types	varchar	boolean	bigint
 region	any_true	c
-east	0	4
-west	0	2
+east	false	4
+west	false	2
 
 -- query 9
+-- legacy
 region	any_true	c
 east	0	3
 west	0	2
 
 -- query 11
+-- legacy
 region	any_true	c
 west	0	2
 
 -- query 12
+-- types	varchar	boolean	bigint
 region	any_true	c
-west	0	2
+west	false	2
 
 -- query 14
+-- legacy
 region	any_true	c
 east	1	1
 west	0	2

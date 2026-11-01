@@ -682,7 +682,7 @@ Important environment variables after sourcing `env.sh`:
 - `NOVA_ENV_SHARED_DOCKER`, `NOVA_ENV_COMPOSE_PROJECT`, `NOVA_ENV_CONFIG_FILE`
 - `NOVA_ENV_OBJECT_STORE_RUNTIME`, `NOVA_ENV_CATALOG_RUNTIME`, `NOVA_ENV_OBJECT_STORE_CONTAINER`
 - `NOVA_ENV_REST_ENV_FILE`（本次 publication 的不可变 `env.sh` 路径）
-- `NOVA_ENV_MINIO_PORT`, `NOVA_ENV_REST_PORT`, `NOVA_ENV_MYSQL_PORT`
+- `NOVA_ENV_MINIO_PORT`, `NOVA_ENV_REST_PORT`, `NOVA_ENV_TRINO_PORT`
 - `NOVA_ENV_REST_MV_PORT`, `NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI`
 - `NOVA_ENV_SPARK_UI_PORT`
 - `AWS_S3_ENDPOINT`, `AWS_S3_ACCESS_KEY_ID`, `AWS_S3_SECRET_ACCESS_KEY`
@@ -714,7 +714,7 @@ cargo run -p novarocks-server -- standalone --role all-in-one \
 ```
 
 When backgrounding the server (e.g. inside an automated test driver), wait
-for the readiness marker before issuing the first query — probing the mysql
+for the readiness marker before issuing the first query — probing the Trino
 port alone cannot distinguish a freshly-bound server from a leftover
 process that already owned the port:
 
@@ -742,6 +742,8 @@ FE 绑定 Trino 与 MySQL 客户端监听后，在 stdout 输出：
 字段 `trino_port` 追加在末尾，原 `NOVAROCKS_READY mysql_port=` 前缀保留。
 后台启动的编排必须等到这一行再连接，端口取本次实际 marker；不能只探测一个可能已被其他进程占用的端口。
 `NOVA_ENV_TRINO_PORT` 是本地 fixture 导出的 Trino 端口。
+
+SQL runner 经 Trino HTTP 协议运行；生成配置的 `[cluster]` 使用 `host`、`trino_port`、`user`，拒绝旧 `port`、`password`。命令行使用 `--trino-port`，不再接受 MySQL、参照或 diff 参数。golden 与语料会话声明见 [SQL README](tests/sql/README.md#golden-格式)。
 
 Run SQL tests with the generated runner config:
 
@@ -854,8 +856,7 @@ IDE 测试按钮与私有 target 配置、清理责任见 [测试治理](docs/gu
 ### 8.4 SQL Regression Tests
 
 The SQL runner is under `tests/sql/runner`; its only suite root is `tests/sql/correctness`.
-It requires a running NovaRocks
-MySQL-compatible standalone server. Do not assume a fixed port in Codex
+It requires a running NovaRocks FE with the Trino HTTP entrypoint. Do not assume a fixed port in Codex
 workspaces; source `docker/iceberg-rest/runtime/current/env.sh` when that
 entry exists.
 
@@ -884,7 +885,7 @@ cargo run -p novarocks-server -- standalone --role all-in-one \
 ```
 
 When starting a server manually inside a Codex worktree, prefer the generated
-config so its configured MySQL port cannot collide with another worktree.
+config so its configured Trino port cannot collide with another worktree.
 
 **Run test suites:**
 
@@ -895,7 +896,7 @@ the exact publication env file. The default config does not supply them.
 source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite <suite> --mode <verify|record|diff> [--query-timeout 60] [-j 4]
+  --suite <suite> --mode <verify|record> [--query-timeout 60] [-j 4]
 ```
 
 With a generated runner config:

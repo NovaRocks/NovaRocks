@@ -1,3 +1,5 @@
+-- query 1
+-- legacy
 channel	id	sales	returns	profit
 NULL	NULL	562937653.47	12490154.95	-100351224.00
 catalog channel	NULL	404410817.75	8201118.96	-42762489.82

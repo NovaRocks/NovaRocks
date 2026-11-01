@@ -1,8 +1,10 @@
 -- query 10
+-- types	bigint
 cnt
 200000
 
 -- query 11
+-- types	varchar
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1

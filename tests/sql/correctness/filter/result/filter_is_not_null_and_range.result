@@ -1,3 +1,5 @@
+-- query 4
+-- types	integer	integer	varchar
 id	k	payload
 3	10	p3
 4	11	p4

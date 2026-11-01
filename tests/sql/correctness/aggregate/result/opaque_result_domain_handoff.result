@@ -1,11 +1,14 @@
 -- query 1
+-- legacy
 bitmap_state	hll_state	percentile_state
 NULL	NULL	NULL
 
 -- query 2
+-- legacy
 bitmap_members	hll_members
 1	1
 
 -- query 3
+-- legacy
 bitmap_values	percentile_values
 [null,null]	[null,null]

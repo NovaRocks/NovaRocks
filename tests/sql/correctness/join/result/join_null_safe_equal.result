@@ -1,4 +1,5 @@
 -- query 6
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	666	6666	6	66	NULL	6666
 3	33	333	3333	3	NULL	333	3333
@@ -7,6 +8,7 @@ t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 4	44	444	4444	4	NULL	NULL	4444
 
 -- query 7
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	666	6666	6	66	NULL	6666
 3	33	333	3333	3	NULL	333	3333
@@ -15,6 +17,7 @@ t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 4	44	444	4444	4	NULL	NULL	4444
 
 -- query 8
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	666	6666	6	66	NULL	6666
 3	33	333	3333	3	NULL	333	3333
@@ -23,6 +26,7 @@ t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 4	44	444	4444	4	NULL	NULL	4444
 
 -- query 9
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	666	6666	6	66	NULL	6666
 3	33	333	3333	3	NULL	333	3333
@@ -33,6 +37,7 @@ t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 5	55	555	5555	NULL	NULL	NULL	NULL
 
 -- query 10
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	666	6666	6	66	NULL	6666
 3	33	333	3333	3	NULL	333	3333
@@ -43,6 +48,7 @@ t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 5	55	555	5555	NULL	NULL	NULL	NULL
 
 -- query 11
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	666	6666	6	66	NULL	6666
 3	33	333	3333	3	NULL	333	3333
@@ -53,6 +59,7 @@ t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 5	55	555	5555	NULL	NULL	NULL	NULL
 
 -- query 12
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	666	6666	6	66	NULL	6666
 3	33	333	3333	3	NULL	333	3333
@@ -63,6 +70,7 @@ NULL	NULL	NULL	NULL	NULL	55	555	NULL
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 
 -- query 13
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t2_c1	t2_c2	t2_c3	t2_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	666	6666	6	66	NULL	6666
 3	33	333	3333	3	NULL	333	3333
@@ -73,6 +81,7 @@ NULL	NULL	NULL	NULL	NULL	55	555	NULL
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 
 -- query 14
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t1_c1	t1_c2	t1_c3	t1_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	NULL	6666	6	66	NULL	6666
 3	NULL	333	3333	3	NULL	333	3333
@@ -85,6 +94,7 @@ NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	55	555	NULL
 
 -- query 15
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t1_c1	t1_c2	t1_c3	t1_c4	t1_c1	t1_c2	t1_c3	t1_c4
 3	NULL	333	3333	3	NULL	333	3333
 6	66	NULL	6666	6	66	NULL	6666
@@ -97,6 +107,7 @@ NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	55	555	NULL
 
 -- query 16
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t1_c1	t1_c2	t1_c3	t1_c4	t1_c1	t1_c2	t1_c3	t1_c4
 2	22	222	2222	2	22	222	2222
 1	11	111	1111	1	11	111	1111
@@ -109,6 +120,7 @@ NULL	NULL	NULL	NULL	NULL	55	555	NULL
 4	NULL	NULL	4444	4	NULL	NULL	4444
 
 -- query 17
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t1_c1	t1_c2	t1_c3	t1_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	NULL	6666	6	66	NULL	6666
 3	NULL	333	3333	3	NULL	333	3333
@@ -121,6 +133,7 @@ NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	55	555	NULL
 
 -- query 18
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t1_c1	t1_c2	t1_c3	t1_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	NULL	6666	6	66	NULL	6666
 3	NULL	333	3333	3	NULL	333	3333
@@ -133,6 +146,7 @@ NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	55	555	NULL
 
 -- query 19
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t1_c1	t1_c2	t1_c3	t1_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	NULL	6666	6	66	NULL	6666
 3	NULL	333	3333	3	NULL	333	3333
@@ -145,6 +159,7 @@ NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	55	555	NULL
 
 -- query 20
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t1_c1	t1_c2	t1_c3	t1_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	NULL	6666	6	66	NULL	6666
 3	NULL	333	3333	3	NULL	333	3333
@@ -157,6 +172,7 @@ NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	55	555	NULL
 
 -- query 21
+-- types	integer	integer	integer	varchar	integer	integer	integer	varchar
 t1_c1	t1_c2	t1_c3	t1_c4	t1_c1	t1_c2	t1_c3	t1_c4
 6	66	NULL	6666	6	66	NULL	6666
 3	NULL	333	3333	3	NULL	333	3333

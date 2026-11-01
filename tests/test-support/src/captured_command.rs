@@ -18,7 +18,7 @@
 //! Complete capture from independently monitored file-backed output.
 use crate::{
     ManagedCommand,
-    monitor_client::{Material, OwnedMonitor},
+    monitor_client::{Material, OwnedMonitor, PayloadLifetimeExpired},
     unix,
 };
 use anyhow::{Context, Result, ensure};
@@ -75,17 +75,23 @@ pub fn capture_command_until(
     let mut owner = OwnedMonitor::spawn("captured command", command, deadline)?;
     let mut timed_out = false;
     let mut failures = vec![];
-    let final_record = match owner.wait(deadline) {
+    let final_record = match owner.wait_for_observed_exit(deadline) {
         Ok(value) => value,
         Err(primary) => {
             timed_out = Instant::now() >= deadline;
             failures.push(format!("captured command original wait: {primary:#}"));
             owner.send(b'K')?;
             owner
-                .wait(Instant::now() + Duration::from_secs(10))
+                .wait_for_observed_exit(Instant::now() + Duration::from_secs(10))
                 .context("actually settle captured command after original wait failed")?
         }
     };
+    if final_record.lifetime_expired {
+        timed_out = true;
+        failures.push(format!(
+            "captured command original work: {PayloadLifetimeExpired}"
+        ));
+    }
     let mut output = Output {
         status: final_record.status,
         stdout: vec![],

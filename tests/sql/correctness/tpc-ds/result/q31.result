@@ -1,3 +1,5 @@
+-- query 1
+-- legacy
 ca_county	d_year	web_q1_q2_increase	store_q1_q2_increase	web_q2_q3_increase	store_q2_q3_increase
 Atchison County	2000	0.80022122	0.24296409	11.94456038	3.16295390
 Bacon County	2000	1.16882639	0.39403767	0.96879955	0.51074308

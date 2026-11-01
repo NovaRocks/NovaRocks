@@ -1,2 +1,4 @@
+-- query 1
+-- legacy
 left_null_keys	right_null_keys	join_matches
 3	3	1

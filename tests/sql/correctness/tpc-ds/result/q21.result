@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	bigint	bigint
 w_warehouse_name	i_item_id	inv_before	inv_after
 NULL	AAAAAAAAAABDAAAA	2565	1922
 NULL	AAAAAAAAAAHDAAAA	2956	2052

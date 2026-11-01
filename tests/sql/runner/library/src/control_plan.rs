@@ -161,10 +161,9 @@ fn budget(
                 } else {
                     crate::session::split_sql_statements(&step.sql)?.len()
                 };
-                // USE + SET query_timeout precede each real submission attempt.
+                // Session context and query_timeout travel in the statement headers.
                 let operations = statements
-                    .checked_add(2)
-                    .and_then(|v| v.checked_mul(2))
+                    .checked_mul(2)
                     .and_then(|v| v.checked_mul(attempts))
                     .context("SQL operation count overflow")?;
                 sum(&mut total, mul(query, operations)?)?;
@@ -343,7 +342,7 @@ fn marker_actions(meta: &QueryMeta) -> Vec<&'static str> {
                 .iter()
                 .map(|(marker, _)| marker),
         )
-        .chain(meta.kill_query_after_be_log_contains.iter())
+        .chain(meta.cancel_query_after_be_log_contains.iter())
         .chain(meta.kill_fe_after_be_log_contains.iter())
         .chain(
             meta.kill_be_after_be_log_contains
@@ -417,6 +416,14 @@ fn native_observation_grants(
     (bind, observe)
 }
 
+fn ensure_single_submitted_statement(sql: &str) -> Result<()> {
+    ensure!(
+        crate::session::split_sql_statements(sql)?.len() == 1,
+        "selected Native fault or client cancellation requires one exact submitted SQL statement"
+    );
+    Ok(())
+}
+
 pub(crate) fn required(inputs: &[PreparedSqlInputs]) -> bool {
     inputs
         .iter()
@@ -451,6 +458,21 @@ pub(crate) fn build(
     session_sql: &[String],
     absolute_limit: Option<Instant>,
 ) -> Result<Option<(ClusterTestSessionPlan, SqlControlExecution)>> {
+    // Cancellation reads a step-owned slot. It cannot follow that slot into
+    // another submitted statement after its marker has already been emitted.
+    // Validate even markers that do not need Native observation grants.
+    for step in inputs
+        .iter()
+        .flat_map(|input| &input.cases)
+        .flat_map(|case| &case.steps)
+        .filter(|step| crate::fault_injection::has_client_query_cancellation(&step.meta))
+    {
+        ensure!(
+            !crate::shell::is_shell_step(&step.sql),
+            "client query cancellation requires a SQL step"
+        );
+        ensure_single_submitted_statement(&step.sql)?;
+    }
     let needs = required(inputs);
     if !needs {
         return Ok(None);
@@ -654,11 +676,9 @@ pub(crate) fn build(
                         &step.sql,
                         crate::results::step_retry_count(step),
                     )?;
-                    ensure!(
-                        faults.is_empty()
-                            || crate::session::split_sql_statements(&step.sql)?.len() == 1,
-                        "selected Native fault requires one exact submitted SQL statement"
-                    );
+                    if !faults.is_empty() {
+                        ensure_single_submitted_statement(&step.sql)?;
+                    }
                     let fe = refs.get_mut(&fe_key).unwrap();
                     if !fe
                         .grants
@@ -816,7 +836,6 @@ mod tests {
             sql_glob: String::new(),
             suite_catalog_override: Some("ice".into()),
             target_db_default: "db".into(),
-            ref_db_default: "db".into(),
             verify_enabled: true,
             query_timeout: 30,
             cases: vec![SqlCase {
@@ -973,6 +992,58 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_rejects_a_step_that_can_replace_its_submitted_query() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for meta in [
+            QueryMeta {
+                cancel_query_after_be_log_contains: Some("NOVAROCKS_TASK_CREATE_APPLIED".into()),
+                ..Default::default()
+            },
+            QueryMeta {
+                cancel_query_after_be_log_contains: Some("custom-cancel-marker".into()),
+                ..Default::default()
+            },
+            QueryMeta {
+                kill_query_at_lifecycle_phase: QueryLifecyclePhase::parse("running"),
+                ..Default::default()
+            },
+        ] {
+            let multiple = inputs(vec![step(1, "SELECT 1; SELECT sleep(10)", meta.clone())]);
+            let error = plan(&multiple, file.path()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires one exact submitted SQL statement"),
+                "{error:#}"
+            );
+            let shell = inputs(vec![step(1, "shell: printf USER_CANCELED", meta)]);
+            let error = plan(&shell, file.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("requires a SQL step"),
+                "{error:#}"
+            );
+        }
+        let single = inputs(vec![step(
+            1,
+            "SELECT ';' AS value",
+            QueryMeta {
+                cancel_query_after_be_log_contains: Some("NOVAROCKS_TASK_CREATE_APPLIED".into()),
+                ..Default::default()
+            },
+        )]);
+        plan(&single, file.path()).unwrap();
+        let observations = inputs(vec![step(
+            1,
+            "SELECT 1; SELECT 2",
+            QueryMeta {
+                be_log_contains: vec!["NOVAROCKS_TASK_CREATE_APPLIED".into()],
+                ..Default::default()
+            },
+        )]);
+        plan(&observations, file.path()).unwrap();
+    }
+
+    #[test]
     fn split_assignment_metadata_authorizes_the_actual_reader_owner() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let input = inputs(vec![step(
@@ -987,7 +1058,7 @@ mod tests {
             },
         )]);
         let (plan, execution) = plan(&input, file.path()).unwrap();
-        // MysqlSession permits the initial submission and one transient
+        // TrinoCaseSession permits the initial submission and one transient
         // reconnect. Both need separate observation permission, while these
         // two split markers still share one reader action per submission.
         let submissions = &execution.step("selected", "one", 1).unwrap().submissions;

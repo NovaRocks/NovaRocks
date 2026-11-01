@@ -1,7 +1,9 @@
 -- query 16
+-- types	varchar	bigint	bigint	bigint
 scenario	row_count	t1_sum	t2_sum
 bilateral_probe	1350	191925	191925
 
 -- query 18
+-- types	varchar	bigint	bigint	bigint
 scenario	row_count	t1_sum	t2_sum
 bilateral_probe	1350	191925	191925

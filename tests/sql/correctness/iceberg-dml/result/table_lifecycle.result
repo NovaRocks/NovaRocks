@@ -1,12 +1,15 @@
 -- query 2
+-- types	integer	varchar
 k1	v1
 1	a
 2	b
 
 -- query 4
+-- types	bigint
 count(*)
 0
 
 -- query 6
+-- types	integer	varchar
 k1	v1
 10	z

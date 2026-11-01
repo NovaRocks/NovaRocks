@@ -1,8 +1,10 @@
 -- query 3
+-- types	integer	integer	integer	integer	decimal(18, 9)	decimal(18, 9)
 max_v	min_v	max_negkey	min_negkey	max_decimal	min_decimal
 9	NULL	NULL	9	9.000000000	NULL
 
 -- query 4
+-- types	integer	integer	integer
 seq	max_v	min_v
 1	4	4
 2	9	4
@@ -10,9 +12,11 @@ seq	max_v	min_v
 4	9	NULL
 
 -- query 5
+-- types	integer	integer
 max_null_key	min_null_key
 NULL	NULL
 
 -- query 6
+-- types	integer	integer
 max_empty	min_empty
 NULL	NULL

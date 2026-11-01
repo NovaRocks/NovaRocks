@@ -1,3 +1,5 @@
+-- query 5
+-- types	integer	varchar	integer
 id	region	amount
 1	east	10
 2	west	20

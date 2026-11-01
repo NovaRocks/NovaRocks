@@ -1,15 +1,19 @@
 -- query 1
+-- types	boolean
 caught_range
-1
+true
 
 -- query 3
+-- types	tinyint
 narrowed
 127
 
 -- query 4
+-- types	boolean
 caught_utf8
-1
+true
 
 -- query 5
+-- types	varchar
 rendered
 2020-01-01

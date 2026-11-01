@@ -1,11 +1,14 @@
 -- query 3
+-- types	integer	integer	varchar
 id	part_id	payload
 12	12	target
 
 -- query 5
+-- types	integer	integer	varchar
 id	part_id	payload
 12	12	target
 
 -- query 6
+-- types	bigint
 cnt
 0

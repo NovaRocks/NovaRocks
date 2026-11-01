@@ -1,19 +1,24 @@
 -- query 6
+-- types	bigint
 n_snapshots
 3
 
 -- query 7
+-- types	varchar	bigint
 operation	n
 append	3
 
 -- query 8
+-- types	bigint
 n_root
 1
 
 -- query 9
+-- types	bigint
 n_with_id
 3
 
 -- query 10
+-- types	bigint
 n_root_aliased
 1

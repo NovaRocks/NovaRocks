@@ -1,22 +1,27 @@
 -- query 2
+-- types	integer	bigint	varchar
 order_id	amount	region
 
 -- query 4
+-- types	integer	bigint	varchar
 order_id	amount	region
 1	10	east
 2	20	west
 
 -- query 6
+-- types	integer	bigint	varchar
 order_id	amount	region
 1	10	east
 2	20	west
 
 -- query 8
+-- types	integer	bigint	varchar
 order_id	amount	region
 1	10	east
 2	20	west
 
 -- query 10
+-- legacy
 order_id	amount	region
 1	10	east
 2	20	west

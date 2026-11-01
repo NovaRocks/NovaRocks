@@ -201,6 +201,11 @@ pub(crate) async fn run(
         QuerySessionOutput::StreamingQuery(mut result) => {
             let produced = async {
                 let schema = result.begin_schema().ok_or_else(|| internal(entry.id.as_str(), "stream has no original schema"))?;
+                tracing::info!(
+                    client_query_id = %entry.id,
+                    query_id = %schema.query_id(),
+                    "Trino statement logical query identity"
+                );
                 let render = schema.schema().client_render().ok_or_else(|| internal(entry.id.as_str(), "stream has no frozen client presentation"))?;
                 initialize(&entry, render, result.result_window_alias().map_err(|_| internal(entry.id.as_str(), "statement result window is absent"))?, ResultSourceBacking::RootSegments)?;
                 schema.complete();
@@ -216,7 +221,18 @@ pub(crate) async fn run(
                             for span in rows.payload_spans() { append(&entry, span, &mut commands).await?; }
                             segment.complete();
                         }
-                        Some(ResultDelivery::End(end)) => { end.complete(); break; }
+                        Some(ResultDelivery::End(end)) => {
+                            let execution = end.execution_id();
+                            tracing::info!(
+                                client_query_id = %entry.id,
+                                query_id = %execution.query_id(),
+                                attempt_id = execution.attempt_id().get(),
+                                query_execution_id = ?execution,
+                                "Trino statement execution identity"
+                            );
+                            end.complete();
+                            break;
+                        }
                         None => return Err(internal(entry.id.as_str(), "stream closed before its original End").into()),
                     }
                 }
@@ -406,13 +422,7 @@ fn initialize(
         query_error_for_query(entry.id.as_str(), TrinoErrorSource::RowTooLarge { message })
     };
     let available = window
-        .all_objects_bytes()
-        .map_err(|_| {
-            internal(
-                entry.id.as_str(),
-                "metadata has no original window envelope",
-            )
-        })?
+        .payload_capacity_bytes()
         .checked_sub(source.retained_bytes())
         .and_then(|bytes| {
             bytes.checked_sub((2 * crate::paging::PAGE_ENVELOPE_RESERVE_BYTES + 1) as u64)

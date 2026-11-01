@@ -72,7 +72,7 @@ INSERT INTO ${case_db}.fe_crash VALUES (3, 15);
 
 -- query 5
 -- @kill_fe_after_be_log_contains=NOVAROCKS_TASK_LEASE_RENEWED
--- @expect_error=server disconnected
+-- @expect_error=Trino transport failure
 -- Every context's lease expires, and this count stays at the cluster size
 -- because that is the property: a frontend that dies must be noticed by each
 -- backend holding a context, not by a quorum of them. It is therefore the one

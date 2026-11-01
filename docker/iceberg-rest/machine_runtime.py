@@ -66,6 +66,13 @@ class SweepLockTimeout(runtime.RuntimeFailure):
         super().__init__("MachineMaintaining", "bounded sweep could not acquire the machine lock")
 
 
+class SweepInventoryTimeout(runtime.RuntimeFailure):
+    """Local inventory expired before operation settlement was dispatched."""
+
+    def __init__(self):
+        super().__init__("ScratchSweepTimeout", "bounded sweep operation inventory is incomplete")
+
+
 class MachineCommandDeadlineExpired(runtime.RuntimeFailure):
     """The command deadline elapsed before a journal or CLI was created."""
 
@@ -726,10 +733,16 @@ class MachineDocker(runtime.Docker):
             return False
         return False
 
-    def unsettled_operations(self, base, *, include_disposed=False):
+    def unsettled_operations(self, base, *, include_disposed=False, deadline=None):
+        def check_deadline():
+            if deadline is not None and time.monotonic() >= deadline:
+                raise SweepInventoryTimeout()
+
+        check_deadline()
         pending = []
         paths = [*Path(base).glob("activations/**/operations/*.json"), *Path(base).glob("operations/*.json")]
         for path in sorted(paths):
+            check_deadline()
             if path.is_symlink():
                 raise runtime.RuntimeFailure("RuntimeStateUnreadable", "operation journal is not a regular owned file")
             fact = runtime.read_json(path)
@@ -739,6 +752,7 @@ class MachineDocker(runtime.Docker):
                 if not include_disposed and self.failed_readonly_disposition(path, fact, base):
                     continue
                 pending.append((path, fact))
+        check_deadline()
         return pending
 
     def _failed_readonly_control_material(self, path, fact, base):
@@ -959,8 +973,12 @@ class MachineDocker(runtime.Docker):
     def _catalog_volume_identity(volume):
         return {key: volume[key] for key in ("Name", "Driver", "Scope", "Options", "Labels", "CreatedAt")}
 
-    def settle_operations(self, base):
-        for path, fact in self.unsettled_operations(base):
+    def settle_operations(self, base, *, inventory_deadline=None):
+        # Collect the complete inventory before any recovery effect. An expired
+        # scan must not be confused with an empty or settled mutation inventory.
+        pending = (self.unsettled_operations(base) if inventory_deadline is None
+                   else self.unsettled_operations(base, deadline=inventory_deadline))
+        for path, fact in pending:
             if fact.get("kind") == "host-sdk":
                 if fact.get("control_root") != str(Path(base).parent) or fact.get("machine") != Path(base).name:
                     raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "host SDK operation belongs to another machine")
@@ -1531,10 +1549,21 @@ class MachineOwner:
                     validate_cloud_snapshot(state)
                 else:
                     self.backend.validate_minio_volume(state)
+                # Local inventory gets at most half the remaining sweep window.
+                # Settlement, health checks and GC keep the original deadline.
+                # Incomplete inventory dispatches no recovery or GC mutation.
+                inventory_deadline = min(deadline, (time.monotonic() + deadline) / 2)
                 observation_only = False
-                self.backend.settle_operations(self.base)
+                self.backend.settle_operations(self.base, inventory_deadline=inventory_deadline)
                 observation_only = True
-                if not self.backend.healthy(state):
+                healthy = self.backend.healthy(state)
+                # HTTP readiness can return False when its inherited deadline expires.
+                # Neither boolean authorizes GC after the observation window closes.
+                if time.monotonic() >= deadline:
+                    if self.backend.unsettled_operations(self.base):
+                        raise runtime.RuntimeFailure("MachineUnavailable", "finish unsettled machine operations explicitly")
+                    raise runtime.RuntimeFailure("ScratchSweepTimeout", "bounded sweep health observation deadline elapsed")
+                if not healthy:
                     raise runtime.RuntimeFailure("MachineUnavailable", "machine services are not healthy")
                 if is_cloud(state):
                     return {"complete": True, "status": "NOT_RUN", "scope": "cloud-ttl", "cleanup_performed": False,

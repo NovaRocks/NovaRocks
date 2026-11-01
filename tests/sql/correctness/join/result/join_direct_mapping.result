@@ -1,319 +1,399 @@
 -- query 12
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 9996	9996	9996
 
 -- query 13
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 18568	9996	9996
 
 -- query 14
+-- types	bigint	bigint
 count(1)	count(t1.c_bool_null)
 1428	1428
 
 -- query 15
+-- types	bigint	bigint
 count(1)	count(t1.c_bool_null)
 8572	0
 
 -- query 16
+-- legacy
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 10081	9996	9996
 
 -- query 17
+-- types	bigint	bigint
 count(1)	count(t2.c_bool_null)
 14	14
 
 -- query 18
+-- types	bigint	bigint
 count(1)	count(t2.c_bool_null)
 85	0
 
 -- query 19
+-- legacy
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 18653	9996	9996
 
 -- query 20
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 4998	4998	4998
 
 -- query 21
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 14284	5712	4998
 
 -- query 22
+-- types	bigint	bigint
 count(1)	count(t1.c_bool_null)
 714	714
 
 -- query 23
+-- types	bigint	bigint
 count(1)	count(t1.c_bool_null)
 9286	714
 
 -- query 24
+-- legacy
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 4998	4998	4998
 
 -- query 25
+-- types	bigint	bigint
 count(1)	count(t2.c_bool_null)
 7	7
 
 -- query 26
+-- types	bigint	bigint
 count(1)	count(t2.c_bool_null)
 0	0
 
 -- query 27
+-- legacy
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 14284	5712	4998
 
 -- query 28
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 0	0	0
 
 -- query 29
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 10000	1428	0
 
 -- query 30
+-- types	bigint	bigint
 count(1)	count(t1.c_bool_null)
 0	0
 
 -- query 31
+-- types	bigint	bigint
 count(1)	count(t1.c_bool_null)
 10000	1428
 
 -- query 32
+-- legacy
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 0	0	0
 
 -- query 33
+-- types	bigint	bigint
 count(1)	count(t2.c_bool_null)
 0	0
 
 -- query 34
+-- types	bigint	bigint
 count(1)	count(t2.c_bool_null)
 0	0
 
 -- query 35
+-- legacy
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 10000	1428	0
 
 -- query 36
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 714	714	714
 
 -- query 37
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 714	714	714
 
 -- query 38
+-- types	bigint	bigint
 count(1)	count(t1.c_bool_null)
 714	714
 
 -- query 39
+-- types	bigint	bigint
 count(1)	count(t1.c_bool_null)
 9286	714
 
 -- query 40
+-- legacy
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 722	714	714
 
 -- query 41
+-- types	bigint	bigint
 count(1)	count(t2.c_bool_null)
 1	1
 
 -- query 42
+-- types	bigint	bigint
 count(1)	count(t2.c_bool_null)
 8	0
 
 -- query 43
+-- legacy
 count(1)	count(t1.c_bool_null)	count(t2.c_bool_null)
 714	714	714
 
 -- query 44
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 625	625	625
 
 -- query 45
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 10000	833	625
 
 -- query 46
+-- types	bigint	bigint
 count(1)	count(t1.c_tinyint_null)
 625	625
 
 -- query 47
+-- types	bigint	bigint
 count(1)	count(t1.c_tinyint_null)
 9375	208
 
 -- query 48
+-- legacy
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 625	625	625
 
 -- query 49
+-- types	bigint	bigint
 count(1)	count(t2.c_tinyint_null)
 24	24
 
 -- query 50
+-- types	bigint	bigint
 count(1)	count(t2.c_tinyint_null)
 0	0
 
 -- query 51
+-- legacy
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 10000	833	625
 
 -- query 52
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 0	0	0
 
 -- query 53
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 10000	833	0
 
 -- query 54
+-- types	bigint	bigint
 count(1)	count(t1.c_tinyint_null)
 0	0
 
 -- query 55
+-- types	bigint	bigint
 count(1)	count(t1.c_tinyint_null)
 10000	833
 
 -- query 56
+-- legacy
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 0	0	0
 
 -- query 57
+-- types	bigint	bigint
 count(1)	count(t2.c_tinyint_null)
 0	0
 
 -- query 58
+-- types	bigint	bigint
 count(1)	count(t2.c_tinyint_null)
 0	0
 
 -- query 59
+-- legacy
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 10000	833	0
 
 -- query 60
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 0	0	0
 
 -- query 61
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 0	0	0
 
 -- query 62
+-- types	bigint	bigint
 count(1)	count(t1.c_tinyint_null)
 0	0
 
 -- query 63
+-- types	bigint	bigint
 count(1)	count(t1.c_tinyint_null)
 10000	833
 
 -- query 64
+-- legacy
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 9	0	0
 
 -- query 65
+-- types	bigint	bigint
 count(1)	count(t2.c_tinyint_null)
 0	0
 
 -- query 66
+-- types	bigint	bigint
 count(1)	count(t2.c_tinyint_null)
 9	0
 
 -- query 67
+-- legacy
 count(1)	count(t1.c_tinyint_null)	count(t2.c_tinyint_null)
 0	0	0
 
 -- query 68
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 11	11	11
 
 -- query 69
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 10000	769	11
 
 -- query 70
+-- types	bigint	bigint
 count(1)	count(t1.c_smallint_null)
 11	11
 
 -- query 71
+-- types	bigint	bigint
 count(1)	count(t1.c_smallint_null)
 9989	758
 
 -- query 72
+-- legacy
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 11	11	11
 
 -- query 73
+-- types	bigint	bigint
 count(1)	count(t2.c_smallint_null)
 11	11
 
 -- query 74
+-- types	bigint	bigint
 count(1)	count(t2.c_smallint_null)
 0	0
 
 -- query 75
+-- legacy
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 10000	769	11
 
 -- query 76
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 0	0	0
 
 -- query 77
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 10000	769	0
 
 -- query 78
+-- types	bigint	bigint
 count(1)	count(t1.c_smallint_null)
 0	0
 
 -- query 79
+-- types	bigint	bigint
 count(1)	count(t1.c_smallint_null)
 10000	769
 
 -- query 80
+-- legacy
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 0	0	0
 
 -- query 81
+-- types	bigint	bigint
 count(1)	count(t2.c_smallint_null)
 0	0
 
 -- query 82
+-- types	bigint	bigint
 count(1)	count(t2.c_smallint_null)
 0	0
 
 -- query 83
+-- legacy
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 10000	769	0
 
 -- query 84
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 0	0	0
 
 -- query 85
+-- types	bigint	bigint	bigint
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 0	0	0
 
 -- query 86
+-- types	bigint	bigint
 count(1)	count(t1.c_smallint_null)
 0	0
 
 -- query 87
+-- types	bigint	bigint
 count(1)	count(t1.c_smallint_null)
 10000	769
 
 -- query 88
+-- legacy
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 9	0	0
 
 -- query 89
+-- types	bigint	bigint
 count(1)	count(t2.c_smallint_null)
 0	0
 
 -- query 90
+-- types	bigint	bigint
 count(1)	count(t2.c_smallint_null)
 9	0
 
 -- query 91
+-- legacy
 count(1)	count(t1.c_smallint_null)	count(t2.c_smallint_null)
 0	0	0

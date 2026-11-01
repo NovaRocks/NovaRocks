@@ -1,3 +1,5 @@
+-- query 3
+-- legacy
 grp	id	score	rn
 A	2	90	1
 A	3	80	2

@@ -2,10 +2,8 @@
 # Run docker/iceberg-rest/up.sh and pass --config "$NOVAROCKS_SQL_TEST_CONFIG".
 [cluster]
 host = "127.0.0.1"
-port = "9030"
+trino_port = "8080"
 user = "root"
-password = ""
-http_port = "8030"
 
 [env]
 url = "http://127.0.0.1:8030"

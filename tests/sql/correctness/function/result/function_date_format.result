@@ -1,15 +1,19 @@
 -- query 3
+-- types	varchar
 date_format(reset_period_data, '%Y-%m-%d %H:%i:%s.%f')
 2023-10-11 00:00:01.030000
 
 -- query 4
+-- types	integer
 length(date_format(reset_period_data, '%Y-%m-%d %H:%i:%s.tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt%f'))
 126
 
 -- query 5
+-- types	bigint
 ifnull(length(date_format(reset_period_data, '%Y-%m-%d %H:%i:%s.tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt%f')), -1)
 -1
 
 -- query 6
+-- types	bigint
 ifnull(length(date_format(reset_period_data, '%Y-%m-%d %H:%i:%s.ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt%ftttttttt')), -1)
 -1

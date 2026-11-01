@@ -74,7 +74,7 @@ INSERT INTO ${case_db}.fragment_execution_failure VALUES (3, 5);
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.unexpected
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.unexpected]
+-- @expect_error=[query.execution.unexpected]
 -- @be_log_count_at_least=NOVAROCKS_TASK_EXECUTION_FAILURE_INJECTED,1
 -- Participant counts cannot be pinned to the cluster size: a context exists
 -- only where a task is placed, and which backends get the table's splits is

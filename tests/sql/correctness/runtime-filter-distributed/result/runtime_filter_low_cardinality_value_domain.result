@@ -1,7 +1,9 @@
 -- query 9
+-- types	varchar	bigint	bigint
 mode	row_count	payload_sum
 rf_off	800	2402400
 
 -- query 11
+-- types	varchar	bigint	bigint
 mode	row_count	payload_sum
 rf_on	800	2402400

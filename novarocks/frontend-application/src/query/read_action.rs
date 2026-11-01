@@ -124,7 +124,7 @@ pub(super) async fn prepare_read(
         .observation
         .as_ref()
         .and_then(|h| h.statement_target())
-        .map(|(run, nominated, _connection_id)| {
+        .map(|(run, nominated)| {
             crate::mv::test_controls::MvRewriteStatementTarget::new(
                 input.statement_token,
                 nominated,

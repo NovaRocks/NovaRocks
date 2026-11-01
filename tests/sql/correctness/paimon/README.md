@@ -23,3 +23,7 @@ The suite covers append-only files and codecs, current-snapshot deduplicate
 merge semantics, field-ID schema evolution, engine-side filter/limit behavior,
 read-only capability rejection, unsupported Paimon encodings, and one
 Iceberg/Paimon cross-catalog query.
+
+SQL runner 经 Trino HTTP 协议访问 FE；配置使用 `[cluster].trino_port`（生成环境为 `NOVA_ENV_TRINO_PORT`），命令行覆盖使用 `--trino-port`。golden 的类型、单元格与迁移规则见 [SQL README](../../README.md#golden-格式)。
+
+此配置说明不改变本 suite 的 DISABLED 状态；保留的 fixture 不会由默认 CI 准备。

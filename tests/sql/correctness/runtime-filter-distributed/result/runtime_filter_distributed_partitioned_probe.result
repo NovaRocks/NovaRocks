@@ -1,7 +1,9 @@
 -- query 13
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 partitioned_probe	1000	1001000
 
 -- query 16
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 partitioned_probe	1000	1001000

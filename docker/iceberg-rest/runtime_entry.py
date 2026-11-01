@@ -299,7 +299,7 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             values.update(oss_ak=ak, oss_sk=sk)
         if "rest-mv" in record["images"]:
             values.update(iceberg_rest_mv_uri=endpoint["rest_mv_uri"], iceberg_rest_mv_warehouse=warehouse["rest_mv_client"])
-        text_file(staging, "sql-test.toml", '[cluster]\nhost = "127.0.0.1"\nport = ' + json_string(ports["mysql"]) + '\nuser = "root"\npassword = ""\n\n[env]\n' + ''.join(f'{key} = {json_string(value)}\n' for key, value in sorted(values.items())))
+        text_file(staging, "sql-test.toml", '[cluster]\nhost = "127.0.0.1"\ntrino_port = ' + json_string(ports["trino"]) + '\nuser = "root"\n\n[env]\n' + ''.join(f'{key} = {json_string(value)}\n' for key, value in sorted(values.items())))
         sql_values = {"type": "iceberg", "iceberg.catalog.type": "rest", "uri": endpoint["rest_uri"], "warehouse": rest,
                       "aws.s3.endpoint": store_endpoint,
                       "aws.s3.region": region, "aws.s3.enable_path_style_access": path_style}

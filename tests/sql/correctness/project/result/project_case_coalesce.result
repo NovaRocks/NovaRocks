@@ -1,3 +1,5 @@
+-- query 4
+-- types	integer	varchar	varchar
 id	grade	note_norm
 1	A	top
 2	B	EMPTY

@@ -1,19 +1,24 @@
 -- query 3
+-- legacy
 region	mn	mx	c
 east	10	50	5
 
 -- query 5
+-- legacy
 region	mn	mx	c
 east	20	50	4
 
 -- query 6
+-- types	varchar	bigint	bigint	bigint
 region	mn	mx	c
 east	20	50	4
 
 -- query 8
+-- legacy
 region	mn	mx	c
 east	20	40	3
 
 -- query 9
+-- types	varchar	bigint	bigint	bigint
 region	mn	mx	c
 east	20	40	3

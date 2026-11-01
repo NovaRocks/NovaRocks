@@ -1,22 +1,26 @@
 -- query 6
+-- types	integer	integer	varchar
 id	v	c
 1	10	NULL
 2	20	NULL
 3	30	three
 
 -- query 8
+-- types	integer	integer	varchar
 id	val	c
 1	10	NULL
 2	20	NULL
 3	30	three
 
 -- query 10
+-- types	bigint	integer	varchar
 id	val	c
 1	10	NULL
 2	20	NULL
 3	30	three
 
 -- query 12
+-- types	bigint	integer
 id	val
 1	10
 2	20

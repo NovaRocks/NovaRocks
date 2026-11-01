@@ -1,4 +1,5 @@
 -- query 1
+-- legacy
 id	name	added
 1	after-a	added-a
 2	before-b	NULL

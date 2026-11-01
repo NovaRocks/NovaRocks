@@ -1,13 +1,16 @@
 -- query 2
+-- shell
 0
 IRU9_EMPTY_BIGINT_OK rows=0 snapshot=absent id=optional-long row-lineage=true
 IRU9_FIXTURE_COMPLETE
 
 -- query 8
+-- types	bigint
 remaining_rows
 0
 
 -- query 12
+-- shell
 0
 IRU9_EMPTY_REGION_OK rows=0 snapshot=absent id=optional-long partition=identity(region)
 IRU9_FIXTURE_COMPLETE

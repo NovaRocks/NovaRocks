@@ -75,3 +75,5 @@ nullability and have no data files or snapshot, including for the row-lineage
 and region-partition targets. Pure Variant function SQL and both pushdown
 oracles remain unchanged; existing function or empty-snapshot failures remain
 visible instead of being accepted as fixture setup failures.
+
+SQL runner 经 Trino HTTP 协议访问 FE；配置使用 `[cluster].trino_port`（生成环境为 `NOVA_ENV_TRINO_PORT`），命令行覆盖使用 `--trino-port`。golden 的类型、单元格与迁移规则见 [SQL README](../../README.md#golden-格式)。

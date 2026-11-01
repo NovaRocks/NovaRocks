@@ -1,9 +1,11 @@
 -- query 5
+-- types	bigint	bigint
 a	b
 3	4
 8	9
 
 -- query 6
+-- types	bigint	bigint
 a	b
 3	4
 8	9

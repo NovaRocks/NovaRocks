@@ -1,24 +1,29 @@
 -- query 10
+-- types	bigint	bigint
 dairy_cnt	snack_cnt
 50	50
 
 -- query 11
+-- types	bigint
 acd
 50
 
 -- query 12
+-- types	varchar	bigint
 category_l1	c
 Baby	800
 Dairy	800
 Snacks	800
 
 -- query 17
+-- types	varchar	bigint	bigint
 category_l1	c	s
 Baby	800	192900
 Dairy	800	193200
 Snacks	800	193100
 
 -- query 24
+-- types	varchar	bigint
 region	s
 east	39600
 north	39600

@@ -1,7 +1,9 @@
 -- query 5
+-- types	varchar
 c1
 NULL
 
 -- query 6
+-- types	varchar	bigint
 c1	count(*)
 NULL	1500

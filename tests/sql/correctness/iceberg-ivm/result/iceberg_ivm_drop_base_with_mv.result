@@ -1,3 +1,5 @@
+-- query 6
+-- types	bigint	varchar	bigint
 id	region	amount
 1	east	10
 2	west	20

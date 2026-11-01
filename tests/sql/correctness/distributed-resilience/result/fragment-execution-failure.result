@@ -9,5 +9,6 @@
 -- query 5
 
 -- query 6
+-- types	bigint
 count(*)
 3

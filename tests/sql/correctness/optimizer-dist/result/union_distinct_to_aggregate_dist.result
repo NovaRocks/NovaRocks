@@ -1,4 +1,5 @@
 -- query 9
+-- types	integer	varchar
 k	s
 1	a
 2	NULL
@@ -6,5 +7,6 @@ k	s
 NULL	n
 
 -- query 10
+-- types	bigint
 distinct_rows
 4

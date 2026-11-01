@@ -1,15 +1,18 @@
 -- query 3
+-- types	bigint	bigint
 id	amount
 1	10
 2	20
 
 -- query 5
+-- legacy
 id	amount
 1	10
 2	25
 3	30
 
 -- query 7
+-- legacy
 id	amount
 1	10
 2	25

@@ -1,39 +1,49 @@
 -- query 8
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 inner_int	3	10
 
 -- query 10
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 inner_int	3	10
 
 -- query 12
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 left_semi_string	3	10
 
 -- query 14
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 left_semi_string	3	10
 
 -- query 16
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 multi_column	3	10
 
 -- query 18
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 multi_column	3	10
 
 -- query 20
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 decimal_key	3	10
 
 -- query 22
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 decimal_key	3	10
 
 -- query 24
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 empty_build	0	0
 
 -- query 26
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 empty_build	0	0

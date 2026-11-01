@@ -1,4 +1,5 @@
 -- query 2
+-- legacy
 id	kind
 1	NULL
 2	Null
@@ -26,5 +27,6 @@ id	kind
 24	Uuid
 
 -- query 3
+-- legacy
 id	nested_a
 3	7

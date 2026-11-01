@@ -1,25 +1,30 @@
 -- query 1
+-- types	bigint	double
 cnt	sum_val
-6	210
+6	210.0
 
 -- query 2
+-- types	varchar	bigint	double
 ym	cnt	sum_val
-2024-01	3	70
-2024-02	2	80
-2024-03	1	60
+2024-01	3	70.0
+2024-02	2	80.0
+2024-03	1	60.0
 
 -- query 3
+-- types	bigint	double
 id	val
-1	10
-2	20
-4	40
+1	10.0
+2	20.0
+4	40.0
 
 -- query 4
+-- types	bigint	double
 cnt	total
-5	1000
+5	1000.0
 
 -- query 5
+-- types	varchar	bigint	double
 city	cnt	total
-Beijing	3	500
-Guangzhou	1	300
-Shanghai	1	200
+Beijing	3	500.0
+Guangzhou	1	300.0
+Shanghai	1	200.0

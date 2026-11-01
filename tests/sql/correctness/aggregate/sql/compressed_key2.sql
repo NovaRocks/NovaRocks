@@ -63,7 +63,27 @@ insert into t3 values (1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1);
 
 -- query 6
 USE ${case_db};
-select distinct c_2_0, c_2_1, c_2_2, c_2_3, c_2_4, c_2_5, c_2_6, c_2_7, c_2_8, c_2_9, c_2_10, c_2_11, c_2_12, c_2_13, c_2_14, c_2_15 from t3 order by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16;
+SELECT
+  CAST(trc2_output.c_2_0 AS VARCHAR) AS c_2_0,
+  CAST(trc2_output.c_2_1 AS VARCHAR) AS c_2_1,
+  CAST(trc2_output.c_2_2 AS VARCHAR) AS c_2_2,
+  CAST(trc2_output.c_2_3 AS VARCHAR) AS c_2_3,
+  CAST(trc2_output.c_2_4 AS VARCHAR) AS c_2_4,
+  CAST(trc2_output.c_2_5 AS VARCHAR) AS c_2_5,
+  CAST(trc2_output.c_2_6 AS VARCHAR) AS c_2_6,
+  CAST(trc2_output.c_2_7 AS VARCHAR) AS c_2_7,
+  CAST(trc2_output.c_2_8 AS VARCHAR) AS c_2_8,
+  CAST(trc2_output.c_2_9 AS VARCHAR) AS c_2_9,
+  CAST(trc2_output.c_2_10 AS VARCHAR) AS c_2_10,
+  CAST(trc2_output.c_2_11 AS VARCHAR) AS c_2_11,
+  CAST(trc2_output.c_2_12 AS VARCHAR) AS c_2_12,
+  CAST(trc2_output.c_2_13 AS VARCHAR) AS c_2_13,
+  CAST(trc2_output.c_2_14 AS VARCHAR) AS c_2_14,
+  CAST(trc2_output.c_2_15 AS VARCHAR) AS c_2_15
+FROM (
+  select distinct c_2_0, c_2_1, c_2_2, c_2_3, c_2_4, c_2_5, c_2_6, c_2_7, c_2_8, c_2_9, c_2_10, c_2_11, c_2_12, c_2_13, c_2_14, c_2_15 from t3 order by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+) AS trc2_output
+ORDER BY trc2_output.c_2_0, trc2_output.c_2_1, trc2_output.c_2_2, trc2_output.c_2_3, trc2_output.c_2_4, trc2_output.c_2_5, trc2_output.c_2_6, trc2_output.c_2_7, trc2_output.c_2_8, trc2_output.c_2_9, trc2_output.c_2_10, trc2_output.c_2_11, trc2_output.c_2_12, trc2_output.c_2_13, trc2_output.c_2_14, trc2_output.c_2_15;
 
 -- query 7
 -- @skip_result_check=true

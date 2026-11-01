@@ -1436,6 +1436,19 @@ fn statement_execution_source<'a>(
 }
 
 impl FrontendQuerySession {
+    fn statement_logical_execution_launcher(&self) -> Arc<dyn LogicalExecutionLauncher> {
+        let launcher = Arc::clone(&self.service.logical_execution_launcher);
+        match &self.origin {
+            novarocks_query_application::session_control::SessionOrigin::ClientStatement(id) => {
+                crate::query_execution::logical_execution::trace_client_statement(
+                    launcher,
+                    id.clone(),
+                )
+            }
+            novarocks_query_application::session_control::SessionOrigin::Connection(_) => launcher,
+        }
+    }
+
     fn governed_statement_begin_error(
         &self,
         error: GovernedQueryStatementBeginError,
@@ -2175,7 +2188,7 @@ impl FrontendQuerySession {
                     sql,
                     context,
                     query_options,
-                    launcher: Arc::clone(&self.service.logical_execution_launcher),
+                    launcher: self.statement_logical_execution_launcher(),
                     #[cfg(novarocks_dev_controls)]
                     observation,
                 },
@@ -2211,7 +2224,7 @@ impl FrontendQuerySession {
                         sql,
                         context,
                         query_options,
-                        launcher: Arc::clone(&self.service.logical_execution_launcher),
+                        launcher: self.statement_logical_execution_launcher(),
                         #[cfg(novarocks_dev_controls)]
                         observation,
                     },
@@ -2234,7 +2247,7 @@ impl FrontendQuerySession {
                         sql,
                         context,
                         query_options,
-                        launcher: Arc::clone(&self.service.logical_execution_launcher),
+                        launcher: self.statement_logical_execution_launcher(),
                         #[cfg(novarocks_dev_controls)]
                         observation,
                     },
@@ -2290,7 +2303,7 @@ impl FrontendQuerySession {
                     sql,
                     context,
                     query_options,
-                    launcher: Arc::clone(&self.service.logical_execution_launcher),
+                    launcher: self.statement_logical_execution_launcher(),
                     #[cfg(novarocks_dev_controls)]
                     observation,
                 },

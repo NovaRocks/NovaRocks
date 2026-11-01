@@ -1,3 +1,5 @@
+-- query 4
+-- types	integer	integer	varchar
 id	k	s
 3	1	z
 2	2	x

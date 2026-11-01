@@ -33,7 +33,7 @@ pub fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
 }
 
 pub fn extract_engine_error_code(actual: &str) -> Option<String> {
-    let message = engine_error_message_body(actual);
+    let message = engine_error_message_body(actual)?;
     let candidate_start = message.strip_prefix('[')?;
     let close_idx = candidate_start.find(']')?;
     let candidate = &candidate_start[..close_idx];
@@ -52,7 +52,7 @@ fn extract_sql_error_code_with_descriptors(
     actual: &str,
     descriptors: &[SqlErrorDescriptor],
 ) -> Option<String> {
-    let message = engine_error_message_body(actual);
+    let message = engine_error_message_body(actual)?;
     let candidate_start = message.strip_prefix('[')?;
     let close_idx = candidate_start.find(']')?;
     let candidate = &candidate_start[..close_idx];
@@ -68,13 +68,13 @@ pub fn extract_sql_error_location(actual: &str) -> Option<SqlErrorLocation> {
         Regex::new(r"(?i)\b(?:at\s+)?line\s+(\d+)\s*(?:,?\s*(?:column|col)\s+|:)(\d+)\b")
             .expect("static SQL error location regex compiles")
     });
-    let captures = re.captures(engine_error_message_body(actual))?;
+    let captures = re.captures(engine_error_message_body(actual)?)?;
     let line = captures.get(1)?.as_str().parse().ok()?;
     let column = captures.get(2)?.as_str().parse().ok()?;
     (line > 0 && column > 0).then_some(SqlErrorLocation { line, column })
 }
 
-fn engine_error_message_body(actual: &str) -> &str {
+fn engine_error_message_body(actual: &str) -> Option<&str> {
     let mut rest = actual.trim_start();
     loop {
         if let Some(stripped) = strip_runner_error_prefix(rest) {
@@ -85,16 +85,26 @@ fn engine_error_message_body(actual: &str) -> &str {
             rest = stripped.trim_start();
             continue;
         }
-        if let Some(stripped) = strip_mysql_error_debug_wrapper(rest) {
-            rest = stripped.trim_start();
-            continue;
-        }
-        if let Some(stripped) = strip_mysql_error_prefix(rest) {
-            rest = stripped.trim_start();
-            continue;
-        }
-        return rest;
+        break;
     }
+    // HTTP/transport/protocol diagnostics carry arbitrary text. Their body
+    // cannot grant a product error identity or SQL source location.
+    if [
+        "TrinoHttp {",
+        "TrinoTransport {",
+        "Trino statement deadline expired",
+        "Unsupported Trino session change header",
+        "Trino protocol failure",
+    ]
+    .iter()
+    .any(|prefix| rest.starts_with(prefix))
+    {
+        return None;
+    }
+    if rest.starts_with("TrinoError { ") {
+        return strip_trino_error_prefix(rest).map(str::trim_start);
+    }
+    Some(rest)
 }
 
 fn strip_statement_failure_context(message: &str) -> Option<&str> {
@@ -116,6 +126,11 @@ fn strip_statement_failure_context(message: &str) -> Option<&str> {
 }
 
 fn strip_runner_error_prefix(message: &str) -> Option<&str> {
+    for prefix in ["target execute failed: ", "record source execute failed: "] {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            return Some(rest);
+        }
+    }
     for prefix in ["ERROR (", "FAIL ("] {
         let Some(rest) = message.strip_prefix(prefix) else {
             continue;
@@ -126,30 +141,11 @@ fn strip_runner_error_prefix(message: &str) -> Option<&str> {
     None
 }
 
-fn strip_mysql_error_debug_wrapper(message: &str) -> Option<&str> {
-    let rest = message.strip_prefix("MySqlError { ")?;
-    let rest = rest.strip_suffix(" }").unwrap_or(rest);
-    if rest.starts_with("ERROR ") {
-        Some(rest)
-    } else {
-        None
-    }
-}
-
-fn strip_mysql_error_prefix(message: &str) -> Option<&str> {
-    let rest = message.strip_prefix("ERROR ")?;
-    let mut rest = rest.strip_prefix(|ch: char| ch.is_ascii_digit())?;
-    while let Some(stripped) = rest.strip_prefix(|ch: char| ch.is_ascii_digit()) {
-        rest = stripped;
-    }
-    let rest = rest.strip_prefix(" (")?;
-    let close_idx = rest.find("): ")?;
-    let sql_state = &rest[..close_idx];
-    if sql_state.len() == 5 && sql_state.chars().all(|ch| ch.is_ascii_alphanumeric()) {
-        Some(&rest[close_idx + "): ".len()..])
-    } else {
-        None
-    }
+fn strip_trino_error_prefix(message: &str) -> Option<&str> {
+    message
+        .strip_prefix("TrinoError { ")?
+        .split_once(" }: ")
+        .map(|(_, body)| body)
 }
 
 pub fn is_transient_iceberg_commit_error(message: &str) -> bool {
@@ -197,8 +193,8 @@ pub fn summarize_connection(label: &str, conn: &ConnectionConfig) -> String {
     let catalog = conn.catalog.as_deref().unwrap_or("");
     let db = conn.db.as_deref().unwrap_or("");
     format!(
-        "{}: mysql={}, host={}:{}, user={}, catalog={}, db={}",
-        label, conn.mysql, conn.host, conn.port, conn.user, catalog, db
+        "{}: trino_http={}:{}, user={}, catalog={}, db={}",
+        label, conn.host, conn.port, conn.user, catalog, db
     )
 }
 
@@ -208,8 +204,7 @@ mod tests {
 
     #[test]
     fn extract_engine_error_code_reads_bracket_prefix() {
-        let actual =
-            "ERROR 1105 (HY000): [IcebergWriteDescriptorMismatch] missing partition descriptor";
+        let actual = "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [IcebergWriteDescriptorMismatch] missing partition descriptor";
 
         assert_eq!(
             extract_engine_error_code(actual),
@@ -226,8 +221,8 @@ mod tests {
     }
 
     #[test]
-    fn extract_engine_error_code_reads_mysql_error_debug_wrapper() {
-        let actual = "FAIL (0.00s): MySqlError { ERROR 1235 (42000): [UnsupportedDistributedDmlShape] ADMIN RAISE ENGINE ERROR: forced P8 SQL runner error-code smoke }";
+    fn extract_engine_error_code_reads_trino_error_wrapper() {
+        let actual = "FAIL (0.00s): TrinoError { name=NOT_SUPPORTED type=USER_ERROR code=13 }: [UnsupportedDistributedDmlShape] ADMIN RAISE ENGINE ERROR: forced P8 SQL runner error-code smoke";
 
         assert_eq!(
             extract_engine_error_code(actual),
@@ -237,7 +232,7 @@ mod tests {
 
     #[test]
     fn extract_engine_error_code_reads_statement_failure_context() {
-        let actual = "FAIL (0.00s): statement 1/1 (sha256=373d888744767278a2480d0ec9a6cf1de16a3c52ab3c7501ddbd79bf7c34f40e): MySqlError { ERROR 1235 (42000): [UnsupportedDistributedDmlShape] forced failure }";
+        let actual = "FAIL (0.00s): statement 1/1 (sha256=373d888744767278a2480d0ec9a6cf1de16a3c52ab3c7501ddbd79bf7c34f40e): TrinoError { name=NOT_SUPPORTED type=USER_ERROR code=13 }: [UnsupportedDistributedDmlShape] forced failure";
         assert_eq!(
             extract_engine_error_code(actual),
             Some("UnsupportedDistributedDmlShape".to_string())
@@ -246,7 +241,7 @@ mod tests {
 
     #[test]
     fn extract_engine_error_code_rejects_malformed_statement_failure_context() {
-        let actual = "FAIL (0.00s): statement 1/1 (sha256=not-a-digest): MySqlError { ERROR 1235 (42000): [UnsupportedDistributedDmlShape] forced failure }";
+        let actual = "FAIL (0.00s): statement 1/1 (sha256=not-a-digest): TrinoError { name=NOT_SUPPORTED type=USER_ERROR code=13 }: [UnsupportedDistributedDmlShape] forced failure";
         assert_eq!(extract_engine_error_code(actual), None);
     }
 
@@ -256,7 +251,7 @@ mod tests {
             code: "UnsupportedCompiledShape",
             phase: crate::sql_error_codes::SqlErrorPhase::Execution,
         }];
-        let actual = "ERROR 1105 (HY000): [UnsupportedCompiledShape] FULL OUTER hash join";
+        let actual = "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [UnsupportedCompiledShape] FULL OUTER hash join";
         assert_eq!(
             extract_sql_error_code_with_descriptors(actual, &registered).as_deref(),
             Some("UnsupportedCompiledShape"),
@@ -267,11 +262,11 @@ mod tests {
             Some("UnsupportedCompiledShape")
         );
         for invalid in [
-            "ERROR 1105 (HY000): [CommitUnknown] FULL OUTER hash join",
-            "ERROR 1105 (HY000): [UnsupportedcompiledShape] FULL OUTER hash join",
-            "ERROR 1105 (HY000): [UnsupportedCompiledShapeX] FULL OUTER hash join",
-            "ERROR 1105 (HY000): [NotARealCode] FULL OUTER hash join",
-            "ERROR 1105 (HY000): ordinary diagnostic near [UnsupportedCompiledShape]",
+            "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [CommitUnknown] FULL OUTER hash join",
+            "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [UnsupportedcompiledShape] FULL OUTER hash join",
+            "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [UnsupportedCompiledShapeX] FULL OUTER hash join",
+            "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [NotARealCode] FULL OUTER hash join",
+            "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: ordinary diagnostic near [UnsupportedCompiledShape]",
         ] {
             assert_eq!(
                 extract_sql_error_code_with_descriptors(invalid, &registered),
@@ -284,7 +279,7 @@ mod tests {
     fn extract_sql_error_code_keeps_dotted_codes_separate_from_engine_codes() {
         assert_eq!(
             extract_sql_error_code(
-                "ERROR 1064 (42000): [sql.parse.unexpected_token] unexpected FROM"
+                "TrinoError { name=SYNTAX_ERROR type=USER_ERROR code=1 }: [sql.parse.unexpected_token] unexpected FROM"
             ),
             Some("sql.parse.unexpected_token".to_string())
         );
@@ -295,7 +290,7 @@ mod tests {
     fn extract_sql_error_location_requires_line_and_column() {
         assert_eq!(
             extract_sql_error_location(
-                "ERROR 1064 (42000): [sql.parse.unexpected_token] at line 7, column 11: unexpected FROM"
+                "TrinoError { name=SYNTAX_ERROR type=USER_ERROR code=1 }: [sql.parse.unexpected_token] at line 7, column 11: unexpected FROM"
             ),
             Some(SqlErrorLocation {
                 line: 7,
@@ -303,22 +298,77 @@ mod tests {
             })
         );
         assert_eq!(
-            extract_sql_error_location("ERROR 1064 (42000): at line 7: incomplete location"),
+            extract_sql_error_location(
+                "TrinoError { name=SYNTAX_ERROR type=USER_ERROR code=1 }: at line 7: incomplete location"
+            ),
             None
         );
     }
 
     #[test]
-    fn extract_engine_error_code_rejects_malformed_mysql_error_debug_wrapper() {
-        let actual = "FAIL (0.00s): MySqlError { [CommitUnknown] bare wrapper }";
+    fn extract_engine_error_code_rejects_malformed_trino_error_wrapper() {
+        let actual = "FAIL (0.00s): TrinoError { [CommitUnknown] bare wrapper }";
 
         assert_eq!(extract_engine_error_code(actual), None);
     }
 
     #[test]
+    fn retired_mysql_carriers_do_not_establish_product_error_identity() {
+        for actual in [
+            "ERROR 1105 (HY000): [CommitUnknown] unavailable",
+            "FAIL (0.00s): MySqlError { ERROR 1235 (42000): [UnsupportedCompiledShape] unavailable }",
+            "ERROR 1064 (42000): [sql.parse.unexpected_token] unexpected FROM",
+        ] {
+            assert_eq!(extract_engine_error_code(actual), None);
+            assert_eq!(extract_sql_error_code(actual), None);
+        }
+    }
+
+    #[test]
+    fn statement_failure_context_preserves_trino_sql_identity_and_location() {
+        let actual = "FAIL (0.02s): statement 2/3 (sha256=373d888744767278a2480d0ec9a6cf1de16a3c52ab3c7501ddbd79bf7c34f40e): TrinoError { name=SYNTAX_ERROR type=USER_ERROR code=1 }: [sql.parse.unexpected_token] at line 7, column 11: unexpected FROM";
+        assert_eq!(
+            extract_sql_error_code(actual).as_deref(),
+            Some("sql.parse.unexpected_token")
+        );
+        assert_eq!(
+            extract_sql_error_location(actual),
+            Some(SqlErrorLocation {
+                line: 7,
+                column: 11
+            })
+        );
+    }
+
+    #[test]
+    fn non_domain_carriers_cannot_spoof_product_error_identity_or_location() {
+        for outer in [
+            "TrinoHttp { status=503 }: ",
+            "TrinoTransport { Trino transport failure }: ",
+            "Trino statement deadline expired: ",
+            "Unsupported Trino session change header: ",
+            "Trino protocol failure: ",
+        ] {
+            for body in [
+                "TrinoError { name=SYNTAX_ERROR type=USER_ERROR code=1 }: [sql.parse.unexpected_token] at line 1 column 2",
+                "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [CommitUnknown] at line 1 column 2",
+            ] {
+                let message = format!(
+                    "FAIL (0.02s): statement 1/1 (sha256=373d888744767278a2480d0ec9a6cf1de16a3c52ab3c7501ddbd79bf7c34f40e): {outer}{body}"
+                );
+                assert_eq!(extract_engine_error_code(&message), None, "{message}");
+                assert_eq!(extract_sql_error_code(&message), None, "{message}");
+                assert_eq!(extract_sql_error_location(&message), None, "{message}");
+            }
+        }
+    }
+
+    #[test]
     fn extract_engine_error_code_rejects_non_prefix_brackets() {
         assert_eq!(
-            extract_engine_error_code("ERROR 1105 (HY000): validation failed near [CommitUnknown]"),
+            extract_engine_error_code(
+                "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: validation failed near [CommitUnknown]"
+            ),
             None
         );
         assert_eq!(
@@ -330,7 +380,9 @@ mod tests {
     #[test]
     fn extract_engine_error_code_returns_none_for_plain_error() {
         assert_eq!(
-            extract_engine_error_code("ERROR 1105 (HY000): plain error"),
+            extract_engine_error_code(
+                "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: plain error"
+            ),
             None
         );
     }
@@ -338,11 +390,15 @@ mod tests {
     #[test]
     fn extract_engine_error_code_rejects_lowercase_and_punctuation() {
         assert_eq!(
-            extract_engine_error_code("ERROR 1105 (HY000): [icebergWriteDescriptorMismatch] bad"),
+            extract_engine_error_code(
+                "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [icebergWriteDescriptorMismatch] bad"
+            ),
             None
         );
         assert_eq!(
-            extract_engine_error_code("ERROR 1105 (HY000): [Iceberg-Write] bad"),
+            extract_engine_error_code(
+                "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [Iceberg-Write] bad"
+            ),
             None
         );
     }
@@ -350,7 +406,9 @@ mod tests {
     #[test]
     fn extract_engine_error_code_rejects_unknown_code_name() {
         assert_eq!(
-            extract_engine_error_code("ERROR 1105 (HY000): [NotARealCode] bad"),
+            extract_engine_error_code(
+                "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [NotARealCode] bad"
+            ),
             None
         );
     }

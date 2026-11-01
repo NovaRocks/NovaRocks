@@ -1,59 +1,74 @@
 -- query 2
+-- types	varchar
 group_concat(v ORDER BY id ASC SEPARATOR ', ')
 a, b
 
 -- query 3
+-- types	varchar
 value
 a-b
 
 -- query 4
+-- types	varchar
 value
 a-,b-
 
 -- query 5
+-- types	varchar
 value
 a-b
 
 -- query 6
+-- types	varchar
 value
 a-,b-
 
 -- query 7
+-- types	varchar
 value
 a-b
 
 -- query 8
+-- types	varchar
 value
 a-|b-
 
 -- query 9
+-- types	varchar
 value
 a|b
 
 -- query 11
+-- types	varchar
 value
 a-,b-
 
 -- query 12
+-- types	varchar
 value
 a|b
 
 -- query 14
+-- types	varchar
 value
 a-,b-
 
 -- query 16
+-- types	varchar
 value
 a-b
 
 -- query 18
+-- types	varchar
 value
 a-b
 
 -- query 20
+-- types	varchar
 value
 a, b
 
 -- query 21
+-- types	varchar
 value
 a-,b-

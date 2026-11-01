@@ -1,9 +1,11 @@
 -- query 4
+-- types	date	bigint
 dt	sum(col_int)
 2023-12-03	4002
 2023-12-04	4002
 
 -- query 5
+-- types	date	bigint
 dt	sum(col_int)
 2023-12-01	4000
 2023-12-02	4000
@@ -11,12 +13,15 @@ dt	sum(col_int)
 2023-12-04	4002
 
 -- query 7
+-- types	varchar	boolean	varchar
 TABLE_NAME	IS_ACTIVE	INACTIVE_REASON
-test_mv1	1	NULL
+test_mv1	true	NULL
 
 -- query 11
+-- types	date	bigint
 dt	sum(col_int)
 
 -- query 12
+-- legacy
 dt	s
 2023-12-01	4000

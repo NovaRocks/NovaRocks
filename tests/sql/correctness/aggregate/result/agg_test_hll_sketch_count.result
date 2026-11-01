@@ -1,45 +1,55 @@
 -- query 4
+-- types	boolean	boolean	boolean	boolean
 id_ok	province_ok	age_ok	dt_ok
-1	1	1	1
+true	true	true	true
 
 -- query 5
+-- types	boolean	boolean	boolean	boolean
 id_ok	province_ok	age_ok	dt_ok
-1	1	1	1
+true	true	true	true
 
 -- query 6
+-- types	boolean	boolean	boolean	boolean
 id_ok	province_ok	age_ok	dt_ok
-1	1	1	1
+true	true	true	true
 
 -- query 7
+-- types	boolean	boolean	boolean	boolean
 id_ok	province_ok	age_ok	dt_ok
-1	1	1	1
+true	true	true	true
 
 -- query 8
+-- types	boolean	boolean	boolean	boolean
 id_ok	province_ok	age_ok	dt_ok
-1	1	1	1
+true	true	true	true
 
 -- query 9
+-- types	boolean	boolean	boolean	boolean
 id_ok	province_ok	age_ok	dt_ok
-1	1	1	1
+true	true	true	true
 
 -- query 10
+-- types	boolean	boolean	boolean	boolean
 id_ok	province_ok	age_ok	dt_ok
-1	1	1	1
+true	true	true	true
 
 -- query 12
+-- types	bigint	varchar	boolean	boolean	boolean	boolean
 id	province	id_ok	province_ok	age_ok	dt_ok
-1	1	1	1	1	1
-1	a	1	1	1	1
-2	2	1	1	1	1
+1	1	true	true	true	true
+1	a	true	true	true	true
+2	2	true	true	true	true
 
 -- query 13
+-- types	bigint	varchar	boolean	boolean	boolean	boolean
 id	province	id_ok	province_ok	age_ok	dt_ok
-1	1	1	1	1	1
-1	a	1	1	1	1
-2	2	1	1	1	1
+1	1	true	true	true	true
+1	a	true	true	true	true
+2	2	true	true	true	true
 
 -- query 14
+-- types	bigint	varchar	boolean	boolean	boolean	boolean
 id	province	id_ok	province_ok	age_ok	dt_ok
-1	1	1	1	1	1
-1	a	1	1	1	1
-2	2	1	1	1	1
+1	1	true	true	true	true
+1	a	true	true	true	true
+2	2	true	true	true	true

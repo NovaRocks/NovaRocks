@@ -1,16 +1,20 @@
 -- query 3
+-- types	integer	integer	integer
 l_orderkey	l_partkey	l_suppkey
 2	3	NULL
 
 -- query 4
+-- types	integer	integer	integer
 l_orderkey	l_partkey	l_suppkey
 2	3	NULL
 2	3	2
 
 -- query 7
+-- types	integer	integer	integer
 l_orderkey	l_partkey	l_suppkey
 
 -- query 8
+-- types	integer	integer	integer
 l_orderkey	l_partkey	l_suppkey
 1	1	1
 1	2	1
@@ -21,78 +25,96 @@ l_orderkey	l_partkey	l_suppkey
 11	2	1
 
 -- query 9
+-- types	integer	integer	integer
 l_orderkey	l_partkey	l_suppkey
 NULL	NULL	NULL
 2	3	NULL
 
 -- query 10
+-- types	integer	integer	integer
 l_orderkey	l_partkey	l_suppkey
 NULL	NULL	NULL
 2	3	NULL
 2	3	2
 
 -- query 11
+-- types	integer	integer	integer
 l_orderkey	l_partkey	l_suppkey
 NULL	NULL	NULL
 2	3	NULL
 2	3	2
 
 -- query 13
+-- types	bigint
 count(*)
 7192
 
 -- query 14
+-- types	bigint
 count(*)
 7192
 
 -- query 19
+-- types	bigint
 count(*)
 4093
 
 -- query 20
+-- legacy
 count(*)
 0
 
 -- query 21
+-- legacy
 count(*)
 4096
 
 -- query 22
+-- legacy
 count(*)
 0
 
 -- query 23
+-- legacy
 count(*)
 3
 
 -- query 24
+-- legacy
 count(*)
 4096
 
 -- query 27
+-- legacy
 count(*)
 0
 
 -- query 28
+-- legacy
 count(*)
 0
 
 -- query 29
+-- legacy
 count(*)
 0
 
 -- query 30
+-- types	bigint
 count(*)
 4095
 
 -- query 31
+-- legacy
 count(*)
 3
 
 -- query 32
+-- types	bigint
 count(*)
 4095
 
 -- query 33
+-- legacy
 count(*)
 3

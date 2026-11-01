@@ -64,4 +64,63 @@ assert_exit 1 "$fixture/clean" "$fixture/unused"
 assert_exit 2 "$fixture/clean" "$fixture/broken"
 grep -q '^error when handling ' "$fixture/stderr"
 grep -q '^error: cargo-machete could not analyze every manifest' "$fixture/stderr"
+
+# A pending lockfile edit is a valid local input. The stage must reject only
+# changes introduced during this invocation, while preserving tool failures.
+mkdir -p "$fixture/workspace/member/src"
+cat >"$fixture/workspace/Cargo.toml" <<'MANIFEST'
+[workspace]
+members = ["member"]
+resolver = "2"
+MANIFEST
+cat >"$fixture/workspace/member/Cargo.toml" <<'MANIFEST'
+[package]
+name = "lock_guard_member"
+version = "0.1.0"
+edition = "2021"
+MANIFEST
+printf '%s\n' 'pub fn value() -> u8 { 1 }' >"$fixture/workspace/member/src/lib.rs"
+cargo generate-lockfile --offline --manifest-path "$fixture/workspace/Cargo.toml"
+git -C "$fixture/workspace" init -q
+git -C "$fixture/workspace" add Cargo.lock
+cat >"$fixture/workspace/member/Cargo.toml" <<'MANIFEST'
+[package]
+name = "lock_guard_member"
+version = "0.1.1"
+edition = "2021"
+MANIFEST
+cargo generate-lockfile --offline --manifest-path "$fixture/workspace/Cargo.toml"
+if git -C "$fixture/workspace" diff --quiet -- Cargo.lock; then
+  echo "error: lockfile fixture has no pending input edit" >&2
+  exit 1
+fi
+
+assert_workspace_stage() {
+  local expected="$1" action="$2" code=0
+  (
+    cd "$fixture/workspace"
+    case "$action" in
+      real) ;;
+      mutate)
+        ci_run_cargo_machete() {
+          printf '\n# Unexpected tool write.\n' >>Cargo.lock
+        }
+        ;;
+      fail)
+        ci_run_cargo_machete() { return 2; }
+        ;;
+      *) exit 2 ;;
+    esac
+    ci_check_unused_dependencies
+  ) >"$fixture/workspace-stdout" 2>"$fixture/workspace-stderr" || code=$?
+  if [ "$code" -ne "$expected" ]; then
+    cat "$fixture/workspace-stdout" "$fixture/workspace-stderr" >&2
+    echo "error: expected workspace stage exit $expected for $action, got $code" >&2
+    exit 1
+  fi
+}
+assert_workspace_stage 0 real
+assert_workspace_stage 1 mutate
+grep -q '^error: cargo machete modified Cargo.lock' "$fixture/workspace-stderr"
+assert_workspace_stage 2 fail
 echo "unused-dependencies-stage-test: PASS"

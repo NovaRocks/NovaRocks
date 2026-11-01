@@ -1,22 +1,26 @@
 -- query 3
+-- legacy
 user_region	mn	mx	c
 east	25	75	2
 south	99	99	1
 west	40	60	2
 
 -- query 4
+-- types	varchar	bigint	bigint	bigint
 user_region	mn	mx	c
 east	25	75	2
 south	99	99	1
 west	40	60	2
 
 -- query 6
+-- legacy
 user_region	mn	mx	c
 east	75	75	1
 south	99	99	1
 west	40	60	2
 
 -- query 7
+-- types	varchar	bigint	bigint	bigint
 user_region	mn	mx	c
 east	75	75	1
 south	99	99	1

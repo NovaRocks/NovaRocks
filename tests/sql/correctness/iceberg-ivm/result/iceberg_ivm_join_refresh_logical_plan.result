@@ -1,14 +1,17 @@
 -- query 4
+-- legacy
 id	region	category	amount
 1	east	book	10
 2	west	toy	20
 
 -- query 7
+-- legacy
 id	region	category	amount
 2	west	toy	20
 3	north	game	30
 
 -- query 8
+-- types	bigint	varchar	varchar	bigint
 id	region	category	amount
 2	west	toy	20
 3	north	game	30

@@ -80,6 +80,90 @@ pub(crate) trait LogicalExecutionLauncher: Send + Sync + 'static {
     ) -> Result<novarocks_query_application::api::LogicalExecutionStartAttempt, QueryExecutionError>;
 }
 
+/// Bind a client identity only to diagnostics; the original runtime remains
+/// the sole owner of reservations, activation and recovery.
+pub(crate) fn trace_client_statement(
+    inner: Arc<dyn LogicalExecutionLauncher>,
+    client_query_id: novarocks_query_application::session_control::ClientQueryId,
+) -> Arc<dyn LogicalExecutionLauncher> {
+    Arc::new(ClientStatementExecutionTrace {
+        inner,
+        client_query_id,
+    })
+}
+
+struct ClientStatementExecutionTrace {
+    inner: Arc<dyn LogicalExecutionLauncher>,
+    client_query_id: novarocks_query_application::session_control::ClientQueryId,
+}
+
+impl LogicalExecutionLauncher for ClientStatementExecutionTrace {
+    fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError> {
+        let reserved = self.inner.reserve_identity()?;
+        let execution = reserved.execution();
+        tracing::info!(
+            client_query_id = %self.client_query_id,
+            query_id = %execution.query_id(),
+            attempt_id = execution.attempt_id().get(),
+            query_execution_id = ?execution,
+            "Client statement logical execution reservation"
+        );
+        Ok(reserved)
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    fn resolve_statement_observation(
+        &self,
+        nomination: &novarocks_failpoint::target_binding::StatementWorkNomination,
+    ) -> Option<crate::preparation_diagnostics::StatementObservationHandle> {
+        self.inner.resolve_statement_observation(nomination)
+    }
+
+    fn start_read_in(
+        &self,
+        read: &mut Option<PreparedLogicalRead>,
+        owner: &mut Option<WorkOwner>,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        io: &Arc<crate::query::read_action::io_source::ReadMetadataIoSource>,
+        original: &mut OriginalComputationStart,
+        #[cfg(novarocks_dev_controls)] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
+    ) -> Result<novarocks_query_application::api::LogicalExecutionStartAttempt, QueryExecutionError>
+    {
+        self.inner.start_read_in(
+            read,
+            owner,
+            capacity,
+            io,
+            original,
+            #[cfg(novarocks_dev_controls)]
+            observation,
+        )
+    }
+
+    fn start_computation_in(
+        &self,
+        computation: &mut Option<PreparedLogicalComputation>,
+        owner: &mut Option<WorkOwner>,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        original: &mut OriginalComputationStart,
+        #[cfg(novarocks_dev_controls)] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
+    ) -> Result<novarocks_query_application::api::LogicalExecutionStartAttempt, QueryExecutionError>
+    {
+        self.inner.start_computation_in(
+            computation,
+            owner,
+            capacity,
+            original,
+            #[cfg(novarocks_dev_controls)]
+            observation,
+        )
+    }
+}
+
 /// Fixed fields inside the statement's existing stable action. These are
 /// original QA inputs/results, not another execution identity or task owner.
 #[derive(Default)]

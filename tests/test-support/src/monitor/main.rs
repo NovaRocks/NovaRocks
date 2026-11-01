@@ -144,6 +144,23 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
         .ok_or_else(|| unix::error("invalid payload complete deadline"))?
         .parse()
         .map_err(unix::error)?;
+    let group_exit_until: u64 = next_arg(&mut args)?
+        .to_str()
+        .ok_or_else(|| unix::error("invalid group observation deadline"))?
+        .parse()
+        .map_err(unix::error)?;
+    if group_exit_until > deadline {
+        return Err(unix::error(
+            "group observation cannot extend the original deadline",
+        ));
+    }
+    let group_deadline = if group_exit_until == 0 {
+        complete
+    } else if complete == 0 {
+        group_exit_until
+    } else {
+        complete.min(group_exit_until)
+    };
     if (work == 0) != (complete == 0) || (work != 0 && work >= complete) {
         return Err(unix::error("invalid payload lifetime clocks"));
     }
@@ -414,7 +431,7 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
     let mut group_exit_observed = false;
     let mut group_exit_observed_ns = 0;
     let mut group_observation_failed = false;
-    if work != 0 {
+    if work != 0 || group_exit_until != 0 {
         // The unreaped leader pins the PGID through actual group observation.
         // A late or unknown exit publishes incomplete, never cleanup success.
         loop {
@@ -424,7 +441,7 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
                     match unix::clock_ns() {
                         Ok(now) => {
                             group_exit_observed_ns = now;
-                            if now >= complete {
+                            if now >= group_deadline {
                                 failures.push(
                                     "original group exit observed after complete deadline".into(),
                                 );
@@ -440,7 +457,7 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
                 }
                 Ok(true) => {
                     let late = match unix::clock_ns() {
-                        Ok(now) => now >= complete,
+                        Ok(now) => now >= group_deadline,
                         Err(error) => {
                             if !group_observation_failed {
                                 failures.push(format!("observe group exit clock: {error}"));

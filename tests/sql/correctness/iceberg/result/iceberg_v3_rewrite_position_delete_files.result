@@ -1,4 +1,5 @@
 -- query 2
+-- types	integer	integer	integer
 id	user_id	amount
 1	10	100
 3	30	300
@@ -6,6 +7,7 @@ id	user_id	amount
 7	70	700
 
 -- query 4
+-- types	integer	integer	integer
 id	user_id	amount
 1	10	100
 3	30	300
@@ -13,5 +15,6 @@ id	user_id	amount
 7	70	700
 
 -- query 5
+-- types	bigint
 puffin_delete_files
 4

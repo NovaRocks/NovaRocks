@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	bigint	decimal(38, 2)
 cntrycode	numcust	totacctbal
 21	955	7235832.66
 24	921	6871024.00

@@ -1,15 +1,19 @@
 -- query 4
+-- types	bigint	bigint
 n_main_rows	n_main_unique
 3	3
 
 -- query 5
+-- legacy
 n_main_diverged
 0
 
 -- query 6
+-- types	bigint	bigint
 n_branch_rows	n_branch_unique
 3	3
 
 -- query 7
+-- types	boolean
 row_id_preserved_under_branch_update
-1
+true

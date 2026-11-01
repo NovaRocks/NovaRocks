@@ -1,2 +1,4 @@
+-- query 1
+-- types	boolean	boolean	boolean	boolean	boolean
 abs_eq_zero	bool_eq_one	bool_lt_one	dbl_gt_int	dec_eq_int
-0	1	1	1	1
+false	true	true	true	true

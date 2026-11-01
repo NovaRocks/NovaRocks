@@ -1,2 +1,4 @@
+-- query 8
+-- types	bigint	integer	integer	bigint
 live_rows	min_id	max_id	total_amount
 8000	18001	80000	392004000

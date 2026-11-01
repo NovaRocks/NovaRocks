@@ -1,31 +1,39 @@
 -- query 1
+-- legacy
 empty_tail
 ["a"]
 
 -- query 2
+-- legacy
 mixed
 ["a","b","c"]
 
 -- query 3
+-- legacy
 null_element
 [null,"b"]
 
 -- query 4
+-- legacy
 null_array
 NULL
 
 -- query 5
+-- legacy
 nested
 [["a"],["b"]]
 
 -- query 6
+-- types	varchar
 string_value
 ab
 
 -- query 7
+-- legacy
 l	nested
 []	[["a"],["b"]]
 
 -- query 8
+-- legacy
 exact_integer
 [9223372036854775807,1]

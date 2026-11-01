@@ -1,16 +1,20 @@
 -- query 2
+-- shell
 0
 IRU9_EMPTY_INT_OK rows=0 snapshot=absent id=optional-int v=optional-variant
 IRU9_FIXTURE_COMPLETE
 
 -- query 4
+-- legacy
 object_kind	array_kind	variant_null_kind	sql_null_kind	variant_is_sql_null	sql_is_null
 Object	Array	Null	NULL	0	1
 
 -- query 5
+-- legacy
 b
 x
 
 -- query 6
+-- types	bigint
 remaining_rows
 0

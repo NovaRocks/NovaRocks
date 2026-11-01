@@ -1,31 +1,39 @@
 -- query 3
+-- legacy
 (round(id_double)) <=> (round(NULL))
 1
 
 -- query 4
+-- legacy
 (dround(id_double)) <=> (dround(NULL))
 1
 
 -- query 5
+-- legacy
 (round(id_double, id_int)) <=> (round(NULL, NULL))
 1
 
 -- query 6
+-- legacy
 (round(id_double, id_int)) <=> (round(id_double, NULL))
 1
 
 -- query 7
+-- legacy
 (round(id_double, id_int)) <=> (round(NULL, id_int))
 1
 
 -- query 8
+-- legacy
 (dround(id_double, id_int)) <=> (dround(NULL, NULL))
 1
 
 -- query 9
+-- legacy
 (dround(id_double, id_int)) <=> (dround(id_double, NULL))
 1
 
 -- query 10
+-- legacy
 (dround(id_double, id_int)) <=> (dround(NULL, id_int))
 1

@@ -19,13 +19,16 @@
 -- query 10
 
 -- query 11
+-- types	bigint
 total
 45
 
 -- query 12
+-- types	bigint
 total
 45
 
 -- query 13
+-- types	bigint
 count(*)
 9

@@ -1,16 +1,19 @@
 -- query 2
+-- types	integer	varchar
 k	v
 1	2
 2	NULL
 3	NULL
 
 -- query 6
+-- types	integer
 k
 1
 2
 3
 
 -- query 9
+-- types	integer
 k
 1
 2

@@ -1,3 +1,5 @@
+-- query 1
+-- types	integer	decimal(38, 2)	decimal(38, 8)
 i_manager_id	sum_sales	avg_monthly_sales
 1	189.04	531.91916667
 1	203.73	531.91916667

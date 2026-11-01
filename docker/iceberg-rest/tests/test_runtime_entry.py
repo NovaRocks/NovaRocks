@@ -157,6 +157,13 @@ class RendererTests(RendererCase):
         self.assertEqual(env['NOVAROCKS_PAIMON_DOCKER_NETWORK'], self.snapshot['network'])
         fe = tomllib.loads((directory / 'fe.toml').read_text())
         self.assertEqual(fe['state_store']['path'], str(self.entry / 'frontend-state.sqlite'))
+        cluster = tomllib.loads((directory / 'sql-test.toml').read_text())['cluster']
+        self.assertEqual(cluster, {
+            'host': '127.0.0.1',
+            'trino_port': str(fe['standalone_server']['trino_port']),
+            'user': 'root',
+        })
+        self.assertEqual(env['NOVA_ENV_TRINO_PORT'], cluster['trino_port'])
         for name in runtime.ENTRY_FILES:
             self.assertTrue((directory / name).is_file(), name)
             self.assertNotIn('.prepare-', (directory / name).read_text())
@@ -259,6 +266,43 @@ class RendererTests(RendererCase):
         self.assertEqual(first['published_dir'], second['published_dir'])
         self.assertEqual(before, self.publication_hashes(directory))
         self.assertEqual(self.backend.events, ['ensure'])
+
+    def test_trino_sql_config_refresh_keeps_previous_mysql_publication(self):
+        original_renderer = entry.render_entry
+
+        def mysql_renderer(context, output):
+            original_renderer(context, output)
+            path = output / 'sql-test.toml'
+            ports = tomllib.loads((output / 'fe.toml').read_text())['standalone_server']
+            text = path.read_text().replace(
+                'trino_port = ' + json.dumps(str(ports['trino_port'])),
+                'port = ' + json.dumps(str(ports['mysql_port'])), 1)
+            path.write_text(text.replace('\n[env]\n', 'password = ""\n\n[env]\n', 1))
+
+        with (
+            mock.patch.object(publication, 'RENDERER_REVISION', publication.RENDERER_REVISION - 1),
+            mock.patch.object(entry, 'render_entry', side_effect=mysql_renderer),
+        ):
+            previous = self.bind()
+        old_directory = Path(previous['published_dir'])
+        old_hashes = self.publication_hashes(old_directory)
+        old_cluster = tomllib.loads((old_directory / 'sql-test.toml').read_text())['cluster']
+        self.assertIn('port', old_cluster)
+        self.assertIn('password', old_cluster)
+        self.assertNotIn('trino_port', old_cluster)
+
+        current = self.bind()
+        current_directory = Path(current['published_dir'])
+        self.assertNotEqual(current_directory, old_directory)
+        self.assertEqual(publication.read(self.entry)['published_dir'], str(current_directory))
+        cluster = tomllib.loads((current_directory / 'sql-test.toml').read_text())['cluster']
+        self.assertEqual(set(cluster), {'host', 'trino_port', 'user'})
+        fe = tomllib.loads((current_directory / 'fe.toml').read_text())
+        self.assertEqual(cluster['trino_port'], str(fe['standalone_server']['trino_port']))
+        self.assertEqual(old_cluster['port'], str(fe['standalone_server']['mysql_port']))
+        self.assertEqual(old_hashes, self.publication_hashes(old_directory))
+        self.assertEqual(old_cluster, tomllib.loads((old_directory / 'sql-test.toml').read_text())['cluster'])
+        self.assertEqual(runtime.digest(runtime.read_json(old_directory / 'entry.json')), old_directory.name)
 
     def test_renderer_revision_switch_preserves_old_schema_two_publication(self):
         first = self.bind()

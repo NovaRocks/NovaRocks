@@ -27,6 +27,12 @@ mod failure_artifacts;
 mod fault_injection;
 mod fixture_context;
 mod fixture_object_store;
+pub mod golden;
+mod golden_commands;
+mod golden_conversion;
+mod hms_case_input;
+#[cfg(all(test, unix))]
+mod hms_selection_tests;
 mod iceberg_orphan_fixture;
 mod mv_rest_document_graph;
 mod namespace_guard;
@@ -39,8 +45,6 @@ mod results_record;
 mod runner;
 mod session;
 mod shell;
-#[cfg(unix)]
-mod socket_deadline;
 mod sql_error_codes;
 mod statement_controls;
 mod suite_manifest;
@@ -51,16 +55,15 @@ mod engine_error_codes;
 
 use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
 use crate::config::{
-    FixtureEndpoints, build_suite_configs, env_optional, env_or_default, list_sql_files,
-    load_runner_config, placeholder_variables, project_fixture_value, resolve_config_path,
-    resolve_path, resolve_reference_port, resolve_repo_root, resolve_target_port,
-    suite_default_query_timeout,
+    FixtureEndpoints, build_suite_configs, env_optional, list_sql_files, load_runner_config,
+    placeholder_variables, project_fixture_value, resolve_config_path, resolve_path,
+    resolve_repo_root, resolve_target_port, suite_default_query_timeout,
 };
 use crate::failure_artifacts::{FailureArtifactContext, FailureArtifactRecorder};
 use crate::parser::load_suite_hook;
 use crate::results::{
     MismatchArtifacts, case_result_path, compare_result_sets, find_legacy_result_paths,
-    load_expected_results, normalize_explain_timing_rows, step_allows_missing_expected_result,
+    normalize_explain_timing_rows, step_allows_missing_expected_result,
     step_has_implicit_skip_result, step_requires_recorded_result, step_retry_count,
     step_retry_interval, verify_text_assertions, write_mismatch_artifacts, write_result_file,
 };
@@ -68,7 +71,7 @@ use crate::runner::{
     error_message_matches, extract_engine_error_code, extract_sql_error_code,
     extract_sql_error_location, parse_selector_list, summarize_connection,
 };
-use crate::session::MysqlSession;
+use crate::session::TrinoCaseSession;
 use crate::sql_error_codes::{
     SqlErrorDescriptor, SqlErrorPhase, is_sql_error_identity, lookup_sql_error_descriptor,
 };
@@ -151,13 +154,6 @@ fn resolve_effective_target_port(
 enum Mode {
     Verify,
     Record,
-    Diff,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum RecordFrom {
-    Target,
-    Reference,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,33 +373,6 @@ fn annotate_failure_with_engine_error_code(message: &str, source: &str) -> Strin
     }
 }
 
-fn expected_engine_error_code_diff_result(
-    expected_code: &str,
-    target_ok: bool,
-    target_err: &str,
-    reference_ok: bool,
-    reference_err: &str,
-) -> Result<(), String> {
-    let target_code = extract_engine_error_code(target_err);
-    let reference_code = extract_engine_error_code(reference_err);
-    let target_matched = !target_ok && target_code.as_deref() == Some(expected_code);
-    let reference_matched = !reference_ok && reference_code.as_deref() == Some(expected_code);
-    if target_matched && reference_matched {
-        Ok(())
-    } else {
-        Err(format!(
-            "expected engine error code {:?} (target_ok={}, target_code={:?}, target_err={}, reference_ok={}, reference_code={:?}, reference_err={})",
-            expected_code,
-            target_ok,
-            target_code,
-            target_err,
-            reference_ok,
-            reference_code,
-            reference_err
-        ))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -415,7 +384,7 @@ fn expected_engine_error_code_diff_result(
 )]
 pub(crate) struct Cli {
     /// Suite name(s), comma-separated. Use "all" for the default non-explicit suites.
-    #[arg(long, required_unless_present_any = ["list_extensions", "list_suites", "list_declarations"])]
+    #[arg(long, required_unless_present_any = ["list_extensions", "list_suites", "list_declarations", "list_legacy_goldens"])]
     suite: Option<String>,
 
     /// Print the deterministic manifest derived from @nova_extension annotations and exit.
@@ -430,6 +399,22 @@ pub(crate) struct Cli {
     #[arg(long, conflicts_with_all = ["list_extensions", "list_suites"])]
     list_declarations: bool,
 
+    /// List remaining old golden blocks without starting resources.
+    #[arg(long, conflicts_with_all = ["list_extensions", "list_suites", "list_declarations"])]
+    list_legacy_goldens: bool,
+
+    /// Convert legacy blocks only after proving old-render equivalence.
+    #[arg(
+        long,
+        requires = "legacy_variant_offset_seconds",
+        conflicts_with = "no_verify"
+    )]
+    convert_legacy: bool,
+
+    /// UTC offset of the original baseline host, explicitly recorded for migration.
+    #[arg(long, requires = "convert_legacy", allow_hyphen_values = true)]
+    legacy_variant_offset_seconds: Option<i32>,
+
     /// Append structured native execution facts to a new JSON Lines file.
     #[arg(long)]
     results_file: Option<String>,
@@ -439,9 +424,6 @@ pub(crate) struct Cli {
 
     #[arg(long, value_enum, default_value_t = Mode::Verify)]
     mode: Mode,
-
-    #[arg(long, value_enum, default_value_t = RecordFrom::Reference)]
-    record_from: RecordFrom,
 
     #[arg(long)]
     sql_dir: Option<String>,
@@ -453,34 +435,13 @@ pub(crate) struct Cli {
     sql_glob: Option<String>,
 
     #[arg(long)]
-    mysql: Option<String>,
-
-    #[arg(long)]
     host: Option<String>,
 
     #[arg(long)]
-    port: Option<String>,
+    trino_port: Option<String>,
 
     #[arg(long)]
     user: Option<String>,
-
-    #[arg(long)]
-    password: Option<String>,
-
-    #[arg(long)]
-    ref_mysql: Option<String>,
-
-    #[arg(long)]
-    ref_host: Option<String>,
-
-    #[arg(long)]
-    ref_port: Option<String>,
-
-    #[arg(long)]
-    ref_user: Option<String>,
-
-    #[arg(long)]
-    ref_password: Option<String>,
 
     #[arg(long)]
     query_timeout: Option<u64>,
@@ -581,7 +542,6 @@ fn mode_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Verify => "verify",
         Mode::Record => "record",
-        Mode::Diff => "diff",
     }
 }
 
@@ -618,24 +578,23 @@ struct SuiteRunContext {
     suite_name: String,
     controls: Option<Arc<control_plan::SqlControlExecution>>,
     mode: Mode,
-    record_from: RecordFrom,
+    convert_legacy: bool,
+    legacy_variant_offset_seconds: Option<i32>,
     target_conn_base: ConnectionConfig,
-    reference_conn_base: ConnectionConfig,
     target_admin_conn: ConnectionConfig,
-    reference_admin_conn: ConnectionConfig,
     result_dir: Option<PathBuf>,
     actual_artifact_dir: Option<PathBuf>,
     verify_enabled: bool,
     query_timeout: u64,
-    reference_required: bool,
     auto_case_db: bool,
     order_sensitive_default: bool,
     float_epsilon: Option<f64>,
     preview_lines: usize,
     update_expected: bool,
+    session_defaults: suite_manifest::SuiteSessionDefaults,
+    case_input: Option<suite_manifest::CaseInputRecipe>,
     target_session_sql: Vec<String>,
     rewrite_explain_contains_as_not_contains: Vec<String>,
-    marker_re: Regex,
     fail_fast: bool,
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
     failure_artifacts: Arc<FailureArtifactRecorder>,
@@ -672,12 +631,7 @@ impl SuiteRunContext {
             },
         )
     }
-    fn execute_shell(
-        &self,
-        sql: &str,
-        deadline: Option<Instant>,
-        cleanup: bool,
-    ) -> (bool, Option<QueryExecution>, String) {
+    fn execute_shell(&self, sql: &str, deadline: Option<Instant>, cleanup: bool) -> SqlStepOutcome {
         let limit = if cleanup {
             self.cleanup_deadline()
         } else {
@@ -690,19 +644,36 @@ impl SuiteRunContext {
                 .map(|scope| scope.to_json())
                 .transpose(),
         ) {
-            (Ok(context), Ok(storage)) => shell::execute_shell_step_observed(
-                sql,
-                Some(deadline.map_or(limit, |d| d.min(limit))),
-                Some(&context),
-                storage.as_deref(),
-                cleanup,
-                Some(&self.fixture_writers_settled),
-            ),
-            (Err(error), _) | (_, Err(error)) => (
+            (Ok(context), Ok(storage)) if self.case_input.is_some() => {
+                let (raw, host_control_confirmed) = shell::execute_hms_shell_step_observed(
+                    sql,
+                    deadline.map_or(limit, |d| d.min(limit)),
+                    Some(&context),
+                    storage.as_deref(),
+                    cleanup,
+                    &self.fixture_writers_settled,
+                );
+                if host_control_confirmed {
+                    SqlStepOutcome::from_shell(raw)
+                } else {
+                    SqlStepOutcome::infrastructure(raw)
+                }
+            }
+            (Ok(context), Ok(storage)) => {
+                SqlStepOutcome::from_shell(shell::execute_shell_step_observed(
+                    sql,
+                    Some(deadline.map_or(limit, |d| d.min(limit))),
+                    Some(&context),
+                    storage.as_deref(),
+                    cleanup,
+                    Some(&self.fixture_writers_settled),
+                ))
+            }
+            (Err(error), _) | (_, Err(error)) => SqlStepOutcome::infrastructure((
                 false,
                 None,
                 format!("SQL run context serialization failed: {error:#}"),
-            ),
+            )),
         }
     }
 }
@@ -747,7 +718,6 @@ struct PreparedSqlInputs {
     sql_glob: String,
     suite_catalog_override: Option<String>,
     target_db_default: String,
-    ref_db_default: String,
     verify_enabled: bool,
     query_timeout: u64,
     cases: Vec<SqlCase>,
@@ -813,7 +783,7 @@ struct WaitAlterRequest<'a> {
 }
 
 fn execute_wait_alter(
-    session: &mut MysqlSession,
+    session: &mut TrinoCaseSession,
     query_timeout: u64,
     request: WaitAlterRequest<'_>,
     log: &mut String,
@@ -907,7 +877,7 @@ fn execute_wait_alter(
 /// Run all wait_alter annotations on a step.  Returns (ok, extra_elapsed).
 fn run_step_wait_alters(
     step: &SqlStep,
-    session: &mut MysqlSession,
+    session: &mut TrinoCaseSession,
     query_timeout: u64,
     log: &mut String,
 ) -> (bool, Duration) {
@@ -970,18 +940,79 @@ fn imv_equivalence_failure(
     }
 }
 
+// Query failure provenance is captured before a later oracle can use the
+// session. Assertion/metadata errors retain their original display text.
+#[derive(Debug)]
+struct DomainOracleFailure {
+    message: String,
+    failure_origin: Option<ExecutionFailureOrigin>,
+    execution: Option<Box<QueryExecution>>,
+    sql: Option<String>,
+}
+
+impl DomainOracleFailure {
+    fn from_execution(
+        message: String,
+        execution: Option<QueryExecution>,
+        sql: &str,
+        session: &TrinoCaseSession,
+    ) -> Self {
+        let failure_origin = SqlStepOutcome::from_session((false, None, String::new()), session).3;
+        Self {
+            message,
+            failure_origin,
+            execution: execution.map(Box::new),
+            sql: Some(sql.to_string()),
+        }
+    }
+}
+
+impl From<String> for DomainOracleFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            failure_origin: None,
+            execution: None,
+            sql: None,
+        }
+    }
+}
+
+impl std::fmt::Display for DomainOracleFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+fn execute_required_oracle_query(
+    session: &mut TrinoCaseSession,
+    query_timeout: u64,
+    sql: &str,
+) -> Result<QueryExecution, DomainOracleFailure> {
+    let (ok, execution, msg) = session.execute_query(query_timeout, sql, None);
+    if !ok {
+        return Err(DomainOracleFailure::from_execution(
+            format!("query failed: {sql}\n{msg}"),
+            execution,
+            sql,
+            session,
+        ));
+    }
+    execution.ok_or_else(|| format!("query returned no result: {sql}").into())
+}
+
 /// Capture the MV's current (incremental) contents, derive a full recompute by
 /// running the MV's `SelectText` query directly against the base tables (obtained
 /// from `SHOW MATERIALIZED VIEWS`), and assert multiset equality of results.
 /// MV is qualified by `db` like wait_alter_*. No side effects on the MV.
 fn run_imv_equivalence_check(
     mv: &str,
-    session: &mut crate::session::MysqlSession,
+    session: &mut crate::session::TrinoCaseSession,
     query_timeout: u64,
     db: Option<&str>,
     epsilon: Option<f64>,
     log: &mut String,
-) -> Result<(), String> {
+) -> Result<(), DomainOracleFailure> {
     let fqn = match db {
         Some(d) if !d.is_empty() => format!("{d}.{mv}"),
         _ => mv.to_string(),
@@ -993,8 +1024,11 @@ fn run_imv_equivalence_check(
     );
     let (ok, inc, msg) = session.execute_query(query_timeout, &select, None);
     if !ok {
-        return Err(format!(
-            "@imv_equivalence_check: incremental SELECT failed: {msg}"
+        return Err(DomainOracleFailure::from_execution(
+            format!("@imv_equivalence_check: incremental SELECT failed: {msg}"),
+            inc,
+            &select,
+            session,
         ));
     }
     let inc = inc.ok_or_else(|| {
@@ -1013,8 +1047,11 @@ fn run_imv_equivalence_check(
     let (ok, show_result, msg) =
         session.execute_query(query_timeout, "SHOW MATERIALIZED VIEWS", None);
     if !ok {
-        return Err(format!(
-            "@imv_equivalence_check: SHOW MATERIALIZED VIEWS failed: {msg}"
+        return Err(DomainOracleFailure::from_execution(
+            format!("@imv_equivalence_check: SHOW MATERIALIZED VIEWS failed: {msg}"),
+            show_result,
+            "SHOW MATERIALIZED VIEWS",
+            session,
         ));
     }
     let show_result = show_result.ok_or_else(|| {
@@ -1076,7 +1113,8 @@ fn run_imv_equivalence_check(
         0 => {
             return Err(format!(
                 "@imv_equivalence_check: MV `{mv}` not found in SHOW MATERIALIZED VIEWS output"
-            ));
+            )
+            .into());
         }
         1 => matched[0]
             .get(select_text_col)
@@ -1088,7 +1126,8 @@ fn run_imv_equivalence_check(
             return Err(format!(
                 "@imv_equivalence_check: MV `{mv}` is ambiguous in SHOW MATERIALIZED VIEWS \
                  (qualify with a unique db); matched {n} rows"
-            ));
+            )
+            .into());
         }
     };
 
@@ -1096,15 +1135,18 @@ fn run_imv_equivalence_check(
     // The native parser re-admits it on every refresh, so it is safe to re-run.
     let (ok, full, msg) = session.execute_query(query_timeout, &select_sql, None);
     if !ok {
-        return Err(format!(
-            "@imv_equivalence_check: full-recompute SELECT failed: {msg}"
+        return Err(DomainOracleFailure::from_execution(
+            format!("@imv_equivalence_check: full-recompute SELECT failed: {msg}"),
+            full,
+            &select_sql,
+            session,
         ));
     }
     let full = full.ok_or_else(|| {
         "@imv_equivalence_check: full-recompute SELECT returned no result".to_string()
     })?;
     match imv_equivalence_failure(&fqn, &inc, &full, epsilon) {
-        Some(reason) => Err(reason),
+        Some(reason) => Err(reason.into()),
         None => {
             let _ = writeln!(log, "    @imv_equivalence_check: incremental == full ✅");
             Ok(())
@@ -1125,10 +1167,10 @@ fn stateless_level_satisfies(available: ImvStatelessLevel, required: ImvStateles
 }
 
 /// Run `sql` and unwrap the `(bool, Option<QueryExecution>, String)` triple
-/// returned by `MysqlSession::execute_query` into a single `Result`, so
+/// returned by `TrinoCaseSession::execute_query` into a single `Result`, so
 /// `@imv_stateless_rebuild` call sites can use `?`.
 fn execute_required_query(
-    session: &mut crate::session::MysqlSession,
+    session: &mut crate::session::TrinoCaseSession,
     query_timeout: u64,
     sql: &str,
 ) -> Result<crate::types::QueryExecution, String> {
@@ -1171,12 +1213,12 @@ fn parse_available_stateless_level(
 /// physically backed. MV is qualified by `db` like wait_alter_*.
 fn run_imv_stateless_rebuild_check(
     directive: &ImvStatelessDirective,
-    session: &mut crate::session::MysqlSession,
+    session: &mut crate::session::TrinoCaseSession,
     query_timeout: u64,
     db: Option<&str>,
     epsilon: Option<f64>,
     log: &mut String,
-) -> Result<(), String> {
+) -> Result<(), DomainOracleFailure> {
     // When no case db is active, `fqn` is the bare MV name and both the SELECT
     // and the `table => '<mv>'` procedure argument resolve their namespace from
     // the session's current database. A case mounting this directive must have
@@ -1191,7 +1233,7 @@ fn run_imv_stateless_rebuild_check(
         log,
         "    @imv_stateless_rebuild: capturing read face of {fqn} before rebuild"
     );
-    let before = execute_required_query(session, query_timeout, &select)?;
+    let before = execute_required_oracle_query(session, query_timeout, &select)?;
 
     let catalog = directive.catalog.as_deref().unwrap_or("ice");
     let call = format!(
@@ -1199,16 +1241,17 @@ fn run_imv_stateless_rebuild_check(
         directive.level.as_sql()
     );
     let _ = writeln!(log, "    @imv_stateless_rebuild: {call}");
-    let procedure_rows = execute_required_query(session, query_timeout, &call)?;
+    let procedure_rows = execute_required_oracle_query(session, query_timeout, &call)?;
     let available = parse_available_stateless_level(&procedure_rows)?;
     if !stateless_level_satisfies(available, directive.level) {
         return Err(format!(
             "@imv_stateless_rebuild: server only supports level {:?}, required {:?}",
             available, directive.level
-        ));
+        )
+        .into());
     }
 
-    let after = execute_required_query(session, query_timeout, &select)?;
+    let after = execute_required_oracle_query(session, query_timeout, &select)?;
     let (same, reason) = compare_result_sets(
         &before.header,
         &before.rows,
@@ -1220,7 +1263,8 @@ fn run_imv_stateless_rebuild_check(
     if !same {
         return Err(format!(
             "@imv_stateless_rebuild: SELECT result changed after lake rebuild for `{fqn}`\n{reason}"
-        ));
+        )
+        .into());
     }
     let _ = writeln!(
         log,
@@ -1284,7 +1328,7 @@ fn explain_matching_lines(explain_text: &str, needle: &str) -> Vec<String> {
 /// Returns `Ok(())` if all assertions pass, or `Err(message)` on the first failure.
 fn run_explain_directive_checks(
     step: &SqlStep,
-    session: &mut crate::session::MysqlSession,
+    session: &mut crate::session::TrinoCaseSession,
     query_timeout: u64,
     rewrite_contains_as_not_contains: &[String],
     log: &mut String,
@@ -1564,15 +1608,85 @@ fn verify_lifecycle_structured_assertion(
     Ok(())
 }
 
+// The failure author travels with this exact invocation, including across
+// temporary sessions and joined actors. Diagnostic text grants no provenance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionFailureOrigin {
+    Statement,
+    // A single typed transport failure from this exact session invocation.
+    // It remains infrastructure until a specific completed control owner accepts it.
+    Transport,
+    Infrastructure,
+    InjectedFrontendDisconnect,
+    ShellCommand,
+}
+
+fn execution_failure_is_infrastructure(origin: Option<ExecutionFailureOrigin>) -> bool {
+    matches!(
+        origin,
+        Some(ExecutionFailureOrigin::Infrastructure | ExecutionFailureOrigin::Transport)
+    )
+}
+
+type RawExecution = (bool, Option<QueryExecution>, String);
+
+struct SqlStepOutcome(
+    bool,
+    Option<QueryExecution>,
+    String,
+    Option<ExecutionFailureOrigin>,
+);
+
+impl SqlStepOutcome {
+    fn from_session(raw: RawExecution, session: &TrinoCaseSession) -> Self {
+        let origin = (!raw.0).then_some(if session.last_failure_is_statement() {
+            ExecutionFailureOrigin::Statement
+        } else if session.last_failure_is_only_transport() {
+            ExecutionFailureOrigin::Transport
+        } else {
+            ExecutionFailureOrigin::Infrastructure
+        });
+        Self(raw.0, raw.1, raw.2, origin)
+    }
+
+    fn infrastructure(raw: RawExecution) -> Self {
+        debug_assert!(!raw.0);
+        Self(
+            raw.0,
+            raw.1,
+            raw.2,
+            Some(ExecutionFailureOrigin::Infrastructure),
+        )
+    }
+
+    fn control_success(raw: RawExecution) -> Self {
+        debug_assert!(raw.0);
+        Self(raw.0, raw.1, raw.2, None)
+    }
+
+    fn from_shell(raw: RawExecution) -> Self {
+        let origin = (!raw.0).then_some(if raw.1.as_ref().is_some_and(|execution| {
+            matches!(execution.shell_result.as_ref(), Some(golden::Block::Shell { exit, .. }) if exit != "0")
+        }) {
+            ExecutionFailureOrigin::ShellCommand
+        } else {
+            ExecutionFailureOrigin::Infrastructure
+        });
+        // A real command failure is not a remote-writer exit proof. The shell
+        // owner keeps its existing fixture_writers_settled policy independently.
+        Self(raw.0, raw.1, raw.2, origin)
+    }
+}
+
 fn execute_target_query_with_fault(
     meta: &QueryMeta,
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
-    session: &mut MysqlSession,
+    session: &mut TrinoCaseSession,
     query_timeout: u64,
     sql: &str,
     db: Option<&str>,
     fault_deadline: Option<Instant>,
-) -> (bool, Option<QueryExecution>, String) {
+) -> SqlStepOutcome {
     execute_target_query_with_selected_control(
         meta,
         server_handle,
@@ -1589,47 +1703,30 @@ fn execute_target_query_with_fault(
 fn execute_target_query_with_selected_control(
     meta: &QueryMeta,
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
-    session: &mut MysqlSession,
+    session: &mut TrinoCaseSession,
     query_timeout: u64,
     sql: &str,
     db: Option<&str>,
     fault_deadline: Option<Instant>,
     selected: Option<(&control_plan::StepControl, usize, Instant)>,
     guard: &mut Option<LifecycleStatementObservationGuard>,
-) -> (bool, Option<QueryExecution>, String) {
-    #[cfg(unix)]
-    let mut operation_owner = match fault_deadline
-        .map(|deadline| {
-            crate::socket_deadline::SocketDeadlineOwner::duplicate(
-                &session.conn,
-                session
-                    .original_deadline()
-                    .map_or(deadline, |original| deadline.min(original)),
-            )
-        })
-        .transpose()
-    {
-        Ok(owner) => owner,
-        Err(error) => {
-            return (
-                false,
-                None,
-                format!("FAIL (runner query socket deadline): {error:#}"),
-            );
-        }
-    };
+) -> SqlStepOutcome {
+    session.set_operation_deadline(fault_deadline);
+    let cancel_slot = session.cancel_slot();
     let query_timeout = bounded_fault_query_timeout(query_timeout, fault_deadline);
-    let mut result = fault_injection::execute_with_post_fragment_start_fault(
+    let mut transport_failure = false;
+    let fault_result = fault_injection::execute_with_post_fragment_start_fault(
         meta,
         server_handle,
-        Some(session.connection_id()),
+        Some(cancel_slot.clone()),
         fault_deadline,
         || {
-            let result = session.execute_query_with_before_submit(
+            let result = session.execute_query_with_before_execute(
                 query_timeout,
                 sql,
                 db,
-                |transient, statement_index, connection_id, submitted| {
+                !fault_injection::has_client_query_cancellation(meta),
+                |transient, statement_index, client_query_id, submitted, _cancel| {
                     let Some((control, outer, deadline)) = selected else {
                         return Ok(());
                     };
@@ -1650,9 +1747,9 @@ fn execute_target_query_with_selected_control(
                         let observation = server_handle
                             .lock()
                             .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
-                            .arm_selected_statement_observation(
+                            .arm_selected_statement_observation_for_client_query(
                                 &target.run_token,
-                                connection_id,
+                                client_query_id,
                                 submitted,
                                 deadline,
                             )?;
@@ -1665,6 +1762,8 @@ fn execute_target_query_with_selected_control(
                     Ok(())
                 },
             );
+            let result = SqlStepOutcome::from_session(result, session);
+            transport_failure = !result.0 && result.3 == Some(ExecutionFailureOrigin::Transport);
             if fault_injection::has_fault(meta) && !result.0 {
                 eprintln!(
                     "target query before fault verification failed: {}",
@@ -1673,56 +1772,296 @@ fn execute_target_query_with_selected_control(
             }
             result
         },
-    )
-    .unwrap_or_else(|error| {
-        (
+    );
+    let fault_completed = fault_result.is_ok();
+    let mut result = fault_result.unwrap_or_else(|error| {
+        SqlStepOutcome::infrastructure((
             false,
             None,
             format!("FAIL (runner fault injection): {error:#}"),
-        )
+        ))
     });
-    #[cfg(unix)]
-    if let Some(owner) = &mut operation_owner
-        && let Err(error) = owner.close_and_join()
-    {
-        result.0 = false;
-        result.2 = format!("{}; query socket owner cleanup: {error:#}", result.2);
-    }
+    session.set_operation_deadline(None);
     if meta.kill_fe_after_mv_known_committed_before_projector_cas
         || meta.kill_fe_after_be_log_contains.is_some()
     {
         if fault_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return (
+            return SqlStepOutcome::infrastructure((
                 false,
                 None,
                 fault_timeout_diagnostics(
                     server_handle,
                     "runner FE restart reconnect: shared lifecycle deadline expired",
                 ),
-            );
+            ));
         }
         if let Err(error) = session.reconnect() {
-            return (
+            return SqlStepOutcome::infrastructure((
                 false,
                 None,
                 fault_timeout_diagnostics(
                     server_handle,
                     &format!("runner FE restart reconnect failed: {error:#}"),
                 ),
-            );
+            ));
         }
         if fault_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return (
+            return SqlStepOutcome::infrastructure((
                 false,
                 None,
                 fault_timeout_diagnostics(
                     server_handle,
                     "runner FE restart reconnect exceeded shared lifecycle deadline",
                 ),
-            );
+            ));
         }
     }
+    if fault_completed
+        && transport_failure
+        && (meta.kill_fe_after_mv_known_committed_before_projector_cas
+            || meta.kill_fe_after_be_log_contains.is_some())
+    {
+        // Only this invocation's completed fault owner and typed transport
+        // failure authorize the injected disconnect. Neither a configured
+        // directive nor a diagnostic string can grant this provenance.
+        result.3 = Some(ExecutionFailureOrigin::InjectedFrontendDisconnect);
+    }
     result
+}
+
+// These borrows preserve the original case/session and joined actor owners.
+// Ordinary recording retains its generic execution path; migration uses the
+// same acceptance dispatch as verification without changing authoring mode.
+struct CaseStepDispatch<'a> {
+    ctx: &'a SuiteRunContext,
+    case: &'a SqlCase,
+    evidence: &'a mut results_record::CaseEvidence,
+    step: &'a SqlStep,
+    case_target_conn: &'a ConnectionConfig,
+    target_session: &'a mut TrinoCaseSession,
+    publication_service_hold: &'a mut Option<publication_service::Hold>,
+    publication_catalog_fault_guard: &'a mut Option<publication_catalog::FixtureFaultGuard>,
+    step_deadline: Instant,
+    fault_deadline: Option<Instant>,
+    selected_control: Option<(&'a control_plan::StepControl, usize, Instant)>,
+    structured_lifecycle_observation: &'a mut Option<LifecycleStatementObservationGuard>,
+    log: &'a mut String,
+}
+
+// This exact helper's original joined query is diagnostic data only. A
+// completed FE control returns its original empty execution, never this partial.
+fn retain_publication_kill_query(
+    ctx: &SuiteRunContext,
+    case: &SqlCase,
+    step: &SqlStep,
+    query: Option<&SqlStepOutcome>,
+    evidence: &mut results_record::CaseEvidence,
+    log: &mut String,
+) -> Result<(), String> {
+    let mut artifact = None;
+    let mut artifact_error = None;
+    if let Some(SqlStepOutcome(ok, Some(execution), _, _)) = query {
+        let retained = if *ok {
+            ctx.failure_artifacts.persist_case_actual_result(
+                &ctx.suite_name,
+                &case.case_id,
+                step.query_number,
+                execution,
+            )
+        } else {
+            ctx.failure_artifacts.persist_case_partial_result(
+                &ctx.suite_name,
+                &case.case_id,
+                step.query_number,
+                execution,
+            )
+        };
+        match retained {
+            Ok(path) => {
+                evidence.artifacts.push(path.clone());
+                artifact = Some(path);
+            }
+            Err(error) => {
+                let reason = format!("retain original publication-kill query: {error:#}");
+                let _ = writeln!(log, "    {reason}");
+                artifact_error = Some(reason);
+            }
+        }
+    }
+    evidence.diagnostics.push(serde_json::json!({
+        "step":step.query_number,
+        "kind":"publication_kill_query_diagnostic",
+        "retained":artifact_error.is_none(),
+        "details":{
+        "original_query_observed":query.is_some(),
+        "original_query_ok":query.map(|q| q.0),
+        "original_failure_origin":query.and_then(|q| q.3).map(|origin| match origin {
+            ExecutionFailureOrigin::Transport => "transport",
+            ExecutionFailureOrigin::Infrastructure => "infrastructure",
+            ExecutionFailureOrigin::Statement => "statement",
+            ExecutionFailureOrigin::InjectedFrontendDisconnect => "injected_frontend_disconnect",
+            ExecutionFailureOrigin::ShellCommand => "shell_command",
+        }),
+        "original_transport_only":query.is_some_and(|q| q.3 == Some(ExecutionFailureOrigin::Transport)),
+        "original_error":query.map(|q| q.2.as_str()),
+        "has_original_execution":query.is_some_and(|q| q.1.is_some()),
+        "execution_artifact":artifact,
+        "artifact_error":artifact_error,
+        "diagnostic_only":true,
+        "authorized_as_complete_R_old_input":false,
+        },
+    }));
+    artifact_error.map_or(Ok(()), Err)
+}
+
+fn publication_execution_mode(mode: Mode, convert_legacy: bool) -> bool {
+    mode == Mode::Verify || (mode == Mode::Record && convert_legacy)
+}
+
+fn execute_case_step(request: CaseStepDispatch<'_>) -> SqlStepOutcome {
+    let CaseStepDispatch {
+        ctx,
+        case,
+        evidence,
+        step,
+        case_target_conn,
+        target_session,
+        publication_service_hold,
+        publication_catalog_fault_guard,
+        step_deadline,
+        fault_deadline,
+        selected_control,
+        structured_lifecycle_observation,
+        log,
+    } = request;
+    let publication_execution = publication_execution_mode(ctx.mode, ctx.convert_legacy);
+    if shell::is_shell_step(&step.sql) {
+        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
+    } else if publication_execution && let Some(hold) = publication_service_hold.as_mut() {
+        let Some(concurrent_shell) = step.meta.publication_catalog_concurrent_shell.as_deref()
+        else {
+            unreachable!("validated service hold requires a companion shell");
+        };
+        let request = InflightPublicationServiceShell {
+            writer_exit: Arc::clone(&ctx.fixture_writers_settled),
+            namespace_guard: ctx.namespace_guard(case_target_conn, step.meta.cleanup),
+            run_context: ctx
+                .fixture_budget
+                .to_json()
+                .expect("admitted context serialization"),
+            meta: &step.meta,
+            server_handle: &ctx.server_handle,
+            session_config: case_target_conn.clone(),
+            session_defaults: ctx.session_defaults.clone(),
+            convert_legacy: ctx.convert_legacy,
+            original_deadline: Some(step_deadline),
+            complete_deadline: ctx.cleanup_deadline(),
+            query_timeout: ctx.query_timeout,
+            sql: step.sql.clone(),
+            db: step.meta.db.clone(),
+            hold,
+            shell: concurrent_shell,
+            log,
+        };
+        match step.meta.publication_service_hold.as_ref().unwrap().actor {
+            PublicationServiceActor::Sql => {
+                execute_target_query_with_inflight_publication_service_shell(request)
+            }
+            PublicationServiceActor::Shell => {
+                execute_target_query_while_publication_service_holds_shell(request)
+            }
+        }
+    } else if publication_execution
+        && step
+            .meta
+            .publication_catalog_fault
+            .is_some_and(|directive| directive.fault.requires_concurrent_shell())
+    {
+        let Some(fault_guard) = publication_catalog_fault_guard.as_mut() else {
+            unreachable!("concurrent shell requires an armed fixture guard");
+        };
+        let Some(concurrent_shell) = step.meta.publication_catalog_concurrent_shell.as_deref()
+        else {
+            unreachable!("validated concurrent shell directive is missing");
+        };
+        execute_target_query_with_inflight_publication_concurrent_shell(
+            InflightPublicationConcurrentShell {
+                writer_exit: Arc::clone(&ctx.fixture_writers_settled),
+                namespace_guard: ctx.namespace_guard(case_target_conn, step.meta.cleanup),
+                run_context: ctx
+                    .fixture_budget
+                    .to_json()
+                    .expect("admitted context serialization"),
+                meta: &step.meta,
+                server_handle: &ctx.server_handle,
+                session_config: case_target_conn.clone(),
+                session_defaults: ctx.session_defaults.clone(),
+                convert_legacy: ctx.convert_legacy,
+                original_deadline: Some(step_deadline),
+                query_timeout: ctx.query_timeout,
+                sql: step.sql.clone(),
+                db: step.meta.db.clone(),
+                fault_guard,
+                fault_deadline,
+                shell: concurrent_shell,
+                log,
+            },
+        )
+    } else if publication_execution
+        && step
+            .meta
+            .publication_catalog_fault
+            .is_some_and(|directive| directive.fault.requires_inflight_frontend_kill())
+    {
+        let Some(fault_guard) = publication_catalog_fault_guard.as_mut() else {
+            unreachable!("in-flight publication kill requires an armed fixture guard");
+        };
+        let mut original_query = None;
+        let outcome = execute_target_query_with_inflight_publication_frontend_kill(
+            InflightPublicationFrontendKill {
+                namespace_guard: ctx.namespace_guard(case_target_conn, step.meta.cleanup),
+                meta: &step.meta,
+                server_handle: &ctx.server_handle,
+                session_config: case_target_conn.clone(),
+                session_defaults: ctx.session_defaults.clone(),
+                convert_legacy: ctx.convert_legacy,
+                original_deadline: Some(step_deadline),
+                session_to_reconnect: target_session,
+                original_query: &mut original_query,
+                query_timeout: ctx.query_timeout,
+                sql: step.sql.clone(),
+                db: step.meta.db.clone(),
+                fault_guard,
+                fault_deadline,
+                log,
+            },
+        );
+        if let Err(error) =
+            retain_publication_kill_query(ctx, case, step, original_query.as_ref(), evidence, log)
+        {
+            return SqlStepOutcome::infrastructure((
+                false,
+                original_query.and_then(|query| query.1),
+                format!(
+                    "FAIL (runner publication query diagnostics): {error}; control: {}",
+                    outcome.2
+                ),
+            ));
+        }
+        outcome
+    } else {
+        execute_target_query_with_selected_control(
+            &step.meta,
+            &ctx.server_handle,
+            target_session,
+            ctx.query_timeout,
+            &step.sql,
+            step.meta.db.as_deref(),
+            fault_deadline,
+            selected_control,
+            structured_lifecycle_observation,
+        )
+    }
 }
 
 struct InflightPublicationFrontendKill<'a> {
@@ -1730,14 +2069,17 @@ struct InflightPublicationFrontendKill<'a> {
     meta: &'a QueryMeta,
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
+    session_defaults: suite_manifest::SuiteSessionDefaults,
+    convert_legacy: bool,
     original_deadline: Option<Instant>,
-    session_to_reconnect: &'a mut MysqlSession,
+    session_to_reconnect: &'a mut TrinoCaseSession,
     query_timeout: u64,
     sql: String,
     db: Option<String>,
     fault_guard: &'a mut publication_catalog::FixtureFaultGuard,
     fault_deadline: Option<Instant>,
     log: &'a mut String,
+    original_query: &'a mut Option<SqlStepOutcome>,
 }
 
 struct InflightPublicationConcurrentShell<'a> {
@@ -1747,6 +2089,8 @@ struct InflightPublicationConcurrentShell<'a> {
     meta: &'a QueryMeta,
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
+    session_defaults: suite_manifest::SuiteSessionDefaults,
+    convert_legacy: bool,
     original_deadline: Option<Instant>,
     query_timeout: u64,
     sql: String,
@@ -1764,6 +2108,8 @@ struct InflightPublicationServiceShell<'a> {
     meta: &'a QueryMeta,
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
+    session_defaults: suite_manifest::SuiteSessionDefaults,
+    convert_legacy: bool,
     original_deadline: Option<Instant>,
     complete_deadline: Instant,
     query_timeout: u64,
@@ -1776,7 +2122,7 @@ struct InflightPublicationServiceShell<'a> {
 
 fn execute_target_query_with_inflight_publication_service_shell(
     request: InflightPublicationServiceShell<'_>,
-) -> (bool, Option<QueryExecution>, String) {
+) -> SqlStepOutcome {
     let InflightPublicationServiceShell {
         namespace_guard,
         run_context,
@@ -1784,6 +2130,8 @@ fn execute_target_query_with_inflight_publication_service_shell(
         meta,
         server_handle,
         session_config,
+        session_defaults,
+        convert_legacy,
         original_deadline,
         complete_deadline: _,
         query_timeout,
@@ -1798,38 +2146,44 @@ fn execute_target_query_with_inflight_publication_service_shell(
         original_deadline.map_or(action_deadline, |original| original.min(action_deadline));
     let thread_meta = meta.clone();
     let thread_server = Arc::clone(server_handle);
-    let query_thread = std::thread::spawn(move || {
-        match MysqlSession::new_with_deadline(&session_config, Some(deadline)) {
-            Ok(mut session) => {
-                session.set_namespace_guard(namespace_guard);
-                execute_target_query_with_fault(
-                    &thread_meta,
-                    &thread_server,
-                    &mut session,
-                    query_timeout,
-                    &sql,
-                    db.as_deref(),
-                    Some(deadline),
-                )
+    let query_thread =
+        std::thread::spawn(move || {
+            match TrinoCaseSession::new_with_session_defaults(
+                &session_config,
+                Some(deadline),
+                &session_defaults,
+            ) {
+                Ok(mut session) => {
+                    session.set_conversion_mode(convert_legacy);
+                    session.set_namespace_guard(namespace_guard);
+                    execute_target_query_with_fault(
+                        &thread_meta,
+                        &thread_server,
+                        &mut session,
+                        query_timeout,
+                        &sql,
+                        db.as_deref(),
+                        Some(deadline),
+                    )
+                }
+                Err(error) => SqlStepOutcome::infrastructure((
+                    false,
+                    None,
+                    format!("FAIL (runner service hold): open query session: {error:#}"),
+                )),
             }
-            Err(error) => (
-                false,
-                None,
-                format!("FAIL (runner service hold): open query session: {error:#}"),
-            ),
-        }
-    });
+        });
     if let Err(error) = hold.wait_until_held(deadline) {
         let _ = hold.release();
         let primary = match query_thread.join() {
-            Ok((_, _, message)) => message,
+            Ok(SqlStepOutcome(_, _, message, _)) => message,
             Err(_) => "query thread panicked".to_string(),
         };
-        return (
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             format!("FAIL (runner service hold): {error:#}; primary query: {primary}"),
-        );
+        ));
     }
     let _ = writeln!(
         log,
@@ -1847,11 +2201,11 @@ fn execute_target_query_with_inflight_publication_service_shell(
     if !companion_ok {
         let _ = hold.release();
         let _ = query_thread.join();
-        return (
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             format!("FAIL (runner service hold companion): {companion_error}"),
-        );
+        ));
     }
     let _ = writeln!(
         log,
@@ -1860,22 +2214,22 @@ fn execute_target_query_with_inflight_publication_service_shell(
     if let Err(error) = hold.release() {
         let retry = hold.release();
         let actual_exit = query_thread.join().is_ok();
-        return (
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             format!(
                 "FAIL (runner service hold release): {error:#}; release_retry={retry:?}; query_actor_joined={actual_exit}"
             ),
-        );
+        ));
     }
     let result = match query_thread.join() {
         Ok(result) => result,
         Err(_) => {
-            return (
+            return SqlStepOutcome::infrastructure((
                 false,
                 None,
                 "FAIL (runner service hold): query thread panicked".into(),
-            );
+            ));
         }
     };
     match hold.verify_original_commit_conflicted() {
@@ -1886,17 +2240,17 @@ fn execute_target_query_with_inflight_publication_service_shell(
             );
             result
         }
-        Err(error) => (
+        Err(error) => SqlStepOutcome::infrastructure((
             false,
             result.1,
             format!("FAIL (runner service hold trace): {error:#}"),
-        ),
+        )),
     }
 }
 
 fn execute_target_query_while_publication_service_holds_shell(
     request: InflightPublicationServiceShell<'_>,
-) -> (bool, Option<QueryExecution>, String) {
+) -> SqlStepOutcome {
     let InflightPublicationServiceShell {
         namespace_guard,
         run_context,
@@ -1904,6 +2258,8 @@ fn execute_target_query_while_publication_service_holds_shell(
         meta,
         server_handle,
         session_config,
+        session_defaults,
+        convert_legacy,
         original_deadline,
         complete_deadline,
         query_timeout,
@@ -1931,18 +2287,23 @@ fn execute_target_query_while_publication_service_holds_shell(
         writer_exit.store(false, Ordering::Release);
         let _ = hold.release();
         let _ = shell_thread.join();
-        return (
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             format!("FAIL (runner service hold): external request did not reach hold: {error:#}"),
-        );
+        ));
     }
     let _ = writeln!(
         log,
         "    @publication_service_hold external request reached post-requirements boundary"
     );
-    let query_result = match MysqlSession::new_with_deadline(&session_config, Some(deadline)) {
+    let query_result = match TrinoCaseSession::new_with_session_defaults(
+        &session_config,
+        Some(deadline),
+        &session_defaults,
+    ) {
         Ok(mut session) => {
+            session.set_conversion_mode(convert_legacy);
             session.set_namespace_guard(namespace_guard);
             execute_target_query_with_fault(
                 meta,
@@ -1954,23 +2315,23 @@ fn execute_target_query_while_publication_service_holds_shell(
                 Some(deadline),
             )
         }
-        Err(error) => (
+        Err(error) => SqlStepOutcome::infrastructure((
             false,
             None,
             format!("FAIL (runner service hold): open query session: {error:#}"),
-        ),
+        )),
     };
     if let Err(error) = hold.release() {
         writer_exit.store(false, Ordering::Release);
         let retry = hold.release();
         let actual_exit = shell_thread.join().is_ok();
-        return (
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             format!(
                 "FAIL (runner service hold release): {error:#}; release_retry={retry:?}; shell_actor_joined={actual_exit}"
             ),
-        );
+        ));
     }
     let shell_result = shell_thread.join();
     // This exact Hold owns the companion request. Always observe its delegate
@@ -1980,11 +2341,11 @@ fn execute_target_query_while_publication_service_holds_shell(
         Ok(result) => result,
         Err(_) => {
             writer_exit.store(false, Ordering::Release);
-            return (
+            return SqlStepOutcome::infrastructure((
                 false,
                 None,
                 "FAIL (runner service hold): external request thread panicked".into(),
-            );
+            ));
         }
     };
     if !local_group_exit || remote_exit.is_err() {
@@ -1995,23 +2356,23 @@ fn execute_target_query_while_publication_service_holds_shell(
         "    @publication_service_hold original local_group_exit={local_group_exit} remote_exit={remote_exit:?}"
     );
     if !shell_ok {
-        return (
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             format!(
                 "FAIL (runner service hold companion): {shell_error}; primary query: {}",
                 query_result.2
             ),
-        );
+        ));
     }
     if !local_group_exit || remote_exit.is_err() {
-        return (
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             format!(
                 "FAIL (runner service hold actual exit): local_group_exit={local_group_exit}; remote_exit={remote_exit:?}"
             ),
-        );
+        ));
     }
     match hold.verify_original_commit_conflicted() {
         Ok(evidence) => {
@@ -2021,17 +2382,17 @@ fn execute_target_query_while_publication_service_holds_shell(
             );
             query_result
         }
-        Err(error) => (
+        Err(error) => SqlStepOutcome::infrastructure((
             false,
             None,
             format!("FAIL (runner service hold trace): {error:#}"),
-        ),
+        )),
     }
 }
 
 fn execute_target_query_with_inflight_publication_concurrent_shell(
     request: InflightPublicationConcurrentShell<'_>,
-) -> (bool, Option<QueryExecution>, String) {
+) -> SqlStepOutcome {
     let InflightPublicationConcurrentShell {
         namespace_guard,
         run_context,
@@ -2039,6 +2400,8 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
         meta,
         server_handle,
         session_config,
+        session_defaults,
+        convert_legacy,
         original_deadline,
         query_timeout,
         sql,
@@ -2055,42 +2418,48 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
     let thread_meta = meta.clone();
     let thread_server = Arc::clone(server_handle);
     let query_timeout = bounded_fault_query_timeout(query_timeout, Some(deadline));
-    let query_thread = std::thread::spawn(move || {
-        match MysqlSession::new_with_deadline(&session_config, Some(deadline)) {
-            Ok(mut session) => {
-                session.set_namespace_guard(namespace_guard);
-                execute_target_query_with_fault(
-                    &thread_meta,
-                    &thread_server,
-                    &mut session,
-                    query_timeout,
-                    &sql,
-                    db.as_deref(),
-                    Some(deadline),
-                )
+    let query_thread =
+        std::thread::spawn(move || {
+            match TrinoCaseSession::new_with_session_defaults(
+                &session_config,
+                Some(deadline),
+                &session_defaults,
+            ) {
+                Ok(mut session) => {
+                    session.set_conversion_mode(convert_legacy);
+                    session.set_namespace_guard(namespace_guard);
+                    execute_target_query_with_fault(
+                        &thread_meta,
+                        &thread_server,
+                        &mut session,
+                        query_timeout,
+                        &sql,
+                        db.as_deref(),
+                        Some(deadline),
+                    )
+                }
+                Err(error) => SqlStepOutcome::infrastructure((
+                    false,
+                    None,
+                    format!("FAIL (runner publication hold): open query session: {error:#}"),
+                )),
             }
-            Err(error) => (
-                false,
-                None,
-                format!("FAIL (runner publication hold): open query session: {error:#}"),
-            ),
-        }
-    });
+        });
 
     if let Err(error) = fault_guard.wait_until_entered(deadline) {
         let _ = fault_guard.release();
         let primary = match query_thread.join() {
-            Ok((_, _, message)) => format!("; primary query: {message}"),
+            Ok(SqlStepOutcome(_, _, message, _)) => format!("; primary query: {message}"),
             Err(_) => "; primary query thread panicked".to_string(),
         };
-        return (
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             fault_timeout_diagnostics(
                 server_handle,
                 &format!("publication before-dispatch hold was not observed: {error:#}{primary}"),
             ),
-        );
+        ));
     }
     let _ = writeln!(
         log,
@@ -2109,11 +2478,11 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
     if !companion_ok {
         let _ = fault_guard.release();
         let _ = query_thread.join();
-        return (
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             format!("FAIL (runner concurrent publication shell): {companion_error}"),
-        );
+        ));
     }
     let _ = writeln!(
         log,
@@ -2124,32 +2493,34 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
         // join its actual exit even if the control acknowledgement was lost.
         let retry = fault_guard.release();
         let actual_exit = query_thread.join().is_ok();
-        return (
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             format!(
                 "FAIL (runner publication hold): release before-dispatch hold: {error:#}; release_retry={retry:?}; query_actor_joined={actual_exit}"
             ),
-        );
+        ));
     }
     match query_thread.join() {
         Ok(result) => result,
-        Err(_) => (
+        Err(_) => SqlStepOutcome::infrastructure((
             false,
             None,
             "FAIL (runner publication hold): query thread panicked".to_string(),
-        ),
+        )),
     }
 }
 
 fn execute_target_query_with_inflight_publication_frontend_kill(
     request: InflightPublicationFrontendKill<'_>,
-) -> (bool, Option<QueryExecution>, String) {
+) -> SqlStepOutcome {
     let InflightPublicationFrontendKill {
         namespace_guard,
         meta,
         server_handle,
         session_config,
+        session_defaults,
+        convert_legacy,
         original_deadline,
         session_to_reconnect,
         query_timeout,
@@ -2158,6 +2529,7 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
         fault_guard,
         fault_deadline,
         log,
+        original_query,
     } = request;
     let action_deadline = fault_deadline
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(query_timeout.saturating_add(10)));
@@ -2166,58 +2538,66 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
     let be_count = match server_handle.lock() {
         Ok(server) => server.be_count(),
         Err(_) => {
-            return (
+            return SqlStepOutcome::infrastructure((
                 false,
                 None,
                 "FAIL (runner publication hold): server handle mutex is poisoned".to_string(),
-            );
+            ));
         }
     };
     if be_count == 0 {
-        return (
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             "FAIL (runner publication hold): requires a runner-owned cross-process frontend"
                 .to_string(),
-        );
+        ));
     }
 
     let thread_meta = meta.clone();
     let thread_server = Arc::clone(server_handle);
     let query_timeout = bounded_fault_query_timeout(query_timeout, Some(deadline));
-    let query_thread = std::thread::spawn(move || {
-        match MysqlSession::new_with_deadline(&session_config, Some(deadline)) {
-            Ok(mut session) => {
-                session.set_namespace_guard(namespace_guard);
-                execute_target_query_with_fault(
-                    &thread_meta,
-                    &thread_server,
-                    &mut session,
-                    query_timeout,
-                    &sql,
-                    db.as_deref(),
-                    Some(deadline),
-                )
+    let query_thread =
+        std::thread::spawn(move || {
+            match TrinoCaseSession::new_with_session_defaults(
+                &session_config,
+                Some(deadline),
+                &session_defaults,
+            ) {
+                Ok(mut session) => {
+                    session.set_conversion_mode(convert_legacy);
+                    session.set_namespace_guard(namespace_guard);
+                    execute_target_query_with_fault(
+                        &thread_meta,
+                        &thread_server,
+                        &mut session,
+                        query_timeout,
+                        &sql,
+                        db.as_deref(),
+                        Some(deadline),
+                    )
+                }
+                Err(error) => SqlStepOutcome::infrastructure((
+                    false,
+                    None,
+                    format!("FAIL (runner publication hold): open query session: {error:#}"),
+                )),
             }
-            Err(error) => (
-                false,
-                None,
-                format!("FAIL (runner publication hold): open query session: {error:#}"),
-            ),
-        }
-    });
+        });
 
     if let Err(error) = fault_guard.wait_until_downstream_successful_hold(deadline) {
         let _ = fault_guard.release();
-        let _ = query_thread.join();
-        return (
+        if let Ok(result) = query_thread.join() {
+            *original_query = Some(result);
+        }
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             fault_timeout_diagnostics(
                 server_handle,
                 &format!("publication downstream-successful hold was not observed: {error:#}"),
             ),
-        );
+        ));
     }
     let _ = writeln!(
         log,
@@ -2237,63 +2617,82 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
         });
     if let Err(error) = restart_result {
         let _ = fault_guard.release();
-        let _ = query_thread.join();
-        return (
+        if let Ok(result) = query_thread.join() {
+            *original_query = Some(result);
+        }
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             fault_timeout_diagnostics(
                 server_handle,
                 &format!("publication in-flight frontend kill failed: {error:#}"),
             ),
-        );
+        ));
     }
     let _ = writeln!(
         log,
         "    @publication_catalog_fault in-flight FE kill/restart PASS"
     );
 
-    let (query_ok, query_execution, query_error) = match query_thread.join() {
+    let query = match query_thread.join() {
         Ok(result) => result,
         Err(_) => {
-            return (
+            return SqlStepOutcome::infrastructure((
                 false,
                 None,
                 "FAIL (runner publication hold): query thread panicked".to_string(),
-            );
+            ));
         }
     };
-    if query_ok || query_execution.is_some() {
-        return (
+    let query_ok = query.0;
+    let query_has_execution = query.1.is_some();
+    let query_error = query.2.clone();
+    let transport_only = query.3 == Some(ExecutionFailureOrigin::Transport);
+    *original_query = Some(query);
+    if query_ok || (!convert_legacy && query_has_execution) {
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             "FAIL (runner publication hold): statement unexpectedly survived frontend kill"
                 .to_string(),
-        );
+        ));
+    }
+    if convert_legacy && !transport_only {
+        return SqlStepOutcome::infrastructure((
+            false,
+            None,
+            format!(
+                "FAIL (runner publication hold): conversion requires the original transport-only query failure after frontend kill; original query: {query_error}"
+            ),
+        ));
     }
     if let Err(error) = session_to_reconnect.reconnect() {
-        return (
+        return SqlStepOutcome::infrastructure((
             false,
             None,
             fault_timeout_diagnostics(
                 server_handle,
                 &format!("reconnect runner session after in-flight frontend kill: {error:#}"),
             ),
-        );
+        ));
     }
     let _ = writeln!(
         log,
         "    @publication_catalog_fault client disconnect observed and runner session reconnected"
     );
-    (
+    SqlStepOutcome::control_success((
         true,
         Some(QueryExecution {
+            shell_result: None,
+            result_statements: Vec::new(),
+            typed_results: Vec::new(),
             text_output: String::new(),
             header: Vec::new(),
             rows: Vec::new(),
             elapsed: Duration::ZERO,
         }),
         query_error,
-    )
+    ))
 }
 
 fn fault_timeout_diagnostics(
@@ -2375,6 +2774,209 @@ fn finish_expected_error_step(
 
 // Per-case execution
 // ---------------------------------------------------------------------------
+
+fn retain_domain_oracle_failure(
+    ctx: &SuiteRunContext,
+    case: &SqlCase,
+    step: &SqlStep,
+    failure: &DomainOracleFailure,
+    evidence: &mut results_record::CaseEvidence,
+    log: &mut String,
+) {
+    let mut artifact = None;
+    if let Some(partial) = failure.execution.as_ref() {
+        match ctx.failure_artifacts.persist_case_partial_result(
+            &ctx.suite_name,
+            &case.case_id,
+            step.query_number,
+            partial,
+        ) {
+            Ok(path) => {
+                evidence.artifacts.push(path.clone());
+                artifact = Some(path);
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    log,
+                    "    failed to retain original domain-oracle partial: {error:#}"
+                );
+            }
+        }
+    }
+    evidence.record(step, "domain_oracle_execution", false, serde_json::json!({
+        "failure_origin":match failure.failure_origin {
+            Some(ExecutionFailureOrigin::Infrastructure | ExecutionFailureOrigin::Transport) => "infrastructure",
+            Some(ExecutionFailureOrigin::Statement) => "statement",
+            _ => "assertion",
+        },
+        "authoring_stopped":execution_failure_is_infrastructure(failure.failure_origin),
+        "original_error":failure.to_string(),
+        "original_sql":failure.sql,
+        "has_original_partial":failure.execution.is_some(),
+        "partial_artifact":artifact,
+    }));
+}
+
+fn run_successful_step_domain_oracles(
+    step: &SqlStep,
+    context_and_case: (&SuiteRunContext, &SqlCase),
+    session: &mut TrinoCaseSession,
+    primary_case_db: Option<&str>,
+    epsilon: Option<f64>,
+    evidence: &mut results_record::CaseEvidence,
+    log: &mut String,
+) -> (bool, bool) {
+    let (ctx, case) = context_and_case;
+    let mut failed = false;
+    // @imv_stateless_rebuild: trigger the lake-native stateless
+    // rebuild procedure for the named MV and assert its read
+    // face is unchanged. Runs before @imv_equivalence_check so
+    // that, when both directives are present on a step, the
+    // equivalence oracle below validates the rebuilt MV.
+    if let Some(directive) = step.meta.imv_stateless_rebuild.as_ref() {
+        let oracle_result = run_imv_stateless_rebuild_check(
+            directive,
+            session,
+            ctx.query_timeout,
+            step.meta.db.as_deref().or(primary_case_db),
+            epsilon,
+            log,
+        );
+        evidence.record(
+            step,
+            "imv_stateless_rebuild",
+            oracle_result.is_ok(),
+            serde_json::json!({}),
+        );
+        if let Err(reason) = oracle_result {
+            let _ = writeln!(log, "    ❌ FAIL: {reason}");
+            failed = true;
+            if ctx.convert_legacy {
+                retain_domain_oracle_failure(ctx, case, step, &reason, evidence, log);
+            }
+            if ctx.convert_legacy && execution_failure_is_infrastructure(reason.failure_origin) {
+                evidence.record_independent_failure(
+                    Some(step.query_number),
+                    "target infrastructure failure during the original domain oracle".into(),
+                );
+                return (false, true);
+            }
+        }
+    }
+    if let Some(directive) = step.meta.mv_rest_document_graph.as_deref() {
+        let graph_result = mv_rest_document_graph::assert_graph(&ctx.suite_name, directive);
+        if graph_result.is_err() {
+            evidence.record(step, "mv_rest_document_graph", false, serde_json::json!({}));
+        }
+        match graph_result {
+            Ok(summary) => {
+                let _ = writeln!(log, "    @mv_rest_document_graph PASS {summary}");
+                let mutations = (|| -> anyhow::Result<String> {
+                    let expectation = mv_rest_document_graph::parse_expectation(directive)?;
+                    let (namespace, table, publications) = (
+                        expectation.namespace,
+                        expectation.table,
+                        expectation.publications,
+                    );
+                    let control = ctx.publication_catalog_control.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "MV REST mutation oracle requires the runner-owned publication catalog proxy"
+                        ))?;
+                    let counts = control.mutation_counts(namespace, table);
+                    let expected_commits = expectation
+                        .table_commits
+                        .unwrap_or(publications + expectation.slot_changes + 1);
+                    anyhow::ensure!(
+                        counts.stage_create_forwarded == 1
+                            && counts.stage_create_succeeded == 1
+                            && counts.table_commit_forwarded
+                                == expected_commits + expectation.failed_table_commits
+                            && counts.table_commit_succeeded == expected_commits
+                            && counts.other_forwarded == 0
+                            && counts.other_succeeded == 0,
+                        "MV REST mutation count for {namespace}.{table}: observed {counts:?}, expected one successful stage-create, {expected_commits} successful table commits, and {} failed table commits",
+                        expectation.failed_table_commits
+                    );
+                    Ok(format!(
+                        "stage-create=1/1 table-commit={}/{} other=0/0",
+                        expected_commits + expectation.failed_table_commits,
+                        expected_commits
+                    ))
+                })();
+                evidence.record(
+                    step,
+                    "mv_rest_document_graph",
+                    mutations.is_ok(),
+                    serde_json::json!({}),
+                );
+                match mutations {
+                    Ok(summary) => {
+                        let _ = writeln!(log, "    @mv_rest_mutations PASS {summary}");
+                    }
+                    Err(reason) => {
+                        let _ = writeln!(log, "    ❌ FAIL: {reason:#}");
+                        failed = true;
+                    }
+                }
+            }
+            Err(reason) => {
+                let _ = writeln!(log, "    ❌ FAIL: {reason:#}");
+                failed = true;
+                if ctx.convert_legacy {
+                    evidence.record(
+                        step,
+                        "mv_rest_document_graph",
+                        false,
+                        serde_json::json!({
+                            "failure_origin":"unclassified",
+                            "authoring_stopped":true,
+                            "original_error":format!("{reason:#}"),
+                        }),
+                    );
+                    return (false, true);
+                }
+            }
+        }
+    }
+    // @imv_equivalence_check: assert MV incremental contents
+    // == a full recompute derived by running the MV's SelectText
+    // directly against the base tables (no MV side effects).
+    // Verification and strict migration share this original oracle; ordinary
+    // recording does not run it. Diff mode compares against a
+    // reference engine (no full-recompute oracle here), and the
+    // check retains the MV's original SelectText.
+    if let Some(mv) = step.meta.imv_equivalence_check.as_deref() {
+        let oracle_result = run_imv_equivalence_check(
+            mv,
+            session,
+            ctx.query_timeout,
+            step.meta.db.as_deref().or(primary_case_db),
+            epsilon,
+            log,
+        );
+        evidence.record(
+            step,
+            "imv_equivalence",
+            oracle_result.is_ok(),
+            serde_json::json!({}),
+        );
+        if let Err(reason) = oracle_result {
+            let _ = writeln!(log, "    ❌ FAIL: {reason}");
+            failed = true;
+            if ctx.convert_legacy {
+                retain_domain_oracle_failure(ctx, case, step, &reason, evidence, log);
+            }
+            if ctx.convert_legacy && execution_failure_is_infrastructure(reason.failure_origin) {
+                evidence.record_independent_failure(
+                    Some(step.query_number),
+                    "target infrastructure failure during the original domain oracle".into(),
+                );
+                return (false, true);
+            }
+        }
+    }
+    (!failed, false)
+}
 
 fn mismatch_artifact_root(ctx: &SuiteRunContext, log: &mut String) -> Option<PathBuf> {
     match ctx
@@ -2554,6 +3156,42 @@ fn retire_unissued_step_role_launches(
     true
 }
 
+// A pure proof over the original paired expectation. Retry eligibility and
+// final authoring use the same complete rendering/comparison owner.
+fn conversion_record_for_execution(
+    ctx: &SuiteRunContext,
+    case: &SqlCase,
+    step: &SqlStep,
+    execution: &QueryExecution,
+    expected: &ResultSet,
+) -> Result<ResultSet> {
+    let mut expected = expected.clone();
+    fixture_context::render_expected_for_execution(
+        &step.sql,
+        &mut expected,
+        &case.expected_variables,
+        &case.namespace_rewrites,
+        &execution.result_statements,
+    )?;
+    golden_conversion::record_result(
+        step,
+        execution,
+        &expected,
+        &golden::legacy::OldRenderContext {
+            variant_offset_seconds: ctx
+                .legacy_variant_offset_seconds
+                .expect("validated conversion offset"),
+        },
+        &golden::legacy::OldComparePolicy {
+            order_sensitive: step
+                .meta
+                .order_sensitive
+                .unwrap_or(ctx.order_sensitive_default),
+            float_epsilon: query_float_epsilon(step, ctx.float_epsilon),
+        },
+    )
+}
+
 fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOutcome {
     let mut evidence = results_record::CaseEvidence::default();
     let mut outcome = run_case_observed(ctx, case, abort, &mut evidence);
@@ -2602,11 +3240,6 @@ fn run_case_observed(
         .filter(|step| step_requires_recorded_result(step))
         .collect();
     let multi_step = result_bearing_steps.len() > 1;
-    let single_step_query_number = if !multi_step {
-        result_bearing_steps.first().map(|s| s.query_number)
-    } else {
-        None
-    };
     let case_path = ctx
         .result_dir
         .as_ref()
@@ -2614,6 +3247,7 @@ fn run_case_observed(
     let case_requires_result_file = case.steps.iter().any(step_requires_recorded_result);
     let mut case_elapsed = Duration::from_secs(0);
     let mut case_failed = false;
+    let mut conversion_infrastructure_failed = false;
 
     let _ = writeln!(
         log,
@@ -2679,11 +3313,11 @@ fn run_case_observed(
     }
 
     // --- load expected results ---
-    let expected_results = if ctx.mode == Mode::Verify && ctx.verify_enabled {
+    let expected_results = if (ctx.mode == Mode::Verify && ctx.verify_enabled) || ctx.convert_legacy
+    {
         if let Some(path) = case_path.as_ref().filter(|p| p.exists()) {
-            match load_expected_results(path, multi_step, &ctx.marker_re, single_step_query_number)
-            {
-                Some(mut results) => {
+            match results::load_expected_results_with_variables(path, &case.expected_variables) {
+                Ok(mut results) => {
                     for (query, result) in &mut results {
                         if let Some(step) =
                             case.steps.iter().find(|step| step.query_number == *query)
@@ -2708,10 +3342,10 @@ fn run_case_observed(
                     }
                     Some(results)
                 }
-                None => {
+                Err(error) => {
                     let _ = writeln!(
                         log,
-                        "    ❌ failed to load expected result: {}",
+                        "    ❌ failed to load expected result {}: {error:#}",
                         path.display()
                     );
                     if ctx.fail_fast {
@@ -2733,11 +3367,29 @@ fn run_case_observed(
         None
     };
 
+    if ctx.convert_legacy && case_requires_result_file && expected_results.is_none() {
+        let _ = writeln!(
+            log,
+            "    ❌ conversion requires an existing paired golden file"
+        );
+        if ctx.fail_fast {
+            abort.store(true, Ordering::Relaxed);
+        }
+        preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
+        return CaseOutcome {
+            case_id: case.case_id.clone(),
+            status: CaseStatus::Fail,
+            elapsed: case_elapsed,
+            log,
+        };
+    }
+
     // --- record mode pre-check ---
     if ctx.mode == Mode::Record
         && case_requires_result_file
         && case_path.as_ref().is_some_and(|p| p.exists())
         && !ctx.update_expected
+        && !ctx.convert_legacy
     {
         let _ = writeln!(
             log,
@@ -2775,21 +3427,11 @@ fn run_case_observed(
         db: None,
         ..ctx.target_conn_base.clone()
     };
-    let reference_case_db_admin_conn = ConnectionConfig {
-        db: None,
-        ..ctx.reference_conn_base.clone()
-    };
 
     // Helper closure: drop all case databases (best-effort).
     let drop_all_case_dbs = |ctx: &SuiteRunContext, dbs: &[String], log: &mut String| {
         for db in dbs {
-            for (connection, role) in [
-                (&target_case_db_admin_conn, "target"),
-                (&reference_case_db_admin_conn, "reference"),
-            ] {
-                if role == "reference" && !ctx.reference_required {
-                    continue;
-                }
+            for (connection, role) in [(&target_case_db_admin_conn, "target")] {
                 if let Err(error) = session::drop_case_database_until(
                     connection,
                     ctx.query_timeout,
@@ -2833,22 +3475,29 @@ fn run_case_observed(
                 log,
             };
         }
-        if ctx.reference_required
-            && let Err(exc) = session::reset_case_database_scoped_until(
-                &reference_case_db_admin_conn,
-                ctx.query_timeout,
-                db_name,
-                "reference",
-                Some(ctx.work_deadline()),
-                Some(ctx.namespace_guard(&reference_case_db_admin_conn, false)),
-            )
-        {
+    }
+
+    // --- Trino session ---
+    let case_target_conn = ConnectionConfig {
+        db: primary_case_db
+            .map(|db| Some(db.to_string()))
+            .unwrap_or_else(|| ctx.target_conn_base.db.clone()),
+        ..ctx.target_conn_base.clone()
+    };
+
+    let mut target_session = match TrinoCaseSession::new_with_session_defaults(
+        &case_target_conn,
+        Some(ctx.work_deadline()),
+        &ctx.session_defaults,
+    ) {
+        Ok(s) => s,
+        Err(exc) => {
             preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
             drop_all_case_dbs(ctx, &case_dbs, &mut log);
             let _ = writeln!(
                 log,
-                "    ❌ failed to prepare reference case database {}: {:#}",
-                db_name, exc
+                "    ❌ failed to create target Trino session: {:#}",
+                exc
             );
             if ctx.fail_fast {
                 abort.store(true, Ordering::Relaxed);
@@ -2861,77 +3510,11 @@ fn run_case_observed(
                 log,
             };
         }
-    }
-
-    // --- MySQL sessions ---
-    let case_target_conn = ConnectionConfig {
-        db: primary_case_db
-            .map(|db| Some(db.to_string()))
-            .unwrap_or_else(|| ctx.target_conn_base.db.clone()),
-        ..ctx.target_conn_base.clone()
-    };
-    let case_reference_conn = ConnectionConfig {
-        db: primary_case_db
-            .map(|db| Some(db.to_string()))
-            .unwrap_or_else(|| ctx.reference_conn_base.db.clone()),
-        ..ctx.reference_conn_base.clone()
     };
 
-    let mut target_session =
-        match MysqlSession::new_with_deadline(&case_target_conn, Some(ctx.work_deadline())) {
-            Ok(s) => s,
-            Err(exc) => {
-                preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
-                drop_all_case_dbs(ctx, &case_dbs, &mut log);
-                let _ = writeln!(
-                    log,
-                    "    ❌ failed to create target mysql session: {:#}",
-                    exc
-                );
-                if ctx.fail_fast {
-                    abort.store(true, Ordering::Relaxed);
-                }
-                preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
-                return CaseOutcome {
-                    case_id: case.case_id.clone(),
-                    status: CaseStatus::Fail,
-                    elapsed: case_elapsed,
-                    log,
-                };
-            }
-        };
-
+    target_session.set_conversion_mode(ctx.convert_legacy);
     target_session.set_namespace_guard(ctx.namespace_guard(&case_target_conn, false));
-    let mut reference_session = if ctx.reference_required {
-        match MysqlSession::new_with_deadline(&case_reference_conn, Some(ctx.work_deadline())) {
-            Ok(s) => Some(s),
-            Err(exc) => {
-                preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
-                drop_all_case_dbs(ctx, &case_dbs, &mut log);
-                let _ = writeln!(
-                    log,
-                    "    ❌ failed to create reference mysql session: {:#}",
-                    exc
-                );
-                if ctx.fail_fast {
-                    abort.store(true, Ordering::Relaxed);
-                }
-                preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
-                return CaseOutcome {
-                    case_id: case.case_id.clone(),
-                    status: CaseStatus::Fail,
-                    elapsed: case_elapsed,
-                    log,
-                };
-            }
-        }
-    } else {
-        None
-    };
 
-    if let Some(reference) = &mut reference_session {
-        reference.set_namespace_guard(ctx.namespace_guard(&case_reference_conn, false));
-    }
     if let Err(error) = execute_target_session_sql_with(
         &mut target_session,
         &ctx.target_session_sql,
@@ -2956,7 +3539,11 @@ fn run_case_observed(
     }
 
     // --- step execution loop ---
-    let mut recorded_results: BTreeMap<usize, ResultSet> = BTreeMap::new();
+    let mut recorded_results: BTreeMap<usize, ResultSet> = if ctx.convert_legacy {
+        expected_results.clone().unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
     // Set once a step fails. The loop then runs only the steps the case marked
     // as its teardown: what a half-finished case leaves behind is adopted by
     // the next case that attaches a catalog onto the same warehouse, so a case
@@ -2991,12 +3578,7 @@ fn run_case_observed(
             for (role, result) in std::iter::once((
                 "target",
                 target_session.begin_cleanup(ctx.cleanup_deadline()),
-            ))
-            .chain(
-                reference_session
-                    .as_mut()
-                    .map(|session| ("reference", session.begin_cleanup(ctx.cleanup_deadline()))),
-            ) {
+            )) {
                 if let Err(error) = result {
                     case_failed = true;
                     let _ = writeln!(
@@ -3272,6 +3854,7 @@ fn run_case_observed(
             }
         };
 
+        let mut expected_error_completion = None;
         match ctx.mode {
             Mode::Verify => {
                 let retry_count = step_retry_count(step);
@@ -3283,121 +3866,24 @@ fn run_case_observed(
 
                 for attempt in 0..retry_count {
                     evidence.begin_attempt();
-                    let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
-                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
-                    } else if let Some(hold) = publication_service_hold.as_mut() {
-                        let Some(concurrent_shell) =
-                            step.meta.publication_catalog_concurrent_shell.as_deref()
-                        else {
-                            unreachable!("validated service hold requires a companion shell");
-                        };
-                        let request = InflightPublicationServiceShell {
-                            writer_exit: Arc::clone(&ctx.fixture_writers_settled),
-                            namespace_guard: ctx
-                                .namespace_guard(&case_target_conn, step.meta.cleanup),
-                            run_context: ctx
-                                .fixture_budget
-                                .to_json()
-                                .expect("admitted context serialization"),
-                            meta: &step.meta,
-                            server_handle: &ctx.server_handle,
-                            session_config: case_target_conn.clone(),
-                            original_deadline: Some(step_deadline),
-                            complete_deadline: ctx.cleanup_deadline(),
-                            query_timeout: ctx.query_timeout,
-                            sql: step.sql.clone(),
-                            db: step.meta.db.clone(),
-                            hold,
-                            shell: concurrent_shell,
-                            log: &mut log,
-                        };
-                        match step.meta.publication_service_hold.as_ref().unwrap().actor {
-                            PublicationServiceActor::Sql => {
-                                execute_target_query_with_inflight_publication_service_shell(
-                                    request,
-                                )
-                            }
-                            PublicationServiceActor::Shell => {
-                                execute_target_query_while_publication_service_holds_shell(request)
-                            }
-                        }
-                    } else if step
-                        .meta
-                        .publication_catalog_fault
-                        .is_some_and(|directive| directive.fault.requires_concurrent_shell())
-                    {
-                        let Some(fault_guard) = publication_catalog_fault_guard.as_mut() else {
-                            unreachable!("concurrent shell requires an armed fixture guard");
-                        };
-                        let Some(concurrent_shell) =
-                            step.meta.publication_catalog_concurrent_shell.as_deref()
-                        else {
-                            unreachable!("validated concurrent shell directive is missing");
-                        };
-                        execute_target_query_with_inflight_publication_concurrent_shell(
-                            InflightPublicationConcurrentShell {
-                                writer_exit: Arc::clone(&ctx.fixture_writers_settled),
-                                namespace_guard: ctx
-                                    .namespace_guard(&case_target_conn, step.meta.cleanup),
-                                run_context: ctx
-                                    .fixture_budget
-                                    .to_json()
-                                    .expect("admitted context serialization"),
-                                meta: &step.meta,
-                                server_handle: &ctx.server_handle,
-                                session_config: case_target_conn.clone(),
-                                original_deadline: Some(step_deadline),
-                                query_timeout: ctx.query_timeout,
-                                sql: step.sql.clone(),
-                                db: step.meta.db.clone(),
-                                fault_guard,
-                                fault_deadline: be_log_snapshot.evidence_deadline(),
-                                shell: concurrent_shell,
-                                log: &mut log,
-                            },
-                        )
-                    } else if step
-                        .meta
-                        .publication_catalog_fault
-                        .is_some_and(|directive| directive.fault.requires_inflight_frontend_kill())
-                    {
-                        let Some(fault_guard) = publication_catalog_fault_guard.as_mut() else {
-                            unreachable!(
-                                "in-flight publication kill requires an armed fixture guard"
-                            );
-                        };
-                        execute_target_query_with_inflight_publication_frontend_kill(
-                            InflightPublicationFrontendKill {
-                                namespace_guard: ctx
-                                    .namespace_guard(&case_target_conn, step.meta.cleanup),
-                                meta: &step.meta,
-                                server_handle: &ctx.server_handle,
-                                session_config: case_target_conn.clone(),
-                                original_deadline: Some(step_deadline),
-                                session_to_reconnect: &mut target_session,
-                                query_timeout: ctx.query_timeout,
-                                sql: step.sql.clone(),
-                                db: step.meta.db.clone(),
-                                fault_guard,
-                                fault_deadline: be_log_snapshot.evidence_deadline(),
-                                log: &mut log,
-                            },
-                        )
-                    } else {
-                        execute_target_query_with_selected_control(
-                            &step.meta,
-                            &ctx.server_handle,
-                            &mut target_session,
-                            ctx.query_timeout,
-                            &step.sql,
-                            step.meta.db.as_deref(),
-                            be_log_snapshot.evidence_deadline(),
-                            selected_control.map(|control| {
+                    let SqlStepOutcome(ok, execution, err_msg, failure_origin) =
+                        execute_case_step(CaseStepDispatch {
+                            ctx,
+                            case,
+                            evidence,
+                            step,
+                            case_target_conn: &case_target_conn,
+                            target_session: &mut target_session,
+                            publication_service_hold: &mut publication_service_hold,
+                            publication_catalog_fault_guard: &mut publication_catalog_fault_guard,
+                            step_deadline,
+                            fault_deadline: be_log_snapshot.evidence_deadline(),
+                            selected_control: selected_control.map(|control| {
                                 (control, attempt, ctx.controls.as_ref().unwrap().deadline)
                             }),
-                            &mut structured_lifecycle_observation,
-                        )
-                    };
+                            structured_lifecycle_observation: &mut structured_lifecycle_observation,
+                            log: &mut log,
+                        });
                     let elapsed = execution
                         .as_ref()
                         .map(|result| result.elapsed)
@@ -3413,6 +3899,30 @@ fn run_case_observed(
                             format!("runner service hold failed: {err_msg}"),
                         );
                         last_failure = err_msg;
+                        break;
+                    }
+
+                    if !ok
+                        && execution_failure_is_infrastructure(failure_origin)
+                        && (ctx.convert_legacy || step.meta.has_error_expectation())
+                    {
+                        case_failed = true;
+                        conversion_infrastructure_failed |= ctx.convert_legacy;
+                        last_failure = format!("target infrastructure failure: {err_msg}");
+                        evidence.record_independent_failure(
+                            Some(step.query_number),
+                            last_failure.clone(),
+                        );
+                        if step.meta.has_error_expectation() {
+                            evidence.record(
+                                step,
+                                "expected_error",
+                                false,
+                                serde_json::json!({"failure_origin":"infrastructure"}),
+                            );
+                        }
+                        // No retry or ordinary successor may turn this original
+                        // infrastructure failure into an expected SQL error.
                         break;
                     }
 
@@ -3472,31 +3982,59 @@ fn run_case_observed(
                             .as_ref()
                             .and_then(|results| results.get(&step.query_number))
                         {
-                            let (cmp_expected_rows, cmp_actual_rows) =
-                                if step.meta.normalize_explain_timing {
-                                    (
-                                        normalize_explain_timing_rows(&expected.rows),
-                                        normalize_explain_timing_rows(&execution.rows),
-                                    )
-                                } else {
-                                    (expected.rows.clone(), execution.rows.clone())
-                                };
-                            let (same, reason) = compare_result_sets(
-                                &expected.header,
-                                &cmp_expected_rows,
-                                &execution.header,
-                                &cmp_actual_rows,
+                            let actual_golden = match results::execution_golden(step, &execution) {
+                                Ok(golden) => golden,
+                                Err(error) => {
+                                    last_failure =
+                                        format!("VERIFY FAILED: typed result rendering: {error:#}");
+                                    continue;
+                                }
+                            };
+                            let pending_legacy = expected.golden.as_ref().is_some_and(|golden| {
+                                golden
+                                    .expanded
+                                    .blocks
+                                    .iter()
+                                    .any(|block| matches!(block, golden::Block::Legacy { .. }))
+                            });
+                            let mut expected = expected.clone();
+                            if !pending_legacy
+                                && let Err(error) = fixture_context::render_expected_for_execution(
+                                    &step.sql,
+                                    &mut expected,
+                                    &case.expected_variables,
+                                    &case.namespace_rewrites,
+                                    &execution.result_statements,
+                                )
+                            {
+                                last_failure =
+                                    format!("VERIFY FAILED: expected metadata binding: {error:#}");
+                                evidence.record_failure(serde_json::json!({"class":"mismatch","error_code":null,"statement_index":step.query_number,"actual_digest":results::golden_actual_digest(&actual_golden.expanded,order_sensitive).expect("rendered golden digest")}));
+                                break;
+                            }
+                            let Some(expected_golden) = expected.golden.as_ref() else {
+                                last_failure =
+                                    "VERIFY FAILED: expected result lacks golden blocks".into();
+                                continue;
+                            };
+                            let mut expected_blocks = expected_golden.expanded.blocks.clone();
+                            if step.meta.normalize_explain_timing {
+                                for block in &mut expected_blocks {
+                                    if let golden::Block::Typed { rows, .. } = block {
+                                        *rows = normalize_explain_timing_rows(rows);
+                                    }
+                                }
+                            }
+                            let (same, reason) = golden::execution::compare_blocks(
+                                &expected_blocks,
+                                &actual_golden.expanded.blocks,
                                 order_sensitive,
                                 epsilon,
                             );
                             evidence.record(step, "result_set", same, serde_json::json!({"float_epsilon":epsilon,"order_sensitive":order_sensitive,"explain_rewritten":false}));
                             if !same {
-                                let mut normalized = cmp_actual_rows.clone();
-                                if !order_sensitive {
-                                    normalized.sort();
-                                }
                                 evidence.record_failure(
-                                    serde_json::json!({"class":"mismatch","error_code":null,"statement_index":step.query_number,"actual_digest":results_record::digest(&serde_json::to_vec(&normalized).expect("rows serialize"))}),
+                                    serde_json::json!({"class":if pending_legacy {"error"}else{"mismatch"},"reason":if pending_legacy {Some("legacy_pending_conversion")}else{None},"error":reason,"error_code":null,"statement_index":step.query_number,"actual_digest":results::golden_actual_digest(&actual_golden.expanded,order_sensitive).expect("rendered golden has a digest")}),
                                 );
                             }
                             if same {
@@ -3552,126 +4090,7 @@ fn run_case_observed(
                 }
 
                 if step.meta.has_error_expectation() {
-                    let expected_ok = finish_expected_error_step(
-                        step,
-                        matched_expected_error,
-                        &last_failure,
-                        &ctx.server_handle,
-                        &be_log_snapshot,
-                        &mut log,
-                    );
-                    evidence.record_expected_error_log(step, matched_expected_error, expected_ok);
-                    if !expected_ok {
-                        case_failed = true;
-                    } else {
-                        // A durable maintenance error can intentionally be
-                        // followed by an FE restart.  In particular cleanup
-                        // response-loss cases must prove startup reconciles
-                        // the frozen prepared batch rather than merely
-                        // returning the expected client error.
-                        if let Err(error) = run_post_step_server_actions(
-                            step,
-                            ctx,
-                            &mut target_session,
-                            &mut publication_catalog_fault_guard,
-                            &mut log,
-                        ) {
-                            case_failed = true;
-                            evidence.record_independent_failure(
-                                Some(step.query_number),
-                                format!("post-step server action failed: {error:#}"),
-                            );
-                            let _ = writeln!(log, "    ❌ {error:#}");
-                            finish_publication_catalog_fault(
-                                &mut publication_catalog_fault_guard,
-                                step.query_number,
-                                evidence,
-                                &mut log,
-                            );
-                            if !retire_unissued_step_role_launches(
-                                ctx,
-                                case,
-                                step.query_number,
-                                abort,
-                                evidence,
-                                &mut log,
-                            ) {
-                                break;
-                            }
-                            cleanup_only = true;
-                            continue;
-                        }
-                        if step.meta.iceberg_orphan_fixture_absent {
-                            let Some(fixture) = orphan_fixture.as_ref() else {
-                                case_failed = true;
-                                evidence.record_independent_failure(
-                                    Some(step.query_number),
-                                    "orphan fixture was not installed before the absence check"
-                                        .into(),
-                                );
-                                let _ = writeln!(log, "    ❌ orphan fixture was not installed");
-                                finish_publication_catalog_fault(
-                                    &mut publication_catalog_fault_guard,
-                                    step.query_number,
-                                    evidence,
-                                    &mut log,
-                                );
-                                if !retire_unissued_step_role_launches(
-                                    ctx,
-                                    case,
-                                    step.query_number,
-                                    abort,
-                                    evidence,
-                                    &mut log,
-                                ) {
-                                    break;
-                                }
-                                cleanup_only = true;
-                                continue;
-                            };
-                            let absent_result = fixture.assert_absent();
-                            evidence.record(
-                                step,
-                                "iceberg_orphan_absent",
-                                absent_result.is_ok(),
-                                serde_json::json!({}),
-                            );
-                            if let Err(error) = absent_result {
-                                case_failed = true;
-                                let _ = writeln!(log, "    ❌ {error:#}");
-                                finish_publication_catalog_fault(
-                                    &mut publication_catalog_fault_guard,
-                                    step.query_number,
-                                    evidence,
-                                    &mut log,
-                                );
-                                if !retire_unissued_step_role_launches(
-                                    ctx,
-                                    case,
-                                    step.query_number,
-                                    abort,
-                                    evidence,
-                                    &mut log,
-                                ) {
-                                    break;
-                                }
-                                cleanup_only = true;
-                                continue;
-                            }
-                            let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
-                        }
-                        let be_log_result = run_be_log_directives_for_successful_step(
-                            step,
-                            &ctx.server_handle,
-                            &be_log_snapshot,
-                            &mut log,
-                        );
-                        evidence.record_expected_error_log(step, true, be_log_result.is_ok());
-                        if let Err(reason) = be_log_result {
-                            case_failed = true;
-                            let _ = writeln!(log, "    ❌ FAIL: {reason}");
-                        }
-                    }
+                    expected_error_completion = Some((matched_expected_error, last_failure));
                 } else if let Some(execution) = passed_execution {
                     if let Err(error) = run_post_step_server_actions(
                         step,
@@ -3799,131 +4218,17 @@ fn run_case_observed(
                                 false
                             }
                         };
-                        // @imv_stateless_rebuild: trigger the lake-native stateless
-                        // rebuild procedure for the named MV and assert its read
-                        // face is unchanged. Runs before @imv_equivalence_check so
-                        // that, when both directives are present on a step, the
-                        // equivalence oracle below validates the rebuilt MV.
-                        if let Some(directive) = step.meta.imv_stateless_rebuild.as_ref() {
-                            let oracle_result = run_imv_stateless_rebuild_check(
-                                directive,
-                                &mut target_session,
-                                ctx.query_timeout,
-                                step.meta.db.as_deref().or(primary_case_db),
-                                epsilon,
-                                &mut log,
-                            );
-                            evidence.record(
-                                step,
-                                "imv_stateless_rebuild",
-                                oracle_result.is_ok(),
-                                serde_json::json!({}),
-                            );
-                            if let Err(reason) = oracle_result {
-                                let _ = writeln!(log, "    ❌ FAIL: {reason}");
-                                case_failed = true;
-                            }
-                        }
-                        if let Some(directive) = step.meta.mv_rest_document_graph.as_deref() {
-                            let graph_result =
-                                mv_rest_document_graph::assert_graph(&ctx.suite_name, directive);
-                            if graph_result.is_err() {
-                                evidence.record(
-                                    step,
-                                    "mv_rest_document_graph",
-                                    false,
-                                    serde_json::json!({}),
-                                );
-                            }
-                            match graph_result {
-                                Ok(summary) => {
-                                    let _ =
-                                        writeln!(log, "    @mv_rest_document_graph PASS {summary}");
-                                    let mutations = (|| -> anyhow::Result<String> {
-                                        let expectation =
-                                            mv_rest_document_graph::parse_expectation(directive)?;
-                                        let (namespace, table, publications) = (
-                                            expectation.namespace,
-                                            expectation.table,
-                                            expectation.publications,
-                                        );
-                                        let control = ctx.publication_catalog_control.as_ref()
-                                            .ok_or_else(|| anyhow::anyhow!(
-                                                "MV REST mutation oracle requires the runner-owned publication catalog proxy"
-                                            ))?;
-                                        let counts = control.mutation_counts(namespace, table);
-                                        let expected_commits = expectation
-                                            .table_commits
-                                            .unwrap_or(publications + expectation.slot_changes + 1);
-                                        anyhow::ensure!(
-                                            counts.stage_create_forwarded == 1
-                                                && counts.stage_create_succeeded == 1
-                                                && counts.table_commit_forwarded
-                                                    == expected_commits
-                                                        + expectation.failed_table_commits
-                                                && counts.table_commit_succeeded
-                                                    == expected_commits
-                                                && counts.other_forwarded == 0
-                                                && counts.other_succeeded == 0,
-                                            "MV REST mutation count for {namespace}.{table}: observed {counts:?}, expected one successful stage-create, {expected_commits} successful table commits, and {} failed table commits",
-                                            expectation.failed_table_commits
-                                        );
-                                        Ok(format!(
-                                            "stage-create=1/1 table-commit={}/{} other=0/0",
-                                            expected_commits + expectation.failed_table_commits,
-                                            expected_commits
-                                        ))
-                                    })();
-                                    evidence.record(
-                                        step,
-                                        "mv_rest_document_graph",
-                                        mutations.is_ok(),
-                                        serde_json::json!({}),
-                                    );
-                                    match mutations {
-                                        Ok(summary) => {
-                                            let _ = writeln!(
-                                                log,
-                                                "    @mv_rest_mutations PASS {summary}"
-                                            );
-                                        }
-                                        Err(reason) => {
-                                            let _ = writeln!(log, "    ❌ FAIL: {reason:#}");
-                                            case_failed = true;
-                                        }
-                                    }
-                                }
-                                Err(reason) => {
-                                    let _ = writeln!(log, "    ❌ FAIL: {reason:#}");
-                                    case_failed = true;
-                                }
-                            }
-                        }
-                        // @imv_equivalence_check: assert MV incremental contents
-                        // == a full recompute derived by running the MV's SelectText
-                        // directly against the base tables (no MV side effects).
-                        // Verify-mode only by design: diff mode compares against a
-                        // reference engine (no full-recompute oracle here), and the
-                        // check needs the MV's own SelectText which only verify drives.
-                        if let Some(mv) = step.meta.imv_equivalence_check.as_deref() {
-                            let oracle_result = run_imv_equivalence_check(
-                                mv,
-                                &mut target_session,
-                                ctx.query_timeout,
-                                step.meta.db.as_deref().or(primary_case_db),
-                                epsilon,
-                                &mut log,
-                            );
-                            evidence.record(
-                                step,
-                                "imv_equivalence",
-                                oracle_result.is_ok(),
-                                serde_json::json!({}),
-                            );
-                            if let Err(reason) = oracle_result {
-                                let _ = writeln!(log, "    ❌ FAIL: {reason}");
-                                case_failed = true;
-                            }
+                        let (domain_oracles_ok, _) = run_successful_step_domain_oracles(
+                            step,
+                            (ctx, case),
+                            &mut target_session,
+                            primary_case_db,
+                            epsilon,
+                            evidence,
+                            &mut log,
+                        );
+                        if !domain_oracles_ok {
+                            case_failed = true;
                         }
                         // @explain_*: issue EXPLAIN VERBOSE and assert substrings.
                         let explain_requested = !step.meta.explain_contains.is_empty()
@@ -4043,18 +4348,31 @@ fn run_case_observed(
                         let reason = last_failure
                             .trim_start_matches("VERIFY FAILED: ")
                             .to_string();
-                        if let Some(root) = root.as_ref()
-                            && let Err(exc) = write_mismatch_artifacts(MismatchArtifacts {
-                                root_dir: root,
-                                suite_name: &ctx.suite_name,
-                                artifact_id: &artifact_id,
-                                expected_header: &expected.header,
-                                expected_rows: &expected.rows,
-                                actual_header: &execution.header,
-                                actual_rows: &execution.rows,
-                                reason: &reason,
-                            })
-                        {
+                        let mut bound_expected = expected.clone();
+                        if let Err(error) = fixture_context::render_expected_for_execution(
+                            &step.sql,
+                            &mut bound_expected,
+                            &case.expected_variables,
+                            &case.namespace_rewrites,
+                            &execution.result_statements,
+                        ) {
+                            let _ = writeln!(
+                                log,
+                                "    expected metadata binding failed while retaining mismatch: {error:#}"
+                            );
+                        }
+                        if let (Some(root), Some(expected_golden), Ok(actual_golden)) = (
+                            root.as_ref(),
+                            bound_expected.golden.as_ref(),
+                            results::execution_golden(step, execution),
+                        ) && let Err(exc) = write_mismatch_artifacts(MismatchArtifacts {
+                            root_dir: root,
+                            suite_name: &ctx.suite_name,
+                            artifact_id: &artifact_id,
+                            expected: &expected_golden.expanded,
+                            actual: &actual_golden.expanded,
+                            reason: &reason,
+                        }) {
                             let _ =
                                 writeln!(log, "    ⚠️ failed to write mismatch artifacts: {}", exc);
                         }
@@ -4062,6 +4380,21 @@ fn run_case_observed(
                 }
             }
             Mode::Record => {
+                // Optional ordinary-record oracles may still have an
+                // original Legacy section that migration must prove.
+                let existing_legacy = ctx.convert_legacy
+                    && expected_results
+                        .as_ref()
+                        .and_then(|sets| sets.get(&step.query_number))
+                        .and_then(|set| set.golden.as_ref())
+                        .is_some_and(|section| {
+                            section
+                                .source
+                                .blocks
+                                .iter()
+                                .any(|block| matches!(block, golden::Block::Legacy { .. }))
+                        });
+                let should_record_step = step_requires_recorded_result(step) || existing_legacy;
                 let retry_count = step_retry_count(step);
                 let retry_interval = step_retry_interval(step);
                 let mut matched_expected_error = false;
@@ -4070,37 +4403,87 @@ fn run_case_observed(
 
                 for attempt in 0..retry_count {
                     evidence.begin_attempt();
-                    let (ok, execution, err_msg) = if ctx.record_from == RecordFrom::Target {
-                        if shell::is_shell_step(&step.sql) {
-                            ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
-                        } else {
-                            execute_target_query_with_selected_control(
-                                &step.meta,
-                                &ctx.server_handle,
-                                &mut target_session,
-                                ctx.query_timeout,
-                                &step.sql,
-                                step.meta.db.as_deref(),
-                                be_log_snapshot.evidence_deadline(),
-                                selected_control.map(|control| {
-                                    (control, attempt, ctx.controls.as_ref().unwrap().deadline)
-                                }),
-                                &mut structured_lifecycle_observation,
-                            )
+                    let SqlStepOutcome(ok, execution, err_msg, failure_origin) =
+                        execute_case_step(CaseStepDispatch {
+                            ctx,
+                            case,
+                            evidence,
+                            step,
+                            case_target_conn: &case_target_conn,
+                            target_session: &mut target_session,
+                            publication_service_hold: &mut publication_service_hold,
+                            publication_catalog_fault_guard: &mut publication_catalog_fault_guard,
+                            step_deadline,
+                            fault_deadline: be_log_snapshot.evidence_deadline(),
+                            selected_control: selected_control.map(|control| {
+                                (control, attempt, ctx.controls.as_ref().unwrap().deadline)
+                            }),
+                            structured_lifecycle_observation: &mut structured_lifecycle_observation,
+                            log: &mut log,
+                        });
+                    if ctx.convert_legacy
+                        && !ok
+                        && let Some(partial) = execution.as_ref()
+                    {
+                        match ctx.failure_artifacts.persist_case_partial_result(
+                            &ctx.suite_name,
+                            &case.case_id,
+                            step.query_number,
+                            partial,
+                        ) {
+                            Ok(path) => {
+                                let _ = writeln!(
+                                    log,
+                                    "    incomplete statement results retained for diagnostics only: {}",
+                                    path.display()
+                                );
+                                evidence.artifacts.push(path);
+                            }
+                            Err(error) => {
+                                let _ = writeln!(
+                                    log,
+                                    "    failed to retain incomplete statement results: {error:#}"
+                                );
+                            }
                         }
-                    } else if shell::is_shell_step(&step.sql) {
-                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
-                    } else {
-                        reference_session
-                            .as_mut()
-                            .expect("reference session required in record-from=reference")
-                            .execute_query(ctx.query_timeout, &step.sql, step.meta.db.as_deref())
-                    };
+                    }
+                    if step.meta.publication_service_hold.is_some()
+                        && err_msg.starts_with("FAIL (runner service hold")
+                    {
+                        evidence.record_independent_failure(
+                            Some(step.query_number),
+                            format!("runner service hold failed: {err_msg}"),
+                        );
+                    }
                     let elapsed = execution
                         .as_ref()
                         .map(|result| result.elapsed)
                         .unwrap_or_default();
                     case_elapsed += elapsed;
+
+                    if !ok
+                        && execution_failure_is_infrastructure(failure_origin)
+                        && (ctx.convert_legacy || step.meta.has_error_expectation())
+                    {
+                        case_failed = true;
+                        conversion_infrastructure_failed |= ctx.convert_legacy;
+                        last_failure = format!("target infrastructure failure: {err_msg}");
+                        evidence.record_independent_failure(
+                            Some(step.query_number),
+                            last_failure.clone(),
+                        );
+                        if step.meta.has_error_expectation() {
+                            evidence.record(
+                                step,
+                                "expected_error",
+                                false,
+                                serde_json::json!({"failure_origin":"infrastructure"}),
+                            );
+                        }
+                        // No retry or ordinary successor may turn this original
+                        // infrastructure failure into an expected SQL error.
+                        break;
+                    }
 
                     if let Some(expected_result) =
                         evaluate_expected_error_branch(&step.meta, ok, &err_msg)
@@ -4117,6 +4500,13 @@ fn run_case_observed(
                             );
                         }
                         if let Err(reason) = expected_result {
+                            if ctx.convert_legacy
+                                && !ok
+                                && (shell::is_shell_step(&step.sql)
+                                    || failure_origin != Some(ExecutionFailureOrigin::Statement))
+                            {
+                                conversion_infrastructure_failed = true;
+                            }
                             last_failure = reason;
                         } else {
                             matched_expected_error = true;
@@ -4124,6 +4514,12 @@ fn run_case_observed(
                             break;
                         }
                     } else if !ok || execution.is_none() {
+                        if ctx.convert_legacy
+                            && (shell::is_shell_step(&step.sql)
+                                || failure_origin != Some(ExecutionFailureOrigin::Statement))
+                        {
+                            conversion_infrastructure_failed = true;
+                        }
                         last_failure = format!("record source execute failed: {}", err_msg);
                         evidence.record_failure(serde_json::json!({
                             "class":"error", "error_code":extract_engine_error_code(&err_msg).or_else(|| extract_sql_error_code(&err_msg)),
@@ -4146,12 +4542,50 @@ fn run_case_observed(
                         }
                         if !assertions_ok {
                             last_failure = format!("VERIFY FAILED: {}", assertions_reason);
+                        }
+                        let conversion_matches = if ctx.convert_legacy
+                            && should_record_step
+                            && attempt + 1 < retry_count
+                        {
+                            match expected_results
+                                .as_ref()
+                                .and_then(|sets| sets.get(&step.query_number))
+                            {
+                                Some(expected) => match conversion_record_for_execution(
+                                    ctx, case, step, &execution, expected,
+                                ) {
+                                    Ok(_) => true,
+                                    Err(error) => {
+                                        last_failure = format!(
+                                            "VERIFY FAILED: original conversion proof: {error:#}"
+                                        );
+                                        false
+                                    }
+                                },
+                                // No original section means no new comparison or
+                                // retry policy. Final recording retains its exact
+                                // missing-expectation error instead of inventing one.
+                                None => true,
+                            }
                         } else {
+                            true
+                        };
+                        if (assertions_ok && conversion_matches)
+                            || (ctx.convert_legacy && attempt + 1 == retry_count)
+                        {
+                            if !assertions_ok {
+                                case_failed = true;
+                                evidence.record_failure(serde_json::json!({"class":"error","error":last_failure,"statement_index":step.query_number}));
+                                let _ = writeln!(log, "    ❌ {last_failure}");
+                            }
                             recorded_execution = Some(execution);
                             break;
                         }
                     }
 
+                    if conversion_infrastructure_failed || (ctx.convert_legacy && !ok) {
+                        break;
+                    }
                     if attempt + 1 < retry_count {
                         let _ = writeln!(
                             log,
@@ -4171,7 +4605,9 @@ fn run_case_observed(
                 }
 
                 let expected_error_be_log_ok =
-                    if matched_expected_error && ctx.record_from == RecordFrom::Target {
+                    if ctx.convert_legacy && step.meta.has_error_expectation() {
+                        true
+                    } else if matched_expected_error {
                         match run_be_log_directives_for_successful_step(
                             step,
                             &ctx.server_handle,
@@ -4191,27 +4627,29 @@ fn run_case_observed(
                     };
 
                 if step.meta.has_error_expectation() {
-                    if matched_expected_error && expected_error_be_log_ok {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ RECORDED EXPECTED ERROR: {} {}",
-                            expected_error_expectation_label(&step.meta),
-                            last_failure
-                        );
+                    if ctx.convert_legacy {
+                        expected_error_completion = Some((matched_expected_error, last_failure));
                     } else {
-                        case_failed = true;
-                        let _ = writeln!(log, "    ❌ {}", last_failure);
+                        if matched_expected_error && expected_error_be_log_ok {
+                            let _ = writeln!(
+                                log,
+                                "    ✅ RECORDED EXPECTED ERROR: {} {}",
+                                expected_error_expectation_label(&step.meta),
+                                last_failure
+                            );
+                        } else {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ {}", last_failure);
+                        }
                     }
                 } else if let Some(execution) = recorded_execution {
-                    if ctx.record_from == RecordFrom::Target
-                        && let Err(error) = run_post_step_server_actions(
-                            step,
-                            ctx,
-                            &mut target_session,
-                            &mut publication_catalog_fault_guard,
-                            &mut log,
-                        )
-                    {
+                    if let Err(error) = run_post_step_server_actions(
+                        step,
+                        ctx,
+                        &mut target_session,
+                        &mut publication_catalog_fault_guard,
+                        &mut log,
+                    ) {
                         case_failed = true;
                         evidence.record_independent_failure(
                             Some(step.query_number),
@@ -4307,7 +4745,7 @@ fn run_case_observed(
                         case_failed = true;
                         evidence.record(step, "wait_alter", false, serde_json::json!({}));
                     } else {
-                        let be_log_ok = if ctx.record_from == RecordFrom::Target {
+                        let be_log_ok = {
                             match run_be_log_directives_for_successful_step(
                                 step,
                                 &ctx.server_handle,
@@ -4322,11 +4760,43 @@ fn run_case_observed(
                                     false
                                 }
                             }
-                        } else {
-                            true
                         };
+                        let domain_oracle_stopped_conversion = if ctx.convert_legacy {
+                            let (domain_oracles_ok, stop_conversion) =
+                                run_successful_step_domain_oracles(
+                                    step,
+                                    (ctx, case),
+                                    &mut target_session,
+                                    primary_case_db,
+                                    epsilon,
+                                    evidence,
+                                    &mut log,
+                                );
+                            case_failed |= !domain_oracles_ok;
+                            conversion_infrastructure_failed |= stop_conversion;
+                            stop_conversion
+                        } else {
+                            false
+                        };
+                        if domain_oracle_stopped_conversion {
+                            match ctx.failure_artifacts.persist_case_actual_result(
+                                &ctx.suite_name,
+                                &case.case_id,
+                                step.query_number,
+                                &execution,
+                            ) {
+                                Ok(path) => evidence.artifacts.push(path),
+                                Err(error) => {
+                                    let _ = writeln!(
+                                        log,
+                                        "    failed to retain primary query after domain oracle stop: {error:#}"
+                                    );
+                                }
+                            }
+                        }
                         // @explain_*: validate during record too.
-                        let explain_ok = be_log_ok
+                        let explain_ok = !domain_oracle_stopped_conversion
+                            && be_log_ok
                             && if !step.meta.explain_contains.is_empty()
                                 || !step.meta.explain_not_contains.is_empty()
                             {
@@ -4337,7 +4807,14 @@ fn run_case_observed(
                                     &ctx.rewrite_explain_contains_as_not_contains,
                                     &mut log,
                                 ) {
-                                    Ok(()) => true,
+                                    Ok(()) => {
+                                        for kind in ["explain_contains", "explain_not_contains"] {
+                                            if results_record::required(step).contains(&kind) {
+                                                evidence.record(step, kind, true, serde_json::json!({"explain_rewritten":!ctx.rewrite_explain_contains_as_not_contains.is_empty()}));
+                                            }
+                                        }
+                                        true
+                                    }
                                     Err(msg) => {
                                         case_failed = true;
                                         for kind in ["explain_contains", "explain_not_contains"] {
@@ -4352,20 +4829,75 @@ fn run_case_observed(
                             } else {
                                 true
                             };
-                        if explain_ok {
-                            if step_requires_recorded_result(step) {
-                                let record_rows = if step.meta.normalize_explain_timing {
-                                    normalize_explain_timing_rows(&execution.rows)
+                        if !domain_oracle_stopped_conversion && (explain_ok || ctx.convert_legacy) {
+                            if should_record_step {
+                                let recorded = if ctx.convert_legacy {
+                                    expected_results
+                                        .as_ref()
+                                        .and_then(|sets| sets.get(&step.query_number))
+                                        .context("conversion requires an existing golden section")
+                                        .and_then(|expected| {
+                                            conversion_record_for_execution(
+                                                ctx, case, step, &execution, expected,
+                                            )
+                                        })
                                 } else {
-                                    execution.rows.clone()
+                                    results::execution_golden(step, &execution).and_then(|golden| {
+                                        let mut set = results::project_golden_blocks(
+                                            &golden.expanded.blocks,
+                                        )?;
+                                        set.golden = Some(golden);
+                                        Ok(set)
+                                    })
                                 };
-                                recorded_results.insert(
-                                    step.query_number,
-                                    ResultSet {
-                                        header: execution.header.clone(),
-                                        rows: record_rows,
-                                    },
-                                );
+                                if ctx.convert_legacy {
+                                    evidence.record(
+                                        step,
+                                        "legacy_conversion",
+                                        recorded.is_ok(),
+                                        serde_json::json!({"retained_original":recorded.is_err()}),
+                                    );
+                                }
+                                match recorded {
+                                    Ok(set) => {
+                                        recorded_results.insert(step.query_number, set);
+                                    }
+                                    Err(error) => {
+                                        case_failed = true;
+                                        let _ = writeln!(
+                                            log,
+                                            "    ❌ typed golden recording failed: {error:#}"
+                                        );
+                                        let actual_digest =
+                                            results::execution_golden(step, &execution)
+                                                .and_then(|golden| {
+                                                    results::golden_actual_digest(
+                                                        &golden.expanded,
+                                                        step.meta
+                                                            .order_sensitive
+                                                            .unwrap_or(ctx.order_sensitive_default),
+                                                    )
+                                                })
+                                                .ok();
+                                        evidence.record_failure(serde_json::json!({"class":"error","error":format!("typed golden recording failed: {error:#}"),"statement_index":step.query_number,"actual_digest":actual_digest}));
+                                        match ctx.failure_artifacts.persist_case_actual_result(
+                                            &ctx.suite_name,
+                                            &case.case_id,
+                                            step.query_number,
+                                            &execution,
+                                        ) {
+                                            Ok(path) => {
+                                                evidence.artifacts.push(path);
+                                            }
+                                            Err(error) => {
+                                                let _ = writeln!(
+                                                    log,
+                                                    "    failed to retain conversion actual: {error:#}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             if step.meta.skip_result_check || step_has_implicit_skip_result(step) {
                                 let _ = writeln!(
@@ -4388,268 +4920,126 @@ fn run_case_observed(
                     let _ = writeln!(log, "    ❌ {}", last_failure);
                 }
             }
-            Mode::Diff => {
-                if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
-                    let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
-                    } else {
-                        execute_target_query_with_selected_control(
-                            &step.meta,
-                            &ctx.server_handle,
-                            &mut target_session,
-                            ctx.query_timeout,
-                            &step.sql,
-                            step.meta.db.as_deref(),
-                            be_log_snapshot.evidence_deadline(),
-                            selected_control.map(|control| {
-                                (control, 0, ctx.controls.as_ref().unwrap().deadline)
-                            }),
-                            &mut structured_lifecycle_observation,
-                        )
-                    };
-                    let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
-                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
-                    } else {
-                        reference_session
-                            .as_mut()
-                            .expect("reference session required in diff mode")
-                            .execute_query(ctx.query_timeout, &step.sql, step.meta.db.as_deref())
-                    };
-                    let elapsed = execution_t.as_ref().map(|r| r.elapsed).unwrap_or_default()
-                        + execution_r.as_ref().map(|r| r.elapsed).unwrap_or_default();
-                    case_elapsed += elapsed;
+        }
 
-                    let expected_code_result = expected_engine_error_code_diff_result(
-                        expected_code,
-                        ok_t,
-                        &err_t,
-                        ok_r,
-                        &err_r,
+        if let Some((matched_expected_error, last_failure)) = expected_error_completion {
+            let expected_ok = finish_expected_error_step(
+                step,
+                matched_expected_error,
+                &last_failure,
+                &ctx.server_handle,
+                &be_log_snapshot,
+                &mut log,
+            );
+            evidence.record_expected_error_log(step, matched_expected_error, expected_ok);
+            if !expected_ok {
+                case_failed = true;
+            } else {
+                // A durable maintenance error can intentionally be
+                // followed by an FE restart.  In particular cleanup
+                // response-loss cases must prove startup reconciles
+                // the frozen prepared batch rather than merely
+                // returning the expected client error.
+                if let Err(error) = run_post_step_server_actions(
+                    step,
+                    ctx,
+                    &mut target_session,
+                    &mut publication_catalog_fault_guard,
+                    &mut log,
+                ) {
+                    case_failed = true;
+                    evidence.record_independent_failure(
+                        Some(step.query_number),
+                        format!("post-step server action failed: {error:#}"),
                     );
-                    if expected_code_result.is_ok() {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ DIFF PASS (both sides matched expected error: engine_error_code={})",
-                            expected_code
-                        );
-                    } else {
+                    let _ = writeln!(log, "    ❌ {error:#}");
+                    finish_publication_catalog_fault(
+                        &mut publication_catalog_fault_guard,
+                        step.query_number,
+                        evidence,
+                        &mut log,
+                    );
+                    if !retire_unissued_step_role_launches(
+                        ctx,
+                        case,
+                        step.query_number,
+                        abort,
+                        evidence,
+                        &mut log,
+                    ) {
+                        break;
+                    }
+                    cleanup_only = true;
+                    continue;
+                }
+                if step.meta.iceberg_orphan_fixture_absent {
+                    let Some(fixture) = orphan_fixture.as_ref() else {
                         case_failed = true;
-                        evidence.record_failure(serde_json::json!({
-                            "class":"error", "error_code":null,
-                            "statement_index":step.query_number, "actual_digest":null,
-                            "error":format!("diff expected engine error mismatch: {expected_code_result:?}")
-                        }));
-                        let _ = writeln!(
-                            log,
-                            "    ❌ DIFF FAILED {}",
-                            expected_code_result.expect_err("checked mismatch above")
+                        evidence.record_independent_failure(
+                            Some(step.query_number),
+                            "orphan fixture was not installed before the absence check".into(),
                         );
-                    }
-                } else if step.meta.has_sql_error_assertion() {
-                    // SQL codes, phases, and source locations are NovaRocks
-                    // conformance contracts. A reference engine cannot be
-                    // required to emit NovaRocks-owned descriptors, so Diff
-                    // validates this branch against the target only.
-                    let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
-                    } else {
-                        execute_target_query_with_selected_control(
-                            &step.meta,
-                            &ctx.server_handle,
-                            &mut target_session,
-                            ctx.query_timeout,
-                            &step.sql,
-                            step.meta.db.as_deref(),
-                            be_log_snapshot.evidence_deadline(),
-                            selected_control.map(|control| {
-                                (control, 0, ctx.controls.as_ref().unwrap().deadline)
-                            }),
-                            &mut structured_lifecycle_observation,
-                        )
-                    };
-                    case_elapsed += execution_t
-                        .as_ref()
-                        .map(|result| result.elapsed)
-                        .unwrap_or_default();
-
-                    match evaluate_expected_error_branch(&step.meta, ok_t, &err_t) {
-                        Some(Ok(())) => {
-                            let _ = writeln!(
-                                log,
-                                "    ✅ DIFF PASS (target SQL error contract matched: {})",
-                                expected_error_expectation_label(&step.meta)
-                            );
-                        }
-                        Some(Err(reason)) => {
-                            case_failed = true;
-                            evidence.record_failure(serde_json::json!({
-                                "class":"error", "error_code":null,
-                                "statement_index":step.query_number, "actual_digest":null,
-                                "error":format!("diff target SQL error contract failed: {reason}")
-                            }));
-                            let _ = writeln!(log, "    ❌ DIFF FAILED {reason}");
-                        }
-                        None => unreachable!("checked has_sql_error_assertion above"),
-                    }
-                } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
-                    let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
-                    } else {
-                        execute_target_query_with_selected_control(
-                            &step.meta,
-                            &ctx.server_handle,
-                            &mut target_session,
-                            ctx.query_timeout,
-                            &step.sql,
-                            step.meta.db.as_deref(),
-                            be_log_snapshot.evidence_deadline(),
-                            selected_control.map(|control| {
-                                (control, 0, ctx.controls.as_ref().unwrap().deadline)
-                            }),
-                            &mut structured_lifecycle_observation,
-                        )
-                    };
-                    let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
-                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
-                    } else {
-                        reference_session
-                            .as_mut()
-                            .expect("reference session required in diff mode")
-                            .execute_query(ctx.query_timeout, &step.sql, step.meta.db.as_deref())
-                    };
-                    let elapsed = execution_t.as_ref().map(|r| r.elapsed).unwrap_or_default()
-                        + execution_r.as_ref().map(|r| r.elapsed).unwrap_or_default();
-                    case_elapsed += elapsed;
-
-                    let target_matched = !ok_t && error_message_matches(&err_t, expected_error);
-                    let reference_matched = !ok_r && error_message_matches(&err_r, expected_error);
-                    if target_matched && reference_matched {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ DIFF PASS (both sides matched expected error: {:?})",
-                            expected_error
+                        let _ = writeln!(log, "    ❌ orphan fixture was not installed");
+                        finish_publication_catalog_fault(
+                            &mut publication_catalog_fault_guard,
+                            step.query_number,
+                            evidence,
+                            &mut log,
                         );
-                    } else {
+                        if !retire_unissued_step_role_launches(
+                            ctx,
+                            case,
+                            step.query_number,
+                            abort,
+                            evidence,
+                            &mut log,
+                        ) {
+                            break;
+                        }
+                        cleanup_only = true;
+                        continue;
+                    };
+                    let absent_result = fixture.assert_absent();
+                    evidence.record(
+                        step,
+                        "iceberg_orphan_absent",
+                        absent_result.is_ok(),
+                        serde_json::json!({}),
+                    );
+                    if let Err(error) = absent_result {
                         case_failed = true;
-                        evidence.record_failure(serde_json::json!({
-                            "class":"error", "error_code":null,
-                            "statement_index":step.query_number, "actual_digest":null,
-                            "error":format!("diff expected error mismatch: target_ok={ok_t}, target_err={err_t}, reference_ok={ok_r}, reference_err={err_r}")
-                        }));
-                        let _ = writeln!(
-                            log,
-                            "    ❌ DIFF FAILED expected error {:?} (target_ok={}, target_err={}, reference_ok={}, reference_err={})",
-                            expected_error, ok_t, err_t, ok_r, err_r
+                        let _ = writeln!(log, "    ❌ {error:#}");
+                        finish_publication_catalog_fault(
+                            &mut publication_catalog_fault_guard,
+                            step.query_number,
+                            evidence,
+                            &mut log,
                         );
-                    }
-                } else {
-                    let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
-                    } else {
-                        execute_target_query_with_selected_control(
-                            &step.meta,
-                            &ctx.server_handle,
-                            &mut target_session,
-                            ctx.query_timeout,
-                            &step.sql,
-                            step.meta.db.as_deref(),
-                            be_log_snapshot.evidence_deadline(),
-                            selected_control.map(|control| {
-                                (control, 0, ctx.controls.as_ref().unwrap().deadline)
-                            }),
-                            &mut structured_lifecycle_observation,
-                        )
-                    };
-                    if !ok_t || execution_t.is_none() {
-                        case_failed = true;
-                        let failure = annotate_failure_with_engine_error_code(
-                            &format!("target execute failed: {}", err_t),
-                            &err_t,
-                        );
-                        evidence.record_failure(serde_json::json!({
-                            "class":"error", "error_code":extract_engine_error_code(&err_t).or_else(|| extract_sql_error_code(&err_t)),
-                            "statement_index":step.query_number, "actual_digest":null,
-                            "error":failure
-                        }));
-                        let _ = writeln!(log, "    ❌ {}", failure);
-                    } else {
-                        let Some(execution_t) = execution_t else {
-                            unreachable!("checked above");
-                        };
-                        let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
-                            ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
-                        } else {
-                            reference_session
-                                .as_mut()
-                                .expect("reference session required in diff mode")
-                                .execute_query(
-                                    ctx.query_timeout,
-                                    &step.sql,
-                                    step.meta.db.as_deref(),
-                                )
-                        };
-                        if !ok_r || execution_r.is_none() {
-                            case_failed = true;
-                            evidence.record_failure(serde_json::json!({
-                                "class":"error", "error_code":extract_engine_error_code(&err_r).or_else(|| extract_sql_error_code(&err_r)),
-                                "statement_index":step.query_number, "actual_digest":null,
-                                "error":format!("diff reference execute failed: {err_r}")
-                            }));
-                            case_elapsed += execution_t.elapsed;
-                            let _ = writeln!(log, "    ❌ reference execute failed: {}", err_r);
-                        } else {
-                            let Some(execution_r) = execution_r else {
-                                unreachable!("checked above");
-                            };
-                            let elapsed = execution_t.elapsed + execution_r.elapsed;
-                            case_elapsed += elapsed;
-
-                            let (same, reason) = compare_result_sets(
-                                &execution_r.header,
-                                &execution_r.rows,
-                                &execution_t.header,
-                                &execution_t.rows,
-                                order_sensitive,
-                                epsilon,
-                            );
-                            if same {
-                                let _ = writeln!(
-                                    log,
-                                    "    ✅ DIFF PASS (target={:.2}s, reference={:.2}s)",
-                                    execution_t.elapsed.as_secs_f64(),
-                                    execution_r.elapsed.as_secs_f64()
-                                );
-                            } else {
-                                case_failed = true;
-                                evidence.record_failure(serde_json::json!({
-                                    "class":"error", "error_code":null,
-                                    "statement_index":step.query_number, "actual_digest":null,
-                                    "error":format!("diff result comparison failed: {reason}")
-                                }));
-                                let _ = writeln!(log, "    ❌ DIFF FAILED: {}", reason);
-                                if let Some(root) = mismatch_artifact_root(ctx, &mut log).as_ref() {
-                                    let artifact_id =
-                                        format!("{}-query{}", case.case_id, step.query_number);
-                                    if let Err(exc) = write_mismatch_artifacts(MismatchArtifacts {
-                                        root_dir: root,
-                                        suite_name: &ctx.suite_name,
-                                        artifact_id: &artifact_id,
-                                        expected_header: &execution_r.header,
-                                        expected_rows: &execution_r.rows,
-                                        actual_header: &execution_t.header,
-                                        actual_rows: &execution_t.rows,
-                                        reason: &reason,
-                                    }) {
-                                        let _ = writeln!(
-                                            log,
-                                            "    ⚠️ failed to write mismatch artifacts: {}",
-                                            exc
-                                        );
-                                    }
-                                }
-                            }
+                        if !retire_unissued_step_role_launches(
+                            ctx,
+                            case,
+                            step.query_number,
+                            abort,
+                            evidence,
+                            &mut log,
+                        ) {
+                            break;
                         }
+                        cleanup_only = true;
+                        continue;
                     }
+                    let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
+                }
+                let be_log_result = run_be_log_directives_for_successful_step(
+                    step,
+                    &ctx.server_handle,
+                    &be_log_snapshot,
+                    &mut log,
+                );
+                evidence.record_expected_error_log(step, true, be_log_result.is_ok());
+                if let Err(reason) = be_log_result {
+                    case_failed = true;
+                    let _ = writeln!(log, "    ❌ FAIL: {reason}");
                 }
             }
         }
@@ -4668,6 +5058,7 @@ fn run_case_observed(
             &mut log,
         ) {
             case_failed = true;
+            conversion_infrastructure_failed = true;
         }
 
         for (action, result) in [
@@ -4676,6 +5067,7 @@ fn run_case_observed(
         ] {
             if let Err(error) = result {
                 case_failed = true;
+                conversion_infrastructure_failed = true;
                 evidence.record_case_cleanup_failure(
                     Some(step.query_number),
                     format!("{action} fault cleanup: {error:#}"),
@@ -4716,6 +5108,7 @@ fn run_case_observed(
                 }
                 Err(error) => {
                     case_failed = true;
+                    conversion_infrastructure_failed = true;
                     evidence.record_independent_failure(
                         Some(step.query_number),
                         format!("query-execution resource convergence failed: {error:#}"),
@@ -4764,6 +5157,7 @@ fn run_case_observed(
                 && let Err(error) = guard.drain()
             {
                 case_failed = true;
+                conversion_infrastructure_failed = true;
                 evidence.record_case_cleanup_failure(
                     Some(step.query_number),
                     format!("exact statement lifecycle observation cleanup failed: {error:#}"),
@@ -4777,6 +5171,7 @@ fn run_case_observed(
 
         if !step.meta.cleanup && Instant::now() >= step_deadline {
             case_failed = true;
+            conversion_infrastructure_failed = true;
             evidence.record_failure(serde_json::json!({"class":"error", "error":"original SQL invocation work deadline expired", "statement_index":step.query_number}));
             let _ = writeln!(log, "    ❌ original SQL invocation work deadline expired");
         }
@@ -4793,7 +5188,8 @@ fn run_case_observed(
             case_failed = true;
             break;
         }
-        if case_failed && !cleanup_only {
+        if case_failed && !cleanup_only && (!ctx.convert_legacy || conversion_infrastructure_failed)
+        {
             cleanup_only = true;
             let remaining_cleanup = case
                 .steps
@@ -4836,18 +5232,14 @@ fn run_case_observed(
     }
 
     // --- cleanup ---
-    for (role, closed) in std::iter::once(("target", target_session.finish())).chain(
-        reference_session
-            .take()
-            .map(|session| ("reference", session.finish())),
-    ) {
+    for (role, closed) in std::iter::once(("target", target_session.finish())) {
         if let Err(error) = closed {
             case_failed = true;
             evidence.record_case_cleanup_failure(
                 None,
-                format!("{role} MySQL socket owner cleanup: {error:#}"),
+                format!("{role} Trino client cleanup: {error:#}"),
             );
-            let _ = writeln!(log, "    ❌ {role} MySQL socket owner cleanup: {error:#}");
+            let _ = writeln!(log, "    ❌ {role} Trino client cleanup: {error:#}");
         }
     }
 
@@ -4870,31 +5262,11 @@ fn run_case_observed(
                 db_name, exc
             );
         }
-        if ctx.reference_required
-            && let Err(exc) = session::drop_case_database_until(
-                &reference_case_db_admin_conn,
-                ctx.query_timeout,
-                db_name,
-                "reference",
-                Some(ctx.cleanup_deadline()),
-            )
-        {
-            case_failed = true;
-            evidence.record_case_cleanup_failure(
-                None,
-                format!("failed to cleanup reference case database {db_name}: {exc:#}"),
-            );
-            let _ = writeln!(
-                log,
-                "    ❌ failed to cleanup reference case database {}: {:#}",
-                db_name, exc
-            );
-        }
     }
 
-    if !case_failed
+    if (!case_failed || ctx.convert_legacy)
         && ctx.mode == Mode::Record
-        && case_requires_result_file
+        && (case_requires_result_file || (ctx.convert_legacy && expected_results.is_some()))
         && let Some(path) = case_path.as_ref()
     {
         if let Err(exc) = write_result_file(path, &recorded_results, multi_step) {
@@ -4978,7 +5350,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
             .cleanup_hook
             .as_ref()
             .is_some_and(|cleanup| cleanup.path == hook.path);
-        session::run_mysql_sql_scoped_until(
+        session::run_trino_sql_scoped_until(
             conn,
             timeout,
             &hook.sql,
@@ -5120,72 +5492,6 @@ fn run_suite_with_hooks_observed(
                 wall_time: wall_start.elapsed(),
             };
         }
-        if ctx.reference_required {
-            {
-                let _guard = stdout_lock.lock().unwrap();
-                println!(
-                    "[{}] running suite init on reference: {}",
-                    ctx.suite_name,
-                    hook.path.display()
-                );
-            }
-            if let Err(exc) = execute_hook(
-                &ctx.reference_admin_conn,
-                ctx.query_timeout,
-                hook,
-                "reference",
-            ) {
-                ctx.failure_artifacts.record_provenance(
-                    format!("suite-init/{}", ctx.suite_name),
-                    serde_json::json!({"role": "reference", "error": format!("{exc:#}")}),
-                );
-                preserve_suite_failure_snapshot(ctx, "init-reference", stdout_lock);
-                let mut cleanup_errors = Vec::new();
-                if let Some(cleanup) = ps.cleanup_hook.as_ref() {
-                    for (connection, role) in [
-                        (&ctx.reference_admin_conn, "reference"),
-                        (&ctx.target_admin_conn, "target"),
-                    ] {
-                        if let Err(error) =
-                            execute_hook(connection, ctx.query_timeout, cleanup, role)
-                        {
-                            cleanup_errors.push(format!(
-                                "[{}] {role} cleanup after init failure: {error:#}",
-                                ctx.suite_name
-                            ));
-                        }
-                    }
-                }
-                let _guard = stdout_lock.lock().unwrap();
-                println!(
-                    "[{}] ❌ suite reference init failed: {}",
-                    ctx.suite_name, exc
-                );
-                let outcomes: Vec<CaseOutcome> = ps
-                    .cases
-                    .iter()
-                    .map(|case| CaseOutcome {
-                        case_id: case.case_id.clone(),
-                        status: CaseStatus::Fail,
-                        elapsed: Duration::ZERO,
-                        log: format!(
-                            "\n[{}] {} (steps={})\n    ❌ suite reference init failed\n",
-                            ctx.suite_name,
-                            case.case_id,
-                            case.steps.len(),
-                        ),
-                    })
-                    .chain(load_failure_outcomes(&ctx.suite_name, &ps.load_failures))
-                    .collect();
-                return SuiteOutcome {
-                    suite_name: ctx.suite_name.clone(),
-                    total,
-                    outcomes,
-                    cleanup_errors,
-                    wall_time: wall_start.elapsed(),
-                };
-            }
-        }
     }
 
     // --- split cases into parallel and sequential groups ---
@@ -5271,25 +5577,6 @@ fn run_suite_with_hooks_observed(
         if let Err(exc) = execute_hook(&ctx.target_admin_conn, ctx.query_timeout, hook, "target") {
             preserve_suite_failure_snapshot(ctx, "cleanup-target", stdout_lock);
             cleanup_errors.push(format!("[{}] {exc:#}", ctx.suite_name));
-        }
-        if ctx.reference_required {
-            {
-                let _guard = stdout_lock.lock().unwrap();
-                println!(
-                    "[{}] running suite cleanup on reference: {}",
-                    ctx.suite_name,
-                    hook.path.display()
-                );
-            }
-            if let Err(exc) = execute_hook(
-                &ctx.reference_admin_conn,
-                ctx.query_timeout,
-                hook,
-                "reference",
-            ) {
-                preserve_suite_failure_snapshot(ctx, "cleanup-reference", stdout_lock);
-                cleanup_errors.push(format!("[{}] {exc:#}", ctx.suite_name));
-            }
         }
     }
 
@@ -5400,7 +5687,7 @@ fn validate_dml_cluster_jobs(cases: &[SqlCase], jobs: usize, mode: ClusterMode) 
 fn run_post_step_server_actions(
     step: &SqlStep,
     ctx: &SuiteRunContext,
-    session: &mut MysqlSession,
+    session: &mut TrinoCaseSession,
     publication_fault: &mut Option<publication_catalog::FixtureFaultGuard>,
     log: &mut String,
 ) -> Result<()> {
@@ -5459,7 +5746,7 @@ fn run_post_step_server_actions(
 /// nothing.
 fn resume_mv_management_after_step(
     step: &SqlStep,
-    session: &mut MysqlSession,
+    session: &mut TrinoCaseSession,
     log: &mut String,
 ) -> Result<()> {
     let Some(resume) = step.meta.mv_resume_management.as_ref() else {
@@ -5526,7 +5813,7 @@ fn resume_mv_management_after_step(
 fn restart_frontend_after_step(
     step: &SqlStep,
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
-    session: &mut MysqlSession,
+    session: &mut TrinoCaseSession,
     after_exit: Option<&mut dyn FnMut() -> Result<()>>,
     log: &mut String,
 ) -> Result<()> {
@@ -5593,7 +5880,7 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
     const DIRECTIVES: &[&str] = &[
         "kill_fe_after_mv_known_committed_before_projector_cas",
         "restart_be_after_establish_context_index",
-        "kill_query_after_be_log_contains",
+        "cancel_query_after_be_log_contains",
         "kill_fe_after_be_log_contains",
         "kill_be_after_be_log_contains",
         "terminal_snapshot_conflict_be_index",
@@ -5722,6 +6009,7 @@ fn validate_publication_catalog_directives(
     fixture_available: bool,
     cluster_mode: ClusterMode,
     mode: Mode,
+    convert_legacy: bool,
 ) -> Result<()> {
     for case in cases {
         for step in &case.steps {
@@ -5749,11 +6037,11 @@ fn validate_publication_catalog_directives(
                 ) || step.meta.publication_catalog_fault_target.is_none()
                     || !step.meta.restart_fe_after_step
                     || step.meta.imv_accelerator_wipe_restart.is_some()
-                    || mode != Mode::Verify
+                    || !publication_execution_mode(mode, convert_legacy)
                     || cluster_mode != ClusterMode::CrossProcess)
             {
                 bail!(
-                    "after-frontend-exit timing requires an exact table-load,corrupt-package fault and explicit cross-process frontend restart in verify mode"
+                    "after-frontend-exit timing requires an exact table-load,corrupt-package fault and explicit cross-process frontend restart in verify or strict conversion mode"
                 );
             }
             if step.meta.publication_catalog_fault_target.is_some()
@@ -5809,9 +6097,9 @@ fn validate_publication_catalog_directives(
                     "@publication_catalog_concurrent_shell must appear exactly with a proxy or REST service publication hold"
                 );
             }
-            if requires_concurrent_shell && mode != Mode::Verify {
+            if requires_concurrent_shell && !publication_execution_mode(mode, convert_legacy) {
                 bail!(
-                    "@publication_catalog_concurrent_shell is acceptance-only and requires --mode verify"
+                    "@publication_catalog_concurrent_shell is acceptance-only and requires --mode verify or --mode record --convert-legacy"
                 );
             }
             if step
@@ -5843,7 +6131,7 @@ fn selected_meta_requires_lifecycle(meta: &QueryMeta) -> bool {
     };
     meta.kill_fe_after_mv_known_committed_before_projector_cas
         || meta.restart_be_after_establish_context_index.is_some()
-        || meta.kill_query_after_be_log_contains.is_some()
+        || meta.cancel_query_after_be_log_contains.is_some()
         || meta.kill_fe_after_be_log_contains.is_some()
         || meta.kill_be_after_be_log_contains.is_some()
         || meta.terminal_snapshot_conflict_be_index.is_some()
@@ -6060,6 +6348,7 @@ fn validate_dataset_launch_profile(
 
 pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
     let base_dir = resolve_repo_root()?;
+    let corpus_session = config::load_corpus_session(&base_dir)?;
     let suite_configs = build_suite_configs(&base_dir)?;
     if suite_configs.is_empty() {
         println!(
@@ -6105,6 +6394,19 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         return Ok(0);
     }
 
+    ensure!(
+        !cli.convert_legacy || cli.mode == Mode::Record,
+        "--convert-legacy requires --mode record"
+    );
+    if let Some(offset) = cli.legacy_variant_offset_seconds {
+        ensure!(
+            chrono::FixedOffset::east_opt(offset).is_some(),
+            "invalid legacy baseline UTC offset"
+        );
+    }
+    if cli.list_legacy_goldens {
+        return golden_commands::inventory(&cli, &suite_configs);
+    }
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let mut runner_config = load_runner_config(config_path.as_deref())?;
     let suite_names = match select_suite_names(
@@ -6200,7 +6502,27 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
     let naming_sources =
         fixture_context::selected_sources(&cli, &base_dir, &suite_names, &suite_configs)?;
     FixtureEndpoints::reject_unsupported_sources(&runner_config, &naming_sources)?;
-    let mut fixture_names = fixture_context::RunNames::prepare(&fixture_budget, &naming_sources)?;
+    let mut case_input_units = std::collections::BTreeSet::new();
+    for (name, suite) in &suite_configs {
+        if suite.manifest.case_input.is_some() && suite_names.contains(name) {
+            ensure!(
+                name == hms_case_input::SUITE,
+                "HMS input recipe declared outside its suite"
+            );
+            let files = &naming_sources[name];
+            ensure!(
+                files.len() == 1
+                    && files[0].file_stem().and_then(|v| v.to_str()) == Some(hms_case_input::CASE),
+                "HMS recipe requires its exact single source case"
+            );
+            case_input_units.insert((name.clone(), hms_case_input::CASE.to_string()));
+        }
+    }
+    let mut fixture_names = fixture_context::RunNames::prepare_with_case_inputs(
+        &fixture_budget,
+        &naming_sources,
+        &case_input_units,
+    )?;
     fixture_names.seal_catalogs(&runner_config, &naming_sources, &suite_configs)?;
     runner_config.fixture_names = Some(Arc::new(fixture_names));
     fixture_context::startup_sweep(&runner_config, &base_dir, &fixture_budget)?;
@@ -6235,7 +6557,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             );
         }
     }
-    results_writer.write(run_record)?;
+    results_writer.write(run_record.clone())?;
     let (mut isolated_rest_catalog, publication_control_uri) = results_record::fixture_start(
         &results_writer,
         fixture_root.as_deref(),
@@ -6248,7 +6570,9 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
     let mut suite_facts = BTreeMap::new();
     let namespace_catalogs = namespace_guard::CatalogFacts::default();
     let mut publication_catalog_fixture: Option<publication_catalog::FixtureHandle> = None;
-    let fixture_primary = (|| -> Result<i32> {
+    let mut hms_case_inputs = Vec::new();
+    let hms_consumers_may_exist = AtomicBool::new(false);
+    let fixture_primary_unwind = hms_case_input::capture_unwind(|| -> Result<i32> {
         if let Some(fixture) = isolated_rest_catalog.as_ref() {
             namespace_catalogs.bind_fixture_storage(&fixture.rest_storage_binding())?;
         }
@@ -6451,9 +6775,6 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             let target_db_default = suite_db_override
                 .clone()
                 .unwrap_or_else(|| suite.default_db.clone());
-            let ref_db_default = suite_db_override
-                .clone()
-                .unwrap_or_else(|| suite.default_db.clone());
 
             let verify_enabled = verify_enabled_override.unwrap_or(suite.verify_default);
             let query_timeout = cli.query_timeout.unwrap_or_else(|| {
@@ -6484,8 +6805,20 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             }
 
             let mut cases: Vec<SqlCase> = Vec::new();
+            let mut input_definitions = Vec::new();
             let mut load_failures: Vec<CaseLoadFailure> = Vec::new();
             for sql_file in sql_files {
+                if suite.manifest.case_input.is_some() {
+                    match hms_case_input::Definition::load(&sql_file, &meta_re, &marker_re) {
+                        Ok(definition) => input_definitions.push(definition),
+                        Err(error) => load_failures.push(CaseLoadFailure {
+                            case_id: hms_case_input::CASE.into(),
+                            source_file: sql_file,
+                            error: format!("HMS input definition: {error:#}"),
+                        }),
+                    }
+                    continue;
+                }
                 match parser::load_sql_case_from_file(
                     &sql_file,
                     &meta_re,
@@ -6527,6 +6860,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 .iter()
                 .map(|c| c.case_id.clone())
                 .chain(load_failures.iter().map(|f| f.case_id.clone()))
+                .chain(input_definitions.iter().map(|d| d.case_id().to_string()))
                 .collect();
             all_available_case_ids.extend(available_case_ids.iter().cloned());
             let only_set = parse_selector_list(cli.only.as_deref(), &available_case_ids, "--only")?;
@@ -6551,6 +6885,61 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 cases.truncate(limit);
             }
 
+            input_definitions.retain(|d| {
+                (only_set.is_empty() || only_set.contains(d.case_id()))
+                    && !skip_set.contains(d.case_id())
+            });
+            if let Some(limit) = cli.limit {
+                input_definitions.truncate(limit.saturating_sub(cases.len()));
+            }
+            for definition in input_definitions {
+                let source = sql_dir.join(format!("{}.sql", definition.case_id()));
+                if cli.dry_run {
+                    load_failures.push(CaseLoadFailure {case_id: hms_case_input::CASE.into(),
+                        source_file: source, error: "HMS runtime input is unresolved in dry-run; no producer started; use resource-free declarations for the template".into()});
+                    continue;
+                }
+                let storage = fixture_storage
+                    .as_ref()
+                    .context("HMS input requires original run storage")?;
+                let expected = result_dir
+                    .as_ref()
+                    .context("HMS input expected directory absent")?
+                    .join(format!("{}.result", hms_case_input::CASE));
+                let manifest = suite
+                    .sql_dir
+                    .parent()
+                    .context("HMS suite directory absent")?
+                    .join("suite.toml");
+                hms_case_inputs.push(hms_case_input::Custody::register(
+                    &base_dir,
+                    definition,
+                    &placeholder_vars,
+                    hms_case_input::Registration {
+                        manifest,
+                        expected,
+                        budget: &fixture_budget,
+                        storage,
+                        invocation: run_record.clone(),
+                    },
+                )?);
+                let owner = hms_case_inputs
+                    .last_mut()
+                    .context("registered HMS input absent")?;
+                match owner.prepare_and_bind(
+                    &meta_re,
+                    &marker_re,
+                    &placeholder_vars,
+                    &results_writer,
+                ) {
+                    Ok(case) => cases.push(case),
+                    Err(error) => load_failures.push(CaseLoadFailure {
+                        case_id: hms_case_input::CASE.into(),
+                        source_file: source,
+                        error: format!("HMS prepared input: {error:#}"),
+                    }),
+                }
+            }
             if cases.is_empty() && load_failures.is_empty() {
                 println!("⚠️ WARNING: no queries selected for suite {}", suite.name);
                 continue;
@@ -6570,26 +6959,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                             step.query_number
                         );
                     }
-                    if let Err(error) = be_log_directive::validate_record_source(
-                        &step.meta,
-                        cli.mode,
-                        cli.record_from,
-                    ) {
-                        println!(
-                            "❌ ERROR: suite {} case {} step {}: {error}",
-                            suite.name, case.case_id, step.query_number
-                        );
-                        return Ok(1);
-                    }
-                    if let Err(error) =
-                        be_log_directive::validate_execution_mode(&step.meta, cli.mode)
-                    {
-                        println!(
-                            "❌ ERROR: suite {} case {} step {}: {error}",
-                            suite.name, case.case_id, step.query_number
-                        );
-                        return Ok(1);
-                    }
+
                     if let Err(error) =
                         be_log_directive::validate_mode(&step.meta, selected_cluster_mode)
                     {
@@ -6627,6 +6997,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 publication_catalog_control.is_some(),
                 selected_cluster_mode,
                 cli.mode,
+                cli.convert_legacy,
             ) {
                 println!("❌ ERROR: suite {}: {error}", suite.name);
                 return Ok(1);
@@ -6677,7 +7048,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 sql_glob,
                 suite_catalog_override,
                 target_db_default,
-                ref_db_default,
+
                 verify_enabled,
                 query_timeout,
                 cases,
@@ -6728,11 +7099,11 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             results_writer.track_file(path)?;
         }
         results_writer.write(serde_json::json!({"kind":"selection",
-            "fixture":{"env_file":fixture_env,"env_file_sha256":results_record::optional_hash(fixture_env.as_deref())?,
-                "isolated_runtime":isolated_rest_catalog.as_ref().map(|f| f.runtime_identity()).transpose()?, "datasets":dataset_bindings},
-            "suites":selected_suites,
-            "unresolved_only":cli.only.as_deref().unwrap_or("").split(',').map(str::trim).filter(|id|!id.is_empty() && !all_available_case_ids.contains(*id)).collect::<Vec<_>>(),
-            "unresolved_skip":cli.skip.as_deref().unwrap_or("").split(',').map(str::trim).filter(|id|!id.is_empty() && !all_available_case_ids.contains(*id)).collect::<Vec<_>>()}))?;
+        "fixture":{"env_file":fixture_env,"env_file_sha256":results_record::optional_hash(fixture_env.as_deref())?,
+            "isolated_runtime":isolated_rest_catalog.as_ref().map(|f| f.runtime_identity()).transpose()?, "datasets":dataset_bindings},
+        "suites":selected_suites,
+        "unresolved_only":cli.only.as_deref().unwrap_or("").split(',').map(str::trim).filter(|id|!id.is_empty() && !all_available_case_ids.contains(*id)).collect::<Vec<_>>(),
+        "unresolved_skip":cli.skip.as_deref().unwrap_or("").split(',').map(str::trim).filter(|id|!id.is_empty() && !all_available_case_ids.contains(*id)).collect::<Vec<_>>()}))?;
         selection_written.store(true, Ordering::Relaxed);
 
         let query_lifecycle_faults_enabled = !cli.dry_run
@@ -6797,11 +7168,11 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             )? {
                 Some((plan, execution)) => {
                     failure_artifacts.record_provenance("selected-control-intents".into(),serde_json::json!({
-                        "role_launches":plan.planned_launch_summaries(),
-                        "remaining_original_budget_millis":execution.deadline.saturating_duration_since(Instant::now()).as_millis(),
-                        "serial_role_order":execution.has_restarts,
-                        "status":"frozen-intents-not-action-evidence",
-                        "mysql_cumulative_slow_progress_handshake":"excluded-by-explicit-user-decision"}));
+                    "role_launches":plan.planned_launch_summaries(),
+                    "remaining_original_budget_millis":execution.deadline.saturating_duration_since(Instant::now()).as_millis(),
+                    "serial_role_order":execution.has_restarts,
+                    "status":"frozen-intents-not-action-evidence",
+                    "mysql_cumulative_slow_progress_handshake":"excluded-by-explicit-user-decision"}));
                     (Some(plan), Some(Arc::new(execution)))
                 }
                 None => (None, None),
@@ -6823,6 +7194,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     .with_work_deadline_limit(controls.deadline)
             },
         );
+        hms_consumers_may_exist.store(true, Ordering::Release);
         let server_handle = launch_server(
             launch_cluster_mode,
             launch_cluster_size,
@@ -6845,16 +7217,11 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     .record_provenance("actual-role-build-information".into(), evidence);
             }
             // Resolve global connection params
-            let reference_required = cli.mode == Mode::Diff
-                || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
             let target_port = resolve_effective_target_port(
                 launched_target_port,
-                cli.port.as_deref(),
+                cli.trino_port.as_deref(),
                 &runner_config,
             )?;
-            let reference_port =
-                resolve_reference_port(cli.ref_port.as_deref(), &target_port, reference_required)?;
-
             let target_host = launched_target_host
                 .or_else(|| cli.host.clone())
                 .or_else(|| env_optional("NOVAROCKS_SQL_TEST_HOST"))
@@ -6866,35 +7233,6 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 .or_else(|| env_optional("NOVAROCKS_SQL_TEST_USER"))
                 .or_else(|| runner_config.cluster.get("user").cloned())
                 .unwrap_or_else(|| "root".to_string());
-            let target_password = cli
-                .password
-                .clone()
-                .or_else(|| env_optional("NOVAROCKS_SQL_TEST_PASSWORD"))
-                .or_else(|| runner_config.cluster.get("password").cloned());
-            let target_mysql_bin = cli
-                .mysql
-                .clone()
-                .unwrap_or_else(|| env_or_default("NOVAROCKS_SQL_TEST_MYSQL", "mysql"));
-
-            let ref_host = cli
-                .ref_host
-                .clone()
-                .or_else(|| env_optional("NOVAROCKS_SQL_TEST_REF_HOST"))
-                .unwrap_or_else(|| "127.0.0.1".to_string());
-            let ref_user = cli
-                .ref_user
-                .clone()
-                .or_else(|| env_optional("NOVAROCKS_SQL_TEST_REF_USER"))
-                .unwrap_or_else(|| "root".to_string());
-            let ref_password = cli
-                .ref_password
-                .clone()
-                .or_else(|| env_optional("NOVAROCKS_SQL_TEST_REF_PASSWORD"));
-            let ref_mysql_bin = cli
-                .ref_mysql
-                .clone()
-                .unwrap_or_else(|| env_or_default("NOVAROCKS_SQL_TEST_REF_MYSQL", "mysql"));
-
             // The execution pool consumes the frozen selection.
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(jobs)
@@ -6912,7 +7250,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     sql_glob,
                     suite_catalog_override,
                     target_db_default,
-                    ref_db_default,
+
                     verify_enabled,
                     query_timeout,
                     cases,
@@ -6926,16 +7264,11 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 let target_catalog_name = suite_catalog_override
                     .clone()
                     .unwrap_or_else(|| suite.default_catalog.clone());
-                let reference_catalog_name = suite_catalog_override
-                    .clone()
-                    .unwrap_or_else(|| suite.default_catalog.clone());
-
                 let target_conn_base = ConnectionConfig {
-                    mysql: target_mysql_bin.clone(),
+                    time_zone: corpus_session.time_zone.clone(),
                     host: target_host.clone(),
                     port: target_port.clone(),
                     user: target_user.clone(),
-                    password: target_password.clone(),
                     catalog: Some(target_catalog_name.clone()),
                     db: if target_db_default.is_empty() {
                         None
@@ -6944,29 +7277,10 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     },
                 };
 
-                let reference_conn_base = ConnectionConfig {
-                    mysql: ref_mysql_bin.clone(),
-                    host: ref_host.clone(),
-                    port: reference_port.clone(),
-                    user: ref_user.clone(),
-                    password: ref_password.clone(),
-                    catalog: Some(reference_catalog_name),
-                    db: if ref_db_default.is_empty() {
-                        None
-                    } else {
-                        Some(ref_db_default)
-                    },
-                };
-
                 let target_admin_conn = ConnectionConfig {
                     catalog: None,
                     db: None,
                     ..target_conn_base.clone()
-                };
-                let reference_admin_conn = ConnectionConfig {
-                    catalog: None,
-                    db: None,
-                    ..reference_conn_base.clone()
                 };
 
                 // Print suite header
@@ -6995,14 +7309,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 }
                 println!("query_timeout={}s", query_timeout);
                 println!("{}", summarize_connection("target", &target_conn_base));
-                if cli.mode == Mode::Diff
-                    || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference)
-                {
-                    println!(
-                        "{}",
-                        summarize_connection("reference", &reference_conn_base)
-                    );
-                }
+
                 if cli.mode == Mode::Verify {
                     println!("verify_enabled={}", verify_enabled);
                 }
@@ -7059,26 +7366,29 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     controls: controls.clone(),
                     suite_name: suite.name.clone(),
                     mode: cli.mode,
-                    record_from: cli.record_from,
+                    convert_legacy: cli.convert_legacy,
+                    legacy_variant_offset_seconds: cli.legacy_variant_offset_seconds,
+
                     target_conn_base,
-                    reference_conn_base,
+
                     target_admin_conn,
-                    reference_admin_conn,
+
                     result_dir,
                     actual_artifact_dir: actual_artifact_dir.clone(),
                     verify_enabled,
                     query_timeout,
-                    reference_required,
+
                     auto_case_db: suite.auto_case_db,
                     order_sensitive_default: cli.order_sensitive_default,
                     float_epsilon: cli.float_epsilon,
                     preview_lines: cli.preview_lines,
                     update_expected: cli.update_expected,
+                    session_defaults: suite.manifest.session.clone(),
+                    case_input: suite.manifest.case_input,
                     target_session_sql: cli.target_session_sql.clone(),
                     rewrite_explain_contains_as_not_contains: cli
                         .rewrite_explain_contains_as_not_contains
                         .clone(),
-                    marker_re: marker_re.clone(),
                     fail_fast: cli.fail_fast,
                     server_handle: Arc::clone(&server_handle),
                     failure_artifacts: Arc::clone(&failure_artifacts),
@@ -7269,8 +7579,27 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         );
         server_recorded.store(true, Ordering::Relaxed);
         result
-    })();
+    });
+    let fixture_primary = match fixture_primary_unwind {
+        Ok(result) => result,
+        Err(payload) if hms_case_inputs.is_empty() => std::panic::resume_unwind(payload),
+        Err(_) => Err(anyhow::anyhow!(
+            "runner panicked after HMS input registration; original panic diagnostics retained"
+        )),
+    };
     let mut fixture_failures = Vec::new();
+    for owner in &mut hms_case_inputs {
+        match owner.finish(
+            (!hms_consumers_may_exist.load(Ordering::Acquire)
+                || server_writers_exited.load(Ordering::Acquire))
+                && fixture_writers_settled.load(Ordering::Acquire),
+        ) {
+            Ok(receipt) => {
+                failure_artifacts.record_provenance("hms-case-input-cleanup".into(), receipt)
+            }
+            Err(error) => fixture_failures.push(format!("HMS input owner cleanup: {error:#}")),
+        }
+    }
     if let Some(fixture) = publication_catalog_fixture.as_mut()
         && let Err(error) = fixture.shutdown()
     {
@@ -7511,17 +7840,16 @@ mod tests {
     use crate::types::{
         ConnectionConfig, PublicationCatalogAction, PublicationCatalogFault,
         PublicationCatalogFaultDirective, PublicationCatalogFaultTarget, QueryExecution,
-        QueryLifecycleStructuredAssertion, QueryMeta, ResultSet, RuntimeFilterDetailExpectation,
-        SqlCase, SqlErrorLocation, SqlErrorTier, SqlStep, SuiteHook,
+        QueryLifecycleStructuredAssertion, QueryMeta, RuntimeFilterDetailExpectation, SqlCase,
+        SqlErrorLocation, SqlErrorTier, SqlStep, SuiteHook,
     };
     use crate::{
-        AlterJobPollState, CaseStatus, Cli, Mode, RecordFrom,
-        annotate_failure_with_engine_error_code, bounded_fault_query_timeout,
-        classify_alter_job_poll, evaluate_expected_error_branch,
+        AlterJobPollState, CaseStatus, Cli, Mode, annotate_failure_with_engine_error_code,
+        bounded_fault_query_timeout, classify_alter_job_poll, evaluate_expected_error_branch,
         evaluate_expected_error_branch_with_sql_error_descriptors, execute_target_session_sql_with,
-        expected_engine_error_code_diff_result, expected_engine_error_code_result,
-        finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
-        statement_starts_dml_operation, validate_dml_cluster_jobs, validate_fault_injection_jobs,
+        expected_engine_error_code_result, finish_expected_error_step,
+        sql_text_has_query_lifecycle_fault_directive, statement_starts_dml_operation,
+        validate_dml_cluster_jobs, validate_fault_injection_jobs,
         validate_lake_publication_preflight, validate_lnp_3d_mv_accelerator_preflight,
         validate_publication_catalog_directives, validate_selected_suite_cluster,
         verify_runtime_filter_structured_assertion,
@@ -7552,6 +7880,7 @@ mod tests {
                 true,
                 cluster_mode,
                 mode,
+                false,
             )
         };
         assert!(valid(&case, ClusterMode::CrossProcess, Mode::Verify).is_err());
@@ -7667,7 +7996,7 @@ mod tests {
         );
         assert_eq!(
             crate::runner::extract_sql_error_code(
-                "ERROR 1105 (HY000): [UnsupportedCompiledShape] FULL OUTER hash join",
+                "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [UnsupportedCompiledShape] FULL OUTER hash join",
             )
             .as_deref(),
             Some("UnsupportedCompiledShape"),
@@ -7772,7 +8101,8 @@ mod tests {
                 std::slice::from_ref(&case),
                 true,
                 ClusterMode::CrossProcess,
-                Mode::Verify
+                Mode::Verify,
+                false
             )
             .is_err()
         );
@@ -7786,7 +8116,8 @@ mod tests {
                 std::slice::from_ref(&case),
                 true,
                 ClusterMode::CrossProcess,
-                Mode::Verify
+                Mode::Verify,
+                false
             )
             .is_err()
         );
@@ -7800,7 +8131,8 @@ mod tests {
                 std::slice::from_ref(&case),
                 true,
                 ClusterMode::CrossProcess,
-                Mode::Verify
+                Mode::Verify,
+                false
             )
             .is_ok()
         );
@@ -7810,7 +8142,8 @@ mod tests {
                 std::slice::from_ref(&case),
                 false,
                 ClusterMode::CrossProcess,
-                Mode::Verify
+                Mode::Verify,
+                false
             )
             .is_err()
         );
@@ -7871,6 +8204,9 @@ mod tests {
     #[test]
     fn alter_job_poll_uses_structured_state_and_preserves_failure_message() {
         let execution = |state: &str, message: &str| QueryExecution {
+            shell_result: None,
+            result_statements: Vec::new(),
+            typed_results: Vec::new(),
             header: vec!["JobId".to_string(), "State".to_string(), "Msg".to_string()],
             rows: vec![vec![
                 "1".to_string(),
@@ -7922,7 +8258,7 @@ mod tests {
             "-- @query_lifecycle_fault=runtime-filter-contribution-ack-drop,1\nSELECT 1;"
         ));
         assert!(sql_text_has_query_lifecycle_fault_directive(
-            "-- @kill_query_after_be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED\nSELECT 1;"
+            "-- @cancel_query_after_be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED\nSELECT 1;"
         ));
         assert!(sql_text_has_query_lifecycle_fault_directive(
             "-- @query_control_fragment_backend_limit=2\nSELECT 1;"
@@ -8074,7 +8410,7 @@ mod tests {
     #[test]
     fn expect_error_code_result_accepts_matching_code() {
         expected_engine_error_code_result(
-            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] commit outcome unavailable",
+            "ERROR (0.01s): TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [CommitUnknown] commit outcome unavailable",
             "CommitUnknown",
         )
         .expect("matching code should pass");
@@ -8083,7 +8419,7 @@ mod tests {
     #[test]
     fn expect_error_code_result_reports_missing_code() {
         let err = expected_engine_error_code_result(
-            "ERROR (0.01s): ERROR 1105 (HY000): plain error",
+            "ERROR (0.01s): TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: plain error",
             "CommitUnknown",
         )
         .expect_err("missing code should fail");
@@ -8105,7 +8441,7 @@ mod tests {
         let result = evaluate_expected_error_branch(
             &meta,
             false,
-            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] commit outcome unavailable",
+            "ERROR (0.01s): TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [CommitUnknown] commit outcome unavailable",
         )
         .expect("expected branch should be active");
 
@@ -8139,7 +8475,7 @@ mod tests {
         let err = evaluate_expected_error_branch(
             &meta,
             false,
-            "ERROR (0.01s): ERROR 1105 (HY000): [ProtocolDecodeError] bad payload",
+            "ERROR (0.01s): TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [ProtocolDecodeError] bad payload",
         )
         .expect("expected branch should be active")
         .expect_err("wrong code should fail");
@@ -8163,7 +8499,7 @@ mod tests {
         let err = evaluate_expected_error_branch(
             &meta,
             false,
-            "ERROR (0.01s): ERROR 1105 (HY000): plain error",
+            "ERROR (0.01s): TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: plain error",
         )
         .expect("expected branch should be active")
         .expect_err("missing code should fail");
@@ -8186,7 +8522,7 @@ mod tests {
             expect_error_tier: Some(SqlErrorTier::Target),
             ..QueryMeta::default()
         };
-        let error = "ERROR 1064 (42000): [sql.parse.unsupported_statement] at line 7, column 11: unsupported statement";
+        let error = "TrinoError { name=SYNTAX_ERROR type=USER_ERROR code=1 }: [sql.parse.unsupported_statement] at line 7, column 11: unsupported statement";
 
         assert_eq!(
             evaluate_expected_error_branch_with_sql_error_descriptors(
@@ -8267,57 +8603,18 @@ mod tests {
     }
 
     #[test]
-    fn expect_error_code_diff_requires_both_sides_to_match() {
-        expected_engine_error_code_diff_result(
-            "CommitUnknown",
-            false,
-            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] target",
-            false,
-            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] reference",
-        )
-        .expect("both sides should match");
-
-        let one_side_success = expected_engine_error_code_diff_result(
-            "CommitUnknown",
-            true,
-            "",
-            false,
-            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] reference",
-        )
-        .expect_err("target success should fail");
-        assert!(
-            one_side_success.contains("target_ok=true"),
-            "unexpected error: {one_side_success}"
-        );
-
-        let wrong_code = expected_engine_error_code_diff_result(
-            "CommitUnknown",
-            false,
-            "ERROR (0.01s): ERROR 1105 (HY000): [ProtocolDecodeError] target",
-            false,
-            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] reference",
-        )
-        .expect_err("wrong target code should fail");
-        assert!(
-            wrong_code.contains("target_code=Some(\"ProtocolDecodeError\")"),
-            "unexpected error: {wrong_code}"
-        );
-    }
-
-    #[test]
     fn failure_log_includes_engine_error_code_when_available() {
-        let msg =
-            "target execute failed: FAIL (0.00s): ERROR 1105 (HY000): [QueryTimeout] slow query";
+        let msg = "target execute failed: FAIL (0.00s): TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [QueryTimeout] slow query";
 
         assert_eq!(
             annotate_failure_with_engine_error_code(msg, msg),
-            "engine_error_code=QueryTimeout target execute failed: FAIL (0.00s): ERROR 1105 (HY000): [QueryTimeout] slow query"
+            "engine_error_code=QueryTimeout target execute failed: FAIL (0.00s): TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [QueryTimeout] slow query"
         );
     }
 
     #[test]
     fn failure_log_includes_sql_error_code_when_available() {
-        let msg = "target execute failed: FAIL (0.00s): ERROR 1105 (HY000): [sql.analyze.unavailable_implementation] compiled implementation unavailable";
+        let msg = "target execute failed: FAIL (0.00s): TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [sql.analyze.unavailable_implementation] compiled implementation unavailable";
 
         assert_eq!(
             annotate_failure_with_engine_error_code(msg, msg),
@@ -8326,7 +8623,7 @@ mod tests {
         assert_eq!(
             annotate_failure_with_engine_error_code(
                 "target execute failed",
-                "ERROR 1105 (HY000): [sql.analyze.unavailable_implementation] compiled implementation unavailable"
+                "TrinoError { name=GENERIC_INTERNAL_ERROR type=INTERNAL_ERROR code=65536 }: [sql.analyze.unavailable_implementation] compiled implementation unavailable"
             ),
             "sql_error_code=sql.analyze.unavailable_implementation target execute failed"
         );
@@ -8687,19 +8984,34 @@ mod tests {
     }
 
     #[test]
-    fn target_session_sql_does_not_touch_reference_session() {
-        let statements = vec!["SET target_only = true".to_string()];
-        let mut target_events = Vec::new();
-        let reference_events: Vec<String> = Vec::new();
-
-        execute_target_session_sql_with(&mut target_events, &statements, |events, statement| {
-            events.push(statement.to_string());
-            Ok(())
-        })
-        .expect("target session SQL should pass");
-
-        assert_eq!(target_events, ["SET target_only = true"]);
-        assert!(reference_events.is_empty());
+    fn cli_rejects_removed_mysql_and_reference_arguments() {
+        for (flag, value) in [
+            ("--mode", "diff"),
+            ("--port", "9030"),
+            ("--mysql", "mysql"),
+            ("--password", "secret"),
+            ("--record-from", "target"),
+            ("--ref-host", "localhost"),
+            ("--ref-port", "9030"),
+            ("--ref-user", "root"),
+            ("--ref-password", "secret"),
+            ("--ref-mysql", "mysql"),
+        ] {
+            assert!(
+                Cli::try_parse_from(["novarocks-sql-test", "--suite", "join", flag, value])
+                    .is_err(),
+                "{flag}"
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "novarocks-sql-test",
+            "--suite",
+            "join",
+            "--trino-port",
+            "8080",
+        ])
+        .unwrap();
+        assert_eq!(cli.trino_port.as_deref(), Some("8080"));
     }
 
     #[test]
@@ -9177,11 +9489,12 @@ mod tests {
     fn failed_suite_init_runs_owned_cleanup_once_and_preserves_both_errors() {
         let temp = tempfile::TempDir::new().unwrap();
         let conn = ConnectionConfig {
-            mysql: "unused".into(),
+            time_zone: "Asia/Shanghai".into(),
+
             host: "localhost".into(),
             port: "1".into(),
             user: "root".into(),
-            password: None,
+
             catalog: None,
             db: None,
         };
@@ -9203,24 +9516,26 @@ mod tests {
             controls: None,
             suite_name: "test".into(),
             mode: Mode::Verify,
-            record_from: RecordFrom::Target,
+            convert_legacy: false,
+            legacy_variant_offset_seconds: None,
+
             target_conn_base: conn.clone(),
-            reference_conn_base: conn.clone(),
+
             target_admin_conn: conn.clone(),
-            reference_admin_conn: conn,
+
             result_dir: None,
             actual_artifact_dir: None,
             verify_enabled: true,
             query_timeout: 1,
-            reference_required: false,
             auto_case_db: false,
             order_sensitive_default: false,
             float_epsilon: None,
             preview_lines: 0,
             update_expected: false,
+            session_defaults: crate::suite_manifest::SuiteSessionDefaults::default(),
+            case_input: None,
             target_session_sql: vec![],
             rewrite_explain_contains_as_not_contains: vec![],
-            marker_re: Regex::new("query").unwrap(),
             fail_fast: false,
             server_handle: Arc::new(Mutex::new(Box::new(ArtifactCapableServer))),
             failure_artifacts: artifacts,
@@ -9603,20 +9918,7 @@ access_key_secret = "admin123"
     }
 
     #[test]
-    fn load_expected_result_accepts_empty_file() {
-        let path = temp_result_path("empty_load");
-        fs::write(&path, "\n").expect("write empty file");
-        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let loaded = load_expected_results(&path, false, &marker_re, None)
-            .expect("must parse empty result file");
-        let result_set = loaded.get(&1).expect("single-step result");
-        assert!(result_set.header.is_empty());
-        assert!(result_set.rows.is_empty());
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn write_result_file_persists_empty_result_set() {
+    fn write_canonical_result_file_persists_empty_document() {
         let path = temp_result_path("empty_write");
         write_result_file(&path, &BTreeMap::new(), false).expect("write empty result file");
         let content = fs::read_to_string(&path).expect("read empty result file");
@@ -9624,98 +9926,39 @@ access_key_secret = "admin123"
         let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
         let loaded = load_expected_results(&path, false, &marker_re, None)
             .expect("must parse empty result file");
-        let result_set = loaded.get(&1).expect("single-step result");
-        assert!(result_set.header.is_empty());
-        assert!(result_set.rows.is_empty());
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_expected_result_accepts_single_step_marker() {
-        let path = temp_result_path("single_marker");
-        fs::write(&path, "-- query 2\ncount(*)\n3\n").expect("write result file");
-        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let loaded =
-            load_expected_results(&path, false, &marker_re, None).expect("must parse result file");
-        assert_eq!(
-            loaded.get(&2).expect("query 2"),
-            &ResultSet {
-                header: vec!["count(*)".to_string()],
-                rows: vec![vec!["3".to_string()]],
-            }
+        assert!(
+            loaded.is_empty(),
+            "an empty canonical document has no invented step"
         );
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn multi_step_result_round_trip() {
-        let path = temp_result_path("multi_step");
-        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let result_sets = BTreeMap::from([
-            (
-                1usize,
-                ResultSet {
-                    header: vec!["count(*)".to_string()],
-                    rows: vec![vec!["1".to_string()]],
-                },
-            ),
-            (
-                3usize,
-                ResultSet {
-                    header: vec!["k1".to_string(), "c1".to_string()],
-                    rows: vec![vec!["1".to_string(), "2".to_string()]],
-                },
-            ),
-        ]);
-        write_result_file(&path, &result_sets, true).expect("write multi-step result file");
-        let loaded = load_expected_results(&path, true, &marker_re, None)
-            .expect("must parse multi-step result file");
-        assert_eq!(loaded, result_sets);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_expected_results_rejects_multi_step_without_markers() {
-        let path = temp_result_path("bad_multi_step");
-        fs::write(&path, "count(*)\n1\n").expect("write bad multi-step file");
-        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let loaded = load_expected_results(&path, true, &marker_re, None);
-        assert!(loaded.is_none());
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_expected_results_preserves_trailing_empty_columns() {
-        let path = temp_result_path("trailing_empty_columns");
-        fs::write(
-            &path,
-            "-- query 1\nField\tType\tNull\tKey\tDefault\tExtra\nevent_day\tdate\tYES\ttrue\tNULL\t\n",
-        )
-        .expect("write result file");
-        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let loaded = load_expected_results(&path, true, &marker_re, None).expect("load result");
+    fn canonical_result_round_trip_retains_types_null_text_and_section_identity() {
+        let path = temp_result_path("canonical_result");
+        let section = crate::golden::Section {
+            step: 3,
+            blocks: vec![crate::golden::Block::Typed {
+                types: vec!["bigint".into(), "varchar".into()],
+                names: vec!["id".into(), "text".into()],
+                rows: vec![vec!["1".into(), "\"NULL\"".into()]],
+            }],
+        };
+        let mut set = crate::results::project_golden_blocks(&section.blocks).unwrap();
+        set.golden = Some(crate::types::GoldenSection {
+            source: section.clone(),
+            expanded: section,
+        });
+        let expected = BTreeMap::from([(3, set)]);
+        write_result_file(&path, &expected, false).unwrap();
         assert_eq!(
-            loaded.get(&1).expect("query 1"),
-            &ResultSet {
-                header: vec![
-                    "Field".to_string(),
-                    "Type".to_string(),
-                    "Null".to_string(),
-                    "Key".to_string(),
-                    "Default".to_string(),
-                    "Extra".to_string(),
-                ],
-                rows: vec![vec![
-                    "event_day".to_string(),
-                    "date".to_string(),
-                    "YES".to_string(),
-                    "true".to_string(),
-                    "NULL".to_string(),
-                    String::new(),
-                ]],
-            }
+            fs::read_to_string(&path).unwrap(),
+            "-- query 3\n-- types\tbigint\tvarchar\nid\ttext\n1\t\"NULL\"\n"
         );
-        let _ = fs::remove_file(path);
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
+        let loaded = load_expected_results(&path, false, &marker_re, None).unwrap();
+        assert_eq!(loaded, expected);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -9757,7 +10000,7 @@ access_key_secret = "admin123"
 
     #[test]
     fn transient_iceberg_commit_error_matches_missing_metadata() {
-        let message = "ERROR 1064 (HY000) at line 11: Metadata file for version 2 is missing under file:/tmp/table/metadata";
+        let message = "TrinoError { name=GENERIC_USER_ERROR type=USER_ERROR code=1 }: at line 11: Metadata file for version 2 is missing under file:/tmp/table/metadata";
         assert!(is_transient_iceberg_commit_error(message));
     }
 
@@ -9961,6 +10204,9 @@ access_key_secret = "admin123"
 
     fn exec(header: &[&str], rows: &[&[&str]]) -> crate::types::QueryExecution {
         crate::types::QueryExecution {
+            shell_result: None,
+            result_statements: Vec::new(),
+            typed_results: Vec::new(),
             header: header.iter().map(|s| s.to_string()).collect(),
             rows: rows
                 .iter()
@@ -10197,5 +10443,108 @@ oss_sk = "private-secret"
                 .log
                 .contains("unknown expect_sql_code: sql.does.not.exist")
         );
+    }
+    #[test]
+    fn publication_conversion_preflight_keeps_ordinary_record_and_shape_rejections() {
+        use crate::types::*;
+        let mut case = test_case_with_meta(QueryMeta {
+            publication_catalog_fault: Some(PublicationCatalogFaultDirective {
+                action: PublicationCatalogAction::TableCommit,
+                fault: PublicationCatalogFault::BeforeRequirementCheckHoldForConcurrentShell,
+            }),
+            publication_catalog_concurrent_shell: Some("printf companion".into()),
+            ..Default::default()
+        });
+        case.sequential = true;
+        let validate = |case: &SqlCase, mode, convert, fixture| {
+            validate_publication_catalog_directives(
+                "lake-publication",
+                std::slice::from_ref(case),
+                fixture,
+                ClusterMode::CrossProcess,
+                mode,
+                convert,
+            )
+        };
+        assert!(validate(&case, Mode::Verify, false, true).is_ok());
+        assert!(validate(&case, Mode::Record, true, true).is_ok());
+        assert!(validate(&case, Mode::Record, false, true).is_err());
+        assert!(validate(&case, Mode::Record, true, false).is_err());
+        case.sequential = false;
+        assert!(validate(&case, Mode::Record, true, true).is_err());
+        case.sequential = true;
+        case.steps[0].meta.publication_catalog_concurrent_shell = None;
+        assert!(validate(&case, Mode::Record, true, true).is_err());
+    }
+
+    #[test]
+    fn publication_conversion_after_exit_keeps_exact_target_and_restart_contract() {
+        use crate::types::*;
+        let mut case = test_case_with_meta(QueryMeta {
+            publication_catalog_fault: Some(PublicationCatalogFaultDirective {
+                action: PublicationCatalogAction::TableLoad,
+                fault: PublicationCatalogFault::CorruptPackage,
+            }),
+            publication_catalog_fault_target: Some(PublicationCatalogFaultTarget {
+                namespace: "owned_ns".into(),
+                table: "a_mv".into(),
+            }),
+            publication_catalog_fault_timing: Some(
+                PublicationCatalogFaultTiming::AfterFrontendExit,
+            ),
+            restart_fe_after_step: true,
+            ..Default::default()
+        });
+        case.sequential = true;
+        let validate = |case: &SqlCase, cluster, convert| {
+            validate_publication_catalog_directives(
+                "lnp-3d-mv-accelerator",
+                std::slice::from_ref(case),
+                true,
+                cluster,
+                Mode::Record,
+                convert,
+            )
+        };
+        assert!(validate(&case, ClusterMode::CrossProcess, true).is_ok());
+        assert!(validate(&case, ClusterMode::CrossProcess, false).is_err());
+        assert!(validate(&case, ClusterMode::AllInOne, true).is_err());
+        case.steps[0].meta.restart_fe_after_step = false;
+        assert!(validate(&case, ClusterMode::CrossProcess, true).is_err());
+        case.steps[0].meta.restart_fe_after_step = true;
+        case.steps[0].meta.publication_catalog_fault_target = None;
+        assert!(validate(&case, ClusterMode::CrossProcess, true).is_err());
+    }
+
+    #[test]
+    fn publication_conversion_service_hold_keeps_actor_retry_and_suite_contract() {
+        use crate::types::*;
+        for actor in [PublicationServiceActor::Sql, PublicationServiceActor::Shell] {
+            let mut case = test_case_with_meta(QueryMeta {
+                publication_service_hold: Some(PublicationServiceHoldDirective {
+                    table: "owned_ns.t".into(),
+                    actor,
+                }),
+                publication_catalog_concurrent_shell: Some("printf companion".into()),
+                retry_count: Some(1),
+                ..Default::default()
+            });
+            case.sequential = true;
+            let validate = |case: &SqlCase, suite, convert| {
+                validate_publication_catalog_directives(
+                    suite,
+                    std::slice::from_ref(case),
+                    true,
+                    ClusterMode::CrossProcess,
+                    Mode::Record,
+                    convert,
+                )
+            };
+            assert!(validate(&case, "mv-publication-v11", true).is_ok());
+            assert!(validate(&case, "mv-publication-v11", false).is_err());
+            assert!(validate(&case, "lake-publication", true).is_err());
+            case.steps[0].meta.retry_count = Some(2);
+            assert!(validate(&case, "mv-publication-v11", true).is_err());
+        }
     }
 }

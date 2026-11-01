@@ -1,2 +1,4 @@
+-- query 4
+-- types	bigint	integer	integer
 n	lo	hi
 1000	1	1000

@@ -1,7 +1,9 @@
 -- query 3
+-- legacy
 count(*)
 2
 
 -- query 7
+-- legacy
 count()
 101

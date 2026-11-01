@@ -1,3 +1,5 @@
+-- query 1
+-- legacy
 substr(r_reason_desc, 1, 20)	avg(ws_quantity)	avg(wr_refunded_cash)	avg(wr_fee)
 Gift exchange	76	464.36000000	8.62000000
 Not the product that	70	876.67000000	46.67000000

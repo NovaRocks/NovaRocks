@@ -70,143 +70,161 @@ pub fn unescape_cell(cell: &str) -> String {
     out
 }
 
+#[cfg(test)]
 pub fn split_row(line: &str) -> Vec<String> {
     line.split('\t').map(unescape_cell).collect()
 }
 
-pub fn parse_result_set(lines: &[String]) -> ResultSet {
-    let lines: Vec<String> = lines
+/// The expected file is expanded before canonical cell validation. Keep both
+/// projections so conversion can retain the original placeholder author.
+pub fn load_expected_results_with_variables(
+    path: &Path,
+    variables: &HashMap<String, String>,
+) -> Result<BTreeMap<usize, ResultSet>> {
+    let source =
+        fs::read_to_string(path).with_context(|| format!("read golden {}", path.display()))?;
+    let expanded = crate::fixture_context::render_expected(&source, variables);
+    let template = crate::golden::GoldenFile::parse_template(&source, &expanded)?;
+    let mut sets = BTreeMap::new();
+    for (source, expanded) in template
+        .source()
+        .sections
         .iter()
-        .map(|line| line.trim_end_matches('\r'))
-        .filter(|line| !line.trim().is_empty())
-        .map(ToString::to_string)
-        .collect();
-
-    if lines.is_empty() {
-        return ResultSet::default();
+        .zip(&template.expanded().sections)
+    {
+        let mut set = project_golden_blocks(&expanded.blocks)?;
+        set.golden = Some(GoldenSection {
+            source: source.clone(),
+            expanded: expanded.clone(),
+        });
+        sets.insert(expanded.step, set);
     }
-
-    let header = split_row(&lines[0]);
-    let rows = lines[1..].iter().map(|line| split_row(line)).collect();
-    ResultSet { header, rows }
+    Ok(sets)
 }
-
-pub fn render_result_set(header: &[String], rows: &[Vec<String>]) -> String {
-    if header.is_empty() && rows.is_empty() {
-        return String::new();
-    }
-
-    let escape_row = |row: &[String]| -> String {
-        row.iter()
-            .map(|cell| escape_cell(cell))
-            .collect::<Vec<_>>()
-            .join("\t")
-    };
-
-    let mut out_lines = Vec::with_capacity(rows.len() + 1);
-    out_lines.push(escape_row(header));
-    out_lines.extend(rows.iter().map(|row| escape_row(row)));
-    format!("{}\n", out_lines.join("\n"))
-}
-
+#[cfg(test)]
 pub fn load_expected_results(
-    result_path: &Path,
-    multi_step: bool,
-    marker_re: &Regex,
-    single_step_query_number: Option<usize>,
+    path: &Path,
+    _multi_step: bool,
+    _marker: &Regex,
+    _single_step: Option<usize>,
 ) -> Option<BTreeMap<usize, ResultSet>> {
-    use crate::parser::extract_query_number;
-
-    let content = match fs::read_to_string(result_path) {
-        Ok(c) => c,
-        Err(exc) => {
-            println!(
-                "Warning: failed to load expected result from {}: {}",
-                result_path.display(),
-                exc
+    match load_expected_results_with_variables(path, &HashMap::new()) {
+        Ok(sets) => Some(sets),
+        Err(error) => {
+            eprintln!(
+                "failed to load canonical golden {}: {error:#}",
+                path.display()
             );
-            return None;
+            None
         }
+    }
+}
+
+/// Flat views serve existing EXPLAIN, metadata and textual assertions only.
+/// Golden equality always compares the original typed blocks separately.
+pub fn project_golden_blocks(blocks: &[crate::golden::Block]) -> Result<ResultSet> {
+    use crate::golden::Block;
+    let mut result = ResultSet::default();
+    for block in blocks {
+        let (names, rows) = match block {
+            Block::Typed { types, names, rows } => {
+                let signatures = types
+                    .iter()
+                    .map(|ty| crate::golden::parse_type(ty))
+                    .collect::<Result<Vec<_>>>()?;
+                let contents = rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .zip(&signatures)
+                            .map(|(cell, sig)| {
+                                Ok(match crate::golden::parse_cell(sig, cell)? {
+                                    novarocks_test_trino_client::TrinoValue::Text(value) => value,
+                                    novarocks_test_trino_client::TrinoValue::Binary(_) => {
+                                        crate::golden::parse_text(cell)?
+                                    }
+                                    _ => cell.clone(),
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (names.clone(), contents)
+            }
+            Block::Shell { exit, lines } => (
+                vec![exit.clone()],
+                lines.iter().map(|line| vec![line.clone()]).collect(),
+            ),
+            Block::Legacy { .. } => {
+                let old = crate::golden::legacy::read_legacy(block)?;
+                (old.header, old.rows)
+            }
+        };
+        if result.header.is_empty() {
+            result.header = names;
+        } else {
+            result.rows.push(names);
+        }
+        result.rows.extend(rows);
+    }
+    Ok(result)
+}
+
+pub fn execution_golden(step: &SqlStep, execution: &QueryExecution) -> Result<GoldenSection> {
+    let mut blocks = if crate::shell::is_shell_step(&step.sql) {
+        vec![
+            execution
+                .shell_result
+                .clone()
+                .context("shell execution omitted its output block")?,
+        ]
+    } else {
+        crate::golden::execution::blocks_from_results(&execution.typed_results)?
     };
-
-    let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
-    let markers: Vec<(usize, usize)> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, line)| extract_query_number(line, marker_re).map(|num| (idx, num)))
-        .collect();
-
-    // If the file is organised by `-- query N` markers, parse the
-    // bodies by section regardless of whether the case was tagged as
-    // multi_step. Result-bearing SELECTs interleaved with setup commands
-    // still need their own result section keyed by query number.
-    if !markers.is_empty() {
-        let mut result_sets = BTreeMap::new();
-        for (idx, (start, query_number)) in markers.iter().enumerate() {
-            let end = markers
-                .get(idx + 1)
-                .map(|(next_start, _)| *next_start)
-                .unwrap_or(lines.len());
-            let body_lines = lines[start + 1..end].to_vec();
-            result_sets.insert(*query_number, parse_result_set(&body_lines));
+    if step.meta.normalize_explain_timing {
+        for block in &mut blocks {
+            if let crate::golden::Block::Typed { rows, .. } = block {
+                *rows = normalize_explain_timing_rows(rows);
+            }
         }
-        return Some(result_sets);
     }
-
-    if multi_step {
-        println!(
-            "Warning: multi-step expected result must use '-- query N' sections: {}",
-            result_path.display()
-        );
-        return None;
-    }
-
-    // Single-result mode: the entire file is the result of the one
-    // result-bearing step. Its query_number is supplied by the caller — the
-    // step may not be step 1 (e.g., CREATE/INSERT/.../SELECT puts SELECT at
-    // step 4). Falls back to 1 if the caller does not supply a number.
-    let result_set =
-        parse_result_set(&content.lines().map(ToString::to_string).collect::<Vec<_>>());
-    Some(BTreeMap::from([(
-        single_step_query_number.unwrap_or(1),
-        result_set,
-    )]))
+    let section = crate::golden::Section {
+        step: step.query_number,
+        blocks,
+    };
+    Ok(GoldenSection {
+        source: section.clone(),
+        expanded: section,
+    })
 }
 
 pub fn write_result_file(
     path: &Path,
-    result_sets: &BTreeMap<usize, ResultSet>,
-    multi_step: bool,
+    sets: &BTreeMap<usize, ResultSet>,
+    _multi_step: bool,
 ) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create parent dir failed: {}", parent.display()))?;
+    let mut source = crate::golden::GoldenFile::default();
+    let mut expanded = crate::golden::GoldenFile::default();
+    for (number, set) in sets {
+        let golden = set
+            .golden
+            .as_ref()
+            .context("recorded result lacks typed golden blocks")?;
+        anyhow::ensure!(
+            golden.source.step == *number && golden.expanded.step == *number,
+            "recorded section identity mismatch"
+        );
+        source.sections.push(golden.source.clone());
+        expanded.sections.push(golden.expanded.clone());
     }
-
-    let content = if multi_step {
-        let mut blocks = Vec::new();
-        for (query_number, result_set) in result_sets {
-            let mut block = format!("-- query {}\n", query_number);
-            block.push_str(&render_result_set(&result_set.header, &result_set.rows));
-            blocks.push(block.trim_end_matches('\n').to_string());
-        }
-        if blocks.is_empty() {
-            String::new()
-        } else {
-            format!("{}\n", blocks.join("\n\n"))
-        }
-    } else {
-        // Single-result mode: the file contains just the one result-bearing step.
-        // Use the first (and only) entry regardless of its query number — the step
-        // may not be query 1 (e.g., CREATE/INSERT/.../SELECT puts SELECT at step 4+).
-        let result_set = result_sets.values().next().cloned().unwrap_or_default();
-        render_result_set(&result_set.header, &result_set.rows)
-    };
-
-    fs::write(path, content).with_context(|| format!("write file failed: {}", path.display()))?;
-    Ok(())
+    let text = source.render_template(&expanded)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, text).with_context(|| format!("write canonical golden {}", path.display()))
 }
 
+#[cfg(test)]
 pub fn parse_output(stdout: &str) -> (Vec<String>, Vec<Vec<String>>) {
     let lines: Vec<&str> = stdout
         .lines()
@@ -223,6 +241,7 @@ pub fn parse_output(stdout: &str) -> (Vec<String>, Vec<Vec<String>>) {
     (header, rows)
 }
 
+#[cfg(test)]
 pub fn render_output(header: &[String], rows: &[Vec<String>]) -> String {
     let mut lines = Vec::new();
     if !header.is_empty() {
@@ -696,53 +715,49 @@ pub struct MismatchArtifacts<'a> {
     pub root_dir: &'a Path,
     pub suite_name: &'a str,
     pub artifact_id: &'a str,
-    pub expected_header: &'a [String],
-    pub expected_rows: &'a [Vec<String>],
-    pub actual_header: &'a [String],
-    pub actual_rows: &'a [Vec<String>],
+    pub expected: &'a crate::golden::Section,
+    pub actual: &'a crate::golden::Section,
     pub reason: &'a str,
 }
-
 pub fn write_mismatch_artifacts(request: MismatchArtifacts<'_>) -> Result<()> {
-    let MismatchArtifacts {
-        root_dir,
-        suite_name,
-        artifact_id,
-        expected_header,
-        expected_rows,
-        actual_header,
-        actual_rows,
-        reason,
-    } = request;
-    let suite_dir = root_dir.join(suite_name);
-    fs::create_dir_all(&suite_dir)
-        .with_context(|| format!("create dir failed: {}", suite_dir.display()))?;
+    let suite_dir = request.root_dir.join(request.suite_name);
+    fs::create_dir_all(&suite_dir)?;
     let out_dir = tempfile::Builder::new()
-        .prefix(&format!("{artifact_id}-"))
-        .tempdir_in(&suite_dir)
-        .context("allocate unique mismatch directory")?
+        .prefix(&format!("{}-", request.artifact_id))
+        .tempdir_in(&suite_dir)?
         .keep();
-
-    let expected = BTreeMap::from([(
-        1usize,
-        ResultSet {
-            header: expected_header.to_vec(),
-            rows: expected_rows.to_vec(),
-        },
-    )]);
-    let actual = BTreeMap::from([(
-        1usize,
-        ResultSet {
-            header: actual_header.to_vec(),
-            rows: actual_rows.to_vec(),
-        },
-    )]);
-
-    write_result_file(&out_dir.join("expected.tsv"), &expected, false)?;
-    write_result_file(&out_dir.join("actual.tsv"), &actual, false)?;
-    fs::write(out_dir.join("diff.txt"), format!("{}\n", reason))
-        .with_context(|| format!("write diff failed: {}", out_dir.display()))?;
+    crate::golden::GoldenFile {
+        sections: vec![request.expected.clone()],
+    }
+    .write(&out_dir.join("expected.result"))?;
+    crate::golden::GoldenFile {
+        sections: vec![request.actual.clone()],
+    }
+    .write(&out_dir.join("actual.result"))?;
+    fs::write(out_dir.join("diff.txt"), format!("{}\n", request.reason))?;
     Ok(())
+}
+pub fn golden_actual_digest(
+    section: &crate::golden::Section,
+    order_sensitive: bool,
+) -> Result<String> {
+    let mut stable = section.clone();
+    stable.step = 1;
+    if !order_sensitive {
+        for block in &mut stable.blocks {
+            if let crate::golden::Block::Typed { rows, .. } = block {
+                rows.sort();
+            }
+        }
+    }
+    let file = crate::golden::GoldenFile {
+        sections: vec![stable],
+    }
+    .render()?;
+    let (_, content) = file
+        .split_once('\n')
+        .context("golden digest section framing")?;
+    Ok(crate::results_record::digest(content.as_bytes()))
 }
 
 #[cfg(test)]
@@ -794,26 +809,6 @@ mod cell_escape_tests {
         // tabs in this context are field separators; escaped tab must not be a real tab
         assert!(!escaped.contains('\t'));
         assert_eq!(unescape_cell(&escaped), s);
-    }
-
-    #[test]
-    fn render_and_parse_result_set_round_trip_with_newline_in_cell() {
-        let header = vec!["id".to_string(), "value".to_string()];
-        let rows = vec![
-            vec!["1".to_string(), "line1\nline2".to_string()],
-            vec!["2".to_string(), "normal".to_string()],
-        ];
-        let rendered = render_result_set(&header, &rows);
-        // The rendered TSV must be exactly 3 physical lines (header + 2 rows + trailing newline).
-        let line_count = rendered.lines().count();
-        assert_eq!(
-            line_count, 3,
-            "expected 3 lines, got {}: {:?}",
-            line_count, rendered
-        );
-        let parsed = parse_result_set(&rendered.lines().map(|l| l.to_string()).collect::<Vec<_>>());
-        assert_eq!(parsed.header, header);
-        assert_eq!(parsed.rows, rows);
     }
 }
 
@@ -988,6 +983,9 @@ mod expected_error_code_result_classification_tests {
         };
         let hash = 80.0_f64 / 0.75 + 10.0 * 16.0;
         let mut execution = QueryExecution {
+            shell_result: None,
+            result_statements: Vec::new(),
+            typed_results: Vec::new(),
             header: vec!["EXPLAIN".to_string()],
             rows: vec![],
             text_output: format!(
@@ -1012,6 +1010,9 @@ mod expected_error_code_result_classification_tests {
             .map(|row| row.map(String::from).to_vec())
             .collect::<Vec<_>>();
         QueryExecution {
+            shell_result: None,
+            result_statements: Vec::new(),
+            typed_results: Vec::new(),
             text_output: render_output(&header, &rows),
             header,
             rows,
@@ -1105,19 +1106,37 @@ mod mismatch_artifact_tests {
                 root_dir: temp.path(),
                 suite_name: "suite",
                 artifact_id: "case-query1",
-                expected_header: &["answer".into()],
-                expected_rows: &[vec!["42".into()]],
-                actual_header: &["answer".into()],
-                actual_rows: &[vec![actual.into()]],
+                expected: &crate::golden::Section {
+                    step: 1,
+                    blocks: vec![crate::golden::Block::Typed {
+                        types: vec!["varchar".into()],
+                        names: vec!["answer".into()],
+                        rows: vec![vec!["42".into()]],
+                    }],
+                },
+                actual: &crate::golden::Section {
+                    step: 1,
+                    blocks: vec![crate::golden::Block::Typed {
+                        types: vec!["varchar".into()],
+                        names: vec!["answer".into()],
+                        rows: vec![vec![actual.into()]],
+                    }],
+                },
                 reason: "different rows",
             })
             .unwrap();
         }
         let mut outputs = std::fs::read_dir(temp.path().join("suite"))
             .unwrap()
-            .map(|e| std::fs::read_to_string(e.unwrap().path().join("actual.tsv")).unwrap())
+            .map(|e| std::fs::read_to_string(e.unwrap().path().join("actual.result")).unwrap())
             .collect::<Vec<_>>();
         outputs.sort();
-        assert_eq!(outputs, vec!["answer\nwrong-one\n", "answer\nwrong-two\n"]);
+        assert_eq!(
+            outputs,
+            vec![
+                "-- query 1\n-- types\tvarchar\nanswer\nwrong-one\n",
+                "-- query 1\n-- types\tvarchar\nanswer\nwrong-two\n"
+            ]
+        );
     }
 }

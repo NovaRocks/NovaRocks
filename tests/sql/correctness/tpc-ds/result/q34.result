@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	varchar	varchar	integer	bigint
 c_last_name	c_first_name	c_salutation	c_preferred_cust_flag	ss_ticket_number	cnt
 NULL	NULL	NULL	Y	16278	15
 NULL	NULL	NULL	Y	146557	16

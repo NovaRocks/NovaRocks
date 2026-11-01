@@ -1,23 +1,29 @@
 -- query 3
+-- legacy
 region	mn	mx	c
 north	10.5	50.5	6
 
 -- query 4
+-- types	varchar	double	double	bigint
 region	mn	mx	c
 north	10.5	50.5	6
 
 -- query 6
+-- legacy
 region	mn	mx	c
 north	20.25	50.5	5
 
 -- query 7
+-- types	varchar	double	double	bigint
 region	mn	mx	c
 north	20.25	50.5	5
 
 -- query 9
+-- legacy
 region	mn	mx	c
 north	20.25	50.5	4
 
 -- query 10
+-- types	varchar	double	double	bigint
 region	mn	mx	c
 north	20.25	50.5	4

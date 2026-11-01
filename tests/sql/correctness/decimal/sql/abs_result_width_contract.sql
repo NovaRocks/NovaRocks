@@ -37,7 +37,7 @@ INSERT INTO ${case_db}.abs_result_width_input VALUES
 -- Explicit casts freeze narrow input domains independently of Iceberg INT storage.
 SELECT id, ABS(CAST(i8 AS TINYINT)) AS abs_i8,
        ABS(CAST(i16 AS SMALLINT)) AS abs_i16, ABS(i32) AS abs_i32,
-       ABS(i64) AS abs_i64, ABS(i128) AS abs_i128
+       CAST(ABS(i64) AS VARCHAR) AS abs_i64, CAST(ABS(i128) AS VARCHAR) AS abs_i128
 FROM ${case_db}.abs_result_width_input ORDER BY id;
 
 -- query 3
@@ -58,12 +58,12 @@ FROM ${case_db}.abs_result_width_input ORDER BY id;
 SELECT ABS(CAST(-128 AS TINYINT)) AS literal_i8,
        ABS(CAST(-32768 AS SMALLINT)) AS literal_i16,
        ABS(CAST(-2147483648 AS INT)) AS literal_i32,
-       ABS(CAST('-9223372036854775808' AS BIGINT)) AS literal_i64,
-       ABS(CAST('-170141183460469231731687303715884105728' AS LARGEINT)) AS literal_i128;
+       CAST(ABS(CAST('-9223372036854775808' AS BIGINT)) AS VARCHAR) AS literal_i64,
+       CAST(ABS(CAST('-170141183460469231731687303715884105728' AS LARGEINT)) AS VARCHAR) AS literal_i128;
 
 -- query 6
 SELECT ABS(CAST(NULL AS TINYINT)) AS null_i8,
        ABS(CAST(NULL AS SMALLINT)) AS null_i16,
        ABS(CAST(NULL AS INT)) AS null_i32,
-       ABS(CAST(NULL AS BIGINT)) AS null_i64,
-       ABS(CAST(NULL AS LARGEINT)) AS null_i128;
+       CAST(ABS(CAST(NULL AS BIGINT)) AS VARCHAR) AS null_i64,
+       CAST(ABS(CAST(NULL AS LARGEINT)) AS VARCHAR) AS null_i128;

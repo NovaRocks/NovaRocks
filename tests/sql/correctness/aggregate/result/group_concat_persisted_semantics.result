@@ -1,15 +1,19 @@
 -- query 4
+-- types	bigint
 value
 7
 
 -- query 8
+-- types	varchar
 value
 a
 
 -- query 10
+-- types	bigint
 value
 7
 
 -- query 13
+-- types	bigint
 value
 7

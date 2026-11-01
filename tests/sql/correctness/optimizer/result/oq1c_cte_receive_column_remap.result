@@ -1,24 +1,29 @@
 -- query 4
+-- types	integer
 k
 2
 3
 
 -- query 5
+-- legacy
 k	payload
 2	200
 3	300
 
 -- query 6
+-- types	integer
 payload
 300
 
 -- query 7
+-- legacy
 k
 1
 2
 3
 
 -- query 10
+-- legacy
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1

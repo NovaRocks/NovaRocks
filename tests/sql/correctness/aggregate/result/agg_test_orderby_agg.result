@@ -1,4 +1,5 @@
 -- query 4
+-- types	bigint
 v1
 NULL
 4
@@ -7,6 +8,7 @@ NULL
 1
 
 -- query 5
+-- types	bigint	bigint
 v1	round_col
 NULL	NULL
 1	2
@@ -15,6 +17,7 @@ NULL	NULL
 4	0
 
 -- query 6
+-- types	bigint
 v1
 NULL
 4
@@ -23,6 +26,7 @@ NULL
 1
 
 -- query 7
+-- types	bigint
 v11
 NULL
 4
@@ -31,6 +35,7 @@ NULL
 1
 
 -- query 8
+-- types	bigint	bigint
 v11	v1
 NULL	NULL
 4	4
@@ -39,6 +44,7 @@ NULL	NULL
 1	1
 
 -- query 9
+-- types	decimal(38, 4)	bigint
 potential_customer_rate	v2
 NULL	NULL
 33.3333	3
@@ -46,6 +52,7 @@ NULL	NULL
 200.0000	1
 
 -- query 10
+-- types	decimal(38, 4)	bigint
 potential_customer_rate	v2
 NULL	NULL
 33.3333	3

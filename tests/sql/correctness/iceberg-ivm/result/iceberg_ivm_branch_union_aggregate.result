@@ -1,4 +1,5 @@
 -- query 3
+-- legacy
 region	c	s
 k1	1	10
 k1	1	100
@@ -6,12 +7,14 @@ k2	1	5
 k3	1	7
 
 -- query 6
+-- legacy
 region	c	s
 k1	1	10
 k2	1	5
 k3	1	7
 
 -- query 9
+-- legacy
 region	c	s
 k1	2	60
 k2	1	5

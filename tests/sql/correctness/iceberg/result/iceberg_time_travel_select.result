@@ -1,21 +1,25 @@
 -- query 5
+-- types	integer	integer
 id	v
 1	10
 2	20
 3	30
 
 -- query 6
+-- types	integer	integer
 id	v
 1	10
 2	20
 3	30
 
 -- query 7
+-- types	integer	integer
 id	v
 1	10
 2	20
 
 -- query 8
+-- types	integer	integer	integer	integer
 main_id	main_v	bak_id	bak_v
 1	10	1	10
 2	20	2	20

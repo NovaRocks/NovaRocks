@@ -1,24 +1,29 @@
 -- query 3
+-- legacy
 customer	c	s
 A	2	30
 B	1	30
 
 -- query 6
+-- legacy
 customer	c	s
 A	3	130
 B	1	30
 
 -- query 9
+-- legacy
 customer	c	s
 A	2	320
 B	1	130
 
 -- query 11
+-- types	bigint	varchar	bigint
 id	customer	amount
 3	B	130
 4	A	200
 
 -- query 13
+-- legacy
 customer	c	s
 A	1	200
 B	1	130

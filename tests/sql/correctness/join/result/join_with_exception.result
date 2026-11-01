@@ -1,3 +1,4 @@
 -- query 6
+-- types	bigint	double	bigint	bigint	bigint
 count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
 40960	20480.5	40960	40960	40960

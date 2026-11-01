@@ -399,7 +399,6 @@ where
         target_session_id: String,
         statement_run_token: String,
         frontend_process_id: String,
-        connection_id: u32,
         session_key: u64,
         statement_generation: u64,
     }
@@ -408,7 +407,6 @@ where
         target_session_id: wire.target_session_id,
         statement_run_token: wire.statement_run_token,
         frontend_process_id: wire.frontend_process_id,
-        connection_id: wire.connection_id,
         session_key: wire.session_key,
         statement_generation: wire.statement_generation,
     })

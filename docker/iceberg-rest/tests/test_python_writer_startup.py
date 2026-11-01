@@ -173,6 +173,32 @@ class WriterStartupTests(unittest.TestCase):
 
 
 class HmsNamespaceFamilyTests(unittest.TestCase):
+    def test_shared_prepare_requires_registered_owner_before_spark(self):
+        identity = ScratchIdentity.create("s3://custom-bucket/shared-owner-test")
+        namespace, sibling = identity.resource_name("h0000"), identity.resource_name("h0001")
+        original = {"identity": identity.as_dict(), "deadline": 123456.75}
+        budget = SimpleNamespace(identity=identity, as_dict=lambda: original,
+                                 remaining_seconds=lambda *, work: 17)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = {"NOVA_ENV_REST_ENV_FILE": str(root / "env.sh"),
+                           "NOVAROCKS_WORKSPACE_ROOT": directory,
+                           "NOVAROCKS_ICEBERG_HMS_WAREHOUSE": "s3://warehouse/original",
+                           "NOVA_FIXTURE_RUN_CONTEXT": json.dumps(original)}
+            with patch.dict(os.environ, environment, clear=True), \
+                    patch.object(sys, "argv", ["fixture.py", "prepare", namespace,
+                                              "--new-namespace", sibling]), \
+                    patch.object(fixture_run, "admit", return_value=({}, {}, budget)), \
+                    patch.object(fixture_run, "startup_sweep"), \
+                    patch.object(hms.signal, "signal"), patch.object(hms.signal, "setitimer"), \
+                    patch.object(hms, "run_spark") as spark, \
+                    patch.object(hms, "inventory") as inventory:
+                with self.assertRaisesRegex(RuntimeError, "requires its registered case input owner"):
+                    hms.main()
+                spark.assert_not_called()
+                inventory.assert_not_called()
+            self.assertFalse((root / "tests/sql/.runtime/hms-evidence" / namespace / "input.ready.json").exists())
+
     def test_shared_modes_pass_the_original_pair_and_original_budget(self):
         for action in ["prepare", "before", "after", "cleanup"]:
             with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
@@ -191,6 +217,22 @@ class HmsNamespaceFamilyTests(unittest.TestCase):
                 snapshot = {"namespace_family": [namespace, sibling], "catalog": catalog,
                             "objects": objects}
                 evidence = root / "tests/sql/.runtime/hms-evidence" / namespace
+                # This test isolates namespace/budget forwarding. The fixed
+                # intent verifier is covered separately by file-based tests.
+                intent = {"context": original, "publications": {}}
+                if action == "prepare":
+                    evidence.mkdir(parents=True)
+                    (evidence / "input.intent.json").write_text(json.dumps({"local_model_only": True}))
+                def spark_result(*args, **kwargs):
+                    remote = kwargs.get("settlement_receipt")
+                    if remote is not None:
+                        remote.write_text(json.dumps({
+                            "schema": "fixture-compose-settlement-v1", "local_model_only": True,
+                            "context": original, "child_waited": True, "returncode": 0,
+                            "cli_returncode": 0, "cleanup_failed": False,
+                            "temporary_owner_removed": True, "never_started": False,
+                        }))
+                    return catalog
                 if action == "after":
                     evidence.mkdir(parents=True)
                     (evidence / "before.json").write_text(json.dumps(snapshot))
@@ -205,7 +247,9 @@ class HmsNamespaceFamilyTests(unittest.TestCase):
                         patch.object(fixture_run, "admit", return_value=({}, {}, budget)) as admit, \
                         patch.object(fixture_run, "startup_sweep") as sweep, \
                         patch.object(hms.signal, "signal"), patch.object(hms.signal, "setitimer") as timer, \
-                        patch.object(hms, "run_spark", return_value=catalog) as spark, \
+                        patch.object(hms, "hms_intent", return_value=intent) as original_intent, \
+                        patch.object(hms, "publications", return_value={}), \
+                        patch.object(hms, "run_spark", side_effect=spark_result) as spark, \
                         patch.object(hms, "inventory", side_effect=inventories) as inventory:
                     hms.main()
                     self.assertEqual(json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]), original)
@@ -214,8 +258,16 @@ class HmsNamespaceFamilyTests(unittest.TestCase):
                     if action == "cleanup":
                         self.assertEqual(os.environ["NOVA_FIXTURE_CLEANUP_MODE"], "true")
                     admit.assert_called_once_with(root / "env.sh")
-                spark.assert_called_once_with(root, "snapshot" if action in ["before", "after"] else action,
-                                              namespace, new_namespace=sibling)
+                if action == "prepare":
+                    original_intent.assert_called_once_with(root, evidence, namespace, sibling, cleanup=False)
+                    spark.assert_called_once_with(root, action, namespace, new_namespace=sibling,
+                                                  settlement_receipt=evidence / "prepare.remote.json",
+                                                  input_publications=intent["publications"])
+                    self.assertTrue((evidence / "input.ready.json").is_file())
+                else:
+                    original_intent.assert_not_called()
+                    spark.assert_called_once_with(root, "snapshot" if action in ["before", "after"] else action,
+                                                  namespace, new_namespace=sibling)
                 for call in inventory.call_args_list:
                     self.assertEqual(call.args, (namespace,))
                     self.assertEqual(call.kwargs, {"new_namespace": sibling})
@@ -266,6 +318,7 @@ class HmsNamespaceFamilyTests(unittest.TestCase):
             hms.main()
             spark.assert_called_once_with(Path(directory), "prepare", "iru7_private",
                                           new_namespace="iru7_private_new")
+            self.assertFalse((Path(directory) / "tests/sql/.runtime/hms-evidence/iru7_private/input.ready.json").exists())
             sweep.assert_not_called()
 
     def test_private_explicit_canonical_pair_preserves_private_properties(self):
@@ -284,6 +337,7 @@ class HmsNamespaceFamilyTests(unittest.TestCase):
                 patch.object(hms, "run_spark") as spark:
             hms.main()
             spark.assert_called_once_with(Path(directory), "prepare", namespace, new_namespace=sibling)
+            self.assertFalse((Path(directory) / "tests/sql/.runtime/hms-evidence" / namespace / "input.ready.json").exists())
             self.assertEqual(os.environ["NOVAROCKS_ICEBERG_HMS_WAREHOUSE"], "s3://private-bucket/original")
             self.assertEqual(os.environ["NOVA_FIXTURE_RUN_CONTEXT"], "null")
             self.assertNotIn("NOVA_FIXTURE_HMS_ORIGINAL_WAREHOUSE", os.environ)

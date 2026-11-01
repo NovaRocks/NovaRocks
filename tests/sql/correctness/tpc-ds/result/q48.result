@@ -1,2 +1,4 @@
+-- query 1
+-- legacy
 sum(ss_quantity)
 26257

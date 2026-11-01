@@ -1,3 +1,5 @@
+-- query 1
+-- legacy
 item_sk	d_date	web_sales	store_sales	web_cumulative	store_cumulative
 14	2000-01-10	176.83	NULL	176.83	73.60
 14	2000-01-21	NULL	75.29	176.83	75.29

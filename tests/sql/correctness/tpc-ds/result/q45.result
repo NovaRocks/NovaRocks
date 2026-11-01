@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	decimal(38, 2)
 ca_zip	ca_city	sum(ws_sales_price)
 10150	Bunker Hill	20.25
 16098	Five Points	18.05

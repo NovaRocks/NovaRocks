@@ -1,8 +1,10 @@
 -- query 3
+-- types	varchar
 orgs
 NULL
 
 -- query 19
+-- types	varchar	bigint	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 NULL	1	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	1	May,Ti,欧阳诸葛方程
@@ -13,6 +15,7 @@ TomEnglish,王武程咬金语文北京上海	1	Tom,Tom,王武程咬金
 李四大闹天空英语外语美誉	1	李四大闹天空
 
 -- query 20
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 Ti物理Phy
 TomEnglish,TomMath
@@ -23,6 +26,7 @@ NULL
 李四大闹天空英语外语美誉
 
 -- query 21
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	Ti98
@@ -33,6 +37,7 @@ TomEnglish,王武程咬金语文北京上海	王武程咬金22
 李四大闹天空英语外语美誉	NULL
 
 -- query 22
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	Ti98
@@ -43,6 +48,7 @@ TomEnglish,王武程咬金语文北京上海	王武程咬金22
 李四大闹天空英语外语美誉	NULL
 
 -- query 23
+-- types	varchar	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT score ORDER BY score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	98
@@ -53,6 +59,7 @@ TomEnglish,王武程咬金语文北京上海	22
 李四大闹天空英语外语美誉	NULL
 
 -- query 24
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -63,6 +70,7 @@ TomEnglish,王武程咬金语文北京上海
 李四大闹天空英语外语美誉
 
 -- query 25
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -73,6 +81,7 @@ TomMath,TomEnglish
 李四大闹天空英语外语美誉
 
 -- query 26
+-- types	varchar	bigint	integer
 group_concat(DISTINCT name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 Ti物理Phy	0	99
@@ -83,6 +92,7 @@ TomMath,TomEnglish	1	90
 欧阳诸葛方程数学大不列颠,TiEnglish	1	98
 
 -- query 28
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')
 NULL
 Ti物理Phy
@@ -93,6 +103,7 @@ TomMath,TomEnglish
 欧阳诸葛方程数学大不列颠,TiEnglish
 
 -- query 29
+-- types	varchar
 group_concat(DISTINCT name,NULL ORDER BY score ASC, name ASC SEPARATOR ',')
 NULL
 NULL
@@ -103,6 +114,7 @@ NULL
 NULL
 
 -- query 30
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -113,6 +125,7 @@ TomEnglish,王武程咬金语文北京上海
 李四大闹天空英语外语美誉
 
 -- query 31
+-- types	varchar
 group_concat(DISTINCT NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 NULL
@@ -123,6 +136,7 @@ NULL
 NULL
 
 -- query 32
+-- types	varchar	varchar	array(varchar)
 group_concat(DISTINCT name,score ORDER BY score ASC, name ASC SEPARATOR ',')	group_concat(subject ORDER BY score ASC, subject ASC SEPARATOR ',')	array_agg(subject ORDER BY score ASC, subject ASC)
 NULL	英语外语美誉	["英语外语美誉"]
 NULL	NULL	[null]
@@ -133,6 +147,7 @@ Tom80,Tom90	Math,English	["Math","English"]
 王武程咬金22	English,语文北京上海	[null,"English","语文北京上海"]
 
 -- query 34
+-- types	varchar
 group_concat(DISTINCT score ORDER BY score ASC, name ASC SEPARATOR ',')
 NULL
 NULL
@@ -143,6 +158,7 @@ NULL
 99
 
 -- query 35
+-- types	varchar
 group_concat(DISTINCT 1,2 SEPARATOR ',')
 12
 12
@@ -153,6 +169,7 @@ group_concat(DISTINCT 1,2 SEPARATOR ',')
 12
 
 -- query 36
+-- types	varchar
 group_concat(DISTINCT 1,2 ORDER BY score ASC SEPARATOR ',')
 12
 12
@@ -163,6 +180,7 @@ group_concat(DISTINCT 1,2 ORDER BY score ASC SEPARATOR ',')
 12
 
 -- query 38
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	1	98
@@ -173,6 +191,7 @@ TomEnglish,王武程咬金语文北京上海	1	22
 李四大闹天空英语外语美誉	1	NULL
 
 -- query 39
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY name ASC, score ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	1	98
@@ -183,6 +202,7 @@ TomMath,TomEnglish	1	90
 李四大闹天空英语外语美誉	1	NULL
 
 -- query 40
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 Ti物理Phy	0	99
@@ -193,6 +213,7 @@ TomMath,TomEnglish	1	90
 欧阳诸葛方程数学大不列颠,TiEnglish	1	98
 
 -- query 42
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 Ti物理Phy	0	99
@@ -203,6 +224,7 @@ TomMath,TomEnglish	1	90
 欧阳诸葛方程数学大不列颠,TiEnglish	1	98
 
 -- query 43
+-- types	varchar
 group_concat(name,NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 NULL
@@ -213,6 +235,7 @@ NULL
 NULL
 
 -- query 44
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -223,6 +246,7 @@ TomEnglish,王武程咬金语文北京上海
 李四大闹天空英语外语美誉
 
 -- query 45
+-- types	varchar
 group_concat(NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 NULL
@@ -233,6 +257,7 @@ NULL
 NULL
 
 -- query 47
+-- types	varchar
 group_concat(score ORDER BY score ASC, name ASC SEPARATOR ',')
 NULL
 NULL
@@ -243,6 +268,7 @@ NULL
 99
 
 -- query 48
+-- types	varchar
 group_concat(1,2 SEPARATOR ',')
 12
 12
@@ -253,6 +279,7 @@ group_concat(1,2 SEPARATOR ',')
 12,12,12
 
 -- query 49
+-- types	varchar
 group_concat(1,2 ORDER BY score ASC SEPARATOR ',')
 12
 12
@@ -263,110 +290,137 @@ group_concat(1,2 ORDER BY score ASC SEPARATOR ',')
 12,12,12
 
 -- query 51
+-- types	varchar	bigint	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	6	May,Ti,Ti,Tom,Tom,Tom,Tom,张三掩耳盗铃,张三此地无银三百两,李四大闹天空,欧阳诸葛方程,王武程咬金
 
 -- query 52
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 53
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	Ti98,Ti99,Tom80,Tom90,张三掩耳盗铃78,张三此地无银三百两98,王武程咬金22
 
 -- query 54
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	Ti98,Ti99,Tom80,Tom90,张三掩耳盗铃78,张三此地无银三百两98,王武程咬金22
 
 -- query 55
+-- types	varchar	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT score ORDER BY score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	22,78,80,90,98,99
 
 -- query 56
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 57
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC, score ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 58
+-- types	varchar	bigint	integer
 group_concat(DISTINCT name,subject ORDER BY length(name) ASC, name ASC, subject ASC, score ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,王武程咬金语文北京上海,张三掩耳盗铃Math数学欧拉方程,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,张三此地无银三百两英文English	6	99
 
 -- query 60
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 61
+-- types	varchar
 group_concat(DISTINCT name,NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 
 -- query 62
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 63
+-- types	varchar
 group_concat(DISTINCT NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 
 -- query 64
+-- types	varchar	varchar	array(varchar)
 group_concat(DISTINCT name ORDER BY name ASC, score ASC, name ASC SEPARATOR ',')	group_concat(subject ORDER BY score ASC, subject ASC SEPARATOR ',')	array_agg(subject ORDER BY score ASC, subject ASC)
 May,Ti,Tom,张三掩耳盗铃,张三此地无银三百两,李四大闹天空,欧阳诸葛方程,王武程咬金	English,数学大不列颠,英语外语美誉,语文北京上海,Math数学欧拉方程,Math,English,English,英文English,物理Phy	[null,null,null,null,"English","数学大不列颠","英语外语美誉","语文北京上海","Math数学欧拉方程","Math","English","English","英文English","物理Phy"]
 
 -- query 66
+-- types	varchar
 group_concat(DISTINCT score ORDER BY score ASC, name ASC SEPARATOR ',')
 22,78,80,90,98,99
 
 -- query 67
+-- types	varchar
 group_concat(DISTINCT 1,2 SEPARATOR ',')
 12
 
 -- query 68
+-- types	varchar
 group_concat(DISTINCT 1,2 ORDER BY score ASC SEPARATOR ',')
 12
 
 -- query 70
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	6	99
 
 -- query 71
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY name ASC, score ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,TomEnglish,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	6	99
 
 -- query 72
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TomEnglish,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海,张三掩耳盗铃Math数学欧拉方程,TomMath,TomEnglish,TiEnglish,张三此地无银三百两英文English,Ti物理Phy	6	99
 
 -- query 74
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TomEnglish,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海,张三掩耳盗铃Math数学欧拉方程,TomMath,TomEnglish,TiEnglish,张三此地无银三百两英文English,Ti物理Phy	6	99
 
 -- query 75
+-- types	varchar
 group_concat(name,NULL ORDER BY score ASC, name ASC SEPARATOR ',')
 NULL
 
 -- query 76
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 77
+-- types	varchar
 group_concat(NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 
 -- query 79
+-- types	varchar
 group_concat(score ORDER BY score ASC, name ASC SEPARATOR ',')
 22,78,80,90,98,98,99
 
 -- query 80
+-- types	varchar
 group_concat(1,2 SEPARATOR ',')
 12,12,12,12,12,12,12,12,12,12,12,12,12,12
 
 -- query 81
+-- types	varchar
 group_concat(1,2 ORDER BY score ASC SEPARATOR ',')
 12,12,12,12,12,12,12,12,12,12,12,12,12,12
 
 -- query 85
+-- types	varchar	bigint	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 NULL	1	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	1	May,Ti,欧阳诸葛方程
@@ -377,6 +431,7 @@ TomEnglish,王武程咬金语文北京上海	1	Tom,Tom,王武程咬金
 李四大闹天空英语外语美誉	1	李四大闹天空
 
 -- query 86
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 Ti物理Phy
 TomEnglish,TomMath
@@ -387,6 +442,7 @@ NULL
 李四大闹天空英语外语美誉
 
 -- query 87
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	Ti98
@@ -397,6 +453,7 @@ TomEnglish,王武程咬金语文北京上海	王武程咬金22
 李四大闹天空英语外语美誉	NULL
 
 -- query 88
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	Ti98
@@ -407,6 +464,7 @@ TomEnglish,王武程咬金语文北京上海	王武程咬金22
 李四大闹天空英语外语美誉	NULL
 
 -- query 89
+-- types	varchar	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT score ORDER BY score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	98
@@ -417,6 +475,7 @@ TomEnglish,王武程咬金语文北京上海	22
 李四大闹天空英语外语美誉	NULL
 
 -- query 90
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -427,6 +486,7 @@ TomEnglish,王武程咬金语文北京上海
 李四大闹天空英语外语美誉
 
 -- query 91
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -437,6 +497,7 @@ TomMath,TomEnglish
 李四大闹天空英语外语美誉
 
 -- query 92
+-- types	varchar	bigint	integer
 group_concat(DISTINCT name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 Ti物理Phy	0	99
@@ -447,6 +508,7 @@ TomMath,TomEnglish	1	90
 欧阳诸葛方程数学大不列颠,TiEnglish	1	98
 
 -- query 94
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')
 NULL
 Ti物理Phy
@@ -457,6 +519,7 @@ TomMath,TomEnglish
 欧阳诸葛方程数学大不列颠,TiEnglish
 
 -- query 95
+-- types	varchar
 group_concat(DISTINCT name,NULL ORDER BY score ASC, name ASC SEPARATOR ',')
 NULL
 NULL
@@ -467,6 +530,7 @@ NULL
 NULL
 
 -- query 96
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -477,6 +541,7 @@ TomEnglish,王武程咬金语文北京上海
 李四大闹天空英语外语美誉
 
 -- query 97
+-- types	varchar
 group_concat(DISTINCT NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 NULL
@@ -487,6 +552,7 @@ NULL
 NULL
 
 -- query 98
+-- types	varchar	varchar	array(varchar)
 group_concat(DISTINCT name,score ORDER BY score ASC, name ASC SEPARATOR ',')	group_concat(subject ORDER BY score ASC, subject ASC SEPARATOR ',')	array_agg(subject ORDER BY score ASC, subject ASC)
 NULL	NULL	[null]
 NULL	英语外语美誉	["英语外语美誉"]
@@ -497,6 +563,7 @@ Tom80,Tom90	Math,English	["Math","English"]
 王武程咬金22	English,语文北京上海	[null,"English","语文北京上海"]
 
 -- query 100
+-- types	varchar
 group_concat(DISTINCT score ORDER BY score ASC, name ASC SEPARATOR ',')
 NULL
 NULL
@@ -507,6 +574,7 @@ NULL
 99
 
 -- query 101
+-- types	varchar
 group_concat(DISTINCT 1,2 SEPARATOR ',')
 12
 12
@@ -517,6 +585,7 @@ group_concat(DISTINCT 1,2 SEPARATOR ',')
 12
 
 -- query 102
+-- types	varchar
 group_concat(DISTINCT 1,2 ORDER BY score ASC SEPARATOR ',')
 12
 12
@@ -527,6 +596,7 @@ group_concat(DISTINCT 1,2 ORDER BY score ASC SEPARATOR ',')
 12
 
 -- query 104
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	1	98
@@ -537,6 +607,7 @@ TomEnglish,王武程咬金语文北京上海	1	22
 李四大闹天空英语外语美誉	1	NULL
 
 -- query 105
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY name ASC, score ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	1	98
@@ -547,6 +618,7 @@ TomMath,TomEnglish	1	90
 李四大闹天空英语外语美誉	1	NULL
 
 -- query 106
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 Ti物理Phy	0	99
@@ -557,6 +629,7 @@ TomMath,TomEnglish	1	90
 欧阳诸葛方程数学大不列颠,TiEnglish	1	98
 
 -- query 108
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 Ti物理Phy	0	99
@@ -567,6 +640,7 @@ TomMath,TomEnglish	1	90
 欧阳诸葛方程数学大不列颠,TiEnglish	1	98
 
 -- query 109
+-- types	varchar
 group_concat(name,NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 NULL
@@ -577,6 +651,7 @@ NULL
 NULL
 
 -- query 110
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -587,6 +662,7 @@ TomEnglish,王武程咬金语文北京上海
 李四大闹天空英语外语美誉
 
 -- query 111
+-- types	varchar
 group_concat(NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 NULL
@@ -597,6 +673,7 @@ NULL
 NULL
 
 -- query 113
+-- types	varchar
 group_concat(score ORDER BY score ASC, name ASC SEPARATOR ',')
 NULL
 NULL
@@ -607,6 +684,7 @@ NULL
 99
 
 -- query 114
+-- types	varchar
 group_concat(1,2 SEPARATOR ',')
 12
 12
@@ -617,6 +695,7 @@ group_concat(1,2 SEPARATOR ',')
 12,12,12
 
 -- query 115
+-- types	varchar
 group_concat(1,2 ORDER BY score ASC SEPARATOR ',')
 12
 12
@@ -627,110 +706,137 @@ group_concat(1,2 ORDER BY score ASC SEPARATOR ',')
 12,12,12
 
 -- query 117
+-- types	varchar	bigint	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	6	May,Ti,Ti,Tom,Tom,Tom,Tom,张三掩耳盗铃,张三此地无银三百两,李四大闹天空,欧阳诸葛方程,王武程咬金
 
 -- query 118
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 119
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	Ti98,Ti99,Tom80,Tom90,张三掩耳盗铃78,张三此地无银三百两98,王武程咬金22
 
 -- query 120
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	Ti98,Ti99,Tom80,Tom90,张三掩耳盗铃78,张三此地无银三百两98,王武程咬金22
 
 -- query 121
+-- types	varchar	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT score ORDER BY score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	22,78,80,90,98,99
 
 -- query 122
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 123
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC, score ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 124
+-- types	varchar	bigint	integer
 group_concat(DISTINCT name,subject ORDER BY length(name) ASC, name ASC, subject ASC, score ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,王武程咬金语文北京上海,张三掩耳盗铃Math数学欧拉方程,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,张三此地无银三百两英文English	6	99
 
 -- query 126
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 127
+-- types	varchar
 group_concat(DISTINCT name,NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 
 -- query 128
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 129
+-- types	varchar
 group_concat(DISTINCT NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 
 -- query 130
+-- types	varchar	varchar	array(varchar)
 group_concat(DISTINCT name ORDER BY name ASC, score ASC, name ASC SEPARATOR ',')	group_concat(subject ORDER BY score ASC, subject ASC SEPARATOR ',')	array_agg(subject ORDER BY score ASC, subject ASC)
 May,Ti,Tom,张三掩耳盗铃,张三此地无银三百两,李四大闹天空,欧阳诸葛方程,王武程咬金	English,数学大不列颠,英语外语美誉,语文北京上海,Math数学欧拉方程,Math,English,English,英文English,物理Phy	[null,null,null,null,"English","数学大不列颠","英语外语美誉","语文北京上海","Math数学欧拉方程","Math","English","English","英文English","物理Phy"]
 
 -- query 132
+-- types	varchar
 group_concat(DISTINCT score ORDER BY score ASC, name ASC SEPARATOR ',')
 22,78,80,90,98,99
 
 -- query 133
+-- types	varchar
 group_concat(DISTINCT 1,2 SEPARATOR ',')
 12
 
 -- query 134
+-- types	varchar
 group_concat(DISTINCT 1,2 ORDER BY score ASC SEPARATOR ',')
 12
 
 -- query 136
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	6	99
 
 -- query 137
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY name ASC, score ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,TomEnglish,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	6	99
 
 -- query 138
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TomEnglish,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海,张三掩耳盗铃Math数学欧拉方程,TomMath,TomEnglish,TiEnglish,张三此地无银三百两英文English,Ti物理Phy	6	99
 
 -- query 140
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TomEnglish,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海,张三掩耳盗铃Math数学欧拉方程,TomMath,TomEnglish,TiEnglish,张三此地无银三百两英文English,Ti物理Phy	6	99
 
 -- query 141
+-- types	varchar
 group_concat(name,NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 
 -- query 142
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 143
+-- types	varchar
 group_concat(NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 
 -- query 145
+-- types	varchar
 group_concat(score ORDER BY score ASC, name ASC SEPARATOR ',')
 22,78,80,90,98,98,99
 
 -- query 146
+-- types	varchar
 group_concat(1,2 SEPARATOR ',')
 12,12,12,12,12,12,12,12,12,12,12,12,12,12
 
 -- query 147
+-- types	varchar
 group_concat(1,2 ORDER BY score ASC SEPARATOR ',')
 12,12,12,12,12,12,12,12,12,12,12,12,12,12
 
 -- query 151
+-- types	varchar	bigint	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 NULL	1	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	1	May,Ti,欧阳诸葛方程
@@ -741,6 +847,7 @@ TomEnglish,王武程咬金语文北京上海	1	Tom,Tom,王武程咬金
 李四大闹天空英语外语美誉	1	李四大闹天空
 
 -- query 152
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 Ti物理Phy
 TomEnglish,TomMath
@@ -751,6 +858,7 @@ NULL
 李四大闹天空英语外语美誉
 
 -- query 153
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	Ti98
@@ -761,6 +869,7 @@ TomEnglish,王武程咬金语文北京上海	王武程咬金22
 李四大闹天空英语外语美誉	NULL
 
 -- query 154
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	Ti98
@@ -771,6 +880,7 @@ TomEnglish,王武程咬金语文北京上海	王武程咬金22
 李四大闹天空英语外语美誉	NULL
 
 -- query 155
+-- types	varchar	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT score ORDER BY score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	98
@@ -781,6 +891,7 @@ TomEnglish,王武程咬金语文北京上海	22
 李四大闹天空英语外语美誉	NULL
 
 -- query 156
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -791,6 +902,7 @@ TomEnglish,王武程咬金语文北京上海
 李四大闹天空英语外语美誉
 
 -- query 157
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -801,6 +913,7 @@ TomMath,TomEnglish
 李四大闹天空英语外语美誉
 
 -- query 158
+-- types	varchar	bigint	integer
 group_concat(DISTINCT name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 Ti物理Phy	0	99
@@ -811,6 +924,7 @@ TomMath,TomEnglish	1	90
 欧阳诸葛方程数学大不列颠,TiEnglish	1	98
 
 -- query 160
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')
 NULL
 Ti物理Phy
@@ -821,6 +935,7 @@ TomMath,TomEnglish
 欧阳诸葛方程数学大不列颠,TiEnglish
 
 -- query 161
+-- types	varchar
 group_concat(DISTINCT name,NULL ORDER BY score ASC, name ASC SEPARATOR ',')
 NULL
 NULL
@@ -831,6 +946,7 @@ NULL
 NULL
 
 -- query 162
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -841,6 +957,7 @@ TomEnglish,王武程咬金语文北京上海
 李四大闹天空英语外语美誉
 
 -- query 163
+-- types	varchar
 group_concat(DISTINCT NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 NULL
@@ -851,6 +968,7 @@ NULL
 NULL
 
 -- query 164
+-- types	varchar	varchar	array(varchar)
 group_concat(DISTINCT name,score ORDER BY score ASC, name ASC SEPARATOR ',')	group_concat(subject ORDER BY score ASC, subject ASC SEPARATOR ',')	array_agg(subject ORDER BY score ASC, subject ASC)
 NULL	NULL	[null]
 NULL	英语外语美誉	["英语外语美誉"]
@@ -861,6 +979,7 @@ Tom80,Tom90	Math,English	["Math","English"]
 王武程咬金22	English,语文北京上海	[null,"English","语文北京上海"]
 
 -- query 166
+-- types	varchar
 group_concat(DISTINCT score ORDER BY score ASC, name ASC SEPARATOR ',')
 NULL
 NULL
@@ -871,6 +990,7 @@ NULL
 99
 
 -- query 167
+-- types	varchar
 group_concat(DISTINCT 1,2 SEPARATOR ',')
 12
 12
@@ -881,6 +1001,7 @@ group_concat(DISTINCT 1,2 SEPARATOR ',')
 12
 
 -- query 168
+-- types	varchar
 group_concat(DISTINCT 1,2 ORDER BY score ASC SEPARATOR ',')
 12
 12
@@ -891,6 +1012,7 @@ group_concat(DISTINCT 1,2 ORDER BY score ASC SEPARATOR ',')
 12
 
 -- query 170
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	1	98
@@ -901,6 +1023,7 @@ TomEnglish,王武程咬金语文北京上海	1	22
 李四大闹天空英语外语美誉	1	NULL
 
 -- query 171
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY name ASC, score ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	1	98
@@ -911,6 +1034,7 @@ TomMath,TomEnglish	1	90
 李四大闹天空英语外语美誉	1	NULL
 
 -- query 172
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 Ti物理Phy	0	99
@@ -921,6 +1045,7 @@ TomMath,TomEnglish	1	90
 欧阳诸葛方程数学大不列颠,TiEnglish	1	98
 
 -- query 174
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 NULL	1	NULL
 Ti物理Phy	0	99
@@ -931,6 +1056,7 @@ TomMath,TomEnglish	1	90
 欧阳诸葛方程数学大不列颠,TiEnglish	1	98
 
 -- query 175
+-- types	varchar
 group_concat(name,NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 NULL
@@ -941,6 +1067,7 @@ NULL
 NULL
 
 -- query 176
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -951,6 +1078,7 @@ TomEnglish,王武程咬金语文北京上海
 李四大闹天空英语外语美誉
 
 -- query 177
+-- types	varchar
 group_concat(NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 NULL
@@ -961,6 +1089,7 @@ NULL
 NULL
 
 -- query 179
+-- types	varchar
 group_concat(score ORDER BY score ASC, name ASC SEPARATOR ',')
 NULL
 NULL
@@ -971,6 +1100,7 @@ NULL
 99
 
 -- query 180
+-- types	varchar
 group_concat(1,2 SEPARATOR ',')
 12
 12
@@ -981,6 +1111,7 @@ group_concat(1,2 SEPARATOR ',')
 12,12,12
 
 -- query 181
+-- types	varchar
 group_concat(1,2 ORDER BY score ASC SEPARATOR ',')
 12
 12
@@ -991,130 +1122,162 @@ group_concat(1,2 ORDER BY score ASC SEPARATOR ',')
 12,12,12
 
 -- query 183
+-- types	varchar	bigint	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	6	May,Ti,Ti,Tom,Tom,Tom,Tom,张三掩耳盗铃,张三此地无银三百两,李四大闹天空,欧阳诸葛方程,王武程咬金
 
 -- query 184
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 185
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	Ti98,Ti99,Tom80,Tom90,张三掩耳盗铃78,张三此地无银三百两98,王武程咬金22
 
 -- query 186
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	Ti98,Ti99,Tom80,Tom90,张三掩耳盗铃78,张三此地无银三百两98,王武程咬金22
 
 -- query 187
+-- types	varchar	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT score ORDER BY score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	22,78,80,90,98,99
 
 -- query 188
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 189
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC, score ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 190
+-- types	varchar	bigint	integer
 group_concat(DISTINCT name,subject ORDER BY length(name) ASC, name ASC, subject ASC, score ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,王武程咬金语文北京上海,张三掩耳盗铃Math数学欧拉方程,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,张三此地无银三百两英文English	6	99
 
 -- query 192
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 193
+-- types	varchar
 group_concat(DISTINCT name,NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 
 -- query 194
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 195
+-- types	varchar
 group_concat(DISTINCT NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 
 -- query 196
+-- types	varchar	varchar	array(varchar)
 group_concat(DISTINCT name ORDER BY name ASC, score ASC, name ASC SEPARATOR ',')	group_concat(subject ORDER BY score ASC, subject ASC SEPARATOR ',')	array_agg(subject ORDER BY score ASC, subject ASC)
 May,Ti,Tom,张三掩耳盗铃,张三此地无银三百两,李四大闹天空,欧阳诸葛方程,王武程咬金	English,数学大不列颠,英语外语美誉,语文北京上海,Math数学欧拉方程,Math,English,English,英文English,物理Phy	[null,null,null,null,"English","数学大不列颠","英语外语美誉","语文北京上海","Math数学欧拉方程","Math","English","English","英文English","物理Phy"]
 
 -- query 198
+-- types	varchar
 group_concat(DISTINCT score ORDER BY score ASC, name ASC SEPARATOR ',')
 22,78,80,90,98,99
 
 -- query 199
+-- types	varchar
 group_concat(DISTINCT 1,2 SEPARATOR ',')
 12
 
 -- query 200
+-- types	varchar
 group_concat(DISTINCT 1,2 ORDER BY score ASC SEPARATOR ',')
 12
 
 -- query 202
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	6	99
 
 -- query 203
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY name ASC, score ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,TomEnglish,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	6	99
 
 -- query 204
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TomEnglish,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海,张三掩耳盗铃Math数学欧拉方程,TomMath,TomEnglish,TiEnglish,张三此地无银三百两英文English,Ti物理Phy	6	99
 
 -- query 206
+-- types	varchar	bigint	integer
 group_concat(name,subject ORDER BY score ASC, name ASC, subject ASC SEPARATOR ',')	count(DISTINCT id)	max(score)
 TomEnglish,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海,张三掩耳盗铃Math数学欧拉方程,TomMath,TomEnglish,TiEnglish,张三此地无银三百两英文English,Ti物理Phy	6	99
 
 -- query 207
+-- types	varchar
 group_concat(name,NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 
 -- query 208
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 209
+-- types	varchar
 group_concat(NULL ORDER BY score ASC SEPARATOR ',')
 NULL
 
 -- query 211
+-- types	varchar
 group_concat(score ORDER BY score ASC, name ASC SEPARATOR ',')
 22,78,80,90,98,98,99
 
 -- query 212
+-- types	varchar
 group_concat(1,2 SEPARATOR ',')
 12,12,12,12,12,12,12,12,12,12,12,12,12,12
 
 -- query 213
+-- types	varchar
 group_concat(1,2 ORDER BY score ASC SEPARATOR ',')
 12,12,12,12,12,12,12,12,12,12,12,12,12,12
 
 -- query 216
+-- types	varchar	bigint	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT score)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	6	May,Ti,Ti,Tom,Tom,Tom,Tom,张三掩耳盗铃,张三此地无银三百两,李四大闹天空,欧阳诸葛方程,王武程咬金
 
 -- query 217
+-- types	bigint	varchar
 count(DISTINCT score)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 6	May,Ti,Ti,Tom,Tom,Tom,Tom,张三掩耳盗铃,张三此地无银三百两,李四大闹天空,欧阳诸葛方程,王武程咬金
 
 -- query 218
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 219
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	Ti98,Ti99,Tom80,Tom90,张三掩耳盗铃78,张三此地无银三百两98,王武程咬金22
 
 -- query 220
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	Ti98,Ti99,Tom80,Tom90,张三掩耳盗铃78,张三此地无银三百两98,王武程咬金22
 
 -- query 221
+-- types	integer	varchar	bigint	varchar
 id	group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT score)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 NULL	Ti物理Phy	1	Ti
 1	TomEnglish,TomMath	2	Tom,Tom
@@ -1125,6 +1288,7 @@ NULL	Ti物理Phy	1	Ti
 12	李四大闹天空英语外语美誉	0	李四大闹天空
 
 -- query 222
+-- types	integer	bigint	varchar
 id	count(DISTINCT score)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 NULL	1	Ti
 1	2	Tom,Tom
@@ -1135,6 +1299,7 @@ NULL	1	Ti
 12	0	李四大闹天空
 
 -- query 223
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 Ti物理Phy
 TomEnglish,TomMath
@@ -1145,6 +1310,7 @@ NULL
 李四大闹天空英语外语美誉
 
 -- query 224
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	Ti98
@@ -1155,6 +1321,7 @@ TomEnglish,王武程咬金语文北京上海	王武程咬金22
 李四大闹天空英语外语美誉	NULL
 
 -- query 225
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	Ti98
@@ -1165,26 +1332,32 @@ TomEnglish,王武程咬金语文北京上海	王武程咬金22
 李四大闹天空英语外语美誉	NULL
 
 -- query 227
+-- types	varchar	bigint	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT score)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	6	May,Ti,Ti,Tom,Tom,Tom,Tom,张三掩耳盗铃,张三此地无银三百两,李四大闹天空,欧阳诸葛方程,王武程咬金
 
 -- query 228
+-- types	bigint	varchar
 count(DISTINCT score)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 6	May,Ti,Ti,Tom,Tom,Tom,Tom,张三掩耳盗铃,张三此地无银三百两,李四大闹天空,欧阳诸葛方程,王武程咬金
 
 -- query 229
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海
 
 -- query 230
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	Ti98,Ti99,Tom80,Tom90,张三掩耳盗铃78,张三此地无银三百两98,王武程咬金22
 
 -- query 231
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	Ti98,Ti99,Tom80,Tom90,张三掩耳盗铃78,张三此地无银三百两98,王武程咬金22
 
 -- query 232
+-- types	integer	varchar	bigint	varchar
 id	group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	count(DISTINCT score)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 NULL	Ti物理Phy	1	Ti
 1	TomEnglish,TomMath	2	Tom,Tom
@@ -1195,6 +1368,7 @@ NULL	Ti物理Phy	1	Ti
 12	李四大闹天空英语外语美誉	0	李四大闹天空
 
 -- query 233
+-- types	integer	bigint	varchar
 id	count(DISTINCT score)	group_concat(name ORDER BY name ASC SEPARATOR ',')
 NULL	1	Ti
 1	2	Tom,Tom
@@ -1205,6 +1379,7 @@ NULL	1	Ti
 12	0	李四大闹天空
 
 -- query 234
+-- types	varchar
 group_concat(DISTINCT name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 Ti物理Phy
 TomEnglish,TomMath
@@ -1215,6 +1390,7 @@ NULL
 李四大闹天空英语外语美誉
 
 -- query 235
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	Ti98
@@ -1225,6 +1401,7 @@ TomEnglish,王武程咬金语文北京上海	王武程咬金22
 李四大闹天空英语外语美誉	NULL
 
 -- query 236
+-- types	varchar	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	group_concat(DISTINCT name,score ORDER BY name ASC, score ASC SEPARATOR ',')
 NULL	NULL
 TiEnglish,欧阳诸葛方程数学大不列颠	Ti98
@@ -1235,38 +1412,47 @@ TomEnglish,王武程咬金语文北京上海	王武程咬金22
 李四大闹天空英语外语美誉	NULL
 
 -- query 239
+-- types	varchar
 group_concat(',' SEPARATOR ',')
 ,
 
 -- query 240
+-- types	varchar
 group_concat('中国',name ORDER BY name ASC, id ASC SEPARATOR ',')
 中国May,中国Ti,中国Ti,中国Tom,中国Tom,中国Tom,中国Tom,中国张三掩耳盗铃,中国张三此地无银三百两,中国李四大闹天空,中国欧阳诸葛方程,中国王武程咬金
 
 -- query 241
+-- types	varchar
 group_concat('中国',name ORDER BY name ASC, id ASC SEPARATOR NULL)
 中国May中国Ti中国Ti中国Tom中国Tom中国Tom中国Tom中国张三掩耳盗铃中国张三此地无银三百两中国李四大闹天空中国欧阳诸葛方程中国王武程咬金
 
 -- query 242
+-- types	varchar
 group_concat('中国',name ORDER BY name ASC, id ASC SEPARATOR ',')
 中国May,中国Ti,中国Ti,中国Tom,中国Tom,中国Tom,中国Tom,中国张三掩耳盗铃,中国张三此地无银三百两,中国李四大闹天空,中国欧阳诸葛方程,中国王武程咬金
 
 -- query 243
+-- types	boolean
 has_lf_separator
-1
+true
 
 -- query 244
+-- types	varchar
 group_concat('中国',name ORDER BY name ASC, subject ASC, id ASC SEPARATOR subject)
 中国May中国TiEnglish中国Ti物理Phy中国Tom中国TomEnglish中国TomEnglish中国TomMath中国张三掩耳盗铃Math数学欧拉方程中国张三此地无银三百两英文English中国李四大闹天空英语外语美誉中国欧阳诸葛方程数学大不列颠中国王武程咬金
 
 -- query 249
+-- types	varchar
 group_concat(json_object('2:3') SEPARATOR ',')
 {"2:3": null},{"2:3": null},{"2:3": null},{"2:3": null},{"2:3": null},{"2:3": null},{"2:3": null},{"2:3": null},{"2:3": null},{"2:3": null},{"2:3": null},{"2:3": null},{"2:3": null},{"2:3": null}
 
 -- query 251
+-- types	varchar
 group_concat(NULL SEPARATOR ',')
 NULL
 
 -- query 255
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 Ti
@@ -1277,6 +1463,7 @@ TomE
 李
 
 -- query 257
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 Ti
@@ -1287,6 +1474,7 @@ TomE
 李
 
 -- query 259
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEng
@@ -1297,6 +1485,7 @@ TomEn
 李
 
 -- query 261
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEngl
@@ -1307,6 +1496,7 @@ TomEng
 李四
 
 -- query 263
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEngli
@@ -1317,6 +1507,7 @@ TomEngl
 李四
 
 -- query 265
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEnglis
@@ -1327,6 +1518,7 @@ TomEngli
 李四
 
 -- query 267
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEnglish
@@ -1337,6 +1529,7 @@ TomEnglis
 李四大
 
 -- query 269
+-- types	varchar
 group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')
 NULL
 TiEnglish,欧阳诸葛方程数学大不列颠
@@ -1347,37 +1540,45 @@ TomEnglish,王武程咬金语文北京上海
 李四大闹天空英语外语美誉
 
 -- query 274
+-- types	tinyint	varchar
 id	group_concat(value SEPARATOR ', ')
 1	fruit, fruit, fruit
 2	fruit, fruit, fruit
 
 -- query 275
+-- types	tinyint	varchar
 id	group_concat(value SEPARATOR '-')
 1	fruit-fruit-fruit
 2	fruit-fruit-fruit
 
 -- query 276
+-- types	varchar
 group_concat(value SEPARATOR ', ')
 fruit, fruit, fruit, fruit, fruit, fruit
 
 -- query 277
+-- types	varchar
 group_concat(value SEPARATOR '-')
 fruit-fruit-fruit-fruit-fruit-fruit
 
 -- query 279
+-- types	tinyint	varchar
 id	group_concat(value SEPARATOR ', ')
 1	fruit, fruit, fruit
 2	fruit, fruit, fruit
 
 -- query 280
+-- types	varchar
 group_concat(value SEPARATOR '-')
 fruit-fruit-fruit-fruit-fruit-fruit
 
 -- query 281
+-- types	tinyint	varchar
 id	group_concat(value,'-' SEPARATOR ',')
 1	fruit-,fruit-,fruit-
 2	fruit-,fruit-,fruit-
 
 -- query 282
+-- types	varchar
 group_concat(value SEPARATOR ',')
 fruit,fruit,fruit,fruit,fruit,fruit

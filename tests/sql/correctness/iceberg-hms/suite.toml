@@ -1,5 +1,6 @@
 # Requires the separately started Hive Metastore fixture and a native cluster.
 explicit_only = true
+case_input = "hms-read-only-compatibility-v1"
 heavy = { reason = "fixture", detail = "Requires docker/iceberg-hive, Spark-authored HMS inputs, native 1FE+3BE and serial execution; Spark owns writes and cleanup." }
 
 [impact]

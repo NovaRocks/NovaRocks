@@ -1,2 +1,4 @@
+-- query 2
+-- types	bigint	bigint	bigint	bigint	bigint	decimal(38, 2)	date	timestamp(6)	bigint
 rows_total	bool_nonnull	bool_true	sum_int	sum_bigint	sum_decimal	min_date	max_ts	string_nonnull
-3	2	1	-1	-2000000000	-44.44	1970-01-01	2025-12-31 23:59:58	2
+3	2	1	-1	-2000000000	-44.44	1970-01-01	2025-12-31 23:59:58.000000	2

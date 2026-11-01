@@ -1,3 +1,5 @@
+-- query 1
+-- legacy
 customer_id	customer_first_name	customer_last_name	customer_preferred_cust_flag
 AAAAAAAAAFGBBAAA	Howard	Major	Y
 AAAAAAAAAMGDAAAA	Kenneth	Harlan	Y

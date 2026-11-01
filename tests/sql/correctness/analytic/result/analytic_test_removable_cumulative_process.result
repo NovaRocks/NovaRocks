@@ -1,4 +1,5 @@
 -- query 2
+-- types	integer	integer	bigint
 v3	v1	CNT
 1	1	0
 2	1	0
@@ -26,6 +27,7 @@ v3	v1	CNT
 24	NULL	0
 
 -- query 3
+-- types	integer	integer	bigint
 v3	v1	CNT
 1	1	3
 2	1	4
@@ -53,6 +55,7 @@ v3	v1	CNT
 24	NULL	0
 
 -- query 4
+-- types	integer	integer	bigint
 v3	v1	CNT
 1	1	4
 2	1	4
@@ -80,6 +83,7 @@ v3	v1	CNT
 24	NULL	0
 
 -- query 5
+-- types	integer	integer	bigint
 v3	v1	CNT
 1	1	1
 2	1	2
@@ -107,6 +111,7 @@ v3	v1	CNT
 24	NULL	0
 
 -- query 6
+-- types	integer	integer	bigint
 v3	v1	CNT
 1	1	3
 2	1	3
@@ -134,6 +139,7 @@ v3	v1	CNT
 24	NULL	0
 
 -- query 7
+-- types	integer	bigint
 v3	CNT
 1	0
 2	0
@@ -161,6 +167,7 @@ v3	CNT
 24	4
 
 -- query 8
+-- types	integer	bigint
 v3	CNT
 1	3
 2	4
@@ -188,6 +195,7 @@ v3	CNT
 24	3
 
 -- query 9
+-- types	integer	bigint
 v3	CNT
 1	4
 2	4
@@ -215,6 +223,7 @@ v3	CNT
 24	0
 
 -- query 10
+-- types	integer	bigint
 v3	CNT
 1	1
 2	2
@@ -242,6 +251,7 @@ v3	CNT
 24	3
 
 -- query 11
+-- types	integer	bigint
 v3	CNT
 1	3
 2	3
@@ -269,6 +279,7 @@ v3	CNT
 24	1
 
 -- query 12
+-- types	integer	integer	bigint
 v3	v1	CNT
 1	1	NULL
 2	1	NULL
@@ -296,6 +307,7 @@ v3	v1	CNT
 24	NULL	NULL
 
 -- query 13
+-- types	integer	integer	bigint
 v3	v1	CNT
 1	1	3
 2	1	4
@@ -323,6 +335,7 @@ v3	v1	CNT
 24	NULL	NULL
 
 -- query 14
+-- types	integer	integer	bigint
 v3	v1	CNT
 1	1	4
 2	1	4
@@ -350,6 +363,7 @@ v3	v1	CNT
 24	NULL	NULL
 
 -- query 15
+-- types	integer	integer	bigint
 v3	v1	CNT
 1	1	1
 2	1	2
@@ -377,6 +391,7 @@ v3	v1	CNT
 24	NULL	NULL
 
 -- query 16
+-- types	integer	integer	bigint
 v3	v1	CNT
 1	1	3
 2	1	3
@@ -404,6 +419,7 @@ v3	v1	CNT
 24	NULL	NULL
 
 -- query 17
+-- types	integer	bigint
 v3	CNT
 1	NULL
 2	NULL
@@ -431,6 +447,7 @@ v3	CNT
 24	82
 
 -- query 18
+-- types	integer	bigint
 v3	CNT
 1	6
 2	10
@@ -458,6 +475,7 @@ v3	CNT
 24	69
 
 -- query 19
+-- types	integer	bigint
 v3	CNT
 1	18
 2	22
@@ -485,6 +503,7 @@ v3	CNT
 24	NULL
 
 -- query 20
+-- types	integer	bigint
 v3	CNT
 1	1
 2	3
@@ -512,6 +531,7 @@ v3	CNT
 24	69
 
 -- query 21
+-- types	integer	bigint
 v3	CNT
 1	6
 2	9
@@ -539,52 +559,54 @@ v3	CNT
 24	24
 
 -- query 22
+-- types	integer	integer	double
 v3	v1	CNT
 1	1	NULL
 2	1	NULL
-3	1	1
-4	1	1
-5	1	1
-6	1	1
-7	1	1
-8	1	1
-9	2	1
-10	2	1
+3	1	1.0
+4	1	1.0
+5	1	1.0
+6	1	1.0
+7	1	1.0
+8	1	1.0
+9	2	1.0
+10	2	1.0
 11	2	1.25
 12	2	1.5
 13	2	1.75
-14	2	2
-15	2	2
-16	2	2
-17	NULL	2
-18	NULL	2
-19	NULL	2
-20	NULL	2
-21	NULL	2
+14	2	2.0
+15	2	2.0
+16	2	2.0
+17	NULL	2.0
+18	NULL	2.0
+19	NULL	2.0
+20	NULL	2.0
+21	NULL	2.0
 22	NULL	NULL
 23	NULL	NULL
 24	NULL	NULL
 
 -- query 23
+-- types	integer	integer	double
 v3	v1	CNT
-1	1	1
-2	1	1
-3	1	1
-4	1	1
-5	1	1
-6	1	1
+1	1	1.0
+2	1	1.0
+3	1	1.0
+4	1	1.0
+5	1	1.0
+6	1	1.0
 7	1	1.2
 8	1	1.4
 9	2	1.6
 10	2	1.8
-11	2	2
-12	2	2
-13	2	2
-14	2	2
-15	2	2
-16	2	2
-17	NULL	2
-18	NULL	2
+11	2	2.0
+12	2	2.0
+13	2	2.0
+14	2	2.0
+15	2	2.0
+16	2	2.0
+17	NULL	2.0
+18	NULL	2.0
 19	NULL	NULL
 20	NULL	NULL
 21	NULL	NULL
@@ -593,21 +615,22 @@ v3	v1	CNT
 24	NULL	NULL
 
 -- query 24
+-- types	integer	integer	double
 v3	v1	CNT
-1	1	1
-2	1	1
-3	1	1
+1	1	1.0
+2	1	1.0
+3	1	1.0
 4	1	1.25
 5	1	1.5
 6	1	1.75
-7	1	2
-8	1	2
-9	2	2
-10	2	2
-11	2	2
-12	2	2
-13	2	2
-14	2	2
+7	1	2.0
+8	1	2.0
+9	2	2.0
+10	2	2.0
+11	2	2.0
+12	2	2.0
+13	2	2.0
+14	2	2.0
 15	2	NULL
 16	2	NULL
 17	NULL	NULL
@@ -620,25 +643,26 @@ v3	v1	CNT
 24	NULL	NULL
 
 -- query 25
+-- types	integer	integer	double
 v3	v1	CNT
-1	1	1
-2	1	1
-3	1	1
-4	1	1
-5	1	1
-6	1	1
-7	1	1
-8	1	1
+1	1	1.0
+2	1	1.0
+3	1	1.0
+4	1	1.0
+5	1	1.0
+6	1	1.0
+7	1	1.0
+8	1	1.0
 9	2	1.3333333333333333
 10	2	1.6666666666666667
-11	2	2
-12	2	2
-13	2	2
-14	2	2
-15	2	2
-16	2	2
-17	NULL	2
-18	NULL	2
+11	2	2.0
+12	2	2.0
+13	2	2.0
+14	2	2.0
+15	2	2.0
+16	2	2.0
+17	NULL	2.0
+18	NULL	2.0
 19	NULL	NULL
 20	NULL	NULL
 21	NULL	NULL
@@ -647,23 +671,24 @@ v3	v1	CNT
 24	NULL	NULL
 
 -- query 26
+-- types	integer	integer	double
 v3	v1	CNT
-1	1	1
-2	1	1
-3	1	1
-4	1	1
-5	1	1
-6	1	1
+1	1	1.0
+2	1	1.0
+3	1	1.0
+4	1	1.0
+5	1	1.0
+6	1	1.0
 7	1	1.3333333333333333
 8	1	1.6666666666666667
-9	2	2
-10	2	2
-11	2	2
-12	2	2
-13	2	2
-14	2	2
-15	2	2
-16	2	2
+9	2	2.0
+10	2	2.0
+11	2	2.0
+12	2	2.0
+13	2	2.0
+14	2	2.0
+15	2	2.0
+16	2	2.0
 17	NULL	NULL
 18	NULL	NULL
 19	NULL	NULL
@@ -674,12 +699,13 @@ v3	v1	CNT
 24	NULL	NULL
 
 -- query 27
+-- types	integer	double
 v3	CNT
 1	NULL
 2	NULL
-3	1
+3	1.0
 4	1.5
-5	2
+5	2.0
 6	2.5
 7	3.5
 8	4.5
@@ -701,33 +727,35 @@ v3	CNT
 24	20.5
 
 -- query 28
+-- types	integer	double
 v3	CNT
-1	2
+1	2.0
 2	2.5
-3	3
-4	4
-5	5
-6	6
-7	7
-8	8
-9	9
-10	10
-11	11
-12	12
-13	13
-14	14
-15	15
-16	16
-17	17
-18	18
-19	19
-20	20
-21	21
-22	22
+3	3.0
+4	4.0
+5	5.0
+6	6.0
+7	7.0
+8	8.0
+9	9.0
+10	10.0
+11	11.0
+12	12.0
+13	13.0
+14	14.0
+15	15.0
+16	16.0
+17	17.0
+18	18.0
+19	19.0
+20	20.0
+21	21.0
+22	22.0
 23	22.5
-24	23
+24	23.0
 
 -- query 29
+-- types	integer	double
 v3	CNT
 1	4.5
 2	5.5
@@ -748,67 +776,70 @@ v3	CNT
 17	20.5
 18	21.5
 19	22.5
-20	23
+20	23.0
 21	23.5
-22	24
+22	24.0
 23	NULL
 24	NULL
 
 -- query 30
+-- types	integer	double
 v3	CNT
-1	1
+1	1.0
 2	1.5
-3	2
-4	3
-5	4
-6	5
-7	6
-8	7
-9	8
-10	9
-11	10
-12	11
-13	12
-14	13
-15	14
-16	15
-17	16
-18	17
-19	18
-20	19
-21	20
-22	21
-23	22
-24	23
+3	2.0
+4	3.0
+5	4.0
+6	5.0
+7	6.0
+8	7.0
+9	8.0
+10	9.0
+11	10.0
+12	11.0
+13	12.0
+14	13.0
+15	14.0
+16	15.0
+17	16.0
+18	17.0
+19	18.0
+20	19.0
+21	20.0
+22	21.0
+23	22.0
+24	23.0
 
 -- query 31
+-- types	integer	double
 v3	CNT
-1	2
-2	3
-3	4
-4	5
-5	6
-6	7
-7	8
-8	9
-9	10
-10	11
-11	12
-12	13
-13	14
-14	15
-15	16
-16	17
-17	18
-18	19
-19	20
-20	21
-21	22
-22	23
+1	2.0
+2	3.0
+3	4.0
+4	5.0
+5	6.0
+6	7.0
+7	8.0
+8	9.0
+9	10.0
+10	11.0
+11	12.0
+12	13.0
+13	14.0
+14	15.0
+15	16.0
+16	17.0
+17	18.0
+18	19.0
+19	20.0
+20	21.0
+21	22.0
+22	23.0
 23	23.5
-24	24
+24	24.0
 
 -- query 33
+-- legacy
 v1	v2	_min
 13	20	20
 12	10	10

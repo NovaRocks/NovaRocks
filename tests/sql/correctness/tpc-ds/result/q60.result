@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	decimal(38, 2)
 i_item_id	total_sales
 AAAAAAAAAABBAAAA	6287.84
 AAAAAAAAAABEAAAA	1297.26

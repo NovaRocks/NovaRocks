@@ -380,10 +380,12 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::Duration;
 
+    type RecordedMetadataRequest = (String, String, Option<String>);
+
     #[derive(Clone, Debug)]
     struct MetadataSequence {
         responses: Arc<Mutex<VecDeque<(u16, String)>>>,
-        requests: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
+        requests: Arc<Mutex<Vec<RecordedMetadataRequest>>>,
         failure: Arc<Mutex<Option<MetadataFailure>>>,
     }
     impl HttpSend for MetadataSequence {

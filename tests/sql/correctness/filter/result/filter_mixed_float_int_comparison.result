@@ -1,2 +1,4 @@
+-- query 1
+-- types	boolean	boolean
 eq_zero	eq_one
-0	1
+false	true

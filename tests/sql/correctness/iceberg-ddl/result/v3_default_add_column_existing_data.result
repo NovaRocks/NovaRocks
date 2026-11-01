@@ -1,9 +1,11 @@
 -- query 2
+-- types	integer	integer
 a	b
 1	9
 2	9
 
 -- query 3
+-- types	integer	integer
 a	b
 1	9
 2	9
