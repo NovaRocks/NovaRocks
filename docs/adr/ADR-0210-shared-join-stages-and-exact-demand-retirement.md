@@ -1,5 +1,5 @@
 ---
-id: ADR-0209
+id: ADR-0210
 title: "Shared join stages separate key work, exact demand and data-only publication"
 domain: [join-execution, pipeline-execution]
 status: active

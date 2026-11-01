@@ -26,7 +26,7 @@
 //! Membership RF producers observe each actual E contribution. K chooses its
 //! own partitions. Only T>0 installs the original Q+T producer Handoff; T=0
 //! keeps probe and downstream fused.
-// Design: ADR-0209 (docs/adr/ADR-0209-shared-join-stages-and-exact-demand-retirement.md)
+// Design: ADR-0210 (docs/adr/ADR-0210-shared-join-stages-and-exact-demand-retirement.md)
 
 use super::super::program_failure;
 use super::*;

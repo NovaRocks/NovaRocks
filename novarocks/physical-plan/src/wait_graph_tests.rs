@@ -23,12 +23,13 @@ use super::*;
 use crate::{
     AggregateGrouping, DeliveryRequirement, Distribution, EdgeDestination, EdgeKind,
     EdgePartitioning, EdgeSource, ExprKind, FragmentBuilder, FragmentOutputPort, FragmentSink,
-    JoinDistribution, JoinKey, JoinKind, JoinSide, LiteralValue, NestLoopJoinDistribution,
-    OutputRole, PhysicalProperties, PipelineDopDomain, RequiredInputs, RowMultiplicity,
-    RuntimeFilterArtifactCapability, RuntimeFilterCompletion, RuntimeFilterConsumer,
-    RuntimeFilterContributionKind, RuntimeFilterCoverage, RuntimeFilterCoverageNode,
-    RuntimeFilterDomain, RuntimeFilterEndpoint, RuntimeFilterEqualityWitnessId, RuntimeFilterKind,
-    RuntimeFilterLifecycle, RuntimeFilterNullSemantics, RuntimeFilterPolicy, RuntimeFilterProducer,
+    HashJoinCondition, JoinDistribution, JoinKey, JoinKind, JoinSide, LiteralValue,
+    NestLoopJoinDistribution, OutputRole, PhysicalProperties, PipelineDopDomain, RequiredInputs,
+    RowMultiplicity, RuntimeFilterArtifactCapability, RuntimeFilterCompletion,
+    RuntimeFilterConsumer, RuntimeFilterContributionKind, RuntimeFilterCoverage,
+    RuntimeFilterCoverageNode, RuntimeFilterDomain, RuntimeFilterEndpoint,
+    RuntimeFilterEqualityWitnessId, RuntimeFilterKind, RuntimeFilterLifecycle,
+    RuntimeFilterNullSemantics, RuntimeFilterPolicy, RuntimeFilterProducer,
     RuntimeFilterProducerProgress, RuntimeFilterReduction, RuntimeFilterWitnessId,
     StagePlacementPolicy, ValueType,
 };
@@ -125,14 +126,16 @@ impl Fixture {
                 Distribution::Singleton,
                 NodeKind::HashJoin {
                     kind: JoinKind::Inner,
-                    keys: Box::from([JoinKey {
-                        left: key,
-                        right: key,
-                        null_safe: false,
-                    }]),
+                    condition: HashJoinCondition::Ordinary {
+                        keys: Box::from([JoinKey {
+                            left: key,
+                            right: key,
+                            null_safe: false,
+                        }]),
+                        residual: None,
+                    },
                     build_side,
                     distribution: JoinDistribution::Singleton,
-                    residual: None,
                     null_extended: Box::default(),
                 },
             )

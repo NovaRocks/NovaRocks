@@ -117,7 +117,7 @@ code-anchors:
 
 领域哲学：join 的行拓扑（key → 枚举该 key 全部 build 行 + gather 物化）与聚合状态不同，分别归原消费者；实例内键相等类、typed 读取与 bulk 构建共享唯一索引。速度来自算法与数据布局（直接寻址、合并列存、选择向量、membership 零枚举、整列直发），不来自手写 SIMD。受支持 join 类型、null-safe 等值与残差谓词的独立结果必须保留；尚未支持的准确拒绝及既有隔离分别记录，不能冒充成功或正式准入。
 
-- [ADR-0209](ADR-0209-shared-join-stages-and-exact-demand-retirement.md) — SharedBuild 为何分开 E/F/Q/T、原 K 工作、准确需求与 data-only 发布，并以增量候选和独立 tail 维持正常退休（active；部分替代 ADR-0004 的单 Chunk/整批选择向量/拒绝增量 cursor，补充 ADR-0205 的推进与 assignment 交接）
+- [ADR-0210](ADR-0210-shared-join-stages-and-exact-demand-retirement.md) — SharedBuild 为何分开 E/F/Q/T、原 K 工作、准确需求与 data-only 发布，并以增量候选和独立 tail 维持正常退休（active；部分替代 ADR-0004 的单 Chunk/整批选择向量/拒绝增量 cursor，补充 ADR-0205 的推进与 assignment 交接）
 - [ADR-0205](ADR-0205-shared-local-key-index-and-consumer-row-topology.md) — 实例内键相等类为何共用唯一索引、bulk 工作与完成协议为何分开，而 join 行关系与聚合状态仍归原消费者（active；部分替代 ADR-0004 的索引分家裁决；推进结果、调用方唤醒和范围 assignment 由 ADR-0209 补充）
 - ADR-0004 — hash join 执行核心为何保留专有行拓扑与 selection/gather，且不写显式 SIMD（active；索引分家与旧 method 前提由 ADR-0205 部分替代；单 Chunk、整批选择向量和拒绝增量 cursor 由 ADR-0209 部分替代，行拓扑与正确性要求保留）
 
@@ -126,7 +126,7 @@ code-anchors:
 领域哲学：查询 pipeline 的 CPU 推进只有一个执行者——driver 池。任何算子（包括 scan 这类 I/O 源）等待时都以 Pending 与可观察的唤醒交还线程，而不是占着线程阻塞或另建执行器；远端 I/O 由独立 I/O runtime 执行，driver 只 await 受管结果。让出靠共享的轮次预算完成，不承诺抢占 kernel。结束以观察到的真实退出为准：close 只观察，丢弃观察者不转移责任，所有 pending finish 只有一个事件入口。并行度声明必须是事实——声明的 DOP 与实际不符时在声明处兑现，而不是让下游逐处补边界。
 
 - [ADR-0211](ADR-0211-deterministic-control-runtime-and-task-ownership.md) — 控制面为何共用确定性运行时、同步资源准入与真实工作保管，Context为何热执行退出后仍由原核心保留（active；部分替代 ADR-0193 的同步实现与无角色结算登记、ADR-0161 的注册表与保留容量承载，既有身份、裁决与真实退出语义保留）
-- [ADR-0209](ADR-0209-shared-join-stages-and-exact-demand-retirement.md) — 本地 join 为何以实际 E/F/Q/T 与原 K 分区分别推进、仅 T>0 安装 Handoff，并分开正常退休与 Task 原因（active）
+- [ADR-0210](ADR-0210-shared-join-stages-and-exact-demand-retirement.md) — 本地 join 为何以实际 E/F/Q/T 与原 K 分区分别推进、仅 T>0 安装 Handoff，并分开正常退休与 Task 原因（active）
 - [ADR-0206](ADR-0206-frozen-write-placement-and-task-completion-assembly.md) — change-stream 写入为何从同一冻结图独立绑定放置、实际 driver、准确 summary 来源和 strict 成功尾部，再交原 FE publication（active；补充 ADR-0208 与 ADR-0198，不替代 Provider 或发布 owner）
 - [ADR-0209](ADR-0209-receiver-authorized-exchange-units-and-shared-wait-graph.md) — push exchange 为何先授予再接管、有序重放，消费与实际退出为何分开，等待图为何只有一个算法（active；部分替代 ADR-0027/0208，保留耦合 multicast 与原治理）
 - [ADR-0208](ADR-0208-logical-write-counts-and-strict-stream-delivery.md) — 逻辑写计数、物理分布与严格消费为何各守独立契约，summary与writer结果为何公平推进（active；当前装配由 ADR-0206 补充，不重放传输的阶段规则由 ADR-0209 部分替代，其余写入规则保留）
