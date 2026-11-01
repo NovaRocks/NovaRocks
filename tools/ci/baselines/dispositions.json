@@ -1502,26 +1502,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:join/join_direct_mapping",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_fixed_size",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:join/join_fixed_size_string",
       "failure": {
         "class": "error_code",
@@ -1529,36 +1509,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/uuid/()->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
       "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_full_outer_null_fill",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_full_outer_with_using",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_interleaving",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
       "expires": "2026-12-15"
     },
     {
@@ -1602,16 +1552,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:join/join_one_key",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:join/join_partition_hash",
       "failure": {
         "class": "error_code",
@@ -1642,36 +1582,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:join/join_self_join_hash",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_using_comprehensive",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:join/join_with_using",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3, I5; remove after capability repair and native verification",
-      "owner": "B3, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:limit/limit_offset_basic",
       "failure": {
         "class": "error_code",
@@ -1679,16 +1589,6 @@
       },
       "reason": "Compiled carrier does not express CTE multicast sinks; owner B4, I5; remove after capability repair and native verification",
       "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:optimizer/column_id_binding_repeat_using",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3; remove after capability repair and native verification",
-      "owner": "B3",
       "expires": "2026-12-15"
     },
     {
@@ -1807,7 +1707,7 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3; remove after capability repair and native verification",
+      "reason": "After B3 restores checked join instance placement, the unchanged complete native case passes its original join checks through step 31, then fails at step 32 before BE execution with the SQL-authored Unsupported StructuralWaitCycle fact (domain 11, code 14). The original full-case diagnostic confirms this exact typed source; it is not the CTE carrier refusal. Contract lowering requires decoupled retained output (B4) for the cyclic shared-CTE plan. Keep the original FAIL, 80 required / 30 executed passing oracles and 50 unexecuted suffix oracles. This historical B3 row stays until the same entire case passes all original oracles with closed cleanup; component or diagnostic progress does not close it. Evidence: B3 plan v5 P08/P10 execution record and p13-rf-multicolumns-original-source-diagnostic-evidence-01/sql.results.jsonl.",
       "owner": "B3",
       "expires": "2026-12-15"
     },
@@ -1829,16 +1729,6 @@
       },
       "reason": "Compiled carrier does not express CTE multicast sinks; owner B4; remove after capability repair and native verification",
       "owner": "B4",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:runtime-filter/runtime_filter_push_down_grf_broadcast",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: build-preserving hash join kind (merged build match flags); owner B3; remove after capability repair and native verification",
-      "owner": "B3",
       "expires": "2026-12-15"
     },
     {

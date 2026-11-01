@@ -906,27 +906,38 @@ fn lower_with_creation<
                             | Distribution::BucketShuffle { .. }
                     )
             });
-        // Repeat emits its frozen grouping sets on the exact input instances.
-        // Its property author may drop partition keys after nullifying them,
-        // but that does not create a new placement or ordering source.
-        let repeat_placed = matches!(node.kind, NodeKind::Repeat { .. })
-            && node.inputs.len() == 1
-            && physical.nodes().get(&node.inputs[0]).is_some_and(|input| {
-                input.output_properties.row_multiplicity
+        // Checked single-copy inputs already name where their rows run, even
+        // when a later operator cannot retain any partition key in its output.
+        let checked_input_placement = |input: &NodeId| {
+            physical.nodes().get(input).is_some_and(|node| {
+                node.output_properties.row_multiplicity
                     == novarocks_physical_plan::RowMultiplicity::SingleCopy
-                    && (properties.get(&input.id).is_some_and(|p| p.2)
+                    && (properties.get(input).is_some_and(|p| p.2)
                         || matches!(
-                            input.output_properties.distribution,
+                            node.output_properties.distribution,
                             Distribution::Singleton
                                 | Distribution::RoundRobin
                                 | Distribution::Hash { .. }
                                 | Distribution::ConditionalKey { .. }
                                 | Distribution::BucketShuffle { .. }
                         ))
-            });
+            })
+        };
+        // Repeat emits its frozen grouping sets on the exact input instances.
+        // Its property author may drop partition keys after nullifying them,
+        // but that does not create a new placement or ordering source.
+        let repeat_placed = matches!(node.kind, NodeKind::Repeat { .. })
+            && node.inputs.len() == 1
+            && checked_input_placement(&node.inputs[0]);
+        // A legal build-preserving join may lose both inputs' partition keys
+        // (FULL OUTER), while both inputs retain their checked instance
+        // placement. Keep that placement fact, not a guessed distribution.
+        // Network join admissibility was checked by orient_join above.
+        let join_placed = probe_input.is_some() && node.inputs.iter().all(checked_input_placement);
         let scan_rooted = matches!(node.kind, NodeKind::Scan { .. })
             || projected_placement
             || repeat_placed
+            || join_placed
             || partial_groups
             || union_placed
             || ((transparent || partial_rows)

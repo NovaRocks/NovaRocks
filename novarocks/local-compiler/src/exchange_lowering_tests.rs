@@ -78,6 +78,8 @@ enum Shape {
     RepeatedHash,
     /// Stream edge without a partitioning contract; consumer is a Noop sink.
     Unconstrained,
+    /// Unknown input placement reaches a Result sink; no Noop refusal masks it.
+    UnconstrainedResult,
     /// CTE multicast producer; consumer is a Noop sink.
     Multicast,
 }
@@ -256,7 +258,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
             (conditional([b, a], b), conditional([ib, ia], ib))
         }
         Shape::RoundRobin => (Distribution::RoundRobin, Distribution::RoundRobin),
-        Shape::Unconstrained | Shape::Multicast => {
+        Shape::Unconstrained | Shape::UnconstrainedResult | Shape::Multicast => {
             (Distribution::Unconstrained, Distribution::Unconstrained)
         }
     };
@@ -278,6 +280,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
             | Shape::Conditional
             | Shape::RepeatedConditional
             | Shape::RoundRobin
+            | Shape::UnconstrainedResult
     );
     let consumer_sink = if gather {
         FragmentSink::Result
@@ -852,4 +855,301 @@ fn repeated_conditional_imports_use_the_same_first_mask_and_hash_key_occurrence(
         }
     );
     assert_eq!(input.hash_partition_slots.as_ref(), &[slots[0], slots[1]]);
+}
+
+#[test]
+fn unconstrained_exchange_input_remains_unsupported_without_instance_placement() {
+    let mut packages = packages(Shape::UnconstrainedResult);
+    refused(
+        compile(packages.remove(&CONSUMER).unwrap(), Some(1)),
+        "unconstrained distribution without a runtime-split scan placement",
+    );
+}
+
+fn full_outer_exchange_input_packages(
+    build_side: novarocks_physical_plan::JoinSide,
+) -> BTreeMap<FragmentId, FragmentPackage> {
+    use novarocks_physical_plan::{
+        HashJoinCondition, JoinDistribution, JoinKey, JoinKind, NodeKind, PhysicalProperties,
+        StagePlacementPolicy,
+    };
+    let ty = ValueType::new(DataType::Int64, false);
+    let nullable = ValueType::new(DataType::Int64, true);
+    let join = NodeId::new(30);
+    let mut consumer = FragmentBuilder::new(CONSUMER);
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap());
+    let mut edges = Vec::new();
+    let mut inputs = Vec::new();
+    let mut imported = Vec::new();
+    let mut input_properties = Vec::new();
+    for (producer_id, edge, receiver) in [
+        (PRODUCER, EDGE, RECEIVER),
+        (FragmentId::new(3), EdgeId::new(6), NodeId::new(21)),
+    ] {
+        let mut producer = FragmentBuilder::new(producer_id);
+        let mut outputs = Vec::new();
+        let mut cells = Vec::new();
+        for (ordinal, literal) in [11, 22].into_iter().enumerate() {
+            outputs.push(
+                producer
+                    .add_value(
+                        ty.clone(),
+                        ValueOrigin::NodeOutput {
+                            node: VALUES,
+                            output_ordinal: ordinal as u32,
+                        },
+                    )
+                    .unwrap(),
+            );
+            cells.push(
+                producer
+                    .add_expression(
+                        VALUES,
+                        ty.clone(),
+                        ExprKind::Literal(LiteralValue::Int64(literal)),
+                    )
+                    .unwrap(),
+            );
+        }
+        producer
+            .add_values(
+                VALUES,
+                Box::from([cells.into_boxed_slice()]),
+                outputs.clone().into_boxed_slice(),
+            )
+            .unwrap();
+        plan.add_fragment(
+            producer
+                .finish_definition(
+                    VALUES,
+                    FragmentSink::Stream { edge },
+                    dop(),
+                    StagePlacementPolicy::Singleton,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let receive = outputs
+            .iter()
+            .map(|source_value| {
+                consumer
+                    .add_value(
+                        ty.clone(),
+                        ValueOrigin::ExchangeImport {
+                            edge,
+                            source_value: *source_value,
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let destination = hash([receive[0], receive[1]]);
+        let mapping = outputs
+            .iter()
+            .copied()
+            .zip(receive.iter().copied())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        consumer
+            .add_exchange_source(
+                receiver,
+                edge,
+                mapping.clone(),
+                receive.clone().into_boxed_slice(),
+                destination.clone(),
+                RowMultiplicity::SingleCopy,
+            )
+            .unwrap();
+        input_properties.push(PhysicalProperties {
+            distribution: destination.clone(),
+            row_multiplicity: RowMultiplicity::SingleCopy,
+            ordering: Box::default(),
+        });
+        inputs.push(receiver);
+        imported.push(receive);
+        edges.push(Edge {
+            role: novarocks_physical_plan::OutputRole::Relational,
+            delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+            id: edge,
+            kind: EdgeKind::Stream,
+            source: EdgeSource {
+                port: novarocks_physical_plan::FragmentOutputPort::Root,
+                fragment: producer_id,
+                projection: outputs.clone().into_boxed_slice(),
+            },
+            destination: EdgeDestination {
+                fragment: CONSUMER,
+                node: receiver,
+                receive_mapping: mapping,
+            },
+            partitioning: EdgePartitioning {
+                source: hash([outputs[0], outputs[1]]),
+                source_multiplicity: RowMultiplicity::SingleCopy,
+                destination,
+                destination_multiplicity: RowMultiplicity::SingleCopy,
+            },
+        });
+    }
+    let keys = (0..2)
+        .map(|ordinal| JoinKey {
+            left: consumer
+                .add_expression(join, ty.clone(), ExprKind::Value(imported[0][ordinal]))
+                .unwrap(),
+            right: consumer
+                .add_expression(join, ty.clone(), ExprKind::Value(imported[1][ordinal]))
+                .unwrap(),
+            null_safe: false,
+        })
+        .collect::<Vec<_>>();
+    let output = imported
+        .iter()
+        .flatten()
+        .map(|of| {
+            consumer
+                .add_value(
+                    nullable.clone(),
+                    ValueOrigin::NullExtended {
+                        node: join,
+                        of: *of,
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    consumer
+        .add_join(
+            join,
+            [inputs[0], inputs[1]],
+            input_properties.into_boxed_slice(),
+            output.clone().into_boxed_slice(),
+            Distribution::Unconstrained,
+            NodeKind::HashJoin {
+                kind: JoinKind::FullOuter,
+                build_side,
+                distribution: JoinDistribution::Partitioned,
+                null_extended: output.clone().into_boxed_slice(),
+                condition: HashJoinCondition::Ordinary {
+                    keys: keys.into_boxed_slice(),
+                    residual: None,
+                },
+            },
+        )
+        .unwrap();
+    plan.add_fragment(
+        consumer
+            .finish_definition(
+                join,
+                FragmentSink::Result,
+                dop(),
+                StagePlacementPolicy::Singleton,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    for edge in edges {
+        plan.add_edge(edge).unwrap();
+    }
+    plan.set_result_port(ResultPort {
+        scalar_schema: None,
+        fragment: CONSUMER,
+        output: OutputPort {
+            node: join,
+            columns: output.clone().into_boxed_slice(),
+        },
+        fields: output
+            .iter()
+            .enumerate()
+            .map(|(ordinal, value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
+                name: format!("join_{ordinal}").into_boxed_str(),
+                alias: None,
+                value: *value,
+                ty: nullable.clone(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    })
+    .unwrap();
+    let plan = plan.finish().unwrap();
+    let mut uses = BTreeMap::new();
+    let mut calls = BTreeMap::new();
+    let mut pruning = BTreeMap::new();
+    let mut admissions = BTreeMap::new();
+    for (&id, fragment) in plan.fragments() {
+        let roots = root_uses(fragment);
+        calls.insert(
+            id,
+            FrozenFragmentCalls::try_new(fragment, &roots, vec![], &FixtureControl).unwrap(),
+        );
+        uses.insert(id, roots);
+        pruning.insert(
+            id,
+            FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
+        );
+        admissions.insert(id, package_admission());
+    }
+    extract_fragment_packages(
+        &plan,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &uses,
+        &calls,
+        &pruning,
+        &admissions,
+        &FixtureControl,
+    )
+    .unwrap()
+}
+
+fn assert_full_outer_checked_exchange_placement(build_side: novarocks_physical_plan::JoinSide) {
+    let mut packages = full_outer_exchange_input_packages(build_side);
+    let package = packages.remove(&CONSUMER).unwrap();
+    let root = &package.fragment().nodes()[&package.fragment().root()];
+    assert_eq!(
+        root.output_properties.distribution,
+        Distribution::Unconstrained
+    );
+    assert_eq!(
+        root.output_properties.row_multiplicity,
+        RowMultiplicity::SingleCopy
+    );
+    for input in root.inputs.iter() {
+        let source = &package.fragment().nodes()[input];
+        assert!(matches!(
+            source.kind,
+            novarocks_physical_plan::NodeKind::ExchangeSource { .. }
+        ));
+        assert!(matches!(
+            source.output_properties.distribution,
+            Distribution::Hash { .. }
+        ));
+    }
+    let program = compile(package, Some(1)).unwrap();
+    assert_eq!(program.exchange_inputs().len(), 2);
+    assert!(program.graph().nodes().iter().any(|node| matches!(
+        node.kind(),
+        ProgramNodeKind::Join {
+            join_type: novarocks_local_program::JoinType::FullOuter,
+            ..
+        },
+    )));
+    let root = &program.graph().nodes()[program.graph().root().index()];
+    assert_eq!(root.output_layout().schema().fields().len(), 4);
+    assert!(
+        root.output_layout()
+            .schema()
+            .fields()
+            .iter()
+            .all(|field| field.data_type() == &DataType::Int64 && field.is_nullable())
+    );
+}
+
+#[test]
+fn full_outer_hash_exchange_inputs_keep_instance_placement_with_right_build() {
+    assert_full_outer_checked_exchange_placement(novarocks_physical_plan::JoinSide::Right);
+}
+
+#[test]
+fn full_outer_hash_exchange_inputs_keep_instance_placement_with_left_build() {
+    assert_full_outer_checked_exchange_placement(novarocks_physical_plan::JoinSide::Left);
 }
