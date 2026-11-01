@@ -1579,16 +1579,20 @@ pub fn validate_plan_observed(
             .map_err(PlanConstructionError::from)?;
     }
     crate::constants::validate_plan_constants_observed(plan, control)?;
-    // Structural validation is still an opaque legacy traversal. Observe its
-    // entry and ordinary/success completion with the original control without
-    // claiming internal cooperative work or an allocation grant.
+    // The shared wait graph observes bounded work using this original scope.
+    // Other structural passes retain their opaque legacy boundary; neither
+    // observation nor the plan's shape grants scratch allocation capacity.
     let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
         control,
         novarocks_type_contract::CompilePhase::Validate,
     )
     .map_err(crate::ConstantReferenceError::from)?;
-    let result = validate_plan(plan).map_err(PlanConstructionError::from);
-    work.step().map_err(crate::ConstantReferenceError::from)?;
-    work.finish().map_err(crate::ConstantReferenceError::from)?;
-    result
+    let result =
+        crate::validation::validate_plan_with_limits_in(plan, crate::PlanLimits::FROZEN, &mut work);
+    if result.is_ok() {
+        work.step().map_err(crate::ConstantReferenceError::from)?;
+    }
+    work.finish_result(result, |cause| {
+        crate::ConstantReferenceError::from(cause).into()
+    })
 }

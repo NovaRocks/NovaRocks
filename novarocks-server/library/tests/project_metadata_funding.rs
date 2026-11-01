@@ -294,7 +294,6 @@ fn compile(
         bytes,
         CompiledTaskOptions {
             pipeline_dop: NonZeroUsize::MIN,
-            exchange_wait: Duration::from_millis(50),
         },
         Arc::clone(tracker),
         &Control,

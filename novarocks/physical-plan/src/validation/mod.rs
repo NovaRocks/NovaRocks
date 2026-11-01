@@ -161,10 +161,86 @@ pub fn validate_plan_with_limits(
     plan: &PhysicalPlan,
     limits: PlanLimits,
 ) -> Result<(), ValidationErrors> {
+    validate_plan_with_limits_core(plan, limits, &mut PlainPlanWaitValidation)
+}
+
+/// Only the shared wait stage is cooperative inside the legacy structural
+/// traversal. The original caller retains its control and work scope.
+pub(crate) fn validate_plan_with_limits_in(
+    plan: &PhysicalPlan,
+    limits: PlanLimits,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), crate::PlanConstructionError> {
+    validate_plan_with_limits_core(plan, limits, &mut CallerPlanWaitValidation { work })
+}
+
+trait PlanWaitValidation {
+    type Error: From<ValidationErrors>;
+    fn validate(
+        &mut self,
+        plan: &PhysicalPlan,
+        errors: &mut ValidationContext,
+    ) -> Result<(), Self::Error>;
+}
+
+// The public plain validator has no caller control. This closed adapter is
+// never selected by caller-observed publication and grants no resources.
+struct PlainValidationControl;
+impl novarocks_type_contract::PureCompileControl for PlainValidationControl {
+    fn checkpoint(
+        &self,
+        _phase: novarocks_type_contract::CompilePhase,
+        _work: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
+    }
+}
+struct PlainPlanWaitValidation;
+impl PlanWaitValidation for PlainPlanWaitValidation {
+    type Error = ValidationErrors;
+    fn validate(
+        &mut self,
+        plan: &PhysicalPlan,
+        errors: &mut ValidationContext,
+    ) -> Result<(), Self::Error> {
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            &PlainValidationControl,
+            novarocks_type_contract::CompilePhase::Validate,
+        )
+        .expect("plain validation control cannot refuse");
+        validate_runtime_filter_wait_graph_in(plan, errors, &mut work)
+            .expect("plain validation control cannot refuse");
+        work.finish()
+            .expect("plain validation control cannot refuse");
+        Ok(())
+    }
+}
+
+struct CallerPlanWaitValidation<'work, 'control> {
+    work: &'work mut novarocks_type_contract::CompileCheckpoints<'control>,
+}
+impl PlanWaitValidation for CallerPlanWaitValidation<'_, '_> {
+    type Error = crate::PlanConstructionError;
+    fn validate(
+        &mut self,
+        plan: &PhysicalPlan,
+        errors: &mut ValidationContext,
+    ) -> Result<(), Self::Error> {
+        validate_runtime_filter_wait_graph_in(plan, errors, self.work)
+            .map_err(crate::ConstantReferenceError::from)?;
+        Ok(())
+    }
+}
+
+fn validate_plan_with_limits_core<V: PlanWaitValidation>(
+    plan: &PhysicalPlan,
+    limits: PlanLimits,
+    waits: &mut V,
+) -> Result<(), V::Error> {
     let mut errors = ValidationContext::with_limits(limits);
     validate_plan_resources(plan, &mut errors);
     if !errors.is_empty() {
-        return Err(ValidationErrors::from_collector(errors));
+        return Err(ValidationErrors::from_collector(errors).into());
     }
     if plan.required().plan_contract_revision != PLAN_CONTRACT_REVISION {
         errors.push(ValidationError::new(
@@ -215,7 +291,7 @@ pub fn validate_plan_with_limits(
         }
         if errors.is_saturated() {
             errors.mark_truncated();
-            return Err(ValidationErrors::from_collector(errors));
+            return Err(ValidationErrors::from_collector(errors).into());
         }
     }
     let mut root_port_indexes = BTreeMap::new();
@@ -223,7 +299,7 @@ pub fn validate_plan_with_limits(
         validate_edge(plan, edge, &mut root_port_indexes, &mut errors);
         if errors.is_saturated() {
             errors.mark_truncated();
-            return Err(ValidationErrors::from_collector(errors));
+            return Err(ValidationErrors::from_collector(errors).into());
         }
     }
     macro_rules! run_validation_stage {
@@ -231,7 +307,7 @@ pub fn validate_plan_with_limits(
             $stage;
             if errors.is_saturated() {
                 errors.mark_truncated();
-                return Err(ValidationErrors::from_collector(errors));
+                return Err(ValidationErrors::from_collector(errors).into());
             }
         }};
     }
@@ -240,6 +316,9 @@ pub fn validate_plan_with_limits(
     run_validation_stage!(validate_writer_flows(plan, &mut errors));
     run_validation_stage!(validate_result(plan, &mut errors));
     run_validation_stage!(validate_runtime_filters(plan, &mut errors));
+    if errors.is_empty() {
+        run_validation_stage!(waits.validate(plan, &mut errors)?);
+    }
     run_validation_stage!(validate_annotations(plan, &mut errors));
     run_validation_stage!(validate_cross_fragment_value_origins(plan, &mut errors));
     run_validation_stage!(validate_provider_read_occurrences(plan, &mut errors));
@@ -253,7 +332,7 @@ pub fn validate_plan_with_limits(
                 "fragments.cuts",
                 "cannot index the complete fragment cut graph",
             ));
-            return Err(ValidationErrors::from_collector(errors));
+            return Err(ValidationErrors::from_collector(errors).into());
         };
         let mut total_cut_items = 0usize;
         let mut total_cut_bytes = 0usize;
@@ -265,7 +344,7 @@ pub fn validate_plan_with_limits(
                     format!("fragments[{}].cuts", fragment.id().get()),
                     "cannot preflight the complete fragment cuts",
                 ));
-                return Err(ValidationErrors::from_collector(errors));
+                return Err(ValidationErrors::from_collector(errors).into());
             };
             total_cut_items = total_cut_items.saturating_add(usage.items);
             total_cut_bytes = total_cut_bytes.saturating_add(usage.bytes);
@@ -278,19 +357,19 @@ pub fn validate_plan_with_limits(
                 ));
             }
             if !errors.is_empty() {
-                return Err(ValidationErrors::from_collector(errors));
+                return Err(ValidationErrors::from_collector(errors).into());
             }
             let Some(cuts) = derivation.derive_preflighted(plan, fragment.id()) else {
                 errors.push(ValidationError::new(
                     format!("fragments[{}].cuts", fragment.id().get()),
                     "cannot derive complete fragment cuts",
                 ));
-                return Err(ValidationErrors::from_collector(errors));
+                return Err(ValidationErrors::from_collector(errors).into());
             };
             validate_fragment_cuts_into(fragment, &cuts, &mut errors);
             validate_fragment_partition_identities(fragment, &cuts, &mut errors);
             if !errors.is_empty() {
-                return Err(ValidationErrors::from_collector(errors));
+                return Err(ValidationErrors::from_collector(errors).into());
             }
         }
     }
@@ -298,7 +377,7 @@ pub fn validate_plan_with_limits(
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(ValidationErrors::from_collector(errors))
+        Err(ValidationErrors::from_collector(errors).into())
     }
 }
 

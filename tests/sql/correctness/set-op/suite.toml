@@ -21,6 +21,8 @@ explicit_only = false
 paths = [
     "novarocks/execution/src/exec/operators/setop/**",
     "novarocks/execution/src/exec/hash_table/**",
+    "novarocks/sql/src/planner/distributed/build/contract_lowering.rs",
+    "novarocks/sql/src/planner/distributed/build/wait_graph.rs",
 ]
 
 [reuse]

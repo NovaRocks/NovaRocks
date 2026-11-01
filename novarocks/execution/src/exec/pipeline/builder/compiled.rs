@@ -861,7 +861,6 @@ fn build_node(
             Ok(build)
         }
         ProgramNodeKind::ExchangeSource {
-            timeout,
             runtime_filters,
             hash_partition_exprs,
         } => {
@@ -890,9 +889,8 @@ fn build_node(
                     format!("missing exchange binding for compiled receiver node {receiver}"),
                 )
             })?;
-            let source: Box<dyn OperatorFactory> = Box::new(ExchangeSourceFactory::new_compiled(
-                node_id, *timeout, binding,
-            ));
+            let source: Box<dyn OperatorFactory> =
+                Box::new(ExchangeSourceFactory::new_compiled(node_id, binding));
             // Every driver pulls from the one instance-wide receiver.
             let pipeline = new_source_pipeline(ctx, source);
             Ok(PipelineBuildResult {

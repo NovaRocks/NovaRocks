@@ -30,7 +30,6 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Duration;
 
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
@@ -64,8 +63,6 @@ use novarocks_type_contract::MetadataRequestError;
 #[derive(Clone, Copy, Debug)]
 pub struct CompiledTaskOptions {
     pub pipeline_dop: NonZeroUsize,
-    /// Host-admitted receive wait for every compiled exchange source.
-    pub exchange_wait: Duration,
 }
 
 /// Why a task's package did not become a LocalProgram.
@@ -457,7 +454,6 @@ impl<E: Error + FailureProjection + Send + Sync + 'static> CompiledPackageInterp
             root_sink_dop,
             kernel_abi: KernelAbiVersion::CURRENT,
             constants: self.constants,
-            exchange_wait: options.exchange_wait,
         };
         let program = match project_host {
             Some(project_host) => compile_fragment_with_creation_and_project_metadata_host(

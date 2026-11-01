@@ -544,7 +544,7 @@ fn compiled_generate_series_compile_three_causes_return_at_original_callback_pre
     };
     use novarocks_local_program::KernelAbiVersion;
     use novarocks_type_contract::{CompileControlError, PureCompileControl};
-    use std::{num::NonZeroUsize, sync::Mutex, time::Duration};
+    use std::{num::NonZeroUsize, sync::Mutex};
     struct Observe {
         trace: Mutex<Vec<(CompilePhase, u32)>>,
         at: Option<usize>,
@@ -572,7 +572,6 @@ fn compiled_generate_series_compile_three_causes_return_at_original_callback_pre
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
         constants: constant_policy(),
-        exchange_wait: Duration::from_secs(120),
     };
     let baseline = Observe {
         trace: Mutex::new(vec![]),

@@ -1497,6 +1497,37 @@ impl SqlCompileOutput {
     }
 }
 
+/// A supported physical shape which requires decoupled retained output before
+/// it can run with bounded receivers. This is a SQL planning capability fact,
+/// not cancellation, malformed input, or an encoder-authored failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructuralWaitCycle {
+    detail: Box<str>,
+}
+
+impl StructuralWaitCycle {
+    pub(crate) fn new(detail: String) -> Self {
+        Self {
+            detail: detail.into_boxed_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for StructuralWaitCycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+impl std::error::Error for StructuralWaitCycle {}
+impl novarocks_failure_contract::FailureProjection for StructuralWaitCycle {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Unsupported,
+            novarocks_failure_contract::sql_reason::STRUCTURAL_WAIT_CYCLE,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlCompileError {
     Cancelled,

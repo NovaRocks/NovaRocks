@@ -65,12 +65,8 @@ use crate::runtime::fragment::exchange::{
 use crate::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentSinkAssignment,
 };
-use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
-use crate::runtime::fragment::io::{
-    ExchangeFrame, ExchangeFrameTransmitter, ExchangeReceiverFrame, ExchangeReceiverKey,
-    ExchangeReceiverPort, ExchangeTransmitRejection, FragmentIoError, FragmentIoErrorKind,
-    FragmentIoOperation, NoopFragmentEventSink,
-};
+use crate::runtime::fragment::io::exchange::test_support::{Fixture, UnitLoopback};
+use crate::runtime::fragment::io::{ExchangeFrameTransmitter, NoopFragmentEventSink};
 use crate::runtime::fragment::sink::materialize_compiled_sink;
 use crate::runtime::runtime_state::RuntimeState;
 
@@ -398,7 +394,6 @@ fn options(root_sink_dop: Option<NonZeroUsize>) -> LocalCompileOptions {
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         },
-        exchange_wait: Duration::from_secs(120),
     }
 }
 
@@ -499,43 +494,46 @@ fn programs_shaped(hashed: bool, values_rows: &[(i64, i64)]) -> Programs {
 /// Delivers every encoded frame to the receiver port, as the native data
 /// plane does after its wire hop.
 struct LoopbackTransmitter {
-    port: Arc<dyn ExchangeReceiverPort>,
+    unit: Arc<UnitLoopback>,
 }
 
 impl ExchangeFrameTransmitter for LoopbackTransmitter {
-    fn transmit(&self, frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
-        self.port
-            .push(
-                ExchangeReceiverKey {
-                    fragment_instance_id: frame.destination_fragment_instance_id,
-                    node_id: frame.destination_node_id,
-                },
-                ExchangeReceiverFrame {
-                    stream: frame.stream.unwrap_or_else(|| {
-                        crate::runtime::fragment::io::exchange::fixture_stream(
-                            frame.sender_fragment_instance_id,
-                            frame.destination_fragment_instance_id,
-                            frame.destination_node_id,
-                            frame.sender_ordinal,
-                        )
-                    }),
-                    source_fragment_instance_id: frame.sender_fragment_instance_id,
-                    sender_ordinal: frame.sender_ordinal,
-                    sender_count: frame.sender_count,
-                    sender_id: frame.sender_id,
-                    backend_number: frame.backend_number,
-                    sequence: frame.sequence,
-                    eos: frame.eos,
-                    payload: frame.payload,
-                },
-            )
-            .map_err(|error| {
-                ExchangeTransmitRejection::Failed(FragmentIoError::new(
-                    FragmentIoOperation::ExchangeTransmit,
-                    FragmentIoErrorKind::RemoteRejected,
-                    error.to_string(),
-                ))
-            })
+    fn deliver_unit(
+        &self,
+        frame: crate::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+        stop: tokio_util::sync::CancellationToken,
+        activity: crate::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
+        done: crate::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+    ) {
+        self.unit.deliver_unit(frame, stop, activity, done);
+    }
+    fn register_unit_demands(
+        &self,
+        destination: RuntimeEndpoint,
+        entries: Vec<crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry>,
+        stop: tokio_util::sync::CancellationToken,
+        done: crate::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+    ) {
+        self.unit
+            .register_unit_demands(destination, entries, stop, done)
+    }
+    fn watch_unit_facts(
+        &self,
+        destination: RuntimeEndpoint,
+        stream: novarocks_execution_contract::ExchangeStreamIdentity,
+        wake: crate::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+    ) -> Result<(), novarocks_failure_contract::FailureFact> {
+        self.unit.watch_unit_facts(destination, stream, wake)
+    }
+    fn forget_unit_facts(&self, stream: novarocks_execution_contract::ExchangeStreamIdentity) {
+        self.unit.forget_unit_facts(stream)
+    }
+    fn schedule_unit_retry(
+        &self,
+        delay: Duration,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), novarocks_failure_contract::FailureFact> {
+        self.unit.schedule_unit_retry(delay, task)
     }
 }
 
@@ -580,29 +578,27 @@ fn stream_assignment() -> FragmentSinkAssignment {
     }
 }
 
-fn receivers(
-    programs: &Programs,
-    port: &Arc<dyn ExchangeReceiverPort>,
-) -> CompiledExchangeReceivers {
-    receivers_at(programs, port, CONSUMER_FINST)
+fn receivers(programs: &Programs, fixture: &Fixture) -> CompiledExchangeReceivers {
+    receivers_at(programs, fixture, CONSUMER_FINST)
 }
 
 fn receivers_at(
     programs: &Programs,
-    port: &Arc<dyn ExchangeReceiverPort>,
+    fixture: &Fixture,
     instance: UniqueId,
 ) -> CompiledExchangeReceivers {
     materialize_compiled_exchange_receivers(
         &programs.consumer,
         instance,
         &assignments(programs.receiver),
-        Arc::clone(port),
-        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
+        fixture.port.clone(),
+        Some(&fixture.creation(instance)),
     )
     .expect("compiled receivers")
 }
 
 fn run(
+    fixture: &Fixture,
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     bindings: ExchangeBindings,
@@ -615,7 +611,7 @@ fn run(
         bindings,
         finst(instance),
         1,
-        runtime_state(),
+        fixture.state(instance),
         Arc::new(NoopFragmentEventSink),
     )
     .expect("compiled program prepares drivers")
@@ -698,27 +694,32 @@ fn compiled_gather_stream_reaches_compiled_exchange_source_positionally() {
         "sender and receiver namespaces disagree on order"
     );
 
-    let port = in_process_test_exchange_receiver_port();
+    let fixture = Fixture::new();
+    let port = fixture.port.clone();
     let CompiledExchangeReceivers {
         registrations,
         bindings,
-    } = receivers(&programs, &port);
+    } = receivers(&programs, &fixture);
     for registration in registrations {
+        let key = registration.key;
         port.register(registration).expect("register receiver");
+        fixture.bind(key, &[PRODUCER_FINST]);
     }
 
-    let producer_sink = materialize_compiled_sink(
-        &programs.producer,
-        &stream_assignment(),
-        PRODUCER_FINST,
-        Arc::new(LoopbackTransmitter {
-            port: Arc::clone(&port),
-        }),
-        None,
-        None,
-    )
-    .expect("compiled stream sink");
+    let producer_sink = fixture
+        .sink(
+            &programs.producer,
+            &stream_assignment(),
+            PRODUCER_FINST,
+            Arc::new(LoopbackTransmitter {
+                unit: fixture.transport.clone(),
+            }),
+            None,
+            None,
+        )
+        .expect("compiled stream sink");
     run(
+        &fixture,
         &programs.producer,
         producer_sink,
         ExchangeBindings::default(),
@@ -735,7 +736,13 @@ fn compiled_gather_stream_reaches_compiled_exchange_source_positionally() {
         None,
     )
     .expect("compiled result sink");
-    run(&programs.consumer, consumer_sink, bindings, CONSUMER_FINST);
+    run(
+        &fixture,
+        &programs.consumer,
+        consumer_sink,
+        bindings,
+        CONSUMER_FINST,
+    );
 
     let chunks = output.take_chunks();
     let mut rows = Vec::new();
@@ -751,7 +758,8 @@ fn compiled_gather_stream_reaches_compiled_exchange_source_positionally() {
 #[test]
 fn compiled_exchange_source_requires_exactly_its_own_receiver_binding() {
     let programs = programs();
-    let port = in_process_test_exchange_receiver_port();
+    let fixture = Fixture::new();
+    let port = fixture.port.clone();
     let result_sink = || -> Box<dyn OperatorFactory> {
         Box::new(ResultSinkFactory::new(ResultSinkHandle::new()))
     };
@@ -961,34 +969,39 @@ fn compiled_hash_stream_places_rows_by_the_exchange_hash_of_its_key_roots() {
         "fixture rows reach both destinations: {expected:?}"
     );
 
-    let port = in_process_test_exchange_receiver_port();
+    let fixture = Fixture::new();
+    let port = fixture.port.clone();
     let mut consumer_bindings = Vec::new();
     for instance in [CONSUMER_FINST, CONSUMER_FINST_2] {
         let CompiledExchangeReceivers {
             registrations,
             bindings,
-        } = receivers_at(&programs, &port, instance);
+        } = receivers_at(&programs, &fixture, instance);
         for registration in registrations {
+            let key = registration.key;
             port.register(registration).expect("register receiver");
+            fixture.bind(key, &[PRODUCER_FINST]);
         }
         consumer_bindings.push((instance, bindings));
     }
 
-    let producer_sink = materialize_compiled_sink(
-        &programs.producer,
-        &FragmentSinkAssignment::StreamDestinations {
-            destinations: vec![destination(CONSUMER_FINST), destination(CONSUMER_FINST_2)],
-            sender_id: None,
-        },
-        PRODUCER_FINST,
-        Arc::new(LoopbackTransmitter {
-            port: Arc::clone(&port),
-        }),
-        None,
-        None,
-    )
-    .expect("compiled hash stream sink");
+    let producer_sink = fixture
+        .sink(
+            &programs.producer,
+            &FragmentSinkAssignment::StreamDestinations {
+                destinations: vec![destination(CONSUMER_FINST), destination(CONSUMER_FINST_2)],
+                sender_id: None,
+            },
+            PRODUCER_FINST,
+            Arc::new(LoopbackTransmitter {
+                unit: fixture.transport.clone(),
+            }),
+            None,
+            None,
+        )
+        .expect("compiled hash stream sink");
     run(
+        &fixture,
         &programs.producer,
         producer_sink,
         ExchangeBindings::default(),
@@ -1006,7 +1019,13 @@ fn compiled_hash_stream_places_rows_by_the_exchange_hash_of_its_key_roots() {
             None,
         )
         .expect("compiled result sink");
-        run(&programs.consumer, consumer_sink, bindings, instance);
+        run(
+            &fixture,
+            &programs.consumer,
+            consumer_sink,
+            bindings,
+            instance,
+        );
         let mut rows = Vec::new();
         for chunk in &output.take_chunks() {
             rows.extend(
@@ -1247,7 +1266,8 @@ fn compiled_receiver_schema_uses_real_creator_until_last_slot_after_program_exit
     use crate::runtime::runtime_state::RuntimeErrorState;
     let programs = programs();
     let weak = Arc::downgrade(&programs.consumer);
-    let port = in_process_test_exchange_receiver_port();
+    let fixture = Fixture::new();
+    let port = fixture.port.clone();
     let assignment = assignments(programs.receiver);
     let missing = match materialize_compiled_exchange_receivers(
         &programs.consumer,
@@ -1299,7 +1319,8 @@ fn compiled_receiver_schema_first_memory_refusal_rolls_back_without_registration
     use crate::runtime::mem_tracker::MemTracker;
     use crate::runtime::runtime_state::RuntimeErrorState;
     let programs = programs();
-    let port = in_process_test_exchange_receiver_port();
+    let fixture = Fixture::new();
+    let port = fixture.port.clone();
     let tracker = MemTracker::new_root("compiled receiver first schema refusal");
     let factory = super::aggregate_fixture::runtime_construction_factory(
         tracker.clone(),

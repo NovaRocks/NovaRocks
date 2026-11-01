@@ -59,7 +59,7 @@ use novarocks_types::UniqueId;
 
 use super::aggregate_fixture::{
     LoopbackTransmitter, destination, edge, hash, receive, register, result_sink, stream_sink,
-    try_compile, try_run,
+    try_compile, try_run_in_fixture,
 };
 use super::family_fixture::{FixtureControl, constant_policy, int64, int64_rows};
 use crate::exec::chunk::Chunk;
@@ -67,7 +67,7 @@ use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
 use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
 use crate::runtime::fragment::io::NoopFragmentEventSink;
-use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
+use crate::runtime::fragment::io::exchange::test_support::Fixture;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_state::RuntimeState;
 
@@ -1212,19 +1212,28 @@ fn unnest_at_four_drivers_keeps_every_row_and_each_parent_in_order() {
     let (source, consumer) = exchanged_programs(&branches, &spec, DOP);
     assert_eq!(consumer.graph().profile().pipeline_dop().get(), DOP);
 
-    let port = in_process_test_exchange_receiver_port();
-    let transmitter = LoopbackTransmitter::new(Arc::clone(&port));
-    let bindings = register(&consumer, CONSUMER_FINST, 1, &port);
+    let fixture = Fixture::new();
+    let port = fixture.port.clone();
+    let transmitter = LoopbackTransmitter::new(fixture.transport.clone());
+    let bindings = register(&fixture, &consumer, CONSUMER_FINST, &[SOURCE_FINST], &port);
     let sink = stream_sink(
+        &fixture,
         &source,
         SOURCE_FINST,
         vec![destination(CONSUMER_FINST, SOURCE_FINST, 0, 1)],
         &transmitter,
     );
-    try_run(&source, sink, ExchangeBindings::default(), SOURCE_FINST)
-        .unwrap_or_else(|error| panic!("source runs: {error}"));
+    try_run_in_fixture(
+        &fixture,
+        &source,
+        sink,
+        ExchangeBindings::default(),
+        SOURCE_FINST,
+    )
+    .unwrap_or_else(|error| panic!("source runs: {error}"));
     let output = ResultSinkHandle::new();
-    try_run(
+    try_run_in_fixture(
+        &fixture,
         &consumer,
         result_sink(&consumer, CONSUMER_FINST, &output),
         bindings,

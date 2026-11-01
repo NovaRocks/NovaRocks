@@ -563,6 +563,7 @@ impl NativeServerAdmission {
     pub fn listener_layer(&self) -> NativeListenerAuthLayer {
         NativeListenerAuthLayer {
             admission: self.clone(),
+            on_authentication_failure: None,
         }
     }
 }
@@ -573,6 +574,30 @@ impl NativeServerAdmission {
 #[derive(Clone, Debug)]
 pub struct NativeListenerAuthLayer {
     admission: NativeServerAdmission,
+    on_authentication_failure: Option<AuthenticationFailureObserver>,
+}
+
+#[derive(Clone)]
+struct AuthenticationFailureObserver(Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for AuthenticationFailureObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticationFailureObserver")
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeListenerAuthLayer {
+    /// The listener contributes metrics without reimplementing authentication
+    /// or deciding what authenticated process claim reaches the application.
+    pub fn with_authentication_failure_observer(
+        mut self,
+        observer: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.on_authentication_failure = Some(AuthenticationFailureObserver(observer));
+        self
+    }
 }
 
 impl<S> Layer<S> for NativeListenerAuthLayer {
@@ -581,6 +606,7 @@ impl<S> Layer<S> for NativeListenerAuthLayer {
     fn layer(&self, inner: S) -> Self::Service {
         NativeListenerAuthService {
             admission: self.admission.clone(),
+            on_authentication_failure: self.on_authentication_failure.clone(),
             inner,
         }
     }
@@ -589,6 +615,7 @@ impl<S> Layer<S> for NativeListenerAuthLayer {
 #[derive(Clone, Debug)]
 pub struct NativeListenerAuthService<S> {
     admission: NativeServerAdmission,
+    on_authentication_failure: Option<AuthenticationFailureObserver>,
     inner: S,
 }
 
@@ -609,12 +636,21 @@ where
         self.inner.poll_ready(context)
     }
 
-    fn call(&mut self, request: http::Request<Body>) -> Self::Future {
-        if self.admission.admit_headers(request.headers()).is_err() {
-            return Box::pin(async {
-                Ok(Status::unauthenticated("native caller authentication failed").into_http())
-            });
-        }
+    fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
+        let caller = match self.admission.admit_headers(request.headers()) {
+            Ok(caller) => caller,
+            Err(_) => {
+                if let Some(observer) = &self.on_authentication_failure {
+                    (observer.0)();
+                }
+                return Box::pin(async {
+                    Ok(Status::unauthenticated("native caller authentication failed").into_http())
+                });
+            }
+        };
+        // The authentication owner publishes the verified claim exactly once.
+        // Application owners still authorize its exact process and operation.
+        request.extensions_mut().insert(caller);
         Box::pin(self.inner.call(request))
     }
 }
@@ -766,6 +802,81 @@ mod tests {
         let signature =
             super::hmac_sha256(&trust.jwt_hmac_key_for_vector(), signing_input.as_bytes());
         format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    #[derive(Clone)]
+    struct CaptureCaller(Arc<std::sync::Mutex<Vec<super::AuthenticatedNativeCaller>>>);
+
+    impl tower::Service<http::Request<()>> for CaptureCaller {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: http::Request<()>) -> Self::Future {
+            // Tonic preserves these HTTP extensions on the generated Request.
+            let request = tonic::Request::from_http(request);
+            self.0.lock().unwrap().push(
+                request
+                    .extensions()
+                    .get::<super::AuthenticatedNativeCaller>()
+                    .unwrap()
+                    .clone(),
+            );
+            std::future::ready(Ok(http::Response::new(tonic::body::empty_body())))
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_preserves_the_verified_caller_for_operation_authorization() {
+        use tower::{Layer, Service};
+
+        let trust = trust(Arc::new(ManualClock::new(1_700_000_000)));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut service = trust
+            .server_admission()
+            .listener_layer()
+            .layer(CaptureCaller(observed.clone()));
+        for identity in [None, Some(backend_identity())] {
+            if let Some(identity) = identity {
+                trust.bind_process_identity(identity).unwrap();
+            }
+            let headers = authorization(&trust.current_token().unwrap());
+            let expected = trust.verify_headers(&headers).unwrap();
+            let mut request = http::Request::new(());
+            *request.headers_mut() = headers;
+            // A stale local extension cannot override the authenticated headers.
+            request
+                .extensions_mut()
+                .insert(super::AuthenticatedNativeCaller {
+                    subject: NativeCallerSubject::parse("stale-local-value").unwrap(),
+                    process_identity: Some(frontend_identity()),
+                });
+            service.call(request).await.unwrap();
+            assert_eq!(observed.lock().unwrap().last(), Some(&expected));
+            assert_eq!(expected.process_identity(), identity);
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_does_not_publish_a_caller_for_rejected_authentication() {
+        use tower::{Layer, Service};
+
+        let trust = trust(Arc::new(ManualClock::new(1_700_000_000)));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut service = trust
+            .server_admission()
+            .listener_layer()
+            .layer(CaptureCaller(observed.clone()));
+        let response = service.call(http::Request::new(())).await.unwrap();
+        assert_eq!(response.headers()["grpc-status"], "16");
+        assert!(observed.lock().unwrap().is_empty());
     }
 
     #[test]

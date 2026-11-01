@@ -1685,8 +1685,6 @@ pub(crate) mod tests {
             crate::runtime::ExecutionRuntime::new(
                 crate::runtime::ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    exchange_wait_ms: 120_000,
-                    exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1024,
                     exchange_max_transmit_batched_bytes: max_packet_bytes,
                     operator_buffer_chunks: 1,
@@ -2969,7 +2967,6 @@ pub(crate) mod tests {
                     root_sink_dop: None,
                     kernel_abi: novarocks_local_program::KernelAbiVersion::CURRENT,
                     constants: crate::exec::expr::test_support::constant_policy(),
-                    exchange_wait: Duration::from_secs(120),
                 },
                 &control,
             )

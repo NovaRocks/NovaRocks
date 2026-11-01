@@ -112,7 +112,6 @@ fn options() -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        exchange_wait: std::time::Duration::from_secs(120),
         constants: ConstantPolicy {
             max_rows: 16,
             max_array_nodes: 128,

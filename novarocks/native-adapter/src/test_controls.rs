@@ -102,6 +102,23 @@ impl NativeFaultClaim {
             .unwrap_or_else(|error| error.into_inner())
             .cancellation()
     }
+    /// The selected action and its role scope are distinct release authors.
+    /// Keep the original claim in this caller-owned future; no background
+    /// task, new permission or file interpretation escapes the Native owner.
+    pub(crate) async fn wait_for_action_end(self) -> Result<(), String> {
+        let cancellation = self.cancellation();
+        loop {
+            if !cancellation.is_active() || self.action_ended()? {
+                return Ok(());
+            }
+            // Reuse the finite Native action observation cadence. This is
+            // control-file polling, not a delay applied to provider work.
+            tokio::select! {
+                _ = cancellation.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
+            }
+        }
+    }
     pub fn record_hit(&self) -> Result<(), String> {
         let mut state = self
             .inner
@@ -1525,7 +1542,7 @@ pub(crate) mod tests {
     pub(crate) fn controlled(action: &str) -> Controlled {
         controlled_with_follow_up(action, false)
     }
-    fn controlled_with_follow_up(action: &str, follow_up: bool) -> Controlled {
+    pub(crate) fn controlled_with_follow_up(action: &str, follow_up: bool) -> Controlled {
         controlled_options(action, follow_up, false, 10_000, false)
     }
     pub(crate) fn controlled_replay(lifetime_millis: u64) -> Controlled {
@@ -1647,12 +1664,20 @@ pub(crate) mod tests {
         fixture: &Controlled,
         kind: QueryLifecycleFaultKind,
     ) -> StatementExecutionBinding {
+        bind_statement(fixture, kind, fixture.execution, &fixture.token)
+    }
+    pub(crate) fn bind_statement(
+        fixture: &Controlled,
+        kind: QueryLifecycleFaultKind,
+        execution: QueryExecutionId,
+        token: &str,
+    ) -> StatementExecutionBinding {
         let binding = StatementExecutionBinding::new(
             "native-tests".into(),
-            fixture.token.clone(),
+            token.to_owned(),
             0,
             fixture.process,
-            fixture.execution,
+            execution,
         )
         .unwrap();
         binding
@@ -1660,7 +1685,7 @@ pub(crate) mod tests {
                 fixture.directory.path(),
                 kind,
                 0,
-                &fixture.token,
+                token,
             ))
             .unwrap();
         binding

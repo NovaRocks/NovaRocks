@@ -34,6 +34,7 @@ pub mod creation;
 pub mod descriptor;
 pub mod domain;
 pub mod exchange_flow_codec;
+pub mod exchange_unit_codec;
 pub mod identity;
 pub mod lease;
 pub mod operation;

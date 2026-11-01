@@ -89,6 +89,10 @@ impl StaticPlanInterpreter {
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
 ///
+/// Epoch 12 adds receiver-authorized Exchange units, explicit End, immutable
+/// replay and covered grant subscriptions to the complete write runtime.
+/// Epoch-10 binaries cannot enforce these Exchange contracts. Epoch 11 remains
+/// the previous test-only island and is not reused for production.
 /// Epoch 10 combines the complete change-stream runtime, exact summary-source
 /// obligations and pre-success strict input validation with the epoch-9 value
 /// semantics. Epoch-9 binaries cannot enforce the complete write obligations
@@ -114,11 +118,11 @@ impl StaticPlanInterpreter {
 /// boundary under the synchronous creation and direct release contract, so
 /// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 10;
+pub const NATIVE_COMPAT_EPOCH: u64 = 12;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
-pub const NATIVE_COMPAT_EPOCH: u64 = 11;
+pub const NATIVE_COMPAT_EPOCH: u64 = 13;
 
 #[cfg(all(feature = "native-compatibility-test-fixture", not(debug_assertions)))]
 compile_error!("native-compatibility-test-fixture is only supported by debug and dev-opt builds");
@@ -669,10 +673,29 @@ mod tests {
     #[test]
     fn test_fixture_epoch_is_explicit_and_never_ambient() {
         #[cfg(feature = "native-compatibility-test-fixture")]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 11);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 13);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 10);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 12);
     }
+    #[test]
+    fn receiver_authorized_exchange_isolates_the_previous_write_runtime_and_test_island() {
+        let at = |epoch| {
+            derive_native_compatibility_material(
+                b"same-descriptor",
+                carriers(),
+                [0x31; 32],
+                1,
+                COMPILED,
+                epoch,
+            )
+            .unwrap()
+        };
+        for previous in [10, 11] {
+            assert_ne!(NATIVE_COMPAT_EPOCH, previous);
+            assert_ne!(at(NATIVE_COMPAT_EPOCH).id(), at(previous).id());
+        }
+    }
+
     #[test]
     fn arrow_selection_and_time_semantics_cut_off_the_previous_epoch() {
         let at = |epoch| {

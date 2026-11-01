@@ -97,12 +97,12 @@ fn missing_task_negative_node_cross_attempt_and_invalid_process_are_refused() {
 }
 
 #[test]
-fn sequence_projection_preserves_zero_and_maximum_and_rejects_negative() {
-    for sequence in [0, 1, i64::MAX] {
+fn sequence_projection_preserves_nonzero_and_maximum_and_rejects_zero() {
+    for sequence in [1, 2, u64::MAX] {
         assert_eq!(decode_sequence(sequence, path()).unwrap().get(), sequence);
     }
     assert_eq!(
-        decode_sequence(-1, path()).unwrap_err().kind(),
+        decode_sequence(0, path()).unwrap_err().kind(),
         &ProtocolErrorKind::InvalidValue
     );
 }
@@ -118,7 +118,7 @@ fn close_round_trip_preserves_cumulative_final_sequence_and_withdrawal() {
             final_sequence: ExchangeFrameSequence::try_new(19).unwrap(),
         },
         ExchangeCloseDisposition::Consumed {
-            final_sequence: ExchangeFrameSequence::try_new(i64::MAX).unwrap(),
+            final_sequence: ExchangeFrameSequence::try_new(u64::MAX).unwrap(),
         },
         ExchangeCloseDisposition::Withdrawn,
     ] {
@@ -169,12 +169,12 @@ fn close_requires_explicit_disposition_and_exact_frozen_stream_fields() {
     }
     assert!(decode_normal_close(&valid, stream, 0, path()).is_err());
     assert!(decode_normal_close(&valid, stream, 1, path()).is_err());
-    let mut negative = valid;
-    negative.disposition = Some(wire::exchange_normal_closed::Disposition::Consumed(
-        wire::ExchangeConsumed { final_sequence: -1 },
+    let mut zero = valid;
+    zero.disposition = Some(wire::exchange_normal_closed::Disposition::Consumed(
+        wire::ExchangeConsumed { final_sequence: 0 },
     ));
     assert_eq!(
-        decode_normal_close(&negative, stream, 2, path())
+        decode_normal_close(&zero, stream, 2, path())
             .unwrap_err()
             .kind(),
         &ProtocolErrorKind::InvalidValue

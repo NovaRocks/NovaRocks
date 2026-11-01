@@ -112,18 +112,26 @@ pub enum ConnectorWriterAbortOutcome {
     Failed,
 }
 
+/// The role-local action owner retains its original permission and decides
+/// when a selected debug hold ends. Worker polls this future inside the
+/// original append; it neither interprets control files nor spawns a waiter.
+#[cfg(novarocks_dev_controls)]
+pub type ConnectorAppendHold = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), ConnectorError>> + Send + 'static>,
+>;
+
 /// Renders Worker-observed connector writer facts without gaining write
 /// authority.
 pub trait ConnectorWriteObservationPort: Send + Sync {
     fn observe(&self, observation: ConnectorWriteObservation);
 
-    /// Scoped hold permission only; Worker retains the provider operation and
-    /// its original cancellation owner. Session end merely releases this hold.
+    /// Selected-action hold only; Worker retains the provider operation and
+    /// its original cancellation owner. Action/role end merely releases it.
     #[cfg(novarocks_dev_controls)]
     fn hold_append(
         &self,
         _writer: ConnectorWriterObservation,
-    ) -> Result<Option<novarocks_failpoint::scope::ControlCancellation>, ConnectorError> {
+    ) -> Result<Option<ConnectorAppendHold>, ConnectorError> {
         Ok(None)
     }
 }
@@ -237,18 +245,19 @@ struct ObservedConnectorBatchWriter {
 impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
     async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
         #[cfg(novarocks_dev_controls)]
-        if let Some(cancellation) = self.observation.hold_append(self.writer)? {
+        if let Some(release) = self.observation.hold_append(self.writer)? {
             use novarocks_spi::connector::ConnectorOperationControl;
             // No provider append has started yet. Ending this artificial wait
             // never drops an in-flight provider future or reborrows its writer.
-            tokio::select! {
-                _ = cancellation.cancelled() => {},
-                _ = self.append_stop.stopped() => {},
-                _ = tokio::time::sleep_until(self.append_control.deadline().into()) => {},
-            }
+            let released = tokio::select! {
+                outcome = release => outcome,
+                _ = self.append_stop.stopped() => Ok(()),
+                _ = tokio::time::sleep_until(self.append_control.deadline().into()) => Ok(()),
+            };
             // Preserve the original operation author's typed stop/deadline
-            // failure. Session end alone just releases the debugging hold.
+            // failure. Action/role end alone just releases the debugging hold.
             self.append_control.check_active()?;
+            released?;
         }
         let rows = batch.num_rows() as u64;
         self.inner.append(batch).await?;

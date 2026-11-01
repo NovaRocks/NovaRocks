@@ -41,6 +41,7 @@ mod resource;
 mod runtime_filter_binding;
 mod structure_input;
 mod validation;
+pub mod wait_graph;
 mod write_execution;
 
 pub use builder::*;

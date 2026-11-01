@@ -22,7 +22,7 @@ mod router_runtime_tests {
     use crate::exec::pipeline::binding::ScanBindings;
     use crate::exec::pipeline::executor::prepare_compiled_program_with_sink_materializer;
     use crate::runtime::exchange::{ExchangeColumnBinding, ExchangePopResult};
-    use crate::runtime::fragment::io::ExchangeReceiverRegistration;
+    use crate::runtime::fragment::io::{ExchangeReceiverKey, ExchangeReceiverRegistration};
     use crate::runtime::fragment::sink::materialize_compiled_sink_for_pipeline;
     use novarocks_physical_plan as p;
     use novarocks_spi::connector::{
@@ -527,8 +527,8 @@ mod router_runtime_tests {
             *summary_branch, 2,
             "this compiler author keeps its independent summary last"
         );
-        let port = in_process_test_exchange_receiver_port();
-        let creation = crate::runtime::fragment::exchange::test_receiver_creation_factory();
+        let fixture = Fixture::new();
+        let port = fixture.port.clone();
         let mut keys = Vec::new();
         let mut groups = Vec::new();
         for (index, branch) in branches.iter().enumerate() {
@@ -545,6 +545,7 @@ mod router_runtime_tests {
                     branch.output_columns(),
                 )
             };
+            let creation = fixture.creation(instance);
             port.register(ExchangeReceiverRegistration {
                 key,
                 expected_senders: 1,
@@ -553,24 +554,16 @@ mod router_runtime_tests {
                 creation_factory: Arc::clone(&creation),
             })
             .unwrap();
-            groups.push(vec![
-                FragmentDestination::new(
-                    instance,
-                    RuntimeEndpoint::new("127.0.0.1", 9030).unwrap(),
-                    SOURCE,
-                    0,
-                    1,
-                )
-                .unwrap(),
-            ]);
+            fixture.bind(key, &[SOURCE]);
+            groups.push(vec![fixture.destination(instance, SOURCE, 0, 1)]);
             keys.push(key);
         }
         let assignment = FragmentSinkAssignment::DestinationGroups {
             groups,
             sender_id: None,
         };
-        let baseline = runtime_state();
-        let state = Arc::new(RuntimeState::for_local_execution(
+        let baseline = fixture.state(SOURCE);
+        let state = Arc::new(RuntimeState::new(
             Some(crate::runtime::query_options::QueryOptions {
                 query_timeout: Some(5),
                 ..Default::default()
@@ -580,8 +573,10 @@ mod router_runtime_tests {
             None,
             None,
             baseline.mem_tracker(),
-            Some(crate::runtime::execution_runtime::test_execution_runtime()),
+            Some(fixture.runtime.clone()),
+            baseline.error_state().clone(),
         ));
+        let creation = fixture.creation(SOURCE);
         let (bindings, input_key) = if let Some((upstream, receiver)) = upstream {
             assert_eq!(program.exchange_inputs().len(), 1);
             let materialized = materialize_compiled_exchange_receivers(
@@ -597,7 +592,9 @@ mod router_runtime_tests {
                 node_id: i32::try_from(receiver.get()).unwrap(),
             };
             for registration in materialized.registrations {
+                let key = registration.key;
                 port.register(registration).unwrap();
+                fixture.bind(key, &[UPSTREAM]);
             }
             let assignment = FragmentSinkAssignment::StreamDestinations {
                 destinations: vec![
@@ -612,26 +609,28 @@ mod router_runtime_tests {
                 ],
                 sender_id: None,
             };
-            let sink = materialize_compiled_sink(
-                &upstream,
-                &assignment,
-                UPSTREAM,
-                Arc::new(LoopbackTransmitter {
-                    port: Arc::clone(&port),
-                }),
-                None,
-                None,
-            )
-            .unwrap();
+            let sink = fixture
+                .sink(
+                    &upstream,
+                    &assignment,
+                    UPSTREAM,
+                    Arc::new(LoopbackTransmitter {
+                        unit: fixture.transport.clone(),
+                    }),
+                    None,
+                    None,
+                )
+                .unwrap();
             // The sender encodes and delivers real DATA/EOS before the source
             // runs. Merely accepting that End cannot author Consumed.
-            run(&upstream, sink, ExchangeBindings::default(), UPSTREAM);
-            let stream = crate::runtime::fragment::io::exchange::fixture_stream(
+            run(
+                &fixture,
+                &upstream,
+                sink,
+                ExchangeBindings::default(),
                 UPSTREAM,
-                SOURCE,
-                input_key.node_id,
-                0,
             );
+            let stream = fixture.stream(UPSTREAM, SOURCE, input_key.node_id, 0);
             assert!(
                 matches!(
                     port.stream_close_facts(input_key, &[stream]).unwrap()[0].disposition,
@@ -645,8 +644,9 @@ mod router_runtime_tests {
         };
         let observed_width = std::cell::Cell::new(None);
         let transmitter: Arc<dyn ExchangeFrameTransmitter> = Arc::new(LoopbackTransmitter {
-            port: Arc::clone(&port),
+            unit: fixture.transport.clone(),
         });
+        let gates = fixture.gates(&program, &assignment).unwrap();
         let prepared = prepare_compiled_program_with_sink_materializer(
             Arc::clone(&program),
             Duration::from_millis(10),
@@ -662,7 +662,7 @@ mod router_runtime_tests {
                     SOURCE,
                     transmitter,
                     None,
-                    None,
+                    Some(gates),
                     actual,
                     state.mem_tracker(),
                 )
@@ -705,12 +705,7 @@ mod router_runtime_tests {
         }
         let mut outputs = Vec::new();
         for key in &keys {
-            let stream = crate::runtime::fragment::io::exchange::fixture_stream(
-                SOURCE,
-                key.fragment_instance_id,
-                key.node_id,
-                0,
-            );
+            let stream = fixture.stream(SOURCE, key.fragment_instance_id, key.node_id, 0);
             assert!(
                 matches!(
                     port.stream_close_facts(*key, &[stream]).unwrap()[0].disposition,

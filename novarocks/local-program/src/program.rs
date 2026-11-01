@@ -22,7 +22,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow_schema::{DataType, FieldRef};
 use novarocks_connector_contract::{
@@ -513,7 +512,6 @@ pub enum ProgramNodeKind {
         limit: Option<usize>,
     },
     ExchangeSource {
-        timeout: Duration,
         runtime_filters: crate::ScanFilterConsumers,
         hash_partition_exprs: Vec<ProgramExprId>,
     },
@@ -2601,7 +2599,6 @@ mod tests {
                 ProgramNode::new(
                     2,
                     ProgramNodeKind::ExchangeSource {
-                        timeout: Duration::from_secs(1),
                         runtime_filters: vec![].into(),
                         hash_partition_exprs: vec![],
                     },
@@ -2622,7 +2619,6 @@ mod tests {
             vec![ProgramNode::new(
                 2,
                 ProgramNodeKind::ExchangeSource {
-                    timeout: Duration::from_secs(1),
                     runtime_filters: vec![].into(),
                     hash_partition_exprs: vec![],
                 },
@@ -2790,7 +2786,6 @@ mod tests {
         let mut nodes = vec![ProgramNode::new(
             7,
             ProgramNodeKind::ExchangeSource {
-                timeout: Duration::from_secs(1),
                 runtime_filters: vec![].into(),
                 hash_partition_exprs: if children {
                     vec![]

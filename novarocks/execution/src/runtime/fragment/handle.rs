@@ -108,9 +108,9 @@ mod owner_tests {
         FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
     };
     use crate::runtime::fragment::io::{
-        ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort,
-        ExchangeReceiverRegistration, ExecutionRuntimeExchangeReceiverPort, FragmentIoError,
-        FragmentResultSession, FragmentResultWriter, ResultAbort, ResultWriteSpec,
+        ExchangeReceiverKey, ExchangeReceiverPort, ExchangeReceiverRegistration,
+        ExecutionRuntimeExchangeReceiverPort, FragmentIoError, FragmentResultSession,
+        FragmentResultWriter, ResultAbort, ResultWriteSpec,
     };
     use crate::runtime::query_options::QueryOptions;
     use novarocks_types::{QueryId, SlotId, UniqueId};
@@ -144,6 +144,56 @@ mod owner_tests {
     }
 
     impl ExchangeReceiverPort for ReceiverConstructionPort {
+        fn bind_unit_receiver(
+            &self,
+            key: ExchangeReceiverKey,
+            streams: Vec<novarocks_execution_contract::ExchangeStreamIdentity>,
+            control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+            grantable_unit_bytes: u64,
+        ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
+            self.delegate
+                .bind_unit_receiver(key, streams, control, grantable_unit_bytes)
+        }
+        fn register_unit_demand(
+            &self,
+            key: ExchangeReceiverKey,
+            entry: crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry,
+        ) -> Result<
+            crate::runtime::fragment::io::exchange_unit::ExchangeStreamObservation,
+            novarocks_failure_contract::FailureFact,
+        > {
+            self.delegate.register_unit_demand(key, entry)
+        }
+        fn receive_unit(
+            &self,
+            key: ExchangeReceiverKey,
+            frame: crate::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame,
+        ) -> Result<
+            crate::runtime::fragment::io::exchange_unit::ExchangeUnitReceipt,
+            novarocks_failure_contract::FailureFact,
+        > {
+            self.delegate.receive_unit(key, frame)
+        }
+        fn unit_sender_states(
+            &self,
+            sender: novarocks_types::BackendProcessId,
+            after: Option<novarocks_execution_contract::ExchangeStreamIdentity>,
+            limit: usize,
+        ) -> Result<
+            Vec<crate::runtime::fragment::io::exchange_unit::ExchangeStreamObservation>,
+            novarocks_failure_contract::FailureFact,
+        > {
+            self.delegate.unit_sender_states(sender, after, limit)
+        }
+        fn set_unit_state_listener(
+            &self,
+            listener: Arc<
+                dyn crate::runtime::fragment::io::exchange_unit::ExchangeUnitStateListener,
+            >,
+        ) -> Result<(), novarocks_failure_contract::FailureFact> {
+            self.delegate.set_unit_state_listener(listener)
+        }
+
         fn register(
             &self,
             registration: ExchangeReceiverRegistration,
@@ -152,13 +202,7 @@ mod owner_tests {
             self.registrations.lock().unwrap().push(registration);
             Ok(())
         }
-        fn push(
-            &self,
-            key: ExchangeReceiverKey,
-            frame: ExchangeReceiverFrame,
-        ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
-            self.delegate.push(key, frame)
-        }
+
         fn cancel(&self, key: ExchangeReceiverKey) {
             self.cancelled.fetch_add(1, Ordering::SeqCst);
             self.delegate.cancel(key);
@@ -200,17 +244,7 @@ mod owner_tests {
         > {
             self.delegate.ensure_mem_tracker(key, root)
         }
-        fn push_local(
-            &self,
-            key: ExchangeReceiverKey,
-            sender_id: i32,
-            backend_number: i32,
-            chunks: Vec<Chunk>,
-            eos: bool,
-        ) {
-            self.delegate
-                .push_local(key, sender_id, backend_number, chunks, eos);
-        }
+
         fn snapshot(
             &self,
             key: ExchangeReceiverKey,
@@ -766,7 +800,7 @@ mod owner_tests {
         let port = ReceiverConstructionPort::new(runtime.clone());
         let control = Arc::new(owner.view(TaskFailurePhase::Execution));
         let mut context = FragmentPrepareContext::default()
-            .with_task_control(control)
+            .with_task_control(control.clone())
             .with_result_identity(owner.identity())
             .with_execution_runtime(runtime)
             .with_exchange_receiver_port(port.clone());
@@ -785,7 +819,7 @@ mod owner_tests {
             crate::runtime::mem_tracker::MemTracker::new_root("deferred retirement fixture");
         let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
             crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-            tracker, Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+            tracker, Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(control)),
         ).unwrap();
         let declaration =
             crate::exec::chunk::typed_fixture::layout(Arc::new(Schema::empty()), &[], &[]);
@@ -824,20 +858,41 @@ mod owner_tests {
             let owner = deferred_fragment_owner(id);
             let (dormant, port, key) = deferred_fragment_with_receiver(id, &owner, None);
             let source = UniqueId::new(id.high(), 99);
-            let stream =
-                crate::runtime::fragment::io::exchange::fixture_stream(source, id, key.node_id, 0);
-            port.push(
+            let task = owner.identity();
+            let source_task = novarocks_execution_contract::TaskIdentity::new(
+                task.query_execution_id(),
+                novarocks_types::identity::StageId::new(99).unwrap(),
+                novarocks_types::identity::TaskId::new(1).unwrap(),
+                task.backend_process_id(),
+            );
+            let stream = novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+                novarocks_execution_contract::ExchangeSource::new(source_task, source, 0),
+                task,
+                id,
+                novarocks_execution_contract::FragmentNodeId::new(key.node_id),
+            )
+            .unwrap();
+            port.bind_unit_receiver(
                 key,
-                crate::runtime::fragment::io::ExchangeReceiverFrame {
+                vec![stream],
+                Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(
+                    Arc::new(owner.view(novarocks_execution_contract::TaskFailurePhase::Execution)),
+                )),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+            port.receive_unit(
+                key,
+                crate::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame {
                     stream,
-                    source_fragment_instance_id: source,
-                    sender_ordinal: 0,
                     sender_count: 1,
                     sender_id: 0,
                     backend_number: 0,
-                    sequence: 0,
-                    eos: true,
-                    payload: Vec::new(),
+                    item: crate::runtime::fragment::io::exchange_unit::ExchangeUnitItem::End(
+                        crate::runtime::fragment::io::exchange_unit::ExchangeUnitSequence::FIRST,
+                    ),
+                    payload: bytes::Bytes::new(),
+                    next_demand: None,
                 },
             )
             .unwrap();
@@ -1243,7 +1298,6 @@ mod owner_tests {
         let id = UniqueId::new(84_500, 1);
         // The existing fixture publishes a real distributed SQL gather package
         // and compiles its ExchangeSource through the production local compiler.
-        // Its exchange wait remains the original one-second bound.
         let program = super::compiled_prepare::tests::sql_gather_receiver_program();
         assert_eq!(program.exchange_inputs().len(), 1);
         let (&compiled_node, input) = program.exchange_inputs().iter().next().unwrap();

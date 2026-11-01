@@ -85,7 +85,7 @@ async fn exact_key_connecting_position_refuses_before_the_connector_runs() {
     // a connection error rather than the admission refusal asserted below.
     let endpoint = NativeEndpoint::from_host_port("127.0.0.1", 1).unwrap();
     for (peer, method) in [
-        (Some(process), NativeRpcMethod::ExchangeUnary),
+        (Some(process), NativeRpcMethod::DeliverExchangeUnit),
         (
             Some(process),
             NativeRpcMethod::TransmitRuntimeFilterEnvelope,
@@ -115,7 +115,7 @@ async fn production_cache_miss_uses_same_key_gate_before_tcp_and_recovers_failed
     let (runtime, admission) = admitted();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = NativeEndpoint::from_socket_addr(listener.local_addr().unwrap());
-    let method = NativeRpcMethod::ExchangeUnary;
+    let method = NativeRpcMethod::DeliverExchangeUnit;
     let key = NativeChannelKey::new(Some(BackendProcessId::new_v7()), endpoint, method).unwrap();
     let blocker = admission
         .try_dial(TransportClass::Data, Some(key.inline_identity().unwrap()))

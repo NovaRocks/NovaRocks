@@ -23,14 +23,18 @@ use std::fmt;
 
 use novarocks_types::UniqueId;
 
+// Existing stream consumers use the same nonzero ordered-unit domain and
+// source-authored close disposition as the receiver receipt kernel.
+pub use crate::ordered_retained_stream::exchange::{
+    ExchangeUnitCloseDisposition as ExchangeCloseDisposition,
+    ExchangeUnitSequence as ExchangeFrameSequence,
+};
 use crate::{ExchangeSource, FragmentNodeId, TaskIdentity};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExchangeFlowContractError {
     CrossAttemptStream,
     NegativeDestinationNode,
-    NegativeSequence,
-    SequenceExhausted,
 }
 
 impl fmt::Display for ExchangeFlowContractError {
@@ -38,8 +42,6 @@ impl fmt::Display for ExchangeFlowContractError {
         f.write_str(match self {
             Self::CrossAttemptStream => "exchange stream crosses query attempts",
             Self::NegativeDestinationNode => "exchange destination node must be nonnegative",
-            Self::NegativeSequence => "exchange sequence must be nonnegative",
-            Self::SequenceExhausted => "exchange sequence domain is exhausted",
         })
     }
 }
@@ -88,44 +90,10 @@ impl ExchangeStreamIdentity {
     }
 }
 
-/// Allocated at the exact stream's serialized admission point, including EOS.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ExchangeFrameSequence(i64);
-
-impl ExchangeFrameSequence {
-    pub const FIRST: Self = Self(0);
-    pub fn try_new(sequence: i64) -> Result<Self, ExchangeFlowContractError> {
-        if sequence < 0 {
-            return Err(ExchangeFlowContractError::NegativeSequence);
-        }
-        Ok(Self(sequence))
-    }
-    pub const fn get(self) -> i64 {
-        self.0
-    }
-    pub fn checked_next(self) -> Result<Self, ExchangeFlowContractError> {
-        self.0
-            .checked_add(1)
-            .map(Self)
-            .ok_or(ExchangeFlowContractError::SequenceExhausted)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExchangeDeliveryRequirement {
     DemandDriven,
     MustDrain,
-}
-
-/// Authored by actual input exhaustion, not inferred from Task status or ACK.
-/// Consumed covers every item through the stream's final EOS sequence, including
-/// data carried by that final message (the retained-stream end-after-data case).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExchangeCloseDisposition {
-    Consumed {
-        final_sequence: ExchangeFrameSequence,
-    },
-    Withdrawn,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,22 +105,24 @@ pub struct ExchangeStreamClose {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ordered_retained_stream::exchange::ExchangeReceiptError;
 
     #[test]
-    fn sequence_exhaustion_and_negative_input_are_not_wrapped() {
+    fn sequence_exhaustion_and_zero_input_are_not_wrapped() {
+        assert_eq!(ExchangeFrameSequence::FIRST.get(), 1);
         assert_eq!(
-            ExchangeFrameSequence::try_new(-1),
-            Err(ExchangeFlowContractError::NegativeSequence)
+            ExchangeFrameSequence::try_new(0),
+            Err(ExchangeReceiptError::ZeroSequence)
         );
         assert_eq!(
             ExchangeFrameSequence::FIRST.checked_next().unwrap().get(),
-            1
+            2
         );
         assert_eq!(
-            ExchangeFrameSequence::try_new(i64::MAX)
+            ExchangeFrameSequence::try_new(u64::MAX)
                 .unwrap()
                 .checked_next(),
-            Err(ExchangeFlowContractError::SequenceExhausted)
+            Err(ExchangeReceiptError::SequenceOverflow)
         );
     }
 }

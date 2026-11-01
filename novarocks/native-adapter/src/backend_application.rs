@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_connector_contract::PureProviderProgramCatalog;
-use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
+use novarocks_execution::runtime::execution_runtime::{
+    ExchangeFlowLimits, ExecutionRuntime, ExecutionRuntimeConfig,
+};
 use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
 use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
 use novarocks_memory::MemoryAuthority;
@@ -123,6 +125,8 @@ pub struct BackendServerConfig {
     pub inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits,
     pub preparation_limits: novarocks_worker::TaskPreparationLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
+    /// Server-validated structural limits for the exchange protocol.
+    pub exchange_flow_limits: ExchangeFlowLimits,
     pub scan_preparation_config: novarocks_worker::ScanPreparationConfig,
     /// The Server's scan I/O runtime. Typed scan streams are polled and
     /// closed inside its context, where their I/O waits and timers live.
@@ -416,6 +420,7 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
 
 struct BackendExecutionRuntimeInput {
     config: ExecutionRuntimeConfig,
+    exchange_flow_limits: ExchangeFlowLimits,
     function_set: Arc<SealedExecutionFunctionSet>,
     memory_authority: Arc<MemoryAuthority>,
 }
@@ -428,9 +433,15 @@ impl BackendExecutionRuntimeInput {
     ) -> Self {
         Self {
             config,
+            exchange_flow_limits: ExchangeFlowLimits::default(),
             function_set,
             memory_authority,
         }
+    }
+
+    fn with_exchange_flow_limits(mut self, limits: ExchangeFlowLimits) -> Self {
+        self.exchange_flow_limits = limits;
+        self
     }
 }
 
@@ -459,14 +470,16 @@ fn compose_backend_application_services(
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let BackendExecutionRuntimeInput {
         config: execution_runtime_config,
+        exchange_flow_limits,
         function_set,
         memory_authority,
     } = execution;
     let execution_runtime = Arc::new(
-        ExecutionRuntime::new(
+        ExecutionRuntime::new_with_exchange_flow_limits(
             execution_runtime_config,
             Arc::clone(&function_set),
             Arc::clone(&memory_authority),
+            exchange_flow_limits,
         )
         .map_err(|error| {
             BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
@@ -584,7 +597,7 @@ fn compose_backend_application_services(
         Arc::clone(&inbound_capabilities),
         novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
             data_runtime.clone(),
-            Duration::from_millis(execution_runtime.config().exchange_wait_ms),
+            execution_runtime.exchange_flow_limits().transport_timeout(),
             #[cfg(novarocks_dev_controls)]
             test_session.and_then(|session| session.observation.clone()),
         ),
@@ -836,6 +849,7 @@ impl BackendApplicationHost {
             inbound_capability_limits,
             preparation_limits,
             execution_runtime_config,
+            exchange_flow_limits,
             scan_preparation_config,
             scan_stream_runtime,
             catalog_manager_config,
@@ -984,7 +998,8 @@ impl BackendApplicationHost {
                 execution_runtime_config,
                 function_set,
                 memory_authority,
-            ),
+            )
+            .with_exchange_flow_limits(exchange_flow_limits),
             native_compatibility_id,
             write_commit_evidence_limits,
             result_retained_limits,
@@ -1053,6 +1068,7 @@ impl BackendApplicationHost {
                 .map_err(|error| {
                     BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
                 })?
+                .with_exchange_flow(Arc::clone(&services.execution_runtime))
                 .with_native_query_resources(Arc::new(|| {
                     novarocks_worker::query_context::query_context_manager()
                         .native_execution_resource_snapshot()
@@ -1374,8 +1390,6 @@ mod tests {
     fn execution_runtime_config() -> ExecutionRuntimeConfig {
         ExecutionRuntimeConfig {
             driver_threads: 1,
-            exchange_wait_ms: 1,
-            exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1,
             exchange_max_transmit_batched_bytes: 1,
             operator_buffer_chunks: 1,
@@ -1529,6 +1543,7 @@ mod tests {
             inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits::default(),
             preparation_limits: novarocks_worker::TaskPreparationLimits::default(),
             execution_runtime_config: execution_runtime_config(),
+            exchange_flow_limits: super::ExchangeFlowLimits::default(),
             scan_preparation_config: novarocks_worker::ScanPreparationConfig::try_new(
                 64 * 1024 * 1024,
                 4,
@@ -1605,6 +1620,9 @@ mod tests {
         use novarocks_worker::SharedFactsRequest;
         use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
 
+        let exchange_flow_limits =
+            super::ExchangeFlowLimits::try_new(2, 5, 0, 3, Duration::from_millis(71))
+                .expect("explicit exchange configuration is valid");
         let services = compose_backend_application_services(
             test_data_runtime(),
             BackendProcessId::new_v7(),
@@ -1612,7 +1630,8 @@ mod tests {
                 execution_runtime_config(),
                 test_execution_function_set(),
                 novarocks_native_adapter::backend_test_support::test_memory_authority(),
-            ),
+            )
+            .with_exchange_flow_limits(exchange_flow_limits),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             WriteCommitEvidenceLimits::default(),
             WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
@@ -1642,6 +1661,10 @@ mod tests {
             None,
         )
         .expect("compose backend application services");
+        assert_eq!(
+            services.execution_runtime.exchange_flow_limits(),
+            exchange_flow_limits
+        );
 
         // The exact attempt the fixture envelope is addressed to, established
         // the way the task protocol establishes one.

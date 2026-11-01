@@ -53,13 +53,17 @@ pub(super) fn mutate_observed(
         })
         .transpose()?;
     let observation = selected.arm(context, control.connection_id(), sql)?;
-    let outcome = control.query_drop(sql);
+    let (outcome, coordinated) =
+        super::super::small_slots::query_drop(context, control, selected, sql, dop);
     // Preserve the actual DML OK packet before any subsequent SQL.
-    let actual_affected = outcome.is_ok().then(|| control.affected_rows());
-    let succeeded = outcome.is_ok();
-    let public_error = matches!(&outcome, Err(mysql::Error::MySqlError(_)));
+    let actual_affected = matches!(&outcome, Some(Ok(()))).then(|| control.affected_rows());
+    let succeeded = matches!(&outcome, Some(Ok(())));
+    let public_error = matches!(&outcome, Some(Err(mysql::Error::MySqlError(_))));
     let primary = (|| -> Result<()> {
-        outcome.with_context(|| subject.to_owned())?;
+        let query = outcome
+            .context("original row-level SQL has no terminal outcome")
+            .and_then(|outcome| outcome.with_context(|| subject.to_owned()));
+        super::super::writer_statement_actor::combine(coordinated, query)?;
         anyhow::ensure!(
             actual_affected == Some(affected),
             "{subject}: affected_rows={actual_affected:?}, expected {affected}"

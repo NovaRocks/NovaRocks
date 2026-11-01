@@ -25,6 +25,17 @@ use novarocks_types::{BackendProcessId, NativeEndpoint, NativeReferenceHost};
 
 const MAX_HOST_BYTES: usize = 253;
 
+/// Method routing stays exact in the manifest; the three unit methods share
+/// one physical Exchange connection owner instead of multiplying peer quotas.
+pub(crate) const fn connection_owner_method(method: NativeRpcMethod) -> NativeRpcMethod {
+    match method {
+        NativeRpcMethod::RegisterExchangeDemand | NativeRpcMethod::SubscribeExchangeGrants => {
+            NativeRpcMethod::DeliverExchangeUnit
+        }
+        _ => method,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum InlineNativeReferenceHostKind {
     Ipv4,
@@ -77,7 +88,7 @@ impl InlineNativeChannelIdentity {
             host_len: source.len() as u8,
             port: endpoint.port(),
             reference_host_kind,
-            method,
+            method: connection_owner_method(method),
         })
     }
 
@@ -142,26 +153,26 @@ mod tests {
         let key = InlineNativeChannelIdentity::from_parts(
             Some(peer(1)),
             &endpoint,
-            NativeRpcMethod::ExchangeUnary,
+            NativeRpcMethod::DeliverExchangeUnit,
         )
         .unwrap();
         for other in [
             InlineNativeChannelIdentity::from_parts(
                 Some(peer(2)),
                 &endpoint,
-                NativeRpcMethod::ExchangeUnary,
+                NativeRpcMethod::DeliverExchangeUnit,
             )
             .unwrap(),
             InlineNativeChannelIdentity::from_parts(
                 Some(peer(1)),
                 &other_port,
-                NativeRpcMethod::ExchangeUnary,
+                NativeRpcMethod::DeliverExchangeUnit,
             )
             .unwrap(),
             InlineNativeChannelIdentity::from_parts(
                 Some(peer(1)),
                 &other_host,
-                NativeRpcMethod::ExchangeUnary,
+                NativeRpcMethod::DeliverExchangeUnit,
             )
             .unwrap(),
             InlineNativeChannelIdentity::from_parts(
@@ -180,7 +191,7 @@ mod tests {
         assert_eq!(key.host(), "example.com");
         assert_eq!(key.host_bytes(), b"example.com");
         assert_eq!(key.port(), 9000);
-        assert_eq!(key.method(), NativeRpcMethod::ExchangeUnary);
+        assert_eq!(key.method(), NativeRpcMethod::DeliverExchangeUnit);
     }
 
     #[test]
@@ -197,13 +208,13 @@ mod tests {
                 InlineNativeChannelIdentity::from_parts(
                     Some(peer(1)),
                     &first,
-                    NativeRpcMethod::ExchangeUnary
+                    NativeRpcMethod::DeliverExchangeUnit
                 )
                 .unwrap(),
                 InlineNativeChannelIdentity::from_parts(
                     Some(peer(1)),
                     &second,
-                    NativeRpcMethod::ExchangeUnary
+                    NativeRpcMethod::DeliverExchangeUnit
                 )
                 .unwrap(),
             );
@@ -223,13 +234,13 @@ mod tests {
         let ip = InlineNativeChannelIdentity::from_parts(
             Some(peer(1)),
             &ip,
-            NativeRpcMethod::ExchangeUnary,
+            NativeRpcMethod::DeliverExchangeUnit,
         )
         .unwrap();
         let dns = InlineNativeChannelIdentity::from_parts(
             Some(peer(1)),
             &dns,
-            NativeRpcMethod::ExchangeUnary,
+            NativeRpcMethod::DeliverExchangeUnit,
         )
         .unwrap();
         assert_ne!(ip, dns);
@@ -252,7 +263,10 @@ mod tests {
             let without_peer =
                 InlineNativeChannelIdentity::from_parts(None, &endpoint, entry.method);
             match entry.method {
-                NativeRpcMethod::ExchangeUnary | NativeRpcMethod::TransmitRuntimeFilterEnvelope => {
+                NativeRpcMethod::DeliverExchangeUnit
+                | NativeRpcMethod::RegisterExchangeDemand
+                | NativeRpcMethod::SubscribeExchangeGrants
+                | NativeRpcMethod::TransmitRuntimeFilterEnvelope => {
                     assert!(with_peer.is_ok());
                     assert_eq!(
                         without_peer.unwrap_err().kind(),
@@ -290,7 +304,7 @@ mod tests {
         let key = InlineNativeChannelIdentity::from_parts(
             Some(peer(1)),
             &endpoint,
-            NativeRpcMethod::ExchangeUnary,
+            NativeRpcMethod::DeliverExchangeUnit,
         )
         .unwrap();
         assert_eq!(key.host_bytes(), host.as_bytes());

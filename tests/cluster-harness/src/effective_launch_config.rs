@@ -202,6 +202,10 @@ pub(crate) fn build_effective_launch_config_evidence(
                 "backend_indices":root.backend_indices,
                 "controller":"shared-one-target-slot-global-connection-stream-owned-buffer-bounds",
                 "actor":root.bounds.semantics(),
+                "exchange_authorization":"original-test-session-and-exact-live-backend-subject-process-roster",
+                "exchange_target_admission":"runner-matches-selected-statement-task-stream-sequence-or-subscription-generation",
+                "exchange_hold":"all-exact-unit-retries-before-upstream-dispatch-until-explicit-release",
+                "exchange_ack_loss":"only-after-real-custody-receipt-never-synthetic-admission",
                 "control_tcp_budget":"original_backend_retained_byte_limit_separate_from_actor"
             })
         }),
@@ -665,7 +669,7 @@ mod tests {
             "[server]\nhost = \"127.0.0.1\"\nhttp_port = {http}\ngrpc_port = {grpc}\n{control}\
              [standalone_server]\n{mysql}\n{trino}\n\
              [cluster]\nrole = \"{role}\"\n{role_fields}\
-             [runtime]\nexchange_wait_ms = 1000\n{extra}\n\
+             [runtime]\noperator_buffer_chunks = 1000\n{extra}\n\
              [native_trust]\ndeployment_id = \"novarocks-system-tests\"\nshared_secret = \"${{ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}}\"\n\
              [native_trust.transport]\nmode = \"{transport_mode}\"\n"
         )

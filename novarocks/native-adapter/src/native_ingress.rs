@@ -893,6 +893,8 @@ mod tests {
         for method in [
             NativeRpcMethod::ApplyTaskOperations,
             NativeRpcMethod::FetchTaskResult,
+            NativeRpcMethod::DeliverExchangeUnit,
+            NativeRpcMethod::RegisterExchangeDemand,
         ] {
             assert!(matches!(data.classify(method), MethodClass::Ordinary));
         }
@@ -902,6 +904,10 @@ mod tests {
         ));
         assert!(matches!(
             data.classify(NativeRpcMethod::SubscribeTaskStatus),
+            MethodClass::Stream
+        ));
+        assert!(matches!(
+            data.classify(NativeRpcMethod::SubscribeExchangeGrants),
             MethodClass::Stream
         ));
         assert_eq!(NativeRpcMethod::from_path("/Other/Heartbeat"), None);

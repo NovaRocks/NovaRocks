@@ -53,6 +53,7 @@ use novarocks_types::UniqueId;
 
 use super::aggregate_fixture::{
     LoopbackTransmitter, destination, dop, hash, result_sink, stream_sink, try_compile, try_run,
+    try_run_in_fixture,
 };
 use super::family_fixture::{FixtureControl, cell, int64, int64_rows, values};
 use crate::exec::fragment::program::FragmentNodeId;
@@ -64,7 +65,7 @@ use crate::runtime::fragment::exchange::{
     CompiledExchangeReceivers, materialize_compiled_exchange_receivers,
 };
 use crate::runtime::fragment::instance::{ExchangeInputAssignment, ExchangeInputAssignments};
-use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
+use crate::runtime::fragment::io::exchange::test_support::Fixture;
 use crate::runtime::fragment::io::{ExchangeReceiverPort, NoopFragmentEventSink};
 use crate::runtime::runtime_state::RuntimeState;
 
@@ -828,9 +829,10 @@ pub(super) fn compile(
 /// Every receiver of `program`, registered for `instance` with `senders`
 /// expected sender instances each.
 fn register_all(
+    fixture: &Fixture,
     program: &LocalProgram,
     instance: UniqueId,
-    senders: usize,
+    sources: &BTreeMap<u32, Vec<UniqueId>>,
     port: &Arc<dyn ExchangeReceiverPort>,
 ) -> ExchangeBindings {
     let assignments = program
@@ -839,7 +841,9 @@ fn register_all(
         .map(|input| {
             (
                 FragmentNodeId::new(i32::try_from(input.receiver_node).unwrap()),
-                ExchangeInputAssignment::new(NonZeroUsize::new(senders).unwrap()),
+                ExchangeInputAssignment::new(
+                    NonZeroUsize::new(sources[&input.source_fragment].len()).unwrap(),
+                ),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -851,11 +855,18 @@ fn register_all(
         instance,
         &ExchangeInputAssignments::new(assignments),
         Arc::clone(port),
-        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
+        Some(&fixture.creation(instance)),
     )
     .expect("compiled receivers");
     for registration in registrations {
+        let key = registration.key;
+        let input = program
+            .exchange_inputs()
+            .values()
+            .find(|input| input.receiver_node == u32::try_from(key.node_id).unwrap())
+            .unwrap();
         port.register(registration).expect("register receiver");
+        fixture.bind(key, &sources[&input.source_fragment]);
     }
     bindings
 }
@@ -902,13 +913,32 @@ fn run_exchanged(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
     let join = compile(packages.remove(&JOIN).unwrap(), JOIN_DOP, false);
     let result = compile(packages.remove(&RESULT).unwrap(), 1, true);
 
-    let port = in_process_test_exchange_receiver_port();
-    let transmitter = LoopbackTransmitter::new(Arc::clone(&port));
-    let join_bindings = JOIN_FINSTS.map(|instance| register_all(&join, instance, 1, &port));
-    let result_bindings = register_all(&result, RESULT_FINST, JOIN_FINSTS.len(), &port);
+    let fixture = Fixture::new();
+    let port = fixture.port.clone();
+    let transmitter = LoopbackTransmitter::new(fixture.transport.clone());
+    let join_bindings = JOIN_FINSTS.map(|instance| {
+        register_all(
+            &fixture,
+            &join,
+            instance,
+            &BTreeMap::from([
+                (LEFT_SOURCE.get(), vec![LEFT_FINST]),
+                (RIGHT_SOURCE.get(), vec![RIGHT_FINST]),
+            ]),
+            &port,
+        )
+    });
+    let result_bindings = register_all(
+        &fixture,
+        &result,
+        RESULT_FINST,
+        &BTreeMap::from([(JOIN.get(), JOIN_FINSTS.to_vec())]),
+        &port,
+    );
 
     for (program, instance) in [(&left_source, LEFT_FINST), (&right_source, RIGHT_FINST)] {
         let sink = stream_sink(
+            &fixture,
             program,
             instance,
             JOIN_FINSTS
@@ -917,11 +947,18 @@ fn run_exchanged(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
                 .collect(),
             &transmitter,
         );
-        try_run(program, sink, ExchangeBindings::default(), instance)
-            .unwrap_or_else(|error| panic!("source runs: {error}"));
+        try_run_in_fixture(
+            &fixture,
+            program,
+            sink,
+            ExchangeBindings::default(),
+            instance,
+        )
+        .unwrap_or_else(|error| panic!("source runs: {error}"));
     }
     for (ordinal, (instance, bindings)) in JOIN_FINSTS.into_iter().zip(join_bindings).enumerate() {
         let sink = stream_sink(
+            &fixture,
             &join,
             instance,
             vec![destination(
@@ -932,11 +969,12 @@ fn run_exchanged(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
             )],
             &transmitter,
         );
-        try_run(&join, sink, bindings, instance)
+        try_run_in_fixture(&fixture, &join, sink, bindings, instance)
             .unwrap_or_else(|error| panic!("{spec:?} join instance runs: {error}"));
     }
     let output = ResultSinkHandle::new();
-    try_run(
+    try_run_in_fixture(
+        &fixture,
         &result,
         result_sink(&result, RESULT_FINST, &output),
         result_bindings,

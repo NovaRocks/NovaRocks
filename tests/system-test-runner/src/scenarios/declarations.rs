@@ -102,6 +102,24 @@ pub(super) fn for_module(
             "novarocks/worker/**",
             "novarocks/native-adapter/**",
         ],
+        "exchange_flow" => &[
+            "novarocks/execution/**",
+            "novarocks/execution-contract/**",
+            "novarocks/native-adapter/**",
+            "novarocks/worker/**",
+            "novarocks/frontend-application/**",
+            "novarocks/query-application/**",
+            "novarocks/sql/**",
+            "novarocks/physical-plan/**",
+            "novarocks/plan-codec/**",
+            "novarocks/task-codec/**",
+            "novarocks/proto-codec/**",
+            "novarocks/local-program/**",
+            "novarocks/local-compiler/**",
+            "novarocks/connector/iceberg/**",
+            "novarocks/fs/**",
+            "novarocks-server/**",
+        ],
         "memory_attribution" => &[
             "novarocks/memory/**",
             "novarocks/execution/**",
@@ -201,6 +219,8 @@ pub(super) fn for_module(
                 "tests/system-test-runner/src/scenarios/distributed_writer_row_level.rs",
                 "tests/system-test-runner/src/scenarios/distributed_writer_dop_observation.rs",
                 "tests/system-test-runner/src/scenarios/distributed_writer_same_file.rs",
+                "tests/system-test-runner/src/scenarios/distributed_writer_small_slots.rs",
+                "tests/system-test-runner/src/scenarios/exchange_flow.rs",
                 "novarocks/execution-contract/**",
                 "novarocks/result-contract/**",
                 "novarocks/physical-plan/**",
@@ -244,6 +264,16 @@ pub(super) fn for_module(
         ),
         heavy: None,
     };
+    if module == "exchange_flow" {
+        declaration.basis = Some(
+            "Fresh native FE+3BE and a private managed-runtime Hadoop Iceberg warehouse; original invocation budget, authenticated finite statement/role scopes, exact stream fault receipts, actual SlotPool/call guards and joined SQL/process owners. No shared fixture mutation or prepared benchmark input.",
+        );
+    }
+    if name == "connector/distributed-writer-row-level-small-slots" {
+        declaration.basis = Some(
+            "Original row-level data, types, DOP and SQL deadlines on isolated FE+3BE; explicit floor1/max2/floating0/window1 and the authenticated actual append hold/end-scope protocol. Original writer/source-summary identities, resource convergence and real exits remain required.",
+        );
+    }
     let env: &[(&str, &str)] = match module {
         "paimon" => &[
             ("NOVAROCKS_PAIMON_FIXTURE_MANIFEST", "file-content"),
@@ -396,6 +426,44 @@ pub(super) fn for_module(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn p10_exchange_and_small_slot_writer_share_their_actual_input_owners() {
+        let scenarios = super::super::all();
+        for id in [
+            "exchange/bounded-backpressure",
+            "exchange/cross-query-probe-build",
+            "exchange/unit-replay",
+            "exchange/grant-subscription-rebuild",
+            "exchange/long-wait-without-idle-failure",
+            "exchange/control-liveness",
+            "connector/distributed-writer-row-level-small-slots",
+        ] {
+            let matches: Vec<_> = scenarios
+                .iter()
+                .filter(|scenario| scenario.name() == id)
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "P10 exact ID must be registered once: {id}"
+            );
+            let declaration = matches[0].declaration();
+            assert_eq!(declaration.initial_state, Some("isolated"));
+            for owner in [
+                "novarocks/execution/**",
+                "novarocks/physical-plan/**",
+                "novarocks/task-codec/**",
+                "tests/cluster-harness/**",
+                "tests/system-test-runner/src/scenarios/exchange_flow.rs",
+            ] {
+                assert!(
+                    declaration.impact.paths.iter().any(|path| path == owner),
+                    "{id} omits {owner}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_native_scenario_declares_shared_process_and_session_owners() {
         let scenarios = super::super::all();

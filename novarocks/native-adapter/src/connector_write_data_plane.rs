@@ -213,7 +213,10 @@ impl ConnectorWriteObservationPort for NativeConnectorWriteObservationPort {
     fn hold_append(
         &self,
         writer: ConnectorWriterObservation,
-    ) -> Result<Option<novarocks_failpoint::scope::ControlCancellation>, ConnectorError> {
+    ) -> Result<
+        Option<novarocks_worker::connector_write_runtime::ConnectorAppendHold>,
+        ConnectorError,
+    > {
         let Some(scope) = self.claim_append_hold(writer.execution_id())? else {
             return Ok(None);
         };
@@ -221,8 +224,13 @@ impl ConnectorWriteObservationPort for NativeConnectorWriteObservationPort {
             .record_hit()
             .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
         crate::backend_metrics::record_connector_write_debug_fault("append_hold");
-        tracing::info!(target:WRITE_EVENT_TARGET,role="be",event="connector_write_append_hold",query_id=%writer.execution_id().query_id(),attempt_id=writer.execution_id().attempt_id().get(),node_id=writer.node_id(),write_target_ordinal=writer.target().get(),token=%scope.token,backend_process_id=%self.process_id,"holding a driver-local writer append until query or test-session cancellation");
-        Ok(Some(scope.cancellation()))
+        tracing::info!(target:WRITE_EVENT_TARGET,role="be",event="connector_write_append_hold",query_id=%writer.execution_id().query_id(),attempt_id=writer.execution_id().attempt_id().get(),node_id=writer.node_id(),write_target_ordinal=writer.target().get(),token=%scope.token,backend_process_id=%self.process_id,"holding a driver-local writer append until selected action end, query control or role session cancellation");
+        Ok(Some(Box::pin(async move {
+            scope
+                .wait_for_action_end()
+                .await
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
+        })))
     }
 }
 pub struct RoleBoundCommitFragmentEncoder {
@@ -671,15 +679,19 @@ mod tests {
         enum Release {
             TaskStop,
             SessionEnd,
+            SelectedEnd,
+            SelectedEndAndTaskStop,
+            ForeignSelectedEnd,
             OriginalDeadline,
         }
 
         async fn real_hold_case(release: Release) {
-            let fixture = crate::test_controls::tests::controlled("connector-write-append-hold");
-            crate::test_controls::tests::bind_fixture(
-                &fixture,
-                novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteAppendHold,
+            let kind = novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteAppendHold;
+            let fixture = crate::test_controls::tests::controlled_with_follow_up(
+                kind.as_str(),
+                matches!(release, Release::SelectedEnd),
             );
+            let binding = crate::test_controls::tests::bind_fixture(&fixture, kind);
             let observer = Arc::new(
                 NativeConnectorWriteObservationPort::new(fixture.process)
                     .with_test_controls(fixture.controls.clone()),
@@ -733,6 +745,32 @@ mod tests {
             match release {
                 Release::TaskStop => stop.request_stop(),
                 Release::SessionEnd => fixture.role.close(),
+                Release::SelectedEnd => {
+                    crate::test_controls::tests::end_fixture(&fixture, kind, &binding);
+                    assert!(fixture.role.scope().is_active());
+                }
+                Release::SelectedEndAndTaskStop => {
+                    crate::test_controls::tests::end_fixture(&fixture, kind, &binding);
+                    stop.request_stop();
+                }
+                Release::ForeignSelectedEnd => {
+                    // No valid retirement accompanies this foreign End: its
+                    // mismatched execution must fail, never release the hold.
+                    let foreign =
+                        novarocks_failpoint::target_binding::StatementExecutionBinding::new(
+                            binding.target_session_id.clone(),
+                            fixture.token.clone(),
+                            0,
+                            fixture.process,
+                            QueryExecutionId::new(
+                                novarocks_types::QueryId::new(71, 74),
+                                novarocks_types::AttemptId::new(1).unwrap(),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    crate::test_controls::tests::end_fixture(&fixture, kind, &foreign);
+                }
                 Release::OriginalDeadline => {}
             }
             let outcome = tokio::time::timeout(Duration::from_secs(5), append.as_mut())
@@ -744,7 +782,7 @@ mod tests {
                 "the original held batch actually retires"
             );
             match release {
-                Release::TaskStop => {
+                Release::TaskStop | Release::SelectedEndAndTaskStop => {
                     assert_eq!(outcome.unwrap_err().kind(), ConnectorErrorKind::Cancelled);
                     assert!(fixture.role.scope().is_active());
                     assert_eq!(calls.appended.load(Ordering::Acquire), 0);
@@ -753,6 +791,47 @@ mod tests {
                     outcome.unwrap();
                     assert!(!stop.view().is_stopped());
                     assert_eq!(calls.appended.load(Ordering::Acquire), 1);
+                }
+                Release::SelectedEnd => {
+                    outcome.unwrap();
+                    assert!(!stop.view().is_stopped());
+                    assert!(fixture.role.scope().is_active());
+                    assert_eq!(calls.appended.load(Ordering::Acquire), 1);
+                    // The same role still owns its predeclared later statement
+                    // and observations; do not end the role to release DOP 1.
+                    let next_execution = QueryExecutionId::new(
+                        novarocks_types::QueryId::new(71, 74),
+                        novarocks_types::AttemptId::new(1).unwrap(),
+                    )
+                    .unwrap();
+                    let next_token = format!("{}-next", fixture.token);
+                    crate::test_controls::tests::bind_statement(
+                        &fixture,
+                        kind,
+                        next_execution,
+                        &next_token,
+                    );
+                    let next = fixture
+                        .controls
+                        .claim(kind, next_execution, fixture.process, false)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(next.token, next_token);
+                    assert!(!next.action_ended().unwrap());
+                    next.record_hit().unwrap();
+                    let observations = fixture.role.scope().observations();
+                    assert_eq!(observations.iter().filter(|e| e.event == "hit").count(), 2);
+                    assert!(
+                        observations
+                            .iter()
+                            .any(|e| { e.grant_id == "second-action" && e.event == "hit" })
+                    );
+                }
+                Release::ForeignSelectedEnd => {
+                    assert_eq!(outcome.unwrap_err().kind(), ConnectorErrorKind::Internal);
+                    assert!(!stop.view().is_stopped());
+                    assert!(fixture.role.scope().is_active());
+                    assert_eq!(calls.appended.load(Ordering::Acquire), 0);
                 }
                 Release::OriginalDeadline => {
                     assert_eq!(
@@ -783,6 +862,18 @@ mod tests {
         #[tokio::test]
         async fn role_session_end_only_releases_the_gate_without_stopping_the_original_operation() {
             real_hold_case(Release::SessionEnd).await;
+        }
+        #[tokio::test]
+        async fn selected_action_end_releases_original_append_and_preserves_the_next_statement() {
+            real_hold_case(Release::SelectedEnd).await;
+        }
+        #[tokio::test]
+        async fn selected_action_end_cannot_override_the_original_task_stop() {
+            real_hold_case(Release::SelectedEndAndTaskStop).await;
+        }
+        #[tokio::test]
+        async fn foreign_selected_action_end_fails_without_appending_or_closing_the_role() {
+            real_hold_case(Release::ForeignSelectedEnd).await;
         }
         #[tokio::test]
         async fn held_append_observes_the_original_operation_deadline_without_a_new_stop_owner() {

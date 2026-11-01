@@ -71,6 +71,8 @@ mod writer_statement_actor;
 use writer_statement_actor::{WriterActor, retain_write_result};
 #[path = "distributed_writer_row_level.rs"]
 mod row_level_contract;
+#[path = "distributed_writer_small_slots.rs"]
+mod small_slots;
 
 use super::connector::{
     await_resource_convergence, connector_launch_config, create_catalog, create_warehouse,
@@ -129,6 +131,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(DistributedStatisticsDataflow),
         Box::new(DistributedWriterOverwrite),
         Box::new(DistributedWriterRowLevel::default()),
+        Box::new(DistributedWriterRowLevel::small_slots()),
         Box::new(DistributedWriterFaults::default()),
     ]
 }
@@ -2106,6 +2109,16 @@ impl Scenario for DistributedWriterOverwrite {
 #[derive(Default)]
 struct DistributedWriterRowLevel {
     observations: SqlIntentOwner,
+    small_slots: bool,
+}
+
+impl DistributedWriterRowLevel {
+    fn small_slots() -> Self {
+        Self {
+            observations: SqlIntentOwner::default(),
+            small_slots: true,
+        }
+    }
 }
 
 impl Scenario for DistributedWriterRowLevel {
@@ -2119,11 +2132,19 @@ impl Scenario for DistributedWriterRowLevel {
     }
 
     fn name(&self) -> &'static str {
-        "connector/distributed-writer-row-level"
+        if self.small_slots {
+            "connector/distributed-writer-row-level-small-slots"
+        } else {
+            "connector/distributed-writer-row-level"
+        }
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        if self.small_slots {
+            small_slots::launch_config()
+        } else {
+            Ok(connector_launch_config())
+        }
     }
 
     fn test_session_plan(
@@ -2134,8 +2155,14 @@ impl Scenario for DistributedWriterRowLevel {
         binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let mut specs = row_level_contract::observation_specs(cluster_size);
+        if self.small_slots {
+            small_slots::add_append_holds(&mut specs, cluster_size)?;
+            specs.push(small_slots::partition_observation(cluster_size));
+            specs.push(small_slots::selected_update_observation(cluster_size));
+        }
         Ok(Some(self.observations.freeze(
-            row_level_contract::observation_specs(cluster_size),
+            specs,
             &[],
             cluster_size,
             binary,
@@ -2145,6 +2172,9 @@ impl Scenario for DistributedWriterRowLevel {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
+        if self.small_slots {
+            small_slots::require_effective_config(context)?;
+        }
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
         let mut control = mysql_actor::connect(
@@ -2432,9 +2462,35 @@ impl Scenario for DistributedWriterRowLevel {
             bail!("MERGE left {merged:?}");
         }
 
-        row_level_contract::run(context, &mut control, CATALOG, DATABASE, &self.observations)?;
+        let partition_diagnostic = if self.small_slots {
+            Some(
+                self.observations
+                    .take(small_slots::PARTITION_OBSERVATION_INDEX)?,
+            )
+        } else {
+            None
+        };
+        row_level_contract::run(
+            context,
+            &mut control,
+            CATALOG,
+            DATABASE,
+            &self.observations,
+            partition_diagnostic,
+            if self.small_slots {
+                Some(
+                    self.observations
+                        .take(small_slots::SELECTED_UPDATE_OBSERVATION_INDEX)?,
+                )
+            } else {
+                None
+            },
+        )?;
 
         await_resource_convergence(context, &baseline, "distributed row-level writes")?;
+        if self.small_slots {
+            small_slots::retain_idle_flow(context)?;
+        }
         Ok(())
     }
 }

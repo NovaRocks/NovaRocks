@@ -539,7 +539,6 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
                     root_sink_dop: std::num::NonZeroUsize::new(1),
                     kernel_abi: novarocks_local_program::KernelAbiVersion::CURRENT,
                     constants: crate::application::test_constant_policy(),
-                    exchange_wait: std::time::Duration::from_secs(60),
                 },
                 &control,
             )

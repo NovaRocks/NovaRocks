@@ -10,6 +10,7 @@ mod distributed_writer;
 pub(crate) mod exact_mysql_native_driver;
 #[cfg(unix)]
 pub(crate) mod exact_mysql_native_oracle;
+mod exchange_flow;
 mod exchange_normal_close;
 mod execution_failure;
 #[cfg(unix)]
@@ -110,6 +111,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(native_ingress::scenarios());
     scenarios.extend(native_creation::scenarios());
     scenarios.extend(exchange_normal_close::scenarios());
+    scenarios.extend(exchange_flow::scenarios());
     scenarios.extend(preparation_capacity::scenarios());
     scenarios.extend(execution_failure::scenarios());
     scenarios.extend(execution_failure_representation::scenarios());

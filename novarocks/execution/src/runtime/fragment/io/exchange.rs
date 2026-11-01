@@ -1,344 +1,490 @@
-use std::fmt;
-
-use novarocks_execution_contract::{
-    ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeStreamIdentity, TaskIdentity,
-};
-use novarocks_types::UniqueId;
+//! Host-owned asynchronous transport boundary for exact Exchange units.
 
 use crate::runtime::endpoint::RuntimeEndpoint;
-use crate::task_execution::status::CancelReason;
+use novarocks_execution_contract::ExchangeStreamIdentity;
 
-use super::FragmentIoError;
-
-/// Encoded exchange payload prepared by the execution kernel for a host-owned
-/// transport adapter.
-#[derive(Clone, Debug)]
-pub struct ExchangeFrame {
-    /// Local operator fixtures have no Task. Native transport requires the
-    /// complete stream and checks every duplicated envelope field against it.
-    pub stream: Option<ExchangeStreamIdentity>,
-    pub delivery: ExchangeDeliveryRequirement,
-    pub destination: RuntimeEndpoint,
-    pub destination_fragment_instance_id: UniqueId,
-    pub destination_task_identity: Option<TaskIdentity>,
-    pub sender_fragment_instance_id: UniqueId,
-    pub sender_ordinal: u32,
-    pub sender_count: u32,
-    pub destination_node_id: i32,
-    pub sender_id: i32,
-    pub backend_number: i32,
-    pub sequence: i64,
-    pub eos: bool,
-    pub payload: Vec<u8>,
-}
-
-/// Why a destination refused one exchange frame.
-///
-/// A destination's normal departure and a real failure reach the producer
-/// through the same call, and only one of them is this producer's error. The
-/// enum is closed and keeps [`FragmentIoError`] for everything else, so a
-/// failure can never be reported as a success-compatible cancellation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExchangeTransmitRejection {
-    /// A receiver-authored close for this exact stream. This is separate from
-    /// an ordinary ACK, which proves admission rather than consumption.
-    NormallyClosed(ExchangeCloseDisposition),
-    /// The destination withdrew its ingress capability because it no longer
-    /// needs this producer's output. The producer closes that one edge,
-    /// discards that edge's frames, and waits to be cancelled by its
-    /// coordinator; it never concludes on its own that its stage succeeded.
-    DestinationCanceled(CancelReason),
-    /// Every other outcome: a failed, aborted, finished, or unknown
-    /// destination, an identity, process, source, or edge mismatch, a
-    /// malformed request, and every transport error.
-    Failed(FragmentIoError),
-}
-
-impl ExchangeTransmitRejection {
-    /// The normal cancellation reason, if this is a destination's normal
-    /// departure rather than a failure.
-    pub const fn cancel_reason(&self) -> Option<CancelReason> {
-        match self {
-            Self::NormallyClosed(_) => None,
-            Self::DestinationCanceled(reason) => Some(*reason),
-            Self::Failed(_) => None,
-        }
-    }
-
-    /// The producer's own failure cause, if this rejection is one.
-    pub const fn failure(&self) -> Option<&FragmentIoError> {
-        match self {
-            Self::NormallyClosed(_) => None,
-            Self::DestinationCanceled(_) => None,
-            Self::Failed(error) => Some(error),
-        }
-    }
-}
-
-impl fmt::Display for ExchangeTransmitRejection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NormallyClosed(disposition) => {
-                write!(formatter, "exchange input closed: {disposition:?}")
-            }
-            Self::DestinationCanceled(reason) => {
-                write!(formatter, "exchange destination cancelled: {reason}")
-            }
-            Self::Failed(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for ExchangeTransmitRejection {}
-
-impl From<FragmentIoError> for ExchangeTransmitRejection {
-    fn from(error: FragmentIoError) -> Self {
-        Self::Failed(error)
-    }
-}
-
-/// Host-owned transport boundary for exchange frames.
+/// All implementations explicitly install the Unit/End, demand and observation
+/// contract. Data call activity remains with its actual request owner through
+/// exit, independently of receipt, timeout or cancellation observations.
 pub trait ExchangeFrameTransmitter: Send + Sync + 'static {
-    fn transmit(&self, frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection>;
-
-    /// A task-scoped stop signal. Transports with cancellable I/O should
-    /// override this so cancellation interrupts a blocked send as well as
-    /// preventing queued successors from starting.
-    fn transmit_cancellable(
+    fn deliver_unit(
         &self,
-        frame: ExchangeFrame,
-        _stop: tokio_util::sync::CancellationToken,
-    ) -> Result<(), ExchangeTransmitRejection> {
-        self.transmit(frame)
+        frame: super::exchange_unit::ExchangeUnitFrame,
+        stop: tokio_util::sync::CancellationToken,
+        activity: super::exchange_unit::ExchangeCallActivity,
+        done: super::exchange_unit::ExchangeDeliveryCallback,
+    );
+    fn register_unit_demands(
+        &self,
+        destination: RuntimeEndpoint,
+        entries: Vec<super::exchange_unit::ExchangeDemandEntry>,
+        stop: tokio_util::sync::CancellationToken,
+        done: super::exchange_unit::ExchangeDemandCallback,
+    );
+    fn watch_unit_facts(
+        &self,
+        destination: RuntimeEndpoint,
+        stream: ExchangeStreamIdentity,
+        wake: super::exchange_unit::ExchangeGrantWake,
+    ) -> Result<(), novarocks_failure_contract::FailureFact>;
+    fn forget_unit_facts(&self, stream: ExchangeStreamIdentity);
+    fn schedule_unit_retry(
+        &self,
+        delay: std::time::Duration,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), novarocks_failure_contract::FailureFact>;
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::runtime::execution_runtime::ExecutionRuntime;
+    use crate::runtime::fragment::io::exchange_unit::*;
+    use crate::runtime::fragment::io::{
+        ExchangeReceiverKey, ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
+    };
+    use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+    use novarocks_execution_contract::{ExchangeSource, FragmentNodeId, TaskIdentity};
+    use novarocks_types::UniqueId;
+    use novarocks_types::identity::{StageId, TaskId};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    pub(crate) struct Fixture {
+        pub(crate) runtime: Arc<ExecutionRuntime>,
+        pub(crate) port: Arc<dyn ExchangeReceiverPort>,
+        pub(crate) transport: Arc<UnitLoopback>,
+        base: TaskIdentity,
+        states: Mutex<HashMap<UniqueId, Arc<RuntimeState>>>,
+    }
+    impl Fixture {
+        pub(crate) fn new() -> Arc<Self> {
+            Self::with_runtime(crate::runtime::execution_runtime::test_execution_runtime())
+        }
+        pub(crate) fn with_runtime(runtime: Arc<ExecutionRuntime>) -> Arc<Self> {
+            let port: Arc<dyn ExchangeReceiverPort> =
+                Arc::new(ExecutionRuntimeExchangeReceiverPort::new(runtime.clone()));
+            let transport = UnitLoopback::new(port.clone());
+            let base = crate::runtime::task_control::test_support::Owner::new()
+                .view(novarocks_execution_contract::TaskFailurePhase::Execution)
+                .identity();
+            Arc::new(Self {
+                runtime,
+                port,
+                transport,
+                base,
+                states: Mutex::new(HashMap::new()),
+            })
+        }
+        pub(crate) fn state(&self, instance: UniqueId) -> Arc<RuntimeState> {
+            let mut states = self.states.lock().unwrap();
+            if let Some(state) = states.get(&instance) {
+                return state.clone();
+            }
+            let identity = TaskIdentity::new(
+                self.base.query_execution_id(),
+                StageId::new(1).unwrap(),
+                TaskId::new(u32::try_from(states.len() + 1).unwrap()).unwrap(),
+                self.base.backend_process_id(),
+            );
+            let owner = crate::runtime::task_control::test_support::owner_for(identity);
+            let control = Arc::new(RuntimeErrorState::for_task(Arc::new(
+                owner.view(novarocks_execution_contract::TaskFailurePhase::Execution),
+            )));
+            let tracker =
+                crate::runtime::mem_tracker::MemTracker::new_root("compiled Unit fixture Task");
+            tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+            let state = Arc::new(RuntimeState::new(
+                None,
+                None,
+                None,
+                Some(instance),
+                Some(1),
+                Some(tracker),
+                Some(self.runtime.clone()),
+                control,
+            ));
+            states.insert(instance, state.clone());
+            state
+        }
+        pub(crate) fn task(&self, instance: UniqueId) -> TaskIdentity {
+            self.state(instance).error_state().task_identity().unwrap()
+        }
+        pub(crate) fn creation(
+            &self,
+            instance: UniqueId,
+        ) -> Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory> {
+            let state = self.state(instance);
+            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                state.mem_tracker().unwrap().clone(), state.error_state().clone(),
+            ).unwrap()
+        }
+        pub(crate) fn stream(
+            &self,
+            source: UniqueId,
+            destination: UniqueId,
+            node: i32,
+            ordinal: u32,
+        ) -> ExchangeStreamIdentity {
+            ExchangeStreamIdentity::try_new(
+                ExchangeSource::new(self.task(source), source, ordinal),
+                self.task(destination),
+                destination,
+                FragmentNodeId::new(node),
+            )
+            .unwrap()
+        }
+        pub(crate) fn bind(&self, key: ExchangeReceiverKey, sources: &[UniqueId]) {
+            let streams = sources
+                .iter()
+                .enumerate()
+                .map(|(ordinal, source)| {
+                    self.stream(
+                        *source,
+                        key.fragment_instance_id,
+                        key.node_id,
+                        u32::try_from(ordinal).unwrap(),
+                    )
+                })
+                .collect();
+            self.port.bind_unit_receiver(key, streams, self.state(key.fragment_instance_id).error_state().clone(), novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64).unwrap();
+        }
+        pub(crate) fn destination(
+            &self,
+            destination: UniqueId,
+            source: UniqueId,
+            ordinal: u32,
+            count: u32,
+        ) -> crate::runtime::endpoint::FragmentDestination {
+            crate::runtime::endpoint::FragmentDestination::new(
+                destination,
+                RuntimeEndpoint::new("127.0.0.1", 9030).unwrap(),
+                source,
+                ordinal,
+                count,
+            )
+            .unwrap()
+            .with_task_identity(self.task(destination))
+        }
+        pub(crate) fn assignment(
+            &self,
+            assignment: &crate::runtime::fragment::instance::FragmentSinkAssignment,
+        ) -> crate::runtime::fragment::instance::FragmentSinkAssignment {
+            use crate::runtime::fragment::instance::FragmentSinkAssignment;
+            let bind = |dest: crate::runtime::endpoint::FragmentDestination| {
+                let task = self.task(*dest.finst_id());
+                dest.with_task_identity(task)
+            };
+            match assignment {
+                FragmentSinkAssignment::StreamDestinations {
+                    destinations,
+                    sender_id,
+                } => FragmentSinkAssignment::StreamDestinations {
+                    destinations: destinations.iter().cloned().map(bind).collect(),
+                    sender_id: *sender_id,
+                },
+                FragmentSinkAssignment::DestinationGroups { groups, sender_id } => {
+                    FragmentSinkAssignment::DestinationGroups {
+                        groups: groups
+                            .iter()
+                            .map(|group| group.iter().cloned().map(bind).collect())
+                            .collect(),
+                        sender_id: *sender_id,
+                    }
+                }
+                other => other.clone(),
+            }
+        }
+        pub(crate) fn gates(
+            &self,
+            program: &novarocks_local_program::LocalProgram,
+            assignment: &crate::runtime::fragment::instance::FragmentSinkAssignment,
+        ) -> Option<Arc<super::super::exchange_edge::ExchangeEdgeGates>> {
+            use super::super::exchange_edge::{ExchangeDestinationKey, ExchangeEdgeGates};
+            use crate::runtime::fragment::instance::FragmentSinkAssignment;
+            use crate::task_execution::domain::{EdgeOpenVersion, ExchangeEdgeId};
+            let branches: Vec<_> = match (assignment, program.graph().sink()) {
+                (
+                    FragmentSinkAssignment::StreamDestinations { destinations, .. },
+                    Some(novarocks_local_program::StaticSinkProgram::DataStream { branch, .. }),
+                ) => vec![(branch.dest_node_id(), destinations)],
+                (
+                    FragmentSinkAssignment::DestinationGroups { groups, .. },
+                    Some(novarocks_local_program::StaticSinkProgram::ChangeStreamRouter {
+                        branches,
+                        ..
+                    }),
+                ) => branches
+                    .iter()
+                    .zip(groups)
+                    .map(|(branch, group)| (branch.dest_node_id(), group))
+                    .collect(),
+                _ => return None,
+            };
+            let edges: Vec<_> = branches
+                .into_iter()
+                .enumerate()
+                .map(|(index, (node, destinations))| {
+                    (
+                        ExchangeEdgeId::new(u32::try_from(index + 1).unwrap()).unwrap(),
+                        destinations
+                            .iter()
+                            .map(|dest| ExchangeDestinationKey::new(*dest.finst_id(), node))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let ids = edges.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            let gates = ExchangeEdgeGates::try_new(edges).unwrap();
+            gates.open(EdgeOpenVersion::new(1).unwrap(), &ids).unwrap();
+            Some(gates)
+        }
+        pub(crate) fn sink(
+            &self,
+            program: &Arc<novarocks_local_program::LocalProgram>,
+            assignment: &crate::runtime::fragment::instance::FragmentSinkAssignment,
+            instance: UniqueId,
+            transmitter: Arc<dyn ExchangeFrameTransmitter>,
+            result: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+            gates: Option<Arc<super::super::exchange_edge::ExchangeEdgeGates>>,
+        ) -> Result<
+            Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>,
+            crate::runtime::fragment::error::FragmentLaunchError,
+        > {
+            let assignment = self.assignment(assignment);
+            let gates = gates.or_else(|| self.gates(program, &assignment));
+            crate::runtime::fragment::sink::materialize_compiled_sink(
+                program,
+                &assignment,
+                instance,
+                transmitter,
+                result,
+                gates,
+            )
+        }
+    }
+
+    pub(crate) struct UnitLoopback {
+        port: Arc<dyn ExchangeReceiverPort>,
+        watches: Arc<Mutex<HashMap<ExchangeStreamIdentity, ExchangeGrantWake>>>,
+    }
+    struct Listener(Arc<Mutex<HashMap<ExchangeStreamIdentity, ExchangeGrantWake>>>);
+    impl ExchangeUnitStateListener for Listener {
+        fn changed(&self, observation: ExchangeStreamObservation) {
+            let wake = self.0.lock().unwrap().get(&observation.stream).cloned();
+            if let Some(wake) = wake {
+                wake(ExchangeGrantNotice::Facts(observation.facts));
+            }
+        }
+    }
+    impl UnitLoopback {
+        pub(crate) fn new(port: Arc<dyn ExchangeReceiverPort>) -> Arc<Self> {
+            let watches = Arc::new(Mutex::new(HashMap::new()));
+            port.set_unit_state_listener(Arc::new(Listener(watches.clone())))
+                .unwrap();
+            Arc::new(Self { port, watches })
+        }
+        fn key(stream: ExchangeStreamIdentity) -> ExchangeReceiverKey {
+            ExchangeReceiverKey {
+                fragment_instance_id: stream.destination_fragment_instance_id(),
+                node_id: stream.destination_node().get(),
+            }
+        }
+    }
+    impl ExchangeFrameTransmitter for UnitLoopback {
+        fn deliver_unit(
+            &self,
+            frame: ExchangeUnitFrame,
+            _stop: tokio_util::sync::CancellationToken,
+            activity: ExchangeCallActivity,
+            done: ExchangeDeliveryCallback,
+        ) {
+            let result = self
+                .port
+                .receive_unit(Self::key(frame.receiver.stream), frame.receiver);
+            done(match result {
+                Ok(receipt) => ExchangeCallOutcome::Observed(receipt),
+                Err(failure) => ExchangeCallOutcome::Refused(failure),
+            });
+            drop(activity);
+        }
+        fn register_unit_demands(
+            &self,
+            _destination: RuntimeEndpoint,
+            entries: Vec<ExchangeDemandEntry>,
+            _stop: tokio_util::sync::CancellationToken,
+            done: ExchangeDemandCallback,
+        ) {
+            let results = entries
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.stream,
+                        self.port
+                            .register_unit_demand(Self::key(entry.stream), entry)
+                            .map(|observation| observation.facts),
+                    )
+                })
+                .collect();
+            done(ExchangeDemandCallOutcome::Observed(results));
+        }
+        fn watch_unit_facts(
+            &self,
+            _destination: RuntimeEndpoint,
+            stream: ExchangeStreamIdentity,
+            wake: ExchangeGrantWake,
+        ) -> Result<(), novarocks_failure_contract::FailureFact> {
+            self.watches.lock().unwrap().insert(stream, wake.clone());
+            let observations = self.port.unit_sender_states(
+                stream.source().task().backend_process_id(),
+                None,
+                usize::MAX,
+            )?;
+            if let Some(observation) = observations
+                .into_iter()
+                .find(|observation| observation.stream == stream)
+            {
+                wake(ExchangeGrantNotice::Facts(observation.facts));
+            }
+            Ok(())
+        }
+        fn forget_unit_facts(&self, stream: ExchangeStreamIdentity) {
+            self.watches.lock().unwrap().remove(&stream);
+        }
+        fn schedule_unit_retry(
+            &self,
+            delay: std::time::Duration,
+            task: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Result<(), novarocks_failure_contract::FailureFact> {
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                task();
+            });
+            Ok(())
+        }
+    }
+
+    // Result-only programs have no outbound route; an accidental use fails the
+    // fixture immediately instead of manufacturing receiver custody.
+    pub(crate) struct UnusedTransport;
+    impl ExchangeFrameTransmitter for UnusedTransport {
+        fn deliver_unit(
+            &self,
+            _: ExchangeUnitFrame,
+            _: tokio_util::sync::CancellationToken,
+            _: ExchangeCallActivity,
+            _: ExchangeDeliveryCallback,
+        ) {
+            panic!("result-only fixture attempted Unit delivery")
+        }
+        fn register_unit_demands(
+            &self,
+            _: RuntimeEndpoint,
+            _: Vec<ExchangeDemandEntry>,
+            _: tokio_util::sync::CancellationToken,
+            _: ExchangeDemandCallback,
+        ) {
+            panic!("result-only fixture attempted demand registration")
+        }
+        fn watch_unit_facts(
+            &self,
+            _: RuntimeEndpoint,
+            _: ExchangeStreamIdentity,
+            _: ExchangeGrantWake,
+        ) -> Result<(), novarocks_failure_contract::FailureFact> {
+            panic!("result-only fixture attempted subscription")
+        }
+        fn forget_unit_facts(&self, _: ExchangeStreamIdentity) {}
+        fn schedule_unit_retry(
+            &self,
+            _: std::time::Duration,
+            _: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Result<(), novarocks_failure_contract::FailureFact> {
+            panic!("result-only fixture attempted retry")
+        }
     }
 }
 
 #[cfg(test)]
 pub(crate) fn discard_exchange_transmitter() -> std::sync::Arc<dyn ExchangeFrameTransmitter> {
-    std::sync::Arc::new(DiscardExchangeFrameTransmitter)
-}
-
-#[cfg(test)]
-struct DiscardExchangeFrameTransmitter;
-
-#[cfg(test)]
-impl ExchangeFrameTransmitter for DiscardExchangeFrameTransmitter {
-    fn transmit(&self, _frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
-        Ok(())
-    }
+    std::sync::Arc::new(test_support::UnusedTransport)
 }
 
 #[cfg(test)]
 pub(crate) fn in_process_test_exchange_receiver_port()
 -> std::sync::Arc<dyn super::ExchangeReceiverPort> {
-    std::sync::Arc::new(TestExchangeReceiverPort::default())
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct TestExchangeReceiverPort {
-    registry: std::sync::Arc<crate::runtime::exchange::ExecutionExchangeRegistry>,
-}
-
-#[cfg(test)]
-impl TestExchangeReceiverPort {
-    fn key(key: super::ExchangeReceiverKey) -> crate::runtime::exchange::ExchangeKey {
-        crate::runtime::exchange::ExchangeKey {
-            finst_id_hi: key.fragment_instance_id.high(),
-            finst_id_lo: key.fragment_instance_id.low(),
-            node_id: key.node_id,
-        }
-    }
-}
-
-#[cfg(test)]
-impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
-    fn register(
-        &self,
-        registration: super::ExchangeReceiverRegistration,
-    ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
-        self.registry
-            .try_register_expected_chunk_schema_with_binding(
-                Self::key(registration.key),
-                registration.expected_senders,
-                registration.expected_chunk_schema,
-                registration.column_binding,
-                registration.creation_factory,
-            )
-    }
-
-    fn push(
-        &self,
-        key: super::ExchangeReceiverKey,
-        frame: super::ExchangeReceiverFrame,
-    ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
-        self.registry.admit_native_frame(Self::key(key), frame)
-    }
-
-    fn cancel(&self, key: super::ExchangeReceiverKey) {
-        self.registry.cancel_exchange_key(Self::key(key));
-    }
-    fn remove(&self, key: super::ExchangeReceiverKey) {
-        self.registry.remove_exchange_key(Self::key(key));
-    }
-    fn cancel_fragment(&self, fragment_instance_id: UniqueId) {
-        self.registry
-            .cancel_fragment(fragment_instance_id.high(), fragment_instance_id.low());
-    }
-    fn receiver_handle(
-        &self,
-        key: super::ExchangeReceiverKey,
-        expected_senders: usize,
-    ) -> Result<
-        crate::runtime::exchange::ExchangeReceiverHandle,
-        crate::runtime::exchange::ExchangeFailure,
-    > {
-        self.registry
-            .get_receiver_handle(Self::key(key), expected_senders)
-    }
-    fn stream_close_facts(
-        &self,
-        key: super::ExchangeReceiverKey,
-        expected: &[novarocks_execution_contract::ExchangeStreamIdentity],
-    ) -> Result<
-        Vec<novarocks_execution_contract::ExchangeStreamClose>,
-        crate::runtime::exchange::ExchangeFailure,
-    > {
-        self.registry.stream_close_facts(Self::key(key), expected)
-    }
-    fn ensure_mem_tracker(
-        &self,
-        key: super::ExchangeReceiverKey,
-        root: &std::sync::Arc<crate::runtime::mem_tracker::MemTracker>,
-    ) -> Result<
-        std::sync::Arc<crate::runtime::mem_tracker::MemTracker>,
-        crate::runtime::exchange::ExchangeFailure,
-    > {
-        self.registry
-            .ensure_receiver_mem_tracker(Self::key(key), root)
-    }
-    fn push_local(
-        &self,
-        key: super::ExchangeReceiverKey,
-        sender_id: i32,
-        backend_number: i32,
-        chunks: Vec<crate::exec::chunk::Chunk>,
-        eos: bool,
-    ) {
-        self.registry.push_chunks(
-            Self::key(key),
-            crate::runtime::exchange::ExchangeSenderIdentity::local(sender_id, backend_number),
-            chunks,
-            eos,
-        );
-    }
-    fn snapshot(
-        &self,
-        key: super::ExchangeReceiverKey,
-    ) -> Option<crate::runtime::exchange::ExchangeReceiverSnapshot> {
-        self.registry.snapshot_receiver_state(Self::key(key))
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn fixture_stream(
-    source_kernel: UniqueId,
-    destination_kernel: UniqueId,
-    node: i32,
-    ordinal: u32,
-) -> ExchangeStreamIdentity {
-    use novarocks_types::identity::{
-        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
-    };
-    static PROCESS: std::sync::OnceLock<BackendProcessId> = std::sync::OnceLock::new();
-    let process = *PROCESS.get_or_init(BackendProcessId::new_v7);
-    let query = QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap();
-    let source = TaskIdentity::new(
-        query,
-        StageId::new(1).unwrap(),
-        TaskId::new(ordinal + 1).unwrap(),
-        process,
-    );
-    let target = TaskIdentity::new(
-        query,
-        StageId::new(2).unwrap(),
-        TaskId::new(1).unwrap(),
-        process,
-    );
-    ExchangeStreamIdentity::try_new(
-        novarocks_execution_contract::ExchangeSource::new(source, source_kernel, ordinal),
-        target,
-        destination_kernel,
-        novarocks_execution_contract::FragmentNodeId::new(node),
-    )
-    .unwrap()
+    std::sync::Arc::new(super::ExecutionRuntimeExchangeReceiverPort::new(
+        crate::runtime::execution_runtime::test_execution_runtime(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::in_process_test_exchange_receiver_port;
-    use crate::runtime::fragment::io::{ExchangeReceiverFrame, ExchangeReceiverKey};
+    use super::test_support::Fixture;
+    use crate::runtime::fragment::io::exchange_unit::{
+        ExchangeUnitItem, ExchangeUnitReceiverFrame, ExchangeUnitSequence,
+    };
+    use crate::runtime::fragment::io::{ExchangeReceiverKey, ExchangeReceiverRegistration};
     use novarocks_types::UniqueId;
 
     #[test]
     fn native_eos_uses_exact_source_identity_when_legacy_sender_fields_collide() {
-        let port = in_process_test_exchange_receiver_port();
+        let fixture = Fixture::new();
+        let port = &fixture.port;
         let key = ExchangeReceiverKey {
             fragment_instance_id: UniqueId::new(50, 60),
             node_id: 70,
         };
-        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("exact native EOS fixture");
-        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-            tracker.clone(), std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
-        ).unwrap();
+        let sources = [UniqueId::new(1, 1), UniqueId::new(2, 2)];
+        let factory = fixture.creation(key.fragment_instance_id);
         let layout = crate::exec::chunk::typed_fixture::layout(
             std::sync::Arc::new(arrow::datatypes::Schema::empty()),
             &[],
             &[],
         );
-        let expected = factory.create_compiled_chunk_schema(&layout).unwrap();
-        port.register(crate::runtime::fragment::io::ExchangeReceiverRegistration {
+        port.register(ExchangeReceiverRegistration {
             key,
             expected_senders: 2,
-            expected_chunk_schema: expected,
+            expected_chunk_schema: factory.create_compiled_chunk_schema(&layout).unwrap(),
             column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
             creation_factory: factory.clone(),
         })
-        .expect("actual native receiver installation");
-        let frame = |source_fragment_instance_id, sender_ordinal| ExchangeReceiverFrame {
-            stream: super::fixture_stream(
-                source_fragment_instance_id,
-                key.fragment_instance_id,
-                key.node_id,
-                sender_ordinal,
-            ),
-            source_fragment_instance_id,
-            sender_ordinal,
-            sender_count: 2,
-            // These legacy fields intentionally collide. Native completion
-            // identity must not use either of them.
-            sender_id: 7,
-            backend_number: 11,
-            sequence: 0,
-            eos: true,
-            payload: Vec::new(),
-        };
-
-        port.push(key, frame(UniqueId::new(1, 1), 0))
-            .expect("first native eos");
-        port.push(key, frame(UniqueId::new(2, 2), 1))
-            .expect("second native eos");
-
-        let snapshot = port.snapshot(key).expect("receiver snapshot");
+        .unwrap();
+        fixture.bind(key, &sources);
+        for (ordinal, source) in sources.into_iter().enumerate() {
+            port.receive_unit(
+                key,
+                ExchangeUnitReceiverFrame {
+                    stream: fixture.stream(
+                        source,
+                        key.fragment_instance_id,
+                        key.node_id,
+                        u32::try_from(ordinal).unwrap(),
+                    ),
+                    sender_count: 2,
+                    sender_id: 7,
+                    backend_number: 11,
+                    item: ExchangeUnitItem::End(ExchangeUnitSequence::FIRST),
+                    payload: bytes::Bytes::new(),
+                    next_demand: None,
+                },
+            )
+            .unwrap();
+        }
+        let snapshot = port.snapshot(key).unwrap();
         assert_eq!(snapshot.finished_senders, 2);
         port.remove(key);
         assert!(port.snapshot(key).is_none());
         drop(factory);
+        // The same Task owns schema construction and runtime execution.
         assert_eq!(
-            tracker.current(),
-            0,
-            "removed receiver releases its finite creation"
+            fixture
+                .state(key.fragment_instance_id)
+                .mem_tracker()
+                .unwrap()
+                .current(),
+            0
         );
     }
 }
