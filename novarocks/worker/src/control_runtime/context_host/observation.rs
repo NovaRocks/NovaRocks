@@ -626,21 +626,38 @@ impl super::ContextHostRecord {
     }
 }
 
+/// Pure metadata continuation is independent of execution Scope lifetime.
+/// A blocked original owner still supplies its own actual progress notice.
+pub(super) enum ObservationTeardownProgress {
+    Blocked,
+    MoreReady,
+    Complete,
+}
+
 impl super::ContextHostRecord {
-    pub(super) fn advance_observation_teardown(&mut self, budget: usize) -> bool {
+    pub(super) fn advance_observation_teardown(
+        &mut self,
+        budget: usize,
+    ) -> ObservationTeardownProgress {
         // The original Root RemoveHost transfer closes future control and
         // subscription issuance. RetireReservation follows HostRemoved, so it
         // cannot authorize the child metadata teardown which publishes that
         // fact. The parent payment still waits for its separate retirement.
         if !self.resources.control_admission_closed || !self.resources.requests.is_empty() {
-            return false;
+            return ObservationTeardownProgress::Blocked;
         }
-        if let Some(source) = self.resources.observation.as_mut()
-            && (source.publication_pending()
-                || source.subscriptions() != 0
-                || !source.source.drain_unsubscribed(budget).complete)
-        {
-            return false;
+        if let Some(source) = self.resources.observation.as_mut() {
+            if source.publication_pending() || source.subscriptions() != 0 {
+                return ObservationTeardownProgress::Blocked;
+            }
+            let drained = source.source.drain_unsubscribed(budget);
+            if !drained.complete {
+                return if drained.work != 0 {
+                    ObservationTeardownProgress::MoreReady
+                } else {
+                    ObservationTeardownProgress::Blocked
+                };
+            }
         }
         // These are original sealed neutral read observations, not rich Task
         // owners. Retire one indexed snapshot per charged metadata unit.
@@ -649,6 +666,12 @@ impl super::ContextHostRecord {
                 break;
             }
         }
-        self.retired_task_reads.is_empty()
+        if self.retired_task_reads.is_empty() {
+            ObservationTeardownProgress::Complete
+        } else if budget != 0 {
+            ObservationTeardownProgress::MoreReady
+        } else {
+            ObservationTeardownProgress::Blocked
+        }
     }
 }

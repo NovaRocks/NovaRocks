@@ -18,6 +18,7 @@
 //! The actual Context metadata turn. Effects move only into their original
 //! owners; physical getters, callbacks and destructors run in the host pools.
 
+use super::observation::ObservationTeardownProgress;
 use super::task_driver::{TaskDriverError, TaskDriverPorts, TaskDriverProgress};
 use super::{ContextHostProgress, ContextHostProgressError, ContextHostRecord};
 use crate::control_runtime::{
@@ -779,19 +780,23 @@ impl ContextHostRecord {
         progress.runnable |= self
             .advance_root_reads(tasks, budget)
             .map_err(ContextDriverError::Request)?;
-        if self.advance_observation_teardown(budget) {
-            if failed && !detached && !self.failed_owner_completed() && !self.failure_tail_started()
-            {
-                progress.runnable |= self.advance_failed_cleanup_tail(tasks, budget)?;
+        match self.advance_observation_teardown(budget) {
+            ObservationTeardownProgress::Complete => {
+                if failed
+                    && !detached
+                    && !self.failed_owner_completed()
+                    && !self.failure_tail_started()
+                {
+                    progress.runnable |= self.advance_failed_cleanup_tail(tasks, budget)?;
+                }
+                progress.metadata_teardown_ready = self
+                    .advance_metadata_teardown()
+                    .map_err(ContextDriverError::Metadata)?;
             }
-            progress.metadata_teardown_ready = self
-                .advance_metadata_teardown()
-                .map_err(ContextDriverError::Metadata)?;
-        } else if !detached
-            && self.resources.control_admission_closed
-            && self.resources.requests.is_empty()
-        {
-            progress.runnable = true;
+            // Cold metadata still owns its bounded cursor after the execution
+            // Scope has exited. No physical producer remains to wake this tail.
+            ObservationTeardownProgress::MoreReady => progress.runnable = true,
+            ObservationTeardownProgress::Blocked => {}
         }
         if progress.metadata_teardown_ready
             && let Some(capacity) = &tasks.capacity
