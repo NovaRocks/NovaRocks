@@ -21,20 +21,21 @@
 //! result.  This adapter is the sole place that recovers generated payloads
 //! from codec-owned handles.
 
-use std::sync::Arc;
+use prost::Message;
+use sha2::{Digest, Sha256};
 
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_execution_contract::task_execution::domain::CodecOwnedContent;
+use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, ContentFingerprint};
 use novarocks_execution_contract::task_execution::operation::CredentialUpdate;
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_spi::connector::CatalogProperties;
-use novarocks_task_codec::domain::{
-    WireContent, WireCredential, stored_credential, stored_message,
+use novarocks_task_codec::domain::{WireCredential, stored_credential, stored_message};
+use novarocks_worker::{
+    FrozenCodecContent, HostRejection, ReleasedContextEvidence, RuntimeFilterReleaseObservation,
 };
-use novarocks_worker::{HostRejection, ReleasedContextEvidence, RuntimeFilterReleaseObservation};
 
 use crate::query_options::decode_query_options;
 
@@ -66,11 +67,21 @@ pub fn sealed_runtime_filter_evidence(
     } else {
         RuntimeFilterReleaseObservation::Unavailable
     };
+    // The validated original is encoded once while its host-owned backing is
+    // still supervised. Cold retention keeps no generated value or alias hook.
+    let bytes = telemetry.as_proto().encode_to_vec();
+    let mut hasher = Sha256::new();
+    hasher.update(RELEASE_RUNTIME_FILTER_EVIDENCE_DOMAIN_TAG);
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    let mut fingerprint = [0u8; 16];
+    fingerprint.copy_from_slice(&digest[..16]);
     ReleasedContextEvidence::with_runtime_filter(
-        Arc::new(WireContent::new(
+        FrozenCodecContent::new(
             RELEASE_RUNTIME_FILTER_EVIDENCE_DOMAIN_TAG,
-            telemetry.as_proto().clone(),
-        )),
+            ContentFingerprint::from_bytes(fingerprint),
+            bytes.into(),
+        ),
         observation,
     )
 }
@@ -81,11 +92,12 @@ pub fn release_runtime_filter_telemetry(
     evidence
         .runtime_filter()
         .map(|payload| {
-            let raw = stored_message::<proto::QueryTerminalProfileContributionTelemetry>(
-                payload.as_ref(),
-            )
-            .ok_or_else(|| carrier_mismatch(SharedFactCarrier::Terminal))?;
-            QueryTerminalProfileContributionTelemetry::parse(raw.clone())
+            if payload.domain_tag() != RELEASE_RUNTIME_FILTER_EVIDENCE_DOMAIN_TAG {
+                return Err(carrier_mismatch(SharedFactCarrier::Terminal));
+            }
+            let raw = proto::QueryTerminalProfileContributionTelemetry::decode(payload.bytes())
+                .map_err(|_| carrier_mismatch(SharedFactCarrier::Terminal))?;
+            QueryTerminalProfileContributionTelemetry::parse(raw)
                 .map_err(|error| HostRejection::from_domain(TaskFailureCategory::Internal, error))
         })
         .transpose()
@@ -158,7 +170,10 @@ mod tests {
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{catalog, filter, novarocks as proto};
     use novarocks_task_codec::domain::{WireContent, WireCredential};
-    use novarocks_worker::{ReleasedContextEvidence, RuntimeFilterReleaseObservation};
+    use novarocks_worker::{
+        FrozenCodecContent, ReleasedContextEvidence, RuntimeFilterReleaseObservation,
+    };
+    use prost::Message;
     use std::sync::Arc;
 
     fn wire<T: prost::Message + 'static>(
@@ -209,10 +224,16 @@ mod tests {
 
     #[test]
     fn foreign_release_evidence_is_refused_rather_than_encoded_as_absent() {
+        let foreign = WireContent::new(b"catalog", catalog::CatalogSet::default());
         let evidence = ReleasedContextEvidence::with_runtime_filter(
-            wire(b"catalog", catalog::CatalogSet::default()),
+            FrozenCodecContent::new(
+                b"catalog",
+                foreign.fingerprint(),
+                foreign.wire().encode_to_vec().into(),
+            ),
             RuntimeFilterReleaseObservation::Unavailable,
         );
+        assert_eq!(evidence.runtime_filter().unwrap().domain_tag(), b"catalog");
         let rejection = release_runtime_filter_telemetry(&evidence)
             .expect_err("only terminal telemetry may be encoded on release");
         assert_eq!(

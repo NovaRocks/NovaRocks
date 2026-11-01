@@ -29,6 +29,16 @@ pub(crate) enum RequestIoError {
     Submit(EstablishSubmitError),
     Observed(EstablishIngressOutcome),
 }
+impl std::fmt::Display for RequestIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Control(error) => write!(f, "Root request IO failed: {error}"),
+            Self::Submit(error) => write!(f, "Root request host submission failed: {error:?}"),
+            Self::Observed(outcome) => write!(f, "Root request host returned {outcome:?}"),
+        }
+    }
+}
+impl std::error::Error for RequestIoError {}
 impl From<ControlRequestError> for RequestIoError {
     fn from(error: ControlRequestError) -> Self {
         Self::Control(error)
@@ -92,6 +102,7 @@ impl ControlRequestCustody {
         self.note_progress();
         Ok(())
     }
+    #[cfg(test)]
     pub(in crate::control_runtime) fn stage_disposal(
         &mut self,
         original: EstablishDisposalJob,
@@ -226,14 +237,7 @@ impl ControlRequestCustody {
         &mut self,
         handles: &EstablishExecutorHandles,
         generation: Generation,
-        failure_work: WorkId,
     ) -> Result<RequestIoProgress, RequestIoError> {
-        if self.ingress_source_phase() == Some(ExitRolePhase::Unresolved) {
-            return Err(ControlRequestError::SourceUnresolved {
-                input: self.input_id(),
-            }
-            .into());
-        }
         if self.failed_submission.is_some() {
             return Err(ControlRequestError::SubmissionUnresolved.into());
         }
@@ -243,15 +247,15 @@ impl ControlRequestCustody {
             ..Default::default()
         };
         if self.ingress_issued && !self.submitted && !self.withdrawal {
-            // take_establish_ingress restores the original authority and caches
+            // take_establish_ingress restores the original child authority and caches
             // the complete neutral outcome before any branch can return.
             if self.ingress_outcome.is_none()
                 && let Err(error) = self.take_establish_ingress()
             {
-                if self.authority.is_none() && self.role.phase() == ExitRolePhase::Unresolved {
+                if self.ingress_source_phase() == Some(ExitRolePhase::Unresolved) {
                     // This existing gate verifies Taken/Unknown and the actual
                     // lost original, without inventing an observed call result.
-                    self.submit_ingress_owner_failure(failure_work)
+                    self.submit_ingress_owner_failure()
                         .map_err(|refusal| RequestIoError::Control(refusal.error))?;
                     progress.submitted += 1;
                 } else {
@@ -273,12 +277,52 @@ impl ControlRequestCustody {
                         progress.submitted += 1;
                     }
                     Some(EstablishIngressOutcome::GetterPanicked) => {
-                        self.submit_ingress_owner_failure(failure_work)
+                        self.submit_ingress_owner_failure()
                             .map_err(|refusal| RequestIoError::Control(refusal.error))?;
                         progress.submitted += 1;
                     }
                     Some(observed) => return Err(RequestIoError::Observed(observed)),
                     None => {}
+                }
+            }
+        }
+        if self.ingress_source_phase() == Some(ExitRolePhase::Unresolved) {
+            // The healthy supervisor's reply can drain independently. This
+            // original lost child and its raw captures remain Unknown; no
+            // getter retry or guessed disposal can release their responsibility.
+            return Ok(progress);
+        }
+        if let Some(route) = &self.route {
+            route
+                .return_comparison_failure()
+                .map_err(ControlRequestError::Route)?;
+            if self.pending_comparison.is_none() {
+                self.pending_comparison = route
+                    .take_comparison_job()
+                    .map_err(ControlRequestError::Route)?;
+            }
+        }
+        if let Some(original) = self.pending_comparison.take() {
+            let before = self.endpoint.ready.source_capacity_revision();
+            match handles.try_submit_comparison(original) {
+                Ok(()) => {
+                    self.endpoint
+                        .ready
+                        .clear_capacity_wait(self.endpoint.external.slot())?;
+                    progress.dispatched += 1;
+                }
+                Err((error, original)) => {
+                    self.pending_comparison = Some(original);
+                    match error {
+                        EstablishSubmitError::Host(error)
+                            if super::super::request_endpoint::notification_submit_busy(&error) =>
+                        {
+                            self.endpoint
+                                .ready
+                                .park_capacity(self.endpoint.external.slot(), before)?;
+                        }
+                        error => return Err(RequestIoError::Submit(error)),
+                    }
                 }
             }
         }

@@ -21,7 +21,7 @@
 
 use crate::{
     completion::ReportSlot,
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     reported_work::ReportedWork,
     sync::{Arc, Mutex},
     transaction::{RuntimeError, ScopeHandle},
@@ -56,7 +56,7 @@ impl std::error::Error for ExitRoleError {}
 struct State {
     phase: ExitRolePhase,
     work: Option<WorkLease>,
-    capacity: Option<CapacityBundle>,
+    capacity: Option<ReservationBundle>,
     body_exited: bool,
     captures_exited: bool,
 }
@@ -100,9 +100,40 @@ impl ExitRole {
     /// This constructor allocates no credit or replacement responsibility.
     pub fn from_admitted(reported: ReportedWork) -> (Self, ExitAuthority) {
         let (work, capacity, report) = reported.into_parts();
+        // Preserve the actual live carrier's start. Supervision may begin
+        // before its unique exit custodian is exposed; no second start or
+        // replacement authority may be inferred from an invalid carrier.
+        let phase = {
+            let ledger = work
+                .scope()
+                .runtime
+                .shared
+                .state
+                .lock()
+                .expect("runtime ledger lock");
+            let Some(original) = ledger
+                .scopes
+                .get(&work.scope().id())
+                .and_then(|scope| scope.work(work.id()))
+            else {
+                std::process::abort();
+            };
+            if original.unbound_guard
+                || original.body_exited
+                || original.captures_exited
+                || ledger.unresolved.contains(&(work.scope().id(), work.id()))
+            {
+                std::process::abort();
+            }
+            match original.phase {
+                novarocks_control_runtime_core::scope::WorkPhase::Queued => ExitRolePhase::Admitted,
+                novarocks_control_runtime_core::scope::WorkPhase::Started => ExitRolePhase::Started,
+                _ => std::process::abort(),
+            }
+        };
         let custody = Arc::new(Custody {
             state: Mutex::new(State {
-                phase: ExitRolePhase::Admitted,
+                phase,
                 work: Some(work),
                 capacity: Some(capacity),
                 body_exited: false,
@@ -180,9 +211,11 @@ impl ExitRole {
             return Ok(false);
         }
         let capacity = state.capacity.as_mut().expect("original role capacity");
-        let release = capacity
-            .resources()
-            .and_then(|resources| capacity.release(&resources));
+        let release = capacity.resources().and_then(|resources| {
+            capacity
+                .release_quota(&resources.quota)
+                .and_then(|()| capacity.finish())
+        });
         if let Err(error) = release {
             state.phase = ExitRolePhase::Unresolved;
             state
@@ -241,7 +274,7 @@ impl ExitAuthority {
     /// use novarocks_control_runtime::exit_role::ExitRole;
     /// use novarocks_control_runtime_core::{identity::Generation, scope::WorkKind};
     /// fn observer(role: ExitRole, generation: Generation) {
-    ///     role.open_child_scope_with_root(generation, 1, 0, WorkKind::Business);
+    ///     role.open_child_scope_with_root(generation, WorkKind::Business,\n    ///         novarocks_control_runtime_core::capacity::ReservationResources::work_only());
     /// }
     /// ```
     /// Positive exit consumes the unique authority before further derivation:
@@ -250,15 +283,14 @@ impl ExitAuthority {
     /// use novarocks_control_runtime_core::{identity::Generation, scope::WorkKind};
     /// fn after_exit(mut authority: ExitAuthority, generation: Generation) {
     ///     authority.exited().unwrap();
-    ///     authority.open_child_scope_with_root(generation, 1, 0, WorkKind::Business);
+    ///     authority.open_child_scope_with_root(generation, WorkKind::Business,\n    ///         novarocks_control_runtime_core::capacity::ReservationResources::work_only());
     /// }
     /// ```
     pub fn open_child_scope_with_root(
         &mut self,
         generation: Generation,
-        max_work: usize,
-        max_slots: usize,
         kind: WorkKind,
+        resources: novarocks_control_runtime_core::capacity::ReservationResources,
     ) -> Result<(ScopeHandle, crate::lease::StepGuard), ExitRoleError> {
         let state = self
             .role
@@ -280,7 +312,7 @@ impl ExitAuthority {
         // atomically; no callback or application policy executes here.
         work.scope()
             .runtime
-            .open_child_scope_with_root(work, generation, max_work, max_slots, kind)
+            .open_child_scope_with_root(work, generation, kind, resources)
             .map_err(Into::into)
     }
 
@@ -294,6 +326,30 @@ impl ExitAuthority {
     /// this authority admitted, with no positive body or capture exit.
     pub fn start_in_generation(&mut self, generation: Generation) -> Result<(), ExitRoleError> {
         self.start_guarded(Some(generation))
+    }
+    /// Start this real child only while its direct parent's original generation
+    /// and stop/failure gates permit business, in the same ledger transaction.
+    pub fn start_in_parent_generation(
+        &mut self,
+        parent: &ScopeHandle,
+        generation: Generation,
+    ) -> Result<(), ExitRoleError> {
+        let mut state = self
+            .role
+            .0
+            .state
+            .lock()
+            .expect("original role custody lock");
+        if !self.active || state.phase != ExitRolePhase::Admitted {
+            return Err(ExitRoleError::InvalidPhase(state.phase));
+        }
+        state
+            .work
+            .as_mut()
+            .expect("original role Work")
+            .start_in_parent_generation(parent, generation)?;
+        state.phase = ExitRolePhase::Started;
+        Ok(())
     }
     fn start_guarded(&mut self, generation: Option<Generation>) -> Result<(), ExitRoleError> {
         let mut state = self

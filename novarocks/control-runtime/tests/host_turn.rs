@@ -20,11 +20,11 @@
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, StepContext},
     driver::{ActorHostTurn, ActorRegistration, ActorRuntime},
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     identity::{ActorId, DimensionId, Generation, ScopeId, Tick},
     mailbox::{InputClass, InputEnvelope},
     scope::{WorkAdmission, WorkKind},
@@ -85,16 +85,16 @@ struct OriginalActorFixture {
     scope: ScopeHandle,
     registration: ActorRegistration,
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     calls: Arc<AtomicUsize>,
 }
 impl OriginalActorFixture {
     fn new(ledger: RuntimeLedger, runtime: ActorRuntime<OriginalActor>, actor: ActorId) -> Self {
-        let scope = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (mut work, capacity) = scope
             .reserve_next(
                 generation(),
-                paid(1),
+                ReservationResources::for_work(paid(1)),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -133,8 +133,8 @@ impl OriginalActorFixture {
     }
     fn independent() -> Self {
         Self::new(
-            RuntimeLedger::new(paid(1), 4, 4),
-            ActorRuntime::new(1),
+            RuntimeLedger::new(paid(1)),
+            ActorRuntime::new(),
             ActorId::new(1).unwrap(),
         )
     }
@@ -146,8 +146,9 @@ impl OriginalActorFixture {
     }
     fn finish_after_actor_retired(mut self) {
         self.capacity
-            .release(&self.capacity.resources().unwrap())
+            .release_quota(&self.capacity.resources().unwrap().quota)
             .unwrap();
+        self.capacity.finish().unwrap();
         self.ledger.remove_scope(self.scope.id()).unwrap();
     }
     fn finish(mut self) {
@@ -162,8 +163,8 @@ impl OriginalActorFixture {
 
 #[test]
 fn a_host_turn_excludes_same_actor_but_allows_core_and_other_actor_progress() {
-    let ledger = RuntimeLedger::new(paid(2), 8, 8);
-    let runtime = ActorRuntime::new(2);
+    let ledger = RuntimeLedger::new(paid(2));
+    let runtime = ActorRuntime::new();
     let first =
         OriginalActorFixture::new(ledger.clone(), runtime.clone(), ActorId::new(1).unwrap());
     let second =

@@ -22,22 +22,20 @@
 
 mod host_cell;
 mod ready_routes;
+pub(in crate::control_runtime) mod rejected_ingress;
 mod request_partial;
-pub(crate) use request_partial::RootRequestPartialProgress;
 mod source_io;
 mod teardown;
-pub(crate) use host_cell::{
-    RootHostCell, RootHostProgress, RootMaterializationError, RootMaterializationRefusal,
-};
+pub(crate) use host_cell::RootHostCell;
 use ready_routes::ReadyRoutes;
 pub(crate) use source_io::RootRequestAdvanceError;
-pub(crate) use teardown::{RootDrainError, RootDrainProgress, RootDrainRefusal};
 
+#[cfg(test)]
+use super::effect_dispatch::EffectRef;
 use super::{
     actors::{ControlActor, WorkerActor},
     context_host::{ContextHostBinding, ContextMetadataRole},
-    context_host_jobs::{ContextHostJobError, ContextHostJobs},
-    context_lifecycle::CONTEXT_LIFECYCLE_INPUTS,
+    context_host_jobs::ContextHostJobs,
     control_internal::{
         ControlInternal, ControlInternalError, ControlInternalPartial, InternalAdvance,
     },
@@ -46,8 +44,7 @@ use super::{
         ControlRequestHandle, ControlRequestPublishRefusal, ControlRequestReady,
         ControlRequestSubmitRefusal, PreparedEstablishRoute,
     },
-    control_ticket::{ControlTicketError, ControlTicketInventory},
-    effect_dispatch::{DispatchError, EffectDispatch, EffectRef, IndexedBatches},
+    effect_dispatch::{DispatchError, EffectDispatch, IndexedBatches},
     establish_executors::{
         EstablishExecutorStartError, EstablishExecutorStartRefusal, EstablishExecutors,
     },
@@ -57,19 +54,18 @@ use crate::{control_admission::AdmissionStorage, control_runtime_policy::Storage
 use novarocks_control_runtime::{
     actor::{ActorConfig, ActorFailurePolicy},
     driver::{
-        ActorRegistration, ActorRuntime, DriverError, EffectCompletionRefusal, EffectTicket,
-        InputRoleId,
+        ActorRegistration, ActorRuntime, CompletedEffect, DriverError, EffectCompletionRefusal,
+        EffectTicket, InputRoleId,
     },
+    header_readiness::HeaderReadyNotice,
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
-    identity::{ActorId, Generation, InputId},
+    capacity::ReservationResources,
+    identity::{ActorId, Generation, InputId, ScopedWorkRef},
     scope::{WorkAdmission, WorkKind},
 };
-use novarocks_execution_contract::{
-    QueryContextAdmissionTicketReceipt, QueryContextRef, TaskOperationId,
-};
+use novarocks_execution_contract::{QueryContextRef, TaskOperationId};
 use novarocks_worker_protocol::{
     control::{ControlCore, ControlInput},
     lease::MonotonicInstant,
@@ -98,8 +94,6 @@ pub(crate) struct ProcessControlBinding {
     pub actor: ActorId,
     pub generation: Generation,
     pub actor_config: ActorConfig,
-    pub max_work: usize,
-    pub max_slots: usize,
     /// Actual process ingress positions, including admitted waiting calls.
     /// This bounds the ready index; each request still pays its own role.
     pub request_positions: NonZeroUsize,
@@ -110,9 +104,33 @@ pub(crate) enum ProcessBootstrapError {
     InvalidGeometry,
     Runtime(RuntimeError),
     Driver(DriverError),
+    Control(ControlRequestError),
 }
+impl std::fmt::Display for ProcessBootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidGeometry => f.write_str("Process control bootstrap geometry is invalid"),
+            Self::Runtime(error) => write!(
+                f,
+                "Process control bootstrap runtime operation failed: {error}"
+            ),
+            Self::Driver(error) => write!(f, "Process control actor registration failed: {error}"),
+            Self::Control(error) => write!(f, "Process control request setup failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for ProcessBootstrapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidGeometry => None,
+            Self::Runtime(error) => Some(error),
+            Self::Driver(error) => Some(error),
+            Self::Control(error) => Some(error),
+        }
+    }
+}
+
 #[must_use = "A refused wake retains its original effect ticket"]
-#[derive(Debug)]
 pub(crate) enum InternalWakeRefusal {
     Rejected {
         error: ControlInternalError,
@@ -120,8 +138,26 @@ pub(crate) enum InternalWakeRefusal {
     },
     Completion(EffectCompletionRefusal<super::actors::WorkerAction>),
 }
+impl std::fmt::Debug for InternalWakeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected { error, ticket } => f
+                .debug_struct("Rejected")
+                .field("error", error)
+                .field("input", &ticket.input)
+                .field("action", &ticket.descriptor.id)
+                .finish_non_exhaustive(),
+            Self::Completion(refusal) => f
+                .debug_struct("Completion")
+                .field("error", &refusal.error)
+                .field("input", &refusal.ticket.input)
+                .field("action", &refusal.ticket.descriptor.id)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 #[must_use = "A refused route handoff retains its original effect"]
-#[derive(Debug)]
 pub(crate) enum ControlRouteHandoffRefusal {
     Rejected {
         error: ControlRequestError,
@@ -129,30 +165,42 @@ pub(crate) enum ControlRouteHandoffRefusal {
     },
     Completion(EffectCompletionRefusal<super::actors::WorkerAction>),
 }
-#[must_use = "A refused Context cleanup handoff retains its original Root effect"]
-#[derive(Debug)]
-pub(crate) enum ControlContextHandoffRefusal {
-    Rejected {
-        error: ContextHostJobError,
-        ticket: EffectTicket<super::actors::WorkerAction>,
-    },
-    Completion(EffectCompletionRefusal<super::actors::WorkerAction>),
+impl std::fmt::Debug for ControlRouteHandoffRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected { error, ticket } => f
+                .debug_struct("Rejected")
+                .field("error", error)
+                .field("input", &ticket.input)
+                .field("action", &ticket.descriptor.id)
+                .finish_non_exhaustive(),
+            Self::Completion(refusal) => f
+                .debug_struct("Completion")
+                .field("error", &refusal.error)
+                .field("input", &refusal.ticket.input)
+                .field("action", &refusal.ticket.descriptor.id)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Partial bootstrap returns these same holders, including a possibly empty
 /// scope. No original role or paid bundle is dropped as an unused reservation.
 #[must_use = "Retain the process root until every original owner actually exits"]
 pub(crate) struct ProcessControlResources {
-    pub admission_epoch: novarocks_control_runtime::publication::PublishedSnapshot<
-        novarocks_execution_contract::AdmissionEpochCapability,
+    pub admission_snapshot: novarocks_control_runtime::publication::PublishedSnapshot<
+        super::node_metrics::ControlAdmissionProjection,
     >,
     pub scope: ScopeHandle,
     pub roles: Vec<ContextMetadataRole>,
     pub registered: bool,
     pub request_ready: ControlRequestReady,
     pub requests: BTreeMap<InputId, ControlRequestCustody>,
+    // One neutral routing row per live, fully admitted original Root R.
+    // This neither records exit nor creates a request or intermediate Work.
+    request_header_routes: BTreeMap<ScopedWorkRef, InputId>,
     request_partials: request_partial::RootRequestPartials,
-    pub tickets: ControlTicketInventory,
+    rejected_ingress: Option<rejected_ingress::RejectedIngressLane>,
     pub dispatch: EffectDispatch,
     pub internal: Option<ControlInternal>,
     pub internal_partial: Option<ControlInternalPartial>,
@@ -174,8 +222,8 @@ pub(super) struct RegisteredControl {
     runtime: ActorRuntime<WorkerActor>,
     ledger: RuntimeLedger,
     actor: ActorId,
-    directory: NonZeroUsize,
     requests: NonZeroUsize,
+    process_source_parent: novarocks_control_runtime::lease::WorkChildAuthority,
 }
 impl RegisteredControl {
     pub(super) fn into_parts(
@@ -185,14 +233,14 @@ impl RegisteredControl {
         RuntimeLedger,
         ActorId,
         NonZeroUsize,
-        NonZeroUsize,
+        novarocks_control_runtime::lease::WorkChildAuthority,
     ) {
         (
             self.runtime,
             self.ledger,
             self.actor,
-            self.directory,
             self.requests,
+            self.process_source_parent,
         )
     }
 }
@@ -211,8 +259,8 @@ impl std::fmt::Debug for ProcessBootstrapRefusal {
 }
 
 /// Service is constructed only after this same Control registration succeeds.
-/// Its directory capacity is read from the actual Core rather than supplied a
-/// second time. The host owns the original root outside the pure actor, so a
+/// Directory metadata follows actual admitted Context objects. The host owns
+/// the original root outside the pure actor, so a
 /// failed Core cannot destroy or recreate its cleanup authority.
 #[must_use = "The actual process owner must drain before its resources can retire"]
 pub(crate) struct ProcessControlOwner {
@@ -233,32 +281,23 @@ impl ProcessControlOwner {
             error: ProcessBootstrapError::InvalidGeometry,
             resources: None,
         };
-        if binding.max_work < KINDS.len()
-            || binding.max_slots == 0
-            || binding.actor_config.max_step_work < ControlActor::MAX_STEP_WORK
+        if binding.actor_config.max_step_work < ControlActor::MAX_STEP_WORK
             || binding.actor_config.max_effects_per_step < ControlActor::MAX_STEP_ACTIONS
             || binding.actor_config.max_dependencies_per_effect < ControlActor::MAX_STEP_ACTIONS
             || binding.actor_config.validate().is_err()
         {
             return Err(invalid());
         }
-        let directory = NonZeroUsize::new(core.directory_capacity()).ok_or_else(invalid)?;
-        let lifecycle_inputs = directory
-            .get()
-            .checked_mul(CONTEXT_LIFECYCLE_INPUTS)
-            .ok_or_else(invalid)?;
         binding.actor_config.mailbox
             [novarocks_control_runtime_core::mailbox::InputClass::Control.index()] = binding
             .actor_config
             .mailbox[novarocks_control_runtime_core::mailbox::InputClass::Control.index()]
         .checked_add(binding.request_positions.get())
-        .and_then(|n| n.checked_add(lifecycle_inputs))
         .ok_or_else(invalid)?;
         binding.actor_config.max_batches = binding
             .actor_config
             .max_batches
             .checked_add(binding.request_positions.get())
-            .and_then(|n| n.checked_add(lifecycle_inputs))
             .ok_or_else(invalid)?;
         let effect_positions = binding
             .actor_config
@@ -269,28 +308,29 @@ impl ProcessControlOwner {
             .resources()
             .map_err(|_| invalid())?;
         let scope = ledger
-            .open_scope_next(
-                None,
-                binding.generation,
-                binding.max_work,
-                binding.max_slots,
-            )
+            .open_scope_next(None, binding.generation)
             .map_err(|error| ProcessBootstrapRefusal {
                 error: ProcessBootstrapError::Runtime(error),
                 resources: None,
             })?;
         let mut resources = ProcessControlResources {
-            admission_epoch: novarocks_control_runtime::publication::PublishedSnapshot::new(
+            admission_snapshot: novarocks_control_runtime::publication::PublishedSnapshot::new(
                 &scope,
-                std::sync::Arc::new(core.admission().capability()),
+                std::sync::Arc::new(super::node_metrics::ControlAdmissionProjection {
+                    epoch: core.admission().capability(),
+                    logical_live_grants: core.admission().logical_live_grants(),
+                    admission_retention: core.admission().retention_inventory(),
+                    control_retention: core.retention_inventory(),
+                }),
             ),
             scope: scope.clone(),
             roles: Vec::with_capacity(KINDS.len()),
             registered: false,
             request_ready: ControlRequestReady::new(binding.request_positions, runtime.clone()),
             requests: BTreeMap::new(),
+            request_header_routes: BTreeMap::new(),
             request_partials: request_partial::RootRequestPartials::default(),
-            tickets: ControlTicketInventory::new(),
+            rejected_ingress: None,
             dispatch: EffectDispatch::control(runtime.clone(), binding.actor, effect_positions),
             internal: None,
             internal_partial: None,
@@ -323,7 +363,7 @@ impl ProcessControlOwner {
                 let guard = scope
                     .reserve_next(
                         binding.generation,
-                        ResourceVector::default(),
+                        ReservationResources::work_only(),
                         kind,
                         WorkAdmission::Derived(resources.roles[LIFETIME].work.id()),
                     )
@@ -344,8 +384,8 @@ impl ProcessControlOwner {
                 core,
                 scope.clone(),
                 binding.admission_storage,
-                resources.roles[TIMER].work.id(),
-                resources.roles[LIFETIME].work.id(),
+                resources.roles[TIMER].work.reference(),
+                resources.roles[LIFETIME].work.reference(),
             );
             let registration = runtime
                 .register_supervised_bound_with_policy(
@@ -369,6 +409,33 @@ impl ProcessControlOwner {
                 });
             }
         };
+        // Pre-R rejected ingress can be the first Root activity. Bind the
+        // existing cleanup capacity wake before any request slot is registered.
+        if let Err(error) = resources
+            .request_ready
+            .bind_source_capacity_owner(&registration)
+        {
+            return Err(ProcessBootstrapRefusal {
+                error: ProcessBootstrapError::Control(error),
+                resources: Some(resources),
+            });
+        }
+        resources.rejected_ingress = Some(rejected_ingress::RejectedIngressLane::new(
+            runtime.clone(),
+            registration.clone(),
+            ledger.clone(),
+            scope,
+            resources.request_ready.clone(),
+        ));
+        let process_source_parent = match resources.roles[LIFETIME].work.child_authority() {
+            Ok(authority) => authority,
+            Err(error) => {
+                return Err(ProcessBootstrapRefusal {
+                    error: ProcessBootstrapError::Runtime(error),
+                    resources: Some(resources),
+                });
+            }
+        };
         Ok(Self {
             actor: binding.actor,
             registration,
@@ -376,15 +443,16 @@ impl ProcessControlOwner {
                 runtime: runtime.clone(),
                 ledger: ledger.clone(),
                 actor: binding.actor,
-                directory,
                 requests: binding.request_positions,
+                process_source_parent,
             }),
             resources,
             source_executors_started: false,
         })
     }
     /// One process composition shares this same signal between physical Task
-    /// pools and the original Root turn. Its size is the real directory C.
+    /// pools and the original Root turn. Each registered actor owns at most
+    /// one neutral address node; it carries no task or resource authority.
     pub(crate) fn task_capacity_signal(
         &mut self,
     ) -> Result<super::task_capacity::TaskCapacitySignal, super::task_capacity::TaskCapacityError>
@@ -395,7 +463,6 @@ impl ProcessControlOwner {
         let original = super::task_capacity::TaskCapacitySignal::new(
             self.runtime().clone(),
             self.registration.clone(),
-            self.service.directory_capacity().get(),
         )?;
         self.resources.task_capacity = Some(original.clone());
         Ok(original)
@@ -425,6 +492,7 @@ impl ProcessControlOwner {
     }
     /// Mechanical projection of the same original source role. In particular,
     /// physical executor drain cannot turn Unresolved into observed raw exit.
+    #[cfg(test)]
     pub(crate) fn establish_source_phase(
         &self,
         input: InputId,
@@ -447,6 +515,11 @@ impl ProcessControlOwner {
     }
     pub(super) fn lifetime_work(&self) -> novarocks_control_runtime_core::identity::WorkId {
         self.resources.roles[LIFETIME].work.id()
+    }
+    pub(in crate::control_runtime) fn lifetime_author(
+        &self,
+    ) -> &novarocks_control_runtime::lease::WorkLease {
+        &self.resources.roles[LIFETIME].work
     }
     /// This independent source is paid before any production facade opens.
     /// The metadata bootstrap alone never promised an internally ready host.
@@ -489,14 +562,14 @@ impl ProcessControlOwner {
         if let Err(error) = source.accept_wake(&ticket) {
             return Err(InternalWakeRefusal::Rejected { error, ticket });
         }
-        let reference = EffectRef {
-            input: ticket.input,
-            action: ticket.descriptor.id,
-        };
-        self.runtime()
-            .effect_completed(ticket)
+        let completed = self
+            .runtime()
+            .effect_completed_with_receipt(ticket)
             .map_err(InternalWakeRefusal::Completion)?;
-        if self.control_completion_observed(reference).is_err() {
+        if self
+            .control_completion_observed_with_receipt(&completed)
+            .is_err()
+        {
             std::process::abort();
         }
         Ok(())
@@ -510,6 +583,37 @@ impl ProcessControlOwner {
             .as_mut()
             .ok_or(ControlInternalError::NotEnabled)?
             .advance()
+    }
+    pub(crate) fn enqueue_failed_lifecycle(
+        &mut self,
+        proof: &novarocks_control_runtime::driver::ActorFailureProof,
+        fact: super::control_internal::RootLifecycleFact,
+        notice: super::context_ready::ContextReadyNotice,
+    ) -> Result<super::control_internal::RootLifecycleReceipt, ControlInternalError> {
+        if self.resources.teardown.internal_closed {
+            return Err(ControlInternalError::Closed);
+        }
+        self.resources
+            .internal
+            .as_mut()
+            .ok_or(ControlInternalError::NotEnabled)?
+            .enqueue_failed_lifecycle(proof, fact, notice)
+    }
+    /// The original removed-host owner keeps this receipt until the Root's
+    /// existing Source has consumed and retired the same HostRemoved input.
+    pub(crate) fn enqueue_host_removed(
+        &mut self,
+        original: &novarocks_control_runtime::lease::WorkLease,
+        context: QueryContextRef,
+    ) -> Result<super::control_internal::RootLifecycleReceipt, ControlInternalError> {
+        if self.resources.teardown.internal_closed {
+            return Err(ControlInternalError::Closed);
+        }
+        self.resources
+            .internal
+            .as_mut()
+            .ok_or(ControlInternalError::NotEnabled)?
+            .enqueue_host_removed(original, context)
     }
     /// Store the actual request before any command capture. Ready's R bound
     /// is the single address bound; this map contains the original owners,
@@ -525,15 +629,61 @@ impl ProcessControlOwner {
                 Ok(original) => original,
                 Err(refusal) => return Err(self.retain_request_partial(refusal)),
             };
-        let input = custody.input_id();
-        if self.resources.requests.contains_key(&input) {
-            // A duplicate actual input identity is a shared runtime invariant.
-            // Preserve both original owners until process fail-stop.
-            std::process::abort();
-        }
-        self.resources.requests.insert(input, custody);
+        let input = self.insert_admitted_request(custody);
         Ok((input, handle))
     }
+    fn insert_admitted_request(&mut self, custody: ControlRequestCustody) -> InputId {
+        let input = custody.input_id();
+        let work = custody.header_work();
+        if self.resources.requests.contains_key(&input)
+            || self.resources.request_header_routes.contains_key(&work)
+        {
+            // Never replace or unwind through either original owner.
+            std::process::abort();
+        }
+        self.resources.request_header_routes.insert(work, input);
+        self.resources.requests.insert(input, custody);
+        input
+    }
+
+    /// The caller holds this actual Root host turn. Numeric Work equality is
+    /// only a lookup: the original registration must match the same cell.
+    pub(crate) fn notify_request_header_readiness(
+        &self,
+        notice: &HeaderReadyNotice,
+    ) -> Result<bool, ControlRequestError> {
+        self.runtime()
+            .validate_registration(self.registration())
+            .map_err(ControlRequestError::Driver)?;
+        let Some(input) = self.resources.request_header_routes.get(&notice.work()) else {
+            return Ok(false);
+        };
+        let original = self
+            .resources
+            .requests
+            .get(input)
+            .ok_or(ControlRequestError::WrongRequest)?;
+        Ok(original.notify_header_readiness(notice))
+    }
+
+    pub(super) fn remove_retired_request(&mut self, input: InputId) {
+        let original = self
+            .resources
+            .requests
+            .get(&input)
+            .expect("same original retired Root R");
+        assert!(
+            original.is_retired(),
+            "Root R removal requires its original true retirement"
+        );
+        let work = original.header_work();
+        assert_eq!(
+            self.resources.request_header_routes.remove(&work),
+            Some(input)
+        );
+        self.resources.requests.remove(&input);
+    }
+
     pub(crate) fn submit_ticket_observation(
         &mut self,
         input: InputId,
@@ -558,10 +708,7 @@ impl ProcessControlOwner {
                 Ok(original) => original,
                 Err(refusal) => return Err(self.retain_request_partial(refusal)),
             };
-        let input = custody.input_id();
-        if self.resources.requests.insert(input, custody).is_some() {
-            std::process::abort();
-        }
+        let input = self.insert_admitted_request(custody);
         Ok((input, handle))
     }
     pub(crate) fn begin_establish_ingress(
@@ -581,6 +728,7 @@ impl ProcessControlOwner {
         };
         custody.begin_establish_ingress(request, payload)
     }
+    #[cfg(test)]
     pub(crate) fn take_establish_ingress(
         &mut self,
         input: InputId,
@@ -592,6 +740,7 @@ impl ProcessControlOwner {
             .ok_or(ControlRequestError::WrongRequest)?
             .take_establish_ingress()
     }
+    #[cfg(test)]
     pub(crate) fn begin_unsubmitted_withdrawal(
         &mut self,
         input: InputId,
@@ -627,16 +776,6 @@ impl ProcessControlOwner {
         }
         result
     }
-    pub(crate) fn take_consumed_creator_disposal(
-        &self,
-        input: InputId,
-    ) -> Result<Option<super::establish_ingress::EstablishDisposalJob>, ControlRequestError> {
-        self.resources
-            .requests
-            .get(&input)
-            .ok_or(ControlRequestError::WrongRequest)?
-            .take_consumed_creator_disposal()
-    }
     /// Borrow the elected original R only after the Context issuer has
     /// admitted its independent M call and all of its return positions.
     pub(crate) fn take_materialization_source(
@@ -649,6 +788,7 @@ impl ProcessControlOwner {
             .ok_or(ControlRequestError::WrongRequest)?
             .take_materialization_source(ticket)
     }
+    #[cfg(test)]
     pub(crate) fn begin_rejected_ingress_disposal(
         &self,
         ticket: &EffectTicket<super::actors::WorkerAction>,
@@ -662,16 +802,16 @@ impl ProcessControlOwner {
             .ok_or(ControlRequestError::WrongRequest)?
             .begin_rejected_ingress_disposal(ticket)
     }
+    #[cfg(test)]
     pub(crate) fn submit_establish_ingress_failure(
         &mut self,
         input: InputId,
     ) -> Result<(), ControlRequestError> {
-        let failure_work = self.resources.roles[FAILURE].work.id();
         self.resources
             .requests
             .get_mut(&input)
             .ok_or(ControlRequestError::WrongRequest)?
-            .submit_ingress_owner_failure(failure_work)
+            .submit_ingress_owner_failure()
             .map_err(|refusal| refusal.error)
     }
     pub(crate) fn submit_request(
@@ -736,14 +876,14 @@ impl ProcessControlOwner {
                 .notify_host_actor(&self.registration)
                 .unwrap_or_else(|_| std::process::abort());
         }
-        let effect = EffectRef {
-            input: ticket.input,
-            action: ticket.descriptor.id,
-        };
-        self.runtime()
-            .effect_completed(ticket)
+        let completed = self
+            .runtime()
+            .effect_completed_with_receipt(ticket)
             .map_err(ControlRouteHandoffRefusal::Completion)?;
-        if self.control_completion_observed(effect).is_err() {
+        if self
+            .control_completion_observed_with_receipt(&completed)
+            .is_err()
+        {
             std::process::abort();
         }
         Ok(())
@@ -816,48 +956,6 @@ impl ProcessControlOwner {
         }
         Ok(())
     }
-    pub(crate) fn handoff_context_removal(
-        &mut self,
-        ticket: EffectTicket<super::actors::WorkerAction>,
-    ) -> Result<(), ControlContextHandoffRefusal> {
-        use super::actors::WorkerAction;
-        use novarocks_worker_protocol::control::ControlEffect;
-        let context = match &ticket.effect {
-            WorkerAction::Control {
-                effect: ControlEffect::RemoveHost { context },
-                ..
-            } if ticket.actor == self.actor => *context,
-            _ => {
-                return Err(ControlContextHandoffRefusal::Rejected {
-                    error: ContextHostJobError::WrongOwner,
-                    ticket,
-                });
-            }
-        };
-        let address = self.service.context(context);
-        let mut host = address.as_ref().and_then(|address| address.lock());
-        let result = host
-            .as_mut()
-            .ok_or(ContextHostJobError::WrongOwner)
-            .and_then(|host| {
-                host.authorize_owner_control_removal(&ticket)
-                    .map_err(ContextHostJobError::Driver)?;
-                host.host_jobs()
-                    .ok_or(ContextHostJobError::WrongOwner)?
-                    .request_holder_disposal(&ticket)
-            });
-        if let Err(error) = result {
-            return Err(ControlContextHandoffRefusal::Rejected { error, ticket });
-        }
-        let input = ticket.input;
-        self.runtime()
-            .effect_completed(ticket)
-            .map_err(ControlContextHandoffRefusal::Completion)?;
-        // RemoveHost releases the Root metadata lane on transfer/start. This
-        // completion releases the original input, never H's physical custody.
-        self.note_control_input_progress(input);
-        Ok(())
-    }
     pub(crate) fn handoff_establish_route_cancel(
         &mut self,
         ticket: EffectTicket<super::actors::WorkerAction>,
@@ -896,18 +994,19 @@ impl ProcessControlOwner {
                 self.resources.ready_routes.forget(context);
             }
         }
-        let effect = EffectRef {
-            input: ticket.input,
-            action: ticket.descriptor.id,
-        };
-        self.runtime()
-            .effect_completed(ticket)
+        let completed = self
+            .runtime()
+            .effect_completed_with_receipt(ticket)
             .map_err(ControlRouteHandoffRefusal::Completion)?;
-        if self.control_completion_observed(effect).is_err() {
+        if self
+            .control_completion_observed_with_receipt(&completed)
+            .is_err()
+        {
             std::process::abort();
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn take_retired_route_disposal(
         &self,
         request: InputId,
@@ -932,19 +1031,11 @@ impl ProcessControlOwner {
             let Some(custody) = self.resources.requests.get_mut(&input) else {
                 std::process::abort();
             };
-            if custody.ingress_source_phase()
-                == Some(novarocks_control_runtime::exit_role::ExitRolePhase::Unresolved)
-            {
-                // The caller must route this exact original R to its failure
-                // owner. Keep all source/R custody; do not park a silent wait
-                // or invent a completed reply, child exit or quota release.
-                return Err(ControlRequestError::SourceUnresolved { input });
-            }
             if custody.try_retire()? {
                 if let Some(role) = custody.route_return_role() {
                     assert_eq!(self.resources.return_routes.remove(&role), Some(input));
                 }
-                self.resources.requests.remove(&input);
+                self.remove_retired_request(input);
                 retired += 1;
             }
         }
@@ -987,17 +1078,16 @@ impl ProcessControlOwner {
                 ticket,
             });
         };
-        let reference = EffectRef {
-            input: ticket.input,
-            action: ticket.descriptor.id,
-        };
         if let Err(error) = custody.stage_reply_disposal(&ticket) {
             return Err(ControlRequestPublishRefusal::Rejected { error, ticket });
         }
-        custody.publish(ticket)?;
+        let completed = custody.publish_with_receipt(ticket)?;
         // The original effect has actually completed. Missing its own root
         // ordering entry is a shared invariant, not a retriable RPC refusal.
-        if self.control_completion_observed(reference).is_err() {
+        if self
+            .control_completion_observed_with_receipt(&completed)
+            .is_err()
+        {
             std::process::abort();
         }
         Ok(())
@@ -1011,6 +1101,7 @@ impl ProcessControlOwner {
             .dispatch
             .publication_committed(&runtime, ticket)
     }
+    #[cfg(test)]
     pub(crate) fn control_completion_observed(
         &mut self,
         effect: EffectRef,
@@ -1018,6 +1109,30 @@ impl ProcessControlOwner {
         self.resources.dispatch.completion_observed(effect)?;
         self.note_control_input_progress(effect.input);
         Ok(())
+    }
+    pub(crate) fn control_completion_observed_with_receipt(
+        &mut self,
+        completed: &CompletedEffect<WorkerActor>,
+    ) -> Result<(), DispatchError> {
+        self.resources
+            .dispatch
+            .completion_observed_with_receipt(completed)?;
+        self.note_control_input_progress(completed.input());
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn take_protocol_observation_for_test(
+        &mut self,
+        input: InputId,
+        ports: &crate::TaskExecutionPorts,
+    ) -> Result<Option<super::request_observation::RequestObservationJob>, ControlRequestError>
+    {
+        Ok(self
+            .resources
+            .requests
+            .get_mut(&input)
+            .ok_or(ControlRequestError::WrongRequest)?
+            .take_protocol_observation_for_test(ports))
     }
     pub(crate) fn note_control_input_progress(&self, input: InputId) {
         if let Some(custody) = self.resources.requests.get(&input) {
@@ -1034,20 +1149,6 @@ impl ProcessControlOwner {
             custody.note_progress();
         }
     }
-    pub(crate) fn adopt_ticket(
-        &mut self,
-        ticket: &EffectTicket<super::actors::WorkerAction>,
-    ) -> Result<QueryContextAdmissionTicketReceipt, ControlTicketError> {
-        let runtime = self.runtime().clone();
-        self.resources.tickets.adopt(&runtime, self.actor, ticket)
-    }
-    pub(crate) fn retire_ticket(
-        &mut self,
-        ticket: &EffectTicket<super::actors::WorkerAction>,
-    ) -> Result<bool, ControlTicketError> {
-        let runtime = self.runtime().clone();
-        self.resources.tickets.retire(&runtime, self.actor, ticket)
-    }
     pub(crate) fn service(&mut self) -> &mut WorkerService {
         &mut self.service
     }
@@ -1056,6 +1157,7 @@ impl ProcessControlOwner {
     }
     /// Move the whole original inventory into its explicit process drain owner.
     /// This proves no publication, holder exit, report or physical executor drain.
+    #[cfg(test)]
     pub(crate) fn into_parts(self) -> (WorkerService, ProcessControlResources) {
         (self.service, self.resources)
     }
@@ -1076,21 +1178,12 @@ mod tests {
         ActorId::new(1).unwrap()
     }
     fn core() -> ControlCore {
-        core_with_fence_limit(1)
-    }
-    fn core_with_fence_limit(gone_fences: usize) -> ControlCore {
         ControlCore::new(
             ControlConfig {
-                max_contexts: 2,
-                max_waiters: 1,
                 max_pending_requests: 1,
                 step_budget: ControlCore::MAX_STEP_WORK,
-                retained_contexts: 1,
-                gone_fences,
-                retention: Duration::from_secs(10),
             },
-            AdmissionTicketConfig::new(1, Duration::from_secs(5), Duration::from_secs(10), 1)
-                .unwrap(),
+            AdmissionTicketConfig::new(Duration::from_secs(5), Duration::from_secs(10)).unwrap(),
             [9; 8],
             MonotonicInstant::ORIGIN,
         )
@@ -1100,8 +1193,6 @@ mod tests {
         ProcessControlBinding {
             actor: actor(),
             generation: generation(),
-            max_work: KINDS.len(),
-            max_slots: 1,
             request_positions: NonZeroUsize::new(1).unwrap(),
             actor_config: ActorConfig {
                 mailbox: [1; 4],
@@ -1116,10 +1207,9 @@ mod tests {
             // This bootstrap submits no request, ticket or Context effect.
             // It cannot claim any such unpaid capability from these vectors.
             admission_storage: AdmissionStorage {
-                loading: ResourceVector::default(),
-                accepted: ResourceVector::default(),
-                context: ResourceVector::default(),
-                ticket: ResourceVector::default(),
+                loading: Default::default(),
+                accepted: Default::default(),
+                context: Default::default(),
             },
         }
     }
@@ -1132,7 +1222,6 @@ mod tests {
         assert_eq!(resources.request_ready.registered(), 0);
         assert!(resources.requests.is_empty());
         assert!(resources.dispatch.is_empty());
-        assert!(resources.tickets.is_empty());
         assert!(resources.internal_partial.is_none());
         if let Some(internal) = &mut resources.internal {
             internal.close_after_drain().unwrap();
@@ -1165,8 +1254,9 @@ mod tests {
         }
         for role in resources.roles.iter_mut().rev() {
             role.capacity
-                .release(&role.capacity.resources().unwrap())
+                .release_quota(&role.capacity.resources().unwrap().quota)
                 .unwrap();
+            role.capacity.finish().unwrap();
         }
         ledger.remove_scope(resources.scope.id()).unwrap();
         assert!(ledger.is_empty());
@@ -1174,8 +1264,8 @@ mod tests {
     #[test]
     fn original_nonzero_root_bundle_owns_the_actual_control_registration_and_roles() {
         let paid = PROCESS_CONTROL_BOOTSTRAP_STORAGE.resources().unwrap();
-        let ledger = RuntimeLedger::new(paid.clone(), KINDS.len(), 1);
-        let runtime = ActorRuntime::new(1);
+        let ledger = RuntimeLedger::new(paid.quota.clone());
+        let runtime = ActorRuntime::new();
         let mut owner =
             ProcessControlOwner::bootstrap(&runtime, &ledger, core(), binding()).unwrap();
         assert_eq!(owner.actor(), actor());
@@ -1186,7 +1276,7 @@ mod tests {
             KINDS.len()
         );
         assert_eq!(owner.resources().scope.snapshot().unwrap().storage, 1);
-        for (dimension, count) in paid.iter() {
+        for (dimension, count) in paid.quota.iter() {
             assert_eq!(ledger.used(dimension), count);
         }
         let (service, resources) = owner.into_parts();
@@ -1218,13 +1308,10 @@ mod tests {
             .unwrap()
             .resources()
             .unwrap();
-        let ledger = RuntimeLedger::new(limits, 5, 1);
-        let runtime = ActorRuntime::new(1);
-        let mut config = binding();
-        config.max_work = 5;
-        let mut owner =
-            ProcessControlOwner::bootstrap(&runtime, &ledger, core_with_fence_limit(2), config)
-                .unwrap();
+        let ledger = RuntimeLedger::new(limits.quota);
+        let runtime = ActorRuntime::new();
+        let config = binding();
+        let mut owner = ProcessControlOwner::bootstrap(&runtime, &ledger, core(), config).unwrap();
         owner.enable_internal_source().unwrap();
         assert_eq!(owner.advance_internal().unwrap(), InternalAdvance::Idle);
         let (mut seed_work, mut seed_capacity) = owner
@@ -1248,7 +1335,7 @@ mod tests {
         for _ in 0..2 {
             let input = seed_role
                 .fill(WorkerMessage::Control(ControlMessage::Command {
-                    work: seed_work.id(),
+                    work: seed_work.reference(),
                     request: None,
                     command: ControlInput::FenceFrontend {
                         frontend: FrontendProcessId::new_v7(),
@@ -1257,7 +1344,31 @@ mod tests {
                 .unwrap();
             assert!(runtime.poll_one(Tick(1)).unwrap());
             owner.index_control_effects(64).unwrap();
-            let wake = owner.take_control_effect(64).unwrap().unwrap();
+            let mut wake = None;
+            for _ in 0..crate::control_runtime::actors::ControlActor::MAX_STEP_ACTIONS {
+                let ticket = owner.take_control_effect(64).unwrap().unwrap();
+                if let WorkerAction::AdmissionEpoch(projection) = &ticket.effect {
+                    // Commit the actual preceding admission projection before
+                    // handling the wake from this same fenced Root step.
+                    runtime
+                        .commit_snapshot(
+                            &ticket,
+                            &owner.resources().admission_snapshot,
+                            std::sync::Arc::new(*projection),
+                        )
+                        .unwrap_or_else(|_| panic!("original admission projection commits"));
+                    let reference = EffectRef {
+                        input: ticket.input,
+                        action: ticket.descriptor.id,
+                    };
+                    runtime.effect_completed(ticket).unwrap();
+                    owner.control_completion_observed(reference).unwrap();
+                } else {
+                    wake = Some(ticket);
+                    break;
+                }
+            }
+            let wake = wake.expect("the same bounded Root step publishes its internal wake");
             assert!(matches!(
                 &wake.effect,
                 WorkerAction::Control {
@@ -1272,8 +1383,9 @@ mod tests {
         seed_work.captures_exited().unwrap();
         seed_role.close_after_exit().unwrap();
         seed_capacity
-            .release(&seed_capacity.resources().unwrap())
+            .release_quota(&seed_capacity.resources().unwrap().quota)
             .unwrap();
+        seed_capacity.finish().unwrap();
         ledger
             .reap_scope_ready(owner.resources().scope.id(), 5)
             .unwrap();
@@ -1309,9 +1421,22 @@ mod tests {
         owner.index_control_effects(64).unwrap();
         assert!(owner.take_control_effect(64).unwrap().is_none());
         assert_eq!(owner.advance_internal().unwrap(), InternalAdvance::Idle);
-        assert_eq!(ledger.used(Dimension::Work.id()), 4);
-        assert_eq!(ledger.used(Dimension::Inputs.id()), 2);
-        assert_eq!(ledger.used(Dimension::Captures.id()), 1);
+        assert_eq!(owner.resources().scope.snapshot().unwrap().work, 4);
+        assert_eq!(runtime.snapshot(actor()).unwrap().roles, 1);
+        assert!(
+            owner.resources().internal.is_some()
+                || owner
+                    .resources()
+                    .internal_partial
+                    .as_ref()
+                    .is_some_and(|partial| partial
+                        .capacity
+                        .resources()
+                        .unwrap()
+                        .owned_slots
+                        .captures
+                        == 1)
+        );
         assert!(matches!(
             owner
                 .resources
@@ -1332,8 +1457,11 @@ mod tests {
             .unwrap()
             .close_after_drain()
             .unwrap();
-        assert_eq!(ledger.used(Dimension::Work.id()), 3);
-        assert_eq!(ledger.used(Dimension::Captures.id()), 0);
+        ledger
+            .reap_scope_ready(owner.resources().scope.id(), 4)
+            .unwrap();
+        assert_eq!(owner.resources().scope.snapshot().unwrap().work, 3);
+        assert!(owner.resources().internal_partial.is_none());
         let (service, resources) = owner.into_parts();
         drop(service);
         finish(&ledger, &runtime, resources);
@@ -1342,10 +1470,9 @@ mod tests {
     fn internal_input_refusal_retains_the_original_nonzero_unused_work() {
         use crate::control_runtime::control_internal::CONTROL_INTERNAL_STORAGE;
         use novarocks_control_runtime_core::mailbox::InputClass;
-        let mut config = binding();
+        let config = binding();
         let control_positions = config.actor_config.mailbox[InputClass::Control.index()]
-            + config.request_positions.get()
-            + core().directory_capacity() * CONTEXT_LIFECYCLE_INPUTS;
+            + config.request_positions.get();
         let unused = StorageNeed {
             inputs: control_positions,
             work: 1,
@@ -1358,9 +1485,8 @@ mod tests {
             .unwrap()
             .resources()
             .unwrap();
-        let ledger = RuntimeLedger::new(limits, 5, 1);
-        let runtime = ActorRuntime::new(1);
-        config.max_work = 5;
+        let ledger = RuntimeLedger::new(limits.quota);
+        let runtime = ActorRuntime::new();
         let mut owner = ProcessControlOwner::bootstrap(&runtime, &ledger, core(), config).unwrap();
         let (mut occupier, mut capacity) = owner
             .resources()
@@ -1387,8 +1513,21 @@ mod tests {
         ));
         assert!(owner.resources().internal.is_none());
         assert!(owner.resources().internal_partial.is_some());
-        assert_eq!(ledger.used(Dimension::Work.id()), 5);
-        assert_eq!(ledger.used(Dimension::Captures.id()), 1);
+        assert_eq!(owner.resources().scope.snapshot().unwrap().work, 5);
+        assert!(
+            owner.resources().internal.is_some()
+                || owner
+                    .resources()
+                    .internal_partial
+                    .as_ref()
+                    .is_some_and(|partial| partial
+                        .capacity
+                        .resources()
+                        .unwrap()
+                        .owned_slots
+                        .captures
+                        == 1)
+        );
         assert!(matches!(
             owner.enable_internal_source(),
             Err(ControlInternalError::AlreadyAdmitted)
@@ -1402,30 +1541,37 @@ mod tests {
         partial.work.captures_exited().unwrap();
         partial
             .capacity
-            .release(&partial.capacity.resources().unwrap())
+            .release_quota(&partial.capacity.resources().unwrap().quota)
+            .and_then(|()| partial.capacity.finish())
             .unwrap();
         for permit in reserved {
             permit.revoke_unused().unwrap();
         }
         occupier.body_exited().unwrap();
         occupier.captures_exited().unwrap();
-        capacity.release(&capacity.resources().unwrap()).unwrap();
-        assert_eq!(ledger.used(Dimension::Work.id()), 3);
-        assert_eq!(ledger.used(Dimension::Captures.id()), 0);
+        capacity
+            .release_quota(&capacity.resources().unwrap().quota)
+            .unwrap();
+        capacity.finish().unwrap();
+        ledger
+            .reap_scope_ready(owner.resources().scope.id(), 4)
+            .unwrap();
+        assert_eq!(owner.resources().scope.snapshot().unwrap().work, 3);
+        assert!(owner.resources().internal_partial.is_none());
         drop((partial, occupier, capacity));
         let (service, resources) = owner.into_parts();
         drop(service);
         finish(&ledger, &runtime, resources);
     }
     #[test]
-    fn real_ticket_replay_and_expiry_keep_the_original_holder_after_each_rpc_exits() {
+    fn ticket_replay_and_expiry_preserve_the_original_receipt_without_work_holders() {
         exercise_ticket_replay_and_expiry(false);
     }
     #[test]
-    fn a_later_expiry_cannot_overtake_the_original_unadopted_ticket_body() {
+    fn later_expiry_publication_cannot_overtake_the_original_ticket_reply_body() {
         exercise_ticket_replay_and_expiry(true);
     }
-    fn exercise_ticket_replay_and_expiry(expire_before_adoption: bool) {
+    fn exercise_ticket_replay_and_expiry(expire_before_reply_body: bool) {
         use crate::control_runtime::{
             actors::WorkerAction,
             control_request::{CONTROL_REQUEST_STORAGE, ControlReplyBody},
@@ -1442,29 +1588,39 @@ mod tests {
         };
         use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
 
-        // One actual external RPC at a time, independently of the live ticket.
-        let ticket_storage = StorageNeed {
-            work: 1,
-            ..StorageNeed::default()
-        };
+        // Only the actual process and one external R own Work/storage.
+        // Ticket history is Core metadata and holds no extra payer.
         let limits = PROCESS_CONTROL_BOOTSTRAP_STORAGE
             .checked_add(CONTROL_REQUEST_STORAGE)
             .unwrap()
-            .checked_add(ticket_storage)
-            .unwrap()
             .resources()
-            .unwrap()
-            .checked_add(&ResourceVector::new([(Dimension::Tickets.id(), 1)]).unwrap())
             .unwrap();
-        let ledger = RuntimeLedger::new(limits, 5, 1);
-        let runtime = ActorRuntime::new(1);
+        let ledger = RuntimeLedger::new(limits.quota);
+        let runtime = ActorRuntime::new();
         let core = core();
         let capability = core.admission().capability();
-        let mut config = binding();
-        config.max_work = 5;
-        config.max_slots = 2;
-        config.admission_storage.ticket = ticket_storage.resources().unwrap();
-        let mut owner = ProcessControlOwner::bootstrap(&runtime, &ledger, core, config).unwrap();
+        let mut owner = ProcessControlOwner::bootstrap(&runtime, &ledger, core, binding()).unwrap();
+        fn complete_marker(
+            owner: &mut ProcessControlOwner,
+            runtime: &ActorRuntime<WorkerActor>,
+            marker: EffectTicket<WorkerAction>,
+        ) {
+            if let WorkerAction::AdmissionEpoch(projection) = &marker.effect {
+                runtime
+                    .commit_snapshot(
+                        &marker,
+                        &owner.resources().admission_snapshot,
+                        std::sync::Arc::new(*projection),
+                    )
+                    .unwrap_or_else(|_| panic!("original admission projection commits"));
+            }
+            let reference = EffectRef {
+                input: marker.input,
+                action: marker.descriptor.id,
+            };
+            runtime.effect_completed(marker).unwrap();
+            owner.control_completion_observed(reference).unwrap();
+        }
         let mut advanced_expiry = None;
         let context = QueryContextRef::new(
             QueryExecutionId::new(QueryId::new(7101, 7102), AttemptId::new(1).unwrap()).unwrap(),
@@ -1476,7 +1632,7 @@ mod tests {
         bytes[8] = 0x80;
         let operation = TaskOperationId::try_from_bytes(bytes).unwrap();
         let mut original = None;
-        for ordinal in 1..=if expire_before_adoption { 1 } else { 2 } {
+        for ordinal in 1..=if expire_before_reply_body { 1 } else { 2 } {
             let (input, mut external) = owner
                 .admit_request(
                     ActorId::new(2).unwrap(),
@@ -1496,7 +1652,7 @@ mod tests {
                             capability,
                         ),
                         // A new issuer candidate is not immutable request semantics;
-                        // the second RPC must receive the first receipt and holder.
+                        // the second RPC must receive the first receipt.
                         ticket: AdmissionTicketId::try_from_bytes([ordinal; 16]).unwrap(),
                     },
                 )
@@ -1505,21 +1661,49 @@ mod tests {
             owner
                 .index_control_effects(ControlCore::MAX_STEP_WORK)
                 .unwrap();
-            let body = owner
+            let mut body = owner
                 .take_control_effect(ControlCore::MAX_STEP_WORK)
                 .unwrap()
                 .unwrap();
             assert_eq!(body.input, input);
-            if expire_before_adoption {
+            if matches!(body.effect, WorkerAction::AdmissionEpoch(_)) {
+                complete_marker(&mut owner, &runtime, body);
+                assert_eq!(
+                    owner
+                        .resources()
+                        .admission_snapshot
+                        .borrow()
+                        .logical_live_grants,
+                    1
+                );
+                body = owner
+                    .take_control_effect(ControlCore::MAX_STEP_WORK)
+                    .unwrap()
+                    .unwrap();
+            }
+            assert_eq!(body.input, input);
+            let receipt = match &body.effect {
+                WorkerAction::Control {
+                    effect:
+                        ControlEffect::AdmissionReply {
+                            result: Ok(receipt),
+                            ..
+                        },
+                    admitted: None,
+                } => *receipt,
+                other => panic!("the original metadata-only ticket grant: {other:?}"),
+            };
+            assert_eq!(*original.get_or_insert(receipt), receipt);
+            if expire_before_reply_body {
                 let expiry = runtime.next_deadline().unwrap();
                 assert_eq!(runtime.advance_time(expiry, 1).unwrap(), 1);
                 assert!(runtime.poll_one(expiry).unwrap());
                 owner
                     .index_control_effects(ControlCore::MAX_STEP_WORK)
                     .unwrap();
-                // The later timer is genuinely committed and its retirement
-                // is ready in Common. Root metadata order still retains the
-                // first original unbound grant until its actual adoption.
+                // The later pure expiry is committed. Its new logical count
+                // cannot publish before the original grant/reply metadata lane
+                // completes; no ticket holder or retirement Work is involved.
                 let timer = runtime.input_inventory(actor(), Some(input), 1).unwrap()[0].input;
                 assert_eq!(
                     runtime
@@ -1534,40 +1718,17 @@ mod tests {
                         .unwrap()
                         .is_none()
                 );
-                assert!(owner.resources().tickets.is_empty());
-                assert_eq!(ledger.used(Dimension::Tickets.id()), 1);
+                assert_eq!(
+                    owner
+                        .resources()
+                        .admission_snapshot
+                        .borrow()
+                        .logical_live_grants,
+                    1
+                );
                 advanced_expiry = Some(expiry);
             }
-            let admitted = matches!(
-                &body.effect,
-                WorkerAction::Control {
-                    admitted: Some(_),
-                    ..
-                }
-            );
-            assert_eq!(admitted, ordinal == 1);
-            let receipt = owner.adopt_ticket(&body).unwrap();
-            assert_eq!(*original.get_or_insert(receipt), receipt);
-            assert_eq!(owner.resources().tickets.len(), 1);
-            assert_eq!(ledger.used(Dimension::Tickets.id()), 1);
-            let completed = body.descriptor.id;
-            runtime.effect_completed(body).unwrap();
-            owner
-                .control_completion_observed(EffectRef {
-                    input,
-                    action: completed,
-                })
-                .unwrap();
-            for (descriptor, _) in runtime
-                .effect_inventory(actor(), input, None, ControlCore::MAX_STEP_WORK)
-                .unwrap()
-            {
-                if descriptor.dependencies.contains(&completed) {
-                    runtime
-                        .acknowledge_dependency(actor(), input, descriptor.id, completed)
-                        .unwrap();
-                }
-            }
+            complete_marker(&mut owner, &runtime, body);
             let reply = owner
                 .take_control_effect(ControlCore::MAX_STEP_WORK)
                 .unwrap()
@@ -1587,9 +1748,12 @@ mod tests {
                 .reap_scope_ready(owner.resources().scope.id(), 5)
                 .unwrap();
             assert_eq!(owner.request_ready().registered(), 0);
-            assert_eq!(ledger.used(Dimension::Replies.id()), 0);
-            assert_eq!(ledger.used(Dimension::Tickets.id()), 1);
-            assert_eq!(ledger.used(Dimension::Work.id()), 4);
+            assert_eq!(ledger.used(Dimension::Requests.id()), 0);
+            assert_eq!(
+                owner.resources().scope.snapshot().unwrap().work,
+                3,
+                "only original process roles remain after this actual R exits"
+            );
         }
         if advanced_expiry.is_none() {
             let expiry = runtime.next_deadline().unwrap();
@@ -1602,61 +1766,87 @@ mod tests {
         let inputs = runtime.input_inventory(actor(), None, 2).unwrap();
         assert_eq!(inputs.len(), 1);
         let timer = inputs[0].input;
-        let retired = owner
+        let expired = owner
             .take_control_effect(ControlCore::MAX_STEP_WORK)
             .unwrap()
             .unwrap();
-        assert_eq!(retired.input, timer);
-        assert!(matches!(
-            &retired.effect,
-            WorkerAction::Control {
-                effect: ControlEffect::RetireReservation(_),
-                admitted: None,
-            }
-        ));
-        assert!(owner.retire_ticket(&retired).unwrap());
-        assert!(owner.resources().tickets.is_empty());
-        let reference = EffectRef {
-            input: timer,
-            action: retired.descriptor.id,
-        };
-        runtime.effect_completed(retired).unwrap();
-        owner.control_completion_observed(reference).unwrap();
+        assert_eq!(expired.input, timer);
+        assert!(
+            matches!(expired.effect, WorkerAction::AdmissionEpoch(projection) if projection.logical_live_grants == 0)
+        );
+        complete_marker(&mut owner, &runtime, expired);
+        assert_eq!(
+            owner
+                .resources()
+                .admission_snapshot
+                .borrow()
+                .logical_live_grants,
+            0
+        );
+        assert!(
+            owner
+                .take_control_effect(ControlCore::MAX_STEP_WORK)
+                .unwrap()
+                .is_none(),
+            "ticket expiry has no retirement reservation or Work effect"
+        );
         runtime.retire_input(actor(), timer).unwrap();
+        let before_forget = *owner.resources().admission_snapshot.borrow();
+        assert_eq!(before_forget.admission_retention.ticket_records, 1);
+        assert_eq!(before_forget.admission_retention.replay_decisions, 1);
+        let horizon = runtime.next_deadline().unwrap();
+        assert_eq!(runtime.advance_time(horizon, 1).unwrap(), 1);
+        assert!(runtime.poll_one(horizon).unwrap());
+        owner
+            .index_control_effects(ControlCore::MAX_STEP_WORK)
+            .unwrap();
+        let forgotten = owner
+            .take_control_effect(ControlCore::MAX_STEP_WORK)
+            .unwrap()
+            .unwrap();
+        let horizon_input = forgotten.input;
+        let WorkerAction::AdmissionEpoch(projection) = &forgotten.effect else {
+            panic!("the original replay-horizon inventory publication");
+        };
+        assert_eq!(projection.epoch, before_forget.epoch);
+        assert_eq!(
+            projection.logical_live_grants,
+            before_forget.logical_live_grants
+        );
+        assert_eq!(projection.admission_retention.ticket_records, 0);
+        assert_eq!(projection.admission_retention.acquisition_decisions, 0);
+        assert_eq!(projection.admission_retention.replay_decisions, 0);
+        complete_marker(&mut owner, &runtime, forgotten);
+        assert_eq!(
+            owner
+                .resources()
+                .admission_snapshot
+                .borrow()
+                .admission_retention
+                .ticket_records,
+            0
+        );
+        assert!(
+            owner
+                .take_control_effect(ControlCore::MAX_STEP_WORK)
+                .unwrap()
+                .is_none()
+        );
+        runtime.retire_input(actor(), horizon_input).unwrap();
         ledger
             .reap_scope_ready(owner.resources().scope.id(), 5)
             .unwrap();
-        assert_eq!(ledger.used(Dimension::Tickets.id()), 0);
-        assert_eq!(ledger.used(Dimension::Work.id()), 3);
+        assert_eq!(owner.resources().scope.snapshot().unwrap().work, 3);
         assert!(owner.resources().dispatch.is_empty());
         let (service, resources) = owner.into_parts();
         drop(service);
         finish(&ledger, &runtime, resources);
     }
     #[test]
-    fn partial_root_role_refusal_retains_the_same_nonzero_payer_until_actual_metadata_exit() {
-        let ledger =
-            RuntimeLedger::new(PROCESS_CONTROL_BOOTSTRAP_STORAGE.resources().unwrap(), 2, 1);
-        let runtime = ActorRuntime::new(1);
-        let refusal = ProcessControlOwner::bootstrap(&runtime, &ledger, core(), binding())
-            .err()
-            .unwrap();
-        assert!(matches!(refusal.error, ProcessBootstrapError::Runtime(_)));
-        let resources = refusal.resources.unwrap();
-        assert!(!resources.registered);
-        assert_eq!(resources.roles.len(), 2);
-        assert_eq!(ledger.used(Dimension::Work.id()), KINDS.len() as u64);
-        assert_eq!(resources.scope.snapshot().unwrap().work, 2);
-        finish(&ledger, &runtime, resources);
-    }
-    #[test]
     fn closed_runtime_registration_returns_the_same_complete_bootstrap_inventory() {
-        let ledger = RuntimeLedger::new(
-            PROCESS_CONTROL_BOOTSTRAP_STORAGE.resources().unwrap(),
-            KINDS.len(),
-            1,
-        );
-        let runtime = ActorRuntime::new(1);
+        let ledger =
+            RuntimeLedger::new(PROCESS_CONTROL_BOOTSTRAP_STORAGE.resources().unwrap().quota);
+        let runtime = ActorRuntime::new();
         runtime.close_admission();
         let refusal = ProcessControlOwner::bootstrap(&runtime, &ledger, core(), binding())
             .err()
@@ -1669,17 +1859,14 @@ mod tests {
         assert!(!resources.registered);
         assert_eq!(resources.roles.len(), KINDS.len());
         assert_eq!(resources.scope.snapshot().unwrap().storage, 0);
-        assert_eq!(ledger.used(Dimension::Work.id()), KINDS.len() as u64);
+        assert_eq!(resources.scope.snapshot().unwrap().work, KINDS.len());
         finish(&ledger, &runtime, resources);
     }
     #[test]
     fn invalid_dependency_geometry_is_rejected_before_any_root_scope_or_payer_exists() {
-        let ledger = RuntimeLedger::new(
-            PROCESS_CONTROL_BOOTSTRAP_STORAGE.resources().unwrap(),
-            KINDS.len(),
-            1,
-        );
-        let runtime = ActorRuntime::new(1);
+        let ledger =
+            RuntimeLedger::new(PROCESS_CONTROL_BOOTSTRAP_STORAGE.resources().unwrap().quota);
+        let runtime = ActorRuntime::new();
         let mut invalid = binding();
         invalid.actor_config.max_dependencies_per_effect = 0;
         let refusal = ProcessControlOwner::bootstrap(&runtime, &ledger, core(), invalid)
@@ -1695,21 +1882,6 @@ mod tests {
             runtime.snapshot(actor()),
             Err(DriverError::UnknownActor)
         ));
-    }
-    #[test]
-    fn real_root_quota_denial_returns_its_empty_scope_without_manufacturing_a_work_exit() {
-        let ledger = RuntimeLedger::new(ResourceVector::default(), KINDS.len(), 1);
-        let runtime = ActorRuntime::new(1);
-        let refusal = ProcessControlOwner::bootstrap(&runtime, &ledger, core(), binding())
-            .err()
-            .unwrap();
-        assert!(matches!(refusal.error, ProcessBootstrapError::Runtime(_)));
-        let resources = refusal.resources.unwrap();
-        assert!(resources.roles.is_empty());
-        assert!(!resources.registered);
-        assert_eq!(resources.scope.snapshot().unwrap().work, 0);
-        assert_eq!(ledger.used(Dimension::Work.id()), 0);
-        finish(&ledger, &runtime, resources);
     }
     #[cfg(unix)]
     #[test]
@@ -1734,10 +1906,9 @@ mod tests {
             let all = PROCESS_CONTROL_BOOTSTRAP_STORAGE
                 .checked_add(request_need)
                 .unwrap();
-            let ledger = RuntimeLedger::new(all.resources().unwrap(), KINDS.len() + 1, 1);
-            let runtime = ActorRuntime::new(1);
-            let mut with_request = binding();
-            with_request.max_work += 1;
+            let ledger = RuntimeLedger::new(all.resources().unwrap().quota);
+            let runtime = ActorRuntime::new();
+            let with_request = binding();
             let owner =
                 ProcessControlOwner::bootstrap(&runtime, &ledger, core(), with_request).unwrap();
             let scope = &owner.resources().scope;
@@ -1762,15 +1933,15 @@ mod tests {
                 .reserve_input(actor(), ActorId::new(2).unwrap(), InputClass::Ordinary)
                 .unwrap()
                 .fill(WorkerMessage::Control(ControlMessage::Command {
-                    work: request.id(),
+                    work: request.reference(),
                     request: None,
                     // An impossible internal host report models a Core bug.
                     // It is not a supported I/O refusal or a query failure.
-                    command: ControlInput::ContextBootstrapFailed {
+                    command: ControlInput::ExecutionRetired {
                         context: unknown,
-                        refusal: novarocks_worker_protocol::creation::AdmissionRefusal::Verdict(
-                            novarocks_execution_contract::OperationOutcome::ResourceExhausted,
-                        ),
+                        retirement: novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                            close_epoch: generation(),
+                        },
                     },
                 }))
                 .unwrap();

@@ -17,7 +17,10 @@
 
 //! Work lifetime is independent from protocol termination and report retirement.
 
-use crate::identity::{Generation, ScopeId, SlotId, WorkId};
+use crate::{
+    identity::{Generation, ScopeId, SlotId, WorkId},
+    owned_storage::{OwnedPosition, OwnedPositionId, OwnedPositionSpan, OwnedSlotKind},
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,16 +56,19 @@ pub enum ScopeError {
     DuplicateWork,
     UnknownWork,
     WorkCapacity,
-    SlotCapacity,
     DuplicateSlot,
     UnknownSlot,
     InvalidTransition,
     ChildrenRemain,
+    HeaderStillHeld,
     ExitUnobserved,
     IdentityExhausted,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct WorkRecord {
+    header: OwnedPosition,
+    owned_captures: Option<OwnedPositionSpan>,
+    header_pins: usize,
     pub kind: WorkKind,
     pub phase: WorkPhase,
     pub parent: Option<WorkId>,
@@ -72,6 +78,35 @@ pub struct WorkRecord {
     pub unbound_guard: bool,
 }
 
+/// One actual holder of this original header. The pure state consumes the
+/// token explicitly; dropping it cannot manufacture a completed input or exit.
+#[derive(Debug)]
+#[must_use = "Return the original header pin when its actual holder retires"]
+pub struct WorkHeaderPin {
+    scope: ScopeId,
+    work: WorkId,
+    header: OwnedPositionId,
+}
+impl WorkHeaderPin {
+    pub const fn scope(&self) -> ScopeId {
+        self.scope
+    }
+    pub const fn work(&self) -> WorkId {
+        self.work
+    }
+    pub const fn header(&self) -> OwnedPositionId {
+        self.header
+    }
+}
+impl WorkRecord {
+    pub const fn header_pin_count(&self) -> usize {
+        self.header_pins
+    }
+    /// Read-only origin; it grants no new Work or publication permission.
+    pub fn header_identity(&self) -> OwnedPositionId {
+        self.header.id()
+    }
+}
 #[derive(Debug)]
 pub struct ScopeState {
     id: ScopeId,
@@ -80,21 +115,13 @@ pub struct ScopeState {
     external_open: bool,
     stopped: bool,
     failed: bool,
-    max_work: usize,
-    max_slots: usize,
     last_work: u64,
     last_slot: u64,
     work: BTreeMap<WorkId, WorkRecord>,
     slots: BTreeSet<SlotId>,
 }
 impl ScopeState {
-    pub fn new(
-        id: ScopeId,
-        parent: Option<ScopeId>,
-        generation: Generation,
-        max_work: usize,
-        max_slots: usize,
-    ) -> Self {
+    pub fn new(id: ScopeId, parent: Option<ScopeId>, generation: Generation) -> Self {
         Self {
             id,
             parent,
@@ -102,8 +129,6 @@ impl ScopeState {
             external_open: true,
             stopped: false,
             failed: false,
-            max_work,
-            max_slots,
             last_work: 0,
             last_slot: 0,
             work: BTreeMap::new(),
@@ -140,6 +165,22 @@ impl ScopeState {
     pub fn work_ids(&self) -> impl Iterator<Item = WorkId> + '_ {
         self.work.keys().copied()
     }
+    /// A bounded observer follows only original records in a frozen ID range.
+    /// This exposes no mutable Work or admission/retirement authority.
+    pub fn observed_work_after(
+        &self,
+        after: Option<WorkId>,
+        until: WorkId,
+    ) -> Option<(WorkId, &WorkRecord)> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        self.work
+            .range((after.map_or(Unbounded, Excluded), Included(until)))
+            .next()
+            .map(|(id, record)| (*id, record))
+    }
+    pub fn last_observed_work(&self) -> Option<WorkId> {
+        self.work.last_key_value().map(|(id, _)| *id)
+    }
     /// Allocated and admitted within the caller's same scope transaction.
     /// Generating IDs before taking that transaction can reorder concurrent
     /// admissions past the monotonic spent-identity watermark.
@@ -167,9 +208,6 @@ impl ScopeState {
         }
         if id.get() <= self.last_work {
             return Err(ScopeError::DuplicateWork);
-        }
-        if self.work.len() >= self.max_work {
-            return Err(ScopeError::WorkCapacity);
         }
         match admission {
             WorkAdmission::External => {
@@ -202,7 +240,26 @@ impl ScopeState {
         kind: WorkKind,
         admission: WorkAdmission,
     ) -> Result<(), ScopeError> {
+        self.admit_owned(
+            generation,
+            id,
+            kind,
+            admission,
+            OwnedPosition::intrinsic_work(self.id, id),
+        )
+    }
+    pub(crate) fn admit_owned(
+        &mut self,
+        generation: Generation,
+        id: WorkId,
+        kind: WorkKind,
+        admission: WorkAdmission,
+        header: OwnedPosition,
+    ) -> Result<(), ScopeError> {
         self.check_admission(generation, id, kind, admission)?;
+        if header.kind() != OwnedSlotKind::WorkHeader {
+            return Err(ScopeError::InvalidTransition);
+        }
         let parent = match admission {
             WorkAdmission::External => None,
             WorkAdmission::Derived(parent) => {
@@ -216,6 +273,9 @@ impl ScopeState {
         self.work.insert(
             id,
             WorkRecord {
+                header,
+                owned_captures: None,
+                header_pins: 0,
                 kind,
                 parent,
                 phase: WorkPhase::Admitted,
@@ -235,8 +295,9 @@ impl ScopeState {
         id: WorkId,
         kind: WorkKind,
         admission: WorkAdmission,
+        header: OwnedPosition,
     ) -> Result<(), ScopeError> {
-        self.admit(generation, id, kind, admission)?;
+        self.admit_owned(generation, id, kind, admission, header)?;
         self.work
             .get_mut(&id)
             .expect("newly admitted guard")
@@ -287,17 +348,100 @@ impl ScopeState {
         Ok(())
     }
     /// Only call after actual capture destruction, never merely after cancellation.
+    pub fn bind_captures(
+        &mut self,
+        id: WorkId,
+        captures: OwnedPositionSpan,
+    ) -> Result<(), ScopeError> {
+        let work = self.work.get_mut(&id).ok_or(ScopeError::UnknownWork)?;
+        if captures.kind() != OwnedSlotKind::Capture
+            || work.unbound_guard
+            || work.body_exited
+            || work.captures_exited
+            || work.owned_captures.is_some()
+        {
+            return Err(ScopeError::InvalidTransition);
+        }
+        work.owned_captures = Some(captures);
+        Ok(())
+    }
+    pub fn capture_positions(&self, id: WorkId) -> Result<usize, ScopeError> {
+        Ok(self
+            .work
+            .get(&id)
+            .ok_or(ScopeError::UnknownWork)?
+            .owned_captures
+            .as_ref()
+            .map_or(0, OwnedPositionSpan::len))
+    }
+    pub fn captures_bound(&self, id: WorkId) -> Result<bool, ScopeError> {
+        Ok(self
+            .work
+            .get(&id)
+            .ok_or(ScopeError::UnknownWork)?
+            .owned_captures
+            .is_some())
+    }
     pub fn captures_exited(&mut self, id: WorkId) -> Result<(), ScopeError> {
         let work = self.work.get_mut(&id).ok_or(ScopeError::UnknownWork)?;
         if work.captures_exited {
             return Err(ScopeError::InvalidTransition);
         }
         work.captures_exited = true;
+        work.owned_captures.take();
         Ok(())
     }
     pub fn work_exited(&self, id: WorkId) -> Result<bool, ScopeError> {
         let work = self.work.get(&id).ok_or(ScopeError::UnknownWork)?;
         Ok(work.body_exited && work.captures_exited && work.children == 0)
+    }
+    /// Header custody is independent of the physical body/capture observation.
+    pub fn work_header_retirement_ready(&self, id: WorkId) -> Result<bool, ScopeError> {
+        Ok(self.work_exited(id)? && self.work[&id].header_pins == 0)
+    }
+    /// Called by the actual Work or still-owned guard holder, never an identity alone.
+    pub fn pin_work_header(&mut self, id: WorkId) -> Result<WorkHeaderPin, ScopeError> {
+        let work = self.work.get_mut(&id).ok_or(ScopeError::UnknownWork)?;
+        work.header_pins = work
+            .header_pins
+            .checked_add(1)
+            .ok_or(ScopeError::IdentityExhausted)?;
+        Ok(WorkHeaderPin {
+            scope: self.id,
+            work: id,
+            header: work.header_identity(),
+        })
+    }
+    pub fn retain_work_header(&mut self, pin: &WorkHeaderPin) -> Result<WorkHeaderPin, ScopeError> {
+        if pin.scope != self.id
+            || self
+                .work
+                .get(&pin.work)
+                .is_none_or(|work| work.header_identity() != pin.header || work.header_pins == 0)
+        {
+            return Err(ScopeError::InvalidTransition);
+        }
+        self.pin_work_header(pin.work)
+    }
+    pub fn release_work_header(
+        &mut self,
+        pin: WorkHeaderPin,
+    ) -> Result<bool, (ScopeError, WorkHeaderPin)> {
+        if pin.scope != self.id
+            || self
+                .work
+                .get(&pin.work)
+                .is_none_or(|work| work.header_identity() != pin.header || work.header_pins == 0)
+        {
+            return Err((ScopeError::InvalidTransition, pin));
+        }
+        self.work
+            .get_mut(&pin.work)
+            .expect("original pinned header")
+            .header_pins -= 1;
+        Ok(self
+            .work_header_retirement_ready(pin.work)
+            .expect("pin retains its original Work"))
     }
     /// Retires one record. A ready parent is returned for a later bounded turn.
     pub fn retire_work(&mut self, id: WorkId) -> Result<Option<WorkId>, ScopeError> {
@@ -307,6 +451,9 @@ impl ScopeState {
         }
         if !work.body_exited || !work.captures_exited {
             return Err(ScopeError::ExitUnobserved);
+        }
+        if work.header_pins != 0 {
+            return Err(ScopeError::HeaderStillHeld);
         }
         let parent = work.parent;
         self.work.remove(&id);
@@ -319,7 +466,11 @@ impl ScopeState {
                 .children
                 .checked_sub(1)
                 .expect("child ownership underflow");
-            if record.body_exited && record.captures_exited && record.children == 0 {
+            if record.body_exited
+                && record.captures_exited
+                && record.children == 0
+                && record.header_pins == 0
+            {
                 return Ok(Some(parent));
             }
         }
@@ -330,6 +481,16 @@ impl ScopeState {
         let record = self.work.get(&id).ok_or(ScopeError::UnknownWork)?;
         if !record.unbound_guard || record.phase != WorkPhase::Admitted || record.children != 0 {
             return Err(ScopeError::InvalidTransition);
+        }
+        if record.header_pins != 0 {
+            // The original never-bound holder really withdrew. No async body
+            // or capture existed; only a resident batch still owns the header.
+            // Its last pin, rather than a fabricated active Work, retires it.
+            let record = self.work.get_mut(&id).expect("same unused original guard");
+            record.body_exited = true;
+            record.captures_exited = true;
+            record.phase = WorkPhase::BodyExited;
+            return Ok(());
         }
         let parent = record.parent;
         self.work.remove(&id);
@@ -348,9 +509,6 @@ impl ScopeState {
     pub fn reserve_slot(&mut self, id: SlotId) -> Result<(), ScopeError> {
         if id.get() <= self.last_slot {
             return Err(ScopeError::DuplicateSlot);
-        }
-        if self.slots.len() >= self.max_slots {
-            return Err(ScopeError::SlotCapacity);
         }
         self.slots.insert(id);
         self.last_slot = id.get();

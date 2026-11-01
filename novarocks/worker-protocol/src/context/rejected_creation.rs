@@ -21,7 +21,7 @@
 
 use super::*;
 
-impl ContextCore {
+impl LiveContextCore {
     pub(super) fn begin_rejected_creation_retirement(
         &mut self,
         task: TaskIdentity,

@@ -15,66 +15,40 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Pure ticket policy. IDs and the issuer come from the driver; capacity
-//! transactions return scope-visible reservations, never asynchronous permits.
-use crate::{
-    creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal},
-    lease::MonotonicInstant,
-};
-use novarocks_control_runtime_core::identity::ReservationId;
+//! Pure ticket metadata policy. IDs and the issuer come from the driver;
+//! grants confer protocol rights without reserving execution capacity.
+use crate::lease::MonotonicInstant;
 use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId, LeaseValidFor,
-    OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextRef, TaskOperationId,
+    QueryContextAdmissionTicketReceipt, QueryContextRef, TaskOperationId,
 };
 use novarocks_types::NativeCompatibilityId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::{fmt, time::Duration};
-/// Maximum number of query-context capacity reservations one worker owns.
-pub const MAX_ADMISSION_RESERVATIONS: usize = 1024;
-
 /// Maximum lifetime an unredeemed grant may request.
 pub const MAX_ADMISSION_TICKET_VALID_FOR: Duration = Duration::from_secs(10);
 
-/// Worker-local bounds for admission grants and their replay records.
+/// Worker-local lifetimes for admission grants and their replay records.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct AdmissionTicketConfig {
-    max_reservations: usize,
     max_valid_for: Duration,
     replay_retention: Duration,
-    max_records: usize,
 }
 
 impl AdmissionTicketConfig {
     pub const DEFAULT: Self = Self {
-        max_reservations: MAX_ADMISSION_RESERVATIONS,
         max_valid_for: MAX_ADMISSION_TICKET_VALID_FOR,
         replay_retention: Duration::from_secs(120),
-        max_records: MAX_ADMISSION_RESERVATIONS * 8,
     };
 
-    pub fn new(
-        max_reservations: usize,
-        max_valid_for: Duration,
-        replay_retention: Duration,
-        max_records: usize,
-    ) -> Option<Self> {
-        if max_reservations == 0
-            || max_valid_for.is_zero()
-            || replay_retention.is_zero()
-            || max_records < max_reservations
-        {
+    pub fn new(max_valid_for: Duration, replay_retention: Duration) -> Option<Self> {
+        if max_valid_for.is_zero() || replay_retention.is_zero() {
             return None;
         }
         Some(Self {
-            max_reservations,
             max_valid_for,
             replay_retention,
-            max_records,
         })
-    }
-
-    pub const fn max_reservations(self) -> usize {
-        self.max_reservations
     }
 
     pub const fn max_valid_for(self) -> Duration {
@@ -82,9 +56,6 @@ impl AdmissionTicketConfig {
     }
     pub const fn replay_retention(self) -> Duration {
         self.replay_retention
-    }
-    pub const fn max_records(self) -> usize {
-        self.max_records
     }
 }
 
@@ -153,15 +124,8 @@ impl AdmissionTicketGrant {
 
 /// Why this worker refused to issue a ticket.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The exact bounded domain refusal stays inline in its prepaid ticket record; capacity denial does not allocate another box."
-)]
 pub enum AdmissionTicketAcquisitionRejection {
     ValidityExceedsWorkerLimit,
-    ReservationCapacityExhausted,
-    ReservationRefused(AdmissionRefusal),
-    ReplayCapacityExhausted,
     ContextAlreadyGranted,
     OperationReplayConflict,
     SealedEpoch,
@@ -174,11 +138,6 @@ impl fmt::Display for AdmissionTicketAcquisitionRejection {
             Self::ValidityExceedsWorkerLimit => {
                 "admission ticket validity exceeds the worker limit"
             }
-            Self::ReservationRefused(_) => "worker admission reservation was refused",
-            Self::ReservationCapacityExhausted => {
-                "worker query-context admission capacity is exhausted"
-            }
-            Self::ReplayCapacityExhausted => "worker admission ticket replay capacity is exhausted",
             Self::ContextAlreadyGranted => "query context already has an active admission ticket",
             Self::OperationReplayConflict => {
                 "admission ticket operation id was replayed with different content"
@@ -244,7 +203,6 @@ struct TicketRecord {
     operation: TaskOperationId,
     receipt: QueryContextAdmissionTicketReceipt,
     state: AdmissionTicketState,
-    reservation: ReservationId,
     expires_at: MonotonicInstant,
 }
 #[derive(Clone, Debug)]
@@ -252,6 +210,16 @@ struct Decision {
     identity: AcquisitionIdentity,
     result: Result<QueryContextAdmissionTicketReceipt, AdmissionTicketAcquisitionRejection>,
     stamp: u64,
+}
+/// Original table inventory. Estimates cover inline keys/values only; tree
+/// nodes, allocator overhead and process memory are not measured here.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdmissionRetentionInventory {
+    pub ticket_records: usize,
+    pub acquisition_decisions: usize,
+    pub replay_decisions: usize,
+    pub expiry_entries: usize,
+    pub metadata_bytes_estimate: Option<usize>,
 }
 #[derive(Debug)]
 pub struct AdmissionCore {
@@ -286,6 +254,58 @@ impl AdmissionCore {
         AdmissionEpochCapability::try_from_issuer_and_stamp(self.issuer, self.next_stamp)
             .expect("nonzero issuer and stamp")
     }
+    /// Issued or redeemed grants not yet closed by a committed transition.
+    /// This is observation only, never a limit or execution capacity grant.
+    pub fn logical_live_grants(&self) -> usize {
+        self.contexts.len()
+    }
+    pub fn retention_inventory(&self) -> AdmissionRetentionInventory {
+        use std::mem::size_of;
+        let metadata_bytes_estimate = Some(size_of::<Self>())
+            .and_then(|n| {
+                n.checked_add(
+                    self.tickets
+                        .len()
+                        .checked_mul(size_of::<(AdmissionTicketId, TicketRecord)>())?,
+                )
+            })
+            .and_then(|n| {
+                n.checked_add(
+                    self.contexts
+                        .len()
+                        .checked_mul(size_of::<(QueryContextRef, AdmissionTicketId)>())?,
+                )
+            })
+            .and_then(|n| {
+                n.checked_add(
+                    self.decisions
+                        .len()
+                        .checked_mul(size_of::<(TaskOperationId, Decision)>())?,
+                )
+            })
+            .and_then(|n| {
+                n.checked_add(
+                    self.expiries
+                        .len()
+                        .checked_mul(size_of::<(MonotonicInstant, AdmissionTicketId)>())?,
+                )
+            })
+            .and_then(|n| {
+                n.checked_add(
+                    self.retention
+                        .len()
+                        .checked_mul(size_of::<(MonotonicInstant, TaskOperationId)>())?,
+                )
+            });
+        AdmissionRetentionInventory {
+            ticket_records: self.tickets.len(),
+            acquisition_decisions: self.decisions.len(),
+            // Includes retained rejections without a ticket; never a ticket count.
+            replay_decisions: self.retention.len(),
+            expiry_entries: self.expiries.len(),
+            metadata_bytes_estimate,
+        }
+    }
     /// Read-only replay existence check used before a new wait deadline may
     /// claim that this operation never acquired ownership.
     pub fn has_decision(&self, operation: TaskOperationId) -> bool {
@@ -296,7 +316,6 @@ impl AdmissionCore {
         request: AcquireQueryContextAdmissionTicket,
         ticket: AdmissionTicketId,
         now: MonotonicInstant,
-        capacity: &mut impl AdmissionPort,
     ) -> Result<AdmissionTicketGrant, AdmissionTicketAcquisitionRejection> {
         let operation = request.envelope().operation_id();
         let identity = AcquisitionIdentity::from(request);
@@ -326,10 +345,7 @@ impl AdmissionCore {
             return Err(AdmissionTicketAcquisitionRejection::SealedEpoch);
         }
         let capability = request.admission_epoch_capability();
-        if capability.issuer() != self.issuer
-            || capability.stamp() <= self.reclaim_frontier
-            || self.decisions.len() >= self.config.max_records
-        {
+        if capability.issuer() != self.issuer || capability.stamp() <= self.reclaim_frontier {
             return Err(AdmissionTicketAcquisitionRejection::SealedEpoch);
         }
         if self.tickets.contains_key(&ticket) {
@@ -346,21 +362,6 @@ impl AdmissionCore {
             self.record(operation, identity, Err(e.clone()), Some(now));
             return Err(e);
         }
-        let reservation = match capacity.try_reserve(AdmissionNeed::Ticket {
-            context: request.context(),
-        }) {
-            Ok(r) => r,
-            Err(AdmissionRefusal::Verdict(OperationOutcome::ResourceExhausted)) => {
-                let e = AdmissionTicketAcquisitionRejection::ReservationCapacityExhausted;
-                self.record(operation, identity, Err(e.clone()), Some(now));
-                return Err(e);
-            }
-            Err(refusal) => {
-                let e = AdmissionTicketAcquisitionRejection::ReservationRefused(refusal);
-                self.record(operation, identity, Err(e.clone()), Some(now));
-                return Err(e);
-            }
-        };
         let receipt =
             QueryContextAdmissionTicketReceipt::new(ticket, request.context(), request.valid_for());
         let expires_at = now.saturating_add(request.valid_for().get());
@@ -370,7 +371,6 @@ impl AdmissionCore {
                 operation,
                 receipt,
                 state: AdmissionTicketState::Issued,
-                reservation,
                 expires_at,
             },
         );
@@ -439,10 +439,8 @@ impl AdmissionCore {
             AdmissionTicketState::Expired => Err(AdmissionTicketRedemptionRejection::Expired),
         }
     }
-    /// Closing new admission revokes an unused ticket only. A redeemed
-    /// reservation remains owned by its actual context until physical release.
     /// Process drain closes new grant/election rights. Existing decisions
-    /// remain observable; actual reservations retire only through their owner.
+    /// remain observable; closing a ticket never proves physical Context exit.
     pub(crate) fn begin_process_drain(&mut self) {
         self.process_draining = true;
     }
@@ -451,11 +449,10 @@ impl AdmissionCore {
     }
     /// The expiry index contains only actual issued, never redeemed tickets.
     /// Revoke one original without fabricating elapsed time or scanning rows.
-    pub(crate) fn revoke_next_unredeemed(
-        &mut self,
-        now: MonotonicInstant,
-    ) -> Option<ReservationId> {
-        let (_, ticket) = self.expiries.first().copied()?;
+    pub(crate) fn revoke_next_unredeemed(&mut self, now: MonotonicInstant) -> bool {
+        let Some((_, ticket)) = self.expiries.first().copied() else {
+            return false;
+        };
         assert_eq!(
             self.tickets
                 .get(&ticket)
@@ -467,23 +464,19 @@ impl AdmissionCore {
         self.terminal(ticket, AdmissionTicketState::Closed, now)
     }
 
-    pub fn revoke_unredeemed(
-        &mut self,
-        context: QueryContextRef,
-        now: MonotonicInstant,
-    ) -> Option<ReservationId> {
-        let ticket = *self.contexts.get(&context)?;
-        if self.tickets.get(&ticket)?.state != AdmissionTicketState::Issued {
-            return None;
+    pub fn revoke_unredeemed(&mut self, context: QueryContextRef, now: MonotonicInstant) -> bool {
+        let Some(&ticket) = self.contexts.get(&context) else {
+            return false;
+        };
+        if self.tickets[&ticket].state != AdmissionTicketState::Issued {
+            return false;
         }
         self.terminal(ticket, AdmissionTicketState::Closed, now)
     }
-    pub fn close_context(
-        &mut self,
-        context: QueryContextRef,
-        now: MonotonicInstant,
-    ) -> Option<ReservationId> {
-        let ticket = self.contexts.remove(&context)?;
+    pub fn close_context(&mut self, context: QueryContextRef, now: MonotonicInstant) -> bool {
+        let Some(ticket) = self.contexts.remove(&context) else {
+            return false;
+        };
         self.terminal(ticket, AdmissionTicketState::Closed, now)
     }
     fn terminal(
@@ -491,13 +484,15 @@ impl AdmissionCore {
         ticket: AdmissionTicketId,
         state: AdmissionTicketState,
         now: MonotonicInstant,
-    ) -> Option<ReservationId> {
-        let r = self.tickets.get_mut(&ticket)?;
+    ) -> bool {
+        let Some(r) = self.tickets.get_mut(&ticket) else {
+            return false;
+        };
         if matches!(
             r.state,
             AdmissionTicketState::Closed | AdmissionTicketState::Expired
         ) {
-            return None;
+            return false;
         }
         self.contexts.remove(&r.receipt.context());
         self.expiries.remove(&(r.expires_at, ticket));
@@ -506,13 +501,12 @@ impl AdmissionCore {
             now.saturating_add(self.config.replay_retention),
             r.operation,
         ));
-        Some(r.reservation)
+        true
     }
     /// A bounded cursor over indexes, never a scan of every task/context.
-    /// Returned reservations are transferred to runtime cleanup, not released by
-    /// this protocol view; the original holder's exit still controls capacity.
-    pub fn advance(&mut self, now: MonotonicInstant, budget: usize) -> Vec<ReservationId> {
-        let mut retired = Vec::new();
+    /// Returns the number of metadata records visited for step accounting.
+    /// Ticket expiration and replay forgetting never release execution work.
+    pub fn advance(&mut self, now: MonotonicInstant, budget: usize) -> usize {
         let mut remaining = budget;
         while remaining > 0 {
             let Some((at, ticket)) = self.expiries.first().copied() else {
@@ -523,9 +517,7 @@ impl AdmissionCore {
             }
             self.expiries.pop_first();
             remaining -= 1;
-            if let Some(r) = self.terminal(ticket, AdmissionTicketState::Expired, now) {
-                retired.push(r);
-            }
+            self.terminal(ticket, AdmissionTicketState::Expired, now);
         }
         while remaining > 0 {
             let Some((at, op)) = self.retention.first().copied() else {
@@ -543,7 +535,7 @@ impl AdmissionCore {
                 }
             }
         }
-        retired
+        budget - remaining
     }
     pub fn next_deadline(&self) -> Option<MonotonicInstant> {
         self.expiries

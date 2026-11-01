@@ -15,28 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Source storage is split from one actual original Accepted bundle. These
-//! tests create no extra source Work, report or Native execution capability.
+//! Future Task roles move once from the original Accepted object's unused inventory.
 
 use super::*;
+use novarocks_control_runtime_core::{
+    capacity::ReservationResources, owned_storage::OwnedSlotNeed,
+};
 
-fn source_fees(units: u64) -> ResourceVector {
-    ResourceVector::new([
-        (Dimension::Work.id(), units),
-        (Dimension::Completions.id(), units),
-        (Dimension::Captures.id(), units),
-    ])
-    .unwrap()
+fn role_storage(roles: usize) -> ReservationResources {
+    crate::control_runtime_policy::StorageNeed::role(false)
+        .checked_mul(roles)
+        .unwrap()
+        .resources()
+        .unwrap()
 }
-fn accepted_resources() -> ResourceVector {
-    ResourceVector::new([
-        (Dimension::PreparingTasks.id(), 1),
-        (Dimension::PreparingBytes.id(), 10),
-        (Dimension::InboundRecords.id(), 1),
-        (Dimension::InboundBytes.id(), 9),
-    ])
-    .unwrap()
-    .checked_add(&source_fees(3))
+fn accepted_resources() -> ReservationResources {
+    ReservationResources::new(
+        ResourceVector::new([
+            (Dimension::PreparingTasks.id(), 1),
+            (Dimension::PreparingBytes.id(), 10),
+        ])
+        .unwrap(),
+        OwnedSlotNeed {
+            work_headers: 1,
+            completions: 2,
+            captures: 1,
+            ..OwnedSlotNeed::default()
+        },
+    )
+    .checked_add(&role_storage(3))
     .unwrap()
 }
 fn admitted() -> (
@@ -47,13 +54,11 @@ fn admitted() -> (
 ) {
     let resources = accepted_resources();
     let mut fixture = Fixture {
-        ledger: RuntimeLedger::new(resources.clone(), 4, 1),
+        ledger: RuntimeLedger::new(resources.quota.clone()),
         scopes: Vec::new(),
     };
     let scope = fixture.scope();
-    // All source fees are paid by this original admission, before binding the
-    // actual input. No later reservation supplies duplicate source fees.
-    let (work, capacity) = scope
+    let (work, mut capacity) = scope
         .reserve_next(
             generation(),
             resources,
@@ -63,11 +68,10 @@ fn admitted() -> (
         .unwrap()
         .bind(WorkKind::Business)
         .unwrap();
-    let report = || {
+    let mut report = || {
         ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            work.id(),
             2,
             [
                 (
@@ -97,67 +101,42 @@ fn admitted() -> (
     );
     (fixture, custody, job, drops)
 }
-fn assert_paid(fixture: &Fixture, resources: &ResourceVector) {
-    for dimension in [
-        Dimension::PreparingTasks,
-        Dimension::PreparingBytes,
-        Dimension::InboundRecords,
-        Dimension::InboundBytes,
-        Dimension::Work,
-        Dimension::Completions,
-        Dimension::Captures,
-    ] {
-        assert_eq!(
-            fixture.ledger.used(dimension.id()),
-            resources.get(dimension.id())
-        );
-    }
+fn assert_preparing(f: &Fixture, count: u64, bytes: u64) {
+    assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), count);
+    assert_eq!(f.ledger.used(Dimension::PreparingBytes.id()), bytes);
 }
 
 #[test]
-fn source_split_moves_only_original_storage_and_stays_paid_after_preparation_returns() {
+fn source_split_moves_only_original_storage_and_stays_owned_after_preparation_returns() {
     let (fixture, owner, job, drops) = admitted();
-    let original = accepted_resources();
-    let source = source_fees(2);
-    let mut storage = owner.take_task_source_storage(&source).unwrap();
-    assert_eq!(storage.resources().unwrap(), source);
-    assert_paid(&fixture, &original);
+    let need = role_storage(2);
+    let mut storage = owner.take_task_role_storage(&need).unwrap();
+    assert_eq!(storage.resources().unwrap(), need);
+    assert_preparing(&fixture, 1, 10);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert!(matches!(
-        owner
-            .take_task_source_storage(&source)
-            .err()
-            .expect("one transfer"),
-        PreparationStorageSplitError::AlreadyTransferred
+        owner.take_task_role_storage(&need),
+        Err(PreparationStorageSplitError::AlreadyTransferred)
     ));
-    assert_paid(&fixture, &original);
-
-    // Dispose the actual never-started job and its original input outside
-    // custody locks. The two reports still need their actual consumer legs.
     assert!(job.dispose());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert!(owner.publish_whole_exit().unwrap());
     assert!(owner.take_after_exit().unwrap().is_none());
-    assert_paid(&fixture, &original);
+    assert_preparing(&fixture, 1, 10);
     for report in [owner.body_report(), owner.exit_report()] {
         report.consume(core()).unwrap();
         report.consume(observer()).unwrap();
     }
     let mut remainder = owner.take_after_exit().unwrap().unwrap();
-    let remaining = remainder.resources().unwrap();
-    assert_eq!(remaining.get(Dimension::PreparingTasks.id()), 0);
-    assert_eq!(remaining.get(Dimension::PreparingBytes.id()), 0);
-    assert_eq!(remaining.get(Dimension::InboundRecords.id()), 1);
-    assert_eq!(remaining.get(Dimension::InboundBytes.id()), 9);
-    for dimension in [Dimension::Work, Dimension::Completions, Dimension::Captures] {
-        assert_eq!(remaining.get(dimension.id()), 1);
-        assert_eq!(fixture.ledger.used(dimension.id()), 3);
-    }
-    remainder.release(&remaining).unwrap();
-    // The preparation can return its own remainder without refunding the
-    // caller's same original source storage, which has never issued a holder.
-    assert_paid(&fixture, &source);
-    storage.release(&source).unwrap();
+    assert_preparing(&fixture, 0, 0);
+    assert_eq!(remainder.resources().unwrap(), role_storage(1));
+    remainder.finish().unwrap();
+    assert_eq!(
+        storage.resources().unwrap(),
+        need,
+        "finishing the original remainder cannot release transferred unused Task roles"
+    );
+    storage.finish().unwrap();
     drop((storage, remainder, owner));
     fixture.finish();
 }
@@ -165,57 +144,42 @@ fn source_split_moves_only_original_storage_and_stays_paid_after_preparation_ret
 #[test]
 fn invalid_and_failed_splits_keep_the_original_storage_and_single_transfer_opportunity() {
     let (fixture, owner, job, drops) = admitted();
-    let original = accepted_resources();
-    let valid = source_fees(2);
+    let valid = role_storage(2);
     let mut invalid = vec![
-        ResourceVector::default(),
-        ResourceVector::new([(Dimension::Work.id(), 1)]).unwrap(),
-        ResourceVector::new([
-            (Dimension::Work.id(), 1),
-            (Dimension::Completions.id(), 2),
-            (Dimension::Captures.id(), 1),
-        ])
-        .unwrap(),
+        ReservationResources::default(),
+        ReservationResources::work_only(),
     ];
+    let mut wrong_profile = valid.clone();
+    wrong_profile.owned_slots.completions += 1;
+    invalid.push(wrong_profile);
     for dimension in [
         Dimension::PreparingTasks,
         Dimension::PreparingBytes,
-        Dimension::InboundRecords,
-        Dimension::InboundBytes,
         Dimension::Requests,
     ] {
-        invalid.push(
-            valid
-                .checked_add(&ResourceVector::new([(dimension.id(), 1)]).unwrap())
-                .unwrap(),
-        );
+        let mut wrong_quota = valid.clone();
+        wrong_quota.quota = ResourceVector::new([(dimension.id(), 1)]).unwrap();
+        invalid.push(wrong_quota);
     }
-    for resources in invalid {
+    for need in invalid {
         assert!(matches!(
-            owner
-                .take_task_source_storage(&resources)
-                .err()
-                .expect("typed refusal"),
-            PreparationStorageSplitError::InvalidResources
+            owner.take_task_role_storage(&need),
+            Err(PreparationStorageSplitError::InvalidResources)
         ));
-        assert_paid(&fixture, &original);
+        assert_preparing(&fixture, 1, 10);
     }
     assert!(matches!(
-        owner
-            .take_task_source_storage(&source_fees(4))
-            .err()
-            .expect("original bundle is too small"),
-        PreparationStorageSplitError::Runtime(_)
+        owner.take_task_role_storage(&role_storage(4)),
+        Err(PreparationStorageSplitError::Runtime(_))
     ));
-    assert_paid(&fixture, &original);
-    let mut storage = owner.take_task_source_storage(&valid).unwrap();
+    let mut storage = owner.take_task_role_storage(&valid).unwrap();
     assert_eq!(storage.resources().unwrap(), valid);
-    assert_paid(&fixture, &original);
     assert!(job.dispose());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     fixture.release(&owner);
-    assert_paid(&fixture, &valid);
-    storage.release(&valid).unwrap();
+    assert_preparing(&fixture, 0, 0);
+    assert_eq!(storage.resources().unwrap(), valid);
+    storage.finish().unwrap();
     drop((storage, owner));
     fixture.finish();
 }
@@ -226,13 +190,10 @@ fn preparation_exit_closes_an_unused_source_storage_transfer() {
     assert!(job.dispose());
     assert!(owner.publish_whole_exit().unwrap());
     assert!(matches!(
-        owner
-            .take_task_source_storage(&source_fees(2))
-            .err()
-            .expect("preparation exit is already published"),
-        PreparationStorageSplitError::Unavailable
+        owner.take_task_role_storage(&role_storage(2)),
+        Err(PreparationStorageSplitError::Unavailable)
     ));
-    assert_paid(&fixture, &accepted_resources());
+    assert_preparing(&fixture, 1, 10);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     fixture.release(&owner);
     drop(owner);

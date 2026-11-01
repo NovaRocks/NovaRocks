@@ -33,12 +33,8 @@ fn adopted_metadata_context() -> Harness {
     fixture
 }
 
-fn bank_charges(fixture: &Harness) -> [u64; 3] {
-    [
-        fixture.ledger.used(Dimension::Work.id()),
-        fixture.ledger.used(Dimension::Captures.id()),
-        fixture.ledger.used(Dimension::Completions.id()),
-    ]
+fn bank_charges(fixture: &Harness) -> [u64; 4] {
+    actual_admission_usage(fixture)
 }
 
 #[test]
@@ -133,7 +129,7 @@ fn an_original_context_binds_and_withdraws_its_prepaid_io_bank_without_new_charg
 }
 
 #[test]
-fn a_sealed_context_refuses_callbacks_and_retires_all_three_unused_partial_roles() {
+fn a_stopped_and_sealed_context_refuses_io_before_binding_any_partial_role() {
     let mut fixture = adopted_metadata_context();
     let scope = fixture
         .service
@@ -145,6 +141,9 @@ fn a_sealed_context_refuses_callbacks_and_retires_all_three_unused_partial_roles
         .clone();
     let baseline = scope.snapshot().unwrap();
     let paid = bank_charges(&fixture);
+    // Obtain the actual pure Core close while its real lifecycle source is
+    // still open. A later driver seal cannot be reopened to invent that fact.
+    fixture.close_model_core();
     fixture
         .runtime
         .close_actor_admission(context_actor())
@@ -175,6 +174,10 @@ fn a_sealed_context_refuses_callbacks_and_retires_all_three_unused_partial_roles
             .close_for_teardown()
             .unwrap()
     );
+    // Closing the original unused sources leaves their actual host-ready
+    // notification queued. Release only claims whose batches really drained
+    // before asking the scheduler to seal this same actor.
+    Harness::release_drained_effect_claims(&fixture.runtime);
     fixture.runtime.seal_actor(context_actor()).unwrap();
     let callback_refused = matches!(
         fixture
@@ -184,8 +187,10 @@ fn a_sealed_context_refuses_callbacks_and_retires_all_three_unused_partial_roles
             .lock()
             .unwrap()
             .admit_io(),
-        Err(ContextHostError::Io(ContextIoError::Driver(
-            DriverError::Closed
+        Err(ContextHostError::Io(ContextIoError::Runtime(
+            novarocks_control_runtime::transaction::RuntimeError::Scope(
+                novarocks_control_runtime_core::scope::ScopeError::Stopped
+            )
         )))
     );
     let partial = scope.snapshot().unwrap();
@@ -225,14 +230,17 @@ fn a_sealed_context_refuses_callbacks_and_retires_all_three_unused_partial_roles
 
     assert!(callback_refused);
     assert!(no_inventory);
-    assert_eq!(partial.work, baseline.work + CONTEXT_IO_ROLES);
+    // The actual Core close already stopped business admission. M is the
+    // first bank role, so this earlier gate refuses before any partial role
+    // or callback exists; the sealed mailbox grants no later admission.
+    assert_eq!(partial.work, baseline.work);
     assert_eq!(partial.storage, baseline.storage);
     assert_eq!(callbacks.inputs, 0);
     assert_eq!(callbacks.roles, 0);
     assert!(unchanged_charge_on_refusal);
     assert!(failed_bank_cannot_rebind);
     assert!(refusal_retry_unchanged);
-    assert_eq!(reaped, CONTEXT_IO_ROLES);
+    assert_eq!(reaped, 0);
     assert_eq!(restored.work, baseline.work);
     assert_eq!(restored.storage, baseline.storage);
     assert!(bank_still_paid);

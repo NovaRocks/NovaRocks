@@ -23,15 +23,16 @@ use novarocks_control_runtime::{
     continuation::{ContinuationSlot, InvocationResult},
     driver::{ActorRuntime, DriverError},
     exit_role::ExitRole,
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     reported_work::{ReportedWork, ReportedWorkBindingError},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     completion::{ConsumerKind, Consumption},
     identity::{ActorId, ConsumerId, DimensionId, Generation, ReservationId, ScopeId, Tick},
     mailbox::InputEnvelope,
+    owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
 };
 use std::sync::{
@@ -50,22 +51,33 @@ fn consumer() -> ConsumerId {
 fn resources(amount: u64) -> ResourceVector {
     ResourceVector::new([(dimension(), amount)]).unwrap()
 }
+fn role_resources(amount: u64, completions: usize) -> ReservationResources {
+    ReservationResources::new(
+        resources(amount),
+        OwnedSlotNeed {
+            work_headers: 1,
+            completions,
+            captures: 1,
+            ..OwnedSlotNeed::default()
+        },
+    )
+}
 fn ledger(amount: u64) -> RuntimeLedger {
-    RuntimeLedger::new(resources(amount), 16, 4)
+    RuntimeLedger::new(resources(amount))
 }
 fn scope(ledger: &RuntimeLedger) -> ScopeHandle {
-    ledger.open_scope_next(None, generation(), 16, 16).unwrap()
+    ledger.open_scope_next(None, generation()).unwrap()
 }
 struct Original {
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     report: ReportSlot,
 }
 fn original(scope: &ScopeHandle, amount: u64, kind: WorkKind) -> Original {
-    let (work, capacity) = scope
+    let (work, mut capacity) = scope
         .reserve_next(
             generation(),
-            resources(amount),
+            role_resources(amount, 1),
             kind,
             WorkAdmission::External,
         )
@@ -73,9 +85,8 @@ fn original(scope: &ScopeHandle, amount: u64, kind: WorkKind) -> Original {
         .bind(kind)
         .unwrap();
     let report = ReportSlot::reserve_next(
-        scope,
+        &mut capacity,
         generation(),
-        work.id(),
         1,
         [(consumer(), ConsumerKind::Observer)],
     )
@@ -293,7 +304,16 @@ fn a_real_split_bundle_is_accepted_by_its_actual_work_not_the_initial_reservatio
         report,
     } = original(&scope, 3, WorkKind::Cleanup);
     let split = capacity
-        .split(ReservationId::new(1000).unwrap(), &resources(1))
+        .split(
+            ReservationId::new(1000).unwrap(),
+            &ReservationResources::new(
+                resources(1),
+                OwnedSlotNeed {
+                    captures: 1,
+                    ..OwnedSlotNeed::default()
+                },
+            ),
+        )
         .unwrap();
     assert_ne!(split.id(), capacity.id());
     let reported = ReportedWork::try_new(work, split, report).unwrap();
@@ -304,7 +324,10 @@ fn a_real_split_bundle_is_accepted_by_its_actual_work_not_the_initial_reservatio
         2,
         "the separately owned original remainder is still charged"
     );
-    capacity.release(&capacity.resources().unwrap()).unwrap();
+    capacity
+        .release_quota(&capacity.resources().unwrap().quota)
+        .unwrap();
+    capacity.finish().unwrap();
     finish_scopes(&ledger, &[&scope]);
 }
 #[test]
@@ -322,12 +345,20 @@ fn a_legal_transfer_after_scope_failure_keeps_the_actual_binding_despite_generat
         capacity: mut remainder,
         report: target_report,
     } = original(&second, 1, WorkKind::Cleanup);
+    work.bind_owned_captures(&mut capacity, 1).unwrap();
+    target.bind_owned_captures(&mut remainder, 1).unwrap();
+    let mut route = capacity
+        .split_next(&ReservationResources::new(
+            resources(3),
+            OwnedSlotNeed::default(),
+        ))
+        .unwrap();
     target.start().unwrap();
     second.fail().unwrap();
-    capacity.transfer(&target).unwrap();
+    route.transfer(&target).unwrap();
     // Transfer records the receiving scope's new generation. The original
     // target report retains its admitted generation and still belongs here.
-    let target_role = ReportedWork::try_new(target, capacity, target_report).unwrap();
+    let target_role = ReportedWork::try_new(target, route, target_report).unwrap();
     assert_eq!(target_role.work().scope().id(), second.id());
     work.start().unwrap();
     work.body_exited().unwrap();
@@ -336,10 +367,14 @@ fn a_legal_transfer_after_scope_failure_keeps_the_actual_binding_despite_generat
     report.captures_exited().unwrap();
     report.consume(consumer()).unwrap();
     assert!(report.try_retire().unwrap());
+    capacity.finish().unwrap();
     assert_eq!(ledger.used(dimension()), 4);
     finish_exit(target_role);
     assert_eq!(ledger.used(dimension()), 1);
-    remainder.release(&remainder.resources().unwrap()).unwrap();
+    remainder
+        .release_quota(&remainder.resources().unwrap().quota)
+        .unwrap();
+    remainder.finish().unwrap();
     finish_scopes(&ledger, &[&first, &second]);
 }
 
@@ -354,10 +389,10 @@ fn a_retired_report_slot_cannot_be_reissued_explicitly_in_another_scope() {
     finish_scopes(&ledger, &[&first]);
 
     let second = scope(&ledger);
-    let (work, capacity) = second
+    let (work, mut capacity) = second
         .reserve_next(
             generation(),
-            resources(1),
+            role_resources(1, 2),
             WorkKind::Cleanup,
             WorkAdmission::External,
         )
@@ -365,10 +400,9 @@ fn a_retired_report_slot_cannot_be_reissued_explicitly_in_another_scope() {
         .bind(WorkKind::Cleanup)
         .unwrap();
     let (unexpected, rejection) = match ReportSlot::reserve(
-        &second,
+        &mut capacity,
         old_id,
         generation(),
-        work.id(),
         1,
         [(consumer(), ConsumerKind::Observer)],
     ) {
@@ -376,9 +410,8 @@ fn a_retired_report_slot_cannot_be_reissued_explicitly_in_another_scope() {
         Err(error) => (None, Some(error)),
     };
     let report = ReportSlot::reserve_next(
-        &second,
+        &mut capacity,
         generation(),
-        work.id(),
         1,
         [(consumer(), ConsumerKind::Observer)],
     )
@@ -454,7 +487,7 @@ fn a_retired_report_slot_cannot_be_reissued_as_an_actor_attachment() {
     finish_exit(ReportedWork::try_new(original.work, original.capacity, original.report).unwrap());
     finish_scopes(&ledger, &[&first]);
 
-    let runtime = ActorRuntime::new(1);
+    let runtime = ActorRuntime::new();
     let second = scope(&ledger);
     let before = second.snapshot().unwrap();
     let actor = ActorId::new(1).unwrap();
@@ -510,7 +543,7 @@ fn a_retired_report_slot_cannot_be_reissued_as_an_actor_attachment() {
 #[test]
 fn a_removed_actor_attachment_cannot_be_reissued_as_a_report_slot() {
     let ledger = ledger(1);
-    let runtime = ActorRuntime::new(1);
+    let runtime = ActorRuntime::new();
     let first = scope(&ledger);
     let actor = ActorId::new(1).unwrap();
     let old_id = runtime
@@ -527,10 +560,10 @@ fn a_removed_actor_attachment_cannot_be_reissued_as_a_report_slot() {
     finish_scopes(&ledger, &[&first]);
 
     let second = scope(&ledger);
-    let (work, capacity) = second
+    let (work, mut capacity) = second
         .reserve_next(
             generation(),
-            resources(1),
+            role_resources(1, 2),
             WorkKind::Cleanup,
             WorkAdmission::External,
         )
@@ -539,10 +572,9 @@ fn a_removed_actor_attachment_cannot_be_reissued_as_a_report_slot() {
         .unwrap();
     let before = second.snapshot().unwrap();
     let (unexpected, rejection) = match ReportSlot::reserve(
-        &second,
+        &mut capacity,
         old_id,
         generation(),
-        work.id(),
         1,
         [(consumer(), ConsumerKind::Observer)],
     ) {
@@ -556,9 +588,8 @@ fn a_removed_actor_attachment_cannot_be_reissued_as_a_report_slot() {
         && ledger.used(dimension()) == 1
         && runtime.is_empty();
     let report = ReportSlot::reserve_next(
-        &second,
+        &mut capacity,
         generation(),
-        work.id(),
         1,
         [(consumer(), ConsumerKind::Observer)],
     )

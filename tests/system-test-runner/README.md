@@ -157,10 +157,18 @@ The `native-ingress/*` scenarios require the real 1FE+3BE launch. They send
 authenticated raw gRPC requests to a BE to check header-stage refusal,
 pre-prost resource checks, and the ordinary/control message boundaries. The
 current-gate case reads the BE management `/metrics?type=json` surface before,
-during, and after a runner-held ordinary Worker closure, so an available gate
-can be distinguished from an unknown, unimplemented source. The explicit
-`blocking-saturation-control` case fills the ordinary blocking pool and checks
-that a small Cancel still completes while a ninth ordinary request waits.
+during, and after a runner-held original asynchronous Native ordinary request,
+so an available gate can be distinguished from an unknown source. Actual Node
+resources are read only from an available original Node snapshot; protocol
+Context/ticket counts do not become capacity limits. The explicit
+`blocking-saturation-control` case holds all eight original ordinary running
+permits before Worker transfer and proves a ninth ordinary request waits.
+Control Cancel and a real Context's Quiesce/Release must still complete. A second
+Context uses its declared short lease: management must observe its actual
+execution custody retire before any application probe, followed by the exact
+LeaseExpired receipt. This validates independent timer progress without letting
+the probing RPC itself trigger expiry. The hold awaits the original test-role
+socket/cancellation asynchronously and does not fill a blocking thread pool.
 `async-scheduling-pressure` runs four distributed SQL queries, waits for real
 Exchange shuffle bytes while one remains active, and checks a small control
 receipt; it is a liveness check under ordinary async work, not proof that all
@@ -169,10 +177,14 @@ async worker threads can be saturated safely.
 termination, the `running_deadline` counter, holder release, and a later
 control receipt. HTTP/2 may end that half-open stream with a reset, leaving no
 readable gRPC status; a fully received unary request has separate status checks.
-`registry-contention-control` 在真实 Worker registry mutex 被持有时，使用
-runner-owned、test-controls 下显式授权的 rendezvous。它区分已开始且等待
-mutex 的 control executor job 与仍排在 ingress 的 job，再验证释放后的
-receipt 和 lock-wait 观察。
+`registry-contention-control` retains its existing scenario name but now
+holds one exact Context's Accepted preparation in the existing supervised
+Native host action. While that original action remains held, another Context
+on the same BE must establish, renew its exact next lease, fence and Release.
+The held Task must still replay as Planned and not Installed before release;
+afterwards its real installation, covered stop, release and owner-idle barrier
+must complete. The runner uses the existing preparation-hold rendezvous; the
+poller stays free and no global registry mutex or lock-wait metric is involved.
 Each selected case records its individual probes in `scenario-evidence.json`;
 the scenario must execute at least one probe to count as passed. These are
 correctness and coarse regression checks, not throughput benchmarks.
@@ -188,6 +200,13 @@ actually exits. FE deployment positions remain occupied after Accepted or an
 unknown RPC outcome, and its window W must fit the exact backend's advertised
 per-context preparation capacity P. These are scenario and implementation
 contracts; a listed scenario does not establish a passing acceptance gate.
+The historical `normal-close-count-capacity` and
+`normal-close-byte-capacity` names now cover retained close facts rather than
+record capacity limits. They use fixed corpora of 2 and 32 receivers, retain
+the original close facts while admitting fresh work, and wait through the
+real 120-second retention horizon before checking that the forgotten stream
+is refused. Neither case configures a retained-record count or byte cap;
+terminal publication alone cannot stand in for physical exit or horizon expiry.
 `frozen-replay-and-membership` sends authenticated raw creates to one BE: a
 legal create, the identical request, and the same task identity with every
 body fact changed. Both replays must retain the winner's exact entity and

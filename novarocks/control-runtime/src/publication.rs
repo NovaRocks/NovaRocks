@@ -19,12 +19,22 @@
 //! the scope-failure gate; host I/O happens only after commit returns.
 
 use crate::{
+    driver::{ActorRegistration, ActorRuntime, DriverError, InputAuthor, PendingInputAuthor},
     sync::{Arc, Mutex, MutexGuard},
     transaction::ScopeHandle,
 };
 
+#[derive(Clone)]
+pub(crate) enum PublicationBinding {
+    SameScope,
+    Actor(ActorRegistration),
+    Input(InputAuthor),
+    PendingInput(PendingInputAuthor),
+}
+
 pub struct PublishedSnapshot<T> {
     pub(crate) owner: ScopeHandle,
+    pub(crate) binding: PublicationBinding,
     pub(crate) value: Arc<Mutex<Arc<T>>>,
 }
 /// A short read of the actual cell without cloning its possibly rich owner.
@@ -43,6 +53,7 @@ impl<T> Clone for PublishedSnapshot<T> {
     fn clone(&self) -> Self {
         Self {
             owner: self.owner.clone(),
+            binding: self.binding.clone(),
             value: self.value.clone(),
         }
     }
@@ -58,6 +69,15 @@ impl<T> PublishedSnapshot<T> {
     pub fn new(owner: &ScopeHandle, initial: Arc<T>) -> Self {
         Self {
             owner: owner.clone(),
+            binding: PublicationBinding::SameScope,
+            value: Arc::new(Mutex::new(initial)),
+        }
+    }
+    /// Bind this same cell to the original actor, independently of its hot Scope.
+    pub fn new_for_actor(owner: &ActorRegistration, initial: Arc<T>) -> Self {
+        Self {
+            owner: owner.publication_scope(),
+            binding: PublicationBinding::Actor(owner.clone()),
             value: Arc::new(Mutex::new(initial)),
         }
     }
@@ -87,6 +107,7 @@ pub(crate) enum ReplyPhase {
     Taken,
 }
 pub(crate) struct ReplyCell<T> {
+    pub(crate) binding: PublicationBinding,
     pub(crate) phase: ReplyPhase,
     pub(crate) value: Option<Arc<T>>,
 }
@@ -107,10 +128,58 @@ impl<T> PublishedReply<T> {
         Self {
             owner: owner.clone(),
             cell: Arc::new(Mutex::new(ReplyCell {
+                binding: PublicationBinding::SameScope,
                 phase: ReplyPhase::Empty,
                 value: None,
             })),
         }
+    }
+    /// Bind one once-only outbox to the original admitted request position.
+    pub fn new_for_input(author: &InputAuthor) -> Self {
+        Self {
+            owner: author.scope.clone(),
+            cell: Arc::new(Mutex::new(ReplyCell {
+                binding: PublicationBinding::Input(author.clone()),
+                phase: ReplyPhase::Empty,
+                value: None,
+            })),
+        }
+    }
+    /// Reserve this same once-only cell before the original causal input exists.
+    /// No input token, position, Work or second reply cell is manufactured.
+    pub fn new_for_admitted_work<A: crate::actor::Actor>(
+        runtime: &ActorRuntime<A>,
+        registration: &ActorRegistration,
+        work: &crate::lease::WorkLease,
+    ) -> Result<Self, DriverError> {
+        let binding = runtime.pending_input_author_for(registration, work)?;
+        Ok(Self {
+            owner: work.scope().clone(),
+            cell: Arc::new(Mutex::new(ReplyCell {
+                binding: PublicationBinding::PendingInput(binding),
+                phase: ReplyPhase::Empty,
+                value: None,
+            })),
+        })
+    }
+    /// Bind exactly once when the real original input position has been issued.
+    pub fn bind_input<A: crate::actor::Actor>(
+        &self,
+        runtime: &ActorRuntime<A>,
+        author: &InputAuthor,
+    ) -> Result<(), DriverError> {
+        runtime.validate_original_input_author(author)?;
+        let mut cell = self.cell.lock().expect("published reply lock");
+        if cell.phase != ReplyPhase::Empty || cell.value.is_some() {
+            return Err(DriverError::ReplyAlreadyCommitted);
+        }
+        match &cell.binding {
+            PublicationBinding::PendingInput(original) if original.matches(author) => {}
+            PublicationBinding::Input(original) if original.same_binding(author) => return Ok(()),
+            _ => return Err(DriverError::InputAuthorMismatch),
+        }
+        cell.binding = PublicationBinding::Input(author.clone());
+        Ok(())
     }
     /// The sending owner consumes the committed outbox value exactly once.
     /// Taking/sending cannot reopen the cell for a second reply.

@@ -31,9 +31,15 @@ fn context_control_handoffs_keep_core_order_across_batches_and_reverse_request_t
     let initial = initial_establishment();
     // These are correlation values from the requesting actor, not Context
     // inputs or Context Work authority. Their numeric order is irrelevant.
-    let requests = [900, 100].map(|token| EstablishReplayRequest {
+    // This component has no Root actor: its two Root R references are plain
+    // monotonically issued correlation facts, never runtime author proofs.
+    let requests = [(900, 1), (100, 2)].map(|(token, root_work)| EstablishReplayRequest {
         request: RequestContext {
             token: InputId::new(token).unwrap(),
+            author: novarocks_control_runtime_core::identity::ScopedWorkRef {
+                scope: novarocks_control_runtime_core::identity::ScopeId::new(7001).unwrap(),
+                work: novarocks_control_runtime_core::identity::WorkId::new(root_work).unwrap(),
+            },
             operation: operation(2),
             deadline: MonotonicInstant::from_origin(Duration::from_secs(10)),
         },
@@ -148,8 +154,6 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
                 input_retained_bytes: 1,
                 ingress_retained_bytes: 1,
                 structural_bytes: 1,
-                inbound_records: 0,
-                inbound_bytes: 0,
             }),
         },
         None,
@@ -371,8 +375,6 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
                     input_retained_bytes: 1,
                     ingress_retained_bytes: 1,
                     structural_bytes: 1,
-                    inbound_records: 0,
-                    inbound_bytes: 0,
                 }),
             },
             None,

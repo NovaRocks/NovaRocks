@@ -15,142 +15,118 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact bounded retention indexes; identities are never reconstructed from time.
+//! Neutral facts retained after the original execution custody retires.
 use crate::lease::MonotonicInstant;
-use std::collections::{BTreeMap, BTreeSet};
 
+/// Neutral final facts for one Task whose original execution custody exited.
+/// It owns no live input, reservation, queue, source object or callback.
+#[derive(Debug)]
+pub struct DecidedTask {
+    pub(crate) custody_payload: crate::creation::PayloadId,
+    pub(crate) custody_epoch: novarocks_control_runtime_core::identity::Generation,
+    pub(crate) status: novarocks_execution_contract::TaskStatus,
+    pub(crate) output: novarocks_execution_contract::TaskOutputFacts,
+    pub(crate) initial_domains:
+        std::sync::Arc<Vec<novarocks_execution_contract::TaskDomainReceipt>>,
+    pub(crate) final_info: Option<std::sync::Arc<novarocks_execution_contract::FinalTaskInfo>>,
+    pub(crate) diagnostics: crate::proposal_summary::Diagnostics,
+    pub(crate) convergence: crate::convergence::TaskConvergenceSnapshot,
+    pub(crate) source: Option<crate::proposal_summary::SourceId>,
+}
+impl DecidedTask {
+    pub(crate) fn compose_status(
+        &self,
+    ) -> Result<novarocks_execution_contract::TaskStatus, crate::context::CoreError> {
+        crate::task::compose_status(
+            self.status.identity(),
+            self.status.version().get(),
+            self.status.state(),
+            self.status.termination().cloned(),
+            self.output,
+            self.status.installed(),
+            self.status.resources(),
+            self.status.writer(),
+            self.status.dynamic_filters(),
+        )
+    }
+    pub fn status(&self) -> &novarocks_execution_contract::TaskStatus {
+        &self.status
+    }
+    pub fn final_info(
+        &self,
+    ) -> Option<&std::sync::Arc<novarocks_execution_contract::FinalTaskInfo>> {
+        self.final_info.as_ref()
+    }
+    pub fn diagnostics(&self) -> &crate::proposal_summary::Diagnostics {
+        &self.diagnostics
+    }
+    pub const fn convergence(&self) -> crate::convergence::TaskConvergenceSnapshot {
+        self.convergence
+    }
+    /// A neutral provenance identity, never access to a retained rich source.
+    pub const fn source(&self) -> Option<crate::proposal_summary::SourceId> {
+        self.source
+    }
+}
+
+/// Frozen inline cold-Core inventory. Indirect Arc backing, pending RPC
+/// collections, tree nodes and allocator overhead are explicitly unmeasured.
+/// This observation grants neither Work nor a retention/physical-exit proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RetentionError {
-    Capacity,
-    Duplicate,
-    Unknown,
-    Overflow,
+pub struct RetainedContextInventory {
+    pub decided_task_records: usize,
+    pub metadata_bytes_estimate: Option<usize>,
 }
-#[derive(Clone, Debug)]
-pub struct RetentionIndex<K: Copy + Ord> {
-    records: BTreeMap<K, (MonotonicInstant, u64)>,
-    deadlines: BTreeSet<(MonotonicInstant, K)>,
-    // Addresses into the same records, never a second retained owner. Protected
-    // records remain deadline-indexed but cannot be capacity-eviction victims.
-    eligible: BTreeSet<(MonotonicInstant, K)>,
-    bytes: u64,
-    max_records: usize,
-    max_bytes: u64,
+
+/// The immutable original execution-retirement fact fixes the whole request
+/// horizon. Sharing this plain value never admits Work or starts another TTL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionOrigin {
+    retired_at: MonotonicInstant,
+    expires_at: MonotonicInstant,
 }
-impl<K: Copy + Ord> RetentionIndex<K> {
-    pub fn new(max_records: usize, max_bytes: u64) -> Self {
+impl RetentionOrigin {
+    pub fn new(retired_at: MonotonicInstant, horizon: crate::lease::RequestHorizon) -> Self {
         Self {
-            records: BTreeMap::new(),
-            deadlines: BTreeSet::new(),
-            eligible: BTreeSet::new(),
-            bytes: 0,
-            max_records,
-            max_bytes,
+            retired_at,
+            expires_at: horizon.retention_deadline(retired_at),
         }
     }
-    pub fn insert(
-        &mut self,
-        key: K,
-        until: MonotonicInstant,
-        bytes: u64,
-    ) -> Result<(), RetentionError> {
-        self.insert_internal(key, until, bytes, None)
+    pub const fn retired_at(&self) -> MonotonicInstant {
+        self.retired_at
     }
-    pub fn insert_with_protection(
-        &mut self,
-        key: K,
-        until: MonotonicInstant,
-        bytes: u64,
-        protected: bool,
-    ) -> Result<(), RetentionError> {
-        self.insert_internal(key, until, bytes, Some(protected))
+    pub const fn expires_at(&self) -> MonotonicInstant {
+        self.expires_at
     }
-    fn insert_internal(
-        &mut self,
-        key: K,
-        until: MonotonicInstant,
-        bytes: u64,
-        protection: Option<bool>,
-    ) -> Result<(), RetentionError> {
-        if self.records.contains_key(&key) {
-            return Err(RetentionError::Duplicate);
-        }
-        let total = self
-            .bytes
-            .checked_add(bytes)
-            .ok_or(RetentionError::Overflow)?;
-        if self.records.len() == self.max_records || total > self.max_bytes {
-            return Err(RetentionError::Capacity);
-        }
-        self.records.insert(key, (until, bytes));
-        self.deadlines.insert((until, key));
-        if protection == Some(false) {
-            self.eligible.insert((until, key));
-        }
-        self.bytes = total;
-        Ok(())
-    }
-    pub fn remove(&mut self, key: K) -> Result<u64, RetentionError> {
-        let (until, bytes) = self.records.remove(&key).ok_or(RetentionError::Unknown)?;
-        assert!(
-            self.deadlines.remove(&(until, key)),
-            "retention indexes agree"
-        );
-        self.eligible.remove(&(until, key));
-        self.bytes -= bytes;
-        Ok(bytes)
-    }
-    pub fn take_due(&mut self, now: MonotonicInstant) -> Option<K> {
-        let (deadline, key) = self.deadlines.first().copied()?;
-        if now < deadline {
-            return None;
-        }
-        self.remove(key).expect("deadline has a record");
-        Some(key)
-    }
-    pub fn next_deadline(&self) -> Option<MonotonicInstant> {
-        self.deadlines.first().map(|(at, _)| *at)
-    }
-    pub fn oldest(&self) -> Option<K> {
-        self.deadlines.first().map(|(_, key)| *key)
-    }
-    pub fn oldest_eligible(&self) -> Option<K> {
-        self.eligible.first().map(|(_, key)| *key)
-    }
-    pub fn eligible_len(&self) -> usize {
-        self.eligible.len()
-    }
-    pub fn contains(&self, key: K) -> bool {
-        self.records.contains_key(&key)
-    }
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
-    }
-    pub fn bytes(&self) -> u64 {
-        self.bytes
+    pub fn has_expired(&self, now: MonotonicInstant) -> bool {
+        now.has_reached(self.expires_at)
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-    fn at(n: u64) -> MonotonicInstant {
-        MonotonicInstant::from_origin(Duration::from_secs(n))
-    }
-    #[test]
-    fn due_order_is_exact_and_rejection_leaves_bytes_unchanged() {
-        let mut r = RetentionIndex::new(2, 9);
-        r.insert(2, at(5), 4).unwrap();
-        r.insert(1, at(5), 5).unwrap();
-        assert_eq!(r.insert(3, at(1), 1), Err(RetentionError::Capacity));
-        assert_eq!(r.bytes(), 9);
-        assert_eq!(r.take_due(at(4)), None);
-        assert_eq!(r.take_due(at(5)), Some(1));
-        assert_eq!(r.take_due(at(5)), Some(2));
-        assert!(r.is_empty());
-        assert_eq!(r.bytes(), 0);
+
+/// Provenance of the original Context retirement, independent of its time.
+/// These plain identities grant no Work, failure, input or publication right.
+/// Worker constructs OwnerFailure only from the actual ActorFailureProof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextRetirementIdentity {
+    Protocol {
+        close_epoch: novarocks_control_runtime_core::identity::Generation,
+    },
+    OwnerFailure {
+        actor: novarocks_control_runtime_core::identity::ActorId,
+        initial_epoch: novarocks_control_runtime_core::identity::Generation,
+        failed_epoch: novarocks_control_runtime_core::identity::Generation,
+    },
+}
+impl ContextRetirementIdentity {
+    /// This checks neutral chronology only; it does not authenticate a runtime.
+    pub fn is_valid(self) -> bool {
+        match self {
+            Self::Protocol { .. } => true,
+            Self::OwnerFailure {
+                initial_epoch,
+                failed_epoch,
+                ..
+            } => failed_epoch.get() > initial_epoch.get(),
+        }
     }
 }

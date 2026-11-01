@@ -22,36 +22,32 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimerError {
-    Full,
     TimeWentBackwards,
 }
 #[derive(Debug)]
 pub struct TimerIndex {
-    max_actors: usize,
     now: Tick,
     by_actor: BTreeMap<ActorId, Tick>,
     by_deadline: BTreeSet<(Tick, ActorId)>,
     pending: BTreeSet<ActorId>,
     deferred_due: BTreeSet<ActorId>,
-    actors: BTreeSet<ActorId>,
+}
+impl Default for TimerIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl TimerIndex {
-    pub fn new(max_actors: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            max_actors,
             now: Tick(0),
             by_actor: BTreeMap::new(),
             by_deadline: BTreeSet::new(),
             pending: BTreeSet::new(),
             deferred_due: BTreeSet::new(),
-            actors: BTreeSet::new(),
         }
     }
     pub fn set(&mut self, actor: ActorId, deadline: Tick) -> Result<(), TimerError> {
-        if !self.actors.contains(&actor) && self.actors.len() >= self.max_actors {
-            return Err(TimerError::Full);
-        }
-        self.actors.insert(actor);
         self.deferred_due.remove(&actor);
         if let Some(old) = self.by_actor.insert(actor, deadline) {
             self.by_deadline.remove(&(old, actor));
@@ -63,9 +59,6 @@ impl TimerIndex {
         self.deferred_due.remove(&actor);
         if let Some(old) = self.by_actor.remove(&actor) {
             self.by_deadline.remove(&(old, actor));
-        }
-        if !self.pending.contains(&actor) {
-            self.actors.remove(&actor);
         }
         // A tick already handed off remains pending until acknowledged.
     }
@@ -105,9 +98,6 @@ impl TimerIndex {
             assert!(removed, "a deferred deadline retains its pending tick");
             let deadline = *self.by_actor.get(&actor).expect("deferred deadline exists");
             self.by_deadline.insert((deadline, actor));
-        }
-        if !self.by_actor.contains_key(&actor) {
-            self.actors.remove(&actor);
         }
         removed
     }

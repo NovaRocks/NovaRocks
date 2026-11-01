@@ -60,15 +60,13 @@ use novarocks_execution_contract::task_execution::operation::{
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
 #[cfg(test)]
+use novarocks_worker::QueryContextHost;
+#[cfg(test)]
 use novarocks_worker::ReleasedContextEvidence;
 #[cfg(test)]
 use novarocks_worker::TaskStatusReporter;
 #[cfg(test)]
 use novarocks_worker::{HostRejection, RunnableTask, SharedFactsRequest, TaskExecutionHost};
-#[cfg(test)]
-use novarocks_worker::{
-    QueryContextHost, TaskExecutionRegistry, TaskExecutionRegistryConfig, WorkerDeadlineSupervisor,
-};
 use novarocks_worker::{WorkerNodeRuntime, WorkerTaskControl};
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -110,8 +108,7 @@ pub struct BackendServerConfig {
     pub result_retained_limits: WorkerResultRetainedLimits,
     /// Independent finite CPU/installation/stack resources for root encoding.
     pub root_producer_limits: RootProducerLimits,
-    /// Active and retained exact late-frame records use one Worker budget.
-    pub inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits,
+
     pub preparation_limits: novarocks_worker::TaskPreparationLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
     pub scan_preparation_config: novarocks_worker::ScanPreparationConfig,
@@ -376,6 +373,17 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
 
     fn remove_receiver(&self, _descriptor: &TaskDescriptor) {}
 
+    fn retire_receiver_checked(
+        &self,
+        _descriptor: &TaskDescriptor,
+        _retirement: novarocks_worker::TaskIngressRetirement,
+    ) -> Result<(), HostRejection> {
+        Err(HostRejection::from_domain(
+            TaskFailureCategory::Internal,
+            UnroutedBinding,
+        ))
+    }
+
     fn install_inbound_capability(
         &self,
         _descriptor: &TaskDescriptor,
@@ -445,7 +453,7 @@ fn compose_backend_application_services(
     result_retained_limits: WorkerResultRetainedLimits,
     result_retained_budget: Arc<novarocks_worker::result_buffer::ResultRetainedBudget>,
     root_producer_limits: RootProducerLimits,
-    inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits,
+
     preparation_limits: novarocks_worker::TaskPreparationLimits,
     scan_stream_host: novarocks_worker::ScanStreamHost,
     catalog_manager_config: CatalogManagerConfig,
@@ -532,8 +540,7 @@ fn compose_backend_application_services(
         None => context_host,
     };
     let context_host = Arc::new(context_host);
-    let inbound_capabilities =
-        novarocks_worker::TaskInboundCapabilities::with_capacity_limits(inbound_capability_limits);
+    let inbound_capabilities = novarocks_worker::TaskInboundCapabilities::new();
     let root_producer_pool = RootProducerPool::try_new(
         root_producer_limits.threads(),
         root_producer_limits.positions(),
@@ -604,8 +611,6 @@ fn compose_backend_application_services(
     let resolved = worker_node_config::ResolvedWorkerNodeConfig::try_new(
         native_ingress,
         preparation_limits,
-        inbound_capability_limits,
-        worker_node_config::DEFAULT_TOTAL_CONTEXT_RECORDS,
         novarocks_worker::NodeWorkers {
             pollers: worker_count(1)?,
             context_materialization: worker_count(native_ingress.control_worker_threads)?,
@@ -888,7 +893,7 @@ impl BackendApplicationHost {
             write_commit_evidence_limits,
             result_retained_limits,
             root_producer_limits,
-            inbound_capability_limits,
+
             preparation_limits,
             execution_runtime_config,
             scan_preparation_config,
@@ -1045,7 +1050,6 @@ impl BackendApplicationHost {
             result_retained_limits,
             result_retained_budget,
             root_producer_limits,
-            inbound_capability_limits,
             preparation_limits,
             novarocks_worker::ScanStreamHost::new(scan_preparation_config, scan_stream_runtime),
             catalog_manager_config,
@@ -1113,7 +1117,8 @@ impl BackendApplicationHost {
                     novarocks_worker::query_context::query_context_manager()
                         .native_execution_resource_snapshot()
                 }))
-                .with_worker_node(services.task_control.clone()),
+                .with_worker_node(services.task_control.clone())
+                .with_inbound_retention(Arc::clone(&services.task_inbound_capabilities)),
         );
         let metrics_http_server =
             MetricsHttpServer::start(&bind_host, metrics_http_port, metrics_registry).map_err(
@@ -1341,15 +1346,6 @@ pub(crate) fn test_compiled_static_plan() -> CompiledStaticPlan {
 }
 
 #[cfg(test)]
-pub(crate) fn test_static_package_admission() -> Arc<StaticPackageAdmission> {
-    let limits = novarocks_plan_codec::physical_package_v2::test_support::decode_limits();
-    Arc::new(StaticPackageAdmission::new(
-        Arc::new(FragmentDecodeResourceModel::try_new(&CompositionControl).unwrap()),
-        limits.wire,
-    ))
-}
-
-#[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1372,11 +1368,7 @@ mod tests {
     use novarocks_proto_models::novarocks::{HeartbeatRequest, HeartbeatResponse};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
-    use novarocks_worker::{
-        CatalogManagerConfig, TaskExecutionRegistry, TaskExecutionRegistryConfig,
-        WorkerResultRetainedLimits,
-    };
-    use novarocks_worker::{ManualClock, WorkerDeadlineSupervisor, WorkerMonotonicClock};
+    use novarocks_worker::{CatalogManagerConfig, WorkerResultRetainedLimits};
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -1419,38 +1411,27 @@ mod tests {
         novarocks_native_adapter::backend_test_support::test_backend_data_runtime()
     }
 
-    /// The tick is the only thing that turns elapsed time into a decision, so
-    /// this asserts an actual reclamation rather than that a task was spawned.
-    ///
-    /// An abort of a context this backend never established leaves a retained
-    /// terminal fence, which needs no execution binding at all. Nothing else
-    /// reclaims it: the clock moves, and only a sweep can notice.
+    /// The production timer, without another protocol request or a sweep,
+    /// expires the original admission grant and returns its actual ticket fee.
     #[test]
-    fn the_deadline_tick_drives_the_task_owner_forward() {
-        use novarocks_execution_contract::task_execution::identity::TaskOperationId;
-        use novarocks_execution_contract::task_execution::operation::AbortQueryContext;
-        use novarocks_execution_contract::task_execution::status::AbortCause;
-        use novarocks_execution_contract::task_execution::transition::QueryContextState;
+    fn the_production_timer_expires_the_original_admission_ticket() {
+        use crate::backend_task_execution::tests::node_fixture::{
+            NativeNodeFixture, await_original, factory_from_host,
+        };
+        use novarocks_execution_contract::{
+            AcquireQueryContextAdmissionTicket, AdmissionTicketId, LeaseValidFor, TaskOperationId,
+        };
         use novarocks_types::identity::{FrontendProcessId, QueryExecutionId, QueryId};
+        use novarocks_worker::{WorkerAdmissionEpochAuthority, WorkerControlReplyBody};
 
         let backend = novarocks_types::BackendProcessId::new_v7();
-        let clock = Arc::new(ManualClock::new());
-        let registry = TaskExecutionRegistry::new(
-            TaskExecutionRegistryConfig::for_process(
-                backend,
-                novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
-                novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
-            ),
-            Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
-            Arc::new(UnroutedQueryContextHost),
+        let node = NativeNodeFixture::start(
+            backend,
+            factory_from_host(Arc::new(UnroutedQueryContextHost)),
             Arc::new(UnroutedTaskExecutionHost),
-            novarocks_native_adapter::task_execution_observation::backend_task_execution_ports(
-                Arc::new(
-                    novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
-                ),
-                #[cfg(novarocks_dev_controls)]
-                None,
-            ),
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
+            17,
+            1,
         );
         let context = QueryContextRef::new(
             QueryExecutionId::new(
@@ -1461,36 +1442,51 @@ mod tests {
             FrontendProcessId::new_v7(),
             backend,
         );
-        registry.abort_query_context(&AbortQueryContext::new(
+        let request = AcquireQueryContextAdmissionTicket::new(
             TaskOperationId::new_v7(),
             context,
-            AbortCause::QueryFailed,
+            LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            node.control.admission_epoch_capability(),
+        );
+        let ticket =
+            AdmissionTicketId::try_from_bytes(TaskOperationId::new_v7().to_bytes()).unwrap();
+        let delivery = await_original(node.control.acquire(request, ticket, node.deadline()))
+            .expect("original ticket delivery");
+        assert!(matches!(
+            delivery.body(),
+            WorkerControlReplyBody::Admission(Ok(_))
         ));
-        assert_eq!(
-            registry.context_state(context),
-            QueryContextState::TerminalRetained
-        );
+        drop(delivery);
+        let initial_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let initial = loop {
+            if let Some(sample) = node.control.try_admission_snapshot() {
+                break sample;
+            }
+            assert!(
+                std::time::Instant::now() < initial_deadline,
+                "original grant snapshot remained unavailable"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(initial.logical_live_grants, 1);
 
-        let mut tick = WorkerDeadlineSupervisor::start(
-            test_data_runtime().handle(),
-            Arc::clone(&registry) as Arc<dyn novarocks_worker::WorkerDeadlineAuthority>,
-            Duration::from_millis(5),
-        );
-        clock.advance(Duration::from_secs(600));
-        let mut reclaimed = false;
-        for _ in 0..500 {
-            if registry.context_state(context) == QueryContextState::Gone {
-                reclaimed = true;
+        node.clock.advance(Duration::from_secs(600));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node
+                .control
+                .try_admission_snapshot()
+                .is_some_and(|sample| sample.logical_live_grants == 0)
+            {
                 break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "production timer did not expire the original ticket"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
-        tick.stop();
-        assert!(
-            reclaimed,
-            "the maintenance tick never re-evaluated the retention horizon"
-        );
-        assert_eq!(tick.poll_failure(), None);
     }
 
     fn http_get(port: u16, path: &str) -> std::io::Result<String> {
@@ -1545,7 +1541,7 @@ mod tests {
             .expect("valid test result retained-byte limits"),
             root_producer_limits: super::RootProducerLimits::try_new(1, 64, 1024 * 1024)
                 .expect("finite root producer limits"),
-            inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits::default(),
+
             preparation_limits: novarocks_worker::TaskPreparationLimits::default(),
             execution_runtime_config: execution_runtime_config(),
             scan_preparation_config: novarocks_worker::ScanPreparationConfig::try_new(
@@ -1641,7 +1637,6 @@ mod tests {
             ),
             super::RootProducerLimits::try_new(1, 64, 1024 * 1024)
                 .expect("finite root producer limits"),
-            novarocks_worker::TaskInboundCapabilityLimits::default(),
             novarocks_worker::TaskPreparationLimits::default(),
             novarocks_worker::ScanStreamHost::new(
                 novarocks_worker::ScanPreparationConfig::try_new(
@@ -1657,6 +1652,7 @@ mod tests {
             CatalogManagerConfig::default(),
             &[],
             super::test_compiled_static_plan(),
+            crate::native_server::NativeIngressConfig::default(),
             #[cfg(novarocks_dev_controls)]
             None,
         )
@@ -2132,7 +2128,6 @@ mod tests {
             ),
             super::RootProducerLimits::try_new(1, 64, 1024 * 1024)
                 .expect("finite root producer limits"),
-            novarocks_worker::TaskInboundCapabilityLimits::default(),
             novarocks_worker::TaskPreparationLimits::default(),
             novarocks_worker::ScanStreamHost::new(
                 novarocks_worker::ScanPreparationConfig::try_new(
@@ -2148,6 +2143,7 @@ mod tests {
             CatalogManagerConfig::default(),
             &[],
             plan,
+            crate::native_server::NativeIngressConfig::default(),
             #[cfg(novarocks_dev_controls)]
             None,
         )
@@ -2187,23 +2183,25 @@ mod tests {
         let carrier = protocol::FrozenFragment {
             package: vec![0; 65].into(),
         };
-        let error = services
-            .task_execution_ingress
-            .apply_task_operations(protocol::ApplyTaskOperationsRequest {
-                operations: vec![protocol::TaskOperation {
-                    envelope: Some(protocol::TaskOperationEnvelope {
-                        operation_id: Some(encode_task_operation_id(TaskOperationId::new_v7())),
-                        max_wait_millis: 5_000,
-                    }),
-                    operation: Some(protocol::task_operation::Operation::CreateTask(
-                        protocol::CreateTaskRequest {
-                            frozen_fragment: carrier.encode_to_vec().into(),
-                            creation_metadata: metadata.encode_to_vec().into(),
-                        },
-                    )),
-                }],
-            })
-            .expect_err("the composed ingress gates the package carrier");
+        let error = crate::backend_task_execution::tests::node_fixture::await_original(
+            services.task_execution_ingress.apply_task_operations(
+                protocol::ApplyTaskOperationsRequest {
+                    operations: vec![protocol::TaskOperation {
+                        envelope: Some(protocol::TaskOperationEnvelope {
+                            operation_id: Some(encode_task_operation_id(TaskOperationId::new_v7())),
+                            max_wait_millis: 5_000,
+                        }),
+                        operation: Some(protocol::task_operation::Operation::CreateTask(
+                            protocol::CreateTaskRequest {
+                                frozen_fragment: carrier.encode_to_vec().into(),
+                                creation_metadata: metadata.encode_to_vec().into(),
+                            },
+                        )),
+                    }],
+                },
+            ),
+        )
+        .expect_err("the composed ingress gates the package carrier");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(
             error
@@ -2213,8 +2211,13 @@ mod tests {
             error.message()
         );
         assert!(
-            !services.task_execution_registry.has_live_task(identity),
+            services.task_control.context_for_task(identity).is_none(),
             "a refused create leaves no task behind"
+        );
+        assert_eq!(
+            services.task_control.metrics_snapshot().active_tasks,
+            0,
+            "the carrier refusal must not charge a creating or active Task"
         );
     }
 }

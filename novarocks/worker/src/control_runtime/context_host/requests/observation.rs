@@ -29,14 +29,14 @@ use crate::control_runtime::{
     service::ContextHostAddress,
 };
 use novarocks_control_runtime::{driver::EffectTicket, reply_notification::ReplyObserver};
-use novarocks_control_runtime_core::identity::WorkId;
+use novarocks_control_runtime_core::identity::ScopedWorkRef;
 use novarocks_execution_contract::OperationOutcome;
 use novarocks_worker_protocol::{
     context::{ContextEffect, ContextReplyBody, RequestResult},
     observation::{CoveredObservationBookmark, SelectedCoveredObservation},
 };
 use std::{
-    future::{Future, poll_fn},
+    future::Future,
     pin::Pin,
     sync::{
         Arc,
@@ -53,7 +53,6 @@ pub(super) struct ObservationRequest {
     unsubscribing: bool,
     failure: Option<Arc<ContextObservationError>>,
 }
-#[derive(Debug)]
 pub(crate) enum ContextObservationStreamError {
     ContextRemoved,
     UnknownRequest,
@@ -64,11 +63,54 @@ pub(crate) enum ContextObservationStreamError {
     Source(Arc<ContextObservationError>),
 }
 
+impl std::fmt::Display for ContextObservationStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ContextRemoved => f.write_str("Observation stream Context was removed"),
+            Self::UnknownRequest => f.write_str("Observation stream original request is unknown"),
+            Self::OwnerFailed => f.write_str("Observation stream original owner failed"),
+            Self::FrameOutstanding => {
+                f.write_str("Observation stream still owns its selected frame")
+            }
+            Self::Intake(error) => {
+                write!(f, "Observation stream original intake failed: {error:?}")
+            }
+            Self::IntakeRejected(_) => {
+                f.write_str("Observation stream original intake was rejected; reply retained")
+            }
+            Self::Source(error) => write!(f, "Observation stream source failed: {error}"),
+        }
+    }
+}
+impl std::fmt::Debug for ContextObservationStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The retained reply body is never traversed by diagnostics.
+        f.debug_struct("ContextObservationStreamError")
+            .field("cause", &format_args!("{self}"))
+            .finish_non_exhaustive()
+    }
+}
+impl std::error::Error for ContextObservationStreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error.as_ref()),
+            Self::Intake(RequestAwaitError::Notification(novarocks_control_runtime::reply_notification::ReplyNotificationError::Driver(error))) => Some(error),
+            Self::ContextRemoved | Self::UnknownRequest | Self::OwnerFailed
+            | Self::FrameOutstanding | Self::IntakeRejected(_)
+            | Self::Intake(RequestAwaitError::AlreadyTaken | RequestAwaitError::Notification(
+                novarocks_control_runtime::reply_notification::ReplyNotificationError::WrongWorkScope
+                | novarocks_control_runtime::reply_notification::ReplyNotificationError::WorkNotLive
+                | novarocks_control_runtime::reply_notification::ReplyNotificationError::ObserverEnded
+                | novarocks_control_runtime::reply_notification::ReplyNotificationError::Failed)) => None,
+        }
+    }
+}
+
 /// The original reply delivery remains held until both stream and last frame
 /// owner have ended. Only the stream holds the single external Waker observer.
 pub(crate) struct ContextObservationStream {
     address: ContextHostAddress,
-    work: WorkId,
+    work: ScopedWorkRef,
     intake: Option<ContextRequestHandle>,
     delivery: Option<Arc<RequestDelivery<ContextReplyBody>>>,
     observer: Option<ReplyObserver<WorkerActor>>,
@@ -77,7 +119,7 @@ pub(crate) struct ContextObservationStream {
 impl ContextObservationStream {
     pub(crate) fn from_request(
         address: ContextHostAddress,
-        work: WorkId,
+        work: ScopedWorkRef,
         handle: ContextRequestHandle,
     ) -> Self {
         Self {
@@ -179,11 +221,6 @@ impl ContextObservationStream {
             Ok(None) => Poll::Pending,
         }
     }
-    pub(crate) async fn next(
-        &mut self,
-    ) -> Result<ObservationFrameDelivery, ContextObservationStreamError> {
-        poll_fn(|cx| self.poll_next(cx)).await
-    }
     pub(crate) fn bookmark(
         &self,
     ) -> Result<CoveredObservationBookmark, ContextObservationStreamError> {
@@ -205,7 +242,7 @@ impl Drop for ContextObservationStream {
 #[must_use = "Only actual ordered transport acceptance acknowledges this frame"]
 pub(crate) struct ObservationFrameDelivery {
     address: ContextHostAddress,
-    work: WorkId,
+    work: ScopedWorkRef,
     selected: Option<SelectedCoveredObservation>,
     original: Arc<RequestDelivery<ContextReplyBody>>,
     outstanding: Arc<AtomicBool>,
@@ -325,7 +362,7 @@ impl ContextHostRecord {
         // Share the same immutable original; the pure source validates one
         // cursor per continuation without copying its complete vectors.
         state.handed_off = true;
-        match source.begin_original_request(&original.scope, work, generation, position) {
+        match source.begin_original_request(&ticket, work, generation, position) {
             Ok(subscription) => state.subscription = Some(subscription),
             Err(error) => {
                 state.failure = Some(Arc::new(error));
@@ -339,7 +376,7 @@ impl ContextHostRecord {
     }
     pub(in crate::control_runtime::context_host) fn advance_observation_request(
         &mut self,
-        work: WorkId,
+        work: ScopedWorkRef,
         budget: usize,
     ) -> Result<(), ContextRequestError> {
         let Some(original) = self.resources.requests.get_mut(&work) else {
@@ -395,7 +432,7 @@ impl ContextHostRecord {
     }
     fn select_observation(
         &mut self,
-        work: WorkId,
+        work: ScopedWorkRef,
     ) -> Result<Option<SelectedCoveredObservation>, ContextObservationStreamError> {
         if self.resources.failure.is_some() {
             return Err(ContextObservationStreamError::OwnerFailed);
@@ -429,7 +466,7 @@ impl ContextHostRecord {
     }
     fn note_observation_delivered(
         &mut self,
-        work: WorkId,
+        work: ScopedWorkRef,
         delivery: u64,
     ) -> Result<CoveredObservationBookmark, ContextObservationStreamError> {
         let original = self
@@ -457,7 +494,7 @@ impl ContextHostRecord {
     }
     fn observation_bookmark(
         &mut self,
-        work: WorkId,
+        work: ScopedWorkRef,
     ) -> Result<CoveredObservationBookmark, ContextObservationStreamError> {
         let original = self
             .resources
@@ -500,10 +537,64 @@ impl super::ContextRequestCustody {
 pub(crate) enum ContextSubscriptionRefusal {
     Admission(super::ContextRequestAdmissionRefusal),
     Submit {
-        error: super::ContextRequestSubmitRefusal,
-        work: WorkId,
-        handle: ContextRequestHandle,
+        error: Box<super::ContextRequestSubmitRefusal>,
+        work: ScopedWorkRef,
+        _original_handle: ContextRequestHandle,
     },
+}
+impl std::fmt::Debug for ContextSubscriptionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(original) => f
+                .debug_struct("SubscriptionAdmissionRefusal")
+                .field("error", &format_args!("{}", original.error))
+                .field("original_partial", &original.partial)
+                .finish(),
+            Self::Submit {
+                error,
+                work,
+                _original_handle: _,
+            } => f
+                .debug_struct("SubscriptionSubmissionRefusal")
+                .field("error", &format_args!("{}", error.error))
+                .field("original_work", work)
+                .field("neutral_command_retained", &error.command.is_some())
+                .field("original_external_handle", &"retained")
+                .finish_non_exhaustive(),
+        }
+    }
+}
+impl std::fmt::Display for ContextSubscriptionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(original) => write!(
+                f,
+                "Observation subscription admission failed: {}",
+                original.error
+            ),
+            Self::Submit {
+                error,
+                work,
+                _original_handle: _,
+            } => write!(
+                f,
+                "Observation subscription original {work:?} submission failed: {}",
+                error.error
+            ),
+        }
+    }
+}
+impl std::error::Error for ContextSubscriptionRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Admission(original) => Some(&original.error),
+            Self::Submit {
+                error,
+                work: _,
+                _original_handle: _,
+            } => Some(&error.error),
+        }
+    }
 }
 impl ContextHostRecord {
     pub(crate) fn begin_status_subscription(
@@ -514,7 +605,7 @@ impl ContextHostRecord {
         deadline: novarocks_worker_protocol::lease::MonotonicInstant,
         generation: u64,
         position: novarocks_worker_protocol::observation::CoveredSubscriptionRequest,
-    ) -> Result<(WorkId, ContextRequestHandle), ContextSubscriptionRefusal> {
+    ) -> Result<(ScopedWorkRef, ContextRequestHandle), ContextSubscriptionRefusal> {
         let (work, handle) = self
             .admit_request(
                 ready,
@@ -533,9 +624,9 @@ impl ContextHostRecord {
         ) {
             Ok(()) => Ok((work, handle)),
             Err(error) => Err(ContextSubscriptionRefusal::Submit {
-                error,
+                error: Box::new(error),
                 work,
-                handle,
+                _original_handle: handle,
             }),
         }
     }

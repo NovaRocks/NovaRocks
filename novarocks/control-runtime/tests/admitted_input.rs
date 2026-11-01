@@ -22,11 +22,11 @@
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, StepContext},
     driver::{ActorRuntime, DriverError, InputPermit},
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     identity::{ActorId, DimensionId, Generation, ScopeId, Tick},
     mailbox::{InputClass, InputEnvelope},
     scope::{WorkAdmission, WorkKind},
@@ -59,19 +59,19 @@ struct Fixture {
     scope: ScopeHandle,
     runtime: ActorRuntime<Neutral>,
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     body_exited: bool,
     captures_exited: bool,
 }
 impl Fixture {
     fn new() -> Self {
         let paid = ResourceVector::new([(DimensionId::new(1).unwrap(), 2)]).unwrap();
-        let ledger = RuntimeLedger::new(paid.clone(), 16, 2);
-        let scope = ledger.open_scope_next(None, generation(), 8, 4).unwrap();
+        let ledger = RuntimeLedger::new(paid.clone());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (mut work, capacity) = scope
             .reserve_next(
                 generation(),
-                paid,
+                ReservationResources::for_work(paid),
                 WorkKind::Settlement,
                 WorkAdmission::External,
             )
@@ -79,7 +79,7 @@ impl Fixture {
             .bind(WorkKind::Settlement)
             .unwrap();
         work.start().unwrap();
-        let runtime = ActorRuntime::new(1);
+        let runtime = ActorRuntime::new();
         runtime
             .register_next(
                 actor(),
@@ -129,8 +129,9 @@ impl Fixture {
         self.ledger.reap_scope_ready(self.scope.id(), 16).unwrap();
         self.runtime.remove_actor(actor()).unwrap();
         self.capacity
-            .release(&self.capacity.resources().unwrap())
+            .release_quota(&self.capacity.resources().unwrap().quota)
             .unwrap();
+        self.capacity.finish().unwrap();
         self.ledger.remove_scope(self.scope.id()).unwrap();
         assert!(self.ledger.is_empty());
         assert!(self.runtime.is_empty());
@@ -139,7 +140,7 @@ impl Fixture {
 
 #[test]
 fn an_existing_holder_can_finish_after_all_external_gates_close_without_new_work_or_capacity() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
     f.ledger.close_admission();
     f.scope.close_external().unwrap();
     f.scope.request_stop().unwrap();
@@ -154,9 +155,26 @@ fn an_existing_holder_can_finish_after_all_external_gates_close_without_new_work
     let mut role = f.admitted().unwrap().into_role().unwrap();
     let second = f.admitted().unwrap();
     let full = matches!(f.admitted(), Err(DriverError::InputCapacity));
+    // The producer really ends before its already-admitted completion is
+    // dispatched. No child Work can accidentally keep this header resident.
+    f.work.body_exited().unwrap();
+    f.body_exited = true;
+    f.work.captures_exited().unwrap();
+    f.captures_exited = true;
+    assert!(f.work.actual_exit_ready().unwrap());
+    let original_exit = f.scope.work_lifecycle(f.work.id()).unwrap().unwrap();
+    assert!(original_exit.1 && original_exit.2);
+    assert_eq!(original_exit.3, 0);
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 0);
+    assert!(f.scope.work_lifecycle(f.work.id()).unwrap().is_some());
+    assert!(matches!(
+        f.admitted(),
+        Err(DriverError::InputAuthorInactive)
+    ));
     let first = role.fill(()).unwrap();
     f.runtime.poll_one(Tick(1)).unwrap();
     f.runtime.retire_input(actor(), first).unwrap();
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 0);
     let next = role.fill(()).unwrap();
     f.runtime.poll_one(Tick(2)).unwrap();
     f.runtime.retire_input(actor(), next).unwrap();
@@ -164,6 +182,8 @@ fn an_existing_holder_can_finish_after_all_external_gates_close_without_new_work
     role.close_after_exit().unwrap();
     let same_scope = f.scope.snapshot().unwrap() == before;
     let same_charge = f.ledger.used(DimensionId::new(1).unwrap()) == 2;
+    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 1);
+    assert!(f.scope.work_lifecycle(f.work.id()).unwrap().is_none());
     f.finish();
     assert!(ordinary_closed);
     assert!(full);
@@ -184,11 +204,11 @@ fn matching_local_work_numbers_from_another_scope_or_ledger_cannot_author_an_inp
             .reserve_admitted_input(actor(), actor(), InputClass::Control, &foreign.work,),
         Err(DriverError::InputAuthorMismatch)
     );
-    let other_scope = f.ledger.open_scope_next(None, generation(), 4, 1).unwrap();
+    let other_scope = f.ledger.open_scope_next(None, generation()).unwrap();
     let (mut other_work, mut other_capacity) = other_scope
         .reserve_next(
             generation(),
-            ResourceVector::default(),
+            ReservationResources::work_only(),
             WorkKind::Settlement,
             WorkAdmission::External,
         )
@@ -207,8 +227,9 @@ fn matching_local_work_numbers_from_another_scope_or_ledger_cannot_author_an_inp
     other_scope.close_external().unwrap();
     f.ledger.reap_scope_ready(other_scope.id(), 4).unwrap();
     other_capacity
-        .release(&other_capacity.resources().unwrap())
+        .release_quota(&other_capacity.resources().unwrap().quota)
         .unwrap();
+    other_capacity.finish().unwrap();
     f.ledger.remove_scope(other_scope.id()).unwrap();
     foreign.finish();
     f.finish();

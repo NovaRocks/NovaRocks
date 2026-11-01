@@ -20,11 +20,11 @@
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, StepContext},
     driver::{ActorRuntime, InputRole, TimerSourceState},
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     identity::*,
     mailbox::{InputClass, InputEnvelope},
     scope::{WorkAdmission, WorkKind},
@@ -58,17 +58,17 @@ struct Fixture<A: Actor> {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     roles: Vec<InputRole<A>>,
 }
 impl<A: Actor> Fixture<A> {
     fn new(value: A) -> Self {
-        let ledger = RuntimeLedger::new(paid(), 4, 1);
-        let scope = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+        let ledger = RuntimeLedger::new(paid());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (mut work, capacity) = scope
             .reserve_next(
                 generation(),
-                paid(),
+                ReservationResources::for_work(paid()),
                 WorkKind::Step,
                 WorkAdmission::External,
             )
@@ -76,7 +76,7 @@ impl<A: Actor> Fixture<A> {
             .bind(WorkKind::Step)
             .unwrap();
         work.start().unwrap();
-        let runtime = ActorRuntime::new(1);
+        let runtime = ActorRuntime::new();
         runtime
             .register_next(actor(), scope.clone(), value, config())
             .unwrap_or_else(|(error, _)| panic!("actual neutral actor registration: {error:?}"));
@@ -119,8 +119,9 @@ impl<A: Actor> Fixture<A> {
         self.ledger.reap_scope_ready(self.scope.id(), 1).unwrap();
         let value = self.runtime.remove_actor(actor()).unwrap();
         self.capacity
-            .release(&self.capacity.resources().unwrap())
+            .release_quota(&self.capacity.resources().unwrap().quota)
             .unwrap();
+        self.capacity.finish().unwrap();
         self.ledger.remove_scope(self.scope.id()).unwrap();
         assert!(self.runtime.is_empty());
         assert!(self.ledger.is_empty());

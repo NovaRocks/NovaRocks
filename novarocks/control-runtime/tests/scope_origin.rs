@@ -6,19 +6,19 @@
 // "License"); you may not //! Origin predicates do not grant new work or revive a failed scope.
 use novarocks_control_runtime::transaction::RuntimeLedger;
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     identity::Generation,
     scope::{WorkAdmission, WorkKind},
 };
 
 #[test]
 fn original_scope_identity_rejects_another_ledgers_same_number_and_survives_gate_changes() {
-    let first = RuntimeLedger::new(ResourceVector::default(), 4, 2);
-    let second = RuntimeLedger::new(ResourceVector::default(), 4, 1);
+    let first = RuntimeLedger::new(ResourceVector::default());
+    let second = RuntimeLedger::new(ResourceVector::default());
     let generation = Generation::new(1).unwrap();
-    let original = first.open_scope_next(None, generation, 1, 0).unwrap();
-    let sibling = first.open_scope_next(None, generation, 1, 0).unwrap();
-    let foreign = second.open_scope_next(None, generation, 1, 0).unwrap();
+    let original = first.open_scope_next(None, generation).unwrap();
+    let sibling = first.open_scope_next(None, generation).unwrap();
+    let foreign = second.open_scope_next(None, generation).unwrap();
     let same = original.clone();
     assert_eq!(original.id(), foreign.id());
     assert!(original.same_scope(&same) && same.same_scope(&original));
@@ -29,7 +29,7 @@ fn original_scope_identity_rejects_another_ledgers_same_number_and_survives_gate
         original
             .reserve_next(
                 failed,
-                ResourceVector::default(),
+                ReservationResources::work_only(),
                 WorkKind::Business,
                 WorkAdmission::External
             )

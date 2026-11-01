@@ -119,7 +119,7 @@ impl ContextHostRecord {
         if !self.bind_failed_cleanup(original, budget)? {
             return Ok(true);
         }
-        self.settle_failed_driver_effect(original)?;
+        self.settle_failed_driver_effect(original, budget)?;
         self.flush_task_cleanup_pending(ports, budget)
             .map_err(ContextDriverError::Task)?;
         if !self.observe_failed_capture(original)? {
@@ -136,11 +136,11 @@ impl ContextHostRecord {
             .ok_or(ContextDriverError::WrongOwner)?
             .descriptor
             .work;
-        let key = (self.scope().id(), author);
+        let key = (author.scope, author.work);
         let mut after = original.refused_request_input_after;
         let request_inputs_runnable = {
             let stage = original.drained().map_err(ContextDriverError::Failure)?;
-            self.advance_refused_root_ack_inputs(&stage, &mut after, budget)
+            self.advance_refused_neutral_inputs(&stage, &mut after, budget)
                 .map_err(ContextDriverError::Request)?
         };
         original.refused_request_input_after = after;
@@ -153,7 +153,8 @@ impl ContextHostRecord {
                 .ok_or(ContextDriverError::WrongOwner)?
                 .port();
             let old = original
-                .session
+                .session_mut()
+                .map_err(ContextDriverError::Failure)?
                 .commit_snapshot(port.publication(), candidate)
                 .map_err(|(error, candidate)| {
                     drop(candidate);
@@ -249,7 +250,11 @@ impl ContextHostRecord {
                     }
                     _ => return Err(ContextDriverError::WrongOwner),
                 };
-                let old = match original.session.commit_snapshot(port.publication(), next) {
+                let old = match original
+                    .session_mut()
+                    .map_err(ContextDriverError::Failure)?
+                    .commit_snapshot(port.publication(), next)
+                {
                     Ok(old) => old,
                     Err((error, next)) => {
                         original.pending_projection_task = Some(task);
@@ -327,6 +332,9 @@ impl ContextHostRecord {
             if !capture.actual_exit_observed() {
                 return Ok((false, false));
             }
+            original
+                .close_session()
+                .map_err(ContextDriverError::Failure)?;
             let ticket = original
                 .ticket
                 .take()
@@ -367,9 +375,13 @@ impl ContextHostRecord {
             || original.physical.is_some()
             || original.pending_projection.is_some()
             || self.resources.pending_host_jobs.driver_effect.is_some()
-            || self.resources.pending_host_jobs.driver_close.is_some()
+            || self
+                .resources
+                .pending_host_jobs
+                .close_fanouts
+                .iter()
+                .any(|f| f.ticket.is_some())
             || self.resources.pending_host_jobs.driver_seal.is_some()
-            || self.resources.pending_host_jobs.driver_release.is_some()
         {
             return Ok((false, false));
         }
@@ -389,9 +401,12 @@ impl ContextHostRecord {
         {
             return Ok((false, false));
         }
+        let stage = original.drained().map_err(ContextDriverError::Failure)?;
         if !self
-            .retire_owner_control()
-            .map_err(ContextDriverError::Metadata)?
+            .resources
+            .owner_control
+            .withdraw_failed(&stage)
+            .map_err(ContextDriverError::Driver)?
         {
             return Ok((false, false));
         }
@@ -414,7 +429,7 @@ impl ContextHostRecord {
         {
             return Ok((true, false));
         }
-        let key = (self.scope().id(), ticket.descriptor.work);
+        let key = (ticket.descriptor.work.scope, ticket.descriptor.work.work);
         let health = ports
             .protocol_events
             .as_ref()
@@ -444,11 +459,109 @@ impl ContextHostRecord {
     fn settle_failed_driver_effect(
         &mut self,
         original: &ScopeFailureOwner,
+        budget: usize,
     ) -> Result<(), ContextDriverError> {
+        if budget == 0 {
+            return Ok(());
+        }
         let Some(ticket) = self.resources.pending_host_jobs.driver_effect.take() else {
             return Ok(());
         };
         let stage = original.drained().map_err(ContextDriverError::Failure)?;
+        if let WorkerAction::Context(
+            novarocks_worker_protocol::context::ContextEffect::LoadInput { task, payload, .. },
+        ) = &ticket.effect
+        {
+            let (task, payload, input) = (*task, *payload, ticket.input);
+            if ticket.actor != self.actor {
+                self.resources.pending_host_jobs.driver_effect = Some(ticket);
+                return Err(ContextDriverError::WrongOwner);
+            }
+            // Verify the original ticket origin and Started/Published record
+            // before any same-number descriptor can select an unused holder.
+            if let Err(error) = self.control_runtime.effect_completion_observer(&ticket) {
+                self.resources.pending_host_jobs.driver_effect = Some(ticket);
+                return Err(ContextDriverError::Driver(error));
+            }
+            if let Some(TaskHostOwner::Initializing(owner)) = self.tasks.get(&task) {
+                // The original constructor variant and monotonic factory bit
+                // prove no loader admission was entered. Its real port and
+                // Source4 continue through the general failed Task pipeline.
+                if let Err(error) = owner.validate_initializing_load(&stage, &ticket) {
+                    self.resources.pending_host_jobs.driver_effect = Some(ticket);
+                    return Err(ContextDriverError::Task(
+                        task_driver::TaskDriverError::Host(error),
+                    ));
+                }
+                if let Err(error) =
+                    self.validate_failed_unpublished_create(&stage, input, task, payload)
+                {
+                    self.resources.pending_host_jobs.driver_effect = Some(ticket);
+                    return Err(ContextDriverError::Request(error));
+                }
+                if let Err(refusal) = self.complete_host_effect(ticket) {
+                    self.resources.pending_host_jobs.driver_effect = Some(refusal.ticket);
+                    return Err(ContextDriverError::Driver(refusal.error));
+                }
+                self.retire_failed_unpublished_create_input(&stage, input, task, payload)
+                    .map_err(ContextDriverError::Request)?;
+                self.notify_task_driver_progress(task);
+                return Ok(());
+            }
+            // A real Reserved or Bound custodian must own the original.
+            // Missing Task/guard or a Ready owner is never an exit witness.
+            let Some(TaskHostOwner::Unpublished(owner)) = self.tasks.get(&task) else {
+                self.resources.pending_host_jobs.driver_effect = Some(ticket);
+                return Ok(());
+            };
+            if !owner.matches_loading(&ticket) {
+                self.resources.pending_host_jobs.driver_effect = Some(ticket);
+                return Err(ContextDriverError::WrongOwner);
+            }
+            if let Err(error) =
+                self.validate_failed_unpublished_create(&stage, input, task, payload)
+            {
+                self.resources.pending_host_jobs.driver_effect = Some(ticket);
+                return Err(ContextDriverError::Request(error));
+            }
+            let Some(TaskHostOwner::Unpublished(owner)) = self.tasks.get_mut(&task) else {
+                unreachable!("same exclusively held unpublished Task");
+            };
+            let ready = match owner.advance_failed_unused(
+                &stage,
+                &self.control_runtime,
+                self.actor,
+                &self.ledger,
+                budget,
+            ) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    self.resources.pending_host_jobs.driver_effect = Some(ticket);
+                    return Err(ContextDriverError::Task(
+                        task_driver::TaskDriverError::Host(error),
+                    ));
+                }
+            };
+            if !ready {
+                self.resources.pending_host_jobs.driver_effect = Some(ticket);
+                // Only a finite set of unexposed metadata remains here.
+                self.task_driver.queue_owned_task(task);
+                self.notify_host_progress();
+                return Ok(());
+            }
+            // Body/captures and unused inventory really exited. Completing
+            // this same LoadInput that never reached a loader does not invent
+            // a TaskPhysicalExit, publication or callback return.
+            if let Err(refusal) = self.complete_host_effect(ticket) {
+                self.resources.pending_host_jobs.driver_effect = Some(refusal.ticket);
+                return Err(ContextDriverError::Driver(refusal.error));
+            }
+            self.retire_failed_unpublished_create_input(&stage, input, task, payload)
+                .map_err(ContextDriverError::Request)?;
+            self.task_driver.queue_owned_task(task);
+            self.notify_host_progress();
+            return Ok(());
+        }
         if matches!(
             &ticket.effect,
             WorkerAction::Context(

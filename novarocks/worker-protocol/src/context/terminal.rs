@@ -18,7 +18,7 @@
 //! One original terminal callback's co-observed neutral facts. This input
 //! neither selects an originating failure nor supplies the callback's exit.
 
-use super::{ContextCore, ContextStep, CoreError};
+use super::{ContextStep, CoreError, LiveContextCore};
 use novarocks_execution_contract::{
     FINAL_TASK_INFO_MAX_OPERATORS, OperatorStatistics, TaskConclusion, TaskIdentity,
     TaskOutputFacts,
@@ -48,7 +48,7 @@ pub struct TerminalObservation {
     pub output_released: bool,
     pub final_statistics: Option<TerminalStatistics>,
 }
-impl ContextCore {
+impl LiveContextCore {
     pub(super) fn observe_terminal(
         &mut self,
         task: TaskIdentity,

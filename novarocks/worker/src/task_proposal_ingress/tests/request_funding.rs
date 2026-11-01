@@ -151,6 +151,7 @@ fn another_ledgers_same_numeric_funding_or_pair_is_refused_without_losing_either
     let own_before = f.scope.snapshot().unwrap();
     let other_before = other.scope.snapshot().unwrap();
     let (error, original_pair) = match f.ingress.restore_retired_funding_pair(RetiredCut {
+        rpc_retirement_notice: None,
         funding: foreign.funding.clone(),
         pair: own.pair,
     }) {
@@ -171,6 +172,7 @@ fn another_ledgers_same_numeric_funding_or_pair_is_refused_without_losing_either
     );
     let foreign_keys = foreign.pair.keys().map(Clone::clone);
     let (error, foreign_pair) = match f.ingress.restore_retired_funding_pair(RetiredCut {
+        rpc_retirement_notice: None,
         funding: own.funding.clone(),
         pair: foreign.pair,
     }) {
@@ -194,6 +196,7 @@ fn another_ledgers_same_numeric_funding_or_pair_is_refused_without_losing_either
     restore_and_retire(
         &f,
         RetiredCut {
+            rpc_retirement_notice: None,
             pair: original_pair.pair,
             funding: own.funding,
         },
@@ -201,6 +204,7 @@ fn another_ledgers_same_numeric_funding_or_pair_is_refused_without_losing_either
     restore_and_retire(
         &other,
         RetiredCut {
+            rpc_retirement_notice: None,
             pair: foreign_pair.pair,
             funding: foreign.funding,
         },
@@ -224,6 +228,7 @@ fn a_pending_cuts_funding_cannot_be_stolen_by_an_earlier_returned_pair() {
         .map(|position| position.key);
     let before = f.scope.snapshot().unwrap();
     let (error, returned) = match f.ingress.restore_retired_funding_pair(RetiredCut {
+        rpc_retirement_notice: None,
         funding: pending_funding.clone(),
         pair: first.pair,
     }) {
@@ -261,6 +266,7 @@ fn a_pending_cuts_funding_cannot_be_stolen_by_an_earlier_returned_pair() {
     restore_and_retire(
         &f,
         RetiredCut {
+            rpc_retirement_notice: None,
             pair: returned.pair,
             funding: second.funding,
         },
@@ -334,7 +340,7 @@ fn a_claimed_funding_source_waits_for_its_last_real_alias_and_cannot_match_a_rea
         .unwrap()
         .map(|probe| probe.observe_reaped().unwrap());
     f.ingress
-        .rearm_open_spare(reaped, f.reported_roles())
+        .rearm_open_spare(reaped, f.slot_roles())
         .unwrap_or_else(|_| {
             panic!("the exact old headers reaped before fresh roles were admitted")
         });

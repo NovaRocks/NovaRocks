@@ -21,18 +21,18 @@
 
 use super::*;
 use crate::{
-    control_admission::{AdmissionStorage, Dimension},
+    control_admission::AdmissionStorage,
     control_runtime::actors::{ContextActor, tests::initial_establishment},
 };
 use novarocks_control_runtime::{
     actor::ActorConfig,
     driver::{ActorRegistration, DriverError},
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
     capacity::ResourceVector,
-    identity::{ActorId, Generation},
+    identity::{ActorId, Generation, ScopedWorkRef},
     scope::{WorkAdmission, WorkKind},
 };
 use novarocks_execution_contract::QueryContextRef;
@@ -52,11 +52,11 @@ fn input(n: u64) -> InputId {
 struct Owner {
     scope: ScopeHandle,
     registration: ActorRegistration,
-    roles: Vec<(WorkLease, CapacityBundle)>,
+    roles: Vec<(WorkLease, ReservationBundle)>,
 }
 impl Owner {
-    fn work(&self, index: usize) -> WorkId {
-        self.roles[index].0.id()
+    fn work(&self, index: usize) -> ScopedWorkRef {
+        self.roles[index].0.reference()
     }
 }
 struct Fixture {
@@ -67,22 +67,17 @@ struct Fixture {
 impl Fixture {
     fn new(count: usize) -> Self {
         let generation = Generation::new(1).unwrap();
-        let ledger = RuntimeLedger::new(
-            ResourceVector::new([(Dimension::Work.id(), u64::try_from(count * 3).unwrap())])
-                .unwrap(),
-            count * 3,
-            count,
-        );
-        let runtime = ActorRuntime::new(count);
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let runtime = ActorRuntime::new();
         let mut owners = Vec::with_capacity(count);
         for n in 0..count {
-            let scope = ledger.open_scope_next(None, generation, 3, 1).unwrap();
+            let scope = ledger.open_scope_next(None, generation).unwrap();
             let mut roles = Vec::with_capacity(3);
             for kind in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step] {
                 let (mut work, capacity) = scope
                     .reserve_next(
                         generation,
-                        ResourceVector::new([(Dimension::Work.id(), 1)]).unwrap(),
+                        novarocks_control_runtime_core::capacity::ReservationResources::work_only(),
                         kind,
                         WorkAdmission::External,
                     )
@@ -105,6 +100,7 @@ impl Fixture {
                 generation,
                 initial_establishment(),
                 ContextConfig {
+                    request_horizon: crate::RequestHorizon::DEFAULT,
                     max_tasks: 1,
                     max_creation_waiters: 2,
                     max_pending_requests: 2,
@@ -120,13 +116,15 @@ impl Fixture {
                 core,
                 scope.clone(),
                 AdmissionStorage {
-                    loading: ResourceVector::default(),
-                    accepted: ResourceVector::default(),
-                    context: ResourceVector::default(),
-                    ticket: ResourceVector::default(),
+                    loading:
+                        novarocks_control_runtime_core::capacity::ReservationResources::default(),
+                    accepted:
+                        novarocks_control_runtime_core::capacity::ReservationResources::default(),
+                    context:
+                        novarocks_control_runtime_core::capacity::ReservationResources::default(),
                 },
-                roles[1].0.id(),
-                roles[2].0.id(),
+                roles[1].0.reference(),
+                roles[2].0.reference(),
             );
             let registration = runtime
                 .register_supervised_bound(
@@ -189,7 +187,10 @@ impl Fixture {
                     .unwrap(),
             );
             for (_, capacity) in &mut owner.roles {
-                capacity.release(&capacity.resources().unwrap()).unwrap();
+                capacity
+                    .release_quota(&capacity.resources().unwrap().quota)
+                    .unwrap();
+                capacity.finish().unwrap();
             }
             self.ledger.remove_scope(owner.scope.id()).unwrap();
         }
@@ -203,12 +204,12 @@ fn both_namespaces_share_one_limit_without_issuing_work_or_accepting_duplicate_s
     let owner = &f.owners[0];
     let ready = f.index(2);
     let baseline = owner.scope.snapshot().unwrap();
-    let paid = f.ledger.used(Dimension::Work.id());
+    let paid = owner.scope.snapshot().unwrap().work;
     let control = ready
         .register_control(input(1), &owner.registration)
         .unwrap();
     let context = ready
-        .register_context(&owner.scope, owner.work(1), &owner.registration)
+        .register_context(&owner.roles[1].0, &owner.registration)
         .unwrap();
     let distinct_namespaces = ready.registered() == 2;
     let duplicate_control = matches!(
@@ -216,7 +217,7 @@ fn both_namespaces_share_one_limit_without_issuing_work_or_accepting_duplicate_s
         Err(ControlRequestError::DuplicateReadySlot)
     );
     let duplicate_context = matches!(
-        ready.register_context(&owner.scope, owner.work(1), &owner.registration),
+        ready.register_context(&owner.roles[1].0, &owner.registration),
         Err(ControlRequestError::DuplicateReadySlot)
     );
     let full_control = matches!(
@@ -224,7 +225,7 @@ fn both_namespaces_share_one_limit_without_issuing_work_or_accepting_duplicate_s
         Err(ControlRequestError::ReadyFull)
     );
     let full_context = matches!(
-        ready.register_context(&owner.scope, owner.work(2), &owner.registration),
+        ready.register_context(&owner.roles[2].0, &owner.registration),
         Err(ControlRequestError::ReadyFull)
     );
     ready.unregister(&context).unwrap();
@@ -233,7 +234,7 @@ fn both_namespaces_share_one_limit_without_issuing_work_or_accepting_duplicate_s
         .unwrap();
     let still_bounded = ready.registered() == 2;
     let unchanged_inventory =
-        owner.scope.snapshot().unwrap() == baseline && f.ledger.used(Dimension::Work.id()) == paid;
+        owner.scope.snapshot().unwrap() == baseline && owner.scope.snapshot().unwrap().work == paid;
     let same_index = ready.same_owner(&ready.clone()) && ready.limit().get() == 2;
     replacement.notify();
     control.notify();
@@ -263,18 +264,18 @@ fn each_context_owner_keeps_ready_fifo_and_cannot_consume_another_owner() {
     let control = ready.register_control(input(7), &a.registration).unwrap();
     let a_slots = [
         ready
-            .register_context(&a.scope, a.work(1), &a.registration)
+            .register_context(&a.roles[1].0, &a.registration)
             .unwrap(),
         ready
-            .register_context(&a.scope, a.work(2), &a.registration)
+            .register_context(&a.roles[2].0, &a.registration)
             .unwrap(),
     ];
     let b_slots = [
         ready
-            .register_context(&b.scope, b.work(1), &b.registration)
+            .register_context(&b.roles[1].0, &b.registration)
             .unwrap(),
         ready
-            .register_context(&b.scope, b.work(2), &b.registration)
+            .register_context(&b.roles[2].0, &b.registration)
             .unwrap(),
     ];
     a_slots[1].notify();
@@ -329,15 +330,15 @@ fn foreign_owners_and_old_slot_aliases_cannot_mutate_or_consume_the_original_que
         ))
     );
     let foreign_context = matches!(
-        ready.register_context(&a.scope, a.work(1), &foreign_owner.registration),
+        ready.register_context(&a.roles[1].0, &foreign_owner.registration),
         Err(ControlRequestError::Driver(
             DriverError::EffectTicketOriginMismatch
         ))
     );
     let foreign_scope = matches!(
-        ready.register_context(&foreign_owner.scope, foreign_owner.work(1), &a.registration),
+        ready.register_context(&foreign_owner.roles[1].0, &a.registration),
         Err(ControlRequestError::Driver(
-            DriverError::EffectTicketOriginMismatch
+            DriverError::InputAuthorMismatch
         ))
     );
     let foreign_index = matches!(
@@ -356,7 +357,7 @@ fn foreign_owners_and_old_slot_aliases_cannot_mutate_or_consume_the_original_que
         Err(ControlRequestError::UnknownReadySlot)
     );
     let context = ready
-        .register_context(&a.scope, a.work(1), &a.registration)
+        .register_context(&a.roles[1].0, &a.registration)
         .unwrap();
     context.notify();
     let same_numbers = a.scope.id() == foreign_owner.scope.id()
@@ -375,7 +376,7 @@ fn foreign_owners_and_old_slot_aliases_cannot_mutate_or_consume_the_original_que
     ready.unregister(&replacement).unwrap();
     ready.unregister(&context).unwrap();
     let context_replacement = ready
-        .register_context(&a.scope, a.work(1), &a.registration)
+        .register_context(&a.roles[1].0, &a.registration)
         .unwrap();
     let before_old_context_notify = ready.change_version();
     context.notify();
@@ -402,10 +403,10 @@ fn original_slot_notification_wakes_its_host_and_survives_a_racing_release() {
     let b = &f.owners[1];
     let ready = f.index(2);
     let first = ready
-        .register_context(&a.scope, a.work(1), &a.registration)
+        .register_context(&a.roles[1].0, &a.registration)
         .unwrap();
     let second = ready
-        .register_context(&b.scope, b.work(1), &b.registration)
+        .register_context(&b.roles[1].0, &b.registration)
         .unwrap();
     first.notify();
     let turn = f.runtime.claim_host_actor().unwrap();
@@ -448,7 +449,7 @@ fn a_retained_weak_slot_cannot_keep_the_index_alive_or_wake_its_former_owner() {
     let a = &f.owners[0];
     let ready = f.index(1);
     let slot = ready
-        .register_context(&a.scope, a.work(1), &a.registration)
+        .register_context(&a.roles[1].0, &a.registration)
         .unwrap();
     let actual_index = Arc::downgrade(&ready.shared);
     let baseline = a.scope.snapshot().unwrap();
@@ -473,7 +474,7 @@ fn external_end_publishes_its_phase_before_the_original_host_notice_and_is_idemp
     let a = &f.owners[0];
     let ready = f.index(1);
     let slot = ready
-        .register_context(&a.scope, a.work(1), &a.registration)
+        .register_context(&a.roles[1].0, &a.registration)
         .unwrap();
     let leg = Arc::new(RequestExternalLeg::new(slot.clone()));
     let reply = PublishedReply::<u8>::new(&a.scope);

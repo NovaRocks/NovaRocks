@@ -30,12 +30,12 @@ use novarocks_control_runtime::{
     completion::ReportSlot,
     continuation::{ContinuationDispatch, ContinuationSlot, InvocationResult, RegistrationToken},
     driver::{ActorRuntime, DriverError, EffectTicket, FailurePublicationSession},
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     publication::PublishedReply,
     transaction::{RuntimeError, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    identity::{ActorId, ScopeId, WorkId},
+    identity::{ActorId, ScopeId, ScopedWorkRef, WorkId},
     scope::ScopeError,
 };
 use novarocks_execution::{
@@ -69,6 +69,32 @@ pub(crate) enum SettlementDispatchError {
     FailureSnapshotMissing,
     Ordering(crate::control_runtime::effect_dispatch::DispatchError),
 }
+impl std::fmt::Display for SettlementDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongRole => f.write_str("Settlement dispatch has a different original role"),
+            Self::Driver(error) => write!(f, "Settlement dispatch driver failure: {error}"),
+            Self::Runtime(error) => write!(f, "Settlement dispatch runtime failure: {error}"),
+            Self::Continuation(error) => write!(f, "Settlement continuation failed: {error}"),
+            Self::FailureSnapshotMissing => {
+                f.write_str("Settlement dispatch has no published failure snapshot")
+            }
+            Self::Ordering(error) => write!(f, "Settlement dispatch ordering failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for SettlementDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Driver(error) => Some(error),
+            Self::Runtime(error) => Some(error),
+            Self::Continuation(error) => Some(error),
+            Self::Ordering(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SettlementRun {
     Exited,
@@ -88,7 +114,7 @@ pub(crate) struct FailedSettlementDispatch {
 }
 impl FailedSettlementDispatch {
     pub(crate) fn queue_key(&self) -> (ScopeId, WorkId) {
-        (self.role.scope.id(), self.role.work)
+        (self.role.work.scope, self.role.work.work)
     }
     /// Run only on the supervised physical lifecycle lane. No foreign
     /// callback, input refresh or port destructor runs on the metadata owner.
@@ -120,7 +146,7 @@ impl FailedSettlementDispatch {
 pub(crate) trait RegistrationNotice: Send {
     /// Binds metadata to the exact original admitted role before its permit
     /// can escape. This cannot allocate input positions or run host work.
-    fn bind_work(&mut self, work: WorkId);
+    fn bind_work(&mut self, work: ScopedWorkRef);
     fn registered(self: Box<Self>);
     fn unused(self: Box<Self>);
 }
@@ -151,7 +177,7 @@ impl SettlementCapability<ExecutionFailure> for Registration {
 #[derive(Clone)]
 pub(crate) struct SettlementRole {
     identity: TaskIdentity,
-    work: WorkId,
+    work: ScopedWorkRef,
     scope: ScopeHandle,
     barrier: PublishedReply<Snapshot>,
     // Weak metadata cannot keep a superseded rich source alive. Actual input
@@ -166,13 +192,13 @@ impl SettlementRole {
     pub(crate) fn from_admitted(
         identity: TaskIdentity,
         work: WorkLease,
-        capacity: CapacityBundle,
+        capacity: ReservationBundle,
         completion: ReportSlot,
         health: Arc<ExecutionHealth>,
         mut notice: Box<dyn RegistrationNotice>,
     ) -> (Self, SettlementPermit<ExecutionFailure>) {
         let scope = work.scope().clone();
-        let work_id = work.id();
+        let work_id = work.reference();
         notice.bind_work(work_id);
         let barrier = PublishedReply::new(&scope);
         let (slot, token) = ContinuationSlot::from_admitted(
@@ -215,7 +241,7 @@ impl SettlementRole {
     pub(crate) fn barrier_committed(&self) -> bool {
         self.barrier.is_committed()
     }
-    pub(crate) fn work_id(&self) -> WorkId {
+    pub(crate) fn work_id(&self) -> ScopedWorkRef {
         self.work
     }
     /// The original barrier is itself an actual runtime publication. Taking a
@@ -508,7 +534,7 @@ mod tests {
 
     struct Notice(Arc<AtomicUsize>);
     impl RegistrationNotice for Notice {
-        fn bind_work(&mut self, _: WorkId) {}
+        fn bind_work(&mut self, _: ScopedWorkRef) {}
         fn registered(self: Box<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
@@ -520,22 +546,24 @@ mod tests {
     fn fixture() -> Fixture {
         let dimension = DimensionId::new(1).unwrap();
         let resources = ResourceVector::new([(dimension, 1)]).unwrap();
-        let ledger = RuntimeLedger::new(resources.clone(), 1, 1);
+        let ledger = RuntimeLedger::new(resources.clone());
         let scope = ledger
-            .open_scope(
-                ScopeId::new(1).unwrap(),
-                None,
-                Generation::new(1).unwrap(),
-                1,
-                1,
-            )
+            .open_scope(ScopeId::new(1).unwrap(), None, Generation::new(1).unwrap())
             .unwrap();
-        let guard = scope
+        let mut guard = scope
             .reserve(ReservationRequest {
                 id: ReservationId::new(1).unwrap(),
                 generation: Generation::new(1).unwrap(),
                 guard: WorkId::new(1).unwrap(),
-                resources,
+                resources: novarocks_control_runtime_core::capacity::ReservationResources::new(
+                    resources,
+                    novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 1,
+                        captures: 1,
+                        ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
+                    },
+                ),
                 admission: WorkAdmission::External,
                 kind: WorkKind::Settlement,
             })
@@ -543,10 +571,9 @@ mod tests {
         let owner = ConsumerId::new(1).unwrap();
         let observer = ConsumerId::new(2).unwrap();
         let report = ReportSlot::reserve(
-            &scope,
+            &mut guard,
             SlotId::new(1).unwrap(),
             Generation::new(1).unwrap(),
-            guard.work_id(),
             2,
             [
                 (

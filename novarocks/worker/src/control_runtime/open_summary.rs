@@ -32,7 +32,7 @@ use novarocks_control_runtime::{
 };
 use novarocks_control_runtime_core::{
     completion::Consumption,
-    identity::{ActorId, Generation, InputId, WorkId},
+    identity::{ActorId, Generation, InputId, ScopedWorkRef},
 };
 use novarocks_execution_contract::TaskIdentity;
 use novarocks_worker_protocol::{context::ContextInput, proposal_summary::SourceId};
@@ -98,7 +98,7 @@ pub(crate) struct TaskOpenSummaryInbox {
     runtime: ActorRuntime<WorkerActor>,
     actor: ActorId,
     task: TaskIdentity,
-    work: WorkId,
+    work: ScopedWorkRef,
     ingress: Arc<TaskProposalIngress>,
     input: InputRole<WorkerActor>,
     delivered: Option<Delivered>,
@@ -112,7 +112,7 @@ impl TaskOpenSummaryInbox {
         runtime: ActorRuntime<WorkerActor>,
         actor: ActorId,
         task: TaskIdentity,
-        work: WorkId,
+        work: ScopedWorkRef,
         ingress: Arc<TaskProposalIngress>,
         input: InputRole<WorkerActor>,
     ) -> Result<Self, (OpenSummaryError, InputRole<WorkerActor>)> {
@@ -201,6 +201,7 @@ impl TaskOpenSummaryInbox {
         }
         Ok(delivered.consumption)
     }
+    #[cfg(test)]
     pub(crate) fn source_input(
         &self,
         source: SourceId,
@@ -370,6 +371,7 @@ impl TaskOpenSummaryInbox {
     }
     /// A source-free summary can hand the same unused permits back to spare.
     /// Neither this operation nor input retirement releases those source roles.
+    #[cfg(test)]
     pub(crate) fn retire_unclaimed(&mut self) -> Result<(), OpenSummaryError> {
         self.check_retirement()?;
         self.ingress.finish_open_unclaimed()?;
@@ -395,7 +397,9 @@ impl TaskOpenSummaryInbox {
         &mut self,
         lifetime: &TaskLifetime,
     ) -> Result<(), OpenSummaryError> {
-        if lifetime.id() != self.work || lifetime.observation().identity() != self.task {
+        if lifetime.work().reference() != self.work
+            || lifetime.observation().identity() != self.task
+        {
             return Err(OpenSummaryError::WrongLifetime);
         }
         if self.closed {
@@ -464,8 +468,6 @@ mod tests {
                     input_retained_bytes: 1,
                     ingress_retained_bytes: 1,
                     structural_bytes: 1,
-                    inbound_records: 0,
-                    inbound_bytes: 0,
                 }),
             },
             ContextInput::Installed { task },
@@ -497,14 +499,24 @@ mod tests {
             &resources.host_calls,
             &f.ledger,
         );
+        // This unissued disposal is the original Context child, outside Task join.
+        let mut disposal_retired = false;
+        for _ in 0..64 {
+            if resources.disposal.retire_unused(&f.ledger).unwrap() {
+                disposal_retired = true;
+                break;
+            }
+        }
+        assert!(disposal_retired && resources.disposal.is_retired());
         resources.lifetime.body_exited().unwrap();
         resources.lifetime.captures_exited().unwrap();
         assert!(resources.lifetime.actual_exit_ready().unwrap());
         open.close_after_exit(&resources.lifetime).unwrap();
         resources
             .active
-            .release(&resources.active.resources().unwrap())
+            .release_quota(&resources.active.resources().unwrap().quota)
             .unwrap();
+        resources.active.finish().unwrap();
         f.ledger.reap_scope_ready(f.scope.id(), 64).unwrap();
         drop(open);
         drop(resources);
@@ -807,7 +819,7 @@ mod tests {
         else {
             panic!("the same refused neutral summary is retained");
         };
-        assert_eq!(*work, resources.lifetime.id());
+        assert_eq!(*work, resources.lifetime.work().reference());
         assert_eq!(*task, resources.port.identity());
         assert_eq!(*epoch, generation());
         assert_eq!(*cut, None);

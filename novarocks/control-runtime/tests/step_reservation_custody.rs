@@ -19,12 +19,12 @@
 
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, DriverError},
-    lease::{CapacityBundle, WorkLease},
+    driver::{ActorRuntime, DriverError, FailureSourceState},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     effect::{EffectDescriptor, EffectKind},
     identity::*,
     mailbox::{InputClass, InputEnvelope},
@@ -66,13 +66,16 @@ impl Actor for Reserving {
             .scope
             .reserve_next(
                 generation(),
-                vector(1),
+                ReservationResources::for_work(vector(1)),
                 WorkKind::Business,
                 WorkAdmission::External,
             )
             .unwrap();
         let reservation = guard.reservation_id();
-        let work = guard.work_id();
+        let work = ScopedWorkRef {
+            scope: guard.scope().id(),
+            work: guard.work_id(),
+        };
         step.reservation(guard)
             .unwrap_or_else(|(e, _)| panic!("handoff: {e:?}"));
         step.effect(
@@ -115,23 +118,23 @@ struct Fixture {
     scope: ScopeHandle,
     runtime: ActorRuntime<Reserving>,
     failure: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
 }
 impl Fixture {
     fn new() -> Self {
-        let ledger = RuntimeLedger::new(vector(1), 8, 1);
-        let scope = ledger.open_scope_next(None, generation(), 8, 4).unwrap();
+        let ledger = RuntimeLedger::new(vector(1));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (failure, capacity) = scope
             .reserve_next(
                 generation(),
-                vector(0),
+                ReservationResources::for_work(vector(0)),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
             .unwrap()
             .bind(WorkKind::Cleanup)
             .unwrap();
-        let runtime = ActorRuntime::new(1);
+        let runtime = ActorRuntime::new();
         runtime
             .register_supervised_next(
                 actor(),
@@ -179,8 +182,9 @@ impl Fixture {
         self.failure.captures_exited().unwrap();
         self.ledger.reap_scope_ready(self.scope.id(), 8).unwrap();
         self.capacity
-            .release(&self.capacity.resources().unwrap())
+            .release_quota(&self.capacity.resources().unwrap().quota)
             .unwrap();
+        self.capacity.finish().unwrap();
         self.scope.close_external().unwrap();
         self.runtime
             .remove_actor(actor())
@@ -189,12 +193,22 @@ impl Fixture {
         assert!(self.ledger.is_empty());
     }
     fn complete_failure(&mut self, input: InputId) {
-        let ticket = self.runtime.take_effect(actor(), input, action()).unwrap();
-        assert_eq!(ticket.descriptor.work, self.failure.id());
+        let FailureSourceState::ClosedPending(supervisor) =
+            self.runtime.failure_source_state(actor()).unwrap()
+        else {
+            panic!("the actual failure owns its independent supervisor input");
+        };
+        assert_ne!(supervisor, input);
+        self.runtime.retire_input(actor(), input).unwrap();
+        let ticket = self
+            .runtime
+            .take_effect(actor(), supervisor, action())
+            .unwrap();
+        assert_eq!(ticket.descriptor.work, self.failure.reference());
         assert!(ticket.effect.is_none());
         self.failure.start().unwrap();
         self.runtime.effect_completed(ticket).unwrap();
-        self.runtime.retire_input(actor(), input).unwrap();
+        self.runtime.retire_input(actor(), supervisor).unwrap();
     }
 }
 #[test]
@@ -207,7 +221,13 @@ fn a_committed_guard_cannot_disappear_when_its_input_effect_completes() {
         .runtime
         .take_step_reservation(&ticket, reservation)
         .unwrap();
-    assert_eq!(guard.work_id(), ticket.descriptor.work);
+    assert_eq!(
+        ScopedWorkRef {
+            scope: guard.scope().id(),
+            work: guard.work_id()
+        },
+        ticket.descriptor.work,
+    );
     assert!(matches!(
         f.runtime.take_step_reservation(&ticket, reservation),
         Err(DriverError::UnknownReservation)
@@ -221,7 +241,10 @@ fn a_committed_guard_cannot_disappear_when_its_input_effect_completes() {
     assert_eq!(f.ledger.used(DimensionId::new(1).unwrap()), 1);
     work.captures_exited().unwrap();
     f.ledger.reap_scope_ready(f.scope.id(), 8).unwrap();
-    capacity.release(&capacity.resources().unwrap()).unwrap();
+    capacity
+        .release_quota(&capacity.resources().unwrap().quota)
+        .unwrap();
+    capacity.finish().unwrap();
     f.finish();
 }
 #[test]
@@ -230,11 +253,10 @@ fn an_uncommitted_step_unwinds_its_original_unbound_guards() {
     let input = f.command(1);
     assert!(f.runtime.snapshot(actor()).unwrap().failed);
     assert_eq!(f.ledger.used(DimensionId::new(1).unwrap()), 0);
-    assert!(
-        f.runtime
-            .step_reservations(actor(), input, None, 8)
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        f.runtime.step_reservations(actor(), input, None, 8),
+        Err(DriverError::UnknownInput),
+        "an uncommitted step never publishes a reservation batch",
     );
     f.complete_failure(input);
     f.finish();

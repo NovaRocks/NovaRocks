@@ -24,12 +24,13 @@ pub mod completion;
 pub mod continuation;
 pub mod driver;
 pub mod exit_role;
+pub mod header_readiness;
 pub mod lease;
 pub mod notify;
 pub mod owned_return;
 pub mod read_resource;
-pub mod reported_work;
 pub mod reply_notification;
+pub mod reported_work;
 pub mod resource;
 pub mod shutdown;
 pub mod sync;
@@ -37,3 +38,5 @@ pub mod transaction;
 
 pub mod history;
 pub mod publication;
+
+pub mod observation;

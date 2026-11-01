@@ -17,7 +17,9 @@
 
 //! Contract sequences use explicit identities, time and an inline reservation
 //! observer. Driver synchronization and actual holder teardown are separate tests.
-use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId};
+use novarocks_control_runtime_core::identity::{
+    Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, WorkId,
+};
 use novarocks_execution_contract::{
     AbortCause, AcquireQueryContextAdmissionTicket, AdmissionTicketId, CancelReason, LeaseSequence,
     LeaseValidFor, OperationOutcome, QueryContextRef, QueryContextState, TaskConclusion,
@@ -42,12 +44,13 @@ use novarocks_worker_protocol::{
     creation::{
         AdmissionNeed, AdmissionPort, AdmissionRefusal, CreationCost, PayloadId, RequestContext,
     },
-    lease::{LeaseBounds, MonotonicInstant},
+    lease::{LeaseBounds, MonotonicInstant, RequestHorizon},
     observation::{
         CoveredObservationFact, CoveredObservationFrame, CoveredSubscriptionError,
         ObservationSource, SubscriptionId,
     },
     proposal_summary::Proposal,
+    retention::RetentionOrigin,
 };
 use std::time::Duration;
 fn bytes(n: u8) -> [u8; 16] {
@@ -56,6 +59,16 @@ fn bytes(n: u8) -> [u8; 16] {
     bytes[8] = 0x80;
     bytes
 }
+// One explicit model process owns these requests. The fixture's non-reused
+// input issuance ordinal also names its original R Work; this is plain protocol
+// metadata and cannot create runtime Work, capacity or an InputAuthor proof.
+fn model_request_author(token: InputId) -> ScopedWorkRef {
+    ScopedWorkRef {
+        scope: ScopeId::new(1).expect("the model process Scope"),
+        work: WorkId::new(token.get()).expect("the original model request ordinal"),
+    }
+}
+
 fn at(n: u64) -> MonotonicInstant {
     MonotonicInstant::from_origin(Duration::from_secs(n))
 }
@@ -103,9 +116,24 @@ fn core_with_establishment(
     max_tasks: usize,
     max_preparing: usize,
 ) -> ContextCore {
-    ContextCore::new(
+    core_from_original_establishment(
         context(),
         Generation::new(1).unwrap(),
+        establishment,
+        max_tasks,
+        max_preparing,
+    )
+}
+fn core_from_original_establishment(
+    identity: QueryContextRef,
+    generation: Generation,
+    establishment: ContextEstablishment,
+    max_tasks: usize,
+    max_preparing: usize,
+) -> ContextCore {
+    ContextCore::new(
+        identity,
+        generation,
         establishment,
         ContextConfig {
             max_tasks,
@@ -116,6 +144,7 @@ fn core_with_establishment(
             step_budget: ContextCore::MAX_STEP_WORK,
             lease_bounds: LeaseBounds::DEFAULT,
             metric_publish_interval: Duration::from_millis(100),
+            request_horizon: novarocks_worker_protocol::lease::RequestHorizon::DEFAULT,
         },
     )
     .unwrap()
@@ -189,6 +218,7 @@ impl FixtureContext for ContextCore {
                 self.handle_request(
                     now,
                     RequestContext {
+                        author: model_request_author(token),
                         token,
                         operation,
                         deadline: at(10_000),
@@ -206,8 +236,6 @@ fn cost() -> CreationCost {
         input_retained_bytes: 3,
         ingress_retained_bytes: 4,
         structural_bytes: 7,
-        inbound_records: 2,
-        inbound_bytes: 9,
     }
 }
 fn activate(core: &mut ContextCore, port: &mut Port) {
@@ -255,6 +283,35 @@ fn has_verdict(
     replies.iter().any(|reply| reply.request.token == token
         && reply.result == RequestResult::Outcome(outcome)
         && matches!(reply.body.as_ref(), ContextReplyBody::Verdict(value) if *value == reply.result))
+}
+fn assert_context_acknowledgement(
+    replies: &[ContextRequestSettlement],
+    token: InputId,
+    outcome: OperationOutcome,
+    state: QueryContextState,
+    cause: Option<AbortCause>,
+) {
+    let mut matches = replies.iter().filter(|reply| reply.request.token == token);
+    let reply = matches.next().expect("the original Context reply");
+    assert!(matches.next().is_none(), "one reply for the original token");
+    assert_eq!(reply.result, RequestResult::Outcome(outcome));
+    assert!(reply.task.is_none());
+    let ContextReplyBody::Context(ack) = reply.body.as_ref() else {
+        panic!("the operation retains its complete original Context acknowledgement")
+    };
+    assert_eq!(ack.outcome, outcome);
+    assert_eq!(ack.receipt.context(), context());
+    assert_eq!(ack.receipt.state(), state);
+    assert_eq!(ack.termination_cause, cause);
+    assert_eq!(
+        ack.receipt.lease(),
+        Some(novarocks_execution_contract::LeaseReceipt::new(
+            LeaseSequence::INITIAL,
+            semantics().initial_lease_valid_for,
+            Duration::from_secs(30),
+        )),
+        "the close or expired renewal does not replace the original lease"
+    );
 }
 fn assert_domain_reply(
     replies: &[ContextRequestSettlement],
@@ -325,7 +382,6 @@ fn proposal(conclusion: TaskConclusion) -> Proposal {
 
 #[test]
 fn settlement_flushes_its_predecessors_without_freezing_later_conclusions_or_claiming_exit() {
-    use novarocks_control_runtime_core::identity::WorkId;
     let mut core = core(4, 1);
     let mut port = Port::default();
     activate(&mut core, &mut port);
@@ -337,7 +393,7 @@ fn settlement_flushes_its_predecessors_without_freezing_later_conclusions_or_cla
             at(0),
             ContextInput::Settle {
                 task: task(1),
-                work: WorkId::new(1).unwrap(),
+                work: model_request_author(InputId::new(1).unwrap()),
             },
             &mut port,
         )
@@ -346,7 +402,7 @@ fn settlement_flushes_its_predecessors_without_freezing_later_conclusions_or_cla
         first.effects,
         [ContextEffect::SettlementBarrier {
             task: task(1),
-            work: WorkId::new(1).unwrap(),
+            work: model_request_author(InputId::new(1).unwrap()),
         }]
     );
     assert!(core.task(task(1)).unwrap().conclusion.accepted.is_none());
@@ -369,7 +425,7 @@ fn settlement_flushes_its_predecessors_without_freezing_later_conclusions_or_cla
             at(1),
             ContextInput::Settle {
                 task: task(1),
-                work: WorkId::new(2).unwrap(),
+                work: model_request_author(InputId::new(2).unwrap()),
             },
             &mut port,
         )
@@ -388,7 +444,7 @@ fn settlement_flushes_its_predecessors_without_freezing_later_conclusions_or_cla
         .iter()
         .position(|effect| {
             matches!(effect,
-        ContextEffect::SettlementBarrier { work, .. } if work.get() == 2)
+        ContextEffect::SettlementBarrier { work, .. } if *work == model_request_author(InputId::new(2).unwrap()))
         })
         .unwrap();
     assert!(publication < barrier);
@@ -426,12 +482,7 @@ fn exact_create_replays_share_one_loader_and_reserve_the_complete_preparation_co
     let effects = loaded(&mut core, &mut port, 1);
     assert!(matches!(
         port.calls[1],
-        AdmissionNeed::Preparation {
-            bytes: 14,
-            inbound_records: 2,
-            inbound_bytes: 9,
-            ..
-        }
+        AdmissionNeed::Preparation { bytes: 14, .. }
     ));
     assert_eq!(
         effects
@@ -639,11 +690,24 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     let refused = core
         .apply_fixture(at(0), rpc(operation(7), ContextCommand::Release), &mut port)
         .unwrap();
-    assert!(has_verdict(
-        &refused.requests,
-        port.request_token(operation(7)),
-        OperationOutcome::ReleaseNotReady
-    ));
+    let original = refused
+        .requests
+        .iter()
+        .find(|reply| reply.request.token == port.request_token(operation(7)))
+        .unwrap();
+    assert_eq!(
+        original.result,
+        RequestResult::Outcome(OperationOutcome::ReleaseNotReady)
+    );
+    assert_eq!(
+        original.body.as_ref(),
+        &ContextReplyBody::Release {
+            context: context(),
+            release: novarocks_execution_contract::ReleaseOutcome::NotReady,
+            state: QueryContextState::Quiescing,
+            termination_cause: None,
+        }
+    );
     let exited = core
         .handle(
             at(0),
@@ -669,21 +733,247 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
             .iter()
             .any(|e| matches!(e, ContextEffect::ReleaseHost { .. }))
     );
-    assert!(!has_verdict(
-        &releasing.requests,
-        port.request_token(operation(7)),
-        OperationOutcome::Accepted
-    ));
+    assert!(
+        releasing
+            .requests
+            .iter()
+            .all(|reply| reply.request.token != port.request_token(operation(7))),
+        "the original Release reply still waits for actual HostReleased"
+    );
     let released = core
         .handle(at(0), ContextInput::HostReleased, &mut port)
         .unwrap();
     assert_eq!(core.state(), QueryContextState::TerminalRetained);
+    let original = released
+        .requests
+        .iter()
+        .find(|reply| reply.request.token == port.request_token(operation(7)))
+        .unwrap();
+    assert_eq!(
+        original.result,
+        RequestResult::Outcome(OperationOutcome::Accepted)
+    );
+    assert_eq!(
+        original.body.as_ref(),
+        &ContextReplyBody::Release {
+            context: context(),
+            release: novarocks_execution_contract::ReleaseOutcome::Released,
+            state: QueryContextState::TerminalRetained,
+            termination_cause: None,
+        }
+    );
+    // Visible terminal state is not the physical custody handoff. These model
+    // facts do not claim that a real Worker/Scope has actually exited.
+    assert!(!core.is_compact_retained());
+    let payload = core.task(task(1)).unwrap().payload;
+    let task_epoch = core.task(task(1)).unwrap().applied_close_generation;
+    let source = core.task(task(1)).unwrap().conclusion.source;
+    let original_status = core.status(task(1)).unwrap().clone();
+    let outcomes = [
+        OperationOutcome::Idempotent,
+        OperationOutcome::Idempotent,
+        OperationOutcome::Accepted,
+        OperationOutcome::ContextTerminalReceipt,
+        OperationOutcome::ContextTerminalReceipt,
+        OperationOutcome::Accepted,
+        OperationOutcome::Idempotent,
+        OperationOutcome::Accepted,
+        OperationOutcome::ContextTerminalReceipt,
+        OperationOutcome::ContextTerminalReceipt,
+        OperationOutcome::ContextTerminalReceipt,
+        OperationOutcome::ContextTerminalReceipt,
+    ];
+    let mut bodies = Vec::new();
+    for (index, command) in terminal_context_commands().into_iter().enumerate() {
+        let step = core
+            .apply_fixture(at(0), rpc(operation(100 + index as u8), command), &mut port)
+            .unwrap();
+        assert_eq!(step.requests.len(), 1);
+        assert_eq!(
+            step.requests[0].result,
+            RequestResult::Outcome(outcomes[index])
+        );
+        assert!(step.charged_work() <= core.max_step_work());
+        bodies.push(step.requests[0].body.clone());
+    }
+    core.handle(
+        at(1),
+        ContextInput::TaskExecutionCustodyRetired {
+            task: task(1),
+            payload,
+            close_epoch: task_epoch,
+        },
+        &mut port,
+    )
+    .unwrap();
+    for _ in 0..16 {
+        if core.decided_task(task(1)).is_some() {
+            break;
+        }
+        let step = core
+            .handle(at(1), ContextInput::NextInternal, &mut port)
+            .unwrap();
+        assert!(step.charged_work() <= core.max_step_work());
+    }
+    assert!(core.task(task(1)).is_none());
+    assert_eq!(core.decided_task(task(1)).unwrap().source(), source);
+    assert_eq!(
+        core.decided_task(task(1)).unwrap().status(),
+        &original_status
+    );
+    assert!(
+        !core.is_compact_retained(),
+        "Task custody does not prove original Context custody exit"
+    );
+    let retired_at = at(1);
+    let origin = RetentionOrigin::new(retired_at, RequestHorizon::DEFAULT);
+    core.handle(
+        at(1),
+        ContextInput::ExecutionCustodyRetired {
+            context: context(),
+            close_epoch: core.generation(),
+            origin,
+        },
+        &mut port,
+    )
+    .unwrap();
+    assert!(core.is_compact_retained());
+    for (index, command) in terminal_context_commands().into_iter().enumerate() {
+        let step = core
+            .apply_fixture(at(1), rpc(operation(120 + index as u8), command), &mut port)
+            .unwrap();
+        assert_eq!(step.requests.len(), 1);
+        assert_eq!(
+            step.requests[0].result,
+            RequestResult::Outcome(outcomes[index])
+        );
+        assert_eq!(step.requests[0].body, bodies[index]);
+        if let (ContextReplyBody::FinalInfo(original), ContextReplyBody::FinalInfo(same)) =
+            (bodies[index].as_ref(), step.requests[0].body.as_ref())
+        {
+            assert!(
+                std::sync::Arc::ptr_eq(original, same),
+                "FinalInfo keeps its original freeze"
+            );
+        }
+        if let (
+            ContextReplyBody::Quiesce {
+                receipt: original, ..
+            },
+            ContextReplyBody::Quiesce { receipt: same, .. },
+        ) = (bodies[index].as_ref(), step.requests[0].body.as_ref())
+        {
+            assert!(
+                std::sync::Arc::ptr_eq(original, same),
+                "Quiesce keeps its original membership receipt"
+            );
+        }
+        assert!(step.charged_work() <= core.max_step_work());
+    }
+    let duplicate = core
+        .handle(
+            at(2),
+            ContextInput::ExecutionCustodyRetired {
+                context: context(),
+                close_epoch: core.generation(),
+                origin,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(duplicate.effects.is_empty());
+    assert_eq!(
+        core.handle(
+            at(2),
+            ContextInput::ExecutionCustodyRetired {
+                context: context(),
+                close_epoch: core.generation(),
+                origin: RetentionOrigin::new(at(2), RequestHorizon::DEFAULT),
+            },
+            &mut port,
+        )
+        .unwrap_err(),
+        novarocks_worker_protocol::context::CoreError::IllegalFact,
+        "a different origin cannot restart the original retention horizon"
+    );
+    assert_eq!(core.next_deadline(), Some(at(121)));
+    assert!(
+        core.handle(at(120), ContextInput::Tick, &mut port)
+            .unwrap()
+            .effects
+            .is_empty()
+    );
+    let expired = core.handle(at(121), ContextInput::Tick, &mut port).unwrap();
+    assert_eq!(
+        expired.effects,
+        vec![ContextEffect::Expired {
+            context: context(),
+            close_epoch: core.generation()
+        }]
+    );
+    assert!(
+        core.handle(at(121), ContextInput::Tick, &mut port)
+            .unwrap()
+            .effects
+            .is_empty()
+    );
+    let gone = core
+        .apply_fixture(
+            at(121),
+            rpc(operation(150), ContextCommand::Release),
+            &mut port,
+        )
+        .unwrap();
     assert!(has_verdict(
-        &released.requests,
-        port.request_token(operation(7)),
-        OperationOutcome::Accepted
+        &gone.requests,
+        port.request_token(operation(150)),
+        OperationOutcome::Gone
     ));
 }
+fn terminal_context_commands() -> Vec<ContextCommand> {
+    vec![
+        ContextCommand::Create {
+            task: task(1),
+            payload: PayloadId(99),
+        },
+        ContextCommand::InspectCreation { task: task(1) },
+        ContextCommand::Cancel {
+            task: task(1),
+            reason: CancelReason::UpstreamNoLongerNeeded,
+        },
+        ContextCommand::UpdateTask {
+            task: task(1),
+            payload: PayloadId(99),
+            updates: Vec::new(),
+        },
+        ContextCommand::UpdateContext {
+            payload: PayloadId(99),
+            update: novarocks_worker_protocol::domain::ContextDomainInput::Filter {
+                version: novarocks_execution_contract::DomainVersion::FIRST,
+                fingerprint: novarocks_execution_contract::ContentFingerprint::from_bytes([2; 16]),
+            },
+        },
+        ContextCommand::GetFinalInfo { task: task(1) },
+        ContextCommand::GetDynamicFilters {
+            task: task(1),
+            acknowledged: None,
+        },
+        ContextCommand::Subscribe {
+            generation: 7,
+            position: novarocks_worker_protocol::observation::CoveredSubscriptionRequest::default(),
+        },
+        ContextCommand::Renew {
+            sequence: LeaseSequence::INITIAL,
+            valid_for: LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        },
+        ContextCommand::Quiesce,
+        ContextCommand::Abort {
+            cause: AbortCause::QueryFailed,
+        },
+        ContextCommand::Release,
+    ]
+}
+
 #[test]
 fn current_input_time_expires_a_lease_before_a_delayed_timer_arrives() {
     let mut core = core(8, 1);
@@ -704,17 +994,21 @@ fn current_input_time_expires_a_lease_before_a_delayed_timer_arrives() {
         .unwrap();
     assert_eq!(core.state(), QueryContextState::Aborting);
     assert_eq!(core.generation().get(), 2);
-    assert!(has_verdict(
+    assert_context_acknowledgement(
         &step.requests,
         port.request_token(operation(7)),
-        OperationOutcome::LeaseExpired
-    ));
+        OperationOutcome::LeaseExpired,
+        QueryContextState::Aborting,
+        Some(AbortCause::LeaseExpired),
+    );
     assert!(core.handle(at(29), ContextInput::Tick, &mut port).is_err());
 }
 #[test]
-fn redemption_does_not_return_a_ticket_reservation_or_expire_an_established_context() {
+fn redemption_preserves_exact_receipts_until_explicit_close_and_replay_expiry() {
+    use novarocks_worker_protocol::admission::{
+        AdmissionTicketAcquisitionRejection, AdmissionTicketRedemptionRejection,
+    };
     let mut tickets = AdmissionCore::new(AdmissionTicketConfig::DEFAULT, [1; 8]);
-    let mut port = Port::default();
     let request = AcquireQueryContextAdmissionTicket::new(
         operation(5),
         context(),
@@ -723,34 +1017,270 @@ fn redemption_does_not_return_a_ticket_reservation_or_expire_an_established_cont
         tickets.capability(),
     );
     let id = AdmissionTicketId::try_from_bytes([4; 16]).unwrap();
-    let grant = tickets.acquire(request, id, at(0), &mut port).unwrap();
+    let grant = tickets.acquire(request, id, at(0)).unwrap();
     assert_eq!(
         tickets
             .acquire(
                 request,
                 AdmissionTicketId::try_from_bytes([5; 16]).unwrap(),
                 at(1),
-                &mut port
             )
             .unwrap()
             .receipt(),
         grant.receipt()
     );
-    assert_eq!(port.calls.len(), 1);
+    assert_eq!(
+        tickets.observe(id, context(), at(2)),
+        AdmissionTicketObservation::Issued {
+            remaining: Duration::from_secs(3),
+        }
+    );
+    assert_eq!(
+        tickets.observe(id, another_control_context(), at(2)),
+        AdmissionTicketObservation::ForeignContext
+    );
+    assert_eq!(
+        tickets.redeem(id, another_control_context(), at(2)),
+        Err(AdmissionTicketRedemptionRejection::ForeignContext)
+    );
     assert!(matches!(
-        tickets.redeem(id, context(), at(1)),
+        tickets.redeem(id, context(), at(2)),
         Ok(AdmissionTicketRedemption::Redeemed(_))
     ));
-    assert!(tickets.advance(at(8), 8).is_empty());
+    assert_eq!(tickets.advance(at(8), 8), 0);
     assert_eq!(
         tickets.observe(id, context(), at(8)),
         AdmissionTicketObservation::Redeemed
     );
+    assert!(!tickets.revoke_unredeemed(context(), at(8)));
+    assert!(matches!(
+        tickets.redeem(id, context(), at(8)),
+        Ok(AdmissionTicketRedemption::Replayed(receipt)) if receipt == grant.receipt()
+    ));
+    assert!(tickets.close_context(context(), at(8)));
+    assert!(!tickets.close_context(context(), at(8)));
     assert_eq!(
-        tickets.close_context(context(), at(8)),
-        ReservationId::new(1)
+        tickets.observe(id, context(), at(8)),
+        AdmissionTicketObservation::Closed
     );
-    assert!(tickets.close_context(context(), at(8)).is_none());
+    assert_eq!(
+        tickets.redeem(id, context(), at(127)),
+        Err(AdmissionTicketRedemptionRejection::Closed)
+    );
+    assert_eq!(tickets.advance(at(127), 8), 0);
+    assert_eq!(tickets.advance(at(128), 8), 1);
+    assert_eq!(
+        tickets.observe(id, context(), at(128)),
+        AdmissionTicketObservation::Unknown
+    );
+
+    let issued = AcquireQueryContextAdmissionTicket::new(
+        operation(6),
+        context(),
+        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        request.native_compatibility_id(),
+        tickets.capability(),
+    );
+    let next_id = AdmissionTicketId::try_from_bytes([6; 16]).unwrap();
+    tickets.acquire(issued, next_id, at(129)).unwrap();
+    assert_eq!(
+        tickets.observe(next_id, context(), at(134)),
+        AdmissionTicketObservation::Expired
+    );
+    assert_eq!(
+        tickets.redeem(next_id, context(), at(134)),
+        Err(AdmissionTicketRedemptionRejection::Expired)
+    );
+    assert_eq!(
+        tickets.logical_live_grants(),
+        1,
+        "observation and a refused redemption do not retire the original grant"
+    );
+    assert_eq!(
+        tickets.advance(at(134), 8),
+        1,
+        "only policy advancement commits expiration of the original grant"
+    );
+    let oversized_validity = AcquireQueryContextAdmissionTicket::new(
+        operation(7),
+        context(),
+        LeaseValidFor::new(Duration::from_secs(11)).unwrap(),
+        request.native_compatibility_id(),
+        tickets.capability(),
+    );
+    assert_eq!(
+        tickets.acquire(
+            oversized_validity,
+            AdmissionTicketId::try_from_bytes([7; 16]).unwrap(),
+            at(134),
+        ),
+        Err(AdmissionTicketAcquisitionRejection::ValidityExceedsWorkerLimit)
+    );
+}
+
+#[test]
+fn forgotten_admission_cannot_reissue_while_retained_replay_and_recent_capability_stay_usable() {
+    use novarocks_worker_protocol::admission::AdmissionTicketAcquisitionRejection as Rejection;
+    let config =
+        AdmissionTicketConfig::new(Duration::from_secs(10), Duration::from_secs(120)).unwrap();
+    let mut tickets = AdmissionCore::new(config, [1; 8]);
+    let context_for = |query| {
+        QueryContextRef::new(
+            QueryExecutionId::new(QueryId::new(query, query + 1), AttemptId::new(1).unwrap())
+                .unwrap(),
+            context().frontend_process_id(),
+            context().backend_process_id(),
+        )
+    };
+    let request_for = |core: &AdmissionCore, ordinal, context, seconds| {
+        AcquireQueryContextAdmissionTicket::new(
+            operation(ordinal),
+            context,
+            LeaseValidFor::new(Duration::from_secs(seconds)).unwrap(),
+            NativeCompatibilityId::new([3; 32]),
+            core.capability(),
+        )
+    };
+    let old = request_for(&tickets, 41, context_for(41), 1);
+    let old_ticket = AdmissionTicketId::try_from_bytes([41; 16]).unwrap();
+    tickets.acquire(old, old_ticket, at(0)).unwrap();
+    let retained = request_for(&tickets, 42, context_for(42), 10);
+    let retained_ticket = AdmissionTicketId::try_from_bytes([42; 16]).unwrap();
+    let retained_receipt = tickets
+        .acquire(retained, retained_ticket, at(0))
+        .unwrap()
+        .receipt();
+    tickets
+        .redeem(retained_ticket, retained.context(), at(0))
+        .unwrap();
+    let refused = request_for(&tickets, 43, retained.context(), 5);
+    assert_eq!(
+        tickets.acquire(
+            refused,
+            AdmissionTicketId::try_from_bytes([43; 16]).unwrap(),
+            at(0),
+        ),
+        Err(Rejection::ContextAlreadyGranted)
+    );
+    assert_eq!(tickets.advance(at(1), 1), 1);
+    let original_inventory = tickets.retention_inventory();
+    assert_eq!(tickets.logical_live_grants(), 1);
+    assert_eq!(original_inventory.ticket_records, 2);
+    assert_eq!(original_inventory.acquisition_decisions, 3);
+    assert_eq!(original_inventory.replay_decisions, 2);
+    let recent_heartbeat = tickets.capability();
+    assert_eq!(
+        tickets.acquire(
+            refused,
+            AdmissionTicketId::try_from_bytes([99; 16]).unwrap(),
+            at(1),
+        ),
+        Err(Rejection::ContextAlreadyGranted),
+        "later requests cannot replace the retained original refusal"
+    );
+
+    // Two histories expire after the same 120-second replay horizon: the
+    // refusal at t=120, then the expired grant at t=121. No capacity is reserved.
+    let before_forget_epoch = tickets.capability();
+    let before_forget_grants = tickets.logical_live_grants();
+    assert_eq!(tickets.advance(at(120), 1), 1);
+    assert_eq!(tickets.capability(), before_forget_epoch);
+    assert_eq!(tickets.logical_live_grants(), before_forget_grants);
+    let after_forget = tickets.retention_inventory();
+    assert_eq!(after_forget.ticket_records, 2);
+    assert_eq!(after_forget.acquisition_decisions, 2);
+    assert_eq!(after_forget.replay_decisions, 1);
+    assert!(
+        after_forget.metadata_bytes_estimate.unwrap()
+            < original_inventory.metadata_bytes_estimate.unwrap()
+    );
+    assert_eq!(
+        tickets.acquire(
+            refused,
+            AdmissionTicketId::try_from_bytes([96; 16]).unwrap(),
+            at(120),
+        ),
+        Err(Rejection::SealedEpoch),
+        "the original rejected history was actually forgotten"
+    );
+    assert_eq!(tickets.advance(at(121), 1), 1);
+    assert_eq!(tickets.retention_inventory().ticket_records, 1);
+    assert_eq!(tickets.retention_inventory().acquisition_decisions, 1);
+    assert_eq!(tickets.retention_inventory().replay_decisions, 0);
+    assert_eq!(
+        tickets.observe(old_ticket, old.context(), at(121)),
+        AdmissionTicketObservation::Unknown
+    );
+    assert_eq!(
+        tickets.acquire(
+            old,
+            AdmissionTicketId::try_from_bytes([98; 16]).unwrap(),
+            at(121),
+        ),
+        Err(Rejection::SealedEpoch),
+        "forgotten original acquisition cannot obtain another ticket"
+    );
+    let stale_new = AcquireQueryContextAdmissionTicket::new(
+        operation(45),
+        context_for(45),
+        old.valid_for(),
+        old.native_compatibility_id(),
+        old.admission_epoch_capability(),
+    );
+    assert_eq!(
+        tickets.acquire(
+            stale_new,
+            AdmissionTicketId::try_from_bytes([45; 16]).unwrap(),
+            at(121),
+        ),
+        Err(Rejection::SealedEpoch)
+    );
+    assert_eq!(
+        tickets
+            .acquire(
+                retained,
+                AdmissionTicketId::try_from_bytes([97; 16]).unwrap(),
+                at(121),
+            )
+            .unwrap()
+            .receipt(),
+        retained_receipt,
+        "the same old capability still identifies its retained exact decision"
+    );
+    let fresh = AcquireQueryContextAdmissionTicket::new(
+        operation(46),
+        context_for(46),
+        old.valid_for(),
+        old.native_compatibility_id(),
+        recent_heartbeat,
+    );
+    tickets
+        .acquire(
+            fresh,
+            AdmissionTicketId::try_from_bytes([46; 16]).unwrap(),
+            at(121),
+        )
+        .expect("a recent heartbeat remains usable through actual history reclamation");
+
+    // Process composition supplies the new issuer. Pure construction neither
+    // reads randomness nor invents a replacement process on its own.
+    let mut replacement = AdmissionCore::new(config, [2; 8]);
+    assert_eq!(
+        replacement.acquire(
+            fresh,
+            AdmissionTicketId::try_from_bytes([47; 16]).unwrap(),
+            at(121),
+        ),
+        Err(Rejection::SealedEpoch)
+    );
+    let replacement_request = request_for(&replacement, 48, context_for(48), 1);
+    replacement
+        .acquire(
+            replacement_request,
+            AdmissionTicketId::try_from_bytes([48; 16]).unwrap(),
+            at(121),
+        )
+        .expect("the replacement accepts its own original issuer");
 }
 fn status(version: u64) -> TaskStatus {
     TaskStatus::try_new(
@@ -919,6 +1449,7 @@ fn absolute_request_deadline_settles_only_reply_and_keeps_accepted_loader_owned(
     let mut port = Port::default();
     activate(&mut core, &mut port);
     let request = RequestContext {
+        author: model_request_author(InputId::new(1).unwrap()),
         token: InputId::new(1).unwrap(),
         operation: operation(1),
         deadline: at(2),
@@ -984,6 +1515,7 @@ fn a_late_request_never_starts_work_and_same_operation_tokens_share_only_the_cre
         .handle_request(
             at(1),
             RequestContext {
+                author: model_request_author(InputId::new(1).unwrap()),
                 token: InputId::new(1).unwrap(),
                 operation: operation(1),
                 deadline: at(1),
@@ -1001,6 +1533,7 @@ fn a_late_request_never_starts_work_and_same_operation_tokens_share_only_the_cre
         core.handle_request(
             at(1),
             RequestContext {
+                author: model_request_author(InputId::new(token).unwrap()),
                 token: InputId::new(token).unwrap(),
                 operation: operation(1),
                 deadline: at(10),
@@ -1311,6 +1844,7 @@ fn expired_create_replay_checks_the_entity_before_claiming_nothing_was_created()
     activate(&mut core, &mut port);
     create(&mut core, &mut port, 1);
     let request = |token, operation_id| RequestContext {
+        author: model_request_author(InputId::new(token).unwrap()),
         token: InputId::new(token).unwrap(),
         operation: operation(operation_id),
         deadline: at(1),
@@ -1406,6 +1940,7 @@ fn pending_task_close_cuts_do_not_keep_an_unhandled_metric_timer_due() {
         .unwrap();
     }
     let request = RequestContext {
+        author: model_request_author(InputId::new(77).unwrap()),
         token: InputId::new(77).unwrap(),
         operation: operation(8),
         deadline: at(5),
@@ -1553,13 +2088,8 @@ fn control_with_pending_limit(
     use novarocks_worker_protocol::control::{ControlConfig, ControlCore};
     ControlCore::new(
         ControlConfig {
-            max_contexts: 8,
-            max_waiters: 8,
             max_pending_requests,
             step_budget: ControlCore::MAX_STEP_WORK,
-            retained_contexts: 8,
-            gone_fences: 8,
-            retention: Duration::from_secs(10),
         },
         AdmissionTicketConfig::DEFAULT,
         [1; 8],
@@ -1684,6 +2214,7 @@ impl ActiveControlFixture {
             .handle_request(
                 at(0),
                 RequestContext {
+                    author: model_request_author(InputId::new(1).unwrap()),
                     token: InputId::new(1).unwrap(),
                     operation: operation(2),
                     deadline: at(deadline),
@@ -1694,7 +2225,7 @@ impl ActiveControlFixture {
             .unwrap();
         assert!(first.charged_work() <= control.max_step_work());
         assert!(first.requests.is_empty());
-        assert_eq!(port.calls.len(), 2);
+        assert_eq!(port.calls.len(), 1);
         Self {
             control,
             port,
@@ -1712,6 +2243,7 @@ impl ActiveControlFixture {
             .handle_request(
                 at(0),
                 RequestContext {
+                    author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(2),
                     deadline: at(deadline),
@@ -1785,7 +2317,7 @@ impl ActiveControlFixture {
             RequestResult::Outcome(OperationOutcome::Accepted)
         );
         assert!(self.flush().requests.is_empty());
-        assert_eq!(self.port.calls.len(), 2);
+        assert_eq!(self.port.calls.len(), 1);
     }
 }
 
@@ -1952,7 +2484,7 @@ fn same_operation_routed_requests_have_independent_results_and_settle_once() {
         );
     }
     assert!(f.flush().requests.is_empty());
-    assert_eq!(f.port.calls.len(), 2);
+    assert_eq!(f.port.calls.len(), 1);
 }
 
 #[test]
@@ -1969,6 +2501,7 @@ fn a_different_operation_routes_its_own_payload_instead_of_joining_the_directory
         .handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(2).unwrap()),
                 token: InputId::new(2).unwrap(),
                 operation: operation(3),
                 deadline: at(100),
@@ -2044,44 +2577,36 @@ fn a_routed_conflict_does_not_take_or_replace_the_original_creation_success() {
 }
 
 #[test]
-fn existing_routes_share_the_original_pending_request_bound() {
-    let mut f = ActiveControlFixture::new(1, 100);
-    f.reject(
-        2,
-        100,
-        active_establish_input(f.ticket, 2),
-        OperationOutcome::ResourceExhausted,
-    );
-    f.finish_original();
-    let route = f.request(3, 100, active_establish_input(f.ticket, 3));
-    assert_eq!(
-        routed_establish_request(&route).1.request.token,
-        InputId::new(3).unwrap()
-    );
-    f.reject(
-        4,
-        100,
-        active_establish_input(f.ticket, 4),
-        OperationOutcome::ResourceExhausted,
-    );
-    let completed = finish_routed_establish(
-        &mut f.control,
-        &mut f.port,
-        &route,
-        0,
-        0,
-        Ok(OperationOutcome::Idempotent),
-    );
-    assert_eq!(
-        completed.requests[0].request.token,
-        InputId::new(3).unwrap()
-    );
-    let next = f.request(5, 100, active_establish_input(f.ticket, 5));
-    assert_eq!(
-        routed_establish_request(&next).1.request.token,
-        InputId::new(5).unwrap()
-    );
-    assert_eq!(f.port.calls.len(), 2);
+fn existing_routes_share_the_original_r_inventory_and_overflow_is_owner_failure() {
+    use novarocks_worker_protocol::context::CoreError;
+    for materialized in [false, true] {
+        let mut f = ActiveControlFixture::new(1, 100);
+        if materialized {
+            f.finish_original();
+            let route = f.request(3, 100, active_establish_input(f.ticket, 3));
+            assert_eq!(
+                routed_establish_request(&route).1.request.token,
+                InputId::new(3).unwrap()
+            );
+        }
+        let failed = f
+            .control
+            .handle_request(
+                at(0),
+                RequestContext {
+                    author: model_request_author(InputId::new(4).unwrap()),
+                    token: InputId::new(4).unwrap(),
+                    operation: operation(2),
+                    deadline: at(100),
+                },
+                active_establish_input(f.ticket, 4),
+                &mut f.port,
+            )
+            .unwrap_err();
+        assert_eq!(failed, CoreError::IllegalFact);
+        assert_eq!(f.port.calls.len(), 1);
+        // This invalid owner must follow S7; it is not reused as healthy.
+    }
 }
 
 #[test]
@@ -2110,6 +2635,7 @@ fn active_control_shape_dies_with_the_last_waiter_without_revoking_materializati
         .handle_request(
             at(1),
             RequestContext {
+                author: model_request_author(InputId::new(2).unwrap()),
                 token: InputId::new(2).unwrap(),
                 operation: operation(2),
                 deadline: at(100),
@@ -2128,8 +2654,8 @@ fn active_control_shape_dies_with_the_last_waiter_without_revoking_materializati
     );
     assert_eq!(
         f.port.calls.len(),
-        3,
-        "no stale active shape is a permanent decision latch"
+        1,
+        "only the original materialization owns execution work"
     );
     let completed = f
         .control
@@ -2177,6 +2703,7 @@ fn acquire_replay_uses_the_existing_identity_author_and_not_new_driver_coordinat
             .handle_request(
                 at(0),
                 RequestContext {
+                    author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(1),
                     deadline: at(deadline),
@@ -2222,6 +2749,7 @@ fn acquire_replay_uses_the_existing_identity_author_and_not_new_driver_coordinat
             .handle_request(
                 at(0),
                 RequestContext {
+                    author: model_request_author(InputId::new(3 + changed).unwrap()),
                     token: InputId::new(3 + changed).unwrap(),
                     operation: operation(1),
                     deadline: at(100),
@@ -2238,7 +2766,7 @@ fn acquire_replay_uses_the_existing_identity_author_and_not_new_driver_coordinat
             RequestResult::Outcome(OperationOutcome::DomainConflict)
         );
     }
-    assert_eq!(port.calls.len(), 1);
+    assert!(port.calls.is_empty());
 }
 
 #[test]
@@ -2250,6 +2778,7 @@ fn a_new_establish_with_an_unknown_ticket_keeps_the_original_gone_verdict() {
         .handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(1).unwrap()),
                 token: InputId::new(1).unwrap(),
                 operation: operation(2),
                 deadline: at(100),
@@ -2343,6 +2872,52 @@ fn active_establishment_decision() -> ContextEstablishmentDecision {
         )
         .unwrap();
     establishment_decision(&step).1
+}
+fn active_decision_from_original_materialization(
+    step: &novarocks_worker_protocol::control::ControlStep,
+) -> (QueryContextRef, ContextEstablishmentDecision) {
+    use novarocks_worker_protocol::control::ControlEffect;
+    let mut original = step.effects.iter().filter_map(|effect| match effect {
+        ControlEffect::Materialize {
+            context,
+            generation,
+            establishment,
+            ..
+        } => Some((*context, *generation, *establishment)),
+        _ => None,
+    });
+    let (identity, generation, establishment) =
+        original.next().expect("the original Materialize handoff");
+    assert!(
+        original.next().is_none(),
+        "one Context per original handoff"
+    );
+    let mut core = core_from_original_establishment(identity, generation, establishment, 1, 1);
+    let completed = core
+        .handle(
+            at(0),
+            ContextInput::MaterializationFinished {
+                result: Ok(ContextMaterialized {
+                    initial_credential_resource: 101,
+                }),
+            },
+            &mut Port::default(),
+        )
+        .unwrap();
+    let mut decisions = completed.effects.iter().filter_map(|effect| match effect {
+        ContextEffect::EstablishmentDecided {
+            context, decision, ..
+        } => {
+            assert_eq!(*context, identity);
+            Some(decision.clone())
+        }
+        _ => None,
+    });
+    let decision = decisions
+        .next()
+        .expect("the same original Context decided materialization");
+    assert!(decisions.next().is_none());
+    (identity, decision)
 }
 fn closed_establishment_decision(
     state: QueryContextState,
@@ -2905,6 +3480,7 @@ fn establish_reply_expiry_does_not_undo_the_redeemed_ticket_or_context_materiali
         .handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(1).unwrap()),
                 token: InputId::new(1).unwrap(),
                 operation: operation(2),
                 deadline: at(1),
@@ -2946,7 +3522,7 @@ fn establish_reply_expiry_does_not_undo_the_redeemed_ticket_or_context_materiali
         .unwrap();
     assert_eq!(control.route(context()), QueryContextState::Active);
     assert!(materialized.requests.is_empty());
-    assert_eq!(port.calls.len(), 2);
+    assert_eq!(port.calls.len(), 1);
 }
 #[test]
 fn frontend_fence_blocks_late_materialization_and_new_entity_routing() {
@@ -2998,7 +3574,7 @@ fn frontend_fence_blocks_late_materialization_and_new_entity_routing() {
         completed.requests[0].result,
         RequestResult::Outcome(OperationOutcome::InvalidStateOrRequest)
     );
-    assert_eq!(f.port.calls.len(), 2);
+    assert_eq!(f.port.calls.len(), 1);
 }
 #[test]
 fn covered_reconnect_positions_validate_convergence_and_skip_known_context_receipt() {
@@ -3267,11 +3843,13 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
             )
             .unwrap();
         assert_eq!(core.task(task(1)).unwrap().conclusion.accepted, Some(first));
-        assert!(has_verdict(
+        assert_context_acknowledgement(
             &a_applied.requests,
             port.request_token(operation(5)),
-            OperationOutcome::Accepted
-        ));
+            OperationOutcome::Accepted,
+            QueryContextState::Aborting,
+            Some(AbortCause::QueryFailed),
+        );
         assert!(!core.task(task(1)).unwrap().loader_exited);
         assert!(!core.task(task(1)).unwrap().actual_stopped);
         let replay = core
@@ -3461,11 +4039,13 @@ fn an_applied_close_waits_for_core_consumption_but_not_the_failure_sources_actua
         task: task(1),
         source: SourceId(17)
     }));
-    assert!(has_verdict(
+    assert_context_acknowledgement(
         &closed.requests,
         port.request_token(operation(5)),
-        OperationOutcome::Accepted
-    ));
+        OperationOutcome::Accepted,
+        QueryContextState::Aborting,
+        Some(AbortCause::QueryFailed),
+    );
     assert!(!core.task(task(1)).unwrap().actual_stopped);
     assert!(!core.task(task(1)).unwrap().resources_converged);
 }
@@ -3479,6 +4059,7 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
     core.handle_request(
         at(0),
         RequestContext {
+            author: model_request_author(InputId::new(1).unwrap()),
             token: InputId::new(1).unwrap(),
             operation: operation(4),
             deadline: at(1000),
@@ -3499,6 +4080,7 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
             .handle_request(
                 at(now),
                 RequestContext {
+                    author: model_request_author(token),
                     token,
                     operation: op,
                     deadline: at(now + 1),
@@ -3532,6 +4114,7 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
         .handle_request(
             at(100),
             RequestContext {
+                author: model_request_author(InputId::new(100).unwrap()),
                 token: InputId::new(100).unwrap(),
                 operation: operation(200),
                 deadline: at(1000),
@@ -3587,6 +4170,7 @@ fn expired_creation_reply_positions_do_not_fill_the_waiter_bound_or_cancel_the_l
     core.handle_request(
         at(0),
         RequestContext {
+            author: model_request_author(InputId::new(1).unwrap()),
             token: InputId::new(1).unwrap(),
             operation: operation(1),
             deadline: at(1),
@@ -3606,6 +4190,7 @@ fn expired_creation_reply_positions_do_not_fill_the_waiter_bound_or_cancel_the_l
             .handle_request(
                 at(now),
                 RequestContext {
+                    author: model_request_author(InputId::new(u64::from(n) + 2).unwrap()),
                     token: InputId::new(u64::from(n) + 2).unwrap(),
                     operation: op,
                     deadline: at(now + 1),
@@ -3626,6 +4211,7 @@ fn expired_creation_reply_positions_do_not_fill_the_waiter_bound_or_cancel_the_l
     core.handle_request(
         at(20),
         RequestContext {
+            author: model_request_author(InputId::new(100).unwrap()),
             token: InputId::new(100).unwrap(),
             operation: operation(50),
             deadline: at(25),
@@ -3677,6 +4263,7 @@ fn expired_establish_routes_do_not_fill_the_request_bound_or_revoke_materializat
             .handle_request(
                 at(now),
                 RequestContext {
+                    author: model_request_author(InputId::new(n + 2).unwrap()),
                     token: InputId::new(n + 2).unwrap(),
                     operation: operation(2),
                     deadline: at(now + 1),
@@ -3703,6 +4290,7 @@ fn expired_establish_routes_do_not_fill_the_request_bound_or_revoke_materializat
         .handle_request(
             at(20),
             RequestContext {
+                author: model_request_author(InputId::new(100).unwrap()),
                 token: InputId::new(100).unwrap(),
                 operation: operation(2),
                 deadline: at(100),
@@ -3740,7 +4328,7 @@ fn expired_establish_routes_do_not_fill_the_request_bound_or_revoke_materializat
         RequestResult::Outcome(OperationOutcome::Idempotent)
     );
     assert_eq!(f.control.route(context()), QueryContextState::Active);
-    assert_eq!(f.port.calls.len(), 2);
+    assert_eq!(f.port.calls.len(), 1);
 }
 #[test]
 fn a_creation_wait_position_survives_until_its_last_real_reply_token_exits() {
@@ -3751,6 +4339,7 @@ fn a_creation_wait_position_survives_until_its_last_real_reply_token_exits() {
         core.handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(token).unwrap()),
                 token: InputId::new(token).unwrap(),
                 operation: operation(1),
                 deadline: at(deadline),
@@ -3790,7 +4379,7 @@ fn a_creation_wait_position_survives_until_its_last_real_reply_token_exits() {
     assert!(core.task(task(1)).unwrap().waiting_replies.is_empty());
     assert_eq!(port.calls.len(), 2);
 }
-fn inbound_refusal() -> AdmissionRefusal {
+fn typed_resource_refusal() -> AdmissionRefusal {
     use novarocks_execution_contract::{
         OperationDomainFailure, SafeDetail,
         failure::{
@@ -3817,14 +4406,14 @@ fn inbound_refusal() -> AdmissionRefusal {
         DomainFailureOutcome::ResourceExhausted,
         OperationDomainFailure::new(
             fact,
-            SafeDetail::truncating("inbound normal-close byte capacity exhausted"),
+            SafeDetail::truncating("original typed resource refusal"),
         ),
     )
 }
 #[test]
-fn inbound_typed_admission_refusal_survives_loader_exit_and_exact_entity_replay() {
+fn typed_admission_refusal_survives_loader_exit_and_exact_entity_replay() {
     use novarocks_worker_protocol::context::DomainRefusal;
-    let refusal = inbound_refusal();
+    let refusal = typed_resource_refusal();
     let AdmissionRefusal::Domain(outcome, failure) = refusal.clone() else {
         unreachable!();
     };
@@ -3835,6 +4424,7 @@ fn inbound_typed_admission_refusal_survives_loader_exit_and_exact_entity_replay(
     core.handle_request(
         at(0),
         RequestContext {
+            author: model_request_author(InputId::new(1).unwrap()),
             token: InputId::new(1).unwrap(),
             operation: operation(1),
             deadline: at(100),
@@ -3905,6 +4495,7 @@ fn inbound_typed_admission_refusal_survives_loader_exit_and_exact_entity_replay(
             .handle_request(
                 at(3),
                 RequestContext {
+                    author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(op),
                     deadline: at(deadline),
@@ -3944,7 +4535,7 @@ fn inbound_typed_admission_refusal_survives_loader_exit_and_exact_entity_replay(
 }
 #[test]
 fn typed_loader_failure_and_active_task_capacity_failure_preserve_their_domain_body() {
-    let refusal = inbound_refusal();
+    let refusal = typed_resource_refusal();
     let mut core = core(8, 2);
     let mut port = Port::default();
     activate(&mut core, &mut port);
@@ -3988,58 +4579,6 @@ fn typed_loader_failure_and_active_task_capacity_failure_preserve_their_domain_b
     );
 }
 #[test]
-fn typed_ticket_capacity_refusal_is_replayed_without_losing_its_failure_facts() {
-    use novarocks_worker_protocol::control::{ControlEffect, ControlInput, ControlReplyBody};
-    let refusal = inbound_refusal();
-    let mut control = control();
-    let mut port = Port {
-        typed_reject: Some(refusal.clone()),
-        ..Port::default()
-    };
-    let request = AcquireQueryContextAdmissionTicket::new(
-        operation(1),
-        context(),
-        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
-        NativeCompatibilityId::new([3; 32]),
-        control.admission().capability(),
-    );
-    let ticket = AdmissionTicketId::try_from_bytes([4; 16]).unwrap();
-    for token in 1..=2 {
-        let step = control
-            .handle_request(
-                at(0),
-                RequestContext {
-                    token: InputId::new(token).unwrap(),
-                    operation: operation(1),
-                    deadline: at(100),
-                },
-                ControlInput::Acquire { request, ticket },
-                &mut port,
-            )
-            .unwrap();
-        assert!(
-            matches!(&step.effects[0], ControlEffect::DomainFailureReply { refusal: value, .. } if value.outcome.outcome() == refusal.outcome() && Some(&value.failure) == match &refusal { AdmissionRefusal::Domain(_, failure) => Some(failure), _ => None })
-        );
-        assert_eq!(
-            step.requests[0].result,
-            RequestResult::Outcome(refusal.outcome())
-        );
-        let AdmissionRefusal::Domain(outcome, failure) = &refusal else {
-            unreachable!()
-        };
-        assert_eq!(
-            step.requests[0].body,
-            ControlReplyBody::Domain(novarocks_worker_protocol::context::DomainRefusal {
-                outcome: *outcome,
-                failure: failure.clone()
-            })
-        );
-        assert_eq!(step.requests[0].request.token, InputId::new(token).unwrap());
-        port.typed_reject = None;
-    }
-    assert_eq!(port.calls.len(), 1);
-}
-#[test]
 fn every_control_reply_carries_its_original_body_when_a_later_decision_reuses_the_operation() {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput, ControlReplyBody};
     let mut control = control();
@@ -4055,6 +4594,7 @@ fn every_control_reply_carries_its_original_body_when_a_later_decision_reuses_th
         .handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(1).unwrap()),
                 token: InputId::new(1).unwrap(),
                 operation: operation(1),
                 deadline: at(100),
@@ -4090,6 +4630,7 @@ fn every_control_reply_carries_its_original_body_when_a_later_decision_reuses_th
         .handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(2).unwrap()),
                 token: InputId::new(2).unwrap(),
                 operation: operation(1),
                 deadline: at(100),
@@ -4111,7 +4652,7 @@ fn every_control_reply_carries_its_original_body_when_a_later_decision_reuses_th
     );
     assert!(first.requests[0].body.matches(first.requests[0].result));
     assert!(next.requests[0].body.matches(next.requests[0].result));
-    assert_eq!(port.calls.len(), 1);
+    assert!(port.calls.is_empty());
 }
 #[test]
 fn a_single_task_byte_refusal_keeps_precedence_over_a_full_preparation_position() {
@@ -4149,7 +4690,7 @@ fn a_single_task_byte_refusal_keeps_precedence_over_a_full_preparation_position(
 #[test]
 fn typed_context_materialization_capacity_refusal_keeps_its_failure_projection() {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
-    let refusal = inbound_refusal();
+    let refusal = typed_resource_refusal();
     let mut control = control();
     let mut port = Port::default();
     let ticket = grant(&mut control, &mut port);
@@ -4158,6 +4699,7 @@ fn typed_context_materialization_capacity_refusal_keeps_its_failure_projection()
         .handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(1).unwrap()),
                 token: InputId::new(1).unwrap(),
                 operation: operation(2),
                 deadline: at(100),
@@ -4230,6 +4772,7 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
             .handle_request(
                 at(0),
                 RequestContext {
+                    author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(op),
                     deadline: at(100),
@@ -4247,6 +4790,7 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
         .handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(20).unwrap()),
                 token: InputId::new(20).unwrap(),
                 operation: operation(3),
                 deadline: at(100),
@@ -4263,6 +4807,7 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
         .handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(30).unwrap()),
                 token: InputId::new(30).unwrap(),
                 operation: operation(4),
                 deadline: at(100),
@@ -4343,6 +4888,7 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
             .handle_request(
                 at(0),
                 RequestContext {
+                    author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(op),
                     deadline: at(100),
@@ -4360,6 +4906,7 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
         semantics: semantics(),
         generation: Generation::new(1).unwrap(),
     };
+    let mut materializations = Vec::new();
     for (token, op, identity, ticket, payload) in [
         (20, 3, context(), ticket_a, 1),
         (10, 4, second, ticket_b, 2),
@@ -4368,6 +4915,7 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
             .handle_request(
                 at(0),
                 RequestContext {
+                    author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(op),
                     deadline: at(100),
@@ -4377,11 +4925,13 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
             )
             .unwrap();
         assert!(step.requests.is_empty());
+        materializations.push(active_decision_from_original_materialization(&step));
     }
     let duplicate = control
         .handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(20).unwrap()),
                 token: InputId::new(20).unwrap(),
                 operation: operation(5),
                 deadline: at(100),
@@ -4395,6 +4945,7 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
         .handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(30).unwrap()),
                 token: InputId::new(30).unwrap(),
                 operation: operation(6),
                 deadline: at(100),
@@ -4406,18 +4957,18 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
     assert_eq!(mismatch, CoreError::WrongIdentity);
     assert_eq!(
         port.calls.len(),
-        4,
-        "two distinct actual context roles were admitted"
+        2,
+        "two distinct actual context materialization roles were admitted"
     );
     let mut replies = Vec::new();
-    for identity in [context(), second] {
+    for (identity, decision) in materializations {
         replies.extend(
             control
                 .handle(
                     at(0),
                     ControlInput::EstablishmentDecided {
                         context: identity,
-                        decision: active_establishment_decision(),
+                        decision,
                     },
                     &mut port,
                 )
@@ -4443,159 +4994,218 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
 }
 
 #[test]
-fn physically_retained_context_returns_the_active_ticket_before_metadata_eviction() {
+fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata_neutral() {
+    use novarocks_control_runtime_core::identity::ActorId;
     use novarocks_worker_protocol::control::{
         ControlConfig, ControlCore, ControlEffect, ControlInput,
     };
-    let mut control = ControlCore::new(
-        ControlConfig {
-            max_contexts: 3,
-            max_waiters: 8,
-            max_pending_requests: 16,
-            step_budget: ControlCore::MAX_STEP_WORK,
-            retained_contexts: 2,
-            gone_fences: 3,
-            retention: Duration::from_secs(10),
+    use novarocks_worker_protocol::retention::ContextRetirementIdentity;
+    // These are explicit pure caller facts, never runtime failure authority.
+    for retirement in [
+        ContextRetirementIdentity::Protocol {
+            close_epoch: Generation::new(2).unwrap(),
         },
-        AdmissionTicketConfig::new(1, Duration::from_secs(10), Duration::from_secs(120), 8)
-            .unwrap(),
-        [1; 8],
-        at(0),
-    )
-    .unwrap();
-    let mut port = Port::default();
-    let ticket = grant(&mut control, &mut port);
-    control
-        .handle(
+        ContextRetirementIdentity::OwnerFailure {
+            actor: ActorId::new(77).unwrap(),
+            initial_epoch: Generation::new(1).unwrap(),
+            failed_epoch: Generation::new(2).unwrap(),
+        },
+    ] {
+        let mut control = ControlCore::new(
+            ControlConfig {
+                max_pending_requests: 16,
+                step_budget: ControlCore::MAX_STEP_WORK,
+            },
+            AdmissionTicketConfig::new(Duration::from_secs(10), Duration::from_secs(120)).unwrap(),
+            [1; 8],
             at(0),
-            ControlInput::Establish {
-                request: operation(2),
-                context: context(),
-                ticket,
-                payload: PayloadId(1),
-                semantics: semantics(),
-                generation: Generation::new(1).unwrap(),
+        )
+        .unwrap();
+        let mut port = Port {
+            typed_reject: Some(typed_resource_refusal()),
+            ..Port::default()
+        };
+        let ticket = grant(&mut control, &mut port);
+        assert!(port.calls.is_empty());
+        port.typed_reject = None;
+        control
+            .handle(
+                at(0),
+                ControlInput::Establish {
+                    request: operation(2),
+                    context: context(),
+                    ticket,
+                    payload: PayloadId(1),
+                    semantics: semantics(),
+                    generation: Generation::new(1).unwrap(),
+                },
+                &mut port,
+            )
+            .unwrap();
+        control
+            .handle(
+                at(1),
+                ControlInput::EstablishmentDecided {
+                    context: context(),
+                    decision: active_establishment_decision(),
+                },
+                &mut port,
+            )
+            .unwrap();
+        let revoked = control
+            .handle(
+                at(1),
+                ControlInput::RevokeTicket { context: context() },
+                &mut port,
+            )
+            .unwrap();
+        assert!(
+            revoked.effects.is_empty(),
+            "closing external admission cannot release a live redeemed context"
+        );
+        assert_eq!(
+            control.admission().observe(ticket, context(), at(1)),
+            AdmissionTicketObservation::Redeemed
+        );
+        assert_eq!(
+            control
+                .handle(
+                    at(1),
+                    ControlInput::ExecutionRetired {
+                        context: context(),
+                        retirement: ContextRetirementIdentity::OwnerFailure {
+                            actor: ActorId::new(77).unwrap(),
+                            initial_epoch: Generation::new(2).unwrap(),
+                            failed_epoch: Generation::new(2).unwrap(),
+                        },
+                    },
+                    &mut port,
+                )
+                .unwrap_err(),
+            novarocks_worker_protocol::context::CoreError::IllegalFact,
+            "a neutral failure identity must advance its actual initial epoch"
+        );
+        let retained = control
+            .handle(
+                at(1),
+                ControlInput::ExecutionRetired {
+                    context: context(),
+                    retirement,
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert_eq!(retained.effects.iter().filter(|effect| matches!(effect,
+        ControlEffect::RetireReservation(original) if *original == ReservationId::new(1).unwrap()
+    )).count(), 1, "the real execution receipt retires the original bootstrap Work exactly once");
+        assert_eq!(
+            control.admission().observe(ticket, context(), at(1)),
+            AdmissionTicketObservation::Closed
+        );
+        let conflicting = match retirement {
+            ContextRetirementIdentity::Protocol { .. } => ContextRetirementIdentity::OwnerFailure {
+                actor: ActorId::new(77).unwrap(),
+                initial_epoch: Generation::new(1).unwrap(),
+                failed_epoch: Generation::new(2).unwrap(),
             },
-            &mut port,
-        )
-        .unwrap();
-    control
-        .handle(
-            at(1),
-            ControlInput::EstablishmentDecided {
-                context: context(),
-                decision: active_establishment_decision(),
+            ContextRetirementIdentity::OwnerFailure { .. } => ContextRetirementIdentity::Protocol {
+                close_epoch: Generation::new(2).unwrap(),
             },
-            &mut port,
-        )
-        .unwrap();
-    let revoked = control
-        .handle(
-            at(1),
-            ControlInput::RevokeTicket { context: context() },
-            &mut port,
-        )
-        .unwrap();
-    assert!(
-        revoked.effects.is_empty(),
-        "closing external admission cannot release a live redeemed context"
-    );
-    assert_eq!(
-        control.admission().observe(ticket, context(), at(1)),
-        AdmissionTicketObservation::Redeemed
-    );
-    let retained = control
-        .handle(
-            at(1),
-            ControlInput::Retained {
-                context: context(),
-                normal_close: false,
-            },
-            &mut port,
-        )
-        .unwrap();
-    assert!(
-        retained.effects.contains(&ControlEffect::RetireReservation(
-            ReservationId::new(1).unwrap()
-        )),
-        "the converged context's active ticket cannot be held throughout metadata retention"
-    );
-    assert_eq!(
-        control.admission().observe(ticket, context(), at(1)),
-        AdmissionTicketObservation::Closed
-    );
-    let replay = control
-        .handle(
-            at(1),
-            ControlInput::Retained {
-                context: context(),
-                normal_close: false,
-            },
-            &mut port,
-        )
-        .unwrap();
-    assert!(
-        replay.effects.is_empty(),
-        "the original physical receipt neither double-releases nor extends retention"
-    );
-    let c = context();
-    let next = QueryContextRef::new(
-        QueryExecutionId::new(QueryId::new(7203, 7204), AttemptId::new(1).unwrap()).unwrap(),
-        c.frontend_process_id(),
-        c.backend_process_id(),
-    );
-    let next_ticket = AdmissionTicketId::try_from_bytes([5; 16]).unwrap();
-    let request = AcquireQueryContextAdmissionTicket::new(
-        operation(3),
-        next,
-        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
-        NativeCompatibilityId::new([3; 32]),
-        control.admission().capability(),
-    );
-    let acquired = control
-        .handle(
-            at(1),
-            ControlInput::Acquire {
-                request,
-                ticket: next_ticket,
-            },
-            &mut port,
-        )
-        .unwrap();
-    assert!(acquired.effects.iter().any(|effect| matches!(effect,
+        };
+        assert_eq!(
+            control
+                .handle(
+                    at(1),
+                    ControlInput::ExecutionRetired {
+                        context: context(),
+                        retirement: conflicting,
+                    },
+                    &mut port,
+                )
+                .unwrap_err(),
+            novarocks_worker_protocol::context::CoreError::IllegalFact,
+            "retirement provenance cannot change after its first original fact"
+        );
+        let replay = control
+            .handle(
+                at(1),
+                ControlInput::ExecutionRetired {
+                    context: context(),
+                    retirement,
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(
+            replay.effects.is_empty(),
+            "the original physical receipt neither double-releases nor extends retention"
+        );
+        let c = context();
+        let next = QueryContextRef::new(
+            QueryExecutionId::new(QueryId::new(7203, 7204), AttemptId::new(1).unwrap()).unwrap(),
+            c.frontend_process_id(),
+            c.backend_process_id(),
+        );
+        let next_ticket = AdmissionTicketId::try_from_bytes([5; 16]).unwrap();
+        let request = AcquireQueryContextAdmissionTicket::new(
+            operation(3),
+            next,
+            LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+            NativeCompatibilityId::new([3; 32]),
+            control.admission().capability(),
+        );
+        let acquired = control
+            .handle(
+                at(1),
+                ControlInput::Acquire {
+                    request,
+                    ticket: next_ticket,
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(acquired.effects.iter().any(|effect| matches!(effect,
         ControlEffect::AdmissionReply { result: Ok(receipt), .. } if receipt.ticket_id() == next_ticket)));
-    let revoked = control
-        .handle(
-            at(1),
-            ControlInput::RevokeTicket { context: next },
-            &mut port,
-        )
-        .unwrap();
-    assert_eq!(
-        revoked.effects,
-        vec![ControlEffect::RetireReservation(
-            ReservationId::new(3).unwrap()
-        )]
-    );
-    assert_eq!(
-        control.admission().observe(next_ticket, next, at(1)),
-        AdmissionTicketObservation::Closed
-    );
-    let removed = control
-        .handle(at(2), ControlInput::HostRemoved { context: c }, &mut port)
-        .unwrap();
-    assert_eq!(
-        removed.effects,
-        vec![
-            ControlEffect::Route {
+        let revoked = control
+            .handle(
+                at(1),
+                ControlInput::RevokeTicket { context: next },
+                &mut port,
+            )
+            .unwrap();
+        assert!(revoked.effects.is_empty());
+        assert_eq!(
+            control.admission().observe(next_ticket, next, at(1)),
+            AdmissionTicketObservation::Closed
+        );
+        let expiry = control
+            .handle(
+                at(121),
+                ControlInput::ContextExpired {
+                    context: c,
+                    retirement,
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(
+            expiry
+                .effects
+                .contains(&ControlEffect::RemoveHost { context: c })
+        );
+        let removed = control
+            .handle(at(121), ControlInput::HostRemoved { context: c }, &mut port)
+            .unwrap();
+        assert_eq!(
+            removed.effects,
+            vec![ControlEffect::Route {
                 context: c,
                 state: QueryContextState::Gone,
                 generation: Generation::new(1).unwrap(),
-            },
-            ControlEffect::RetireReservation(ReservationId::new(2).unwrap()),
-        ]
-    );
-    assert_eq!(control.route(c), QueryContextState::Gone);
+            },]
+        );
+        assert_eq!(control.route(c), QueryContextState::Absent);
+    }
 }
 
 #[test]
@@ -4937,6 +5547,7 @@ fn successful_root_production_waits_for_output_and_drain_reply_follows_the_termi
         .handle_root_end_acknowledged(
             at(0),
             RequestContext {
+                author: model_request_author(token),
                 token,
                 operation: operation(10),
                 deadline: at(0),
@@ -5472,6 +6083,7 @@ fn a_root_drain_applies_its_positive_output_before_finishing_a_buffered_peer_abo
         .handle_root_end_acknowledged(
             at(0),
             RequestContext {
+                author: model_request_author(token),
                 token,
                 operation: operation(10),
                 deadline: at(0),
@@ -5528,13 +6140,24 @@ fn one_finish_with_output_event_preserves_its_causal_failure_source_and_positive
     assert_eq!(record.conclusion.source, Some(SourceId(77)));
     assert!(record.published.output().responsibility_complete());
     assert!(!record.actual_stopped && !record.resources_converged && !record.output_released);
-    assert!(matches!(
-        finish.effects.last(),
-        Some(ContextEffect::PublishTask {
-            state: TaskState::Failed,
-            ..
+    let published = finish.effects.iter().position(|effect| matches!(effect,
+        ContextEffect::PublishTask { task: original, state: TaskState::Failed, snapshot, .. }
+            if *original == task(1) && *snapshot == record.published
+    )).expect("the original failure and output are published together");
+    let finalized = finish
+        .effects
+        .iter()
+        .position(|effect| {
+            matches!(effect,
+                ContextEffect::FinalizeTaskExecution { task: original, normally_stopped: false }
+                    if *original == task(1)
+            )
         })
-    ));
+        .expect("the same failed Task still owes real execution finalization");
+    assert!(
+        published < finalized,
+        "terminal publication precedes actual execution finalization"
+    );
     completion_step(
         &mut core,
         &mut port,
@@ -5866,6 +6489,7 @@ fn selector_establish(
         .handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(u64::from(base) * 10 + 1).unwrap()),
                 token: InputId::new(u64::from(base) * 10 + 1).unwrap(),
                 operation: operation(base + 1),
                 deadline: at(100),
@@ -5900,6 +6524,7 @@ fn next_internal_fairly_services_fences_and_due_maintenance_without_taking_route
             .handle_request(
                 at(0),
                 RequestContext {
+                    author: model_request_author(InputId::new(u64::from(base) * 10 + 2).unwrap()),
                     token: InputId::new(u64::from(base) * 10 + 2).unwrap(),
                     operation: operation(base + 1),
                     deadline: at(100),
@@ -5928,7 +6553,8 @@ fn next_internal_fairly_services_fences_and_due_maintenance_without_taking_route
         )
         .unwrap();
     selector_grant(&mut control, &mut port, selector_context(8301, 2), 30, 1);
-    let due_reservation = ReservationId::new(port.next).unwrap();
+    let initial_live_grants = control.admission().logical_live_grants();
+    let mut expiration_position = None;
     let calls = port.calls.len();
     let mut steps = Vec::new();
     for _ in 0..16 {
@@ -5943,15 +6569,17 @@ fn next_internal_fairly_services_fences_and_due_maintenance_without_taking_route
             next.requests.is_empty(),
             "the selector cannot decide a pending routed R"
         );
+        if control.admission().logical_live_grants() < initial_live_grants {
+            expiration_position.get_or_insert(steps.len());
+        }
         steps.push(next);
         if !control.has_internal_work() {
             break;
         }
     }
     assert!(!control.has_internal_work());
-    let retire_position=steps.iter().position(|step|step.effects.iter().any(|effect|matches!(effect,ControlEffect::RetireReservation(id) if *id==due_reservation))).unwrap();
     assert!(
-        retire_position < 4,
+        expiration_position.expect("the original ticket expiration was committed") < 4,
         "due maintenance gets a turn while the fence still has members"
     );
     for identity in contexts {
@@ -6029,10 +6657,11 @@ fn next_internal_serializes_two_frontend_fences_without_restarting_duplicates() 
         selector_context(9201, 3),
         selector_context(9301, 4),
     ];
+    let mut materializations = Vec::new();
     for (i, context) in contexts.into_iter().enumerate() {
         let base = 40 + i as u8 * 3;
         let ticket = selector_grant(&mut control, &mut port, context, base, 5);
-        control
+        let original = control
             .handle(
                 at(0),
                 ControlInput::Establish {
@@ -6046,6 +6675,7 @@ fn next_internal_serializes_two_frontend_fences_without_restarting_duplicates() 
                 &mut port,
             )
             .unwrap();
+        materializations.push(active_decision_from_original_materialization(&original));
     }
     // Both ordinary FE loss facts can arrive before the first scan starts.
     for frontend in [
@@ -6083,7 +6713,7 @@ fn next_internal_serializes_two_frontend_fences_without_restarting_duplicates() 
         effects.extend(step.effects);
     }
     assert!(!control.has_internal_work());
-    for (i, context) in contexts.into_iter().enumerate() {
+    for (i, (context, decision)) in materializations.into_iter().enumerate() {
         assert_eq!(control.route(context), QueryContextState::Aborting);
         assert_eq!(
             effects
@@ -6098,10 +6728,7 @@ fn next_internal_serializes_two_frontend_fences_without_restarting_duplicates() 
         let materialized = control
             .handle(
                 at(0),
-                ControlInput::EstablishmentDecided {
-                    context,
-                    decision: active_establishment_decision(),
-                },
+                ControlInput::EstablishmentDecided { context, decision },
                 &mut port,
             )
             .unwrap();
@@ -6142,19 +6769,14 @@ fn next_internal_serializes_two_frontend_fences_without_restarting_duplicates() 
 }
 
 #[test]
-fn next_internal_empty_frontend_fences_each_take_one_step_and_preserve_the_fence_bound() {
+fn next_internal_empty_frontend_fences_each_take_one_step_without_a_global_fence_cap() {
     use novarocks_worker_protocol::control::{
         ControlConfig, ControlCore, ControlEffect, ControlInput,
     };
     let mut control = ControlCore::new(
         ControlConfig {
-            max_contexts: 2,
-            max_waiters: 2,
             max_pending_requests: 2,
             step_budget: ControlCore::MAX_STEP_WORK,
-            retained_contexts: 2,
-            gone_fences: 2,
-            retention: Duration::from_secs(10),
         },
         AdmissionTicketConfig::DEFAULT,
         [1; 8],
@@ -6195,20 +6817,23 @@ fn next_internal_empty_frontend_fences_each_take_one_step_and_preserve_the_fence
         .unwrap();
     assert!(duplicate.effects.is_empty());
     assert!(!control.has_internal_work());
-    assert_eq!(
-        control
-            .handle(
-                at(0),
-                ControlInput::FenceFrontend {
-                    frontend: frontends[2]
-                },
-                &mut port
-            )
-            .unwrap_err(),
-        novarocks_worker_protocol::context::CoreError::InvalidConfiguration
-    );
+    let third = control
+        .handle(
+            at(0),
+            ControlInput::FenceFrontend {
+                frontend: frontends[2],
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(third.effects, vec![ControlEffect::ContinueFence]);
+    let finished = control
+        .handle(at(0), ControlInput::NextInternal, &mut port)
+        .unwrap();
+    assert!(finished.effects.is_empty());
+    assert!(!control.has_internal_work());
     assert!(port.calls.is_empty());
-    for step in [first, second, duplicate] {
+    for step in [first, second, duplicate, third, finished] {
         assert!(step.charged_work() <= control.max_step_work());
     }
 }
@@ -6571,16 +7196,23 @@ fn late_materialization_error_reports_actual_releasing_or_terminal_state_without
             context_core
                 .handle(at(0), ContextInput::HostReleased, &mut f.port)
                 .unwrap();
-            f.control
+            assert!(!context_core.is_compact_retained());
+            let rejected = context_core
                 .handle(
                     at(0),
-                    ControlInput::Retained {
+                    ContextInput::ExecutionCustodyRetired {
                         context: context(),
-                        normal_close: false,
+                        close_epoch: context_core.generation(),
+                        origin: RetentionOrigin::new(at(0), RequestHorizon::DEFAULT),
                     },
                     &mut f.port,
                 )
-                .unwrap();
+                .unwrap_err();
+            assert_eq!(
+                rejected,
+                novarocks_worker_protocol::context::CoreError::IllegalFact,
+                "HostReleased cannot invent the original unfinished M decision"
+            );
         }
         let error = context_core
             .handle(
@@ -6625,18 +7257,29 @@ fn late_materialization_error_reports_actual_releasing_or_terminal_state_without
 }
 
 #[test]
-fn context_bootstrap_failure_keeps_the_original_reply_and_a_pending_route_is_independent() {
+fn original_context_materialization_failure_keeps_its_reply_and_a_pending_route_is_independent() {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput, ControlReplyBody};
     let mut f = ActiveControlFixture::new(4, 100);
     let route = f.request(2, 100, active_establish_input(f.ticket, 2));
     let calls = f.port.calls.len();
+    let mut context_core = core(1, 1);
+    let original_m = context_core
+        .handle(
+            at(0),
+            ContextInput::MaterializationFinished {
+                result: Err(materialization_refusal()),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    let decision = establishment_decision(&original_m).1;
     let failure = f
         .control
         .handle(
             at(0),
-            ControlInput::ContextBootstrapFailed {
+            ControlInput::EstablishmentDecided {
                 context: context(),
-                refusal: materialization_refusal(),
+                decision: decision.clone(),
             },
             &mut f.port,
         )
@@ -6648,9 +7291,9 @@ fn context_bootstrap_failure_keeps_the_original_reply_and_a_pending_route_is_ind
         .control
         .handle(
             at(0),
-            ControlInput::ContextBootstrapFailed {
+            ControlInput::EstablishmentDecided {
                 context: context(),
-                refusal: OperationOutcome::ResourceExhausted.into(),
+                decision,
             },
             &mut f.port,
         )
@@ -6719,10 +7362,10 @@ fn a_routed_typed_decision_keeps_its_own_time_without_reusing_the_creation_body(
 }
 
 #[test]
-fn terminal_establishment_and_retained_use_one_original_retirement_and_one_ttl_in_either_order() {
+fn original_context_expiry_and_execution_retirement_keep_one_horizon_in_either_root_order() {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
-    for retained_first in [false, true] {
-        let mut f = ActiveControlFixture::new(4, 100);
+    for execution_first in [false, true] {
+        let mut f = ActiveControlFixture::new(4, 200);
         let mut context_core = core(1, 1);
         release_while_materialization_is_outstanding(&mut context_core, &mut f.port);
         context_core
@@ -6738,75 +7381,145 @@ fn terminal_establishment_and_retained_use_one_original_retirement_and_one_ttl_i
             )
             .unwrap();
         let decision = establishment_decision(&finished).1;
-        assert_eq!(decision.state, QueryContextState::TerminalRetained);
+        let close_epoch = context_core.generation();
+        let compact = context_core
+            .handle(
+                at(1),
+                ContextInput::ExecutionCustodyRetired {
+                    context: context(),
+                    close_epoch,
+                    origin: RetentionOrigin::new(at(1), RequestHorizon::DEFAULT),
+                },
+                &mut f.port,
+            )
+            .unwrap();
+        assert!(context_core.is_compact_retained());
+        assert!(
+            !compact
+                .effects
+                .iter()
+                .any(|e| matches!(e, ContextEffect::Expired { .. }))
+        );
         let decided = ControlInput::EstablishmentDecided {
             context: context(),
             decision,
         };
-        let retained = ControlInput::Retained {
+        let retired = ControlInput::ExecutionRetired {
             context: context(),
-            normal_close: false,
+            retirement: novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                close_epoch,
+            },
         };
-        let (first, second) = if retained_first {
-            (retained, decided)
+        let (first, second) = if execution_first {
+            (retired, decided)
         } else {
-            (decided, retained)
+            (decided, retired)
         };
         let first = f.control.handle(at(1), first, &mut f.port).unwrap();
-        assert_eq!(
-            f.control.route(context()),
-            QueryContextState::TerminalRetained
-        );
-        assert_eq!(f.control.next_deadline(), Some(at(11)));
         let second = f.control.handle(at(2), second, &mut f.port).unwrap();
-        assert_eq!(
-            f.control.route(context()),
-            QueryContextState::TerminalRetained
-        );
-        assert_eq!(
-            f.control.next_deadline(),
-            Some(at(11)),
-            "the second fact cannot restart retention"
-        );
-        let effects: Vec<_> = first.effects.iter().chain(&second.effects).collect();
-        assert_eq!(
-            effects
-                .iter()
-                .filter(|effect| matches!(effect, ControlEffect::RetireReservation(_)))
-                .count(),
-            1
-        );
-        assert_eq!(
-            effects
-                .iter()
-                .filter(|effect| matches!(
-                    effect,
-                    ControlEffect::Route {
-                        state: QueryContextState::TerminalRetained,
-                        ..
-                    }
-                ))
-                .count(),
-            1
-        );
         assert_eq!(first.requests.len() + second.requests.len(), 1);
-        for step in [first, second] {
-            assert!(
-                step.charged_work() + usize::from(f.control.has_internal_work())
-                    <= f.control.max_step_work()
-            );
-        }
-        // The host has not supplied HostRemoved. No physical Work/report exit
-        // follows from either of these terminal protocol inputs.
-        let pending = f
-            .control
-            .handle(at(11), ControlInput::Tick, &mut f.port)
-            .unwrap();
-        assert!(pending.effects.iter().any(|effect| matches!(effect, ControlEffect::RemoveHost { context: original } if *original == context())));
+        assert_eq!(
+            first
+                .effects
+                .iter()
+                .chain(&second.effects)
+                .filter(|e| matches!(e, ControlEffect::RetireReservation(_)))
+                .count(),
+            1
+        );
+        assert!(
+            !first
+                .effects
+                .iter()
+                .chain(&second.effects)
+                .any(|e| matches!(e, ControlEffect::RemoveHost { .. }))
+        );
         assert_eq!(
             f.control.route(context()),
             QueryContextState::TerminalRetained
         );
+        context_core
+            .handle(
+                at(2),
+                ContextInput::ExecutionCustodyRetired {
+                    context: context(),
+                    close_epoch,
+                    origin: RetentionOrigin::new(at(1), RequestHorizon::DEFAULT),
+                },
+                &mut f.port,
+            )
+            .unwrap();
+        assert_eq!(context_core.next_deadline(), Some(at(121)));
+        let no_root_ttl = f
+            .control
+            .handle(at(120), ControlInput::Tick, &mut f.port)
+            .unwrap();
+        assert!(
+            !no_root_ttl
+                .effects
+                .iter()
+                .any(|e| matches!(e, ControlEffect::RemoveHost { .. }))
+        );
+        let before = context_core
+            .handle(at(120), ContextInput::Tick, &mut f.port)
+            .unwrap();
+        assert!(
+            !before
+                .effects
+                .iter()
+                .any(|e| matches!(e, ContextEffect::Expired { .. }))
+        );
+        let due = context_core
+            .handle(at(121), ContextInput::Tick, &mut f.port)
+            .unwrap();
+        assert_eq!(due.effects.iter().filter(|e| matches!(e, ContextEffect::Expired { context: original, close_epoch: epoch } if *original == context() && *epoch == close_epoch)).count(), 1);
+        let removal = f
+            .control
+            .handle(
+                at(121),
+                ControlInput::ContextExpired {
+                    context: context(),
+                    retirement:
+                        novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                            close_epoch,
+                        },
+                },
+                &mut f.port,
+            )
+            .unwrap();
+        assert_eq!(removal.effects.iter().filter(|e| matches!(e, ControlEffect::RemoveHost { context: original } if *original == context())).count(), 1);
+        let duplicate = f
+            .control
+            .handle(
+                at(121),
+                ControlInput::ContextExpired {
+                    context: context(),
+                    retirement:
+                        novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                            close_epoch,
+                        },
+                },
+                &mut f.port,
+            )
+            .unwrap();
+        assert!(duplicate.effects.is_empty());
+        let removed = f
+            .control
+            .handle(
+                at(121),
+                ControlInput::HostRemoved { context: context() },
+                &mut f.port,
+            )
+            .unwrap();
+        assert_eq!(f.control.route(context()), QueryContextState::Absent);
+        assert!(removed.effects.contains(&ControlEffect::Route {
+            context: context(),
+            state: QueryContextState::Gone,
+            generation: Generation::new(1).unwrap()
+        }));
+        for step in [first, second, no_root_ttl, removal, duplicate, removed] {
+            assert!(step.charged_work() <= f.control.max_step_work());
+        }
     }
 }
 
@@ -6857,19 +7570,6 @@ fn materialization_decisions_reject_impossible_shapes_and_unknown_contexts() {
         );
         assert_eq!(f.control.route(context()), QueryContextState::Establishing);
     }
-    assert_eq!(
-        f.control
-            .handle(
-                at(0),
-                ControlInput::ContextBootstrapFailed {
-                    context: context(),
-                    refusal: OperationOutcome::Accepted.into(),
-                },
-                &mut f.port
-            )
-            .unwrap_err(),
-        CoreError::IllegalFact
-    );
     f.finish_original();
 }
 
@@ -6900,21 +7600,9 @@ fn a_quiesced_context_does_not_accept_a_success_disguised_as_host_refusal() {
 }
 
 #[test]
-fn retained_state_without_a_completion_does_not_backdate_the_typed_establishment_decision() {
+fn original_execution_retirement_does_not_backdate_a_delayed_materialization_reply() {
     use novarocks_worker_protocol::control::ControlInput;
     let mut f = ActiveControlFixture::new(4, 1);
-    let retained = f
-        .control
-        .handle(
-            at(0),
-            ControlInput::Retained {
-                context: context(),
-                normal_close: false,
-            },
-            &mut f.port,
-        )
-        .unwrap();
-    assert!(retained.requests.is_empty());
     let mut context_core = core(1, 1);
     release_while_materialization_is_outstanding(&mut context_core, &mut f.port);
     context_core
@@ -6922,17 +7610,44 @@ fn retained_state_without_a_completion_does_not_backdate_the_typed_establishment
         .unwrap();
     let finished = context_core
         .handle(
-            at(0),
+            at(2),
             ContextInput::MaterializationFinished {
                 result: Err(materialization_refusal()),
             },
             &mut f.port,
         )
         .unwrap();
-    let late = f
+    let close_epoch = context_core.generation();
+    context_core
+        .handle(
+            at(2),
+            ContextInput::ExecutionCustodyRetired {
+                context: context(),
+                close_epoch,
+                origin: RetentionOrigin::new(at(2), RequestHorizon::DEFAULT),
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    let retired = f
         .control
         .handle(
             at(2),
+            ControlInput::ExecutionRetired {
+                context: context(),
+                retirement:
+                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        close_epoch,
+                    },
+            },
+            &mut f.port,
+        )
+        .unwrap();
+    assert!(retired.requests.is_empty());
+    let late = f
+        .control
+        .handle(
+            at(3),
             ControlInput::EstablishmentDecided {
                 context: context(),
                 decision: establishment_decision(&finished).1,
@@ -6944,7 +7659,7 @@ fn retained_state_without_a_completion_does_not_backdate_the_typed_establishment
     assert_eq!(
         late.requests[0].result,
         RequestResult::TimeoutWhileAccepted,
-        "Root retained state at zero was not yet an operation decision"
+        "execution retirement cannot backdate the original M decision at two"
     );
     assert_eq!(
         f.control.route(context()),
@@ -6966,6 +7681,7 @@ fn creation_and_routed_request_with_deadlines(first: u64, second: u64) -> Active
         .handle_request(
             at(0),
             RequestContext {
+                author: model_request_author(InputId::new(2).unwrap()),
                 token: InputId::new(2).unwrap(),
                 operation: operation(3),
                 deadline: at(second),
@@ -6994,8 +7710,8 @@ fn terminal_typed_establishment_decision() -> ContextEstablishmentDecision {
 #[test]
 fn retained_host_removal_preserves_an_independent_routed_reply_without_restarting_retention() {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput, ControlReplyBody};
-    let mut f = ActiveControlFixture::new(8, 100);
-    let route = f.request(2, 100, active_establish_input(f.ticket, 2));
+    let mut f = ActiveControlFixture::new(8, 200);
+    let route = f.request(2, 200, active_establish_input(f.ticket, 2));
     let first = f
         .control
         .handle(
@@ -7012,27 +7728,81 @@ fn retained_host_removal_preserves_an_independent_routed_reply_without_restartin
         first.requests[0].body,
         ControlReplyBody::Domain(_)
     ));
+    let retained = f
+        .control
+        .handle(
+            at(0),
+            ControlInput::ExecutionRetired {
+                context: context(),
+                retirement:
+                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        close_epoch: Generation::new(2).unwrap(),
+                    },
+            },
+            &mut f.port,
+        )
+        .unwrap();
     let due = f
         .control
-        .handle(at(10), ControlInput::Tick, &mut f.port)
+        .handle(
+            at(120),
+            ControlInput::ContextExpired {
+                context: context(),
+                retirement:
+                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        close_epoch: Generation::new(2).unwrap(),
+                    },
+            },
+            &mut f.port,
+        )
         .unwrap();
     assert_eq!(due.effects.iter().filter(|effect|matches!(effect,ControlEffect::RemoveHost{context:target} if *target==context())).count(),1);
+    // A known original Context expiry projects Gone immediately for new R,
+    // while the independently routed original token keeps its frozen result.
+    for (token, input) in [
+        (
+            3,
+            ControlInput::CreateWithoutContextAddress {
+                context: context(),
+                task: task(1),
+            },
+        ),
+        (4, active_establish_input(f.ticket, 9)),
+    ] {
+        let request = RequestContext {
+            author: model_request_author(InputId::new(token).unwrap()),
+            token: InputId::new(token).unwrap(),
+            operation: operation(2),
+            deadline: at(200),
+        };
+        let reply = f
+            .control
+            .handle_request(at(120), request, input, &mut f.port)
+            .unwrap();
+        assert_eq!(reply.requests.len(), 1);
+        assert_eq!(reply.requests[0].request, request);
+        assert_eq!(
+            reply.requests[0].result,
+            RequestResult::Outcome(OperationOutcome::Gone)
+        );
+        assert!(reply.effects.is_empty());
+    }
     // The model reports actual Context physical removal only after its own
     // route leg exited; a Root backchannel may still be awaiting delivery.
     let gone = f
         .control
         .handle(
-            at(10),
+            at(120),
             ControlInput::HostRemoved { context: context() },
             &mut f.port,
         )
         .unwrap();
-    assert_eq!(f.control.route(context()), QueryContextState::Gone);
+    assert_eq!(f.control.route(context()), QueryContextState::Absent);
     let second = finish_routed_establish(
         &mut f.control,
         &mut f.port,
         &route,
-        11,
+        121,
         1,
         Ok(OperationOutcome::ContextTerminalReceipt),
     );
@@ -7045,7 +7815,7 @@ fn retained_host_removal_preserves_an_independent_routed_reply_without_restartin
         first.requests[0].body,
         ControlReplyBody::Domain(_)
     ));
-    for step in [first, due, gone, second] {
+    for step in [first, retained, due, gone, second] {
         assert!(step.charged_work() <= f.control.max_step_work());
     }
 }
@@ -7071,6 +7841,7 @@ fn an_expired_new_r_cannot_copy_a_creation_domain_body_or_consume_another_route(
         .handle_request(
             at(2),
             RequestContext {
+                author: model_request_author(InputId::new(3).unwrap()),
                 token: InputId::new(3).unwrap(),
                 operation: operation(2),
                 deadline: at(1),
@@ -7108,22 +7879,47 @@ fn an_expired_new_r_cannot_copy_a_creation_domain_body_or_consume_another_route(
 #[test]
 fn pending_retained_removal_and_a_routed_deadline_keep_separate_obligations() {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
-    let mut f = ActiveControlFixture::new(8, 100);
-    let route = f.request(2, 11, active_establish_input(f.ticket, 2));
+    let mut f = ActiveControlFixture::new(8, 200);
+    let route = f.request(2, 121, active_establish_input(f.ticket, 2));
     let original = routed_establish_request(&route).1.request;
     f.control
         .handle(
             at(0),
-            ControlInput::Retained {
+            ControlInput::ExecutionRetired {
                 context: context(),
-                normal_close: false,
+                retirement:
+                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        close_epoch: Generation::new(2).unwrap(),
+                    },
             },
             &mut f.port,
         )
         .unwrap();
+    // Advance only the independent ticket metadata deadline. It cannot
+    // substitute for ContextCore's explicit expiry notification.
+    let ticket_maintenance = f
+        .control
+        .handle(at(120), ControlInput::Tick, &mut f.port)
+        .unwrap();
+    assert!(
+        !ticket_maintenance
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ControlEffect::RemoveHost { .. }))
+    );
     let due = f
         .control
-        .handle(at(10), ControlInput::Tick, &mut f.port)
+        .handle(
+            at(120),
+            ControlInput::ContextExpired {
+                context: context(),
+                retirement:
+                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        close_epoch: Generation::new(2).unwrap(),
+                    },
+            },
+            &mut f.port,
+        )
         .unwrap();
     assert!(
         !due.effects
@@ -7134,7 +7930,7 @@ fn pending_retained_removal_and_a_routed_deadline_keep_separate_obligations() {
     let decided = f
         .control
         .handle(
-            at(11),
+            at(121),
             ControlInput::EstablishmentDecided {
                 context: context(),
                 decision: terminal_typed_establishment_decision(),
@@ -7146,7 +7942,7 @@ fn pending_retained_removal_and_a_routed_deadline_keep_separate_obligations() {
     assert_eq!(decided.effects.iter().filter(|effect|matches!(effect,ControlEffect::RemoveHost{context:target} if *target==context())).count(),1);
     let timed = f
         .control
-        .handle(at(11), ControlInput::Tick, &mut f.port)
+        .handle(at(121), ControlInput::Tick, &mut f.port)
         .unwrap();
     assert_eq!(timed.requests[0].request, original);
     assert_eq!(
@@ -7163,157 +7959,23 @@ fn pending_retained_removal_and_a_routed_deadline_keep_separate_obligations() {
     assert!(
         f.control
             .next_deadline()
-            .is_none_or(|deadline| deadline > at(21)),
-        "neither M nor routed timeout restarts TTL"
+            .is_none_or(|deadline| deadline > at(241)),
+        "neither M nor routed timeout creates another Context deadline"
     );
     let idle = f
         .control
-        .handle(at(11), ControlInput::NextInternal, &mut f.port)
+        .handle(at(121), ControlInput::NextInternal, &mut f.port)
         .unwrap();
     assert!(idle.effects.is_empty());
     let late = finish_routed_establish(
         &mut f.control,
         &mut f.port,
         &route,
-        11,
-        10,
+        121,
+        120,
         Ok(OperationOutcome::ContextTerminalReceipt),
     );
     assert!(late.requests.is_empty());
-}
-
-#[test]
-fn retained_capacity_eviction_preserves_a_routed_result_and_the_new_context_ttl() {
-    use novarocks_worker_protocol::control::{
-        ControlConfig, ControlCore, ControlEffect, ControlInput, ControlReplyBody,
-    };
-    let mut control = ControlCore::new(
-        ControlConfig {
-            max_contexts: 2,
-            max_waiters: 8,
-            max_pending_requests: 8,
-            step_budget: ControlCore::MAX_STEP_WORK,
-            retained_contexts: 1,
-            gone_fences: 8,
-            retention: Duration::from_secs(10),
-        },
-        AdmissionTicketConfig::DEFAULT,
-        [1; 8],
-        at(0),
-    )
-    .unwrap();
-    let mut port = Port::default();
-    let old = context();
-    let new = another_control_context();
-    let mut routed = None;
-    for (identity, base, tokens) in [(old, 70, vec![(1, 71), (2, 72)]), (new, 80, vec![(3, 81)])] {
-        let ticket = selector_grant(&mut control, &mut port, identity, base, 5);
-        for (token, op) in tokens {
-            let accepted = control
-                .handle_request(
-                    at(0),
-                    RequestContext {
-                        token: InputId::new(token).unwrap(),
-                        operation: operation(op),
-                        deadline: at(100),
-                    },
-                    ControlInput::Establish {
-                        request: operation(op),
-                        context: identity,
-                        ticket,
-                        payload: PayloadId(u64::from(base)),
-                        semantics: semantics(),
-                        generation: Generation::new(1).unwrap(),
-                    },
-                    &mut port,
-                )
-                .unwrap();
-            assert!(accepted.requests.is_empty());
-            assert!(accepted.charged_work() <= control.max_step_work());
-            if token == 2 {
-                routed_establish_request(&accepted);
-                routed = Some(accepted);
-            }
-        }
-    }
-    let calls = port.calls.len();
-    let first = control
-        .handle(
-            at(0),
-            ControlInput::EstablishmentDecided {
-                context: old,
-                decision: terminal_typed_establishment_decision(),
-            },
-            &mut port,
-        )
-        .unwrap();
-    assert_eq!(first.requests[0].request.token, InputId::new(1).unwrap());
-    assert!(matches!(
-        first.requests[0].body,
-        ControlReplyBody::Domain(_)
-    ));
-    let evicted = control
-        .handle(
-            at(1),
-            ControlInput::EstablishmentDecided {
-                context: new,
-                decision: terminal_typed_establishment_decision(),
-            },
-            &mut port,
-        )
-        .unwrap();
-    assert_eq!(evicted.requests[0].request.token, InputId::new(3).unwrap());
-    assert_eq!(
-        evicted
-            .effects
-            .iter()
-            .filter(|effect| matches!(effect,ControlEffect::RemoveHost{context} if *context==old))
-            .count(),
-        1
-    );
-    assert_eq!(control.next_deadline(), Some(at(11)));
-    control
-        .handle(at(1), ControlInput::HostRemoved { context: old }, &mut port)
-        .unwrap();
-    let tail = finish_routed_establish(
-        &mut control,
-        &mut port,
-        &routed.unwrap(),
-        2,
-        1,
-        Ok(OperationOutcome::ContextTerminalReceipt),
-    );
-    assert_eq!(tail.requests[0].request.token, InputId::new(2).unwrap());
-    assert_eq!(
-        tail.requests[0].result,
-        RequestResult::Outcome(OperationOutcome::ContextTerminalReceipt)
-    );
-    assert_eq!(control.route(old), QueryContextState::Gone);
-    assert_eq!(control.route(new), QueryContextState::TerminalRetained);
-    assert_eq!(control.next_deadline(), Some(at(11)));
-    let before = control
-        .handle(at(10), ControlInput::Tick, &mut port)
-        .unwrap();
-    assert!(
-        !before
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, ControlEffect::RemoveHost { .. }))
-    );
-    let due = control
-        .handle(at(11), ControlInput::Tick, &mut port)
-        .unwrap();
-    assert_eq!(
-        due.effects
-            .iter()
-            .filter(|effect| matches!(effect,ControlEffect::RemoveHost{context} if *context==new))
-            .count(),
-        1
-    );
-    assert_eq!(port.calls.len(), calls);
-    for step in [first, evicted, tail, before, due] {
-        assert!(step.charged_work() <= control.max_step_work());
-    }
 }
 
 #[test]
@@ -7324,9 +7986,12 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
         .control
         .handle(
             at(0),
-            ControlInput::Retained {
+            ControlInput::ExecutionRetired {
                 context: context(),
-                normal_close: false,
+                retirement:
+                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        close_epoch: Generation::new(2).unwrap(),
+                    },
             },
             &mut f.port,
         )
@@ -7352,9 +8017,31 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
     for result in [&first_timeout.requests[0], &last_timeout.requests[0]] {
         assert_eq!(result.result, RequestResult::TimeoutWhileAccepted);
     }
+    // Advance only the independent ticket metadata deadline. It cannot
+    // substitute for ContextCore's explicit expiry notification.
+    let ticket_maintenance = f
+        .control
+        .handle(at(120), ControlInput::Tick, &mut f.port)
+        .unwrap();
+    assert!(
+        !ticket_maintenance
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ControlEffect::RemoveHost { .. }))
+    );
     let due = f
         .control
-        .handle(at(10), ControlInput::Tick, &mut f.port)
+        .handle(
+            at(120),
+            ControlInput::ContextExpired {
+                context: context(),
+                retirement:
+                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        close_epoch: Generation::new(2).unwrap(),
+                    },
+            },
+            &mut f.port,
+        )
         .unwrap();
     assert!(
         !due.effects
@@ -7366,7 +8053,7 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
     for _ in 0..2 {
         let idle = f
             .control
-            .handle(at(10), ControlInput::NextInternal, &mut f.port)
+            .handle(at(120), ControlInput::NextInternal, &mut f.port)
             .unwrap();
         assert!(idle.effects.is_empty());
         assert!(idle.requests.is_empty());
@@ -7379,7 +8066,7 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
     let decided = f
         .control
         .handle(
-            at(11),
+            at(121),
             ControlInput::EstablishmentDecided {
                 context: context(),
                 decision: terminal_typed_establishment_decision(),
@@ -7395,18 +8082,18 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
     assert!(!f.control.has_internal_work());
     let idle = f
         .control
-        .handle(at(11), ControlInput::NextInternal, &mut f.port)
+        .handle(at(121), ControlInput::NextInternal, &mut f.port)
         .unwrap();
     assert!(idle.effects.is_empty());
     let gone = f
         .control
         .handle(
-            at(11),
+            at(121),
             ControlInput::HostRemoved { context: context() },
             &mut f.port,
         )
         .unwrap();
-    assert_eq!(f.control.route(context()), QueryContextState::Gone);
+    assert_eq!(f.control.route(context()), QueryContextState::Absent);
     for step in [
         retained,
         first_timeout,
@@ -7441,6 +8128,7 @@ fn an_ingress_owner_failure_settles_only_its_original_token_without_business_adm
         .handle(at(0), ControlInput::NextInternal, &mut port)
         .unwrap();
     let request = RequestContext {
+        author: model_request_author(InputId::new(1).unwrap()),
         token: InputId::new(1).unwrap(),
         operation: operation(90),
         deadline: at(0),
@@ -7484,6 +8172,7 @@ fn an_ingress_owner_failure_settles_only_its_original_token_without_business_adm
         .handle_request(
             at(5),
             RequestContext {
+                author: model_request_author(InputId::new(2).unwrap()),
                 token: InputId::new(2).unwrap(),
                 operation: request.operation,
                 deadline: at(100),
@@ -7500,7 +8189,7 @@ fn an_ingress_owner_failure_settles_only_its_original_token_without_business_adm
         accepted.requests[0].body,
         ControlReplyBody::Admission(Ok(_))
     ));
-    assert_eq!(port.calls.len(), 1);
+    assert!(port.calls.is_empty());
     assert!(failed.charged_work() <= control.max_step_work());
     assert!(accepted.charged_work() <= control.max_step_work());
 }
@@ -7533,6 +8222,7 @@ fn an_ingress_failure_cannot_consume_an_original_creation_or_independent_routed_
             .handle_request(
                 at(2),
                 RequestContext {
+                    author: model_request_author(InputId::new(3).unwrap()),
                     token: InputId::new(3).unwrap(),
                     operation: operation(2),
                     deadline: at(0),
@@ -7630,6 +8320,7 @@ fn an_ingress_failure_requires_a_valid_unique_rpc_token_and_monotonic_time() {
                 .handle_request(
                     at(0),
                     RequestContext {
+                        author: model_request_author(InputId::new(token).unwrap()),
                         token: InputId::new(token).unwrap(),
                         operation: candidate_operation,
                         deadline: at(100),
@@ -7648,6 +8339,7 @@ fn an_ingress_failure_requires_a_valid_unique_rpc_token_and_monotonic_time() {
         .handle_request(
             at(1),
             RequestContext {
+                author: model_request_author(InputId::new(2).unwrap()),
                 token: InputId::new(2).unwrap(),
                 operation: operation(2),
                 deadline: at(0),
@@ -7664,6 +8356,7 @@ fn an_ingress_failure_requires_a_valid_unique_rpc_token_and_monotonic_time() {
             .handle_request(
                 at(0),
                 RequestContext {
+                    author: model_request_author(InputId::new(3).unwrap()),
                     token: InputId::new(3).unwrap(),
                     operation: operation(2),
                     deadline: at(100),
@@ -7711,6 +8404,7 @@ fn an_rpc_transport_wrapper_cannot_bypass_the_actual_request_envelope() {
     assert!(port.calls.is_empty());
     assert!(core.task(task(1)).is_none());
     let request = RequestContext {
+        author: model_request_author(InputId::new(71).unwrap()),
         token: InputId::new(71).unwrap(),
         operation: operation(9),
         deadline: at(100),
@@ -7743,11 +8437,13 @@ fn the_same_wire_operation_does_not_join_distinct_tasks_or_replace_a_settled_bod
     activate(&mut core, &mut port);
     let requests = [
         RequestContext {
+            author: model_request_author(InputId::new(81).unwrap()),
             token: InputId::new(81).unwrap(),
             operation: operation(9),
             deadline: at(100),
         },
         RequestContext {
+            author: model_request_author(InputId::new(82).unwrap()),
             token: InputId::new(82).unwrap(),
             operation: operation(9),
             deadline: at(100),

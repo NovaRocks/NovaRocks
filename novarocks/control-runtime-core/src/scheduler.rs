@@ -19,11 +19,10 @@
 
 use crate::identity::ActorId;
 use crate::mailbox::InputClass;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerError {
-    Full,
     DuplicateActor,
     UnknownActor,
     AlreadyClaimed,
@@ -36,27 +35,33 @@ struct ActorReadiness {
     claimed: bool,
     queued: bool,
     pending: bool,
+    previous: Option<ActorId>,
+    next: Option<ActorId>,
 }
 #[derive(Debug)]
 pub struct ReadyQueue {
-    limit: usize,
     actors: BTreeMap<ActorId, ActorReadiness>,
-    ready: VecDeque<ActorId>,
+    head: Option<ActorId>,
+    tail: Option<ActorId>,
+    ready: usize,
+}
+impl Default for ReadyQueue {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl ReadyQueue {
-    pub fn new(max_actors: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            limit: max_actors,
             actors: BTreeMap::new(),
-            ready: VecDeque::new(),
+            head: None,
+            tail: None,
+            ready: 0,
         }
     }
     pub fn register(&mut self, actor: ActorId) -> Result<(), SchedulerError> {
         if self.actors.contains_key(&actor) {
             return Err(SchedulerError::DuplicateActor);
-        }
-        if self.actors.len() >= self.limit {
-            return Err(SchedulerError::Full);
         }
         self.actors.insert(actor, ActorReadiness::default());
         Ok(())
@@ -79,16 +84,15 @@ impl ReadyQueue {
             .ok_or(SchedulerError::UnknownActor)?;
         state.pending = true;
         if !state.claimed && !state.queued {
-            state.queued = true;
-            self.ready.push_back(actor);
+            self.append_ready(actor);
         }
         Ok(())
     }
     pub fn claim(&mut self) -> Option<ActorId> {
-        let actor = self.ready.pop_front()?;
+        let actor = self.head?;
+        self.unlink_ready(actor);
         let state = self.actors.get_mut(&actor).expect("queued actor exists");
         assert!(!state.claimed, "one poller owns an actor");
-        state.queued = false;
         state.claimed = true;
         state.pending = false;
         Some(actor)
@@ -105,10 +109,66 @@ impl ReadyQueue {
         state.claimed = false;
         state.pending |= has_pending;
         if state.pending && !state.queued {
-            state.queued = true;
-            self.ready.push_back(actor);
+            self.append_ready(actor);
         }
         Ok(())
+    }
+    /// Cancel only neutral readiness before an independently authorized owner
+    /// unregisters its metadata address. A claimed turn is never revoked.
+    pub fn cancel_pending(&mut self, actor: ActorId) -> Result<(), SchedulerError> {
+        let state = self
+            .actors
+            .get(&actor)
+            .ok_or(SchedulerError::UnknownActor)?;
+        if state.claimed {
+            return Err(SchedulerError::AlreadyClaimed);
+        }
+        if state.queued {
+            self.unlink_ready(actor);
+        }
+        self.actors.get_mut(&actor).expect("same actor").pending = false;
+        Ok(())
+    }
+    // Links live in the same registered actor rows. Enqueue and arbitrary
+    // cancellation visit a fixed number of rows and never scan siblings.
+    fn append_ready(&mut self, actor: ActorId) {
+        let state = self.actors.get_mut(&actor).expect("registered actor");
+        assert!(!state.queued && !state.claimed, "one unclaimed FIFO node");
+        state.queued = true;
+        state.previous = self.tail;
+        state.next = None;
+        if let Some(tail) = self.tail {
+            self.actors.get_mut(&tail).expect("same ready tail").next = Some(actor);
+        } else {
+            self.head = Some(actor);
+        }
+        self.tail = Some(actor);
+        self.ready += 1;
+    }
+    fn unlink_ready(&mut self, actor: ActorId) {
+        let state = *self.actors.get(&actor).expect("same queued actor");
+        assert!(state.queued, "ready links belong to queued actors");
+        if let Some(previous) = state.previous {
+            self.actors
+                .get_mut(&previous)
+                .expect("same ready predecessor")
+                .next = state.next;
+        } else {
+            self.head = state.next;
+        }
+        if let Some(next) = state.next {
+            self.actors
+                .get_mut(&next)
+                .expect("same ready successor")
+                .previous = state.previous;
+        } else {
+            self.tail = state.previous;
+        }
+        let state = self.actors.get_mut(&actor).expect("same ready actor");
+        state.queued = false;
+        state.previous = None;
+        state.next = None;
+        self.ready -= 1;
     }
     /// Remove the caller's claimed scheduling position after its real actor
     /// has independently satisfied retirement. Pending marks carry no input,
@@ -142,7 +202,7 @@ impl ReadyQueue {
             .ok_or(SchedulerError::UnknownActor)
     }
     pub fn ready_count(&self) -> usize {
-        self.ready.len()
+        self.ready
     }
     pub fn actor_count(&self) -> usize {
         self.actors.len()

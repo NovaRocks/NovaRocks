@@ -45,6 +45,13 @@ identity!(
     BatchId
 );
 
+/// A neutral address within one runtime ledger. It grants no Work authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ScopedWorkRef {
+    pub scope: ScopeId,
+    pub work: WorkId,
+}
+
 impl Generation {
     pub fn next(self) -> Option<Self> {
         self.get().checked_add(1).and_then(Self::new)

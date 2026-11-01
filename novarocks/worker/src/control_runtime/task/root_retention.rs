@@ -116,6 +116,25 @@ impl RootContextRetention {
     ) -> Result<RootChannelRead, TaskRootReadError> {
         self.custody.begin_original_root_read(read)
     }
+    pub(crate) fn closed_read_frontier(
+        &self,
+        read: &RootResultRead,
+    ) -> Result<Option<u64>, TaskRootReadError> {
+        let state = self
+            .custody
+            .state
+            .lock()
+            .expect("original Context Root route");
+        if !state.adopted {
+            return Err(TaskRootReadError::OwnerNotReady);
+        }
+        state
+            .root
+            .as_ref()
+            .ok_or(TaskRootReadError::NoRoot)?
+            .closed_read_frontier(read)
+            .map_err(TaskRootReadError::Channel)
+    }
     /// Borrow the original channel without creating a rich alias or a credit pin.
     pub(crate) fn try_ownership_snapshot(
         &self,
@@ -219,8 +238,8 @@ impl RetainedRootSeal {
                 .lock()
                 .expect("original Root seal capture")
                 .root
-                .as_ref()
-                .map(|root| Arc::clone(root))
+                .clone()
+                .map(ManuallyDrop::into_inner)
                 .ok_or(RetainedRootSealError::NoRoot)?;
             root.finish_seal();
             drop(root);

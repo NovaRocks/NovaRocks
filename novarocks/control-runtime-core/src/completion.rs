@@ -207,6 +207,10 @@ impl CompletionSlot {
         *state = Consumption::AbandonedByOwnerFailure;
         Ok(())
     }
+    /// Read the original declared consumer identity without changing its leg.
+    pub fn consumer_kind(&self, consumer: ConsumerId) -> Option<ConsumerKind> {
+        self.consumers.get(&consumer).map(|(kind, _)| *kind)
+    }
     pub fn consumption(&self, consumer: ConsumerId) -> Option<Consumption> {
         self.consumers.get(&consumer).map(|(_, s)| *s)
     }
@@ -223,6 +227,17 @@ impl CompletionSlot {
         }
         self.state = SlotState::RevokedUnused;
         Ok(())
+    }
+    /// Only the original producer's body/capture receipts, not child/header
+    /// retirement or a substitute for every consumer's acknowledgement.
+    pub const fn body_and_captures_exited(&self) -> bool {
+        self.body_exited && self.captures_exited
+    }
+    pub fn pending_consumers(&self) -> usize {
+        self.consumers
+            .values()
+            .filter(|(_, state)| *state == Consumption::Pending)
+            .count()
     }
     pub fn retirable(&self) -> bool {
         self.body_exited

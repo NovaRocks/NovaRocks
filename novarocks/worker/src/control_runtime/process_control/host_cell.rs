@@ -18,7 +18,7 @@
 //! Original Root inventory cell for the shared host poller. Each Context
 //! transfer is prepared under Root, then bound with that Root guard released.
 
-use super::{ControlContextHandoffRefusal, ProcessControlOwner, RootRequestAdvanceError};
+use super::{ProcessControlOwner, RootRequestAdvanceError};
 use crate::QueryContextHostFactory;
 use crate::control_runtime::{
     actors::{WorkerAction, WorkerActor},
@@ -44,6 +44,7 @@ pub(crate) struct RootHostProgress {
     pub routed: usize,
     pub stale_targets: usize,
     pub requests: RequestIoProgress,
+    pub rejected_ingress: super::rejected_ingress::RejectedIngressProgress,
     /// Only this turn's route/source classes, not all Node effects or Tasks.
     pub runnable: bool,
 }
@@ -54,6 +55,35 @@ pub(crate) enum RootMaterializationError {
     Control(ControlRequestError),
     WrongTarget,
 }
+impl std::fmt::Display for RootMaterializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Driver(error) => {
+                write!(f, "Root materialization actor operation failed: {error}")
+            }
+            Self::Context(error) => {
+                write!(f, "Root materialization Context handoff failed: {error}")
+            }
+            Self::Control(error) => {
+                write!(f, "Root materialization request operation failed: {error}")
+            }
+            Self::WrongTarget => {
+                f.write_str("Root materialization target does not match the original Context")
+            }
+        }
+    }
+}
+impl std::error::Error for RootMaterializationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Driver(error) => Some(error),
+            Self::Context(error) => Some(error),
+            Self::Control(error) => Some(error),
+            Self::WrongTarget => None,
+        }
+    }
+}
+
 /// Every refusal preserves the exclusive Root ticket. Captures which have
 /// already moved to the original Context inventory are never copied back.
 #[must_use = "Retain the original ticket and every refused capture"]
@@ -61,19 +91,19 @@ pub(crate) enum RootMaterializationRefusal {
     Rejected {
         error: RootMaterializationError,
         ticket: EffectTicket<WorkerAction>,
-        target: ContextHostAddress,
-        factory: Arc<dyn QueryContextHostFactory>,
+        _target: ContextHostAddress,
+        _factory: Arc<dyn QueryContextHostFactory>,
     },
     Capture {
         ticket: EffectTicket<WorkerAction>,
-        target: ContextHostAddress,
+        _target: ContextHostAddress,
         refusal: MaterializationCaptureRefusal,
     },
     Stage {
         error: ContextHostJobError,
         ticket: EffectTicket<WorkerAction>,
-        target: ContextHostAddress,
-        job: ContextHostJob,
+        _target: ContextHostAddress,
+        _job: ContextHostJob,
     },
     Completion(EffectCompletionRefusal<WorkerAction>),
 }
@@ -112,10 +142,10 @@ impl RootHostCell {
     pub(crate) fn lock(&self) -> MutexGuard<'_, ProcessControlOwner> {
         self.owner.lock().expect("original Root host inventory")
     }
-    #[cfg(test)]
     pub(crate) fn try_lock(&self) -> Option<MutexGuard<'_, ProcessControlOwner>> {
         self.owner.try_lock().ok()
     }
+    #[cfg(test)]
     pub(crate) fn into_owner(self) -> ProcessControlOwner {
         self.owner
             .into_inner()
@@ -145,8 +175,8 @@ impl RootHostCell {
                 return Err(RootMaterializationRefusal::Rejected {
                     error: RootMaterializationError::WrongTarget,
                     ticket,
-                    target,
-                    factory,
+                    _target: target,
+                    _factory: factory,
                 });
             }
         };
@@ -169,8 +199,8 @@ impl RootHostCell {
                 return Err(RootMaterializationRefusal::Rejected {
                     error,
                     ticket,
-                    target,
-                    factory,
+                    _target: target,
+                    _factory: factory,
                 });
             }
         };
@@ -205,8 +235,8 @@ impl RootHostCell {
                 return Err(RootMaterializationRefusal::Rejected {
                     error,
                     ticket,
-                    target,
-                    factory,
+                    _target: target,
+                    _factory: factory,
                 });
             }
         };
@@ -222,8 +252,8 @@ impl RootHostCell {
                 return Err(RootMaterializationRefusal::Rejected {
                     error: RootMaterializationError::Control(error),
                     ticket,
-                    target,
-                    factory,
+                    _target: target,
+                    _factory: factory,
                 });
             }
         };
@@ -235,7 +265,7 @@ impl RootHostCell {
             Err(refusal) => {
                 return Err(RootMaterializationRefusal::Capture {
                     ticket,
-                    target,
+                    _target: target,
                     refusal,
                 });
             }
@@ -248,8 +278,8 @@ impl RootHostCell {
             return Err(RootMaterializationRefusal::Stage {
                 error,
                 ticket,
-                target,
-                job,
+                _target: target,
+                _job: job,
             });
         }
         // This completion acknowledges captured ownership, not M's physical
@@ -258,66 +288,6 @@ impl RootHostCell {
         runtime
             .effect_completed_for(&self.registration, ticket)
             .map_err(RootMaterializationRefusal::Completion)?;
-        self.lock().note_control_input_progress(input);
-        Ok(())
-    }
-    /// Hand Root's original removal intent to the same Context H custody.
-    /// Authorization and H capture happen under Context only; Root retains
-    /// neither a Context guard nor any opaque resources across this transfer.
-    pub(crate) fn handoff_context_removal(
-        &self,
-        ticket: EffectTicket<WorkerAction>,
-        target: ContextHostAddress,
-    ) -> Result<(), ControlContextHandoffRefusal> {
-        let context = match &ticket.effect {
-            WorkerAction::Control {
-                effect: ControlEffect::RemoveHost { context },
-                ..
-            } if ticket.actor == self.registration.actor() => *context,
-            _ => {
-                return Err(ControlContextHandoffRefusal::Rejected {
-                    error: ContextHostJobError::WrongOwner,
-                    ticket,
-                });
-            }
-        };
-        let preflight = {
-            let owner = self.lock();
-            let runtime = owner.runtime();
-            if target.context() != context {
-                Err(ContextHostJobError::WrongOwner)
-            } else {
-                runtime
-                    .validate_effect_ticket(&ticket)
-                    .and_then(|()| runtime.validate_registration(target.registration()))
-                    .map(|()| runtime.clone())
-                    .map_err(ContextHostJobError::Driver)
-            }
-        };
-        let runtime = match preflight {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                return Err(ControlContextHandoffRefusal::Rejected { error, ticket });
-            }
-        };
-        let handoff = match target.lock() {
-            Some(mut host) if host.registration().same_registration(target.registration()) => host
-                .authorize_owner_control_removal(&ticket)
-                .map_err(ContextHostJobError::Driver)
-                .and_then(|()| {
-                    host.host_jobs()
-                        .ok_or(ContextHostJobError::WrongPhase)?
-                        .request_holder_disposal(&ticket)
-                }),
-            _ => Err(ContextHostJobError::WrongOwner),
-        };
-        if let Err(error) = handoff {
-            return Err(ControlContextHandoffRefusal::Rejected { error, ticket });
-        }
-        let input = ticket.input;
-        runtime
-            .effect_completed_for(&self.registration, ticket)
-            .map_err(ControlContextHandoffRefusal::Completion)?;
         self.lock().note_control_input_progress(input);
         Ok(())
     }
@@ -362,8 +332,12 @@ impl RootHostCell {
         }
         let mut owner = self.lock();
         progress.requests = owner.advance_ready_requests(handles, protocol_events, budget)?;
-        progress.runnable =
-            !owner.resources.ready_routes.is_empty() || owner.request_ready().has_control_ready();
+        // Each source class has its own finite allowance. The rejected lane
+        // visits at most budget retry addresses plus budget original owners.
+        progress.rejected_ingress = owner.advance_rejected_ingress(handles, budget)?;
+        progress.runnable = !owner.resources.ready_routes.is_empty()
+            || owner.request_ready().has_control_ready()
+            || progress.rejected_ingress.runnable;
         Ok(progress)
     }
 }

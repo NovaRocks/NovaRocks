@@ -24,7 +24,6 @@ use crate::control_runtime::{
     context_host::{ContextInternalAdvance, failure::FailurePublicationError},
 };
 use novarocks_control_runtime::driver::InputPhase;
-use novarocks_control_runtime_core::identity::ActionId;
 
 fn take_wake(f: &mut Harness, input: InputId) -> EffectTicket<WorkerAction> {
     let mut wake = None;
@@ -83,11 +82,9 @@ fn seed(f: &mut Harness) -> EffectTicket<WorkerAction> {
     let input = model_fact(f, ContextInput::OwnerFenced, 2);
     take_wake(f, input)
 }
-fn begin_failure(f: &Harness, input: InputId) {
-    let failure = f
-        .runtime
-        .take_effect(context_actor(), input, ActionId::new(1).unwrap())
-        .unwrap();
+fn begin_failure(f: &Harness, input: InputId) -> InputId {
+    let failure = super::failure_publications::take_actual_failure(f, input);
+    let failure_input = failure.input;
     assert!(matches!(failure.effect, WorkerAction::OwnerFailed { .. }));
     let address = f.service.context(f.identity).unwrap();
     let mut host = address.lock().unwrap();
@@ -108,6 +105,7 @@ fn begin_failure(f: &Harness, input: InputId) {
         "actual original failure publication session drains"
     );
     host.discard_failed_internal_hint().unwrap();
+    failure_input
 }
 fn fault_input(f: &Harness) -> InputId {
     let work = f
@@ -119,30 +117,35 @@ fn fault_input(f: &Harness) -> InputId {
         .resources
         .roles[TIMER]
         .work
-        .id();
-    f.runtime
-        .reserve_input(
-            context_actor(),
-            ActorId::new(88).unwrap(),
-            InputClass::Control,
-        )
-        .unwrap()
-        .fill(WorkerMessage::Context(ContextMessage::Command {
-            work,
-            request: None,
-            command: ContextInput::Installed {
-                task: task(f.identity, 999),
-            },
-        }))
-        .unwrap()
+        .reference();
+    {
+        let address = f.service.context(f.identity).unwrap();
+        let host = address.lock().unwrap();
+        f.runtime
+            .reserve_admitted_input_for(
+                host.registration(),
+                ActorId::new(88).unwrap(),
+                InputClass::Control,
+                &host.resources.roles[TIMER].work,
+            )
+            .unwrap()
+    }
+    .fill(WorkerMessage::Context(ContextMessage::Command {
+        work,
+        request: None,
+        command: ContextInput::Installed {
+            task: task(f.identity, 999),
+        },
+    }))
+    .unwrap()
 }
 
 #[test]
 fn coalesced_context_hint_uses_original_prepaid_role_and_waits_for_its_real_old_batch() {
-    let mut f = original_context(1, StorageNeed::default());
-    let work_before = f.ledger.used(Dimension::Work.id());
-    let inputs_before = f.ledger.used(Dimension::Inputs.id());
-    let effects_before = f.ledger.used(Dimension::Effects.id());
+    let mut f = original_context(1);
+    let work_before = actual_component_inventory(&f);
+    let inputs_before = actual_component_inventory(&f);
+    let effects_before = actual_component_inventory(&f);
     let wake1 = seed(&mut f);
     let first_seed = wake1.input;
     let wake2 = seed(&mut f);
@@ -163,9 +166,9 @@ fn coalesced_context_hint_uses_original_prepaid_role_and_waits_for_its_real_old_
     complete_model_effects(&mut f, first);
     assert_eq!(next(&f), ContextInternalAdvance::Idle);
     assert_eq!(next(&f), ContextInternalAdvance::Idle);
-    assert_eq!(f.ledger.used(Dimension::Work.id()), work_before);
-    assert_eq!(f.ledger.used(Dimension::Inputs.id()), inputs_before);
-    assert_eq!(f.ledger.used(Dimension::Effects.id()), effects_before);
+    assert_eq!(actual_component_inventory(&f), work_before);
+    assert_eq!(actual_component_inventory(&f), inputs_before);
+    assert_eq!(actual_component_inventory(&f), effects_before);
     assert!(
         !f.service
             .context(f.identity)
@@ -181,28 +184,28 @@ fn coalesced_context_hint_uses_original_prepaid_role_and_waits_for_its_real_old_
 
 #[test]
 fn pending_only_context_hint_is_withdrawn_by_real_failure_stage_without_an_input_or_exit() {
-    let mut f = original_context(1, StorageNeed::default());
+    let mut f = original_context(1);
     let wake = seed(&mut f);
     let input = wake.input;
     handoff(&f, wake);
     f.runtime.retire_input(context_actor(), input).unwrap();
-    let before = f.ledger.used(Dimension::Work.id());
+    let before = actual_component_inventory(&f);
     let bad = fault_input(&f);
     assert!(f.runtime.poll_one(Tick(9)).unwrap());
     assert_eq!(next(&f), ContextInternalAdvance::AwaitingFailurePublication);
-    begin_failure(&f, bad);
+    let failure_input = begin_failure(&f, bad);
     assert_eq!(next(&f), ContextInternalAdvance::Idle);
     assert_eq!(
-        f.ledger.used(Dimension::Work.id()),
+        actual_component_inventory(&f),
         before,
         "withdrawing a pure hint grants no Work exit"
     );
-    finish(f);
+    super::failure_publications::finish_failed_fixture(f, failure_input);
 }
 
 #[test]
 fn queued_internal_input_needs_actual_failed_abandonment_before_role_reuse_or_close() {
-    let mut f = original_context(1, StorageNeed::default());
+    let mut f = original_context(1);
     let wake = seed(&mut f);
     let seed_input = wake.input;
     handoff(&f, wake);
@@ -222,7 +225,7 @@ fn queued_internal_input_needs_actual_failed_abandonment_before_role_reuse_or_cl
             .phase,
         InputPhase::Filled
     );
-    begin_failure(&f, bad);
+    let failure_input = begin_failure(&f, bad);
     assert_eq!(next(&f), ContextInternalAdvance::Waiting(queued));
     let address = f.service.context(f.identity).unwrap();
     let mut host = address.lock().unwrap();
@@ -251,13 +254,13 @@ fn queued_internal_input_needs_actual_failed_abandonment_before_role_reuse_or_cl
             .unwrap()
             .is_none()
     );
-    finish(f);
+    super::failure_publications::finish_failed_fixture(f, failure_input);
 }
 
 #[test]
 fn source_close_waits_for_an_unhanded_original_wake_even_after_other_metadata_sources_end() {
-    let mut f = original_context(1, StorageNeed::default());
-    let before = f.ledger.used(Dimension::Work.id());
+    let mut f = original_context(1);
+    let before = actual_component_inventory(&f);
     let wake = seed(&mut f);
     let seed_input = wake.input;
     {
@@ -292,7 +295,7 @@ fn source_close_waits_for_an_unhanded_original_wake_even_after_other_metadata_so
     );
     assert_eq!(next(&f), ContextInternalAdvance::Closed);
     assert_eq!(
-        f.ledger.used(Dimension::Work.id()),
+        actual_component_inventory(&f),
         before,
         "closing a metadata role does not exit its permanent author"
     );

@@ -17,48 +17,19 @@
 
 //! Actual retained creation geometry. Input getters execute only on host work;
 //! the Core receives neutral costs and performs all admission decisions.
-use novarocks_execution_contract::{
-    CreateTask, OperationDomainFailure, SafeDetail, TaskCreationInput,
-    failure::{FailureClass, FailureFact},
-    operation::DomainFailureOutcome,
-};
-use novarocks_worker_protocol::creation::{AdmissionRefusal, CreationCost};
+use novarocks_execution_contract::{CreateTask, TaskCreationInput};
+use novarocks_worker_protocol::creation::CreationCost;
 
 pub(crate) fn measure(
     request: &CreateTask,
     input: &TaskCreationInput,
     ingress_retained_bytes: usize,
-) -> Result<CreationCost, AdmissionRefusal> {
-    let inbound_bytes = inbound_record_bytes(request.descriptor()).ok_or_else(|| {
-        AdmissionRefusal::Domain(
-            DomainFailureOutcome::ResourceExhausted,
-            OperationDomainFailure::new(
-                FailureFact::new(
-                    FailureClass::Resource,
-                    crate::failure_reason::WorkerFailureReason::InboundRecordSize.reason(),
-                ),
-                SafeDetail::truncating("inbound normal-close record size overflowed"),
-            ),
-        )
-    })?;
-    Ok(CreationCost {
+) -> CreationCost {
+    CreationCost {
         input_retained_bytes: input.retained_bytes() as u64,
         ingress_retained_bytes: ingress_retained_bytes as u64,
         structural_bytes: structural_bytes(request) as u64,
-        inbound_records: u64::from(inbound_bytes != 0),
-        inbound_bytes: inbound_bytes as u64,
-    })
-}
-
-/// The pure author receives the actual inline owner layout. The live permit
-/// and its original reservation remain outside the protocol core.
-pub(crate) fn inbound_record_bytes(
-    descriptor: &novarocks_execution_contract::TaskDescriptor,
-) -> Option<usize> {
-    novarocks_worker_protocol::inbound_cost::record_bytes(
-        descriptor,
-        std::mem::size_of::<Option<crate::TaskInboundPermit>>(),
-    )
+    }
 }
 
 pub(crate) fn structural_bytes(request: &CreateTask) -> usize {

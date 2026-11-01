@@ -33,6 +33,7 @@ use novarocks_execution_contract::task_execution::{
 };
 use novarocks_proto_models::{catalog, filter};
 use novarocks_types::identity::{StageId, TaskId};
+use std::time::Duration;
 
 fn pair(bound: u32) -> (QueryContextRef, TaskIdentity) {
     let (context, task) = super::covered_wire_tests::context_and_task();

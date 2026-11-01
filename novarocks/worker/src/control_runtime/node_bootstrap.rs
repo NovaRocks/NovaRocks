@@ -73,6 +73,7 @@ pub struct NodeWorkers {
 /// from the same Root's real committed projection, never this initial value.
 pub(crate) struct NodeBootstrapConfig {
     pub observation: super::context_host::observation::ObservationProjection,
+    pub history: Option<novarocks_control_runtime::history::HistoryCapture>,
     pub backend: BackendProcessId,
     pub compatibility: NativeCompatibilityId,
     pub admission_epoch: AdmissionEpochCapability,
@@ -112,6 +113,38 @@ pub(crate) enum NodeBootstrapError {
     Core(novarocks_worker_protocol::context::CoreError),
     OriginalOwner,
     Spawn(std::io::Error),
+}
+impl std::fmt::Display for NodeBootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Geometry(error) => write!(f, "Worker Node geometry is invalid: {error}"),
+            Self::CapacityIndex(error) => write!(
+                f,
+                "Worker Node capacity index initialization failed: {error}"
+            ),
+            Self::InvalidConfiguration(reason) => {
+                write!(f, "Worker Node configuration is invalid: {reason}")
+            }
+            Self::Core(error) => write!(
+                f,
+                "Worker Node protocol Core initialization failed: {error:?}"
+            ),
+            Self::OriginalOwner => {
+                f.write_str("Worker Node startup could not transfer its original owner")
+            }
+            Self::Spawn(error) => write!(f, "Worker Node thread creation failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for NodeBootstrapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Geometry(error) => Some(error),
+            Self::CapacityIndex(error) => Some(error),
+            Self::Spawn(error) => Some(error),
+            Self::InvalidConfiguration(_) | Self::Core(_) | Self::OriginalOwner => None,
+        }
+    }
 }
 
 /// This carrier does not destroy partially started workers, original Root
@@ -163,6 +196,8 @@ impl NodeStartupState {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TaskPhysicalGeometry {
+    pub context_materialization: HostExecutorLimits,
+    pub context_cleanup: HostExecutorLimits,
     pub loading: HostExecutorLimits,
     pub preparation: HostExecutorLimits,
     pub lifecycle: HostExecutorLimits,
@@ -179,22 +214,25 @@ fn nz(value: usize) -> Result<NonZeroUsize, NodeGeometryError> {
 impl TaskPhysicalGeometry {
     fn checked(config: &NodeBootstrapConfig) -> Result<Self, NodeGeometryError> {
         let g = &config.geometry;
-        let c = g.inputs.contexts.get();
         let t = g.inputs.tasks_per_context.get();
         let a = g.inputs.active_tasks.get();
         let p = g.inputs.preparing_tasks.get();
         let r = g.request_positions.get();
-        let loading = HostExecutorLimits {
-            contexts: nz(add(c, config.workers.loading.get())?)?,
-            jobs: nz(add(a, config.workers.loading.get())?)?,
-            // Task identities are cumulative in the exact original Context;
-            // the old loader tail already has one of those T identities.
-            per_context: nz(t)?,
-            workers: config.workers.loading,
+        // Context queues share the configured ingress window, not a limit on
+        // live or retained directory records. Full retains the same pending
+        // job. N covers actual running tails after their original report.
+        let context_limits = |workers: NonZeroUsize, roles: usize| {
+            Ok::<_, NodeGeometryError>(HostExecutorLimits {
+                jobs: nz(add(mul(r, roles)?, workers.get())?)?,
+                per_context: nz(add(roles, workers.get())?)?,
+                workers,
+            })
         };
+        let context_materialization = context_limits(config.workers.context_materialization, 1)?;
+        let context_cleanup = context_limits(config.workers.context_cleanup, 2)?;
+        let loading = HostExecutorLimits::for_loading(t, a, config.workers.loading.get())?;
         let per_preparing = p.min(config.context.max_preparing).min(t);
         let preparation = HostExecutorLimits {
-            contexts: nz(add(c, config.workers.preparation.get())?)?,
             jobs: nz(add(p, config.workers.preparation.get())?)?,
             // Preparation membership includes the actual running body tail.
             // Its later activation uses the paid lifecycle continuation slot.
@@ -209,7 +247,10 @@ impl TaskPhysicalGeometry {
         // rollback. The same owner cannot issue both: activation requires its
         // runnable, while rollback requires that no runnable was adopted.
         let fixed_task_jobs = add(super::task_host_call::HOST_CALL_KINDS.len(), 4)?;
-        let projection_jobs = g.storage.effects;
+        let projection_jobs = add(
+            mul(g.inputs.policy.task_base.effects, a)?,
+            mul(g.request_per_position.effects, r)?,
+        )?;
         // Each R has independent notification and protocol-observation
         // captures. Both can await their actual physical exit concurrently.
         // Never-loaded Create disposal uses the same original R only after
@@ -221,7 +262,7 @@ impl TaskPhysicalGeometry {
                 add(projection_jobs, mul(fixed_task_jobs, a)?)?,
                 request_jobs,
             )?,
-            c,
+            r,
         )?;
         let context_projection = add(
             add(
@@ -241,7 +282,6 @@ impl TaskPhysicalGeometry {
             1,
         )?;
         let lifecycle = HostExecutorLimits {
-            contexts: nz(add(c, config.workers.lifecycle.get())?)?,
             // R has its notification and observation bodies; a retained-root sweep has
             // one Context effect/capture. N accounts for real running tails
             // after their logical holder/role can already have retired.
@@ -250,6 +290,8 @@ impl TaskPhysicalGeometry {
             workers: config.workers.lifecycle,
         };
         Ok(Self {
+            context_materialization,
+            context_cleanup,
             loading,
             preparation,
             lifecycle,
@@ -275,7 +317,6 @@ fn run_task(job: TaskDriverHostJob) {
 #[must_use = "The actual Node must drain and explicitly join its original pools"]
 pub(crate) struct OwnedNodeRuntime {
     state: ManuallyDrop<Box<NodeStartupState>>,
-    physical: TaskPhysicalGeometry,
 }
 #[derive(Debug)]
 pub(crate) enum NodeShutdownError {
@@ -287,6 +328,46 @@ pub(crate) enum NodeShutdownError {
     Establish(HostPairShutdownError),
     PollersStillLive,
 }
+impl std::fmt::Display for NodeShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StillLive => {
+                f.write_str("Worker Node still owns live execution or control inventory")
+            }
+            Self::Loading(error) => {
+                write!(f, "Worker Node loading pool shutdown failed: {error:?}")
+            }
+            Self::Preparation(error) => {
+                write!(f, "Worker Node preparation pool shutdown failed: {error:?}")
+            }
+            Self::Lifecycle(error) => {
+                write!(f, "Worker Node lifecycle pool shutdown failed: {error:?}")
+            }
+            Self::Context(error) => {
+                write!(f, "Worker Node Context pools shutdown failed: {error:?}")
+            }
+            Self::Establish(error) => write!(
+                f,
+                "Worker Node establishment pools shutdown failed: {error:?}"
+            ),
+            Self::PollersStillLive => f.write_str("Worker Node pollers have not physically exited"),
+        }
+    }
+}
+impl std::error::Error for NodeShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::StillLive
+            | Self::Loading(_)
+            | Self::Preparation(_)
+            | Self::Lifecycle(_)
+            | Self::Context(_)
+            | Self::Establish(_)
+            | Self::PollersStillLive => None,
+        }
+    }
+}
+
 impl OwnedNodeRuntime {
     pub(crate) fn start(config: NodeBootstrapConfig) -> Result<Self, NodeBootstrapRefusal> {
         let mut state = NodeStartupState {
@@ -304,17 +385,13 @@ impl OwnedNodeRuntime {
             refused: None,
         };
         let g = &state.config.geometry;
-        let invalid = if state.config.control.max_contexts != g.inputs.contexts.get()
-            || state.config.context.max_tasks != g.inputs.tasks_per_context.get()
-            || state.config.control.max_waiters != g.request_positions.get()
+        let invalid = if state.config.context.max_tasks != g.inputs.tasks_per_context.get()
             || state.config.control.max_pending_requests != g.request_positions.get()
             || state.config.context.max_pending_requests != g.request_positions.get()
             || state.config.control.step_budget != ControlCore::MAX_STEP_WORK
             || state.config.context.step_budget != ContextCore::MAX_STEP_WORK
             || state.config.context.max_preparing == 0
             || state.config.context.max_preparing > state.config.context.max_tasks
-            || state.config.tickets.max_reservations() != g.inputs.ticket_live.get()
-            || state.config.tickets.max_records() != g.inputs.ticket_records.get()
             || state.config.next_actor.get() <= state.config.root_actor.get()
             || state.config.cadence.is_zero()
         {
@@ -352,12 +429,16 @@ impl OwnedNodeRuntime {
                 ));
             }
         };
-        let runtime = ActorRuntime::new(state.config.geometry.max_actors);
-        let ledger = match RuntimeLedger::with_owner_usage_dimensions(
+        let observation = novarocks_control_runtime::observation::RuntimeObservation::new(Some(
+            state.config.clock.clone(),
+        ));
+        let runtime =
+            ActorRuntime::with_observation(state.config.history.clone(), observation.clone());
+        let ledger = match RuntimeLedger::with_owner_usage_dimensions_and_observation(
             state.config.geometry.limits.clone(),
-            state.config.geometry.reservations.total,
-            state.config.geometry.max_scopes,
             [crate::control_admission::Dimension::PreparingTasks.id()],
+            state.config.history.clone(),
+            observation,
         ) {
             Ok(ledger) => ledger,
             Err(error) => {
@@ -367,17 +448,8 @@ impl OwnedNodeRuntime {
                 ));
             }
         };
-        if ledger
-            .owner_usage_metadata_entries(crate::control_admission::Dimension::PreparingTasks.id())
-            != Some(state.config.geometry.capacity_owner_usage_entries)
-        {
-            return Err(state.refuse(
-                NodeBootstrapPhase::Validate,
-                NodeBootstrapError::InvalidConfiguration(
-                    "preparation owner index differs from actual Node geometry",
-                ),
-            ));
-        }
+        // Owner-index storage follows actual reservations. Its current row
+        // count is observation, not a prepaid admission quota or startup gate.
         state.runtime = Some(runtime.clone());
         state.ledger = Some(ledger.clone());
         let r = state.config.geometry.request_positions.get();
@@ -409,8 +481,6 @@ impl OwnedNodeRuntime {
                 actor: state.config.root_actor,
                 generation: state.config.generation,
                 actor_config,
-                max_work: state.config.geometry.root_scope.max_work,
-                max_slots: state.config.geometry.root_scope.max_slots,
                 request_positions: state.config.geometry.request_positions,
                 admission_storage: state.config.geometry.admission.clone(),
             },
@@ -436,24 +506,6 @@ impl OwnedNodeRuntime {
                 ));
             }
         }
-        match state
-            .root
-            .as_mut()
-            .unwrap()
-            .service()
-            .start_context_executors(
-                state.config.workers.context_materialization,
-                state.config.workers.context_cleanup,
-            ) {
-            Ok(owner) => state.contexts = Some(owner),
-            Err(original) => {
-                state.refused = Some(Box::new(original));
-                return Err(state.refuse(
-                    NodeBootstrapPhase::ContextPools,
-                    NodeBootstrapError::OriginalOwner,
-                ));
-            }
-        }
         let signal = match state.root.as_mut().unwrap().task_capacity_signal() {
             Ok(signal) => signal,
             Err(original) => {
@@ -464,6 +516,25 @@ impl OwnedNodeRuntime {
                 ));
             }
         };
+        match state
+            .root
+            .as_mut()
+            .unwrap()
+            .service()
+            .start_context_executors(
+                physical.context_materialization,
+                physical.context_cleanup,
+                signal.clone(),
+            ) {
+            Ok(owner) => state.contexts = Some(owner),
+            Err(original) => {
+                state.refused = Some(Box::new(original));
+                return Err(state.refuse(
+                    NodeBootstrapPhase::ContextPools,
+                    NodeBootstrapError::OriginalOwner,
+                ));
+            }
+        }
         let runner: fn(LoadingHostJob) = run_loading;
         match HostExecutor::start_with_waker(physical.loading, runner, signal.waker()) {
             Ok(owner) => state.loading = Some(owner),
@@ -532,9 +603,9 @@ impl OwnedNodeRuntime {
                 storage: state.config.geometry.admission.clone(),
                 max_live_tasks: state.config.geometry.inputs.tasks_per_context.get(),
                 max_live_roots: state.config.geometry.inputs.tasks_per_context.get(),
-                max_contexts: state.config.geometry.inputs.contexts.get(),
             },
             NodeActorIds::new(state.config.next_actor),
+            state.config.clock.clone(),
         );
         let node = match node {
             Ok(node) => Arc::new(node),
@@ -547,10 +618,7 @@ impl OwnedNodeRuntime {
             }
         };
         state.node = Some(node.clone());
-        match node.start_pollers(
-            state.config.clock.clone(),
-            state.config.workers.pollers.get(),
-        ) {
+        match node.start_pollers(state.config.workers.pollers.get()) {
             Ok(owner) => {
                 let observation = owner.observation();
                 // Store the original stop/join owner before the metadata bind.
@@ -572,7 +640,6 @@ impl OwnedNodeRuntime {
         }
         Ok(Self {
             state: ManuallyDrop::new(Box::new(state)),
-            physical,
         })
     }
     pub(crate) fn node(&self) -> &Arc<WorkerNodeHost> {
@@ -595,9 +662,6 @@ impl OwnedNodeRuntime {
     }
     pub(crate) fn execution_ports(&self) -> &TaskExecutionPorts {
         &self.state.config.execution_ports
-    }
-    pub(crate) fn now(&self) -> MonotonicInstant {
-        MonotonicInstant::from_origin(Duration::from_nanos(self.state.config.clock.now().0))
     }
     pub(crate) fn begin_drain(&self) -> Result<(), NodeHostRefusal> {
         self.node().begin_drain()
@@ -630,17 +694,17 @@ impl OwnedNodeRuntime {
                 }
             }
         }
-        if let Some(owner) = self.state.contexts.take() {
-            if let Err((error, owner)) = owner.shutdown() {
-                self.state.contexts = Some(owner);
-                return Err((NodeShutdownError::Context(error), self));
-            }
+        if let Some(owner) = self.state.contexts.take()
+            && let Err((error, owner)) = owner.shutdown()
+        {
+            self.state.contexts = Some(owner);
+            return Err((NodeShutdownError::Context(error), self));
         }
-        if let Some(owner) = self.state.establish.take() {
-            if let Err((error, owner)) = owner.shutdown() {
-                self.state.establish = Some(owner);
-                return Err((NodeShutdownError::Establish(error), self));
-            }
+        if let Some(owner) = self.state.establish.take()
+            && let Err((error, owner)) = owner.shutdown()
+        {
+            self.state.establish = Some(owner);
+            return Err((NodeShutdownError::Establish(error), self));
         }
         // Cleanup remains available until all business/source pools joined.
         if let Some(owner) = self.state.lifecycle.take() {
@@ -652,11 +716,11 @@ impl OwnedNodeRuntime {
                 }
             }
         }
-        if let Some(owner) = self.state.pollers.take() {
-            if let Err(owner) = owner.shutdown() {
-                self.state.pollers = Some(owner);
-                return Err((NodeShutdownError::PollersStillLive, self));
-            }
+        if let Some(owner) = self.state.pollers.take()
+            && let Err(owner) = owner.shutdown()
+        {
+            self.state.pollers = Some(owner);
+            return Err((NodeShutdownError::PollersStillLive, self));
         }
         // Only actual empty inventories and real physical joins reach here.
         // Remaining supplied ports/factory captures are dropped by this caller,
@@ -750,23 +814,34 @@ impl std::fmt::Debug for WorkerNodeStartRefusal {
 }
 impl std::fmt::Display for WorkerNodeStartRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Worker Node startup refused at {}: {self:?}",
-            self.stage()
-        )
+        write!(f, "Worker Node startup refused at {}: ", self.stage())?;
+        match &*self.original {
+            WorkerNodeStartOriginal::Configuration { error, .. } => write!(f, "{error}"),
+            WorkerNodeStartOriginal::Startup(original) => write!(f, "{}", original.error),
+        }
     }
 }
-impl std::error::Error for WorkerNodeStartRefusal {}
+impl std::error::Error for WorkerNodeStartRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &*self.original {
+            WorkerNodeStartOriginal::Configuration { error, .. } => Some(error),
+            WorkerNodeStartOriginal::Startup(original) => Some(&original.error),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct WorkerNodeShutdownError(NodeShutdownError);
 impl std::fmt::Display for WorkerNodeShutdownError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Worker Node shutdown remains incomplete: {:?}", self.0)
+        write!(f, "Worker Node shutdown remains incomplete: {}", self.0)
     }
 }
-impl std::error::Error for WorkerNodeShutdownError {}
+impl std::error::Error for WorkerNodeShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 
 /// The sole process-owned Node and all of its original physical joins.
 /// The control handle is cloneable; cloning it does not clone this owner.
@@ -777,6 +852,22 @@ pub struct WorkerNodeRuntime {
 }
 impl WorkerNodeRuntime {
     pub fn start(config: WorkerNodeConfig) -> Result<Self, WorkerNodeStartRefusal> {
+        Self::start_observed(config, None)
+    }
+    /// The observer retains a clone and drains this same bounded capture.
+    /// Driver and original ledger publish into it; the normal constructor
+    /// allocates no history. Overflow marks the history incomplete and never
+    /// changes Task decisions, work admission or physical shutdown.
+    pub fn start_with_history(
+        config: WorkerNodeConfig,
+        history: novarocks_control_runtime::history::HistoryCapture,
+    ) -> Result<Self, WorkerNodeStartRefusal> {
+        Self::start_observed(config, Some(history))
+    }
+    fn start_observed(
+        config: WorkerNodeConfig,
+        history: Option<novarocks_control_runtime::history::HistoryCapture>,
+    ) -> Result<Self, WorkerNodeStartRefusal> {
         // Recompute from the actual original manifest rather than trusting a
         // configuration-time aggregate or accepting a supplied RuntimeLedger.
         let geometry = match NodeGeometry::try_new(config.geometry.inputs) {
@@ -793,6 +884,7 @@ impl WorkerNodeRuntime {
         let clock = config.clock;
         let original = OwnedNodeRuntime::start(NodeBootstrapConfig {
             observation: config.observation,
+            history,
             backend: config.backend,
             compatibility: config.compatibility,
             admission_epoch: config.initial_admission_epoch,
@@ -818,10 +910,20 @@ impl WorkerNodeRuntime {
         Ok(Self { original, clock })
     }
     pub fn task_control(&self) -> crate::WorkerTaskControl {
-        crate::WorkerTaskControl::from_node(self.original.node().clone(), self.clock.clone())
+        crate::WorkerTaskControl::from_node(
+            self.original.node().clone(),
+            self.clock.clone(),
+            self.original.backend(),
+        )
     }
     pub fn now(&self) -> crate::MonotonicInstant {
         self.clock.now()
+    }
+    /// The owner of a replaceable clock signals after advancing its timeline.
+    /// This only wakes the original pollers: they read that same clock and
+    /// author their own due timer inputs. It grants no work or expiry fact.
+    pub fn notify_clock_changed(&self) {
+        self.original.runtime().notify_pollers();
     }
     pub fn backend(&self) -> BackendProcessId {
         self.original.backend()

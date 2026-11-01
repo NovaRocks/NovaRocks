@@ -25,14 +25,15 @@ use crate::{
 };
 use novarocks_control_runtime::{completion::ReportSlot, transaction::RuntimeError};
 use novarocks_control_runtime_core::{
-    completion::ConsumerKind, identity::ConsumerId, scope::WorkKind,
+    capacity::ReservationResources, completion::ConsumerKind, identity::ConsumerId,
+    owned_storage::OwnedSlotNeed, scope::WorkKind,
 };
 use novarocks_execution::runtime::{
     execution_health::{ExecutionExitOrigin, ExecutionHealth},
     fragment::ExecutionFailure,
 };
 use novarocks_execution_contract::{
-    OperationDomainFailure, TaskFailureCategory, TaskFailurePhase, TaskIdentity,
+    TaskFailurePhase, TaskIdentity,
     failure::{FailureClass, FailureFact},
 };
 use std::{
@@ -55,15 +56,21 @@ pub(crate) struct RefusalPosition {
 }
 impl RefusalPosition {
     pub(crate) fn reserve(parent: &PreparationParent) -> Result<Self, RuntimeError> {
-        let guard = parent.derive(WorkKind::Cleanup)?;
-        let scope = guard.scope();
-        let report = ReportSlot::reserve_next(
-            scope,
-            scope.gates()?.generation,
-            guard.work_id(),
-            1,
-            [(HOST, ConsumerKind::Observer)],
+        let mut guard = parent.derive_with_storage(
+            WorkKind::Cleanup,
+            ReservationResources::new(
+                Default::default(),
+                OwnedSlotNeed {
+                    work_headers: HOST_REFUSAL_WORK_POSITIONS,
+                    completions: HOST_REFUSAL_REPORT_POSITIONS,
+                    captures: HOST_REFUSAL_CAPTURE_POSITIONS,
+                    ..OwnedSlotNeed::default()
+                },
+            ),
         )?;
+        let generation = guard.scope().gates()?.generation;
+        let report =
+            ReportSlot::reserve_next(&mut guard, generation, 1, [(HOST, ConsumerKind::Observer)])?;
         let (work, capacity) = match guard.bind(WorkKind::Cleanup) {
             Ok(bound) => bound,
             Err(error) => {
@@ -74,6 +81,8 @@ impl RefusalPosition {
                 return Err(error);
             }
         };
+        let (work, capacity, report) =
+            super::admitted_role::adopt_reported_work(work, capacity, report).into_parts();
         Ok(Self {
             role: Some(AdmittedCompletionRole {
                 work,
@@ -89,10 +98,6 @@ impl RefusalPosition {
         pending: Arc<dyn TaskPendingNotice>,
         health: Arc<ExecutionHealth>,
     ) -> HostPreparationRefusal {
-        // Projection is a foreign boundary and runs before any custody lock.
-        let neutral = rejection.operation_failure();
-        let category = rejection.category();
-        let closed_queue = rejection.is_closed_queue();
         let custody = Arc::new(RefusalCustody {
             task,
             pending,
@@ -106,9 +111,6 @@ impl RefusalPosition {
         });
         *custody.retained.lock().expect("host refusal retention") = Some(custody.clone());
         HostPreparationRefusal {
-            neutral,
-            category,
-            closed_queue,
             custody,
             active: true,
         }
@@ -136,13 +138,8 @@ fn exit_role(mut role: AdmittedCompletionRole) {
             .expect("host refusal report retirement")
     );
     role.capacity
-        .release(
-            &role
-                .capacity
-                .resources()
-                .expect("original zero-resource header"),
-        )
-        .expect("original host refusal header release");
+        .finish()
+        .expect("original host refusal storage exit");
 }
 impl Drop for RefusalPosition {
     fn drop(&mut self) {
@@ -214,8 +211,7 @@ fn finish_retained_role(role: &mut AdmittedCompletionRole) -> Result<bool, Runti
     if !role.report.try_retire()? {
         return Ok(false);
     }
-    let resources = role.capacity.resources()?;
-    role.capacity.release(&resources)?;
+    role.capacity.finish()?;
     Ok(true)
 }
 impl Drop for RefusalSourceRetention {
@@ -261,22 +257,10 @@ impl Drop for RefusalSourceRetention {
 
 #[must_use = "The original refusal source retains preparation work until transfer or actual disposal"]
 pub(crate) struct HostPreparationRefusal {
-    neutral: OperationDomainFailure,
-    category: TaskFailureCategory,
-    closed_queue: bool,
     custody: Arc<RefusalCustody>,
     active: bool,
 }
 impl HostPreparationRefusal {
-    pub(crate) fn neutral(&self) -> &OperationDomainFailure {
-        &self.neutral
-    }
-    pub(crate) fn category(&self) -> TaskFailureCategory {
-        self.category
-    }
-    pub(crate) fn is_closed_queue(&self) -> bool {
-        self.closed_queue
-    }
     /// Move the original rich source into its canonical source node, together
     /// with this exact already paid preparation child. No second error clone
     /// is retained by the Task. Aliases of an inner shared cause keep the same
@@ -325,25 +309,6 @@ impl HostPreparationRefusal {
             started,
         }));
         source
-    }
-    /// Transfers both original artifacts to the real source/disposal owner.
-    /// The receiver must keep the work until its source capture actually exits;
-    /// it cannot substitute a wire failure or release only the error carrier.
-    /// This remains a preparation child: the live source owner must finalize
-    /// its rich projections after executable/control users exit and before
-    /// PreparationExited/RetireTask. Neutral terminal retention is independent.
-    /// Keeping this source until Task retirement would create a wait cycle.
-    pub(crate) fn into_source(mut self) -> (ExecutionFailure, AdmittedCompletionRole) {
-        let (rejection, role) = {
-            let mut state = self.custody.state.lock().expect("host refusal custody");
-            (
-                state.rejection.take().expect("original host refusal"),
-                state.role.take().expect("original host refusal child work"),
-            )
-        };
-        self.active = false;
-        self.custody.release_retention();
-        (ManuallyDrop::into_inner(rejection).into_failure(), role)
     }
     /// Only a real host disposal observes source exit. Any panic keeps the
     /// original work, prepaid header and opaque panic in bounded custody.
@@ -468,23 +433,30 @@ mod tests {
             (Dimension::PreparingBytes.id(), 100),
         ])
         .unwrap();
-        let ledger = RuntimeLedger::new(resources.clone(), 4, 1);
-        let scope = ledger.open_scope_next(None, generation, 4, 4).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(resources.clone());
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation,
-                resources,
+                novarocks_control_runtime_core::capacity::ReservationResources::new(
+                    resources,
+                    novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 2,
+                        captures: 1,
+                        ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
+                    },
+                ),
                 WorkKind::Business,
                 WorkAdmission::External,
             )
             .unwrap()
             .bind(WorkKind::Business)
             .unwrap();
-        let report = || {
+        let mut report = || {
             ReportSlot::reserve_next(
-                &scope,
+                &mut capacity,
                 generation,
-                work.id(),
                 2,
                 [
                     (
@@ -568,13 +540,15 @@ mod tests {
             .exit_report()
             .consume(PREPARATION_OBSERVER_CONSUMER)
             .unwrap();
-        let remainder = custody.take_after_exit().unwrap().unwrap();
+        let mut remainder = custody.take_after_exit().unwrap().unwrap();
         assert_eq!(ledger.used(Dimension::PreparingTasks.id()), 0);
         assert_eq!(ledger.used(Dimension::PreparingBytes.id()), 0);
         assert!(
-            remainder.is_released(),
-            "this bundle held only the P/count and original preparation bytes"
+            !remainder.is_released(),
+            "returning preparation quota does not retire original reservation storage"
         );
+        remainder.finish().unwrap();
+        assert!(remainder.is_released());
         drop(remainder);
         ledger.reap_scope_ready(scope.id(), 4).unwrap();
         scope.close_external().unwrap();

@@ -341,16 +341,15 @@ impl ControlRuntimePolicy {
             .checked_add(root_request_positions)
             .and_then(|positions| positions.checked_add(observation_request_positions))
             .ok_or(PolicyError::Overflow)?;
-        // Preparation owns four original unwind/publication roles plus its
-        // fixed cleanup steps. Their counts share the actual role definitions.
-        let fixed_roles = TaskLifecycleRole::COUNT
-            .checked_add(crate::task_preparation::BODY_ROLES)
-            .and_then(|n| n.checked_add(crate::task_preparation::STEPS))
-            .ok_or(PolicyError::Overflow)?;
+        // Provider callback phases own no independent causal roles. Only the
+        // actual Task lifecycle authors contribute fixed cuts; the Accepted
+        // preparation body has its own Work/report/capture footprint below.
+        let fixed_roles = TaskLifecycleRole::COUNT;
         let host_calls = crate::control_runtime::task_host_call::HOST_CALL_STORAGE
             .checked_mul(crate::control_runtime::task_host_call::HOST_CALL_KINDS.len())?;
         let mut task_base = StorageNeed::role(false)
             .checked_mul(fixed_roles)?
+            .checked_add(crate::control_runtime::preparation::PREPARATION_STORAGE)?
             .checked_add(crate::control_runtime::open_summary::OPEN_SUMMARY_STORAGE)?
             .checked_add(host_calls)?;
         // Protocol lifecycle roles are bounded input authors. The original
@@ -523,14 +522,19 @@ mod tests {
         assert_eq!(policy.request_pool.requests, policy.request_roles);
         assert_eq!(policy.task_base.requests, 0);
         assert_eq!(policy.root_read_pool_per_root.requests, 0);
-        assert_eq!(policy.request_pool.cuts, policy.request_roles);
+        assert_eq!(policy.request_pool.cuts, 2 * policy.request_roles);
+        assert_eq!(policy.request_pool.inputs, 4 * policy.request_roles);
         let actor = policy.context_actor(9).unwrap();
         assert_eq!(
             actor.mailbox[0],
-            (policy.task_base.inputs + 4 - 1) * 9 + policy.request_roles
+            (policy.task_base.inputs
+                - crate::control_runtime::operator_statistics::STATISTICS_INPUT_POSITIONS
+                - crate::control_runtime::dynamic_filters::RF_INPUT_POSITIONS)
+                * 9
+                + 3 * policy.request_roles
         );
         assert_eq!(actor.mailbox[1], policy.request_roles);
-        assert_eq!(actor.mailbox[2], policy.request_roles + 9);
+        assert_eq!(actor.mailbox[2], policy.request_roles + 2 * 9);
     }
 
     #[test]
@@ -573,11 +577,11 @@ mod tests {
         .unwrap();
         let live_tasks = policy.request_roles + 1;
         let config = policy.context_actor(live_tasks).unwrap();
-        let ledger = RuntimeLedger::new(ResourceVector::new([]).unwrap(), 1, 1);
+        let ledger = RuntimeLedger::new(ResourceVector::new([]).unwrap());
         let scope = ledger
-            .open_scope_next(None, Generation::new(1).unwrap(), 1, 1)
+            .open_scope_next(None, Generation::new(1).unwrap())
             .unwrap();
-        let runtime = ActorRuntime::new(1);
+        let runtime = ActorRuntime::new();
         let actor = ActorId::new(1).unwrap();
         runtime
             .register_next(actor, scope.clone(), Idle, config)
@@ -585,7 +589,14 @@ mod tests {
         let mut permits = Vec::new();
         // All request positions may already be busy when each live Task
         // attaches its independently paid periodic data producer.
-        for _ in 0..policy.request_roles + live_tasks {
+        let periodic_positions =
+            crate::control_runtime::operator_statistics::STATISTICS_INPUT_POSITIONS
+                + crate::control_runtime::dynamic_filters::RF_INPUT_POSITIONS;
+        assert_eq!(
+            config.mailbox[2],
+            policy.request_roles + periodic_positions * live_tasks
+        );
+        for _ in 0..policy.request_roles + periodic_positions * live_tasks {
             permits.push(
                 runtime
                     .reserve_input(actor, actor, InputClass::Ordinary)
@@ -600,12 +611,18 @@ mod tests {
         assert_eq!(
             config.mailbox.iter().sum::<usize>(),
             (policy.task_base.inputs + policy.root_read_pool_per_root.inputs) * live_tasks
-                + 3 * policy.request_roles
+                + 5 * policy.request_roles
                 + 1
         );
         for permit in permits {
             permit.revoke_unused().unwrap();
         }
+        runtime.close_actor_admission(actor).unwrap();
+        runtime.close_timer_source(actor).unwrap();
+        while let Some(claim) = runtime.claim_host_actor() {
+            claim.release(false).unwrap();
+        }
+        runtime.seal_actor(actor).unwrap();
         scope.close_external().unwrap();
         runtime
             .remove_actor(actor)
@@ -634,7 +651,11 @@ mod tests {
             policy.task_base.completions
         );
         let root = policy.process_task_storage(2, 1).unwrap();
-        assert_eq!(root.cuts - two.cuts, 2);
+        assert_eq!(
+            root.cuts, two.cuts,
+            "the same R owns the Root cut; retained Root data adds no author"
+        );
+        assert_eq!(policy.root_read_pool_per_root.inputs, 0);
         assert_eq!(root.requests, policy.request_roles);
         assert_eq!(root.work - two.work, policy.root_read_pool_per_root.work);
         assert_eq!(
@@ -643,7 +664,7 @@ mod tests {
         );
         assert_eq!(
             policy.max_task_cuts,
-            policy.task_base.cuts + policy.request_roles + 2
+            policy.task_base.cuts + 2 * policy.request_roles + policy.ingress.root_read_holders
         );
     }
 
@@ -673,24 +694,47 @@ mod tests {
     #[test]
     fn loading_pays_one_open_notification_without_a_second_work_or_cut() {
         let policy = ControlRuntimePolicy::try_new(ingress()).unwrap();
-        // InputLoaded and LoaderExited each own prefix/event positions. The
-        // Task also owns one independent coalesced open-summary position;
-        // its two host calls add Work/report/capture only, never input/cut.
-        assert_eq!(policy.loading.inputs, 5);
-        assert_eq!(policy.loading.batches, 5);
+        // Loading owns both loader observations and both distinct Context-close
+        // authors before Accepted. Only these real cuts add input positions.
+        let cuts = TaskLifecycleRole::LOADING.len();
+        let sources = 2 * cuts + 4; // Each cut's Source2 plus open/consuming candidates.
+        let host_calls = crate::control_runtime::task_host_call::HOST_CALL_KINDS.len();
+        let disposal = crate::control_runtime::task_disposal::TASK_DISPOSAL_STORAGE;
+        assert_eq!(policy.loading.inputs, 2 * cuts + 1);
+        assert_eq!(policy.loading.batches, policy.loading.inputs);
         assert_eq!(
             policy.loading.effects,
-            5 * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS
+            policy.loading.inputs * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS
         );
-        assert_eq!(policy.loading.cuts, 2);
-        assert_eq!(policy.loading.work, 13);
-        assert_eq!(policy.loading.completions, 12);
-        assert_eq!(policy.loading.captures, 13);
+        assert_eq!(policy.loading.cuts, cuts);
+        assert_eq!(
+            policy.loading.work,
+            crate::control_runtime::loading::LOADING_WORK_POSITIONS
+                + TaskLifecycleRole::CONTEXT_CLOSE.len()
+                + sources
+                + host_calls
+                + disposal.work
+        );
+        assert_eq!(
+            policy.loading.completions,
+            crate::control_runtime::loading::LOADING_REPORT_POSITIONS
+                + TaskLifecycleRole::CONTEXT_CLOSE.len()
+                + sources
+                + host_calls
+                + disposal.completions
+        );
+        assert_eq!(
+            policy.loading.captures,
+            3 * cuts + 4 + host_calls + disposal.captures
+        );
         assert_eq!(
             policy.loading.checked_add(policy.accepted).unwrap(),
             policy.task_base
         );
-        assert_eq!(policy.accepted.inputs, 62);
+        assert_eq!(
+            policy.accepted.inputs,
+            2 * (TaskLifecycleRole::COUNT - TaskLifecycleRole::LOADING.len())
+        );
     }
 
     #[test]
@@ -698,9 +742,15 @@ mod tests {
         use crate::control_runtime::actors::ContextActor;
         let policy = ControlRuntimePolicy::try_new(ingress()).unwrap();
         let config = policy.context_actor(1).unwrap();
-        assert_eq!(config.max_step_work, 22);
-        assert_eq!(config.max_effects_per_step, 16);
-        assert_eq!(config.turn_budget, 92);
+        assert_eq!(
+            config.max_step_work,
+            novarocks_worker_protocol::context::ContextCore::MAX_STEP_WORK + 1
+        );
+        assert_eq!(
+            config.max_effects_per_step,
+            novarocks_worker_protocol::context::ContextCore::MAX_STEP_ACTIONS + 1
+        );
+        assert_eq!(config.turn_budget, 4 * (config.max_step_work + 1));
         let mut insufficient = config;
         insufficient.turn_budget -= 1;
         assert!(

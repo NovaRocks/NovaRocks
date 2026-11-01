@@ -19,17 +19,18 @@
 
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, InputPhase},
+    driver::{ActorRuntime, FailureSourceState, InputPhase},
     history::HistoryCapture,
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     effect::{EffectDescriptor, EffectKind, EffectState},
     history::HistoryFact,
-    identity::{ActionId, ActorId, DimensionId, Generation, InputId, ScopeId, Tick, WorkId},
+    identity::{ActionId, ActorId, DimensionId, Generation, InputId, ScopeId, ScopedWorkRef, Tick},
     mailbox::{InputClass, InputEnvelope},
+    owned_storage::OwnedSlotNeed,
     scope::{ScopeError, WorkAdmission, WorkKind},
 };
 use std::sync::{Arc, Barrier};
@@ -54,7 +55,7 @@ enum Command {
     Continue,
 }
 struct Controller {
-    work: WorkId,
+    work: ScopedWorkRef,
     pause: Option<Arc<Pause>>,
 }
 impl Actor for Controller {
@@ -112,12 +113,23 @@ fn resources(n: u64) -> ResourceVector {
 }
 struct Admitted {
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
 }
 impl Admitted {
     fn reserve(scope: &ScopeHandle, kind: WorkKind) -> Self {
         let (work, capacity) = scope
-            .reserve_next(generation(), resources(1), kind, WorkAdmission::External)
+            .reserve_next(
+                generation(),
+                ReservationResources {
+                    quota: resources(1),
+                    owned_slots: OwnedSlotNeed {
+                        work_headers: 1,
+                        ..OwnedSlotNeed::default()
+                    },
+                },
+                kind,
+                WorkAdmission::External,
+            )
             .unwrap()
             .bind(kind)
             .unwrap();
@@ -136,19 +148,19 @@ struct Fixture {
 impl Fixture {
     fn new(pause: Option<Arc<Pause>>) -> Self {
         let history = HistoryCapture::new(256);
-        let ledger = RuntimeLedger::with_history(resources(3), 3, 1, history.clone());
-        let scope = ledger.open_scope_next(None, generation(), 3, 1).unwrap();
+        let ledger = RuntimeLedger::with_history(resources(3), history.clone());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let mut metadata = Admitted::reserve(&scope, WorkKind::Settlement);
         let business = Admitted::reserve(&scope, WorkKind::Business);
         let cleanup = Admitted::reserve(&scope, WorkKind::Cleanup);
         metadata.work.start().unwrap();
-        let runtime = ActorRuntime::with_history(1, history.clone());
+        let runtime = ActorRuntime::with_history(history.clone());
         runtime
-            .register_next(
+            .register_supervised_bound(
                 actor(),
                 scope.clone(),
                 Controller {
-                    work: metadata.work.id(),
+                    work: metadata.work.reference(),
                     pause,
                 },
                 ActorConfig {
@@ -159,6 +171,7 @@ impl Fixture {
                     turn_budget: 8,
                     max_step_work: 1,
                 },
+                &cleanup.work,
             )
             .unwrap_or_else(|(error, _)| panic!("actual controller registration: {error:?}"));
         Self {
@@ -181,11 +194,28 @@ impl Fixture {
     fn finish(mut self, input: InputId) -> Vec<HistoryFact> {
         let payload = self.runtime.take_failure_payload(actor()).unwrap();
         drop(payload);
-        for action in self.runtime.ready_effects(actor(), input, 1).unwrap() {
-            let ticket = self.runtime.take_effect(actor(), input, action).unwrap();
-            self.runtime.effect_completed(ticket).unwrap();
+        let original = self.runtime.input_custody(actor(), input).unwrap().unwrap();
+        if original.phase == InputPhase::Committed {
+            for action in self.runtime.ready_effects(actor(), input, 1).unwrap() {
+                let ticket = self.runtime.take_effect(actor(), input, action).unwrap();
+                self.runtime.effect_completed(ticket).unwrap();
+            }
+        } else {
+            assert_eq!(original.phase, InputPhase::AbandonedByOwnerFailure);
         }
         self.runtime.retire_input(actor(), input).unwrap();
+        if let FailureSourceState::ClosedPending(supervisor) =
+            self.runtime.failure_source_state(actor()).unwrap()
+        {
+            // The empty static failure projection has its own original batch.
+            assert!(
+                self.runtime
+                    .ready_effects(actor(), supervisor, 1)
+                    .unwrap()
+                    .is_empty()
+            );
+            self.runtime.retire_input(actor(), supervisor).unwrap();
+        }
         self.runtime.close_actor_admission(actor()).unwrap();
         self.scope.close_external().unwrap();
         for admitted in [&mut self.metadata, &mut self.business, &mut self.cleanup] {
@@ -201,7 +231,8 @@ impl Fixture {
         self.runtime.seal_actor(actor()).unwrap();
         drop(self.runtime.remove_actor(actor()).unwrap());
         for admitted in [&mut self.metadata, &mut self.business, &mut self.cleanup] {
-            admitted.capacity.release(&resources(1)).unwrap();
+            admitted.capacity.release_quota(&resources(1)).unwrap();
+            admitted.capacity.finish().unwrap();
         }
         self.ledger.remove_scope(self.scope.id()).unwrap();
         assert!(self.runtime.is_empty());

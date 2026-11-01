@@ -35,7 +35,6 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
 
 use std::num::NonZeroUsize;
 
-mod admission;
 mod admission_epoch;
 mod catalog_manager;
 mod catalog_manager_config;
@@ -48,19 +47,15 @@ mod control_runtime;
 pub mod control_runtime_policy;
 mod convergence;
 mod credential_slot;
-mod deadline;
 mod domain;
 mod drain;
 mod failure_reason;
 pub mod guarded_bytes;
 mod host;
 mod inbound_capability;
-mod inbound_permit;
 mod ingress;
 mod lease;
-mod lease_expiry_index;
 mod lifecycle;
-mod observation;
 mod operation;
 pub mod query_context;
 pub mod read_attempt;
@@ -72,7 +67,6 @@ pub mod root_result_channel;
 mod runtime_filter_error;
 mod settlement;
 pub mod sink_commit;
-mod status;
 mod task_causal_input;
 mod task_completion;
 mod task_completion_roles;
@@ -91,16 +85,11 @@ pub use task_preparation::{
     TaskPreparationChild, TaskPreparationChildExit, TaskPreparationChildRegistrationFailure,
     TaskPreparationOutputExit,
 };
-#[cfg(test)]
-mod task_registry;
-mod task_registry_config;
-mod task_registry_entry;
+mod task_preparation_limits;
 mod task_reporter;
 pub use host::{
     TaskPreparationContext, TaskPreparationRoles, TaskPreparationRolesTaken, TaskPreparationView,
 };
-#[cfg(test)]
-mod task_registry_tests;
 pub mod typed_connector_runtime;
 pub mod typed_page_source;
 mod typed_preparation_flow;
@@ -123,12 +112,6 @@ pub mod runtime_filter {
     pub mod typed_scan;
 }
 
-pub use admission::{
-    AdmissionReservationObservation, AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority,
-    AdmissionTicketConfig, AdmissionTicketGrant, AdmissionTicketObservation,
-    AdmissionTicketProgression, AdmissionTicketRedemption, AdmissionTicketRedemptionRejection,
-    AdmissionTicketState, MAX_ADMISSION_RESERVATIONS, MAX_ADMISSION_TICKET_VALID_FOR,
-};
 pub use admission_epoch::WorkerAdmissionEpochAuthority;
 pub use catalog_manager::{
     CatalogLeaseSnapshot, CatalogManager, CatalogManagerError, CatalogPruneResult,
@@ -141,10 +124,11 @@ pub use control_runtime::context_host::observation::{
 };
 pub use control_runtime::lifecycle_read::TaskReadError;
 pub use control_runtime::node_api::{
-    WorkerContextDelivery, WorkerContextReplyBody, WorkerControlDelivery, WorkerControlReplyBody,
-    WorkerCreateDelivery, WorkerCreateReply, WorkerMonotonicInstant, WorkerRequestError,
-    WorkerRequestRefusal, WorkerRequestResult, WorkerRootDelivery, WorkerRootRead,
-    WorkerRootReadError, WorkerRootReadErrorKind, WorkerTaskControl, WorkerTaskDelivery,
+    WorkerCancelOutcome, WorkerContextDelivery, WorkerContextReplyBody, WorkerControlDelivery,
+    WorkerControlReplyBody, WorkerCreateDelivery, WorkerCreateReply, WorkerIngressBacking,
+    WorkerIngressResponsibility, WorkerMonotonicInstant, WorkerRequestError, WorkerRequestRefusal,
+    WorkerRequestResult, WorkerRootDelivery, WorkerRootRead, WorkerRootReadError,
+    WorkerRootReadErrorKind, WorkerTaskControl, WorkerTaskDelivery,
 };
 pub use control_runtime::node_bootstrap::{
     NODE_CONTEXT_STEP_BUDGET, NODE_CONTROL_STEP_BUDGET, NodeAdmissionTicketConfig,
@@ -153,9 +137,12 @@ pub use control_runtime::node_bootstrap::{
 };
 pub use control_runtime::node_geometry::{NodeGeometry, NodeGeometryError, NodeGeometryInputs};
 pub use control_runtime::node_metrics::{
+    WorkerAdmissionSnapshot, WorkerCapacityRefusalKind, WorkerContextRetentionSnapshot,
     WorkerControlPlanePhase, WorkerControlPlaneSnapshot, WorkerControlPlaneTimerSnapshot,
     WorkerControlPlaneWorkerSnapshot, WorkerExecutionQuiescenceSnapshot, WorkerNodeMetricsSnapshot,
-    WorkerPreparationObservationError, WorkerPreparationSnapshot,
+    WorkerPreparationObservationError, WorkerPreparationSnapshot, WorkerProtocolRetentionSnapshot,
+    WorkerRuntimeInputClass, WorkerRuntimeInventory, WorkerRuntimeInventoryPage,
+    WorkerRuntimeObservationError, WorkerRuntimeObservationSnapshot,
 };
 pub use control_runtime::operator_statistics::{
     StatisticsSubmission, TaskStatisticsFinalizer, TaskStatisticsProducer,
@@ -164,7 +151,6 @@ pub use convergence::{
     TaskConvergence, TaskConvergenceAdvance, TaskConvergenceRejection, TaskConvergenceSnapshot,
 };
 pub use credential_slot::QueryContextCredentialSlot;
-pub use deadline::{WorkerDeadlineAuthority, WorkerDeadlineSupervisor};
 pub use domain::{
     DomainPolicyRejection, QueryContextDomains, TaskDomains, commit_task_domain_updates,
     plan_task_domain_updates, task_domain_reaches_execution, validate_task_domain_membership,
@@ -173,16 +159,14 @@ pub use drain::WorkerDrainState;
 #[cfg(novarocks_dev_controls)]
 pub use host::TestTaskUpdateConsumptionReservation;
 pub use host::{
-    HostRejection, InboundCloseReservationRefusal, PreparationControlLoan,
-    PreparedTaskInstallation, QueryContextHost, QueryContextHostFactory, QueryContextHostInstance,
-    ReleasedContextEvidence, RunnableTask, SharedFactsRequest, TaskExecutionHost,
-    TaskIngressRetirement,
+    FrozenCodecContent, HostRejection, PreparationControlLoan, PreparedTaskInstallation,
+    QueryContextHost, QueryContextHostFactory, QueryContextHostInstance, ReleasedContextEvidence,
+    RunnableTask, SharedFactsRequest, TaskExecutionHost, TaskIngressRetirement,
 };
 pub use inbound_capability::{
-    InboundFrameAdmission, InboundFrameClaim, InboundFrameDelivery, NormalClosedInbound,
-    TaskInboundCapabilities, TaskInboundCapabilityLimits,
+    InboundFrameAdmission, InboundFrameClaim, InboundFrameDelivery, InboundRetentionSnapshot,
+    NormalClosedInbound, TaskInboundCapabilities,
 };
-pub use inbound_permit::{TaskInboundPermit, TaskInboundPermitError};
 pub use ingress::{IngressRejection, authorize_inbound_frame};
 pub use lease::{InstalledLease, LeaseBounds, LeaseProgression, MonotonicInstant, RequestHorizon};
 pub use lifecycle::{
@@ -190,6 +174,11 @@ pub use lifecycle::{
     RootDrainAction, TaskTransition, TerminationLatch, classify_context_transition,
     classify_operation_admission, classify_root_drain, classify_task_transition,
 };
+pub use novarocks_control_runtime::history::{
+    HistoryCapture as WorkerHistoryCapture, HistorySlice as WorkerHistorySlice,
+};
+pub use novarocks_control_runtime_core::history::EffectHistoryPhase as WorkerEffectHistoryPhase;
+pub use novarocks_control_runtime_core::history::HistoryFact as WorkerHistoryFact;
 pub use novarocks_execution_contract::AdmissionEpochCapability;
 pub use novarocks_worker_protocol::admission::AdmissionTicketObservation as NodeAdmissionTicketObservation;
 pub use novarocks_worker_protocol::context::{
@@ -202,12 +191,7 @@ pub use novarocks_worker_protocol::observation::{
     CoveredObservationFrame as NodeCoveredObservationFrame,
     CoveredSubscriptionRequest as NodeCoveredSubscriptionRequest,
 };
-pub use observation::{
-    ContextConvergenceCursorError, CoveredObservationBookmark, CoveredObservationFact,
-    CoveredObservationFrame, CoveredSubscription, CoveredSubscriptionError, CursorObservation,
-    QuiesceObservationCursor, SelectedCoveredObservation, TaskStatusEvent, TaskStatusSource,
-    TaskStatusSubscriptionPosition,
-};
+
 pub use operation::OperationWaitCaps;
 pub use receipt::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
@@ -220,9 +204,7 @@ pub use reliable_transport::{
     ReliableTransportState, ReliableTransportStateError, ReliableTransportTick,
 };
 pub use runtime_filter_error::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
-pub use status::{
-    METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance, TaskStatusOwner,
-};
+
 pub use task_completion::{
     CompletionReservationError, TaskCompletionAction, TaskCompletionReservation,
     TaskCompletionSignal, TaskCompletionSlotRefusal, TaskCompletionSupervisor, TaskTerminalAction,
@@ -230,8 +212,8 @@ pub use task_completion::{
 };
 pub use task_creation_gate::{NoopTaskCreationGate, TaskCreationGate};
 pub use task_diagnostics::{
-    DiagnosticRecordOutcome, PreparedCleanupDiagnostic, TaskDiagnosticRole,
-    TaskSecondaryDiagnostic, TaskSecondaryDiagnosticsSnapshot,
+    PreparedCleanupDiagnostic, TaskDiagnosticRole, TaskSecondaryDiagnostic,
+    TaskSecondaryDiagnosticsSnapshot,
 };
 pub use task_domain_execution::{
     DomainExecutionRejection, apply_planned_task_domain_updates, apply_task_domain_updates,
@@ -247,12 +229,8 @@ pub use task_lifecycle::{
     TaskStartPermit, TaskStartRefusal, TaskStopIntent, TaskTerminalPermit,
 };
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
-#[cfg(test)]
-pub use task_registry::{
-    DeadlineSweep, RegistryCounters, RegistryLockObservation, RegistryLockSnapshot,
-    TaskExecutionRegistry, TaskPreparationSnapshot, TaskPreparationSnapshotError,
-};
-pub use task_registry_config::{TaskExecutionRegistryConfig, TaskPreparationLimits};
+
+pub use task_preparation_limits::{METRIC_PUBLISH_MIN_INTERVAL, TaskPreparationLimits};
 pub use task_reporter::TaskStatusReporter;
 pub use typed_preparation_flow::ScanPreparationTimer;
 pub use typed_scan_runtime::{
@@ -335,17 +313,29 @@ impl WorkerResultRetainedLimits {
     }
 }
 
-#[cfg(any(test, novarocks_dev_controls))]
-pub use host::TestPreparationControl;
-#[cfg(any(test, novarocks_dev_controls))]
-pub use task_registry_entry::TestPreparationIntent;
-
 // Refuse flags that would make capability reporting disagree with compiled seams.
 #[cfg(any(
     all(novarocks_dev_controls, not(debug_assertions)),
     all(not(novarocks_dev_controls), debug_assertions)
 ))]
 compile_error!("novarocks_dev_controls must match debug_assertions");
+
+pub use control_runtime::node_api::{
+    WorkerObservationError, WorkerObservationErrorKind, WorkerObservationFrameDelivery,
+    WorkerObservationStream,
+};
+
+pub use novarocks_worker_protocol::observation::{
+    CoveredSubscriptionError as NodeCoveredSubscriptionError,
+    QuiesceObservationCursor as NodeQuiesceObservationCursor,
+};
+
+pub use control_runtime::node_api::WorkerTaskReadDelivery;
+
+pub use control_runtime::dynamic_filters::{
+    DynamicFilterSubmission, TaskDynamicFilterCommittedNotice, TaskDynamicFilterProducer,
+    TaskDynamicFilterWriter,
+};
 
 #[cfg(test)]
 mod result_policy_failure_tests {
@@ -375,20 +365,3 @@ mod result_policy_failure_tests {
         assert_eq!((valid.per_root().get(), valid.per_process().get()), (8, 16));
     }
 }
-
-pub use control_runtime::node_api::{
-    WorkerObservationError, WorkerObservationErrorKind, WorkerObservationFrameDelivery,
-    WorkerObservationStream,
-};
-
-pub use novarocks_worker_protocol::observation::{
-    CoveredSubscriptionError as NodeCoveredSubscriptionError,
-    QuiesceObservationCursor as NodeQuiesceObservationCursor,
-};
-
-pub use control_runtime::node_api::WorkerTaskReadDelivery;
-
-pub use control_runtime::dynamic_filters::{
-    DynamicFilterSubmission, TaskDynamicFilterCommittedNotice, TaskDynamicFilterProducer,
-    TaskDynamicFilterWriter,
-};

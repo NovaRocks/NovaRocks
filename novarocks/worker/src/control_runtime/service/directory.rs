@@ -55,9 +55,6 @@ impl ContextHostGuard<'_> {
     pub(in crate::control_runtime) fn take_for_parent(&mut self) -> ContextHostRecord {
         self.0.take().expect("same original Context parent owner")
     }
-    pub(super) fn take_original(mut self) -> ContextHostRecord {
-        self.0.take().expect("same original Context removal owner")
-    }
 }
 impl ContextHostAddress {
     pub(super) fn new(host: ContextHostRecord) -> Self {
@@ -82,6 +79,7 @@ impl ContextHostAddress {
         let host = self.0.host.try_lock().ok()?;
         host.is_some().then_some(ContextHostGuard(host))
     }
+    #[cfg(test)]
     pub(super) fn take(&self) -> Option<ContextHostRecord> {
         // Returning the value moves its actual custody out of the cell. No
         // resource or foreign destructor executes under the directory lock.
@@ -111,6 +109,11 @@ impl ContextDirectory {
     pub(crate) fn is_empty(&self) -> bool {
         let state = self.state();
         state.contexts.is_empty() && state.actors.is_empty() && state.executions.is_empty()
+    }
+    /// Neutral address inventory only; it grants no execution capacity and
+    /// proves no Context/Scope exit.
+    pub(in crate::control_runtime) fn len(&self) -> usize {
+        self.state().contexts.len()
     }
     pub(super) fn state(&self) -> MutexGuard<'_, DirectoryState> {
         self.0.lock().expect("Context address directory lock")
@@ -185,16 +188,12 @@ impl ContextDirectory {
 }
 
 impl ContextDirectory {
-    /// Copy bounded metadata addresses under the short directory lock only.
+    /// Copy actual metadata addresses under the short directory lock only.
     /// A published cell's original owner is taken before its address is removed.
     pub(in crate::control_runtime) fn try_census_addresses(
         &self,
-        limit: usize,
     ) -> Option<Vec<ContextHostAddress>> {
         let state = self.0.try_lock().ok()?;
-        if state.contexts.len() > limit {
-            return None;
-        }
         Some(state.contexts.values().cloned().collect())
     }
     /// No Context lock is held here. Same-ID replacement cannot reuse a cell

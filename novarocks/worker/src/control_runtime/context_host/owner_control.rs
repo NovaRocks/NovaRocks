@@ -53,6 +53,7 @@ pub(crate) struct OwnerControl {
     input: Option<InputId>,
     delivered: bool,
     removal_authorized: bool,
+    failed: bool,
     closed: bool,
     unresolved: Option<DriverError>,
 }
@@ -69,6 +70,30 @@ pub(crate) enum OwnerFenceDelivery {
     FailedOwner,
 }
 impl OwnerControl {
+    pub(super) fn detachment_source(
+        &mut self,
+    ) -> Result<Option<&mut InputRole<WorkerActor>>, DriverError> {
+        if let Some(error) = self.unresolved {
+            return Err(error);
+        }
+        if self.permit.is_some()
+            || self.input.is_some()
+            || self
+                .role
+                .as_ref()
+                .map(InputRole::in_flight)
+                .transpose()?
+                .flatten()
+                .is_some()
+        {
+            return Err(DriverError::ActorNotRetired);
+        }
+        Ok(self.role.as_mut())
+    }
+    pub(super) fn execution_detached(&mut self) {
+        self.role = None;
+        self.closed = true;
+    }
     pub(super) fn admit(
         &mut self,
         runtime: &ActorRuntime<WorkerActor>,
@@ -144,6 +169,7 @@ impl OwnerControl {
         // Empty is not proof that a live parent has no future fence to send.
         if !self.delivered
             && !self.removal_authorized
+            && !self.failed
             && (self.role.is_some() || self.permit.is_some())
         {
             return Ok(false);
@@ -185,6 +211,17 @@ impl OwnerControl {
         self.closed = true;
         Ok(true)
     }
+    /// The actual completed failure-publication stage fences every future
+    /// Core consumer; a real filled input still retires through close().
+    pub(super) fn withdraw_failed(
+        &mut self,
+        stage: &super::failure::ScopePublicationsDrained<'_>,
+    ) -> Result<bool, DriverError> {
+        let binding = self.binding.as_ref().ok_or(DriverError::UnknownRole)?;
+        stage.validate(&binding.runtime, binding.registration.actor())?;
+        self.failed = true;
+        self.close()
+    }
     /// A stopped metadata component fixture has no producer beyond its own
     /// serial driver. This is not production Root removal or a Scope exit.
     #[cfg(test)]
@@ -215,9 +252,9 @@ impl ContextHostRecord {
             .validate_effect_ticket(ticket)
             .map_err(ContextHostError::Driver)?;
         if self
-            .scope()
-            .gates()
-            .map_err(ContextHostError::Runtime)?
+            .control_runtime
+            .snapshot(self.actor)
+            .map_err(ContextHostError::Driver)?
             .failed
         {
             // The existing failed-owner inventory still owns every physical
@@ -251,7 +288,7 @@ impl ContextHostRecord {
                 ticket,
                 role,
                 WorkerMessage::Context(ContextMessage::Command {
-                    work: self.resources.roles[TIMER].work.id(),
+                    work: self.resources.roles[TIMER].work.reference(),
                     request: None,
                     command: ContextInput::OwnerFenced,
                 }),

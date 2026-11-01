@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One original Task-causal R payment. The main author, request outer storage
-//! and two source-slot fees leave the original admission as separate owners.
-//! Each source fee follows its actual bank slot across generations; a future
-//! source may outlive this request without retaining its R position.
+//! One original Task-causal request admission. External R work belongs to the
+//! process request scope. Its two original Sources derive independently from
+//! the same process baseline, while the exact cut retains its own exit gates.
+//! Core report consumption still belongs to the exact destination actor.
 
 use super::*;
 use crate::control_runtime::{
-    source_positions::SourceSlotAdmission,
-    source_slot_issuer::{SourceSlotPayer, reserve_source_slots},
+    source_positions::{SOURCE_SLOT_STORAGE, SourceSlotAdmission},
+    source_slot_issuer::{
+        SourceSlotPayer, reserve_source_slots, reserve_source_slots_from_authority,
+    },
 };
 use crate::task_completion_roles::AdmittedCompletionRole;
+use novarocks_control_runtime_core::scope::WorkAdmission;
 
 const AUTHOR_STORAGE: StorageNeed = StorageNeed {
     requests: 0,
@@ -42,18 +45,22 @@ const AUTHOR_STORAGE: StorageNeed = StorageNeed {
 /// These are the actual admitted originals, not a promise to fund Source2
 /// after it captures a producer. The main owner retains `outer` through its
 /// cut/input/delivery retirement, including after the author retires. Each
-/// source admission separately carries its original slot payment into the bank.
+/// source admission carries its original bound positions into the bank.
 #[must_use = "The original Task request must retain its outer funding and source holders"]
 pub(crate) struct TaskRequestFunding {
     pub author: AdmittedCompletionRole,
     pub sources: [SourceSlotAdmission; 2],
-    pub outer: CapacityBundle,
+    pub outer: ReservationBundle,
+    // One unique subscription signed by this actual R Work. Deferred EOF
+    // moves it to the R before the same funding later binds a causal cut.
+    pub header_ready: Option<HeaderReadyRegistration>,
 }
 impl ContextHostRecord {
     /// Called by this Context's Task request factory before exposing a sender.
-    /// All three Work holders are siblings under its actual lifetime; making
-    /// the source holders children of the short author creates a retirement
-    /// cycle because causal cut retirement itself waits for that author.
+    /// External R and Source2 share the original process financial Scope.
+    /// Source birth belongs to the independent Root baseline, so future
+    /// Sources can outlive R without retaining Context execution Work. The
+    /// exact cut's consumed prefix keeps its separate real retirement gates.
     pub(crate) fn reserve_task_request_funding(
         &mut self,
     ) -> Result<TaskRequestFunding, ContextRequestAdmissionRefusal> {
@@ -72,18 +79,33 @@ impl ContextHostRecord {
         let resources = full
             .resources()
             .map_err(|e| (ContextRequestError::Policy(e), None))?;
+        let source_storage = SOURCE_SLOT_STORAGE
+            .checked_mul(2)
+            .map_err(|e| (ContextRequestError::Policy(e), None))?;
+        let source_resources = source_storage
+            .resources()
+            .map_err(|e| (ContextRequestError::Policy(e), None))?;
         let outer = full
             .checked_sub(author_storage)
+            .and_then(|remaining| remaining.checked_sub(source_storage))
             .and_then(StorageNeed::resources)
             .map_err(|e| (ContextRequestError::Policy(e), None))?;
-        let scope = self.scope();
+        let scope = if reply {
+            self.request_scope()
+        } else {
+            self.scope()
+        };
         let generation = scope
             .gates()
             .map_err(|e| (ContextRequestError::Runtime(e), None))?
             .generation;
-        let parent = self.resources.roles[super::super::LIFETIME].capacity.id();
+        let admission = if reply {
+            WorkAdmission::External
+        } else {
+            WorkAdmission::Derived(self.resources.roles[super::super::LIFETIME].work.id())
+        };
         let guard = scope
-            .reserve_child_next(generation, parent, resources, WorkKind::Settlement)
+            .reserve_next(generation, resources, WorkKind::Settlement, admission)
             .map_err(|e| (ContextRequestError::Runtime(e), None))?;
         let (work, capacity) = guard
             .bind(WorkKind::Settlement)
@@ -102,24 +124,39 @@ impl ContextHostRecord {
             outer: None,
             sources: None,
         };
-        partial.outer = match partial.capacity.split_next(&outer) {
-            Ok(outer) => Some(outer),
+        // During issuance this original partial retains the Source-only
+        // parcel. The R outer remains in its original financial capacity until
+        // Source2 is bound; every refusal therefore returns all originals.
+        partial.outer = match partial.capacity.split_next(&source_resources) {
+            Ok(parcel) => Some(parcel),
             Err(e) => return Err((ContextRequestError::Runtime(e), Some(partial))),
         };
+        // External R's Source-only parcel is already in the Root financial
+        // Scope. Its actual baseline capability selects the parent at birth;
+        // neither that parcel nor an existing Work is reparented afterward.
+        // Internal feedback retains the original live Context lineage.
+        if !reply
+            && let Err(error) = partial
+                .outer
+                .as_mut()
+                .expect("original Source2 parcel")
+                .transfer(&self.resources.roles[super::super::LIFETIME].work)
+        {
+            return Err((ContextRequestError::Runtime(error), Some(partial)));
+        }
         // Issuance follows the current cleanup epoch, but the consumer is
         // still this Context's original Core. A failed owner must abandon
         // that exact original leg; no cleanup epoch creates another Core.
         partial.report = match ReportSlot::reserve_next(
-            scope,
+            &mut partial.capacity,
             generation,
-            partial.work.id(),
             2,
             [
                 (
                     core_consumer(),
                     ConsumerKind::Owner {
-                        scope: scope.id(),
-                        generation: self.initial_generation,
+                        scope: self.registration().scope_id(),
+                        generation: self.registration().initial_epoch(),
                     },
                 ),
                 (external_consumer(), ConsumerKind::Observer),
@@ -128,12 +165,28 @@ impl ContextHostRecord {
             Ok(report) => Some(report),
             Err(e) => return Err((ContextRequestError::Runtime(e), Some(partial))),
         };
-        let sources = match reserve_source_slots::<2>(
-            scope,
-            parent,
-            self.initial_generation,
-            SourceSlotPayer::Retained(partial.outer.as_mut().expect("original R outer")),
-        ) {
+        let core_owner = (
+            self.registration().scope_id(),
+            self.registration().initial_epoch(),
+        );
+        let payer =
+            SourceSlotPayer::Retained(partial.outer.as_mut().expect("original Source2 parcel"));
+        let issued = if reply {
+            reserve_source_slots_from_authority::<2>(
+                scope,
+                &self.process_source_parent,
+                core_owner,
+                payer,
+            )
+        } else {
+            reserve_source_slots::<2>(
+                scope,
+                &self.resources.roles[super::super::LIFETIME].work,
+                core_owner,
+                payer,
+            )
+        };
+        let sources = match issued {
             Ok(slots) => slots,
             Err(refusal) => {
                 partial.sources = Some(refusal.partial);
@@ -143,6 +196,29 @@ impl ContextHostRecord {
                 ));
             }
         };
+        // Bound Source positions now belong to their own actual roles. This
+        // carrier contains no R quota and only never-bound unused inventory.
+        if let Err(error) = partial
+            .outer
+            .as_mut()
+            .expect("original Source2 parcel")
+            .finish()
+        {
+            partial.sources = Some(SourceSlotIssuePartial::from_admissions(scope, sources));
+            return Err((ContextRequestError::Runtime(error), Some(partial)));
+        }
+        partial.outer = None;
+        partial.outer = match partial.capacity.split_next(&outer) {
+            Ok(outer) => Some(outer),
+            Err(error) => {
+                partial.sources = Some(SourceSlotIssuePartial::from_admissions(scope, sources));
+                return Err((ContextRequestError::Runtime(error), Some(partial)));
+            }
+        };
+        let header_ready = partial
+            .work
+            .header_readiness_registration()
+            .unwrap_or_else(|_| std::process::abort());
         Ok(TaskRequestFunding {
             author: AdmittedCompletionRole {
                 work: partial.work,
@@ -151,6 +227,7 @@ impl ContextHostRecord {
             },
             sources,
             outer: partial.outer.expect("original Task R outer escrow"),
+            header_ready: Some(header_ready),
         })
     }
 }

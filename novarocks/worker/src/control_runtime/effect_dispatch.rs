@@ -20,7 +20,7 @@
 //! after publication does not prevent the next metadata publication.
 
 use super::actors::{WorkerAction, WorkerActor};
-use novarocks_control_runtime::driver::{ActorRuntime, DriverError, EffectTicket};
+use novarocks_control_runtime::driver::{ActorRuntime, CompletedEffect, DriverError, EffectTicket};
 use novarocks_control_runtime_core::{
     effect::EffectState,
     identity::{ActionId, ActorId, BatchId, InputId},
@@ -391,6 +391,45 @@ impl EffectDispatch {
         self.pop_lane(key, effect);
         Ok(())
     }
+    /// Read the same original dispatch policy that released or retained this
+    /// taken ticket. A host completion cannot invent a second ordered ACK for
+    /// an action whose lane already advanced at start or publication.
+    pub(crate) fn requires_completion(
+        &self,
+        ticket: &EffectTicket<WorkerAction>,
+    ) -> Result<bool, DispatchError> {
+        let runtime = self
+            .completion_runtime
+            .as_ref()
+            .ok_or(DispatchError::MissingMetadata)?;
+        // This is physical completion, including an already Published route.
+        // Publication authority has ended at that point; its original actual
+        // Started/Published dispatch still owns the right to report completion.
+        let _original = runtime.effect_completion_observer(ticket)?;
+        if ticket.actor != self.actor {
+            return Err(DispatchError::MissingMetadata);
+        }
+        let (key, release) = self
+            .classify(&ticket.effect)
+            .ok_or(DispatchError::MissingMetadata)?;
+        if release != Release::Completed {
+            return Ok(false);
+        }
+        let reference = EffectRef {
+            input: ticket.input,
+            action: ticket.descriptor.id,
+        };
+        let lane = self.lanes.get(&key).ok_or(DispatchError::MissingMetadata)?;
+        if lane.in_flight != Some(reference)
+            || lane
+                .entries
+                .front()
+                .is_none_or(|entry| entry.release != Release::Completed)
+        {
+            return Err(DispatchError::InvalidPublication);
+        }
+        Ok(true)
+    }
     /// A synchronous metadata owner calls this after actual handoff completion,
     /// before retiring that input. An absent record is never a completion fact.
     pub(crate) fn completion_observed(&mut self, effect: EffectRef) -> Result<(), DispatchError> {
@@ -400,6 +439,33 @@ impl EffectDispatch {
             LaneKey::ContextMetadata
         };
         self.complete_lane(key, effect)
+    }
+    /// The actual completion receipt survives automatic input retirement.
+    /// Its source identity and original lane head must both match; numeric
+    /// absence or a caller's success flag never authorizes lane advancement.
+    pub(crate) fn completion_observed_with_receipt(
+        &mut self,
+        completed: &CompletedEffect<WorkerActor>,
+    ) -> Result<(), DispatchError> {
+        let key = if self.control {
+            LaneKey::ControlMetadata
+        } else {
+            LaneKey::ContextMetadata
+        };
+        if completed.registration().actor() != self.actor {
+            return Err(DispatchError::InvalidPublication);
+        }
+        let effect = EffectRef {
+            input: completed.input(),
+            action: completed.descriptor().id,
+        };
+        self.validate_completed_lane_head(key, effect)?;
+        self.completion_runtime
+            .as_ref()
+            .ok_or(DispatchError::MissingMetadata)?
+            .acknowledge_completed_effect(completed)?;
+        self.pop_lane(key, effect);
+        Ok(())
     }
     /// Only the original synchronous preparation's actual completion releases
     /// this Task ordering position. Getter I/O and delivery captures keep their
@@ -414,11 +480,11 @@ impl EffectDispatch {
         }
         self.complete_lane(LaneKey::Task(task), effect)
     }
-    fn complete_lane(&mut self, key: LaneKey, effect: EffectRef) -> Result<(), DispatchError> {
-        let runtime = self
-            .completion_runtime
-            .as_ref()
-            .ok_or(DispatchError::MissingMetadata)?;
+    fn validate_completed_lane_head(
+        &self,
+        key: LaneKey,
+        effect: EffectRef,
+    ) -> Result<(), DispatchError> {
         let lane = self.lanes.get(&key).ok_or(DispatchError::MissingMetadata)?;
         if lane.in_flight != Some(effect)
             || lane
@@ -428,6 +494,14 @@ impl EffectDispatch {
         {
             return Err(DispatchError::InvalidPublication);
         }
+        Ok(())
+    }
+    fn complete_lane(&mut self, key: LaneKey, effect: EffectRef) -> Result<(), DispatchError> {
+        let runtime = self
+            .completion_runtime
+            .as_ref()
+            .ok_or(DispatchError::MissingMetadata)?;
+        self.validate_completed_lane_head(key, effect)?;
         let actual = runtime.effect_inventory(
             self.actor,
             effect.input,
@@ -510,6 +584,7 @@ impl EffectDispatch {
     }
     /// Indexes hold only plain references. The failure owner recovers original
     /// runtime/resource custody; clearing these never supplies any exit proof.
+    #[cfg(test)]
     pub(crate) fn clear_failed_index(
         &mut self,
         runtime: &ActorRuntime<WorkerActor>,

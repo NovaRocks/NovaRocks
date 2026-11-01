@@ -97,7 +97,7 @@ use novarocks_worker::{
     CatalogManager, CatalogManagerError, CatalogPruneResult,
     ConnectorExecutionRoleBindingFactorySet, HostRejection, QueryContextCredentialSlot,
     QueryContextHost, QueryContextHostFactory, QueryContextHostInstance, ReleasedContextEvidence,
-    SharedFactsRequest, TaskStatusReporter,
+    SharedFactsRequest,
 };
 
 type RuntimeFilterParticipantInstaller = dyn Fn(
@@ -1906,6 +1906,9 @@ mod tests {
     };
 
     use super::super::execution_host::TaskQueryContextFacts;
+    use crate::backend_task_execution::tests::node_fixture::{
+        ContextContents, NativeNodePreparation,
+    };
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_native_adapter::backend_test_support::test_backend_data_runtime;
     use novarocks_native_adapter::runtime_filter_install::DecodedRuntimeFilterContribution;
@@ -1913,15 +1916,10 @@ mod tests {
         NativeRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
     };
     use novarocks_native_adapter::task_shared_facts::release_runtime_filter_telemetry;
-    use novarocks_worker::{
-        CatalogManager, ConnectorExecutionRoleBindingFactorySet, ProcessMonotonicClock,
-    };
+    use novarocks_worker::SharedFactsRequest;
+    use novarocks_worker::{CatalogManager, ConnectorExecutionRoleBindingFactorySet};
     use novarocks_worker::{
         HostRejection, QueryContextHost, QueryContextHostFactory, QueryContextHostInstance,
-    };
-    use novarocks_worker::{
-        METRIC_PUBLISH_MIN_INTERVAL, SharedFactsRequest, TaskStatusOwner, TaskStatusReporter,
-        TaskStatusSource,
     };
     use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 
@@ -3478,14 +3476,19 @@ mod tests {
         // longer publishes.
         let fixture = Fixture::new();
         let context = context(1);
-        fixture
-            .establish(
-                context,
-                vec![],
-                participant_contribution(1),
-                &credential(1, ANNOUNCED_SCOPE, live_until()),
-            )
-            .expect("establish with a participant");
+        let first = task_identity(context, 1);
+        let second = task_identity(context, 2);
+        let original = NativeNodePreparation::with_context(
+            context,
+            fixture.host.clone(),
+            ContextContents {
+                catalog: catalog_payload(vec![]),
+                filters: filter_payload(participant_contribution(1)),
+                options: query_options_payload(),
+                credential: credential(1, ANNOUNCED_SCOPE, live_until()),
+            },
+            &[first, second],
+        );
         let execution = context.query_execution_id();
         assert_eq!(
             fixture.host.feedback_carrier(execution),
@@ -3493,22 +3496,21 @@ mod tests {
             "an established context with no submitted task carries nothing yet"
         );
 
-        let first = task_identity(context, 1);
-        let second = task_identity(context, 2);
-        let (_first_owner, first_reporter) = reporter_for(first);
-        let (_second_owner, second_reporter) = reporter_for(second);
-
         assert!(
-            fixture
-                .host
-                .bind_runtime_filter_feedback(execution, first, &first_reporter),
+            fixture.host.bind_runtime_filter_feedback(
+                execution,
+                first,
+                original[0].dynamic_filter_writer()
+            ),
             "the first submitted task takes the carrier role"
         );
         assert_eq!(fixture.host.feedback_carrier(execution), Some(first));
         assert!(
-            !fixture
-                .host
-                .bind_runtime_filter_feedback(execution, second, &second_reporter),
+            !fixture.host.bind_runtime_filter_feedback(
+                execution,
+                second,
+                original[1].dynamic_filter_writer()
+            ),
             "a second task must not replace the carrier"
         );
         assert_eq!(
@@ -3519,7 +3521,7 @@ mod tests {
 
         // Releasing the context drops the only strong reference to the sink,
         // so a late publication finds nothing to publish through.
-        fixture.host.release(context);
+        NativeNodePreparation::release_context(&original);
         assert_eq!(fixture.host.feedback_carrier(execution), None);
     }
 
@@ -3528,25 +3530,30 @@ mod tests {
     fn a_context_without_a_participant_declines_the_carrier_role() {
         let fixture = Fixture::new();
         let context = context(1);
-        fixture
-            .establish(
-                context,
-                vec![],
-                no_contribution(),
-                &credential(1, ANNOUNCED_SCOPE, live_until()),
-            )
-            .expect("establish without a participant");
-        let execution = context.query_execution_id();
         let task = task_identity(context, 1);
-        let (_owner, reporter) = reporter_for(task);
+        let original = NativeNodePreparation::with_context(
+            context,
+            fixture.host.clone(),
+            ContextContents {
+                catalog: catalog_payload(vec![]),
+                filters: filter_payload(no_contribution()),
+                options: query_options_payload(),
+                credential: credential(1, ANNOUNCED_SCOPE, live_until()),
+            },
+            &[task],
+        );
+        let execution = context.query_execution_id();
 
         assert!(
-            !fixture
-                .host
-                .bind_runtime_filter_feedback(execution, task, &reporter),
+            !fixture.host.bind_runtime_filter_feedback(
+                execution,
+                task,
+                original[0].dynamic_filter_writer()
+            ),
             "there is no channel that could ever reduce, so there is nothing to carry"
         );
         assert_eq!(fixture.host.feedback_carrier(execution), None);
+        NativeNodePreparation::release_context(&original);
     }
 
     /// One task of a context, on the exact backend process that context names.
@@ -3557,18 +3564,6 @@ mod tests {
             novarocks_types::identity::TaskId::new(task).expect("nonzero task"),
             context.backend_process_id(),
         )
-    }
-
-    fn reporter_for(identity: TaskIdentity) -> (Arc<TaskStatusOwner>, TaskStatusReporter) {
-        let owner = Arc::new(TaskStatusOwner::new(
-            identity,
-            Arc::new(TaskStatusSource::new()),
-            Arc::new(ProcessMonotonicClock::new()),
-            METRIC_PUBLISH_MIN_INTERVAL,
-            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
-        ));
-        owner.release_to_observers();
-        (Arc::clone(&owner), TaskStatusReporter::new(owner))
     }
 
     /// No credential material exists to render, and none may be invented.

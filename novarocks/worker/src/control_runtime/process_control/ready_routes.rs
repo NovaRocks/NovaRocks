@@ -31,7 +31,7 @@ impl ReadyRoutes {
         // This is the existing admitted-R bound, not a separate quota.
         let positions = request_positions.get();
         Self {
-            queue: FairWorkQueue::new(positions, positions, 1),
+            queue: FairWorkQueue::new(positions, 1),
         }
     }
     pub(super) fn mark(&mut self, context: QueryContextRef) {

@@ -18,12 +18,145 @@
 //! History records are observations, never inputs to scheduling or policy.
 
 use crate::identity::{
-    ActionId, ActorId, Generation, InputId, ReservationId, ScopeId, SlotId, Tick, WorkId,
+    ActionId, ActorId, ConsumerId, Generation, InputId, ReservationId, ScopeId, ScopedWorkRef,
+    SlotId, Tick, WorkId,
 };
 use std::collections::VecDeque;
 
+/// One original registration within the capture's externally bound runtime
+/// namespace. The attachment is the actual original slot, not a debug ID.
+/// scope_origin survives detachment and may name an already retired Scope;
+/// it never makes the process financial affiliation this actor's owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryActorTarget {
+    pub actor: ActorId,
+    pub attachment: SlotId,
+    pub scope_origin: ScopeId,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EffectHistoryPhase {
+    /// The original effect ticket was handed off. Physical Work starts have
+    /// their independent Started fact and are not inferred from this event.
+    Dispatched,
+    Published,
+    Completed,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailurePublicationHistoryOrigin {
+    SupervisorEffect {
+        input: InputId,
+        action: ActionId,
+    },
+    StartedCleanup {
+        header: crate::owned_storage::OwnedPositionId,
+    },
+}
+/// Original capacity intent, without IDs for any refused new object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CapacityHistoryRequest {
+    Reserve {
+        scope: ScopeId,
+        generation: Generation,
+        admission: crate::scope::WorkAdmission,
+        kind: crate::scope::WorkKind,
+        requested: crate::capacity::ReservationResources,
+    },
+    ReserveFromParent {
+        scope: ScopeId,
+        generation: Generation,
+        parent: ReservationId,
+        kind: crate::scope::WorkKind,
+        requested: crate::capacity::ReservationResources,
+    },
+    ReserveChildRole {
+        scope: ScopeId,
+        generation: Generation,
+        payer: ReservationId,
+        payer_is_local: bool,
+        parent: ScopedWorkRef,
+        parent_is_local: bool,
+        kind: crate::scope::WorkKind,
+        requested: crate::capacity::ReservationResources,
+    },
+    OpenChildScope {
+        parent: ScopedWorkRef,
+        parent_is_local: bool,
+        parent_generation: Option<Generation>,
+        child_generation: Generation,
+        kind: crate::scope::WorkKind,
+        requested: crate::capacity::ReservationResources,
+    },
+    Split {
+        scope: ScopeId,
+        source: ReservationId,
+        generation: Option<Generation>,
+        requested: crate::capacity::ReservationResources,
+    },
+    TransferWhole {
+        scope: ScopeId,
+        source: ReservationId,
+        generation: Option<Generation>,
+        target: ScopedWorkRef,
+        target_is_local: bool,
+        /// None only when the original source no longer exists; the typed
+        /// refusal must not invent a resource vector for that missing owner.
+        requested: Option<crate::capacity::ReservationResources>,
+    },
+    ReleaseQuota {
+        scope: ScopeId,
+        source: ReservationId,
+        generation: Option<Generation>,
+        requested: crate::capacity::ResourceVector,
+    },
+    Finish {
+        scope: ScopeId,
+        source: ReservationId,
+        generation: Option<Generation>,
+    },
+}
+/// Exact neutral errors. API ownership/state failures are never exhaustion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapacityHistoryRefusal {
+    Capacity(crate::capacity::CapacityError),
+    Scope(crate::scope::ScopeError),
+    Completion(crate::completion::CompletionError),
+    OwnedStorage(crate::owned_storage::OwnedStorageError),
+    CapacityDenied {
+        dimension: crate::identity::DimensionId,
+        requested: u64,
+        committed: u64,
+        limit: u64,
+    },
+    UnknownScope,
+    DuplicateScope,
+    UnknownSlot,
+    DuplicateSlot,
+    ScopeNotRetired,
+    UnresolvedWork,
+    IdentityExhausted,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HistoryFact {
+    CapacityRefused {
+        request: CapacityHistoryRequest,
+        reason: CapacityHistoryRefusal,
+    },
+    Effect {
+        target: HistoryActorTarget,
+        input: InputId,
+        action: ActionId,
+        /// The original actor batch's epoch, even for late completion after
+        /// actor failure. This does not belong to the financial Work's Scope.
+        actor_generation: Generation,
+        financial_work: ScopedWorkRef,
+        /// The original financial-author epoch frozen in the actual ticket.
+        /// A late completion does not refresh it from the current ledger.
+        author_generation: Generation,
+        phase: EffectHistoryPhase,
+    },
+    ReservationRetired {
+        reservation: ReservationId,
+    },
     CapacitySplit {
         from: ReservationId,
         to: ReservationId,
@@ -36,6 +169,7 @@ pub enum HistoryFact {
     ScopeOpened {
         scope: ScopeId,
         generation: Generation,
+        parent: Option<ScopedWorkRef>,
     },
     ScopeClosed {
         scope: ScopeId,
@@ -46,6 +180,7 @@ pub enum HistoryFact {
     WorkAdmitted {
         scope: ScopeId,
         work: WorkId,
+        parent: Option<ScopedWorkRef>,
     },
     WorkRetired {
         scope: ScopeId,
@@ -60,6 +195,7 @@ pub enum HistoryFact {
     },
     SlotAbandoned {
         slot: SlotId,
+        consumer: ConsumerId,
     },
     SlotRetired {
         slot: SlotId,
@@ -83,31 +219,38 @@ pub enum HistoryFact {
         scope: ScopeId,
         work: WorkId,
         reservation: ReservationId,
+        parent: Option<ScopedWorkRef>,
     },
-    Transferred {
-        work: WorkId,
-        from: ScopeId,
-        to: ScopeId,
+    /// The same reservation moves to another existing Work. Neither Work
+    /// identity is minted, moved, exited or retired by this transfer.
+    ReservationTransferred {
+        reservation: ReservationId,
+        from: ScopedWorkRef,
+        to: ScopedWorkRef,
     },
     Claimed {
-        actor: ActorId,
+        target: HistoryActorTarget,
     },
     InputConsumed {
-        actor: ActorId,
+        target: HistoryActorTarget,
         input: InputId,
     },
     InputAbandoned {
-        actor: ActorId,
+        target: HistoryActorTarget,
         input: InputId,
     },
     BatchCommitted {
-        scope: ScopeId,
+        target: HistoryActorTarget,
+        actor_generation: Generation,
         input: InputId,
     },
-    Published {
-        scope: ScopeId,
-        generation: Generation,
+    FailurePublication {
+        target: HistoryActorTarget,
+        actor_generation: Generation,
+        financial_work: ScopedWorkRef,
+        financial_generation: Generation,
         action: ActionId,
+        origin: FailurePublicationHistoryOrigin,
     },
     Started {
         scope: ScopeId,
@@ -123,6 +266,7 @@ pub enum HistoryFact {
     },
     CompletionConsumed {
         slot: SlotId,
+        consumer: ConsumerId,
     },
     OwnerFailed {
         scope: ScopeId,
@@ -132,7 +276,7 @@ pub enum HistoryFact {
         reservation: ReservationId,
     },
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryEntry {
     pub ordinal: u64,
     pub now: Tick,

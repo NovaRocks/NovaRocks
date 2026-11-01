@@ -15,30 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Bootstrap refusal retains the elected Task's actual paid host/source roles.
-//! No Native port, getter, observer or execution callback has been exposed.
+//! The elected Task retains its original host/source holders through actual
+//! unused revocation. No getter, observer or execution callback is invoked.
 
 use super::*;
 use crate::control_runtime::{
     source_positions::SOURCE_SLOT_STORAGE,
-    task::{TaskHostBinding, TaskHostError, TaskHostRecord},
-    task_host_call::{HOST_CALL_STORAGE, TaskHostCallError, TaskHostCallKind},
+    task::{TaskHostBinding, TaskHostRecord},
+    task_host_call::{HOST_CALL_STORAGE, TaskHostCallKind},
 };
-use novarocks_control_runtime::{exit_role::ExitRolePhase, transaction::RuntimeError};
-use novarocks_control_runtime_core::scope::ScopeError;
+use novarocks_control_runtime::exit_role::ExitRolePhase;
 use std::sync::Arc;
 
 #[test]
-fn second_host_report_refusal_keeps_the_same_task_and_all_paid_originals_until_unused_exit() {
-    // The actual Actor attachment and four Source reports consume five slots.
-    // Stop fits as slot six; RetireBorrowing's report must really be refused.
-    let mut f = Fixture::with_policy_scope_slot_limit(100, Some(6));
+fn original_host_reports_retire_independently_before_the_same_task_returns_its_payment() {
+    let mut f = Fixture::with_policy_byte_limits(100);
     let policy = f.policy.unwrap();
     let task = task(f.identity, 1);
     let original = f.scope.snapshot().unwrap();
     assert_eq!(original.storage, 1);
     assert_eq!(original.unresolved, 0);
-    f.assert_storage_paid(StorageNeed::default());
     let create = f.send(
         ContextInput::Request(ContextCommand::Create {
             task,
@@ -58,17 +54,16 @@ fn second_host_report_refusal_keeps_the_same_task_and_all_paid_originals_until_u
     let task_work = ticket.descriptor.work;
     let elected = f.scope.snapshot().unwrap();
     assert_eq!(elected.work, original.work + 1);
-    f.assert_storage_paid(policy.loading);
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
-    let refusal = TaskHostRecord::adopt_loading(
+    let host = TaskHostRecord::adopt_loading(
         &f.runtime,
         &ticket,
-        TaskHostBinding {
+        &TaskHostBinding {
+            registration: f.registration.clone(),
             context: f.identity,
             task_source: ActorId::new(2).unwrap(),
             protocol_generation: generation(),
             max_cuts: 1,
-            source_storage_model: false,
             pending: Arc::new(CausalPending),
             health: Arc::new(
                 novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
@@ -76,116 +71,131 @@ fn second_host_report_refusal_keeps_the_same_task_and_all_paid_originals_until_u
         },
         &f.roles[0].0,
     )
-    .err()
-    .expect("the second host report exceeds the actual six-slot Scope limit");
-    assert!(matches!(
-        refusal.error,
-        TaskHostError::HostCall(TaskHostCallError::Runtime(RuntimeError::Scope(
-            ScopeError::SlotCapacity
-        )))
-    ));
-    let mut unpublished = refusal
-        .unpublished
-        .expect("bootstrap refusal returns the same whole elected Task");
-    assert_eq!(unpublished.task, task);
-    assert_eq!(unpublished.lifetime.id(), task_work);
-    assert_eq!(unpublished.active.id(), reservation);
-    assert_eq!(unpublished.host_calls.len(), 1);
-    assert_eq!(unpublished.host_calls[0].kind(), TaskHostCallKind::Stop);
-    assert_eq!(unpublished.host_calls[0].phase(), ExitRolePhase::Admitted);
-    assert_eq!(unpublished.host_calls[0].key().0, f.scope.id());
-    assert!(!unpublished.host_calls[0].is_retired());
-    assert!(unpublished.host_calls[0].poll_return().unwrap().is_none());
-    assert_eq!(unpublished.host_call_payments.len(), 1);
-    assert_eq!(
-        unpublished.host_call_payments[0].resources().unwrap(),
-        HOST_CALL_STORAGE.resources().unwrap()
-    );
-    assert_eq!(unpublished.source_partials.len(), 1);
-    assert!(!unpublished.source_partials[0].is_empty());
-    assert_eq!(unpublished.source_partials[0].scope().id(), f.scope.id());
+    .unwrap_or_else(|refusal| panic!("the original host bootstrap succeeds: {:?}", refusal.error));
+    let mut resources = host.into_resources();
+    assert_eq!(resources.lifetime.work().reference(), task_work);
+    assert_eq!(resources.active.id(), reservation);
+    assert!(resources.source_partials.is_empty());
+    assert!(resources.loader.is_none());
+    assert!(resources.loading_events.is_none());
+    assert!(resources.loading_return.is_none());
+    assert!(resources.pending_loading.is_none());
+    assert!(resources.preparation.is_none());
+    assert!(resources.preparation_remainder.is_none());
+    assert!(resources.accepted_role_storage.is_none());
+    assert!(resources.pending_preparation_adoption.is_none());
+    assert!(resources.completion.is_none());
+    assert!(resources.completion_action.is_none());
+    assert!(resources.lifecycle_inputs.is_empty());
+    assert!(resources.statistics.is_none());
+    assert!(resources.dynamic_filters.is_none());
+    assert!(resources.open_summary.is_none());
+    assert!(resources.causal.is_empty());
+    assert!(resources.production.is_none());
+    for (call, kind) in resources
+        .host_calls
+        .iter()
+        .zip([TaskHostCallKind::Stop, TaskHostCallKind::RetireBorrowing])
+    {
+        assert_eq!(call.kind(), kind);
+        assert_eq!(call.phase(), ExitRolePhase::Admitted);
+        assert_eq!(call.key().0, f.scope.id());
+        assert!(!call.is_retired());
+        assert!(call.poll_return().unwrap().is_none());
+    }
     let sources = SOURCE_SLOT_STORAGE.checked_mul(4).unwrap();
     let host_fees = HOST_CALL_STORAGE.checked_mul(2).unwrap();
-    let retained_active = policy
+    let mut retained_active = policy
         .loading
         .checked_sub(sources)
         .unwrap()
         .checked_sub(host_fees)
+        .unwrap()
+        .checked_sub(crate::control_runtime::task_disposal::TASK_DISPOSAL_STORAGE)
+        .unwrap()
+        .resources()
+        .unwrap()
+        .checked_add(&ReservationResources::new(
+            ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap(),
+            Default::default(),
+        ))
         .unwrap();
-    assert_eq!(
-        unpublished.active.resources().unwrap(),
-        retained_active
-            .resources()
-            .unwrap()
-            .checked_add(&ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap())
-            .unwrap()
-    );
-    let partial = f.scope.snapshot().unwrap();
-    assert_eq!(partial.storage, original.storage + 5);
-    assert_eq!(partial.work, elected.work + 5);
-    assert_eq!(partial.unresolved, 0);
+    retained_active.owned_slots = retained_active
+        .owned_slots
+        .checked_sub(novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::work_only())
+        .unwrap();
+    assert_eq!(resources.active.resources().unwrap(), retained_active);
+    assert_eq!(f.scope.snapshot().unwrap().storage, original.storage + 7);
+    assert_eq!(f.scope.snapshot().unwrap().work, elected.work + 7);
+    assert_eq!(f.scope.snapshot().unwrap().unresolved, 0);
     assert!(f.ledger.unresolved_work().is_empty());
-    // Moving split payments and reported Work into unpublished custody does
-    // not refund any of the original Task.loading payment.
-    f.assert_storage_paid(policy.loading);
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
-    let lifetime = unpublished.lifetime.retirement_observer();
+    let lifetime = resources.lifetime.retirement_observer();
     assert!(!lifetime.is_retired());
-    assert!(!unpublished.lifetime.actual_exit_ready().unwrap());
+    assert!(!resources.lifetime.actual_exit_ready().unwrap());
     assert!(matches!(
         f.runtime.take_step_reservation(&ticket, reservation),
         Err(DriverError::UnknownReservation)
     ));
     f.runtime.effect_completed(ticket).unwrap();
     f.drain(create);
-    f.assert_storage_paid(policy.loading);
 
-    // These are the same never-exposed empty roles. Their genuine unused
-    // revocation/report retirement/Work reaping precede either host-fee return.
-    let mut retired = false;
+    // Each exact unexposed host role revokes its own report and waits for its
+    // real Work reaper before that original role's payment is returned.
+    for (index, call) in resources.host_calls.iter().enumerate() {
+        let mut retired = false;
+        for _ in 0..64 {
+            if call.retire_unused(&f.ledger).unwrap() {
+                retired = true;
+                break;
+            }
+        }
+        assert!(retired && call.is_retired());
+        assert!(call.retire_unused(&f.ledger).unwrap());
+        assert_eq!(call.phase(), ExitRolePhase::Retired);
+        assert_eq!(resources.active.resources().unwrap(), retained_active);
+        assert_eq!(
+            f.scope.snapshot().unwrap().storage,
+            original.storage + 6 - index
+        );
+        assert_eq!(f.scope.snapshot().unwrap().work, elected.work + 6 - index);
+        assert!(!lifetime.is_retired());
+        assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
+    }
+    let mut disposal_retired = false;
     for _ in 0..64 {
-        if unpublished.retire_host_calls(&f.ledger).unwrap() {
-            retired = true;
+        if resources.disposal.retire_unused(&f.ledger).unwrap() {
+            disposal_retired = true;
             break;
         }
     }
-    assert!(retired);
-    assert!(unpublished.retire_host_calls(&f.ledger).unwrap());
-    assert!(unpublished.host_calls[0].is_retired());
-    assert_eq!(unpublished.host_calls[0].phase(), ExitRolePhase::Retired);
-    assert!(unpublished.host_call_payments.is_empty());
-    f.assert_storage_paid(policy.loading.checked_sub(host_fees).unwrap());
+    assert!(disposal_retired && resources.disposal.is_retired());
     assert_eq!(f.scope.snapshot().unwrap().storage, original.storage + 4);
     assert_eq!(f.scope.snapshot().unwrap().work, elected.work + 4);
-    assert!(!unpublished.source_partials[0].is_empty());
-    assert!(!lifetime.is_retired());
-    assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
-
-    // All four original Source holders still have their original paid storage.
-    // Revoke and reap them before the Task lifetime can actually finish.
-    retire_source_partials(&f, &mut unpublished.source_partials);
+    finish_source_routes(&f, resources.port.ingress());
     assert_eq!(f.scope.snapshot().unwrap().storage, original.storage);
     assert_eq!(f.scope.snapshot().unwrap().work, elected.work);
-    f.assert_storage_paid(retained_active);
+    assert_eq!(resources.active.resources().unwrap(), retained_active);
     assert!(!lifetime.is_retired());
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
-    unpublished.lifetime.body_exited().unwrap();
-    assert!(!unpublished.lifetime.actual_exit_ready().unwrap());
-    unpublished.lifetime.captures_exited().unwrap();
-    assert!(unpublished.lifetime.actual_exit_ready().unwrap());
+    drop(resources.port);
+    resources.lifetime.body_exited().unwrap();
+    assert!(!resources.lifetime.actual_exit_ready().unwrap());
+    resources.lifetime.captures_exited().unwrap();
+    assert!(resources.lifetime.actual_exit_ready().unwrap());
     assert!(!lifetime.is_retired());
-    f.assert_storage_paid(retained_active);
     assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 1);
     assert!(lifetime.is_retired());
-    // Work reaping is still not the explicit return of the original capacity.
-    f.assert_storage_paid(retained_active);
-    let resources = unpublished.active.resources().unwrap();
-    unpublished.active.release(&resources).unwrap();
+    // Reaping Work does not return the original resource reservation.
+    assert_eq!(resources.active.resources().unwrap(), retained_active);
+    resources
+        .active
+        .release_quota(&resources.active.resources().unwrap().quota)
+        .unwrap();
+    resources.active.finish().unwrap();
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 0);
-    f.assert_storage_paid(StorageNeed::default());
     assert_eq!(f.scope.snapshot().unwrap().work, original.work);
     assert_eq!(f.scope.snapshot().unwrap().unresolved, 0);
     assert!(f.ledger.unresolved_work().is_empty());
-    drop(unpublished);
     f.finish();
 }

@@ -30,7 +30,51 @@ fn metadata() -> RequestMetadata {
     }
 }
 fn admit_original(h: &Harness) -> (RpcAuthorAdmission, ReportSlot) {
-    let admitted = source_role(&h.fixture.scope, h.parent);
+    let generation = h.fixture.scope.gates().unwrap().generation;
+    let mut guard = h
+        .fixture
+        .scope
+        .reserve_child_next(
+            generation,
+            h.parent,
+            novarocks_control_runtime_core::capacity::ReservationResources::new(
+                ResourceVector::default(),
+                novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                    work_headers: 1,
+                    completions: 1,
+                    captures: 1,
+                    inputs: 2,
+                    batches: 2,
+                    effects: 2 * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                    replies: 1,
+                    ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
+                },
+            ),
+            WorkKind::Cleanup,
+        )
+        .unwrap();
+    let report = ReportSlot::reserve_next(
+        &mut guard,
+        generation,
+        2,
+        [
+            (
+                ConsumerId::new(1).unwrap(),
+                ConsumerKind::Owner {
+                    scope: h.fixture.scope.id(),
+                    generation,
+                },
+            ),
+            (ConsumerId::new(2).unwrap(), ConsumerKind::Observer),
+        ],
+    )
+    .unwrap();
+    let (work, capacity) = guard.bind(WorkKind::Cleanup).unwrap();
+    let admitted = AdmittedCompletionRole {
+        work,
+        capacity,
+        report,
+    };
     let report = admitted.report.clone();
     let rpc = h
         .inbox
@@ -124,6 +168,7 @@ fn rpc_sender_return_and_core_receipt_do_not_exit_or_consume_the_long_lived_main
             role,
             mut authority,
             sender,
+            input_author: _,
         },
         report,
     ) = admit_original(&h);
@@ -211,6 +256,7 @@ fn unused_unique_rpc_return_rejects_another_inbox_and_never_fabricates_an_event(
             role,
             authority,
             sender,
+            input_author: _,
         },
         report,
     ) = admit_original(&h);

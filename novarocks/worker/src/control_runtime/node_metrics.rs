@@ -18,11 +18,36 @@
 //! Read-only observations of this same Node's actual admission ledger.
 
 use crate::control_admission::Dimension;
+pub use novarocks_control_runtime::observation::{
+    CapacityRefusalKind as WorkerCapacityRefusalKind,
+    LedgerInventoryObservation as WorkerRuntimeInventory,
+    LedgerInventoryPage as WorkerRuntimeInventoryPage,
+    RuntimeObservationSnapshot as WorkerRuntimeObservationSnapshot,
+};
+pub use novarocks_control_runtime::transaction::CapacityObservationError as WorkerRuntimeObservationError;
 use novarocks_control_runtime::transaction::RuntimeLedger;
+pub use novarocks_control_runtime_core::mailbox::InputClass as WorkerRuntimeInputClass;
 
-/// Each field is independently sampled under the original ledger lock. These
-/// are actual charged units, including retained and physically exiting holders.
-/// They are neither an instantaneous cross-dimension sum nor exit receipts.
+/// The original Control Core's one published admission projection. Only the
+/// epoch field carries its existing protocol meaning; the count grants nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ControlAdmissionProjection {
+    pub epoch: novarocks_execution_contract::AdmissionEpochCapability,
+    pub logical_live_grants: usize,
+    pub admission_retention: novarocks_worker_protocol::admission::AdmissionRetentionInventory,
+    pub control_retention: novarocks_worker_protocol::control::ControlRetentionInventory,
+}
+
+/// Issued/redeemed grants remain logical-live until Core commits their terminal
+/// transition. This is a metadata count, not capacity or a physical-exit receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerAdmissionSnapshot {
+    pub logical_live_grants: u64,
+}
+
+/// Resources are independently sampled from the original ledger. Contexts
+/// count original metadata addresses, including retained actors, without a
+/// quota. These samples are neither a coherent instant nor exit receipts.
 /// Queue/running counts, Root census and limits are absent: no actual read port
 /// for those observations is inferred from these charged-resource samples.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,18 +56,16 @@ pub struct WorkerNodeMetricsSnapshot {
     pub preparing_tasks: u64,
     pub preparing_bytes: u64,
     pub requests: u64,
-    pub tickets: u64,
     pub contexts: u64,
 }
 impl WorkerNodeMetricsSnapshot {
-    pub(super) fn sample(ledger: &RuntimeLedger) -> Self {
+    pub(super) fn sample(ledger: &RuntimeLedger, contexts: usize) -> Self {
         Self {
             active_tasks: ledger.used(Dimension::ActiveTasks.id()),
             preparing_tasks: ledger.used(Dimension::PreparingTasks.id()),
             preparing_bytes: ledger.used(Dimension::PreparingBytes.id()),
             requests: ledger.used(Dimension::Requests.id()),
-            tickets: ledger.used(Dimension::Tickets.id()),
-            contexts: ledger.used(Dimension::Contexts.id()),
+            contexts: u64::try_from(contexts).expect("Context metadata count fits u64"),
         }
     }
 }
@@ -127,7 +150,6 @@ pub struct WorkerExecutionQuiescenceSnapshot {
     pub preparing_tasks: u64,
     pub preparing_bytes: u64,
     pub requests: u64,
-    pub tickets: u64,
     pub contexts_with_execution_custody: u64,
     pub root_producers_running: u64,
     pub root_data_positions: u64,
@@ -144,6 +166,7 @@ impl WorkerExecutionQuiescenceSnapshot {
     pub(super) fn sample(
         ledger: &RuntimeLedger,
         contexts_with_execution_custody: u64,
+        context_records: usize,
         root: crate::root_result_channel::RootOwnershipSnapshot,
     ) -> Option<Self> {
         let charges = ledger
@@ -153,8 +176,6 @@ impl WorkerExecutionQuiescenceSnapshot {
                     Dimension::PreparingTasks.id(),
                     Dimension::PreparingBytes.id(),
                     Dimension::Requests.id(),
-                    Dimension::Tickets.id(),
-                    Dimension::Contexts.id(),
                 ],
                 Dimension::PreparingTasks.id(),
             )
@@ -164,8 +185,7 @@ impl WorkerExecutionQuiescenceSnapshot {
             preparing_tasks: charges.used[1],
             preparing_bytes: charges.used[2],
             requests: charges.used[3],
-            tickets: charges.used[4],
-            context_records: charges.used[5],
+            context_records: u64::try_from(context_records).ok()?,
             contexts_with_execution_custody,
             root_producers_running: u64::try_from(root.producers_running).ok()?,
             root_data_positions: u64::try_from(root.data_positions).ok()?,
@@ -178,4 +198,45 @@ impl WorkerExecutionQuiescenceSnapshot {
             root_metadata_bytes: u64::try_from(root.metadata_bytes).ok()?,
         })
     }
+}
+
+/// Nonblocking original-owner observations, not a coherent instant or exit
+/// receipt. Estimates cover only documented inline fields; all indirect backing
+/// and allocator overhead remain unmeasured. No estimate is a capacity grant.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkerContextRetentionSnapshot {
+    pub compact_contexts: usize,
+    pub failed_custodians: usize,
+    pub decided_task_records: Option<usize>,
+    pub metadata_bytes_estimate: Option<usize>,
+}
+impl WorkerContextRetentionSnapshot {
+    pub(super) fn try_add(&mut self, other: Self) -> Option<()> {
+        self.compact_contexts = self.compact_contexts.checked_add(other.compact_contexts)?;
+        self.failed_custodians = self
+            .failed_custodians
+            .checked_add(other.failed_custodians)?;
+        self.decided_task_records = self
+            .decided_task_records
+            .zip(other.decided_task_records)
+            .and_then(|(a, b)| a.checked_add(b));
+        self.metadata_bytes_estimate = self
+            .metadata_bytes_estimate
+            .zip(other.metadata_bytes_estimate)
+            .and_then(|(a, b)| a.checked_add(b));
+        Some(())
+    }
+    pub(super) fn empty() -> Self {
+        Self {
+            decided_task_records: Some(0),
+            metadata_bytes_estimate: Some(0),
+            ..Self::default()
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerProtocolRetentionSnapshot {
+    pub contexts: WorkerContextRetentionSnapshot,
+    pub admission: novarocks_worker_protocol::admission::AdmissionRetentionInventory,
+    pub control: novarocks_worker_protocol::control::ControlRetentionInventory,
 }

@@ -39,6 +39,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const REQUIRED_BACKENDS: usize = 3;
+// Observation pacing matches the existing task-evidence polling cadence.
+// It never decides expiry or extends the original request/scenario deadline.
+const ADMISSION_OBSERVATION_INTERVAL: Duration = Duration::from_millis(25);
 const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
 pub(super) const HEARTBEAT_PATH: &str = "/novarocks.NovaRocksGrpc/Heartbeat";
 
@@ -308,9 +311,31 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             .timeout(Duration::from_secs(5))
             .build()?;
         let metrics_port = context.handle().runtime().be[0].http;
+        let mut admission_sample = 0usize;
+        let observation_deadline = context
+            .deadline()
+            .min(Instant::now() + Duration::from_secs(15));
+        let issued = loop {
+            if let Some(sample) = admission_observation(
+                &metrics_client,
+                context,
+                metrics_port,
+                &mut admission_sample,
+            )? {
+                break sample;
+            }
+            ensure!(
+                Instant::now() < observation_deadline,
+                "original admission observation remained unavailable"
+            );
+            thread::sleep(
+                ADMISSION_OBSERVATION_INTERVAL
+                    .min(observation_deadline.saturating_duration_since(Instant::now())),
+            );
+        };
         ensure!(
-            admission_reservation_used(&metrics_client, metrics_port)? == 1.0,
-            "the issued raw admission ticket must hold the target BE's only Worker reservation"
+            issued.logical_live_grants == 1.0,
+            "the issued raw ticket must retain its original logical grant: {issued:?}"
         );
         let establish_applied_before = context
             .handle()
@@ -405,11 +430,16 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         );
 
         // The absent-context CreateTask does not consume the admission ticket.
-        // Observe the Worker's released reservation before asking
-        // for a new ticket; rejected acquisitions remain in its replay ledger.
-        wait_for_admission_ticket_expiry(&metrics_client, context, metrics_port)?;
+        // Observe both the committed logical terminal transition and actual fee
+        // return before a new acquisition; rejected acquisitions remain replayable.
+        wait_for_admission_ticket_expiry(
+            &metrics_client,
+            context,
+            metrics_port,
+            &mut admission_sample,
+        )?;
         context.action(
-            "target BE Worker admission reservation moved from 1 to 0 before renewed acquisition",
+            "target BE original logical grant and actual ticket charge both moved from 1 to 0 before renewed acquisition",
         );
         let renewed_acquisition = raw_apply_task_operations(
             &connector,
@@ -478,43 +508,109 @@ fn wait_for_admission_ticket_expiry(
     client: &reqwest::blocking::Client,
     context: &ScenarioContext,
     port: u16,
+    sample_index: &mut usize,
 ) -> Result<()> {
     let deadline = context
         .deadline()
         .min(Instant::now() + Duration::from_secs(15));
     loop {
-        let used = admission_reservation_used(client, port)?;
-        if used == 0.0 {
+        let sample = admission_observation(client, context, port, sample_index)?;
+        if let Some(sample) = sample
+            && sample.logical_live_grants == 0.0
+        {
             return Ok(());
         }
         ensure!(
             Instant::now() < deadline,
-            "Worker did not release the admission ticket reservation before the scenario deadline; used={used}"
+            "Worker did not close the original grant before the scenario deadline; sample={sample:?}"
         );
-        thread::yield_now();
+        thread::sleep(
+            ADMISSION_OBSERVATION_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
-fn admission_reservation_used(client: &reqwest::blocking::Client, port: u16) -> Result<f64> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AdmissionObservation {
+    logical_live_grants: f64,
+}
+
+fn admission_observation(
+    client: &reqwest::blocking::Client,
+    context: &ScenarioContext,
+    port: u16,
+    sample_index: &mut usize,
+) -> Result<Option<AdmissionObservation>> {
     let url = format!("http://127.0.0.1:{port}/metrics?type=json");
-    let rows: serde_json::Value = client.get(&url).send()?.error_for_status()?.json()?;
+    let response = client.get(&url).send()?;
+    let status = response.status();
+    let body = response.bytes()?;
+    let stem = format!("admission-owner-sample-{:04}", *sample_index);
+    *sample_index = sample_index
+        .checked_add(1)
+        .context("admission sample index exhausted")?;
+    // Preserve the actual response before parsing or reporting a missing field.
+    std::fs::write(context.scenario_root().join(format!("{stem}.body")), &body)?;
+    std::fs::write(
+        context.scenario_root().join(format!("{stem}-http.json")),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"url":url,"status":status.as_u16(),"bytes":body.len()}),
+        )?,
+    )?;
+    ensure!(
+        status.is_success(),
+        "original admission metrics HTTP failed: {status}"
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&body)?;
     let rows = rows
         .as_array()
         .context("BE metrics JSON was not an array")?;
-    let mut samples = rows.iter().filter(|row| {
-        row["tags"]["metric"] == "novarocks_backend_worker_context_reservations"
-            && row["tags"]["dimension"] == "used"
-    });
-    let sample = samples
-        .next()
-        .context("BE metrics omitted Worker admission reservation usage")?;
+    let read = |metric: &str, resource: Option<&str>| -> Result<f64> {
+        let mut samples = rows.iter().filter(|row| {
+            row["tags"]["metric"] == metric
+                && resource.is_none_or(|resource| row["tags"]["resource"] == resource)
+        });
+        let sample = samples
+            .next()
+            .with_context(|| format!("BE metrics omitted {metric} {resource:?}"))?;
+        ensure!(
+            samples.next().is_none(),
+            "BE metrics duplicated {metric} {resource:?}"
+        );
+        let value = sample["value"]
+            .as_f64()
+            .context("original admission metric was not numeric")?;
+        ensure!(
+            value.is_finite()
+                && value.fract() == 0.0
+                && (0.0..=9_007_199_254_740_991.0).contains(&value),
+            "original admission metric is not an exact nonnegative integer"
+        );
+        Ok(value)
+    };
+    let available = read(
+        "novarocks_backend_worker_admission_snapshot_available",
+        None,
+    )?;
     ensure!(
-        samples.next().is_none(),
-        "BE metrics duplicated Worker admission reservation usage"
+        available == 0.0 || available == 1.0,
+        "invalid admission availability"
     );
-    sample["value"]
-        .as_f64()
-        .context("BE Worker admission reservation usage was not numeric")
+    if available == 0.0 {
+        ensure!(
+            !rows
+                .iter()
+                .any(|row| row["tags"]["metric"] == "novarocks_backend_worker_admission"),
+            "unavailable admission sample retained stale fields"
+        );
+        return Ok(None);
+    }
+    Ok(Some(AdmissionObservation {
+        logical_live_grants: read(
+            "novarocks_backend_worker_admission",
+            Some("logical_live_grants"),
+        )?,
+    }))
 }
 
 impl Scenario for OtherIslandHardCut {
@@ -950,7 +1046,25 @@ fn assert_other_island_admission_cut(
         .timeout(Duration::from_secs(5))
         .build()?;
     let metrics_port = context.handle().runtime().be[2].http;
-    let reservations_before = admission_reservation_used(&metrics_client, metrics_port)?;
+    let mut sample_index = 0;
+    let mut observe_admission = || -> Result<AdmissionObservation> {
+        loop {
+            if let Some(sample) =
+                admission_observation(&metrics_client, context, metrics_port, &mut sample_index)?
+            {
+                return Ok(sample);
+            }
+            ensure!(
+                Instant::now() < context.deadline(),
+                "OtherIsland admission observation remained unavailable"
+            );
+            thread::sleep(
+                ADMISSION_OBSERVATION_INTERVAL
+                    .min(context.deadline().saturating_duration_since(Instant::now())),
+            );
+        }
+    };
+    let reservations_before = observe_admission()?;
     let response = raw_apply_task_operations(
         &connector,
         &authorization,
@@ -972,7 +1086,7 @@ fn assert_other_island_admission_cut(
         "rejected admission must not issue a ticket"
     );
     ensure!(
-        admission_reservation_used(&metrics_client, metrics_port)? == reservations_before,
+        observe_admission()? == reservations_before,
         "OtherIsland rejection must not acquire a Worker reservation"
     );
     context

@@ -48,12 +48,40 @@ pub use novarocks_worker_protocol::{
     lease::MonotonicInstant as WorkerMonotonicInstant,
 };
 
+/// The original admitted transport responsibility, not a new request permit.
+/// Trusted role composition implements this only for admission bookkeeping:
+/// Drop may return scheduler credits, but must perform no I/O, user callback,
+/// or destruction of a rich input. Rich inputs have their separate host job.
+pub trait WorkerIngressBacking: Send + Sync + 'static {}
+
+/// One validated batch item's responsibility for its original ingress owner.
+/// Sharing the underlying owner grants neither another Native permit nor
+/// another item; only the bounded ingress projection constructs these values.
+/// The wrapper is deliberately not Clone and has no empty/default form.
+pub struct WorkerIngressResponsibility {
+    _original: Arc<dyn WorkerIngressBacking>,
+}
+impl WorkerIngressResponsibility {
+    pub fn from_admitted(original: Arc<dyn WorkerIngressBacking>) -> Self {
+        Self {
+            _original: original,
+        }
+    }
+}
+impl fmt::Debug for WorkerIngressResponsibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkerIngressResponsibility")
+            .finish_non_exhaustive()
+    }
+}
+
 /// A clone shares the same original node, directory, identity issuer and
 /// admitted owners. It creates neither a registry nor an alternate driver.
 #[derive(Clone)]
 pub struct WorkerTaskControl {
     node: Arc<WorkerNodeHost>,
     clock: Arc<dyn crate::WorkerMonotonicClock>,
+    backend: novarocks_types::BackendProcessId,
 }
 impl crate::WorkerAdmissionEpochAuthority for WorkerTaskControl {
     fn admission_epoch_capability(&self) -> novarocks_execution_contract::AdmissionEpochCapability {
@@ -71,9 +99,6 @@ impl WorkerRequestRefusal {
     pub fn stage(&self) -> &'static str {
         self.original.operation
     }
-    pub(crate) fn into_original(self) -> NodeHostRefusal {
-        ManuallyDrop::into_inner(self.original)
-    }
 }
 impl fmt::Debug for WorkerRequestRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -85,8 +110,9 @@ impl fmt::Debug for WorkerRequestRefusal {
 #[derive(Debug)]
 pub enum WorkerRequestError {
     HandoffRefused(WorkerRequestRefusal),
-    /// The same original observer failed; this does not overwrite an already
-    /// committed pure business verdict or report a physical author exit.
+    /// The actual request owner failed before admission or its same original
+    /// reply observer failed. Existing commitments and physical exits remain
+    /// independently owned facts.
     OwnerFailed,
 }
 impl fmt::Display for WorkerRequestError {
@@ -97,7 +123,7 @@ impl fmt::Display for WorkerRequestError {
                 "original Worker handoff was refused at {}",
                 refusal.stage()
             ),
-            Self::OwnerFailed => f.write_str("the original Worker reply observer failed"),
+            Self::OwnerFailed => f.write_str("the original Worker request owner failed"),
         }
     }
 }
@@ -107,6 +133,14 @@ impl From<NodeHostRefusal> for WorkerRequestError {
         Self::HandoffRefused(WorkerRequestRefusal {
             original: ManuallyDrop::new(original),
         })
+    }
+}
+impl From<super::node::NodeRequestRefusal> for WorkerRequestError {
+    fn from(original: super::node::NodeRequestRefusal) -> Self {
+        match original {
+            super::node::NodeRequestRefusal::OwnerFailed => Self::OwnerFailed,
+            super::node::NodeRequestRefusal::Invariant(original) => original.into(),
+        }
     }
 }
 /// Borrow only the original complete Core decision. Keeping this value keeps
@@ -178,14 +212,31 @@ impl WorkerTaskDelivery {
         self.original.body()
     }
 }
+/// An admitted cancellation retains its exact original R delivery. A lookup
+/// refusal is only a neutral pre-admission fact and owns no replacement R.
+#[must_use = "Project the original cancellation decision without discarding its delivery"]
+pub enum WorkerCancelOutcome {
+    Task(WorkerTaskDelivery),
+    Context(WorkerContextDelivery),
+    Refused {
+        operation: TaskOperationId,
+        reason: novarocks_worker_protocol::context::TaskControlRefusal,
+    },
+}
+
 impl WorkerTaskControl {
     /// Process composition is the only constructor. Numeric source/payload
     /// addresses below all come from this same original node's checked issuer.
     pub(crate) fn from_node(
         node: Arc<WorkerNodeHost>,
         clock: Arc<dyn crate::WorkerMonotonicClock>,
+        backend: novarocks_types::BackendProcessId,
     ) -> Self {
-        Self { node, clock }
+        Self {
+            node,
+            clock,
+            backend,
+        }
     }
 
     pub fn now(&self) -> WorkerMonotonicInstant {
@@ -197,8 +248,11 @@ impl WorkerTaskControl {
         context: QueryContextRef,
         original: novarocks_execution_contract::UpdateTask,
         deadline: WorkerMonotonicInstant,
+        ingress: WorkerIngressResponsibility,
     ) -> Result<WorkerTaskDelivery, WorkerRequestError> {
-        let handle = self.node.submit_task_domain(context, original, deadline)?;
+        let handle = self
+            .node
+            .submit_task_domain(context, original, deadline, ingress)?;
         let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
         Ok(WorkerTaskDelivery { original })
     }
@@ -206,8 +260,11 @@ impl WorkerTaskControl {
         &self,
         original: novarocks_execution_contract::AdvanceQueryContextDomain,
         deadline: WorkerMonotonicInstant,
+        ingress: WorkerIngressResponsibility,
     ) -> Result<WorkerContextDelivery, WorkerRequestError> {
-        let handle = self.node.submit_context_domain(original, deadline)?;
+        let handle = self
+            .node
+            .submit_context_domain(original, deadline, ingress)?;
         let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
         Ok(WorkerContextDelivery {
             evidence: None,
@@ -257,21 +314,26 @@ impl WorkerTaskControl {
 
     pub async fn cancel(
         &self,
-        context: QueryContextRef,
         request: novarocks_execution_contract::CancelTask,
         deadline: WorkerMonotonicInstant,
-    ) -> Result<WorkerTaskDelivery, WorkerRequestError> {
-        let handle = self.node.submit_task_command(
-            context,
-            request.envelope().operation_id(),
-            deadline,
-            ContextCommand::Cancel {
-                task: request.identity(),
-                reason: request.reason(),
-            },
-        )?;
-        let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
-        Ok(WorkerTaskDelivery { original })
+    ) -> Result<WorkerCancelOutcome, WorkerRequestError> {
+        let operation = request.envelope().operation_id();
+        match self.node.submit_cancel_task(request, deadline)? {
+            super::node::NodeCancelHandle::Task(handle) => {
+                let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
+                Ok(WorkerCancelOutcome::Task(WorkerTaskDelivery { original }))
+            }
+            super::node::NodeCancelHandle::Context(handle) => {
+                let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
+                Ok(WorkerCancelOutcome::Context(WorkerContextDelivery {
+                    evidence: None,
+                    original,
+                }))
+            }
+            super::node::NodeCancelHandle::Refused(reason) => {
+                Ok(WorkerCancelOutcome::Refused { operation, reason })
+            }
+        }
     }
 
     pub async fn acquire(
@@ -311,6 +373,7 @@ impl WorkerTaskControl {
         input: TaskCreationInput,
         ingress_retained_bytes: usize,
         deadline: WorkerMonotonicInstant,
+        ingress: WorkerIngressResponsibility,
     ) -> Result<WorkerCreateDelivery, WorkerRequestError> {
         let payload = TaskCreatePayload {
             id: self.node.next_payload(),
@@ -320,9 +383,9 @@ impl WorkerTaskControl {
         };
         // Node constructs the actual TaskHostBinding from its own held
         // Context, original runtime generation, ports and identity issuer.
-        let handle = self
-            .node
-            .submit_task_create(self.node.next_source(), deadline, payload)?;
+        let handle =
+            self.node
+                .submit_task_create(self.node.next_source(), deadline, payload, ingress)?;
         match handle {
             NodeCreateHandle::Context(handle) => {
                 let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
@@ -456,6 +519,11 @@ impl WorkerTaskControl {
         deadline: WorkerMonotonicInstant,
         request: &RootResultRead,
     ) -> Result<WorkerRootRead, WorkerRootReadError> {
+        if request.root_task().backend_process_id() != self.backend {
+            return Err(WorkerRootReadError::from_original(
+                RootReadError::ForeignProcess,
+            ));
+        }
         let original = self
             .node
             .begin_root_read(
@@ -474,6 +542,11 @@ impl WorkerTaskControl {
         deadline: WorkerMonotonicInstant,
         request: &RootResultRead,
     ) -> Result<WorkerRootRead, WorkerRootReadError> {
+        if request.root_task().backend_process_id() != self.backend {
+            return Err(WorkerRootReadError::from_original(
+                RootReadError::ForeignProcess,
+            ));
+        }
         let context = self
             .node
             .task_context(request.root_task())
@@ -486,6 +559,7 @@ impl WorkerTaskControl {
 /// receipt, and an admission refusal is not a fabricated channel verdict.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerRootReadErrorKind {
+    ForeignProcess,
     UnknownContext,
     ContextRemoved,
     AdmissionRefused,
@@ -495,7 +569,6 @@ pub enum WorkerRootReadErrorKind {
     UnknownTask,
     Capacity,
     WrongOwner,
-    BodyFailed,
 }
 #[derive(Debug)]
 pub struct WorkerRootReadError {
@@ -508,6 +581,7 @@ impl WorkerRootReadError {
     fn from_original(original: RootReadError) -> Self {
         use super::task::TaskRootReadError;
         let kind = match &original {
+            RootReadError::ForeignProcess => WorkerRootReadErrorKind::ForeignProcess,
             RootReadError::UnknownContext => WorkerRootReadErrorKind::UnknownContext,
             RootReadError::ContextRemoved => WorkerRootReadErrorKind::ContextRemoved,
             RootReadError::Request(_) => WorkerRootReadErrorKind::AdmissionRefused,
@@ -515,18 +589,24 @@ impl WorkerRootReadError {
                 TaskRootReadError::NotInstalled | TaskRootReadError::OwnerNotReady,
             ) => WorkerRootReadErrorKind::TaskNotReady,
             RootReadError::Task(TaskRootReadError::NoRoot) => WorkerRootReadErrorKind::NoRoot,
-            RootReadError::Task(TaskRootReadError::Channel(_)) | RootReadError::Channel(_) => {
-                WorkerRootReadErrorKind::Channel
-            }
+            RootReadError::Task(TaskRootReadError::Channel(_))
+            | RootReadError::Channel(_)
+            | RootReadError::Closed { .. } => WorkerRootReadErrorKind::Channel,
             RootReadError::UnknownTask => WorkerRootReadErrorKind::UnknownTask,
             RootReadError::Capacity(_) => WorkerRootReadErrorKind::Capacity,
             RootReadError::WrongOwner => WorkerRootReadErrorKind::WrongOwner,
-            RootReadError::BodyFailed => WorkerRootReadErrorKind::BodyFailed,
         };
         Self { kind, original }
     }
     pub fn kind(&self) -> WorkerRootReadErrorKind {
         self.kind
+    }
+    /// The original sealed channel's applied ACK frontier, without a new read.
+    pub fn closed_frontier(&self) -> Option<u64> {
+        match &self.original {
+            RootReadError::Closed { accepted_consumed } => Some(*accepted_consumed),
+            _ => None,
+        }
     }
     pub fn channel_error(&self) -> Option<RootChannelError> {
         match &self.original {
@@ -568,6 +648,10 @@ impl novarocks_execution_contract::failure::FailureProjection for WorkerRootRead
         use novarocks_control_runtime_core::capacity::CapacityError;
         use novarocks_execution_contract::failure::{FailureClass, FailureFact};
         let (class, reason) = match &self.original {
+            RootReadError::ForeignProcess => (FailureClass::Data, R::RootReadIdentity),
+            RootReadError::Closed { .. } => {
+                return RootChannelError::Closed.failure_fact();
+            }
             RootReadError::Channel(error)
             | RootReadError::Task(TaskRootReadError::Channel(error)) => {
                 return error.failure_fact();
@@ -591,10 +675,7 @@ impl novarocks_execution_contract::failure::FailureProjection for WorkerRootRead
             RootReadError::Request(original) => match &original.error {
                 ContextRequestError::Runtime(RuntimeError::Capacity(CapacityError::Exhausted(
                     _,
-                )))
-                | ContextRequestError::RootReadCapacity => {
-                    (FailureClass::Resource, R::RootControlReadCapacity)
-                }
+                ))) => (FailureClass::Resource, R::RootControlReadCapacity),
                 ContextRequestError::AdmissionClosed => {
                     (FailureClass::Control, R::RootControlReadAdmission)
                 }
@@ -604,9 +685,7 @@ impl novarocks_execution_contract::failure::FailureProjection for WorkerRootRead
                 }
                 _ => (FailureClass::Invariant, R::ProtocolOwnerFailed),
             },
-            RootReadError::WrongOwner | RootReadError::BodyFailed => {
-                (FailureClass::Invariant, R::ProtocolOwnerFailed)
-            }
+            RootReadError::WrongOwner => (FailureClass::Invariant, R::ProtocolOwnerFailed),
         };
         FailureFact::new(class, reason.reason())
     }
@@ -952,6 +1031,34 @@ impl WorkerTaskControl {
     ) -> Option<super::node_metrics::WorkerControlPlaneSnapshot> {
         self.node.try_control_plane_snapshot()
     }
+    /// Cumulative original-owner diagnostics. These independently sampled
+    /// counters are neither a coherent instant nor a capacity/exit receipt.
+    pub fn runtime_observation_snapshot(
+        &self,
+    ) -> Option<super::node_metrics::WorkerRuntimeObservationSnapshot> {
+        self.node.runtime_observation_snapshot()
+    }
+    /// Advance at most `budget` original inventory records without blocking.
+    /// Only a completing page carries a fresh interval; no cached inventory
+    /// is supplied for busy or incomplete traversals.
+    pub fn try_runtime_inventory_page(
+        &self,
+        budget: usize,
+    ) -> Result<
+        Option<super::node_metrics::WorkerRuntimeInventoryPage>,
+        super::node_metrics::WorkerRuntimeObservationError,
+    > {
+        self.node.try_runtime_inventory_page(budget)
+    }
+}
+
+impl WorkerTaskControl {
+    /// Nonblocking original admission projection and actual ticket charges.
+    /// Logical closure does not prove the physical ticket fee has returned.
+    /// Missing, busy, poisoned or overflowing samples return None as a whole.
+    pub fn try_admission_snapshot(&self) -> Option<super::node_metrics::WorkerAdmissionSnapshot> {
+        self.node.try_admission_snapshot()
+    }
 }
 
 impl WorkerTaskControl {
@@ -962,5 +1069,15 @@ impl WorkerTaskControl {
         &self,
     ) -> Option<super::node_metrics::WorkerExecutionQuiescenceSnapshot> {
         self.node.try_execution_quiescence_snapshot()
+    }
+}
+
+impl WorkerTaskControl {
+    /// Original retained owners, sampled without waiting for any owner lock.
+    /// Missing/busy/poisoned census omits the sample, never substitutes zero.
+    pub fn try_protocol_retention_snapshot(
+        &self,
+    ) -> Option<super::node_metrics::WorkerProtocolRetentionSnapshot> {
+        self.node.try_protocol_retention_snapshot()
     }
 }

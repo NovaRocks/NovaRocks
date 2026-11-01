@@ -15,20 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One prepaid, coalesced internal control wake. The Core chooses its next
-//! bounded continuation from its own state; the host owns no operation queue.
+//! One original internal input serializes coalesced control hints and original
+//! failed-Context lifecycle facts. No Context prepays Work for this source.
+
+mod lifecycle;
+use lifecycle::{InFlightLifecycle, PendingLifecycle};
+pub(crate) use lifecycle::{RootLifecycleConsumption, RootLifecycleFact, RootLifecycleReceipt};
 
 use super::{
     actors::{ControlMessage, WorkerAction, WorkerActor, WorkerMessage},
+    context_ready::ContextReadyNotice,
     process_control::ProcessControlOwner,
 };
 use crate::control_runtime_policy::StorageNeed;
 use novarocks_control_runtime::{
     driver::{
-        ActorRegistration, ActorRuntime, DriverError, EffectTicket, InputPermit, InputRole,
-        TimerSourceState,
+        ActorFailureProof, ActorRegistration, ActorRuntime, DriverError, EffectTicket, InputPermit,
+        InputPhase, InputRole, TimerSourceState,
     },
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeError, RuntimeLedger},
 };
 use novarocks_control_runtime_core::{
@@ -37,6 +42,8 @@ use novarocks_control_runtime_core::{
     scope::{WorkAdmission, WorkKind},
 };
 use novarocks_worker_protocol::control::{ControlCore, ControlEffect, ControlInput};
+use novarocks_worker_protocol::retention::ContextRetirementIdentity;
+use std::collections::VecDeque;
 
 pub(crate) const CONTROL_INTERNAL_STORAGE: StorageNeed = StorageNeed {
     requests: 0,
@@ -50,16 +57,56 @@ pub(crate) const CONTROL_INTERNAL_STORAGE: StorageNeed = StorageNeed {
     completions: 0,
 };
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControlInternalError {
     Runtime(RuntimeError),
     Driver(DriverError),
     WrongEffect,
+    WrongOwner,
     NotEnabled,
     AlreadyAdmitted,
+    #[cfg(test)]
     TimerStillOpen,
+    #[cfg(test)]
     Pending,
     Closed,
+}
+impl std::fmt::Display for ControlInternalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runtime(error) => write!(f, "Control internal role operation failed: {error}"),
+            Self::Driver(error) => write!(
+                f,
+                "Control internal input or effect operation failed: {error}"
+            ),
+            Self::WrongEffect => f.write_str("Control internal source received the wrong effect"),
+            Self::WrongOwner => {
+                f.write_str("Control internal source does not belong to the original owner")
+            }
+            Self::NotEnabled => f.write_str("Control internal source is not enabled"),
+            Self::AlreadyAdmitted => f.write_str("Control internal source was already admitted"),
+            #[cfg(test)]
+            Self::TimerStillOpen => f.write_str("Control internal timer source has not closed"),
+            #[cfg(test)]
+            Self::Pending => f.write_str("Control internal source still owns a pending input"),
+            Self::Closed => f.write_str("Control internal source is closed"),
+        }
+    }
+}
+impl std::error::Error for ControlInternalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(error) => Some(error),
+            Self::Driver(error) => Some(error),
+            Self::WrongEffect
+            | Self::WrongOwner
+            | Self::NotEnabled
+            | Self::AlreadyAdmitted
+            | Self::Closed => None,
+            #[cfg(test)]
+            Self::TimerStillOpen | Self::Pending => None,
+        }
+    }
 }
 
 /// Only these same never-filled originals can take unused teardown. A bound
@@ -67,7 +114,7 @@ pub(crate) enum ControlInternalError {
 #[must_use = "Retain the original partially admitted internal source"]
 pub(crate) struct ControlInternalPartial {
     pub work: WorkLease,
-    pub capacity: CapacityBundle,
+    pub capacity: ReservationBundle,
     pub permit: Option<InputPermit<WorkerActor>>,
     pub role: Option<InputRole<WorkerActor>>,
 }
@@ -98,11 +145,14 @@ pub(crate) struct ControlInternal {
     registration: ActorRegistration,
     actor: ActorId,
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     role: InputRole<WorkerActor>,
     pending: bool,
     process_drain_pending: bool,
     ingress_closed_pending: bool,
+    lifecycle_pending: VecDeque<PendingLifecycle>,
+    lifecycle_in_flight: Option<InFlightLifecycle>,
+    lifecycle_turn: bool,
     body_exited: bool,
     captures_exited: bool,
     role_closed: bool,
@@ -181,6 +231,9 @@ impl ControlInternal {
             pending: false,
             process_drain_pending: false,
             ingress_closed_pending: false,
+            lifecycle_pending: VecDeque::new(),
+            lifecycle_in_flight: None,
+            lifecycle_turn: true,
             body_exited: false,
             captures_exited: false,
             role_closed: false,
@@ -208,6 +261,96 @@ impl ControlInternal {
         self.runtime
             .notify_host_actor(&self.registration)
             .map_err(ControlInternalError::Driver)
+    }
+
+    /// Transfer one original failed owner's neutral fact to this process's
+    /// existing input source. Failure proof and actual bindings qualify the
+    /// sender; the receipt does not sign execution exit or another deadline.
+    pub(crate) fn enqueue_failed_lifecycle(
+        &mut self,
+        proof: &ActorFailureProof,
+        fact: RootLifecycleFact,
+        notice: ContextReadyNotice,
+    ) -> Result<RootLifecycleReceipt, ControlInternalError> {
+        if self.role_closed || self.body_exited {
+            return Err(ControlInternalError::Closed);
+        }
+        self.runtime
+            .validate_registration(&self.registration)
+            .map_err(ControlInternalError::Driver)?;
+        let retirement = fact.retirement().ok_or(ControlInternalError::WrongOwner)?;
+        let actual = self
+            .runtime
+            .failure_proof_for(proof.registration())
+            .map_err(ControlInternalError::Driver)?;
+        if actual.initial_epoch() != proof.initial_epoch()
+            || actual.failed_epoch() != proof.failed_epoch()
+            || !actual
+                .registration()
+                .same_registration(proof.registration())
+            || proof.registration().actor() == self.actor
+            || !proof.registration().retained_in_process(self.work.scope())
+            || !notice.matches_registration(&self.runtime, proof.registration())
+            || notice.context() != fact.context()
+            || !retirement.is_valid()
+        {
+            return Err(ControlInternalError::WrongOwner);
+        }
+        if let ContextRetirementIdentity::OwnerFailure {
+            actor,
+            initial_epoch,
+            failed_epoch,
+        } = retirement
+            && (actor != proof.registration().actor()
+                || initial_epoch != proof.initial_epoch()
+                || failed_epoch != proof.failed_epoch())
+        {
+            return Err(ControlInternalError::WrongOwner);
+        }
+        // Root's owner lock serializes this insertion with its real host
+        // turn. Mark before the infallible move so a refused wake retains no
+        // hidden accepted fact and a released caller cannot lose the notice.
+        self.runtime
+            .notify_host_actor(&self.registration)
+            .map_err(ControlInternalError::Driver)?;
+        let (original, receipt) = PendingLifecycle::new(fact, notice, &self.registration);
+        self.lifecycle_pending.push_back(original);
+        Ok(receipt)
+    }
+
+    /// Called only by the original removal owner after its forget child and
+    /// directory/actor removal. The subject keeps that owner alive through the
+    /// receipt, while this existing Source alone pays the actual Root input.
+    pub(crate) fn enqueue_host_removed(
+        &mut self,
+        original: &WorkLease,
+        context: novarocks_execution_contract::QueryContextRef,
+    ) -> Result<RootLifecycleReceipt, ControlInternalError> {
+        if self.role_closed || self.body_exited {
+            return Err(ControlInternalError::Closed);
+        }
+        self.runtime
+            .validate_registration(&self.registration)
+            .map_err(ControlInternalError::Driver)?;
+        if !self.registration.matches_scope(original.scope()) {
+            return Err(ControlInternalError::WrongOwner);
+        }
+        self.runtime
+            .validate_work_author(&self.registration, original)
+            .map_err(ControlInternalError::Driver)?;
+        let fact = RootLifecycleFact::HostRemoved {
+            context,
+            subject: original.reference(),
+        };
+        // Notify before transferring the single neutral fact. A refused wake
+        // leaves the original caller's owner and its unregistered fact intact.
+        self.runtime
+            .notify_host_actor(&self.registration)
+            .map_err(ControlInternalError::Driver)?;
+        let (pending, receipt) =
+            PendingLifecycle::for_root(fact, &self.runtime, &self.registration);
+        self.lifecycle_pending.push_back(pending);
+        Ok(receipt)
     }
 
     /// Acceptance moves only a known scheduling hint into its paid bool cell.
@@ -252,20 +395,63 @@ impl ControlInternal {
             .in_flight()
             .map_err(ControlInternalError::Driver)?
         {
+            if let Some(original) = &self.lifecycle_in_flight {
+                if original.input != input {
+                    return Err(ControlInternalError::WrongOwner);
+                }
+                let custody = self
+                    .runtime
+                    .input_custody(self.actor, input)
+                    .map_err(ControlInternalError::Driver)?
+                    .ok_or(ControlInternalError::WrongOwner)?;
+                if custody.role != Some(self.role.id())
+                    || custody.source != self.actor
+                    || custody.class != InputClass::Control
+                    || custody.runtime_metadata
+                {
+                    return Err(ControlInternalError::WrongOwner);
+                }
+                match custody.phase {
+                    InputPhase::Committed => original.original.consumed(input)?,
+                    InputPhase::AbandonedByOwnerFailure => {
+                        return Err(ControlInternalError::Driver(DriverError::ActorFailed));
+                    }
+                    _ => {}
+                }
+            }
             match self.runtime.retire_input(self.actor, input) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if let Some(original) = &self.lifecycle_in_flight {
+                        original.original.retired(input)?;
+                        self.lifecycle_in_flight = None;
+                    }
+                }
                 Err(
                     DriverError::InputStillQueued
                     | DriverError::EffectsRemain
-                    | DriverError::ReservationsRemain,
+                    | DriverError::ReservationsRemain
+                    | DriverError::MetadataStillPending,
                 ) => return Ok(InternalAdvance::Waiting(input)),
                 Err(error) => return Err(ControlInternalError::Driver(error)),
             }
+        } else if self.lifecycle_in_flight.is_some() {
+            return Err(ControlInternalError::WrongOwner);
         }
+        let lifecycle = !self.lifecycle_pending.is_empty()
+            && (!self.pending || self.lifecycle_turn)
+            && !self.process_drain_pending
+            && !self.ingress_closed_pending;
+        let mut selected = if lifecycle {
+            self.lifecycle_pending.pop_front()
+        } else {
+            None
+        };
         let command = if self.process_drain_pending {
             ControlInput::ProcessDrain
         } else if self.ingress_closed_pending {
             ControlInput::ProcessIngressClosed
+        } else if let Some(original) = &selected {
+            original.fact.into_command()
         } else if self.pending {
             ControlInput::NextInternal
         } else {
@@ -274,26 +460,41 @@ impl ControlInternal {
         let process_drain = matches!(&command, ControlInput::ProcessDrain);
         let ingress_closed = matches!(&command, ControlInput::ProcessIngressClosed);
         let message = WorkerMessage::Control(ControlMessage::Command {
-            work: self.work.id(),
+            work: self.work.reference(),
             request: None,
             command,
         });
         let input = match self.role.fill(message) {
             Ok(input) => input,
-            Err((error, _same_neutral_hint)) => return Err(ControlInternalError::Driver(error)),
+            Err((error, _same_neutral_command)) => {
+                if let Some(original) = selected.take() {
+                    self.lifecycle_pending.push_front(original);
+                }
+                return Err(ControlInternalError::Driver(error));
+            }
         };
-        if process_drain {
+        if let Some(original) = selected {
+            self.lifecycle_in_flight = Some(InFlightLifecycle { input, original });
+            self.lifecycle_in_flight
+                .as_ref()
+                .expect("same original lifecycle source")
+                .original
+                .submitted(input)?;
+            self.lifecycle_turn = false;
+        } else if process_drain {
             self.process_drain_pending = false;
         } else if ingress_closed {
             self.ingress_closed_pending = false;
         } else {
             self.pending = false;
+            self.lifecycle_turn = true;
         }
         Ok(InternalAdvance::Submitted(input))
     }
 
     /// Component callers retain the original owner when a bounded closing
     /// step still has ready metadata to reap.
+    #[cfg(test)]
     pub(crate) fn close_after_drain(&mut self) -> Result<(), ControlInternalError> {
         if self
             .runtime
@@ -303,7 +504,12 @@ impl ControlInternal {
         {
             return Err(ControlInternalError::TimerStillOpen);
         }
-        if self.pending || self.process_drain_pending || self.ingress_closed_pending {
+        if self.pending
+            || self.process_drain_pending
+            || self.ingress_closed_pending
+            || !self.lifecycle_pending.is_empty()
+            || self.lifecycle_in_flight.is_some()
+        {
             return Err(ControlInternalError::Pending);
         }
         if self.advance_close_after_drain()? {
@@ -325,6 +531,8 @@ impl ControlInternal {
             || self.pending
             || self.process_drain_pending
             || self.ingress_closed_pending
+            || !self.lifecycle_pending.is_empty()
+            || self.lifecycle_in_flight.is_some()
         {
             return Ok(false);
         }
@@ -374,12 +582,8 @@ impl ControlInternal {
             }
         }
         if !self.capacity.is_released() {
-            let resources = self
-                .capacity
-                .resources()
-                .map_err(ControlInternalError::Runtime)?;
             self.capacity
-                .release(&resources)
+                .finish()
                 .map_err(ControlInternalError::Runtime)?;
         }
         Ok(true)

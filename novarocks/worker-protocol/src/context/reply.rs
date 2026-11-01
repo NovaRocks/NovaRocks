@@ -150,9 +150,19 @@ impl ContextRequestSettlement {
 mod tests {
     use super::*;
     use crate::lease::MonotonicInstant;
-    use novarocks_control_runtime_core::identity::InputId;
+    use novarocks_control_runtime_core::identity::{InputId, ScopeId, ScopedWorkRef, WorkId};
     use novarocks_execution_contract::{DomainProgression, TaskOperationId, TaskState};
     use std::time::Duration;
+
+    // One explicit model process owns these requests. The fixture's non-reused
+    // input issuance ordinal also names its original R Work; this is plain protocol
+    // metadata and cannot create runtime Work, capacity or an InputAuthor proof.
+    fn model_request_author(token: InputId) -> ScopedWorkRef {
+        ScopedWorkRef {
+            scope: ScopeId::new(1).expect("the model process Scope"),
+            work: WorkId::new(token.get()).expect("the original model request ordinal"),
+        }
+    }
 
     fn operation() -> TaskOperationId {
         let mut bytes = [71; 16];
@@ -224,6 +234,7 @@ mod tests {
     #[test]
     fn settlement_result_is_derived_from_its_same_body_and_keeps_the_original_request() {
         let request = RequestContext {
+            author: model_request_author(InputId::new(41).unwrap()),
             token: InputId::new(41).unwrap(),
             operation: operation(),
             deadline: MonotonicInstant::from_origin(Duration::from_nanos(43)),

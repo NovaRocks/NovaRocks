@@ -23,10 +23,13 @@ use crate::{
     sync::{Arc, Mutex},
 };
 use novarocks_control_runtime_core::{
-    capacity::{CapacityError, CapacityLedger, ReservationRequest, ResourceVector},
+    capacity::{
+        CapacityError, CapacityLedger, ReservationRequest, ReservationResources, ResourceVector,
+    },
     completion::CompletionError,
-    history::HistoryFact,
-    identity::{DimensionId, Generation, ReservationId, ScopeId, SlotId, WorkId},
+    history::{CapacityHistoryRefusal, CapacityHistoryRequest, HistoryFact},
+    identity::{DimensionId, Generation, ReservationId, ScopeId, ScopedWorkRef, SlotId, WorkId},
+    owned_storage::{OwnedSlotKind, OwnedStorageError},
     scope::{ScopeError, ScopeState, WorkAdmission, WorkKind},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,14 +48,19 @@ pub enum RuntimeError {
     CapacityDenied(CapacityDenial),
     Scope(ScopeError),
     Completion(CompletionError),
+    OwnedStorage(OwnedStorageError),
     UnknownScope,
-    ScopeCapacity,
     DuplicateScope,
     UnknownSlot,
     DuplicateSlot,
     ScopeNotRetired,
     UnresolvedWork,
     IdentityExhausted,
+}
+impl From<OwnedStorageError> for RuntimeError {
+    fn from(value: OwnedStorageError) -> Self {
+        Self::OwnedStorage(value)
+    }
 }
 impl From<CapacityError> for RuntimeError {
     fn from(value: CapacityError) -> Self {
@@ -79,18 +87,78 @@ impl std::error::Error for RuntimeError {}
 pub(crate) struct LedgerState {
     pub(crate) ledger: CapacityLedger,
     pub(crate) scopes: BTreeMap<ScopeId, ScopeState>,
-    pub(crate) slots: BTreeMap<SlotId, novarocks_control_runtime_core::completion::CompletionSlot>,
+    pub(crate) slots: BTreeMap<SlotId, crate::completion::ReportRecord>,
     pub(crate) unresolved: BTreeSet<(ScopeId, WorkId)>,
     unresolved_by_scope: BTreeMap<ScopeId, usize>,
     pub(crate) abandoned_bundles: BTreeSet<ReservationId>,
     pub(crate) pending_retirement: BTreeSet<(ScopeId, WorkId)>,
+    pub(crate) header_readiness:
+        BTreeMap<(ScopeId, WorkId), crate::header_readiness::HeaderBinding>,
     parent_links: BTreeMap<ScopeId, (ScopeId, WorkId)>,
-    max_scopes: usize,
     last_scope: u64,
     last_slot: u64,
     external_open: bool,
 }
 impl LedgerState {
+    fn history_parent(&self, scope: ScopeId, work: WorkId) -> Option<ScopedWorkRef> {
+        self.scopes
+            .get(&scope)
+            .expect("the actual admitted Scope")
+            .work(work)
+            .expect("the actual admitted Work")
+            .parent
+            .map(|work| ScopedWorkRef { scope, work })
+    }
+    /// Validate the real direct parent and both scopes before a delayed child
+    /// begins business. Caller starts that same child under this ledger lock.
+    pub(crate) fn validate_parent_start(
+        &self,
+        child: ScopeId,
+        parent: ScopeId,
+        generation: Generation,
+    ) -> Result<(), RuntimeError> {
+        let child_scope = self.scopes.get(&child).ok_or(RuntimeError::UnknownScope)?;
+        let (owner, link) = self
+            .parent_links
+            .get(&child)
+            .copied()
+            .ok_or(CapacityError::WrongOwner)?;
+        if owner != parent || child_scope.parent() != Some(parent) {
+            return Err(CapacityError::WrongOwner.into());
+        }
+        let parent_scope = self.scopes.get(&parent).ok_or(RuntimeError::UnknownScope)?;
+        if parent_scope.generation() != generation {
+            return Err(ScopeError::GenerationMismatch.into());
+        }
+        if parent_scope.failed() || child_scope.failed() {
+            return Err(ScopeError::Failed.into());
+        }
+        if parent_scope.stopped() || child_scope.stopped() {
+            return Err(ScopeError::Stopped.into());
+        }
+        let record = parent_scope.work(link).ok_or(ScopeError::UnknownWork)?;
+        for work in [Some(link), record.parent].into_iter().flatten() {
+            let original = parent_scope.work(work).ok_or(ScopeError::UnknownWork)?;
+            if original.unbound_guard || original.body_exited || original.captures_exited {
+                return Err(ScopeError::InvalidTransition.into());
+            }
+            if self.unresolved.contains(&(parent, work)) {
+                return Err(RuntimeError::UnresolvedWork);
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn note_header_ready(&mut self, scope: ScopeId, work: WorkId) {
+        self.pending_retirement.insert((scope, work));
+        if let Some(binding) = self.header_readiness.get(&(scope, work)) {
+            binding.ready();
+        }
+    }
+    fn note_header_retired(&self, scope: ScopeId, work: WorkId) {
+        if let Some(binding) = self.header_readiness.get(&(scope, work)) {
+            binding.ready();
+        }
+    }
     pub(crate) fn note_unresolved(&mut self, scope: ScopeId, work: WorkId) {
         if self.unresolved.insert((scope, work)) {
             let count = self.unresolved_by_scope.entry(scope).or_default();
@@ -150,14 +218,47 @@ impl LedgerState {
 }
 
 pub(crate) struct LedgerShared {
-    pub(crate) state: Mutex<LedgerState>,
+    pub(crate) state: crate::observation::ObservedMutex<LedgerState>,
     pub(crate) changed: Notify,
     pub(crate) history: Option<crate::history::HistoryCapture>,
+    pub(crate) observation: crate::observation::RuntimeObservation,
+    pub(crate) inventory: Option<Mutex<crate::observation::InventoryCursor>>,
 }
 impl LedgerShared {
-    pub(crate) fn record(&self, fact: HistoryFact) {
+    pub(crate) fn record_capacity_refusal<T>(
+        &self,
+        result: &Result<T, RuntimeError>,
+        request: impl FnOnce() -> CapacityHistoryRequest,
+    ) {
+        let Err(error) = result else {
+            return;
+        };
+        self.record(|| HistoryFact::CapacityRefused {
+            request: request(),
+            reason: match *error {
+                RuntimeError::Capacity(error) => CapacityHistoryRefusal::Capacity(error),
+                RuntimeError::CapacityDenied(d) => CapacityHistoryRefusal::CapacityDenied {
+                    dimension: d.dimension,
+                    requested: d.requested,
+                    committed: d.committed,
+                    limit: d.limit,
+                },
+                RuntimeError::Scope(error) => CapacityHistoryRefusal::Scope(error),
+                RuntimeError::Completion(error) => CapacityHistoryRefusal::Completion(error),
+                RuntimeError::OwnedStorage(error) => CapacityHistoryRefusal::OwnedStorage(error),
+                RuntimeError::UnknownScope => CapacityHistoryRefusal::UnknownScope,
+                RuntimeError::DuplicateScope => CapacityHistoryRefusal::DuplicateScope,
+                RuntimeError::UnknownSlot => CapacityHistoryRefusal::UnknownSlot,
+                RuntimeError::DuplicateSlot => CapacityHistoryRefusal::DuplicateSlot,
+                RuntimeError::ScopeNotRetired => CapacityHistoryRefusal::ScopeNotRetired,
+                RuntimeError::UnresolvedWork => CapacityHistoryRefusal::UnresolvedWork,
+                RuntimeError::IdentityExhausted => CapacityHistoryRefusal::IdentityExhausted,
+            },
+        });
+    }
+    pub(crate) fn record(&self, fact: impl FnOnce() -> HistoryFact) {
         if let Some(history) = &self.history {
-            history.record(fact);
+            history.record(fact());
         }
     }
 }
@@ -187,6 +288,16 @@ pub struct ScopeParentAdmission {
     pub generation: Generation,
     pub kind: WorkKind,
     pub admission: WorkAdmission,
+}
+/// Exact declaration of one actual role, including its original consumers.
+pub struct RoleSpec {
+    pub generation: Generation,
+    pub kind: WorkKind,
+    pub resources: ReservationResources,
+    pub consumers: Vec<(
+        novarocks_control_runtime_core::identity::ConsumerId,
+        novarocks_control_runtime_core::completion::ConsumerKind,
+    )>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScopeGates {
@@ -221,64 +332,76 @@ pub enum CapacityObservationError {
     OwnerIndexNotConfigured(DimensionId),
     UnknownDimension(DimensionId),
     Poisoned,
+    InventoryOverflow,
 }
 impl RuntimeLedger {
-    pub fn new(limits: ResourceVector, max_reservations: usize, max_scopes: usize) -> Self {
-        Self::build(
-            CapacityLedger::new(limits, max_reservations),
-            max_scopes,
-            None,
-        )
+    pub fn new(limits: ResourceVector) -> Self {
+        Self::build(CapacityLedger::new(limits), None, Default::default())
     }
-    pub fn with_history(
-        limits: ResourceVector,
-        max_reservations: usize,
-        max_scopes: usize,
-        history: crate::history::HistoryCapture,
-    ) -> Self {
+    pub fn with_history(limits: ResourceVector, history: crate::history::HistoryCapture) -> Self {
         Self::build(
-            CapacityLedger::new(limits, max_reservations),
-            max_scopes,
+            CapacityLedger::new(limits),
             Some(history),
+            Default::default(),
         )
     }
     pub fn with_owner_usage_dimensions(
         limits: ResourceVector,
-        max_reservations: usize,
-        max_scopes: usize,
         dimensions: impl IntoIterator<Item = DimensionId>,
     ) -> Result<Self, RuntimeError> {
-        let ledger = CapacityLedger::with_owner_usage_dimensions(
+        Self::with_owner_usage_dimensions_and_history(limits, dimensions, None)
+    }
+    pub fn with_owner_usage_dimensions_and_history(
+        limits: ResourceVector,
+        dimensions: impl IntoIterator<Item = DimensionId>,
+        history: Option<crate::history::HistoryCapture>,
+    ) -> Result<Self, RuntimeError> {
+        Self::with_owner_usage_dimensions_and_observation(
             limits,
-            max_reservations,
-            max_scopes,
             dimensions,
-        )?;
-        Ok(Self::build(ledger, max_scopes, None))
+            history,
+            Default::default(),
+        )
+    }
+    pub fn with_owner_usage_dimensions_and_observation(
+        limits: ResourceVector,
+        dimensions: impl IntoIterator<Item = DimensionId>,
+        history: Option<crate::history::HistoryCapture>,
+        observation: crate::observation::RuntimeObservation,
+    ) -> Result<Self, RuntimeError> {
+        let ledger = CapacityLedger::with_owner_usage_dimensions(limits, dimensions)?;
+        Ok(Self::build(ledger, history, observation))
     }
     fn build(
         ledger: CapacityLedger,
-        max_scopes: usize,
         history: Option<crate::history::HistoryCapture>,
+        observation: crate::observation::RuntimeObservation,
     ) -> Self {
         Self {
             shared: Arc::new(LedgerShared {
-                state: Mutex::new(LedgerState {
-                    ledger,
-                    scopes: BTreeMap::new(),
-                    slots: BTreeMap::new(),
-                    unresolved: BTreeSet::new(),
-                    unresolved_by_scope: BTreeMap::new(),
-                    abandoned_bundles: BTreeSet::new(),
-                    pending_retirement: BTreeSet::new(),
-                    parent_links: BTreeMap::new(),
-                    max_scopes,
-                    last_scope: 0,
-                    last_slot: 0,
-                    external_open: true,
-                }),
+                state: crate::observation::ObservedMutex::new(
+                    LedgerState {
+                        ledger,
+                        scopes: BTreeMap::new(),
+                        slots: BTreeMap::new(),
+                        unresolved: BTreeSet::new(),
+                        unresolved_by_scope: BTreeMap::new(),
+                        abandoned_bundles: BTreeSet::new(),
+                        pending_retirement: BTreeSet::new(),
+                        header_readiness: BTreeMap::new(),
+                        parent_links: BTreeMap::new(),
+                        last_scope: 0,
+                        last_slot: 0,
+                        external_open: true,
+                    },
+                    observation.clone(),
+                ),
                 changed: Notify::default(),
                 history,
+                inventory: observation
+                    .is_enabled()
+                    .then(|| Mutex::new(Default::default())),
+                observation,
             }),
         }
     }
@@ -287,11 +410,9 @@ impl RuntimeLedger {
         id: ScopeId,
         parent: Option<ScopeParent>,
         generation: Generation,
-        max_work: usize,
-        max_slots: usize,
     ) -> Result<ScopeHandle, RuntimeError> {
         let mut state = self.shared.state.lock().expect("runtime ledger lock");
-        self.open_scope_locked(&mut state, id, parent, generation, max_work, max_slots)
+        self.open_scope_locked(&mut state, id, parent, generation)
     }
     /// Allocates the scope identity and any parent responsibility atomically
     /// with admission. Explicit open_scope IDs require an already serialized owner.
@@ -299,8 +420,6 @@ impl RuntimeLedger {
         &self,
         parent: Option<ScopeParentAdmission>,
         generation: Generation,
-        max_work: usize,
-        max_slots: usize,
     ) -> Result<ScopeHandle, RuntimeError> {
         let mut state = self.shared.state.lock().expect("runtime ledger lock");
         let id = ScopeId::new(
@@ -326,13 +445,13 @@ impl RuntimeLedger {
                 })
             })
             .transpose()?;
-        self.open_scope_locked(&mut state, id, parent, generation, max_work, max_slots)
+        self.open_scope_locked(&mut state, id, parent, generation)
     }
     /// Bootstrap one child scope and its original root from a live parent.
     /// Parent-link admission, root reservation and publication share one ledger
     /// transaction, including when external intake has already closed. The
-    /// root owns a real zero-resource reservation; the caller retains the
-    /// original capacity payer for this finite header inventory. No quota is
+    /// root owns a real zero-resource reservation. Metadata follows its actual
+    /// lifetime; resource capacity remains with the original payer. No quota is
     /// acquired again or inferred from the parent lease alone.
     ///
     /// The child inherits the parent's closed/stopped/failed gates before it
@@ -344,132 +463,171 @@ impl RuntimeLedger {
         &self,
         parent: &crate::lease::WorkLease,
         child_generation: Generation,
-        max_work: usize,
-        max_slots: usize,
         root_kind: WorkKind,
+        resources: ReservationResources,
     ) -> Result<(ScopeHandle, StepGuard), RuntimeError> {
-        if !Arc::ptr_eq(&self.shared, &parent.scope().runtime.shared) {
-            return Err(CapacityError::WrongOwner.into());
+        let parent_is_local = Arc::ptr_eq(&self.shared, &parent.scope().runtime.shared);
+        if !parent_is_local && self.shared.history.is_none() {
+            let result = Err(CapacityError::WrongOwner.into());
+            self.shared.observation.capacity_runtime(&result);
+            return result;
         }
+
         let mut state = self.shared.state.lock().expect("runtime ledger lock");
-        if state.scopes.len() >= state.max_scopes {
-            return Err(RuntimeError::ScopeCapacity);
-        }
-        let id = state
-            .last_scope
-            .checked_add(1)
-            .and_then(ScopeId::new)
-            .ok_or(RuntimeError::IdentityExhausted)?;
-        let parent_scope = parent.scope().id();
-        let (parent_generation, link, parent_closed, parent_stopped, parent_failed) = {
-            let owner = state
-                .scopes
-                .get(&parent_scope)
-                .ok_or(RuntimeError::UnknownScope)?;
-            let link = owner.next_work_id()?;
-            owner.check_admission(
-                owner.generation(),
-                link,
-                root_kind,
-                WorkAdmission::Derived(parent.id()),
+        let refusal_intent =
+            self.shared
+                .history
+                .as_ref()
+                .map(|_| CapacityHistoryRequest::OpenChildScope {
+                    parent: parent.reference(),
+                    parent_is_local,
+                    parent_generation: if Arc::ptr_eq(&self.shared, &parent.scope().runtime.shared)
+                    {
+                        state
+                            .scopes
+                            .get(&parent.scope().id())
+                            .map(ScopeState::generation)
+                    } else {
+                        None
+                    },
+                    child_generation,
+                    kind: root_kind,
+                    requested: resources.clone(),
+                });
+        let mut notify = false;
+        let result = (|| {
+            if !parent_is_local {
+                return Err(CapacityError::WrongOwner.into());
+            }
+
+            let id = state
+                .last_scope
+                .checked_add(1)
+                .and_then(ScopeId::new)
+                .ok_or(RuntimeError::IdentityExhausted)?;
+            let parent_scope = parent.scope().id();
+            let (parent_generation, link, parent_closed, parent_stopped, parent_failed) = {
+                let owner = state
+                    .scopes
+                    .get(&parent_scope)
+                    .ok_or(RuntimeError::UnknownScope)?;
+                let link = owner.next_work_id()?;
+                owner.check_admission(
+                    owner.generation(),
+                    link,
+                    root_kind,
+                    WorkAdmission::Derived(parent.id()),
+                )?;
+                (
+                    owner.generation(),
+                    link,
+                    !owner.external_open(),
+                    owner.stopped(),
+                    owner.failed(),
+                )
+            };
+            // No fallible gate transition may remain after reserving the real
+            // root. Inherited failure uses the existing generation transition.
+            if parent_failed && child_generation.next().is_none() {
+                return Err(ScopeError::IdentityExhausted.into());
+            }
+            let mut child = ScopeState::new(id, Some(parent_scope), child_generation);
+            let root = child.next_work_id()?;
+            let reservation = state.ledger.next_reservation_id()?;
+            // The local scope is not published yet. Its initial root is authorized
+            // by the exact parent preflight above, rather than by opening a live
+            // external gate. A refusal mutates neither ledger nor parent scope.
+            state.ledger.try_reserve_bundle(
+                &mut child,
+                ReservationRequest {
+                    id: reservation,
+                    generation: child_generation,
+                    guard: root,
+                    resources,
+                    admission: WorkAdmission::External,
+                    kind: root_kind,
+                },
             )?;
-            (
-                owner.generation(),
-                link,
-                !owner.external_open(),
-                owner.stopped(),
-                owner.failed(),
-            )
-        };
-        // No fallible gate transition may remain after reserving the real
-        // root. Inherited failure uses the existing generation transition.
-        if parent_failed && child_generation.next().is_none() {
-            return Err(ScopeError::IdentityExhausted.into());
-        }
-        let mut child = ScopeState::new(
-            id,
-            Some(parent_scope),
-            child_generation,
-            max_work,
-            max_slots,
-        );
-        let root = child.next_work_id()?;
-        let reservation = state.ledger.next_reservation_id()?;
-        // The local scope is not published yet. Its initial root is authorized
-        // by the exact parent preflight above, rather than by opening a live
-        // external gate. A refusal mutates neither ledger nor parent scope.
-        state.ledger.try_reserve_bundle(
-            &mut child,
-            ReservationRequest {
-                id: reservation,
-                generation: child_generation,
-                guard: root,
-                resources: ResourceVector::default(),
-                admission: WorkAdmission::External,
-                kind: root_kind,
-            },
-        )?;
-        if parent_failed {
-            child
-                .fail()
-                .expect("inherited child failure generation was preflighted");
-        } else if parent_stopped {
-            child.request_stop();
-        } else if parent_closed || !state.external_open {
-            child.close_external();
-        }
-        // Only the private child and capacity ledger changed after preflight;
-        // the same locked parent transition cannot now ordinarily refuse.
-        state
-            .scopes
-            .get_mut(&parent_scope)
-            .expect("preflighted parent remains live")
-            .admit(
-                parent_generation,
-                link,
-                root_kind,
-                WorkAdmission::Derived(parent.id()),
-            )
-            .expect("same-transaction parent link admission was preflighted");
-        assert!(
+            if parent_failed {
+                child
+                    .fail()
+                    .expect("inherited child failure generation was preflighted");
+            } else if parent_stopped {
+                child.request_stop();
+            } else if parent_closed || !state.external_open {
+                child.close_external();
+            }
+            // Only the private child and capacity ledger changed after preflight;
+            // the same locked parent transition cannot now ordinarily refuse.
             state
-                .parent_links
-                .insert(id, (parent_scope, link))
-                .is_none()
-        );
-        let generation = child.generation();
-        assert!(state.scopes.insert(id, child).is_none());
-        state.last_scope = id.get();
-        self.shared.record(HistoryFact::WorkAdmitted {
-            scope: parent_scope,
-            work: link,
-        });
-        self.shared.record(HistoryFact::ScopeOpened {
-            scope: id,
-            generation: child_generation,
-        });
-        self.shared.record(HistoryFact::Admitted {
-            scope: id,
-            work: root,
-            reservation,
-        });
-        if parent_failed {
-            self.shared.record(HistoryFact::OwnerFailed {
-                scope: id,
-                generation,
+                .scopes
+                .get_mut(&parent_scope)
+                .expect("preflighted parent remains live")
+                .admit(
+                    parent_generation,
+                    link,
+                    root_kind,
+                    WorkAdmission::Derived(parent.id()),
+                )
+                .expect("same-transaction parent link admission was preflighted");
+            assert!(
+                state
+                    .parent_links
+                    .insert(id, (parent_scope, link))
+                    .is_none()
+            );
+            let generation = child.generation();
+            assert!(state.scopes.insert(id, child).is_none());
+            state.last_scope = id.get();
+            self.shared.record(|| HistoryFact::WorkAdmitted {
+                scope: parent_scope,
+                work: link,
+                parent: state.history_parent(parent_scope, link),
             });
-        } else if parent_stopped {
-            self.shared.record(HistoryFact::ScopeStopped { scope: id });
-        } else if parent_closed || !state.external_open {
-            self.shared.record(HistoryFact::ScopeClosed { scope: id });
-        }
-        let scope = ScopeHandle {
-            runtime: self.clone(),
-            id,
-        };
+            self.shared.record(|| HistoryFact::ScopeOpened {
+                scope: id,
+                generation: child_generation,
+                parent: Some(ScopedWorkRef {
+                    scope: parent_scope,
+                    work: link,
+                }),
+            });
+            self.shared.record(|| HistoryFact::Admitted {
+                scope: id,
+                work: root,
+                reservation,
+                parent: state.history_parent(id, root),
+            });
+            if parent_failed {
+                self.shared.observation.scope_failed();
+                self.shared.record(|| HistoryFact::OwnerFailed {
+                    scope: id,
+                    generation,
+                });
+            } else if parent_stopped {
+                self.shared
+                    .record(|| HistoryFact::ScopeStopped { scope: id });
+            } else if parent_closed || !state.external_open {
+                self.shared
+                    .record(|| HistoryFact::ScopeClosed { scope: id });
+            }
+            let scope = ScopeHandle {
+                runtime: self.clone(),
+                id,
+            };
+
+            notify = true;
+            Ok((scope.clone(), StepGuard::new(scope, root, reservation)))
+        })();
+        self.shared.record_capacity_refusal(&result, || {
+            refusal_intent.expect("enabled history retains the original capacity intent")
+        });
         drop(state);
-        self.shared.changed.notify();
-        Ok((scope.clone(), StepGuard::new(scope, root, reservation)))
+        if notify {
+            self.shared.changed.notify();
+        }
+        self.shared.observation.capacity_runtime(&result);
+        result
     }
     fn open_scope_locked(
         &self,
@@ -477,8 +635,6 @@ impl RuntimeLedger {
         id: ScopeId,
         parent: Option<ScopeParent>,
         generation: Generation,
-        max_work: usize,
-        max_slots: usize,
     ) -> Result<ScopeHandle, RuntimeError> {
         if !state.external_open
             && !parent.is_some_and(|parent| matches!(parent.admission, WorkAdmission::Derived(_)))
@@ -487,9 +643,6 @@ impl RuntimeLedger {
         }
         if id.get() <= state.last_scope || state.scopes.contains_key(&id) {
             return Err(RuntimeError::DuplicateScope);
-        }
-        if state.scopes.len() >= state.max_scopes {
-            return Err(RuntimeError::ScopeCapacity);
         }
         if let Some(parent) = parent {
             let owner = state
@@ -503,20 +656,15 @@ impl RuntimeLedger {
                 parent.admission,
             )?;
             state.parent_links.insert(id, (parent.scope, parent.work));
-            self.shared.record(HistoryFact::WorkAdmitted {
+            self.shared.record(|| HistoryFact::WorkAdmitted {
                 scope: parent.scope,
                 work: parent.work,
+                parent: state.history_parent(parent.scope, parent.work),
             });
         }
         state.scopes.insert(
             id,
-            ScopeState::new(
-                id,
-                parent.map(|parent| parent.scope),
-                generation,
-                max_work,
-                max_slots,
-            ),
+            ScopeState::new(id, parent.map(|parent| parent.scope), generation),
         );
         state.last_scope = id.get();
         if !state.external_open {
@@ -526,9 +674,13 @@ impl RuntimeLedger {
                 .expect("new child scope")
                 .close_external();
         }
-        self.shared.record(HistoryFact::ScopeOpened {
+        self.shared.record(|| HistoryFact::ScopeOpened {
             scope: id,
             generation,
+            parent: parent.map(|parent| ScopedWorkRef {
+                scope: parent.scope,
+                work: parent.work,
+            }),
         });
         Ok(ScopeHandle {
             runtime: self.clone(),
@@ -631,13 +783,16 @@ impl RuntimeLedger {
                 .get_mut(id)
                 .expect("selected scope")
                 .close_external();
-            self.shared.record(HistoryFact::ScopeClosed { scope: *id });
+            self.shared
+                .record(|| HistoryFact::ScopeClosed { scope: *id });
         }
         drop(state);
         self.shared.changed.notify();
         ids
     }
-    /// Each retirement is one budget unit. A ready parent is queued for a later bounded visit.
+    /// Each physically exited, unpinned header retirement is one budget unit.
+    /// The last actual input holder queues its exact newly ready header; a
+    /// ready parent is queued for a later bounded visit.
     pub fn reap_ready(&self, budget: usize) -> Result<usize, RuntimeError> {
         let mut state = self.shared.state.lock().expect("runtime ledger lock");
         let mut retired = 0;
@@ -684,6 +839,31 @@ impl RuntimeLedger {
         }
         Ok(retired)
     }
+    /// Reap only the header named by this same ledger's original observer.
+    /// Readiness still comes from canonical body/capture/child/pin gates.
+    pub fn reap_observed_header(
+        &self,
+        observer: &crate::lease::WorkRetirementObserver,
+    ) -> Result<bool, RuntimeError> {
+        let (scope, work) = observer
+            .for_ledger(self)
+            .ok_or(ScopeError::InvalidTransition)?;
+        let mut state = self.shared.state.lock().expect("runtime ledger lock");
+        let Some(owner) = state.scopes.get(&scope) else {
+            return Ok(true);
+        };
+        if owner.work(work).is_none() {
+            return Ok(true);
+        }
+        if !owner.work_header_retirement_ready(work)? {
+            return Ok(false);
+        }
+        self.retire_work_locked(&mut state, scope, work)?;
+        state.pending_retirement.remove(&(scope, work));
+        drop(state);
+        self.shared.changed.notify();
+        Ok(true)
+    }
     fn retire_work_locked(
         &self,
         state: &mut LedgerState,
@@ -696,23 +876,49 @@ impl RuntimeLedger {
             .ok_or(RuntimeError::UnknownScope)?
             .retire_work(work)?;
         state.clear_unresolved(scope, work);
-        self.shared.record(HistoryFact::WorkRetired { scope, work });
+        state.note_header_retired(scope, work);
+        self.shared
+            .record(|| HistoryFact::WorkRetired { scope, work });
         if let Some(parent) = parent {
-            state.pending_retirement.insert((scope, parent));
+            state.note_header_ready(scope, parent);
         }
         Ok(())
     }
     pub fn remove_scope(&self, id: ScopeId) -> Result<(), RuntimeError> {
         let mut state = self.shared.state.lock().expect("runtime ledger lock");
         let scope = state.scopes.get(&id).ok_or(RuntimeError::UnknownScope)?;
+        // Every live child owns an intrinsic Work link in this Scope. That
+        // link exits only when the actual child is removed, so the original
+        // retirement proof already excludes children without a node-wide scan.
         if !scope.retirement_ready()
             || state.ledger.reservation_count_for(id) != 0
             || state
-                .scopes
-                .values()
-                .any(|child| child.parent() == Some(id))
+                .header_readiness
+                .range((id, WorkId::new(1).expect("minimum Work identity"))..)
+                .next()
+                .is_some_and(|((owner, _), _)| *owner == id)
         {
             return Err(RuntimeError::ScopeNotRetired);
+        }
+        if let Some(&(parent, work)) = state.parent_links.get(&id) {
+            let owner = state
+                .scopes
+                .get(&parent)
+                .expect("the original child retains its parent Scope");
+            let link = owner
+                .work(work)
+                .expect("the original Scope owns its intrinsic parent link");
+            // Only this Scope owns the link. It has no asynchronous body,
+            // capture, report or capacity reservation beyond that ownership.
+            // Validate its actual record before removing either original.
+            if link.children != 0
+                || link.header_pin_count() != 0
+                || link.body_exited
+                || link.captures_exited
+                || owner.captures_bound(work)?
+            {
+                return Err(RuntimeError::ScopeNotRetired);
+            }
         }
         state.scopes.remove(&id);
         if let Some((parent, work)) = state.parent_links.remove(&id) {
@@ -720,19 +926,25 @@ impl RuntimeLedger {
                 .scopes
                 .get_mut(&parent)
                 .expect("child scope retains its parent");
-            parent_scope.body_exited(work)?;
-            parent_scope.captures_exited(work)?;
-            self.shared.record(HistoryFact::BodyExited {
+            parent_scope
+                .body_exited(work)
+                .expect("preflighted intrinsic parent link body");
+            parent_scope
+                .captures_exited(work)
+                .expect("preflighted capture-free intrinsic parent link");
+            self.shared.record(|| HistoryFact::BodyExited {
                 scope: parent,
                 work,
             });
-            self.shared.record(HistoryFact::CapturesExited {
+            self.shared.record(|| HistoryFact::CapturesExited {
                 scope: parent,
                 work,
             });
-            if parent_scope.work_exited(work)? {
-                state.pending_retirement.insert((parent, work));
-            }
+            // Removing the actual child ends the link itself in this same
+            // transaction. A cold actor never leaves this join obligation
+            // pending on a later unrelated process-scope reaper turn.
+            self.retire_work_locked(&mut state, parent, work)
+                .expect("preflighted original child-free parent link");
         }
         drop(state);
         self.shared.changed.notify();
@@ -740,7 +952,10 @@ impl RuntimeLedger {
     }
     pub fn is_empty(&self) -> bool {
         let state = self.shared.state.lock().expect("runtime ledger lock");
-        state.scopes.is_empty() && state.ledger.reservation_count() == 0 && state.slots.is_empty()
+        state.scopes.is_empty()
+            && state.ledger.reservation_count() == 0
+            && state.slots.is_empty()
+            && state.header_readiness.is_empty()
     }
     pub fn change_version(&self) -> u64 {
         self.shared.changed.version()
@@ -750,6 +965,45 @@ impl RuntimeLedger {
     }
 }
 impl ScopeHandle {
+    /// Reap bounded real ready headers through this actual financial owner.
+    /// The handle selects its original ledger; numeric ScopeId equality grants
+    /// no authority to retire a different runtime's records.
+    pub fn reap_ready(&self, budget: usize) -> Result<usize, RuntimeError> {
+        self.runtime.reap_scope_ready(self.id, budget)
+    }
+    /// Observe one original Work record through its actual owning Scope.
+    /// This neither recreates a retired header nor authorizes new input/work.
+    pub fn work_lifecycle(
+        &self,
+        work: WorkId,
+    ) -> Result<
+        Option<(
+            novarocks_control_runtime_core::scope::WorkPhase,
+            bool,
+            bool,
+            usize,
+        )>,
+        RuntimeError,
+    > {
+        let state = self
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let scope = state
+            .scopes
+            .get(&self.id)
+            .ok_or(RuntimeError::UnknownScope)?;
+        Ok(scope.work(work).map(|record| {
+            (
+                record.phase,
+                record.body_exited,
+                record.captures_exited,
+                record.children,
+            )
+        }))
+    }
     pub const fn id(&self) -> ScopeId {
         self.id
     }
@@ -758,6 +1012,11 @@ impl ScopeHandle {
     /// read grants no admission, start, publication or capacity authority.
     pub fn same_scope(&self, other: &Self) -> bool {
         self.id == other.id && Arc::ptr_eq(&self.runtime.shared, &other.runtime.shared)
+    }
+    /// Read-only ledger identity across two original scopes. This grants no
+    /// resource, publication, lifecycle or cross-scope access authority.
+    pub fn same_ledger(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.runtime.shared, &other.runtime.shared)
     }
 
     pub(crate) fn attach_actor(&self, slot: SlotId) -> Result<(), RuntimeError> {
@@ -778,7 +1037,7 @@ impl ScopeHandle {
             return Err(ScopeError::Closed.into());
         }
         state.reserve_slot(self.id, slot)?;
-        self.runtime.shared.record(HistoryFact::SlotReserved {
+        self.runtime.shared.record(|| HistoryFact::SlotReserved {
             scope: self.id,
             slot,
         });
@@ -803,7 +1062,7 @@ impl ScopeHandle {
         }
         let slot = state.next_slot_id(self.id)?;
         state.reserve_slot(self.id, slot)?;
-        self.runtime.shared.record(HistoryFact::SlotReserved {
+        self.runtime.shared.record(|| HistoryFact::SlotReserved {
             scope: self.id,
             slot,
         });
@@ -840,7 +1099,7 @@ impl ScopeHandle {
         }
         let slot = state.next_slot_id(self.id)?;
         state.reserve_slot(self.id, slot)?;
-        self.runtime.shared.record(HistoryFact::SlotReserved {
+        self.runtime.shared.record(|| HistoryFact::SlotReserved {
             scope: self.id,
             slot,
         });
@@ -862,7 +1121,7 @@ impl ScopeHandle {
             .retire_slot(slot)?;
         self.runtime
             .shared
-            .record(HistoryFact::SlotRetired { slot });
+            .record(|| HistoryFact::SlotRetired { slot });
         drop(state);
         self.runtime.shared.changed.notify();
         Ok(())
@@ -928,12 +1187,193 @@ impl ScopeHandle {
                 .unwrap_or(0),
         })
     }
+    /// Original positions and already-held quota move into exactly this real
+    /// role. Every ordinary refusal precedes mutation, with no exposed partial.
+    pub fn reserve_child_from(
+        &self,
+        payer: &mut crate::lease::ReservationBundle,
+        actual_parent: &crate::lease::WorkLease,
+        role: RoleSpec,
+    ) -> Result<crate::reported_work::ReportedWork, RuntimeError> {
+        self.reserve_child_from_parent(payer, actual_parent.scope(), actual_parent.id(), role)
+    }
+    /// Consume the same original payer under an authority issued by its real
+    /// parent Work. The authority grants no storage or parent keepalive;
+    /// lifecycle and Unknown-exit checks share the admission transaction.
+    pub fn reserve_child_from_authority(
+        &self,
+        payer: &mut crate::lease::ReservationBundle,
+        authority: &crate::lease::WorkChildAuthority,
+        role: RoleSpec,
+    ) -> Result<crate::reported_work::ReportedWork, RuntimeError> {
+        self.reserve_child_from_parent(payer, authority.scope(), authority.parent(), role)
+    }
+    fn reserve_child_from_parent(
+        &self,
+        payer: &mut crate::lease::ReservationBundle,
+        parent_scope: &ScopeHandle,
+        parent: WorkId,
+        role: RoleSpec,
+    ) -> Result<crate::reported_work::ReportedWork, RuntimeError> {
+        let precheck =
+            if !self.same_scope(parent_scope) || !self.same_scope(&payer.scope) || !payer.active {
+                Some(OwnedStorageError::WrongOwner)
+            } else if role.resources.owned_slots.completions == 0 {
+                Some(OwnedStorageError::MissingPosition(
+                    OwnedSlotKind::Completion,
+                ))
+            } else {
+                None
+            };
+        if self.runtime.shared.history.is_none()
+            && let Some(error) = precheck
+        {
+            let result = Err(error.into());
+            self.runtime.shared.observation.capacity_runtime(&result);
+            return result;
+        }
+
+        let mut state = self
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let refusal_intent = self.runtime.shared.history.as_ref().map(|_| {
+            CapacityHistoryRequest::ReserveChildRole {
+                scope: self.id,
+                generation: role.generation,
+                payer: payer.id,
+                payer_is_local: self.same_scope(&payer.scope),
+                parent: ScopedWorkRef {
+                    scope: parent_scope.id(),
+                    work: parent,
+                },
+                parent_is_local: self.same_scope(parent_scope),
+                kind: role.kind,
+                requested: role.resources.clone(),
+            }
+        });
+        let mut notify = false;
+        let result = (|| {
+            use crate::{
+                completion::{ReportRecord, ReportSlot},
+                lease::{ReservationBundle, WorkLease},
+                reported_work::ReportedWork,
+            };
+            if let Some(error) = precheck {
+                return Err(error.into());
+            }
+
+            if state.unresolved.contains(&(self.id, parent)) {
+                return Err(RuntimeError::UnresolvedWork);
+            }
+            let scope = state
+                .scopes
+                .get(&self.id)
+                .ok_or(RuntimeError::UnknownScope)?;
+            let work = scope.next_work_id()?;
+            scope.check_admission(
+                role.generation,
+                work,
+                role.kind,
+                WorkAdmission::Derived(parent),
+            )?;
+            let reservation = state.ledger.next_reservation_id()?;
+            let report_id = state.next_slot_id(self.id)?;
+            let report = novarocks_control_runtime_core::completion::CompletionSlot::new(
+                report_id,
+                self.id,
+                role.generation,
+                work,
+                role.consumers.len(),
+                role.consumers,
+            )?;
+            {
+                let (ledger, scope) = state.parts(self.id)?;
+                ledger.reserve_from(
+                    scope,
+                    payer.id,
+                    ReservationRequest {
+                        id: reservation,
+                        generation: role.generation,
+                        guard: work,
+                        resources: role.resources,
+                        admission: WorkAdmission::Derived(parent),
+                        kind: role.kind,
+                    },
+                )?;
+                ledger
+                    .bind(scope, reservation, role.kind)
+                    .expect("preflighted actual role binding");
+            }
+            state
+                .reserve_slot(self.id, report_id)
+                .expect("preflighted actual report position");
+            let completion = state
+                .ledger
+                .take_owned(reservation, OwnedSlotKind::Completion)
+                .expect("preflighted original completion");
+            if let Some(captures) = state
+                .ledger
+                .take_owned_kind(reservation, OwnedSlotKind::Capture)
+                .expect("committed original role inventory")
+            {
+                state
+                    .scopes
+                    .get_mut(&self.id)
+                    .expect("committed original scope")
+                    .bind_captures(work, captures)
+                    .expect("new actual role owns its declared captures");
+            }
+            assert!(
+                state
+                    .slots
+                    .insert(report_id, ReportRecord::new(report, completion))
+                    .is_none()
+            );
+            payer.active = state.ledger.reservation(payer.id).is_some();
+            self.runtime.shared.record(|| HistoryFact::Admitted {
+                scope: self.id,
+                work,
+                reservation,
+                parent: state.history_parent(self.id, work),
+            });
+            self.runtime.shared.record(|| HistoryFact::SlotReserved {
+                scope: self.id,
+                slot: report_id,
+            });
+
+            notify = true;
+            Ok(ReportedWork::from_committed(
+                WorkLease::new(self.clone(), work),
+                ReservationBundle {
+                    scope: self.clone(),
+                    id: reservation,
+                    active: true,
+                },
+                ReportSlot {
+                    runtime: self.runtime.clone(),
+                    id: report_id,
+                },
+            ))
+        })();
+        self.runtime.shared.record_capacity_refusal(&result, || {
+            refusal_intent.expect("enabled history retains the original capacity intent")
+        });
+        drop(state);
+        if notify {
+            self.runtime.shared.changed.notify();
+        }
+        self.runtime.shared.observation.capacity_runtime(&result);
+        result
+    }
     /// Production allocation: identity selection and admission are one ledger
     /// transaction. A preempted producer never loses to a later external ID.
     pub fn reserve_next(
         &self,
         generation: Generation,
-        resources: ResourceVector,
+        resources: ReservationResources,
         kind: WorkKind,
         admission: WorkAdmission,
     ) -> Result<StepGuard, RuntimeError> {
@@ -948,7 +1388,7 @@ impl ScopeHandle {
         &self,
         generation: Generation,
         parent: ReservationId,
-        resources: ResourceVector,
+        resources: ReservationResources,
         kind: WorkKind,
     ) -> Result<StepGuard, RuntimeError> {
         self.reserve_next_parent(
@@ -962,7 +1402,7 @@ impl ScopeHandle {
     fn reserve_next_parent(
         &self,
         generation: Generation,
-        resources: ResourceVector,
+        resources: ReservationResources,
         kind: WorkKind,
         admission: WorkAdmission,
         parent: Option<ReservationId>,
@@ -973,80 +1413,127 @@ impl ScopeHandle {
             .state
             .lock()
             .expect("runtime ledger lock");
-        let admission = if let Some(parent) = parent {
-            let record = state
-                .ledger
-                .reservation(parent)
-                .ok_or(CapacityError::UnknownReservation)?;
-            if record.scope != self.id {
-                return Err(CapacityError::WrongOwner.into());
-            }
-            if !record.bound {
-                return Err(CapacityError::UnboundReservation.into());
-            }
-            WorkAdmission::Derived(record.work)
-        } else {
-            admission
-        };
-        if !state.external_open && admission == WorkAdmission::External {
-            return Err(ScopeError::Closed.into());
-        }
-        let (ledger, scope) = state.parts(self.id)?;
-        let work = scope.next_work_id()?;
-        let reservation = ledger.next_reservation_id()?;
-        // The fixed dimension inventory is plain metadata. Capture a denial
-        // in this transaction, rather than sampling counters after unlocking
-        // and attaching another thread's later state to the original refusal.
-        let requested = resources.clone();
-        let reserved = ledger.try_reserve_bundle(
-            scope,
-            ReservationRequest {
-                id: reservation,
+        let refusal_intent = self.runtime.shared.history.as_ref().map(|_| match parent {
+            Some(parent) => CapacityHistoryRequest::ReserveFromParent {
+                scope: self.id,
                 generation,
-                guard: work,
-                resources,
+                parent,
+                kind,
+                requested: resources.clone(),
+            },
+            None => CapacityHistoryRequest::Reserve {
+                scope: self.id,
+                generation,
                 admission,
                 kind,
+                requested: resources.clone(),
             },
-        );
-        if let Err(CapacityError::Exhausted(dimension)) = reserved {
-            return Err(RuntimeError::CapacityDenied(CapacityDenial {
-                dimension,
-                requested: requested.get(dimension),
-                committed: ledger.used(dimension),
-                limit: ledger.limit(dimension),
-            }));
-        }
-        reserved?;
-        self.runtime.shared.record(HistoryFact::Admitted {
-            scope: self.id,
-            work,
-            reservation,
         });
-        Ok(StepGuard::new(self.clone(), work, reservation))
+        let result = (|| {
+            let admission = if let Some(parent) = parent {
+                let record = state
+                    .ledger
+                    .reservation(parent)
+                    .ok_or(CapacityError::UnknownReservation)?;
+                if record.scope != self.id {
+                    return Err(CapacityError::WrongOwner.into());
+                }
+                if !record.bound {
+                    return Err(CapacityError::UnboundReservation.into());
+                }
+                WorkAdmission::Derived(record.work)
+            } else {
+                admission
+            };
+            if !state.external_open && admission == WorkAdmission::External {
+                return Err(ScopeError::Closed.into());
+            }
+            let (ledger, scope) = state.parts(self.id)?;
+            let work = scope.next_work_id()?;
+            let reservation = ledger.next_reservation_id()?;
+            // The fixed dimension inventory is plain metadata. Capture a denial
+            // in this transaction, rather than sampling counters after unlocking
+            // and attaching another thread's later state to the original refusal.
+            let requested = resources.clone();
+            let reserved = ledger.try_reserve_bundle(
+                scope,
+                ReservationRequest {
+                    id: reservation,
+                    generation,
+                    guard: work,
+                    resources,
+                    admission,
+                    kind,
+                },
+            );
+            if let Err(CapacityError::Exhausted(dimension)) = reserved {
+                return Err(RuntimeError::CapacityDenied(CapacityDenial {
+                    dimension,
+                    requested: requested.quota.get(dimension),
+                    committed: ledger.used(dimension),
+                    limit: ledger.limit(dimension),
+                }));
+            }
+            reserved?;
+            self.runtime.shared.record(|| HistoryFact::Admitted {
+                scope: self.id,
+                work,
+                reservation,
+                parent: state.history_parent(self.id, work),
+            });
+            Ok(StepGuard::new(self.clone(), work, reservation))
+        })();
+        self.runtime.shared.record_capacity_refusal(&result, || {
+            refusal_intent.expect("enabled history retains the original capacity intent")
+        });
+        drop(state);
+        self.runtime.shared.observation.capacity_runtime(&result);
+        result
     }
     /// Explicit identities are for deterministic tests or an already serialized
     /// identity owner. Concurrent production callers use reserve_next.
     pub fn reserve(&self, request: ReservationRequest) -> Result<StepGuard, RuntimeError> {
-        let reservation = request.id;
-        let work = request.guard;
         let mut state = self
             .runtime
             .shared
             .state
             .lock()
             .expect("runtime ledger lock");
-        if !state.external_open && request.admission == WorkAdmission::External {
-            return Err(ScopeError::Closed.into());
-        }
-        let (ledger, scope) = state.parts(self.id)?;
-        ledger.try_reserve_bundle(scope, request)?;
-        self.runtime.shared.record(HistoryFact::Admitted {
-            scope: self.id,
-            work,
-            reservation,
+        let refusal_intent =
+            self.runtime
+                .shared
+                .history
+                .as_ref()
+                .map(|_| CapacityHistoryRequest::Reserve {
+                    scope: self.id,
+                    generation: request.generation,
+                    admission: request.admission,
+                    kind: request.kind,
+                    requested: request.resources.clone(),
+                });
+        let result = (|| {
+            let reservation = request.id;
+            let work = request.guard;
+
+            if !state.external_open && request.admission == WorkAdmission::External {
+                return Err(ScopeError::Closed.into());
+            }
+            let (ledger, scope) = state.parts(self.id)?;
+            ledger.try_reserve_bundle(scope, request)?;
+            self.runtime.shared.record(|| HistoryFact::Admitted {
+                scope: self.id,
+                work,
+                reservation,
+                parent: state.history_parent(self.id, work),
+            });
+            Ok(StepGuard::new(self.clone(), work, reservation))
+        })();
+        self.runtime.shared.record_capacity_refusal(&result, || {
+            refusal_intent.expect("enabled history retains the original capacity intent")
         });
-        Ok(StepGuard::new(self.clone(), work, reservation))
+        drop(state);
+        self.runtime.shared.observation.capacity_runtime(&result);
+        result
     }
     pub fn close_external(&self) -> Result<(), RuntimeError> {
         let mut state = self
@@ -1062,7 +1549,7 @@ impl ScopeHandle {
             .close_external();
         self.runtime
             .shared
-            .record(HistoryFact::ScopeClosed { scope: self.id });
+            .record(|| HistoryFact::ScopeClosed { scope: self.id });
         drop(state);
         self.runtime.shared.changed.notify();
         Ok(())
@@ -1081,7 +1568,7 @@ impl ScopeHandle {
             .request_stop();
         self.runtime
             .shared
-            .record(HistoryFact::ScopeStopped { scope: self.id });
+            .record(|| HistoryFact::ScopeStopped { scope: self.id });
         drop(state);
         self.runtime.shared.changed.notify();
         Ok(())
@@ -1093,15 +1580,19 @@ impl ScopeHandle {
             .state
             .lock()
             .expect("runtime ledger lock");
-        let generation = state
+        let scope = state
             .scopes
             .get_mut(&self.id)
-            .ok_or(RuntimeError::UnknownScope)?
-            .fail()?;
-        self.runtime.shared.record(HistoryFact::OwnerFailed {
-            scope: self.id,
-            generation,
-        });
+            .ok_or(RuntimeError::UnknownScope)?;
+        let was_failed = scope.failed();
+        let generation = scope.fail()?;
+        if !was_failed {
+            self.runtime.shared.observation.scope_failed();
+            self.runtime.shared.record(|| HistoryFact::OwnerFailed {
+                scope: self.id,
+                generation,
+            });
+        }
         drop(state);
         self.runtime.shared.changed.notify();
         Ok(generation)
@@ -1127,9 +1618,10 @@ impl ScopeHandle {
             .get_mut(&self.id)
             .ok_or(RuntimeError::UnknownScope)?
             .admit(generation, id, kind, admission)?;
-        self.runtime.shared.record(HistoryFact::WorkAdmitted {
+        self.runtime.shared.record(|| HistoryFact::WorkAdmitted {
             scope: self.id,
             work: id,
+            parent: state.history_parent(self.id, id),
         });
         Ok(crate::lease::WorkLease::new(self.clone(), id))
     }

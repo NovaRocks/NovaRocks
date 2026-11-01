@@ -144,6 +144,8 @@ fn an_unsealed_reporter_returns_owner_missing_for_every_read_after_real_inventor
     // Even genuine pure-protocol retirement does not authorize a reader to
     // manufacture its own seal when the original host deliberately omitted it.
     f.retire_task();
+    f.port().retire_execution_port();
+    f.detach_source();
     exit_lifetime(&mut f, &mut lifetime, &mut capacity);
     f.finish();
     assert!(weak_port.upgrade().is_none());

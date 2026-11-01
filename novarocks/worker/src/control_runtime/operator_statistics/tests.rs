@@ -104,8 +104,6 @@ fn fixture() -> (
                 input_retained_bytes: 1,
                 ingress_retained_bytes: 1,
                 structural_bytes: 1,
-                inbound_records: 0,
-                inbound_bytes: 0,
             }),
         },
     );
@@ -118,11 +116,22 @@ fn fixture() -> (
     command(&mut f, ContextInput::Installed { task: identity });
     // This role's separate position is charged explicitly before any producer
     // captures it; the Task host factory is tested in its integration slice.
-    let (work, capacity) = f
+    let (work, mut capacity) = f
         .scope
         .reserve_next(
             generation(),
-            ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap(),
+            novarocks_control_runtime_core::capacity::ReservationResources::new(
+                ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap(),
+                novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                    work_headers: 1,
+                    completions: 1,
+                    captures: 1,
+                    inputs: 1,
+                    batches: 1,
+                    effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                    ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
+                },
+            ),
             WorkKind::Cleanup,
             WorkAdmission::External,
         )
@@ -130,9 +139,8 @@ fn fixture() -> (
         .bind(WorkKind::Cleanup)
         .unwrap();
     let report = ReportSlot::reserve_next(
-        &f.scope,
+        &mut capacity,
         generation(),
-        work.id(),
         2,
         [
             (
@@ -567,30 +575,25 @@ fn a_failed_scope_keeps_the_exact_refused_sample_and_independent_physical_observ
     f.scope.fail().unwrap();
     assert!(matches!(
         inbox.advance(),
-        Err(StatisticsError::Driver(DriverError::ActorFailed))
+        Err(StatisticsError::FailurePublicationRequired)
     ));
-    match inbox.rejected.as_ref() {
-        Some(WorkerMessage::Context(ContextMessage::Command {
-            request: None,
-            command:
-                ContextInput::OperatorStatistics {
-                    task,
-                    statistics,
-                    truncated: true,
-                },
-            ..
-        })) => {
-            assert_eq!(*task, identity);
-            assert_eq!(statistics, &sample(17, true).statistics);
-        }
-        _ => panic!("the exact refused original statistics occurrence remains owned"),
+    assert_eq!(inbox.custody.task, identity);
+    {
+        let state = inbox.custody.state.lock().unwrap();
+        let pending = state
+            .pending
+            .as_ref()
+            .expect("the original sample remains pending");
+        assert_eq!(pending.statistics, sample(17, true).statistics);
+        assert!(pending.truncated);
     }
+    assert!(inbox.rejected.is_none());
     assert!(inbox.input.in_flight().unwrap().is_none());
     drop(finalizer);
     drop(producer);
     assert!(matches!(
         inbox.advance(),
-        Err(StatisticsError::RefusedInput)
+        Err(StatisticsError::FailurePublicationRequired)
     ));
     assert_eq!(inbox.phase(), ExitRolePhase::Exited);
     assert_eq!(
@@ -598,7 +601,7 @@ fn a_failed_scope_keeps_the_exact_refused_sample_and_independent_physical_observ
             .report()
             .consumption(ConsumerId::new(2).unwrap())
             .unwrap(),
-        Consumption::Consumed
+        Consumption::Pending
     );
     assert_eq!(
         inbox
@@ -674,7 +677,7 @@ fn an_actual_failed_owner_input_is_reported_without_claiming_core_consumption() 
     );
     assert!(matches!(
         inbox.advance(),
-        Err(StatisticsError::OwnerFailed { input }) if input == statistics_input
+        Err(StatisticsError::FailurePublicationRequired)
     ));
     assert_eq!(
         inbox
@@ -686,7 +689,7 @@ fn an_actual_failed_owner_input_is_reported_without_claiming_core_consumption() 
     drop(producer);
     assert!(matches!(
         inbox.advance(),
-        Err(StatisticsError::OwnerFailed { input }) if input == statistics_input
+        Err(StatisticsError::FailurePublicationRequired)
     ));
     assert_eq!(inbox.phase(), ExitRolePhase::Exited);
     assert_eq!(
@@ -694,7 +697,7 @@ fn an_actual_failed_owner_input_is_reported_without_claiming_core_consumption() 
             .report()
             .consumption(ConsumerId::new(2).unwrap())
             .unwrap(),
-        Consumption::Consumed
+        Consumption::Pending
     );
     assert_eq!(
         inbox

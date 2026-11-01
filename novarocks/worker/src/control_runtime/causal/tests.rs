@@ -26,7 +26,7 @@ use crate::control_runtime::actors::{
 use crate::task_completion_roles::AdmittedCompletionRole;
 use crate::task_proposal_ingress::{CutSourceAdmission, RetiredCut};
 use novarocks_control_runtime::{
-    completion::ReportSlot, driver::Clock, lease::CapacityBundle, transaction::ScopeHandle,
+    completion::ReportSlot, driver::Clock, lease::ReservationBundle, transaction::ScopeHandle,
 };
 use novarocks_control_runtime_core::{
     capacity::ResourceVector,
@@ -59,13 +59,25 @@ impl TaskPendingNotice for Pending {
 
 fn source_role(scope: &ScopeHandle, parent: ReservationId) -> AdmittedCompletionRole {
     let g = scope.gates().unwrap().generation;
-    let admitted = scope
-        .reserve_child_next(g, parent, ResourceVector::default(), WorkKind::Cleanup)
+    let mut admitted = scope
+        .reserve_child_next(
+            g,
+            parent,
+            novarocks_control_runtime_core::capacity::ReservationResources::new(
+                ResourceVector::default(),
+                novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                    work_headers: 1,
+                    completions: 1,
+                    captures: 1,
+                    ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
+                },
+            ),
+            WorkKind::Cleanup,
+        )
         .unwrap();
     let report = ReportSlot::reserve_next(
-        scope,
+        &mut admitted,
         g,
-        admitted.work_id(),
         2,
         [
             (
@@ -92,13 +104,14 @@ fn model_source_slot(
     parent: ReservationId,
 ) -> crate::control_runtime::source_positions::SourceSlotAdmission {
     let admitted = source_role(scope, parent);
-    crate::control_runtime::source_positions::SourceSlotAdmission::protocol_model(
+    crate::control_runtime::source_positions::SourceSlotAdmission::from_admitted(
         crate::control_runtime::admitted_role::adopt_reported_work(
             admitted.work,
             admitted.capacity,
             admitted.report,
         ),
     )
+    .unwrap()
 }
 struct Harness {
     fixture: Fixture,
@@ -107,7 +120,7 @@ struct Harness {
     inbox: Arc<Mutex<TaskCausalInbox>>,
     parent: ReservationId,
     author: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     author_exited: bool,
 }
 impl Harness {
@@ -141,8 +154,6 @@ impl Harness {
                     input_retained_bytes: 1,
                     ingress_retained_bytes: 1,
                     structural_bytes: 1,
-                    inbound_records: 0,
-                    inbound_bytes: 0,
                 }),
             },
             None,
@@ -164,7 +175,7 @@ impl Harness {
         );
         let inbox = Arc::new(Mutex::new(TaskCausalInbox::new(
             fixture.runtime.clone(),
-            actor(),
+            fixture.registration.clone(),
             ActorId::new(7001).unwrap(),
             task,
             generation(),
@@ -176,7 +187,19 @@ impl Harness {
             .reserve_child_next(
                 generation(),
                 parent,
-                ResourceVector::default(),
+                novarocks_control_runtime_core::capacity::ReservationResources::new(
+                    ResourceVector::default(),
+                    novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 0,
+                        captures: 0,
+                        inputs: 2,
+                        batches: 2,
+                        effects: 2 * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                        replies: 1,
+                        ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
+                    },
+                ),
                 WorkKind::Cleanup,
             )
             .unwrap()
@@ -246,12 +269,12 @@ impl Harness {
             .prepare_owned_pair_reap(&retired.pair)
             .unwrap()
             .map(|probe| probe.observe_reaped().unwrap());
-        for mut storage in self
+        for storage in self
             .ingress
             .release_owned_pair(&retired.pair, witnesses)
             .unwrap()
         {
-            storage.release().unwrap();
+            drop(storage);
         }
     }
     fn retire(&mut self, delivery: CausalDelivery) -> Vec<WorkerAction> {
@@ -310,8 +333,9 @@ impl Harness {
             .reap_scope_ready(self.fixture.scope.id(), 256)
             .unwrap();
         self.capacity
-            .release(&self.capacity.resources().unwrap())
+            .release_quota(&self.capacity.resources().unwrap().quota)
             .unwrap();
+        self.capacity.finish().unwrap();
         self.fixture.finish();
     }
 }
@@ -483,7 +507,7 @@ fn check_admission_refusal(
         assert_eq!(slot.reported().work().scope().id(), scope);
         assert!(slot.reported().report().same_slot(&report));
         assert!(!retired.is_retired());
-        let (role, mut payment) = slot.into_originals();
+        let role = slot.into_reported();
         let (custody, unused) =
             crate::control_runtime::source_custody::SourceCustody::from_reported(
                 h.task,
@@ -502,9 +526,6 @@ fn check_admission_refusal(
             .unwrap();
         assert!(retired.is_retired());
         assert!(custody.reusable());
-        if let Some(payment) = &mut payment {
-            payment.release(&payment.resources().unwrap()).unwrap();
-        }
     }
 }
 
@@ -573,13 +594,12 @@ fn mismatched_request_bodies_return_the_original_input_without_sealing_the_cut()
     }
 }
 
-fn exercise_foreign_author(foreign_ledger: bool) {
+fn exercise_foreign_author() {
     use novarocks_control_runtime::transaction::RuntimeLedger;
     use novarocks_control_runtime_core::scope::WorkAdmission;
     let h = Harness::new();
-    let other = foreign_ledger.then(|| RuntimeLedger::new(ResourceVector::default(), 256, 1));
-    let ledger = other.as_ref().unwrap_or(&h.fixture.ledger);
-    let scope = ledger.open_scope_next(None, generation(), 256, 1).unwrap();
+    let ledger = RuntimeLedger::new(ResourceVector::default());
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
     let mut authors = Vec::new();
     // Real original Works intentionally reach the same numeric ID; no explicit
     // fabricated identity or foreign Root numeric Work can authorize Context.
@@ -587,7 +607,7 @@ fn exercise_foreign_author(foreign_ledger: bool) {
         let (mut work, capacity) = scope
             .reserve_next(
                 generation(),
-                ResourceVector::default(),
+                novarocks_control_runtime_core::capacity::ReservationResources::work_only(),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -599,11 +619,7 @@ fn exercise_foreign_author(foreign_ledger: bool) {
     }
     let author = &authors.last().unwrap().0;
     assert_eq!(author.id(), h.author.id());
-    if foreign_ledger {
-        assert_eq!(scope.id(), h.fixture.scope.id());
-    } else {
-        assert_ne!(scope.id(), h.fixture.scope.id());
-    }
+    assert_eq!(scope.id(), h.fixture.scope.id());
     check_admission_refusal(
         &h,
         author,
@@ -614,24 +630,20 @@ fn exercise_foreign_author(foreign_ledger: bool) {
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
         ledger.reap_scope_ready(scope.id(), 256).unwrap();
-        capacity.release(&capacity.resources().unwrap()).unwrap();
+        capacity
+            .release_quota(&capacity.resources().unwrap().quota)
+            .unwrap();
+        capacity.finish().unwrap();
     }
     scope.close_external().unwrap();
     ledger.remove_scope(scope.id()).unwrap();
-    if let Some(other) = &other {
-        assert!(other.is_empty());
-    }
+    assert!(ledger.is_empty());
     h.finish();
 }
 
 #[test]
-fn a_root_scope_work_with_the_same_numeric_id_cannot_author_a_context_request() {
-    exercise_foreign_author(false);
-}
-
-#[test]
 fn a_foreign_ledger_with_the_same_scope_and_work_numbers_cannot_author_a_context_request() {
-    exercise_foreign_author(true);
+    exercise_foreign_author();
 }
 
 mod rpc_author;

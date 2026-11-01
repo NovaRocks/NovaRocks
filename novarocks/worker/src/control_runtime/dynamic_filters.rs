@@ -91,7 +91,6 @@ pub enum DynamicFilterSubmission {
     Unresolved,
 }
 struct OpaquePayload {
-    version: DomainVersion,
     value: ManuallyDrop<Arc<dyn CodecOwnedContent>>,
 }
 impl OpaquePayload {
@@ -218,13 +217,13 @@ impl TaskDynamicFilterWriter {
         // It has never been loaned, published or captured by a Core occurrence.
         let old = state.pending_value.take();
         drop(state);
-        if let Some(old) = old {
-            if let Err(original) = dispose_unexposed(old) {
-                let mut state = custody.state.lock().expect("original RF source");
-                state.pending_value = Some(original);
-                state.unresolved = true;
-                return DynamicFilterSubmission::Sealed;
-            }
+        if let Some(old) = old
+            && let Err(original) = dispose_unexposed(old)
+        {
+            let mut state = custody.state.lock().expect("original RF source");
+            state.pending_value = Some(original);
+            state.unresolved = true;
+            return DynamicFilterSubmission::Sealed;
         }
         let mut state = custody.state.lock().expect("original RF source");
         // A concurrent writer may have filled this one slot while the previous
@@ -245,7 +244,6 @@ impl TaskDynamicFilterWriter {
         }
         let id = SlotId::new(next).expect("positive RF payload position");
         let value = OpaquePayload {
-            version,
             value: ManuallyDrop::new(payload),
         };
         let row = match custody
@@ -313,6 +311,44 @@ pub(crate) enum DynamicFilterError {
     WrongReadSelection,
     ReadAdmissionClosed,
     FailurePublicationRequired,
+}
+impl std::fmt::Display for DynamicFilterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runtime(error) => write!(f, "dynamic filter runtime failed: {error}"),
+            Self::Driver(error) => write!(f, "dynamic filter control driver failed: {error}"),
+            Self::Role(error) => write!(f, "dynamic filter role failed: {error}"),
+            Self::Resource(error) => write!(f, "dynamic filter read resource failed: {error}"),
+            Self::Unresolved => f.write_str("dynamic filter responsibility remains unresolved"),
+            Self::MissingInput => f.write_str("dynamic filter publication input is missing"),
+            Self::WrongPublication => {
+                f.write_str("dynamic filter publication differs from its original binding")
+            }
+            Self::WrongReadSelection => {
+                f.write_str("dynamic filter read selection differs from its original binding")
+            }
+            Self::ReadAdmissionClosed => f.write_str("dynamic filter read admission is closed"),
+            Self::FailurePublicationRequired => {
+                f.write_str("dynamic filter failure publication is required")
+            }
+        }
+    }
+}
+impl std::error::Error for DynamicFilterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(error) => Some(error),
+            Self::Driver(error) => Some(error),
+            Self::Role(error) => Some(error),
+            Self::Resource(error) => Some(error),
+            Self::Unresolved
+            | Self::MissingInput
+            | Self::WrongPublication
+            | Self::WrongReadSelection
+            | Self::ReadAdmissionClosed
+            | Self::FailurePublicationRequired => None,
+        }
+    }
 }
 impl From<RuntimeError> for DynamicFilterError {
     fn from(e: RuntimeError) -> Self {
@@ -419,13 +455,13 @@ impl TaskDynamicFilterInbox {
         version: DomainVersion,
     ) -> Result<(), DynamicFilterError> {
         let mut state = self.custody.state.lock().expect("original RF source");
-        if let Some(flight) = &mut state.flight {
-            if flight.snapshot.version == version {
-                flight.published = true;
-                drop(state);
-                self.custody.pending.pending();
-                return Ok(());
-            }
+        if let Some(flight) = &mut state.flight
+            && flight.snapshot.version == version
+        {
+            flight.published = true;
+            drop(state);
+            self.custody.pending.pending();
+            return Ok(());
         }
         // Other Task publications legitimately repeat the already committed
         // advertisement; they mint no new receipt or callback invocation.
@@ -622,7 +658,10 @@ impl TaskDynamicFilterInbox {
         }
         if let Some(snapshot) = state.pending_value.take() {
             let command = WorkerMessage::Context(ContextMessage::Command {
-                work: self.work,
+                work: novarocks_control_runtime_core::identity::ScopedWorkRef {
+                    scope: self.custody.scope.id(),
+                    work: self.work,
+                },
                 request: None,
                 command: ContextInput::DynamicFilterPublished {
                     task: self.custody.task,

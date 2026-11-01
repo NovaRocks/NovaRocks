@@ -27,7 +27,9 @@ use std::{
     time::Duration,
 };
 
-use novarocks_control_runtime::{publication::PublishedSnapshot, transaction::ScopeHandle};
+#[cfg(test)]
+use novarocks_control_runtime::transaction::ScopeHandle;
+use novarocks_control_runtime::{driver::ActorRegistration, publication::PublishedSnapshot};
 use novarocks_execution::runtime::{
     execution_health::{ExecutionExitOrigin, ExecutionHealth},
     fragment::ExecutionFailure,
@@ -183,6 +185,7 @@ impl TaskProjection {
     pub(crate) fn convergence(&self) -> TaskConvergenceSnapshot {
         self.convergence
     }
+    #[cfg(test)]
     pub(crate) fn secondary_diagnostics(&self) -> &TaskSecondaryDiagnosticsSnapshot {
         &self.diagnostics
     }
@@ -358,7 +361,7 @@ impl TaskRuntimePort {
     /// constructor grants no authority to admit another role or callback.
     pub(crate) fn from_admitted(
         identity: TaskIdentity,
-        scope: &ScopeHandle,
+        owner: &ActorRegistration,
         proposals: Arc<TaskProposalIngress>,
         pending: Arc<dyn TaskPendingNotice>,
         health: Arc<ExecutionHealth>,
@@ -369,7 +372,10 @@ impl TaskRuntimePort {
             proposals,
             pending,
             health,
-            published: PublishedSnapshot::new(scope, Arc::new(TaskProjection::bootstrap(identity))),
+            published: PublishedSnapshot::new_for_actor(
+                owner,
+                Arc::new(TaskProjection::bootstrap(identity)),
+            ),
             stop: Arc::new(Observable::new()),
             stop_published: stop.stopped,
             wait: Mutex::new(()),
@@ -415,6 +421,7 @@ impl TaskRuntimePort {
             self.pending.pending();
         }
     }
+    #[cfg(test)]
     pub(crate) fn report_unresolved(&self, fact: FailureFact, phase: TaskFailurePhase) {
         self.health.report_unresolved(
             ExecutionExitOrigin::Task {
@@ -424,6 +431,7 @@ impl TaskRuntimePort {
             fact,
         );
     }
+    #[cfg(test)]
     pub(crate) fn health(&self) -> Arc<ExecutionHealth> {
         self.health.clone()
     }
@@ -575,6 +583,7 @@ impl TaskRuntimePort {
             stopped: self.stop_published.clone(),
         }
     }
+    #[cfg(test)]
     pub(crate) fn stop_observable(&self) -> Arc<Observable> {
         self.stop.clone()
     }
@@ -664,14 +673,14 @@ mod tests {
         actor::{Actor, ActorConfig, StepContext},
         completion::ReportSlot,
         driver::ActorRuntime,
-        lease::{CapacityBundle, WorkLease},
+        lease::{ReservationBundle, WorkLease},
         transaction::RuntimeLedger,
     };
     use novarocks_control_runtime_core::{
         capacity::ResourceVector,
         completion::{CompletionError, ConsumerKind},
         effect::{EffectDescriptor, EffectKind},
-        identity::{ActionId, ActorId, ConsumerId, DimensionId, Generation, ScopeId, Tick, WorkId},
+        identity::{ActionId, ActorId, ConsumerId, DimensionId, Generation, ScopeId, Tick},
         mailbox::{InputClass, InputEnvelope},
         scope::{WorkAdmission, WorkKind},
     };
@@ -702,16 +711,16 @@ mod tests {
     #[derive(Debug)]
     struct Publisher;
     impl Actor for Publisher {
-        type Input = WorkId;
+        type Input = novarocks_control_runtime_core::identity::ScopedWorkRef;
         type Effect = ();
-        fn timer_input(_: Tick) -> WorkId {
+        fn timer_input(_: Tick) -> novarocks_control_runtime_core::identity::ScopedWorkRef {
             unreachable!("no timer")
         }
         fn handle(
             &mut self,
             _: Tick,
             _: InputEnvelope,
-            work: WorkId,
+            work: novarocks_control_runtime_core::identity::ScopedWorkRef,
             step: &mut StepContext<'_, ()>,
         ) {
             step.effect(
@@ -735,7 +744,7 @@ mod tests {
         scope: ScopeHandle,
         runtime: ActorRuntime<Publisher>,
         work: WorkLease,
-        capacity: CapacityBundle,
+        capacity: ReservationBundle,
         port: Arc<TaskRuntimePort>,
         wakes: Arc<AtomicUsize>,
         open_consuming: AtomicBool,
@@ -748,20 +757,19 @@ mod tests {
     }
     fn fixture_with_source_notice(
         source_notice: Option<Arc<dyn TaskPendingNotice>>,
-        prestart_first_source: bool,
+        refuse_first_source_start: bool,
     ) -> Fixture {
-        let ledger = RuntimeLedger::new(
-            ResourceVector::new([(DimensionId::new(1).unwrap(), 1)]).unwrap(),
-            32,
-            1,
-        );
+        let ledger =
+            RuntimeLedger::new(ResourceVector::new([(DimensionId::new(1).unwrap(), 1)]).unwrap());
         let scope = ledger
-            .open_scope_next(None, Generation::new(1).unwrap(), 32, 32)
+            .open_scope_next(None, Generation::new(1).unwrap())
             .unwrap();
         let (mut work, capacity) = scope
             .reserve_next(
                 Generation::new(1).unwrap(),
-                ResourceVector::new([(DimensionId::new(1).unwrap(), 1)]).unwrap(),
+                novarocks_control_runtime_core::capacity::ReservationResources::for_work(
+                    ResourceVector::new([(DimensionId::new(1).unwrap(), 1)]).unwrap(),
+                ),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -769,9 +777,9 @@ mod tests {
             .bind(WorkKind::Cleanup)
             .unwrap();
         work.start().unwrap();
-        let runtime = ActorRuntime::new(1);
-        runtime
-            .register_next(
+        let runtime = ActorRuntime::new();
+        let registration = runtime
+            .register_supervised_bound(
                 actor(),
                 scope.clone(),
                 Publisher,
@@ -783,6 +791,7 @@ mod tests {
                     turn_budget: 8,
                     max_step_work: 1,
                 },
+                &work,
             )
             .unwrap();
         let identity = TaskIdentity::new(
@@ -796,20 +805,23 @@ mod tests {
         // Publisher is not WorkerCore. These actual paid source roles declare
         // only the host observer, never a fictitious Core InputId consumer.
         let roles = std::array::from_fn(|index| {
-            let role = admitted_source(&scope, capacity.id());
-            let mut role = role;
-            if prestart_first_source && index == 0 {
-                // Deliberate custody fault: the original binder must reject
-                // this already-started header and preserve Unknown custody.
-                role.work.start().unwrap();
-            }
-            crate::control_runtime::source_positions::SourceSlotAdmission::protocol_model(
+            // Only the fault fixture gives its first original header a Step
+            // start gate. Keep its actual Queued/Admitted phase so the bank
+            // selects it; the later real stop makes the binder itself refuse.
+            let kind = if refuse_first_source_start && index == 0 {
+                WorkKind::Step
+            } else {
+                WorkKind::Cleanup
+            };
+            let role = admitted_source(&scope, capacity.id(), kind);
+            crate::control_runtime::source_positions::SourceSlotAdmission::from_admitted(
                 crate::control_runtime::admitted_role::adopt_reported_work(
                     role.work,
                     role.capacity,
                     role.report,
                 ),
             )
+            .unwrap()
         });
         let health = Arc::new(ExecutionHealth::default());
         let ingress = Arc::new(
@@ -817,8 +829,18 @@ mod tests {
                 .unwrap_or_else(|_| panic!("the original paid source roles fit")),
         );
         let port = Arc::new(TaskRuntimePort::from_admitted(
-            identity, &scope, ingress, pending, health,
+            identity,
+            &registration,
+            ingress,
+            pending,
+            health,
         ));
+        if refuse_first_source_start {
+            // This is a genuine start refusal on the selected paid original,
+            // rather than an impossible disagreement between its Work phase
+            // and the ExitRole constructor's actual phase observation.
+            scope.request_stop().unwrap();
+        }
         Fixture {
             ledger,
             scope,
@@ -836,25 +858,33 @@ mod tests {
     fn admitted_source(
         scope: &ScopeHandle,
         parent: novarocks_control_runtime_core::identity::ReservationId,
+        kind: WorkKind,
     ) -> AdmittedCompletionRole {
         let generation = scope.gates().unwrap().generation;
-        let guard = scope
+        let mut guard = scope
             .reserve_child_next(
                 generation,
                 parent,
-                ResourceVector::default(),
-                WorkKind::Cleanup,
+                novarocks_control_runtime_core::capacity::ReservationResources::new(
+                    ResourceVector::default(),
+                    novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 1,
+                        captures: 1,
+                        ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
+                    },
+                ),
+                kind,
             )
             .unwrap();
         let report = ReportSlot::reserve_next(
-            scope,
+            &mut guard,
             generation,
-            guard.work_id(),
             1,
             [(observer(), ConsumerKind::Observer)],
         )
         .unwrap();
-        let (work, capacity) = guard.bind(WorkKind::Cleanup).unwrap();
+        let (work, capacity) = guard.bind(kind).unwrap();
         AdmittedCompletionRole {
             work,
             capacity,
@@ -876,7 +906,7 @@ mod tests {
                 .runtime
                 .reserve_input(actor(), ActorId::new(2).unwrap(), InputClass::Lifecycle)
                 .unwrap()
-                .fill(self.work.id())
+                .fill(self.work.reference())
                 .unwrap();
             self.runtime.poll_one(Tick(1)).unwrap();
             let ticket = self
@@ -954,8 +984,9 @@ mod tests {
             self.work.captures_exited().unwrap();
             self.ledger.reap_scope_ready(self.scope.id(), 1).unwrap();
             self.capacity
-                .release(&self.capacity.resources().unwrap())
+                .release_quota(&self.capacity.resources().unwrap().quota)
                 .unwrap();
+            self.capacity.finish().unwrap();
             self.scope.close_external().unwrap();
             while let Some(original_host_turn) = self.runtime.claim_host_actor() {
                 original_host_turn.release(false).unwrap();
@@ -965,6 +996,77 @@ mod tests {
             assert!(self.ledger.is_empty());
         }
     }
+    // These original preparation-view tests exercise the actual port's
+    // publication and stop notification. They do not adjudicate a Node Task.
+    #[test]
+    fn preparation_control_stop_before_wait_and_notification_race_never_lose_stop() {
+        use novarocks_execution_contract::{CancelReason, TerminationDetail};
+        for before in [false, true] {
+            for _ in 0..64 {
+                let f = fixture();
+                let original = f.port.execution_port();
+                let view = crate::TaskPreparationView::from_execution_port(
+                    &original,
+                    Duration::from_secs(30),
+                );
+                let conclusion = TaskConclusion::Terminated(TerminationDetail::Canceled(
+                    CancelReason::UpstreamNoLongerNeeded,
+                ));
+                let stop = || {
+                    let next = f
+                        .port
+                        .prepare_conclusion(NonZeroU64::MIN, conclusion.clone(), None)
+                        .unwrap();
+                    let projection = f.port.publication().read().with_conclusion(next).unwrap();
+                    f.publish(projection);
+                    f.port.notify_stopped();
+                };
+                if before {
+                    stop();
+                }
+                let (send, receive) = std::sync::mpsc::channel();
+                let other = view.clone();
+                let worker = std::thread::spawn(move || {
+                    send.send(other.borrow_control().wait()).unwrap();
+                });
+                if !before {
+                    stop();
+                }
+                let observed = receive
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(
+                    f.port.accepted().unwrap().neutral().conclusion(),
+                    &conclusion
+                );
+                assert_eq!(
+                    observed.failure_fact().evidence(),
+                    novarocks_execution_contract::failure::FailureEvidence::StopObservation
+                );
+                worker.join().unwrap();
+                assert!(view.borrow_control().checkpoint().is_err());
+                drop(view);
+                drop(original);
+                f.finish();
+            }
+        }
+    }
+
+    #[test]
+    fn preparation_control_explicit_cadence_returns_retry_without_creating_stop() {
+        let f = fixture();
+        let original = f.port.execution_port();
+        let view =
+            crate::TaskPreparationView::from_execution_port(&original, Duration::from_millis(1));
+        assert!(view.borrow_control().wait().is_ok());
+        assert!(view.borrow_control().checkpoint().is_ok());
+        assert!(f.port.accepted().is_none());
+        drop(view);
+        drop(original);
+        f.finish();
+    }
+
     #[test]
     fn source_retirement_preserves_neutral_receipt_and_requires_a_real_host_commit() {
         struct Source {
@@ -1014,7 +1116,6 @@ mod tests {
                 assert!(!original.custody.reusable());
                 assert_eq!(port.ingress().retained_sources(), 1);
                 assert!(!self.preparation.physical_bodies_exited());
-                self.preparation.admission_exited();
                 self.drops.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -1023,7 +1124,6 @@ mod tests {
             f.port.identity(),
             f.port.health(),
         ));
-        preparation.begin_admission();
         let drops = Arc::new(AtomicUsize::new(0));
         let source = Arc::new(Mutex::new(None));
         f.port
@@ -1734,6 +1834,10 @@ mod tests {
                     .expect("the original claim has its actual source identity");
                 if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     assert_eq!(source.phase, SourcePositionPhase::Pending);
+                    assert_eq!(
+                        source.custody.phase(),
+                        novarocks_control_runtime::exit_role::ExitRolePhase::Unresolved
+                    );
                     panic!("controlled failure of the binder's original pending notice");
                 }
                 assert_eq!(source.phase, SourcePositionPhase::Abandoned);
@@ -1752,6 +1856,14 @@ mod tests {
         });
         let f = fixture_with_source_notice(Some(notice.clone()), true);
         *notice.ingress.lock().unwrap() = Arc::downgrade(f.port.ingress());
+        assert_eq!(notice.calls.load(Ordering::SeqCst), 0);
+        let before = f.port.ingress().pair_inventory(PairRoute::Open).unwrap();
+        assert_eq!(before[0].phase, SourcePositionPhase::Available);
+        assert_eq!(
+            before[0].custody.phase(),
+            novarocks_control_runtime::exit_role::ExitRolePhase::Admitted
+        );
+        assert!(f.scope.gates().unwrap().stopped);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             f.port.submit(TaskConclusionProposal::Failed {
                 cause: novarocks_functions::KernelFailure::ResourceExhausted.into(),
@@ -1776,5 +1888,27 @@ mod tests {
         assert!(f.port.health().failure().is_some());
         // The deliberately damaged original Work stays Unknown. This test
         // cannot finish it, acknowledge its report or claim an empty ledger.
+        let unresolved = f.ledger.unresolved_work();
+        let scope = f.scope.snapshot().unwrap();
+        f.runtime.close_actor_admission(actor()).unwrap();
+        while let Some(original_host_turn) = f.runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
+        }
+        // Publisher has no queued input or failure-publication batch. Close
+        // only its unused builtin sources before dropping the actual runtime;
+        // sealing still supplies no Work, report, Scope or actor exit proof.
+        f.runtime.seal_actor(actor()).unwrap();
+        assert_eq!(
+            f.runtime.failure_source_state(actor()).unwrap(),
+            novarocks_control_runtime::driver::FailureSourceState::ClosedDrained
+        );
+        assert_eq!(
+            f.runtime.timer_source_state(actor()).unwrap(),
+            novarocks_control_runtime::driver::TimerSourceState::ClosedDrained
+        );
+        assert_eq!(f.ledger.unresolved_work(), unresolved);
+        assert_eq!(f.scope.snapshot().unwrap(), scope);
+        assert!(!original.custody.reusable());
+        assert!(f.port.health().failure().is_some());
     }
 }

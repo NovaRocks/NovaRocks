@@ -21,12 +21,12 @@
 use loom::{sync::Arc, thread};
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, DriverError},
+    driver::{ActorRuntime, DriverError, FailureSourceState, InputPhase},
     publication::PublishedSnapshot,
     transaction::RuntimeLedger,
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     effect::{EffectDescriptor, EffectKind},
     identity::*,
     mailbox::{InputClass, InputEnvelope},
@@ -59,7 +59,9 @@ impl Actor for Failing {
         step.effect(
             EffectDescriptor {
                 id: ActionId::new(7).unwrap(),
-                work: WorkId::new(1).unwrap(),
+                work: step
+                    .failure_work()
+                    .expect("original admitted Cleanup supervisor"),
                 kind: EffectKind::Cleanup,
                 dependencies: vec![],
             },
@@ -77,12 +79,21 @@ fn actual_cleanup_body_exit_and_actual_snapshot_swap_have_one_gate_order() {
         let generation = Generation::new(1).unwrap();
         let actor = ActorId::new(1).unwrap();
         let resources = ResourceVector::new([(DimensionId::new(1).unwrap(), 1)]).unwrap();
-        let ledger = RuntimeLedger::new(resources.clone(), 1, 1);
-        let scope = ledger.open_scope_next(None, generation, 1, 1).unwrap();
+        let ledger = RuntimeLedger::new(resources.clone());
+        let scope = ledger.open_scope_next(None, generation).unwrap();
         let (mut work, mut capacity) = scope
             .reserve_next(
                 generation,
-                resources.clone(),
+                ReservationResources::new(
+                    resources.clone(),
+                    novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                        work_headers: 1,
+                        inputs: 1,
+                        batches: 1,
+                        effects: 1,
+                        ..Default::default()
+                    },
+                ),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -90,9 +101,9 @@ fn actual_cleanup_body_exit_and_actual_snapshot_swap_have_one_gate_order() {
             .bind(WorkKind::Cleanup)
             .unwrap();
         work.start().unwrap();
-        let runtime = ActorRuntime::new(1);
+        let runtime = ActorRuntime::new();
         runtime
-            .register_next(
+            .register_supervised_next(
                 actor,
                 scope.clone(),
                 Failing,
@@ -104,16 +115,29 @@ fn actual_cleanup_body_exit_and_actual_snapshot_swap_have_one_gate_order() {
                     turn_budget: 8,
                     max_step_work: 1,
                 },
+                &work,
             )
             .unwrap();
         let input = runtime
-            .reserve_input(actor, actor, InputClass::Ordinary)
+            .reserve_admitted_input(actor, actor, InputClass::Ordinary, &work)
             .unwrap()
             .fill(())
             .unwrap();
         runtime.poll_one(Tick(1)).unwrap();
+        // The failed occurrence keeps its original custody. Common commits
+        // the supervisor projection to its distinct builtin source position.
+        assert_eq!(
+            runtime.input_custody(actor, input).unwrap().unwrap().phase,
+            InputPhase::AbandonedByOwnerFailure
+        );
+        let FailureSourceState::ClosedPending(supervisor) =
+            runtime.failure_source_state(actor).unwrap()
+        else {
+            panic!("the actual original failure source owns its pending batch");
+        };
+        assert_ne!(supervisor, input);
         let ticket = runtime
-            .take_effect(actor, input, ActionId::new(7).unwrap())
+            .take_effect(actor, supervisor, ActionId::new(7).unwrap())
             .unwrap();
         let mut session = runtime.claim_failure_publication(&ticket).unwrap();
         let target = PublishedSnapshot::new(&scope, Arc::new(0));
@@ -122,7 +146,8 @@ fn actual_cleanup_body_exit_and_actual_snapshot_swap_have_one_gate_order() {
         let exit = thread::spawn(move || {
             work.body_exited().unwrap();
             work.captures_exited().unwrap();
-            capacity.release(&resources).unwrap();
+            capacity.release_quota(&resources).unwrap();
+            capacity.finish().unwrap();
         });
         let publication = publish.join().unwrap();
         exit.join().unwrap();
@@ -138,6 +163,11 @@ fn actual_cleanup_body_exit_and_actual_snapshot_swap_have_one_gate_order() {
             other => panic!("unexpected gate result: {other:?}"),
         }
         runtime.effect_completed(ticket).unwrap();
+        runtime.retire_input(actor, supervisor).unwrap();
+        assert_eq!(
+            runtime.failure_source_state(actor).unwrap(),
+            FailureSourceState::ClosedDrained
+        );
         runtime.retire_input(actor, input).unwrap();
         ledger.reap_ready(1).unwrap();
         drop(runtime.take_failure_payload(actor).unwrap());

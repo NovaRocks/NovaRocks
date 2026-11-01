@@ -20,13 +20,13 @@
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, StepContext},
     driver::{ActorRuntime, DriverError, EffectTicket, InputPhase, InputRole},
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
-    effect::{EffectDescriptor, EffectError, EffectKind},
-    identity::{ActionId, ActorId, DimensionId, Generation, InputId, ScopeId, Tick, WorkId},
+    capacity::{ReservationResources, ResourceVector},
+    effect::{EffectDescriptor, EffectKind},
+    identity::{ActionId, ActorId, DimensionId, Generation, InputId, ScopeId, ScopedWorkRef, Tick},
     mailbox::{InputClass, InputEnvelope},
     scope::{WorkAdmission, WorkKind},
 };
@@ -39,7 +39,7 @@ enum Input {
 }
 #[derive(Debug)]
 struct Neutral {
-    work: WorkId,
+    work: ScopedWorkRef,
     received: Vec<u64>,
 }
 impl Actor for Neutral {
@@ -86,15 +86,15 @@ struct Owner {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
 }
 impl Owner {
     fn register(runtime: &ActorRuntime<Neutral>, actor: ActorId, ledger: RuntimeLedger) -> Self {
-        let scope = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (mut work, capacity) = scope
             .reserve_next(
                 generation(),
-                paid(1),
+                ReservationResources::for_work(paid(1)),
                 WorkKind::Settlement,
                 WorkAdmission::External,
             )
@@ -107,7 +107,7 @@ impl Owner {
                 actor,
                 scope.clone(),
                 Neutral {
-                    work: work.id(),
+                    work: work.reference(),
                     received: vec![],
                 },
                 ActorConfig {
@@ -144,14 +144,14 @@ impl Fixture {
         separate_ledger: bool,
         role_source: Option<u64>,
     ) -> (Self, EffectTicket<()>) {
-        let runtime = ActorRuntime::new(2);
-        let ledger = RuntimeLedger::new(paid(2), 8, 2);
+        let runtime = ActorRuntime::new();
+        let ledger = RuntimeLedger::new(paid(2));
         let source = id(source);
         let target = id(target);
         let mut owners = vec![Owner::register(&runtime, source, ledger.clone())];
         if target != source {
             let target_ledger = if separate_ledger {
-                RuntimeLedger::new(paid(2), 8, 2)
+                RuntimeLedger::new(paid(2))
             } else {
                 ledger
             };
@@ -226,8 +226,9 @@ impl Fixture {
             received.push(self.runtime.remove_actor(owner.actor).unwrap().received);
             owner
                 .capacity
-                .release(&owner.capacity.resources().unwrap())
+                .release_quota(&owner.capacity.resources().unwrap().quota)
                 .unwrap();
+            owner.capacity.finish().unwrap();
             owner.ledger.remove_scope(owner.scope.id()).unwrap();
         }
         assert!(self.runtime.is_empty());
@@ -344,7 +345,7 @@ fn prior_source_failure_rejects_the_original_generation_without_consuming_its_ti
     );
     let unused = f.role().in_flight().unwrap().is_none();
     f.finish(ticket);
-    assert_eq!(error, DriverError::Effect(EffectError::StaleGeneration));
+    assert_eq!(error, DriverError::FailurePublicationRequired);
     assert!(unused);
 }
 
@@ -406,7 +407,7 @@ fn forwarding_and_source_failure_share_one_actual_ledger_order() {
         }
         Err((error, Input::Value(original))) => {
             assert!(Arc::ptr_eq(&original, &value));
-            assert_eq!(error, DriverError::Effect(EffectError::StaleGeneration));
+            assert_eq!(error, DriverError::FailurePublicationRequired);
             false
         }
         Err((_, Input::Emit)) => panic!("the original value cannot change shape"),

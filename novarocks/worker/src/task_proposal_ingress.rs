@@ -18,26 +18,32 @@
 //! A Task's original paid source inventory and causal handoff fence.
 //! Foreign projection, binding, destruction and ledger operations run outside it.
 
+mod retirement_notice;
+use crate::control_runtime::request_ready::RequestReadySlot;
+use retirement_notice::RetirementWakes;
+
+#[cfg(test)]
+use crate::task_completion_roles::AdmittedCompletionRole;
 use crate::{
     control_runtime::{
         source_custody::SourceCustody,
         source_positions::{
-            BoundSource, DetachedSourceSlotStorage, ReapedPosition, RetirementProbe,
+            BoundSource, DetachedSourcePosition, ReapedPosition, RetirementProbe,
             SourcePositionError, SourcePositionKey, SourcePositionObservation, SourcePositionPair,
             SourcePositionPhase, SourcePositions, SourceSlotAdmission, UnusedPosition,
         },
     },
-    task_completion_roles::AdmittedCompletionRole,
     task_port::TaskPendingNotice,
 };
+#[cfg(test)]
 use novarocks_control_runtime::reported_work::ReportedWork;
 use novarocks_control_runtime_core::{
     completion::Consumption,
-    identity::{Generation, WorkId},
+    identity::{Generation, ScopedWorkRef},
 };
 use novarocks_execution::runtime::{execution_health::ExecutionHealth, fragment::ExecutionFailure};
 use novarocks_execution_contract::{
-    RetainedTaskSource, TaskConclusionProposal, TaskFailurePhase, TaskIdentity, TaskOperationId,
+    RetainedTaskSource, TaskConclusionProposal, TaskIdentity, TaskOperationId,
 };
 use novarocks_worker_protocol::{
     context::{ContextCommand, ContextInput, TaskCloseIntent},
@@ -46,7 +52,7 @@ use novarocks_worker_protocol::{
 };
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 type RetainedSource = RetainedTaskSource<ExecutionFailure>;
@@ -79,12 +85,19 @@ impl From<SourcePositionError> for IngressError {
 /// Original paid roles or a unique pair owner, never a source-credit count.
 pub(crate) enum CutSourceAdmission {
     Fresh([SourceSlotAdmission; 2]),
-    Rearm {
-        pair: SourcePositionPair,
-        reaped: [ReapedPosition; 2],
-        roles: [ReportedWork; 2],
-    },
+    #[cfg(test)]
     Unclaimed(SourcePositionPair),
+}
+impl CutSourceAdmission {
+    /// Move the original paid Fresh roles out without cloning or dropping a
+    /// different admission. Component-only pair transfers return intact.
+    pub(crate) fn into_fresh(self) -> Result<[SourceSlotAdmission; 2], Self> {
+        match self {
+            Self::Fresh(roles) => Ok(roles),
+            #[cfg(test)]
+            original @ Self::Unclaimed(_) => Err(original),
+        }
+    }
 }
 /// Original funding handles survive rotation of a cut's prefix pair. Their
 /// report/ledger operations belong to the host, outside this fence.
@@ -113,6 +126,7 @@ struct CutCell {
     event: Option<EventCell>,
     sealed: bool,
     unused: bool,
+    rpc_retirement_notice: Option<Weak<RequestReadySlot>>,
 }
 struct State {
     task: TaskIdentity,
@@ -130,7 +144,7 @@ struct State {
 }
 struct EventCell {
     task: TaskIdentity,
-    work: Option<WorkId>,
+    work: Option<ScopedWorkRef>,
     phase: EventPhase,
     kind: CausalEventKind,
     input: Option<ContextInput>,
@@ -163,7 +177,7 @@ enum EventPhase {
 }
 pub(crate) struct CausalEventInput {
     pub prefix: SummaryInput,
-    pub work: WorkId,
+    pub work: ScopedWorkRef,
     pub request: Option<RequestMetadata>,
     pub event: ContextInput,
 }
@@ -175,8 +189,8 @@ pub(crate) struct SummaryInput {
     pub summary: ProposalSummary,
 }
 pub(crate) enum DiscardedProposal {
-    Unadmitted(ExecutionFailure),
-    Admitted(RetainedSource),
+    Unadmitted { _original_source: ExecutionFailure },
+    Admitted { _original_source: RetainedSource },
 }
 pub(crate) struct ProposalHandoff {
     pub transferred: bool,
@@ -187,6 +201,7 @@ pub(crate) struct ProposalHandoff {
 pub(crate) struct RetiredCut {
     pub pair: SourcePositionPair,
     pub funding: SourceFunding,
+    pub(crate) rpc_retirement_notice: Option<Weak<RequestReadySlot>>,
 }
 
 impl State {
@@ -233,28 +248,13 @@ impl State {
                 .sources
                 .append_pair(roles)
                 .map_err(|(error, roles)| (error.into(), CutSourceAdmission::Fresh(roles))),
+            #[cfg(test)]
             CutSourceAdmission::Unclaimed(pair) => {
                 match self.sources.validate_unclaimed_pair(&pair) {
                     Ok(()) => Ok(pair),
                     Err(error) => Err((error.into(), CutSourceAdmission::Unclaimed(pair))),
                 }
             }
-            CutSourceAdmission::Rearm {
-                pair,
-                reaped,
-                roles,
-            } => self.sources.rearm_pair(pair, reaped, roles).map_err(
-                |(error, pair, reaped, roles)| {
-                    (
-                        error.into(),
-                        CutSourceAdmission::Rearm {
-                            pair,
-                            reaped,
-                            roles,
-                        },
-                    )
-                },
-            ),
         }
     }
     fn reserve(
@@ -290,20 +290,42 @@ impl State {
                         event,
                         sealed: false,
                         unused: false,
+                        rpc_retirement_notice: None,
                     }
                 )
                 .is_none()
         );
         Ok(())
     }
-    fn seal(&mut self, cut: CutId) -> Result<(), IngressError> {
+    fn seal(&mut self, cut: CutId, wakes: &mut RetirementWakes) -> Result<(), IngressError> {
         let cell = self.cuts.get(&cut).ok_or(CutError::Unknown)?;
         if cell.unused {
             return Err(CutError::NotReserved.into());
         }
         self.sources
             .validate_unclaimed_pair(cell.pair.as_ref().expect("original cut pair"))?;
+        let notice = cell.rpc_retirement_notice.clone();
+        let cut_pair = cell.pair.as_ref().expect("original cut pair");
+        let open_pair = self.open.as_ref().expect("original open pair");
+        for pair in [cut_pair, open_pair] {
+            for original in self.observe_owned_pair(pair)? {
+                let allowed = match &notice {
+                    Some(notice) => original.custody.can_arm_retirement_notice(false, notice),
+                    None => !original.custody.has_pair_retirement_notice(),
+                };
+                if !allowed {
+                    return Err(SourcePositionError::ForeignInventory.into());
+                }
+            }
+        }
         self.segments.seal_cut(cut)?;
+        wakes.capture_pair(self, cut_pair);
+        wakes.capture_pair(self, open_pair);
+        if let Some(notice) = &notice {
+            for original in self.observe_owned_pair(cut_pair)? {
+                original.custody.clear_pair_retirement_notice(notice);
+            }
+        }
         self.cuts.get_mut(&cut).expect("original cut").sealed = true;
         let cut_pair = self
             .cuts
@@ -317,6 +339,11 @@ impl State {
             .expect("original open pair")
             .swap_with(cut_pair)
             .expect("same original bank");
+        if let Some(notice) = &notice {
+            for original in self.observe_pair(PairRoute::Cut(cut))? {
+                original.custody.arm_retirement_notice(false, notice);
+            }
+        }
         Ok(())
     }
     fn ready(&self, summary: &ProposalSummary) -> bool {
@@ -324,7 +351,10 @@ impl State {
             .candidate_sources()
             .all(|id| self.sources.is_ready(id))
     }
-    fn take_open_summary(&mut self) -> Result<SummaryInput, IngressError> {
+    fn take_open_summary(
+        &mut self,
+        wakes: &mut RetirementWakes,
+    ) -> Result<SummaryInput, IngressError> {
         let summary = self.segments.peek_open()?;
         if !self.ready(summary) {
             return Err(CutError::NotReady.into());
@@ -333,6 +363,8 @@ impl State {
             .validate_unclaimed_pair(self.spare.as_ref().expect("original base spare"))
             .map_err(storage_gate)?;
         let summary = self.segments.begin_open()?;
+        wakes.capture_pair(self, self.open.as_ref().expect("original open pair"));
+        wakes.capture_pair(self, self.spare.as_ref().expect("original spare pair"));
         self.open
             .as_mut()
             .expect("original open pair")
@@ -397,7 +429,9 @@ impl TaskProposalIngress {
                 drop(state);
                 return ProposalHandoff {
                     transferred: false,
-                    discarded: original.map(DiscardedProposal::Unadmitted),
+                    discarded: original.map(|source| DiscardedProposal::Unadmitted {
+                        _original_source: source,
+                    }),
                     error: None,
                 };
             }
@@ -413,7 +447,9 @@ impl TaskProposalIngress {
                 drop(state);
                 return ProposalHandoff {
                     transferred: false,
-                    discarded: original.map(DiscardedProposal::Unadmitted),
+                    discarded: original.map(|source| DiscardedProposal::Unadmitted {
+                        _original_source: source,
+                    }),
                     error: Some(IngressError::Source(SourcePositionError::IdentityExhausted)),
                 };
             };
@@ -429,7 +465,9 @@ impl TaskProposalIngress {
                 drop(state);
                 return ProposalHandoff {
                     transferred: true,
-                    discarded: original.map(DiscardedProposal::Unadmitted),
+                    discarded: original.map(|source| DiscardedProposal::Unadmitted {
+                        _original_source: source,
+                    }),
                     error: None,
                 };
             }
@@ -454,7 +492,9 @@ impl TaskProposalIngress {
                 drop(state);
                 return ProposalHandoff {
                     transferred: false,
-                    discarded: original.map(DiscardedProposal::Unadmitted),
+                    discarded: original.map(|source| DiscardedProposal::Unadmitted {
+                        _original_source: source,
+                    }),
                     error: Some(IngressError::Source(SourcePositionError::NotAvailable)),
                 };
             };
@@ -468,7 +508,9 @@ impl TaskProposalIngress {
                         drop(state);
                         return ProposalHandoff {
                             transferred: false,
-                            discarded: original.map(DiscardedProposal::Unadmitted),
+                            discarded: original.map(|source| DiscardedProposal::Unadmitted {
+                                _original_source: source,
+                            }),
                             error: Some(error.into()),
                         };
                     }
@@ -504,7 +546,9 @@ impl TaskProposalIngress {
             },
             Some((error, bound)) => ProposalHandoff {
                 transferred: true,
-                discarded: Some(DiscardedProposal::Admitted(bound.into_retained())),
+                discarded: Some(DiscardedProposal::Admitted {
+                    _original_source: bound.into_retained(),
+                }),
                 error,
             },
         }
@@ -517,6 +561,7 @@ impl TaskProposalIngress {
         state.segments.cleanup(diagnostic);
         true
     }
+    #[cfg(test)]
     pub(crate) fn reserve_cut(
         &self,
         cut: CutId,
@@ -557,7 +602,11 @@ impl TaskProposalIngress {
         )?;
         Ok(cut)
     }
-    pub(crate) fn bind_event_work(&self, cut: CutId, work: WorkId) -> Result<(), IngressError> {
+    pub(crate) fn bind_event_work(
+        &self,
+        cut: CutId,
+        work: ScopedWorkRef,
+    ) -> Result<(), IngressError> {
         let mut state = self.state.lock().expect("task proposal handoff lock");
         let event = state
             .cuts
@@ -571,6 +620,7 @@ impl TaskProposalIngress {
         Ok(())
     }
     pub(crate) fn register_causal_event(&self, cut: CutId) -> Result<(), IngressError> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         let event = state
             .cuts
@@ -580,7 +630,7 @@ impl TaskProposalIngress {
         if event.phase != EventPhase::Reserved || event.work.is_none() || event.kind.has_input() {
             return Err(CutError::NotReserved.into());
         }
-        state.seal(cut)?;
+        state.seal(cut, &mut retirement_wakes)?;
         state
             .cuts
             .get_mut(&cut)
@@ -599,6 +649,7 @@ impl TaskProposalIngress {
         generation: Generation,
         intent: TaskCloseIntent,
     ) -> Result<(), IngressError> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("original Task close handoff");
         let event = state
             .cuts
@@ -611,7 +662,7 @@ impl TaskProposalIngress {
         {
             return Err(CutError::NotReserved.into());
         }
-        state.seal(cut)?;
+        state.seal(cut, &mut retirement_wakes)?;
         state
             .cuts
             .get_mut(&cut)
@@ -627,6 +678,7 @@ impl TaskProposalIngress {
         cut: CutId,
         input: ContextInput,
     ) -> Result<(), (IngressError, ContextInput)> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         let Some(event) = state.cuts.get(&cut).and_then(|cell| cell.event.as_ref()) else {
             return Err((CutError::Unknown.into(), input));
@@ -673,7 +725,7 @@ impl TaskProposalIngress {
         {
             return Err((CutError::NotReserved.into(), input));
         }
-        if let Err(error) = state.seal(cut) {
+        if let Err(error) = state.seal(cut, &mut retirement_wakes) {
             return Err((error, input));
         }
         let event = state.cuts.get_mut(&cut).unwrap().event.as_mut().unwrap();
@@ -701,6 +753,7 @@ impl TaskProposalIngress {
     }
     /// The original non-event author relinquishes a reservation which never
     /// registered. Actual producer/effect exits are still independent facts.
+    #[cfg(test)]
     pub(crate) fn revoke_unregistered_cut(&self, cut: CutId) -> Result<(), IngressError> {
         let mut state = self.state.lock().expect("task proposal handoff lock");
         let cell = state.cuts.get_mut(&cut).ok_or(CutError::Unknown)?;
@@ -726,7 +779,7 @@ impl TaskProposalIngress {
         &self,
         cut: CutId,
         task: TaskIdentity,
-        work: WorkId,
+        work: ScopedWorkRef,
     ) -> Result<(), IngressError> {
         let state = self.state.lock().expect("task proposal handoff lock");
         let event = state
@@ -752,7 +805,7 @@ impl TaskProposalIngress {
         &self,
         cut: CutId,
         task: TaskIdentity,
-        work: WorkId,
+        work: ScopedWorkRef,
     ) -> Result<(), IngressError> {
         let state = self.state.lock().expect("task proposal handoff lock");
         let event = state
@@ -770,11 +823,18 @@ impl TaskProposalIngress {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn seal_cut(&self, cut: CutId) -> Result<(), IngressError> {
+        let mut retirement_wakes = RetirementWakes::default();
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        state.seal(cut, &mut retirement_wakes)
+    }
+    pub(crate) fn next_event_cut(&self) -> Option<CutId> {
         self.state
             .lock()
             .expect("task proposal handoff lock")
-            .seal(cut)
+            .segments
+            .next_cut()
     }
     pub(crate) fn take_next_event(&self, abandon: bool) -> Result<CausalEventInput, IngressError> {
         let mut state = self.state.lock().expect("task proposal handoff lock");
@@ -834,7 +894,9 @@ impl TaskProposalIngress {
             event: input,
         })
     }
+    #[cfg(test)]
     pub(crate) fn take_next_summary(&self) -> Result<SummaryInput, IngressError> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         if state.failed {
             return Err(CutError::NotReady.into());
@@ -855,13 +917,14 @@ impl TaskProposalIngress {
                 summary: state.segments.begin_consume(cut)?,
             })
         } else {
-            state.take_open_summary()
+            state.take_open_summary(&mut retirement_wakes)
         }
     }
     /// Only the open-summary owner uses this path. A preceding cut retains
     /// its own author, even when it has no event, and an empty open segment
     /// never occupies the reusable runtime input or swaps its source pair.
     pub(crate) fn try_take_open_summary(&self) -> Result<Option<SummaryInput>, IngressError> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         if state.failed {
             return Err(CutError::NotReady.into());
@@ -869,7 +932,7 @@ impl TaskProposalIngress {
         if state.segments.next_cut().is_some() {
             return Ok(None);
         }
-        match state.take_open_summary() {
+        match state.take_open_summary(&mut retirement_wakes) {
             Ok(input) => Ok(Some(input)),
             Err(IngressError::Cut(CutError::NotReady | CutError::Consuming)) => Ok(None),
             Err(error) => Err(error),
@@ -879,6 +942,7 @@ impl TaskProposalIngress {
     /// an input for the dead Core. Its caller validates the drained failure
     /// session; actual source/report exit is still required independently.
     pub(crate) fn take_failed_open_summary(&self) -> Result<Option<SummaryInput>, IngressError> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         if !state.failed || state.open_consuming {
             return Err(CutError::NotReady.into());
@@ -893,6 +957,14 @@ impl TaskProposalIngress {
             return Ok(None);
         }
         let summary = state.segments.begin_abandon_open()?;
+        retirement_wakes.capture_pair(
+            &state,
+            state.open.as_ref().expect("original failed open pair"),
+        );
+        retirement_wakes.capture_pair(
+            &state,
+            state.spare.as_ref().expect("original failed spare pair"),
+        );
         let State { open, spare, .. } = &mut *state;
         open.as_mut()
             .expect("original failed open pair")
@@ -1060,11 +1132,13 @@ impl TaskProposalIngress {
         &self,
         pair: &SourcePositionPair,
         reaped: [ReapedPosition; 2],
-    ) -> Result<[DetachedSourceSlotStorage; 2], (IngressError, [ReapedPosition; 2])> {
+    ) -> Result<[DetachedSourcePosition; 2], (IngressError, [ReapedPosition; 2])> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         if let Err(error) = state.sources.validate_reaped_pair(pair, &reaped) {
             return Err((error.into(), reaped));
         }
+        retirement_wakes.capture_pair(&state, pair);
         Ok(reaped.map(|witness| {
             state
                 .sources
@@ -1073,19 +1147,37 @@ impl TaskProposalIngress {
         }))
     }
     /// Final teardown of this exact closed routing pair. Current generation
-    /// witnesses prove real Work/report exit; the owned storage leaves the
-    /// handoff lock with the caller and is refunded only outside it.
+    /// witnesses prove real Work/report exit; the original metadata owner
+    /// leaves the handoff lock with the caller and is dropped outside it.
     pub(crate) fn release_closed_route_pair(
         &self,
         route: PairRoute,
         reaped: [ReapedPosition; 2],
-    ) -> Result<[DetachedSourceSlotStorage; 2], (IngressError, [ReapedPosition; 2])> {
+    ) -> Result<[DetachedSourcePosition; 2], (IngressError, [ReapedPosition; 2])> {
+        self.release_producer_pair_inner(route, reaped, true)
+    }
+    /// Exact physical producer custody may end while independent RPC cuts
+    /// remain resident. Both original Source headers must still be reaped.
+    pub(crate) fn release_physically_closed_producer_pair(
+        &self,
+        route: PairRoute,
+        reaped: [ReapedPosition; 2],
+    ) -> Result<[DetachedSourcePosition; 2], (IngressError, [ReapedPosition; 2])> {
+        self.release_producer_pair_inner(route, reaped, false)
+    }
+    fn release_producer_pair_inner(
+        &self,
+        route: PairRoute,
+        reaped: [ReapedPosition; 2],
+        require_empty_cuts: bool,
+    ) -> Result<[DetachedSourcePosition; 2], (IngressError, [ReapedPosition; 2])> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         let checked = (|| {
             if !state.source_closed
                 || state.open_consuming
                 || !state.segments.open_is_empty()
-                || !state.cuts.is_empty()
+                || (require_empty_cuts && !state.cuts.is_empty())
                 || matches!(route, PairRoute::Cut(_))
             {
                 return Err(IngressError::Cut(CutError::NotReady));
@@ -1098,6 +1190,12 @@ impl TaskProposalIngress {
         if let Err(error) = checked {
             return Err((error, reaped));
         }
+        retirement_wakes.capture_pair(
+            &state,
+            state
+                .pair(route)
+                .expect("same physically closed producer pair"),
+        );
         let original = match route {
             PairRoute::Open => state.open.take(),
             PairRoute::ConsumingOpen => state.spare.take(),
@@ -1113,6 +1211,7 @@ impl TaskProposalIngress {
         drop(original);
         Ok(storage)
     }
+    #[cfg(test)]
     pub(crate) fn cut_funding(&self, cut: CutId) -> Result<SourceFunding, IngressError> {
         Ok(self
             .state
@@ -1138,6 +1237,7 @@ impl TaskProposalIngress {
         &self,
         mut retired: RetiredCut,
     ) -> Result<RetiredCut, (IngressError, RetiredCut)> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         let checked = (|| {
             let funding = &retired.funding;
@@ -1164,6 +1264,17 @@ impl TaskProposalIngress {
                 return Err(IngressError::Cut(CutError::NotReady));
             };
             state.sources.validate_unclaimed_pair(state.pair(route)?)?;
+            for pair in [&retired.pair, state.pair(route)?] {
+                for original in state.observe_owned_pair(pair)? {
+                    let allowed = match &retired.rpc_retirement_notice {
+                        Some(notice) => original.custody.can_arm_retirement_notice(false, notice),
+                        None => !original.custody.has_pair_retirement_notice(),
+                    };
+                    if !allowed {
+                        return Err(IngressError::Source(SourcePositionError::ForeignInventory));
+                    }
+                }
+            }
             Ok(Some(route))
         })();
         let route = match checked {
@@ -1171,6 +1282,19 @@ impl TaskProposalIngress {
             Err(error) => return Err((error, retired)),
         };
         if let Some(route) = route {
+            retirement_wakes.capture_pair(&state, &retired.pair);
+            retirement_wakes.capture_pair(
+                &state,
+                state.pair(route).expect("same original funding route"),
+            );
+            if let Some(notice) = &retired.rpc_retirement_notice {
+                for original in state
+                    .observe_owned_pair(&retired.pair)
+                    .expect("same original retired pair")
+                {
+                    original.custody.clear_pair_retirement_notice(notice);
+                }
+            }
             let current = match route {
                 PairRoute::Open => state.open.as_mut(),
                 PairRoute::ConsumingOpen => state.spare.as_mut(),
@@ -1180,6 +1304,14 @@ impl TaskProposalIngress {
             current
                 .swap_with(&mut retired.pair)
                 .expect("same-lock validated original bank");
+            if let Some(notice) = &retired.rpc_retirement_notice {
+                for original in state
+                    .observe_owned_pair(&retired.pair)
+                    .expect("same original restored funding pair")
+                {
+                    original.custody.arm_retirement_notice(false, notice);
+                }
+            }
         }
         Ok(retired)
     }
@@ -1242,7 +1374,9 @@ impl TaskProposalIngress {
     }
     /// An empty source pair transfers the same untouched paid permits back
     /// to the spare. This releases neither credit nor any original source role.
+    #[cfg(test)]
     pub(crate) fn finish_open_unclaimed(&self) -> Result<(), IngressError> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         if !state.open_consuming {
             return Err(CutError::NotReady.into());
@@ -1259,6 +1393,10 @@ impl TaskProposalIngress {
         } else {
             state.segments.finish_open()?;
         }
+        retirement_wakes.capture_pair(
+            &state,
+            state.spare.as_ref().expect("original consuming pair"),
+        );
         state.open_consuming = false;
         state.open_core_consumed = false;
         Ok(())
@@ -1275,6 +1413,7 @@ impl TaskProposalIngress {
         self.retire_unclaimed_inner(cut, true)
     }
     fn retire_unclaimed_inner(&self, cut: CutId, unused: bool) -> Result<RetiredCut, IngressError> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         let cell = state.cuts.get(&cut).ok_or(CutError::Unknown)?;
         if unused && !cell.unused {
@@ -1289,10 +1428,20 @@ impl TaskProposalIngress {
         } else {
             state.segments.retire(cut)?;
         }
+        let original_cell = state.cuts.get(&cut).expect("original retired cut");
+        retirement_wakes.capture_pair(
+            &state,
+            original_cell
+                .pair
+                .as_ref()
+                .expect("original retired cut pair"),
+        );
+        retirement_wakes.capture_funding(&original_cell.funding);
         let cell = state.cuts.remove(&cut).expect("original retired cut");
         Ok(RetiredCut {
             pair: cell.pair.expect("original paid pair"),
             funding: cell.funding,
+            rpc_retirement_notice: cell.rpc_retirement_notice,
         })
     }
     /// A reap witness is produced outside this fence. Core acknowledgement
@@ -1301,6 +1450,7 @@ impl TaskProposalIngress {
         &self,
         reaped: [ReapedPosition; 2],
     ) -> Result<(), (IngressError, [ReapedPosition; 2])> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         let checked = (|| {
             if !state.open_consuming {
@@ -1329,6 +1479,10 @@ impl TaskProposalIngress {
                 .finish_open()
                 .expect("the actual Core leg was already observed");
         }
+        retirement_wakes.capture_pair(
+            &state,
+            state.spare.as_ref().expect("original consuming pair"),
+        );
         for witness in reaped {
             state
                 .sources
@@ -1342,19 +1496,26 @@ impl TaskProposalIngress {
     /// Reissue only the original base spare addresses, after actual retirement.
     /// Admission of these new paid roles occurred on the original host outside
     /// this fence, never by waiting here for another queue or new capacity.
+    #[cfg(test)]
     pub(crate) fn rearm_open_spare(
         &self,
         reaped: [ReapedPosition; 2],
-        roles: [ReportedWork; 2],
-    ) -> Result<(), (IngressError, [ReapedPosition; 2], [ReportedWork; 2])> {
+        roles: [SourceSlotAdmission; 2],
+    ) -> Result<(), (IngressError, [ReapedPosition; 2], [SourceSlotAdmission; 2])> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         if state.failed || state.source_closed || state.open_consuming {
             return Err((CutError::NotReady.into(), reaped, roles));
         }
+        let successful_wakes = RetirementWakes::snapshot_pair(
+            &state,
+            state.spare.as_ref().expect("original base spare"),
+        );
         let pair = state.spare.take().expect("original base spare");
         match state.sources.rearm_pair(pair, reaped, roles) {
             Ok(pair) => {
                 state.spare = Some(pair);
+                retirement_wakes.extend(successful_wakes);
                 Ok(())
             }
             Err((error, pair, reaped, roles)) => {
@@ -1383,6 +1544,7 @@ impl TaskProposalIngress {
         reaped: [ReapedPosition; 2],
         unused: bool,
     ) -> Result<RetiredCut, (IngressError, [ReapedPosition; 2])> {
+        let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         let checked = (|| {
             if unused && !state.cuts.get(&cut).ok_or(CutError::Unknown)?.unused {
@@ -1406,10 +1568,20 @@ impl TaskProposalIngress {
                 .mark_generation_retired(witness)
                 .expect("same-lock validated original pair");
         }
+        let original_cell = state.cuts.get(&cut).expect("original retired cut");
+        retirement_wakes.capture_pair(
+            &state,
+            original_cell
+                .pair
+                .as_ref()
+                .expect("original retired cut pair"),
+        );
+        retirement_wakes.capture_funding(&original_cell.funding);
         let cell = state.cuts.remove(&cut).expect("original retired cut");
         Ok(RetiredCut {
             pair: cell.pair.expect("original source pair"),
             funding: cell.funding,
+            rpc_retirement_notice: cell.rpc_retirement_notice,
         })
     }
     pub(crate) fn fail(&self) {
@@ -1482,7 +1654,7 @@ mod tests {
         scope::{WorkAdmission, WorkKind},
     };
     use novarocks_execution_contract::{
-        AcceptedConclusion, AcceptedTaskConclusion,
+        AcceptedConclusion, AcceptedTaskConclusion, TaskFailurePhase,
         failure::{FailureClass, FailureFact, FailureProjection, FailureReason, domain},
     };
     use novarocks_worker_protocol::proposal_summary::{ConclusionState, Diagnostics};
@@ -1503,13 +1675,11 @@ mod tests {
         )
     }
     fn slot(role: AdmittedCompletionRole) -> SourceSlotAdmission {
-        // Finite empty-resource protocol model, not production slot funding.
-        SourceSlotAdmission::protocol_model(reported(role))
+        // The actual bound role is the only Source storage owner.
+        SourceSlotAdmission::from_admitted(reported(role)).unwrap()
     }
-    fn release_storage(storage: [DetachedSourceSlotStorage; 2]) {
-        for mut original in storage {
-            original.release().unwrap();
-        }
+    fn release_storage(originals: [DetachedSourcePosition; 2]) {
+        drop(originals);
     }
     #[derive(Default)]
     struct Pending(AtomicUsize);
@@ -1540,7 +1710,7 @@ mod tests {
         ledger: RuntimeLedger,
         scope: ScopeHandle,
         parent: WorkLease,
-        capacity: novarocks_control_runtime::lease::CapacityBundle,
+        capacity: novarocks_control_runtime::lease::ReservationBundle,
         pending: Arc<Pending>,
         health: Arc<ExecutionHealth>,
         ingress: Arc<TaskProposalIngress>,
@@ -1549,13 +1719,15 @@ mod tests {
         fn new(max_cuts: usize) -> Self {
             let task = task(1);
             let resources = ResourceVector::new([(DimensionId::new(1).unwrap(), 1)]).unwrap();
-            let ledger = RuntimeLedger::new(resources.clone(), 128, 1);
+            let ledger = RuntimeLedger::new(resources.clone());
             let generation = Generation::new(1).unwrap();
-            let scope = ledger.open_scope_next(None, generation, 128, 128).unwrap();
+            let scope = ledger.open_scope_next(None, generation).unwrap();
             let (mut parent, capacity) = scope
                 .reserve_next(
                     generation,
-                    resources,
+                    novarocks_control_runtime_core::capacity::ReservationResources::for_work(
+                        resources,
+                    ),
                     WorkKind::Business,
                     WorkAdmission::External,
                 )
@@ -1592,18 +1764,26 @@ mod tests {
             parent: novarocks_control_runtime_core::identity::ReservationId,
         ) -> AdmittedCompletionRole {
             let generation = scope.gates().unwrap().generation;
-            let guard = scope
+            let mut guard = scope
                 .reserve_child_next(
                     generation,
                     parent,
-                    ResourceVector::default(),
+                    novarocks_control_runtime_core::capacity::ReservationResources::new(
+                        ResourceVector::default(),
+                        novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                            work_headers: 1,
+                            completions: 1,
+                            captures: 1,
+                            ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default(
+                            )
+                        },
+                    ),
                     WorkKind::Cleanup,
                 )
                 .unwrap();
             let report = ReportSlot::reserve_next(
-                scope,
+                &mut guard,
                 generation,
-                guard.work_id(),
                 1,
                 [(observer(), ConsumerKind::Observer)],
             )
@@ -1626,11 +1806,7 @@ mod tests {
         }
         fn dispose_admissions<const N: usize>(&self, roles: [SourceSlotAdmission; N]) {
             self.dispose_roles(roles.map(|slot| {
-                let (reported, payment) = slot.into_originals();
-                assert!(
-                    payment.is_none(),
-                    "only this explicit protocol model is unpaid"
-                );
+                let reported = slot.into_reported();
                 let (work, capacity, report) = reported.into_parts();
                 AdmittedCompletionRole {
                     work,
@@ -1734,8 +1910,9 @@ mod tests {
             self.parent.body_exited().unwrap();
             self.parent.captures_exited().unwrap();
             self.capacity
-                .release(&self.capacity.resources().unwrap())
+                .release_quota(&self.capacity.resources().unwrap().quota)
                 .unwrap();
+            self.capacity.finish().unwrap();
             self.ledger.reap_scope_ready(self.scope.id(), 1).unwrap();
             self.scope.close_external().unwrap();
             self.ledger.remove_scope(self.scope.id()).unwrap();
@@ -1922,7 +2099,7 @@ mod tests {
             let handoff = f.ingress.submit(failure(&f, &drops));
             assert!(matches!(
                 handoff.discarded,
-                Some(DiscardedProposal::Unadmitted(_))
+                Some(DiscardedProposal::Unadmitted { .. })
             ));
             drop_handoff(handoff);
         }
@@ -1979,7 +2156,9 @@ mod tests {
                 CutSourceAdmission::Fresh(f.slot_roles()),
             )
             .unwrap_or_else(|_| panic!("actual input pair"));
-        f.ingress.bind_event_work(cut, f.parent.id()).unwrap();
+        f.ingress
+            .bind_event_work(cut, f.parent.reference())
+            .unwrap();
         f.ingress
             .register_input_event(cut, ContextInput::CompletionExited { task: f.task })
             .unwrap();
@@ -2133,7 +2312,7 @@ mod tests {
         assert!(!late.transferred);
         assert!(matches!(
             late.discarded,
-            Some(DiscardedProposal::Unadmitted(_))
+            Some(DiscardedProposal::Unadmitted { .. })
         ));
         drop_handoff(late);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -2194,7 +2373,10 @@ mod tests {
         let roles = f.reported_roles();
         let ids = roles.each_ref().map(|role| role.report().id());
         f.ingress
-            .rearm_open_spare(reaped, roles)
+            .rearm_open_spare(
+                reaped,
+                roles.map(|reported| SourceSlotAdmission::from_admitted(reported).unwrap()),
+            )
             .unwrap_or_else(|_| panic!("same base addresses"));
         assert_eq!(
             f.ingress
@@ -2242,7 +2424,10 @@ mod tests {
         let handoff = f.ingress.finish_binding(claim.bind(original.unwrap()));
         assert!(handoff.transferred);
         assert!(handoff.error.is_none());
-        let Some(DiscardedProposal::Admitted(carrier)) = handoff.discarded else {
+        let Some(DiscardedProposal::Admitted {
+            _original_source: carrier,
+        }) = handoff.discarded
+        else {
             panic!("same admitted carrier")
         };
         assert_eq!(carrier.cause().cause() as *const _, pointer);

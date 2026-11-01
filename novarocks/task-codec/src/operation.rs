@@ -31,7 +31,6 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::time::Duration;
 
 use novarocks_execution_contract::task_execution::context_convergence::{
     QueryContextConvergenceCursor, QueryContextConvergenceReceipt,

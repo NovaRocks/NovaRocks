@@ -20,11 +20,11 @@
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, StepContext},
     driver::{ActorHostTurn, ActorRegistration, ActorRuntime, Clock, DriverError, PollerPool},
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     identity::{ActorId, DimensionId, Generation, InputId, ScopeId, Tick},
     mailbox::{InputClass, InputEnvelope},
     scope::{WorkAdmission, WorkKind},
@@ -115,7 +115,7 @@ struct Fixture {
     scope: ScopeHandle,
     registration: ActorRegistration,
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     inputs: Vec<InputId>,
     calls: Arc<AtomicUsize>,
     retired: bool,
@@ -129,11 +129,11 @@ impl Fixture {
         completed: Option<Sender<()>>,
     ) -> Self {
         let generation = Generation::new(1).unwrap();
-        let scope = ledger.open_scope_next(None, generation, 4, 4).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
         let (mut work, capacity) = scope
             .reserve_next(
                 generation,
-                paid(1),
+                ReservationResources::for_work(paid(1)),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -270,8 +270,9 @@ fn finish(pool: PollerPool<OriginalActor>, mut fixtures: Vec<Fixture>) {
     for mut fixture in fixtures {
         fixture
             .capacity
-            .release(&fixture.capacity.resources().unwrap())
+            .release_quota(&fixture.capacity.resources().unwrap().quota)
             .unwrap();
+        fixture.capacity.finish().unwrap();
         fixture.ledger.remove_scope(fixture.scope.id()).unwrap();
     }
     assert!(healthy_cleanup);
@@ -279,8 +280,8 @@ fn finish(pool: PollerPool<OriginalActor>, mut fixtures: Vec<Fixture>) {
 
 #[test]
 fn one_poller_services_host_during_a_finite_core_chain_and_wakes_again_from_idle() {
-    let ledger = RuntimeLedger::new(paid(1), 4, 4);
-    let runtime = ActorRuntime::new(1);
+    let ledger = RuntimeLedger::new(paid(1));
+    let runtime = ActorRuntime::new();
     let (all_core, all_core_rx) = mpsc::channel();
     let mut fixture = Fixture::new(
         ledger.clone(),
@@ -381,8 +382,8 @@ impl ReleaseGate {
 
 #[test]
 fn two_pollers_keep_one_original_host_turn_exclusive_while_another_actor_progresses() {
-    let ledger = RuntimeLedger::new(paid(2), 8, 8);
-    let runtime = ActorRuntime::new(2);
+    let ledger = RuntimeLedger::new(paid(2));
+    let runtime = ActorRuntime::new();
     let first = Fixture::new(
         ledger.clone(),
         runtime.clone(),

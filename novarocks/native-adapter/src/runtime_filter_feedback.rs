@@ -298,16 +298,13 @@ mod tests {
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
 
-    use crate::task_protocol::encode_dynamic_filter_read;
-    use novarocks_worker::ProcessMonotonicClock;
+    use crate::backend_task_execution::tests::node_fixture::{
+        NativeNodePreparation, PreparationStop,
+    };
     use novarocks_worker::runtime_filter::domain::{
         BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication,
         BackendFrontendFeedbackSink, BackendMaterializationOwner,
     };
-    use novarocks_worker::{
-        METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter, TaskStatusSource,
-    };
-
     fn identity() -> TaskIdentity {
         TaskIdentity::new(
             QueryExecutionId::new(QueryId::new(11, 12), AttemptId::new(3).expect("nonzero"))
@@ -316,18 +313,6 @@ mod tests {
             TaskId::new(4).expect("nonzero task"),
             BackendProcessId::new_v7(),
         )
-    }
-
-    fn owner(identity: TaskIdentity) -> (Arc<TaskStatusOwner>, TaskStatusReporter) {
-        let owner = Arc::new(TaskStatusOwner::new(
-            identity,
-            Arc::new(TaskStatusSource::new()),
-            Arc::new(ProcessMonotonicClock::new()),
-            METRIC_PUBLISH_MIN_INTERVAL,
-            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
-        ));
-        owner.release_to_observers();
-        (Arc::clone(&owner), TaskStatusReporter::new(owner))
     }
 
     fn publication() -> BackendFrontendFeedbackPublication {
@@ -347,8 +332,8 @@ mod tests {
         // internal invariant violation, so a wrong tag or a wrong message type
         // here would make every real fetch fail rather than degrade.
         let identity = identity();
-        let (status, reporter) = owner(identity);
-        let egress = TaskRuntimeFilterFeedbackEgress::new(identity, reporter);
+        let status = NativeNodePreparation::new(identity);
+        let egress = TaskRuntimeFilterFeedbackEgress::new(identity, status.dynamic_filter_writer());
 
         egress.try_publish(
             RuntimeFilterChannelId::new(7),
@@ -357,18 +342,22 @@ mod tests {
             BackendFrontendFeedbackOutcome::CanonicalDomain(Arc::from(vec![1, 2, 3])),
         );
 
-        let advertised = status
-            .current()
+        let current = status.wait_status(|current| current.dynamic_filters().is_some());
+        let advertised = current
             .dynamic_filters()
             .expect("the status advertises the version it published");
         assert_eq!(advertised.version().get(), 1);
         assert_eq!(advertised.domain_count(), 1);
 
-        let read = status.dynamic_filters().expect("the payload is retained");
+        let read = status.dynamic_filters();
+        let (version, payload) = read
+            .dynamic_filter_payload()
+            .expect("the payload is retained");
+        assert_eq!(version.get(), 1);
         let response =
-            encode_dynamic_filter_read(identity, Some(&read)).expect("a projectable payload");
-        assert_eq!(response.version, 1);
-        let envelope = response.domains[0]
+            novarocks_task_codec::domain::encode_task_dynamic_filter_domain(version, payload)
+                .expect("a projectable payload");
+        let envelope = response
             .envelope
             .as_ref()
             .expect("the domain carries its envelope");
@@ -396,8 +385,8 @@ mod tests {
         // first reduction must not both claim version one -- the second would
         // be at or below the cursor and never fetched.
         let identity = identity();
-        let (status, reporter) = owner(identity);
-        let egress = TaskRuntimeFilterFeedbackEgress::new(identity, reporter);
+        let status = NativeNodePreparation::new(identity);
+        let egress = TaskRuntimeFilterFeedbackEgress::new(identity, status.dynamic_filter_writer());
 
         egress.try_publish(
             RuntimeFilterChannelId::new(7),
@@ -412,11 +401,19 @@ mod tests {
             BackendFrontendFeedbackOutcome::DomainBudget,
         );
 
-        let advertised = status.current().dynamic_filters().expect("advertised");
+        let current = status.wait_status(|current| {
+            current
+                .dynamic_filters()
+                .is_some_and(|value| value.version().get() == 2)
+        });
+        let advertised = current.dynamic_filters().expect("advertised");
         assert_eq!(advertised.version().get(), 2);
-        let read = status.dynamic_filters().expect("retained");
-        let response = encode_dynamic_filter_read(identity, Some(&read)).expect("projectable");
-        let envelope = response.domains[0].envelope.as_ref().expect("envelope");
+        let read = status.dynamic_filters();
+        let (version, payload) = read.dynamic_filter_payload().expect("retained");
+        let response =
+            novarocks_task_codec::domain::encode_task_dynamic_filter_domain(version, payload)
+                .expect("projectable");
+        let envelope = response.envelope.as_ref().expect("envelope");
         assert_eq!(envelope.channel_id, 8);
         assert_eq!(
             envelope.kind,
@@ -435,17 +432,21 @@ mod tests {
         // payload, so advertising onto one would promise a fetch that can
         // never be served. The frontend widens the channel instead.
         let identity = identity();
-        let (status, reporter) = owner(identity);
-        status.note_installed();
-        reporter.running();
-        reporter.finished(
-            novarocks_execution_contract::task_execution::status::TaskOutputFacts::new(true),
-        );
+        let status = NativeNodePreparation::new(identity);
+        let writer = status.dynamic_filter_writer();
+        // Cancellation and physical preparation return go through the actual
+        // Node. The old publisher's weak writer cannot reopen its terminal
+        // carrier after the original Context release.
+        status.stop(PreparationStop::Cancel(
+            novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
+        ));
+        NativeNodePreparation::release_context(std::slice::from_ref(&status));
         assert!(
-            status.current().is_terminal(),
-            "the carrier really finished"
+            status
+                .wait_status(|current| current.is_terminal())
+                .is_terminal()
         );
-        let egress = TaskRuntimeFilterFeedbackEgress::new(identity, reporter);
+        let egress = TaskRuntimeFilterFeedbackEgress::new(identity, writer);
 
         egress.try_publish(
             RuntimeFilterChannelId::new(7),
@@ -454,7 +455,7 @@ mod tests {
             BackendFrontendFeedbackOutcome::CanonicalDomain(Arc::from(vec![1])),
         );
 
-        assert!(status.current().dynamic_filters().is_none());
-        assert!(status.dynamic_filters().is_none());
+        assert!(status.status().dynamic_filters().is_none());
+        assert!(status.dynamic_filters().dynamic_filter_payload().is_none());
     }
 }

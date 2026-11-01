@@ -133,7 +133,7 @@ pub(crate) fn claim<T: Send + 'static>(
     // Only this original finite slot can claim the cell. All shared access
     // uses Ledger -> cell, including the initialization before publication.
     shared.cell.lock().expect("owned return cell").retained = Some(shared.clone());
-    runtime.shared.record(HistoryFact::ReturnClaimed {
+    runtime.shared.record(|| HistoryFact::ReturnClaimed {
         slot: shared.report.id,
     });
     drop(state);
@@ -167,7 +167,7 @@ impl<T: Send + 'static> Shared<T> {
             false
         };
         if changed {
-            runtime.shared.record(HistoryFact::ReturnUnknown {
+            runtime.shared.record(|| HistoryFact::ReturnUnknown {
                 slot: self.report.id,
             });
         }
@@ -208,7 +208,7 @@ impl<T: Send + 'static> OwnedReturnSender<T> {
         assert!(cell.payload.is_none(), "one original payload fill");
         cell.payload = Some(ManuallyDrop::new(value));
         self.active = false;
-        runtime.shared.record(HistoryFact::ReturnFilled {
+        runtime.shared.record(|| HistoryFact::ReturnFilled {
             slot: shared.report.id,
         });
         drop(cell);
@@ -238,7 +238,7 @@ impl<T: Send + 'static> OwnedReturnSender<T> {
         assert!(cell.payload.is_none(), "unused return never held a value");
         let retained = cell.retained.take();
         self.active = false;
-        runtime.shared.record(HistoryFact::ReturnRevokedUnused {
+        runtime.shared.record(|| HistoryFact::ReturnRevokedUnused {
             slot: shared.report.id,
         });
         drop(cell);
@@ -292,7 +292,7 @@ impl<T: Send + 'static> OwnedReturnReader<T> {
         let value = cell.payload.take().expect("the original filled payload");
         let retained = cell.retained.take();
         self.terminal = Some(ReturnState::Taken);
-        runtime.shared.record(HistoryFact::ReturnTaken {
+        runtime.shared.record(|| HistoryFact::ReturnTaken {
             slot: shared.report.id,
         });
         drop(cell);

@@ -291,15 +291,27 @@ impl NovaRocksGrpc for BackendRpcService {
             None
         };
         #[cfg(novarocks_dev_controls)]
-        if hold_token.is_some() || registry_hold_token.is_some() {
+        if registry_hold_token.is_some() {
             return Err(tonic::Status::unimplemented(
-                "synchronous Native ingress/registry lock holds are retired; async owner hold injection is not yet connected",
+                "synchronous Native registry lock holds are retired",
             ));
+        }
+        #[cfg(novarocks_dev_controls)]
+        if let Some(claim) = hold_token {
+            // This same admitted RPC owns the ordinary RunningPermit and raw
+            // input throughout the asynchronous test-role rendezvous. Neither
+            // a Worker poller nor a blocking pool owns another call or permit.
+            crate::task_protocol_fault::hold_native_ingress_ordinary_request(
+                claim,
+                ownership.deadline(),
+            )
+            .await?;
         }
         // This exact admitted Native owner remains live while the original
         // Worker request is awaited. No blocking executor owns a second call.
-        let _ownership = ownership;
-        let response = ingress.apply_task_operations_at(raw, timing).await?;
+        let response = ingress
+            .apply_task_operations_at(raw, timing, ownership)
+            .await?;
         Ok(tonic::Response::new(response))
     }
 
@@ -313,9 +325,8 @@ impl NovaRocksGrpc for BackendRpcService {
         })?;
         let timing = TaskIngressTiming::new(ownership.arrival(), ownership.deadline());
         let raw = request.into_inner();
-        let _ownership = ownership;
         let response = ingress
-            .apply_task_control_operations_at(raw, timing)
+            .apply_task_control_operations_at(raw, timing, ownership)
             .await?;
         Ok(tonic::Response::new(response))
     }

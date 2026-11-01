@@ -81,7 +81,8 @@ impl ContextHostRecord {
                     };
                     if *state == EffectState::Pending && descriptor.kind.allowed_after_failure() {
                         let ticket = original
-                            .session
+                            .session_mut()
+                            .map_err(ContextDriverError::Failure)?
                             .take_cleanup(input, descriptor.id)
                             .map_err(ContextDriverError::Driver)?;
                         if let Err((error, ticket)) = self.adopt_failed_cleanup(original, ticket) {
@@ -125,16 +126,53 @@ impl ContextHostRecord {
                 self.resources.pending_host_jobs.driver_seal = Some(ticket);
                 Ok(())
             }
-            WorkerAction::Context(ContextEffect::ReleaseHost { .. }) => {
-                if self.resources.pending_host_jobs.driver_release.is_some() {
-                    return Err((ContextDriverError::Driver(DriverError::RoleBusy), ticket));
+            WorkerAction::Context(ContextEffect::ReleaseHost { context, .. })
+                if *context == self.identity =>
+            {
+                let Some(jobs) = self.resources.host_jobs.as_ref() else {
+                    return Err((ContextDriverError::WrongOwner, ticket));
+                };
+                if let Err(error) = jobs.request_failed_release(&stage) {
+                    return Err((ContextDriverError::Host(error), ticket));
                 }
-                self.resources.pending_host_jobs.driver_release = Some(ticket);
-                Ok(())
+                // This exact drained-stage handoff ends only the source
+                // effect. The original R body/return still waits for every
+                // Root/Task/M/loan gate in the shared physical path.
+                self.complete_host_effect(ticket)
+                    .map_err(|refusal| (ContextDriverError::Driver(refusal.error), refusal.ticket))
             }
             WorkerAction::Context(ContextEffect::CancelLoader { task, .. }) => {
-                let Some(owner) = self.task(*task) else {
-                    return Err((ContextDriverError::WrongOwner, ticket));
+                if let Some(TaskHostOwner::Unpublished(owner)) = self.tasks.get(task) {
+                    if owner.task != *task {
+                        return Err((ContextDriverError::WrongOwner, ticket));
+                    }
+                    if let Err(error) =
+                        owner.validate_never_built_loader(&stage, &self.control_runtime, self.actor)
+                    {
+                        return Err((
+                            ContextDriverError::Task(task_driver::TaskDriverError::Host(error)),
+                            ticket,
+                        ));
+                    }
+                    // Authenticate this same original payload incarnation;
+                    // CancelLoader itself contains only the neutral Task ID.
+                    if let Err(error) = self.validate_failed_unpublished_create(
+                        &stage,
+                        owner.loading_input,
+                        *task,
+                        owner.payload,
+                    ) {
+                        return Err((ContextDriverError::Request(error), ticket));
+                    }
+                    // Only the cancellation instruction is now discharged.
+                    // Original guard/roles still retire through their owners.
+                    return self.complete_host_effect(ticket).map_err(|refusal| {
+                        (ContextDriverError::Driver(refusal.error), refusal.ticket)
+                    });
+                }
+                let owner = match self.failed_task_for_cleanup(&stage, *task) {
+                    Ok(owner) => owner,
+                    Err(error) => return Err((ContextDriverError::Metadata(error), ticket)),
                 };
                 // This field is the original loader custodian; it is never
                 // cleared while the Task remains owned. None means LoadInput
@@ -152,8 +190,9 @@ impl ContextHostRecord {
             ) => {
                 let notice = self.request_notice_for_input(ticket.input);
                 let runtime = self.control_runtime.clone();
-                let Some(owner) = self.task(*task) else {
-                    return Err((ContextDriverError::WrongOwner, ticket));
+                let owner = match self.failed_task_for_cleanup(&stage, *task) {
+                    Ok(owner) => owner,
+                    Err(error) => return Err((ContextDriverError::Metadata(error), ticket)),
                 };
                 if matches!(&ticket.effect, WorkerAction::Context(ContextEffect::DisposeLoadedInput { payload, .. }) if *payload != owner.original_payload_id())
                 {

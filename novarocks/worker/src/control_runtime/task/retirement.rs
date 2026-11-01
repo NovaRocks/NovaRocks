@@ -137,64 +137,65 @@ impl TaskHostRecord {
     ) -> Result<bool, TaskHostError> {
         let mut progress = false;
         self.observe_completion_action()?;
-        if !self.completion_core_observed {
-            if let Some(action) = &self.resources.completion_action {
-                self.completion_core_observed = action.phase() == ExitRolePhase::Retired
-                    || action.report().consumption(ConsumerId::new(1).unwrap())?
-                        == Consumption::Consumed;
-            }
+        if !self.completion_core_observed
+            && let Some(action) = &self.resources.completion_action
+        {
+            self.completion_core_observed = action.phase() == ExitRolePhase::Retired
+                || action.report().consumption(ConsumerId::new(1).unwrap())?
+                    == Consumption::Consumed;
         }
-        if let Some(roles) = &self.resources.completion {
-            if !roles.is_retired() && roles.execution_calls_exited() {
-                for kind in [
-                    TaskLifecycleRole::Finisher,
-                    TaskLifecycleRole::WallTime,
-                    TaskLifecycleRole::TerminalPublisher,
-                    TaskLifecycleRole::Settlement,
-                ] {
-                    let retired = if kind == TaskLifecycleRole::Settlement {
-                        roles.settlement_phase() == crate::settlement::SettlementPhase::Retired
-                    } else {
-                        roles.phase(kind) == ExitRolePhase::Retired
-                    };
-                    if retired {
+        if let Some(roles) = &self.resources.completion
+            && !roles.is_retired()
+            && roles.execution_calls_exited()
+        {
+            for kind in [
+                TaskLifecycleRole::Finisher,
+                TaskLifecycleRole::WallTime,
+                TaskLifecycleRole::TerminalPublisher,
+                TaskLifecycleRole::Settlement,
+            ] {
+                let retired = if kind == TaskLifecycleRole::Settlement {
+                    roles.settlement_phase() == crate::settlement::SettlementPhase::Retired
+                } else {
+                    roles.phase(kind) == ExitRolePhase::Retired
+                };
+                if retired {
+                    continue;
+                }
+                let report = roles.report(kind);
+                for id in [2, 1] {
+                    if id == 1 && !self.completion_core_observed {
                         continue;
                     }
-                    let report = roles.report(kind);
-                    for id in [2, 1] {
-                        if id == 1 && !self.completion_core_observed {
-                            continue;
-                        }
-                        let consumer = ConsumerId::new(id).unwrap();
-                        if report.consumption(consumer)? == Consumption::Pending {
-                            report.consume(consumer)?;
-                            progress = true;
-                        }
+                    let consumer = ConsumerId::new(id).unwrap();
+                    if report.consumption(consumer)? == Consumption::Pending {
+                        report.consume(consumer)?;
+                        progress = true;
                     }
                 }
-                // A newly retired settlement child is real progress even
-                // while its finisher awaits the next original header reaping.
-                let before = (
-                    roles.phase(TaskLifecycleRole::Finisher),
-                    roles.phase(TaskLifecycleRole::WallTime),
-                    roles.phase(TaskLifecycleRole::TerminalPublisher),
-                    roles.settlement_phase(),
-                );
-                roles.try_retire();
-                let after = (
-                    roles.phase(TaskLifecycleRole::Finisher),
-                    roles.phase(TaskLifecycleRole::WallTime),
-                    roles.phase(TaskLifecycleRole::TerminalPublisher),
-                    roles.settlement_phase(),
-                );
-                progress |= before != after;
             }
+            // A newly retired settlement child is real progress even
+            // while its finisher awaits the next original header reaping.
+            let before = (
+                roles.phase(TaskLifecycleRole::Finisher),
+                roles.phase(TaskLifecycleRole::WallTime),
+                roles.phase(TaskLifecycleRole::TerminalPublisher),
+                roles.settlement_phase(),
+            );
+            roles.try_retire();
+            let after = (
+                roles.phase(TaskLifecycleRole::Finisher),
+                roles.phase(TaskLifecycleRole::WallTime),
+                roles.phase(TaskLifecycleRole::TerminalPublisher),
+                roles.settlement_phase(),
+            );
+            progress |= before != after;
         }
-        if let Some(statistics) = &mut self.resources.statistics {
-            if !statistics.is_retired() {
-                let turn = statistics.advance().map_err(TaskHostError::Statistics)?;
-                progress |= turn.submitted || turn.consumed || turn.retired;
-            }
+        if let Some(statistics) = &mut self.resources.statistics
+            && !statistics.is_retired()
+        {
+            let turn = statistics.advance().map_err(TaskHostError::Statistics)?;
+            progress |= turn.submitted || turn.consumed || turn.retired;
         }
         for call in &self.resources.host_calls {
             if !call.is_retired() && call.actual_call_exited() {
@@ -205,9 +206,12 @@ impl TaskHostRecord {
         }
         self.observe_lifecycle_inputs()?;
         if !self.production_retired()
-            || !self.resources.causal.is_empty()
-            || !self.host_retired_pairs.is_empty()
+            || (self.resources.preparation.is_some()
+                && self.resources.preparation_remainder.is_none())
         {
+            // Preparation's original body/whole reports still need their
+            // lifecycle inputs. Only the actual report retirement and bundle
+            // handoff prove that no preparation author remains to be issued.
             return Ok(progress);
         }
         let ingress = self.resources.port.ingress();
@@ -235,6 +239,8 @@ impl TaskHostRecord {
         if !ingress.open_summary_drained() {
             return Ok(progress);
         }
+        // Both fixed pairs share one real header retirement per turn.
+        let mut source_reap_budget = 1;
         for (index, route) in [
             crate::task_proposal_ingress::PairRoute::Open,
             crate::task_proposal_ingress::PairRoute::ConsumingOpen,
@@ -264,10 +270,17 @@ impl TaskHostRecord {
                 })? {
                     return Ok(progress);
                 }
-                // The Task's bounded reaper already ran earlier this turn.
-                // A newly retired role can expose a ready original header;
-                // keep one continuation to observe its actual reclamation.
                 progress |= phase != ExitRolePhase::Retired;
+            }
+            for position in ingress
+                .pair_inventory(route)
+                .map_err(|error| TaskHostError::Causal(error.into()))?
+            {
+                if source_reap_budget != 0 && !position.custody.reusable() {
+                    let reaped = position.custody.financial_scope().reap_ready(1)?;
+                    source_reap_budget -= reaped;
+                    progress |= reaped != 0;
+                }
             }
             let [a, b] = ingress
                 .prepare_pair_reap(route)
@@ -276,14 +289,18 @@ impl TaskHostRecord {
             let (Ok(a), Ok(b)) = (a, b) else {
                 return Ok(progress);
             };
-            let mut detached = ingress
-                .release_closed_route_pair(route, [a, b])
+            let detached = ingress
+                .release_physically_closed_producer_pair(route, [a, b])
                 .map_err(|(error, _)| TaskHostError::Causal(error.into()))?;
-            for storage in &mut detached {
-                storage.release()?;
-            }
+            drop(detached);
             self.normal_source_detached[index] = true;
             progress = true;
+        }
+        // A consumed RPC may still own its process-funded delivery tail.
+        // Close and physically retire the original producer pairs first;
+        // remaining causal roles still block actual Task lifetime exit.
+        if !self.resources.causal.is_empty() || !self.host_retired_pairs.is_empty() {
+            return Ok(progress);
         }
         if !self.normal_lifetime_ended {
             if !self.retirement_projections_exited()? {
@@ -325,14 +342,13 @@ impl TaskHostRecord {
             self.normal_lifetime_ended = true;
             progress = true;
         }
-        if self.resources.lifetime.actual_exit_ready()? {
-            if let Some(open) = &mut self.resources.open_summary {
-                if !open.is_closed() {
-                    open.close_after_exit(&self.resources.lifetime)
-                        .map_err(TaskHostError::OpenSummary)?;
-                    progress = true;
-                }
-            }
+        if self.resources.lifetime.actual_exit_ready()?
+            && let Some(open) = &mut self.resources.open_summary
+            && !open.is_closed()
+        {
+            open.close_after_exit(&self.resources.lifetime)
+                .map_err(TaskHostError::OpenSummary)?;
+            progress = true;
         }
         Ok(progress)
     }
@@ -372,27 +388,6 @@ impl ProductionPreparation {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(descriptor) = &descriptor {
                 host.retire_receiver_checked(descriptor, ingress)?;
-            }
-            // A failed/never-run reservation still owns its original permit
-            // here. Checked Remove completed before this refund; a bank-owned
-            // normal-close permit is absent and remains with that actual row.
-            let payment = self
-                .state
-                .lock()
-                .expect("original unattached inbound payment")
-                .inbound
-                .take();
-            if let Some(payment) = payment {
-                if let Err((error, payment)) = payment.release() {
-                    self.state
-                        .lock()
-                        .expect("failed original inbound refund")
-                        .inbound = Some(payment);
-                    return Err(crate::HostRejection::from_domain(
-                        novarocks_execution_contract::TaskFailureCategory::Internal,
-                        error,
-                    ));
-                }
             }
             let (runnable, refusal, descriptor) = {
                 let mut state = self
@@ -475,11 +470,14 @@ struct TaskDisposalState {
     payload: Option<Box<ManuallyDrop<Box<dyn std::any::Any + Send>>>>,
     payment: Option<(
         TaskLifetime,
-        CapacityBundle,
-        Option<CapacityBundle>,
-        Option<CapacityBundle>,
+        ReservationBundle,
+        Option<ReservationBundle>,
+        Option<ReservationBundle>,
     )>,
     panic: Option<ManuallyDrop<Box<dyn std::any::Any + Send>>>,
+    // Neutral identity copied only from the same original RetireTask effect.
+    // This holds no Work and never substitutes for actual disposal completion.
+    accepted_custody: Option<(PayloadId, Generation)>,
     retirement_input: Option<novarocks_control_runtime_core::identity::InputId>,
 }
 impl TaskDisposal {
@@ -506,7 +504,7 @@ impl TaskDisposal {
         let TaskHostResources {
             active,
             preparation_remainder,
-            accepted_source_storage,
+            accepted_role_storage,
             lifetime,
             port,
             host_calls,
@@ -559,9 +557,10 @@ impl TaskDisposal {
                         lifetime,
                         active,
                         preparation_remainder,
-                        accepted_source_storage,
+                        accepted_role_storage,
                     )),
                     panic: None,
+                    accepted_custody: None,
                     retirement_input: None,
                 }),
             },
@@ -585,6 +584,44 @@ impl TaskDisposal {
                 .expect("original Task disposal payment")
                 .payment
                 .is_none()
+    }
+    /// Preserve this original effect's custody identity before handing its
+    /// physical disposal job off. A rejected creation retains its separate
+    /// same-identity retry protocol rather than becoming an accepted Task.
+    pub(crate) fn bind_custody_retirement(&self, payload: PayloadId, close_epoch: Generation) {
+        let mut state = self.state.lock().expect("original Task custody identity");
+        match state.origin {
+            super::super::task_disposal::TaskDisposalOrigin::AcceptedTerminal { .. } => {
+                assert!(
+                    state
+                        .accepted_custody
+                        .replace((payload, close_epoch))
+                        .is_none(),
+                    "one original accepted Task custody identity"
+                );
+            }
+            super::super::task_disposal::TaskDisposalOrigin::RejectedCreation {
+                payload: original,
+                ..
+            } => assert_eq!(payload, original, "same rejected creation payload"),
+            super::super::task_disposal::TaskDisposalOrigin::OwnerFailed => {
+                panic!("failed-owner disposal has no normal Task custody reply");
+            }
+        }
+    }
+    /// Reading this neutral identity requires the same disposal role, Task
+    /// lifetime header and every original payment to have actually retired.
+    pub(crate) fn accepted_custody(&self) -> Option<(PayloadId, Generation)> {
+        assert!(self.complete(), "original Task disposal is not complete");
+        let state = self.state.lock().expect("original accepted Task custody");
+        match state.origin {
+            super::super::task_disposal::TaskDisposalOrigin::AcceptedTerminal { .. } => Some(
+                state
+                    .accepted_custody
+                    .expect("original RetireTask custody identity"),
+            ),
+            _ => None,
+        }
     }
     pub(crate) fn rejected_payload(&self) -> Option<PayloadId> {
         match self
@@ -688,8 +725,8 @@ impl TaskDisposal {
         true
     }
     /// The original A position stays occupied through physical exit AND the
-    /// disposal role's actual report/header/payment tail. This is the finite
-    /// header bound, rather than an unbounded collection of completed jobs.
+    /// disposal role's actual report/header/payment tail. A later Core receipt
+    /// retains only neutral disposal metadata and grants no execution capacity.
     pub(crate) fn advance_retirement(&self, ledger: &RuntimeLedger) -> Result<bool, TaskHostError> {
         let progress = self
             .role
@@ -705,13 +742,15 @@ impl TaskDisposal {
             };
             for capacity in [preparation, source].into_iter().flatten() {
                 if !capacity.is_released() {
-                    capacity.release(&capacity.resources()?)?;
+                    capacity.release_quota(&capacity.resources()?.quota)?;
+                    capacity.finish()?;
                 }
             }
-            // Releasing the whole last Task bundle removes its original row
-            // atomically with making ActiveTasks reusable. All sibling role
-            // and fee rows are already truly retired/reaped/released above.
-            active.release(&active.resources()?)?;
+            // All sibling roles and their original storage have truly retired.
+            // Return the remaining quota at this actual exit gate, then destroy
+            // only unused owned positions from the original last Task bundle.
+            active.release_quota(&active.resources()?.quota)?;
+            active.finish()?;
             state.payment.take()
         };
         drop(payment);

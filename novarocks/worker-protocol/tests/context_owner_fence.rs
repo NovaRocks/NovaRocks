@@ -18,7 +18,9 @@
 //! Pure lifecycle decisions from the Context's already-bound owner-fence
 //! input. Explicit model host facts prove no physical Native/Scope exit.
 
-use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId};
+use novarocks_control_runtime_core::identity::{
+    Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, WorkId,
+};
 use novarocks_execution_contract::{
     AbortCause, AdmissionTicketId, CancelReason, ContentFingerprint, CredentialEpoch,
     CredentialLeaseId, LeaseValidFor, QueryContextRef, QueryContextState, TaskIdentity,
@@ -46,6 +48,16 @@ fn bytes(n: u8) -> [u8; 16] {
     bytes[8] = 0x80;
     bytes
 }
+// One explicit model process owns these requests. The fixture's non-reused
+// input issuance ordinal also names its original R Work; this is plain protocol
+// metadata and cannot create runtime Work, capacity or an InputAuthor proof.
+fn model_request_author(token: InputId) -> ScopedWorkRef {
+    ScopedWorkRef {
+        scope: ScopeId::new(1).expect("the model process Scope"),
+        work: WorkId::new(token.get()).expect("the original model request ordinal"),
+    }
+}
+
 fn at(seconds: u64) -> MonotonicInstant {
     MonotonicInstant::from_origin(Duration::from_secs(seconds))
 }
@@ -112,6 +124,7 @@ impl Model {
                     step_budget: ContextCore::MAX_STEP_WORK,
                     lease_bounds: LeaseBounds::DEFAULT,
                     metric_publish_interval: Duration::from_millis(100),
+                    request_horizon: novarocks_worker_protocol::lease::RequestHorizon::DEFAULT,
                 },
             )
             .unwrap(),
@@ -158,6 +171,7 @@ impl Model {
             .handle_request(
                 at(now),
                 RequestContext {
+                    author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(u8::try_from(token + 10).unwrap()),
                     deadline: at(100),
@@ -185,8 +199,6 @@ impl Model {
                     input_retained_bytes: 1,
                     ingress_retained_bytes: 1,
                     structural_bytes: 1,
-                    inbound_records: 0,
-                    inbound_bytes: 0,
                 }),
             },
         );

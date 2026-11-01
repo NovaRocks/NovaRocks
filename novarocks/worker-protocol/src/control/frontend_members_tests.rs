@@ -28,7 +28,9 @@ use crate::{
     creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal, PayloadId, RequestContext},
     lease::MonotonicInstant,
 };
-use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId};
+use novarocks_control_runtime_core::identity::{
+    Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, WorkId,
+};
 use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, AdmissionTicketId, ContentFingerprint, CredentialEpoch,
     CredentialLeaseId, LeaseValidFor, OperationOutcome, QueryContextRef, QueryContextState,
@@ -39,6 +41,16 @@ use novarocks_types::{
     identity::{AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId},
 };
 use std::time::Duration;
+
+// One explicit model process owns these requests. The fixture's non-reused
+// input issuance ordinal also names its original R Work; this is plain protocol
+// metadata and cannot create runtime Work, capacity or an InputAuthor proof.
+fn model_request_author(token: InputId) -> ScopedWorkRef {
+    ScopedWorkRef {
+        scope: ScopeId::new(1).expect("the model process Scope"),
+        work: WorkId::new(token.get()).expect("the original model request ordinal"),
+    }
+}
 
 fn at(seconds: u64) -> MonotonicInstant {
     MonotonicInstant::from_origin(Duration::from_secs(seconds))
@@ -97,13 +109,8 @@ impl Fixture {
         Self {
             core: ControlCore::new(
                 ControlConfig {
-                    max_contexts: 2,
-                    max_waiters: 2,
                     max_pending_requests: 2,
                     step_budget: ControlCore::MAX_STEP_WORK,
-                    retained_contexts: 2,
-                    gone_fences: 2,
-                    retention: Duration::from_secs(10),
                 },
                 AdmissionTicketConfig::DEFAULT,
                 [1; 8],
@@ -119,6 +126,7 @@ impl Fixture {
         let id = self.next;
         self.next += 1;
         RequestContext {
+            author: model_request_author(InputId::new(id).unwrap()),
             token: InputId::new(id).unwrap(),
             operation: TaskOperationId::try_from_bytes(bytes(id)).unwrap(),
             deadline: at(self.now + 100),
@@ -217,29 +225,46 @@ impl Fixture {
         assert_eq!(self.core.route(context), QueryContextState::Active);
     }
     fn remove(&mut self, context: QueryContextRef) {
-        self.event(ControlInput::Retained { context });
+        let close_epoch = Generation::new(3).unwrap();
+        let retired = self.event(ControlInput::ExecutionRetired {
+            context,
+            retirement: crate::retention::ContextRetirementIdentity::Protocol { close_epoch },
+        });
+        assert_eq!(
+            retired
+                .effects
+                .iter()
+                .filter(|effect| matches!(effect, ControlEffect::RetireReservation(_)))
+                .count(),
+            1
+        );
         assert_eq!(
             self.core.route(context),
             QueryContextState::TerminalRetained
         );
-        self.now += 11;
-        let due = self.event(ControlInput::Tick);
+        // The explicit fact models the original Context timer; Root does not
+        // manufacture H from a second TTL. No Native exit is claimed here.
+        self.now += 120;
+        let due = self.event(ControlInput::ContextExpired {
+            context,
+            retirement: crate::retention::ContextRetirementIdentity::Protocol { close_epoch },
+        });
         assert!(due.effects.iter().any(|effect| matches!(
             effect, ControlEffect::RemoveHost { context: original } if *original == context
         )));
         let removed = self.event(ControlInput::HostRemoved { context });
         assert!(
-            removed
+            !removed
                 .effects
                 .iter()
                 .any(|effect| matches!(effect, ControlEffect::RetireReservation(_)))
         );
-        assert_eq!(self.core.route(context), QueryContextState::Gone);
+        assert_eq!(self.core.route(context), QueryContextState::Absent);
     }
 }
 
 #[test]
-fn sequential_frontend_churn_reclaims_actual_member_rows_at_fixed_directory_capacity() {
+fn sequential_frontend_churn_reclaims_actual_member_rows_after_context_expiry() {
     let mut f = Fixture::new();
     for query in 1..=64 {
         let context = context(10 + query, query);
@@ -250,10 +275,9 @@ fn sequential_frontend_churn_reclaims_actual_member_rows_at_fixed_directory_capa
         assert!(f.core.frontend_members.is_empty());
         assert!(f.core.directory.is_empty());
         assert!(f.core.owners.is_empty());
-        assert!(f.core.gone.len() <= 2);
         assert!(f.core.fenced.is_empty());
     }
-    assert_eq!(f.capacity.calls, 128);
+    assert_eq!(f.capacity.calls, 64);
 }
 
 #[test]

@@ -18,7 +18,9 @@
 //! Pure Context owner decisions after an admitted M returns without invoking
 //! materialization I/O. Host exit itself remains an explicit world fact.
 
-use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId};
+use novarocks_control_runtime_core::identity::{
+    Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, WorkId,
+};
 use novarocks_execution_contract::{
     AdmissionTicketId, ContentFingerprint, CredentialEpoch, CredentialLeaseId, LeaseValidFor,
     OperationOutcome, QueryContextRef, QueryContextState, TaskOperationId,
@@ -37,6 +39,16 @@ use novarocks_worker_protocol::{
     lease::{LeaseBounds, MonotonicInstant},
 };
 use std::time::Duration;
+
+// One explicit model process owns these requests. The fixture's non-reused
+// input issuance ordinal also names its original R Work; this is plain protocol
+// metadata and cannot create runtime Work, capacity or an InputAuthor proof.
+fn model_request_author(token: InputId) -> ScopedWorkRef {
+    ScopedWorkRef {
+        scope: ScopeId::new(1).expect("the model process Scope"),
+        work: WorkId::new(token.get()).expect("the original model request ordinal"),
+    }
+}
 
 fn at(seconds: u64) -> MonotonicInstant {
     MonotonicInstant::from_origin(Duration::from_secs(seconds))
@@ -82,6 +94,7 @@ fn core() -> ContextCore {
             step_budget: ContextCore::MAX_STEP_WORK,
             lease_bounds: LeaseBounds::DEFAULT,
             metric_publish_interval: Duration::from_millis(100),
+            request_horizon: novarocks_worker_protocol::lease::RequestHorizon::DEFAULT,
         },
     )
     .unwrap()
@@ -98,6 +111,7 @@ fn command_step(
         .handle_request(
             at(now),
             RequestContext {
+                author: model_request_author(InputId::new(token).unwrap()),
                 token: InputId::new(token).unwrap(),
                 operation,
                 deadline: at(10_000),

@@ -17,6 +17,9 @@
 
 //! Production pollers and deterministic drivers execute the same bounded turn.
 
+mod actor_failure_publication;
+mod execution_detach;
+mod failed_custodian_timer;
 mod poller_observation;
 #[cfg(not(loom))]
 pub use poller_observation::{
@@ -30,12 +33,13 @@ use crate::{
     sync::{Arc, Mutex},
     transaction::{RuntimeError, ScopeHandle},
 };
+use failed_custodian_timer::FailedCustodianTimer;
 use novarocks_control_runtime_core::{
     effect::{EffectDescriptor, EffectError, EffectKind, EffectState},
     history::HistoryFact,
     identity::{
-        ActionId, ActorId, BatchId, Generation, InputId, ReservationId, ScopeId, SlotId, Tick,
-        WorkId,
+        ActionId, ActorId, BatchId, Generation, InputId, ReservationId, ScopeId, ScopedWorkRef,
+        SlotId, Tick, WorkId,
     },
     mailbox::{InputClass, InputEnvelope, MailboxError, MailboxState},
     scheduler::{ReadyQueue, SchedulerError, TurnBudget},
@@ -44,7 +48,7 @@ use novarocks_control_runtime_core::{
 };
 use std::{
     any::Any,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind},
 };
@@ -55,6 +59,8 @@ pub enum DriverError {
     Mailbox(MailboxError),
     Effect(EffectError),
     Timer(TimerError),
+    CustodianDeadlineMismatch,
+    CustodianTimerReceiptMissing,
     Runtime(RuntimeError),
     UnknownActor,
     Closed,
@@ -77,6 +83,11 @@ pub enum DriverError {
     FailurePublicationRequired,
     FailurePublicationAlreadyClaimed,
     FailureWorkInactive,
+    ExecutionAlreadyDetached,
+    RetainedInputRequired,
+    MetadataStillPending,
+    MetadataAlreadyForwarded,
+    MetadataDeliveryAbandoned,
     ReservationsRemain,
     UnknownReservation,
     ReservationOwnerMismatch,
@@ -119,7 +130,7 @@ impl std::error::Error for DriverError {}
 pub struct ActorRegistration {
     actor: ActorId,
     attachment: SlotId,
-    scope: ScopeHandle,
+    scope: Arc<RegistrationScope>,
     origin: Arc<()>,
 }
 impl ActorRegistration {
@@ -129,20 +140,44 @@ impl ActorRegistration {
     pub fn attachment(&self) -> SlotId {
         self.attachment
     }
+    pub(crate) fn publication_scope(&self) -> ScopeHandle {
+        self.scope.current_scope()
+    }
     pub fn scope_id(&self) -> ScopeId {
         self.scope.id()
+    }
+    /// The original actor epoch survives execution-scope detachment unchanged.
+    /// It is an identity fact, not current admission or failure authority.
+    pub fn initial_epoch(&self) -> Generation {
+        self.scope.original_epoch
     }
     /// Equal public numbers do not identify the same registration. This is a
     /// read-only origin comparison and grants no scheduling or Work authority.
     pub fn same_registration(&self, other: &Self) -> bool {
         self.actor == other.actor
             && self.attachment == other.attachment
-            && self.scope.same_scope(&other.scope)
+            && Arc::ptr_eq(&self.scope, &other.scope)
             && Arc::ptr_eq(&self.origin, &other.origin)
     }
-    /// Original scope identity only; this grants no Work or publication right.
+    /// Match only a still-attached execution scope. After detachment the
+    /// historical scope_id remains, but no execution scope is owned here.
     pub fn matches_scope(&self, scope: &ScopeHandle) -> bool {
-        self.scope.same_scope(scope)
+        self.scope.matches_live_scope(scope)
+    }
+    /// A read-only observation of this same registration's execution binding.
+    /// False grants no request, Work or publication right.
+    pub fn execution_attached(&self) -> bool {
+        !self.scope.retained()
+    }
+    /// Observe only this original registration's actual retained affiliation.
+    /// This grants no Work, request admission or publication authority.
+    pub fn retained_in_process(&self, process: &ScopeHandle) -> bool {
+        let execution = self
+            .scope
+            .execution
+            .lock()
+            .expect("actor execution binding lock");
+        matches!(&*execution, ActorExecution::Retained { process: actual } if actual.same_scope(process))
     }
 }
 impl std::fmt::Debug for ActorRegistration {
@@ -152,6 +187,169 @@ impl std::fmt::Debug for ActorRegistration {
             .field("attachment", &self.attachment)
             .field("scope", &self.scope.id())
             .finish_non_exhaustive()
+    }
+}
+
+/// An immutable binding issued only from an actual admitted input position.
+/// Cloning it copies no input credit, WorkLease, report leg or consumption state.
+#[derive(Clone)]
+pub struct InputAuthor {
+    actor: ActorId,
+    origin: Arc<()>,
+    input: InputId,
+    actor_generation: Generation,
+    pub(crate) scope: ScopeHandle,
+    work: ScopedWorkRef,
+    generation: Generation,
+}
+impl std::fmt::Debug for InputAuthor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputAuthor")
+            .field("actor", &self.actor)
+            .field("input", &self.input)
+            .field("work", &self.work)
+            .field("actor_generation", &self.actor_generation)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Clone)]
+pub(crate) struct PendingInputAuthor {
+    pub(crate) registration: ActorRegistration,
+    pub(crate) scope: ScopeHandle,
+    work: ScopedWorkRef,
+    actor_generation: Generation,
+    generation: Generation,
+}
+impl PendingInputAuthor {
+    pub(crate) fn matches(&self, author: &InputAuthor) -> bool {
+        self.registration.actor == author.actor
+            && Arc::ptr_eq(&self.registration.origin, &author.origin)
+            && self.scope.same_scope(&author.scope)
+            && self.work == author.work
+            && self.actor_generation == author.actor_generation
+            && self.generation == author.generation
+    }
+}
+impl InputAuthor {
+    pub const fn actor(&self) -> ActorId {
+        self.actor
+    }
+    /// Original admitted position, retained across persistent-role occurrences.
+    /// The current command's token still comes from its actual InputEnvelope.
+    pub const fn input(&self) -> InputId {
+        self.input
+    }
+    pub const fn work(&self) -> ScopedWorkRef {
+        self.work
+    }
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+    /// Compare only the same original read-only binding; this grants no credit.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.actor == other.actor
+            && Arc::ptr_eq(&self.origin, &other.origin)
+            && self.input == other.input
+            && self.work == other.work
+            && self.actor_generation == other.actor_generation
+            && self.generation == other.generation
+            && self.scope.same_scope(&other.scope)
+    }
+}
+
+/// Proof of one actual original actor's fenced failure. Its financial scope
+/// may remain healthy or its old execution scope may already have been removed.
+/// Cloning grants no Work, publication authority or additional report leg.
+#[derive(Clone)]
+pub struct ActorFailureProof {
+    registration: ActorRegistration,
+    failed_epoch: Generation,
+    ledger: crate::transaction::RuntimeLedger,
+}
+impl ActorFailureProof {
+    pub fn registration(&self) -> &ActorRegistration {
+        &self.registration
+    }
+    pub fn initial_epoch(&self) -> Generation {
+        self.registration.initial_epoch()
+    }
+    pub const fn failed_epoch(&self) -> Generation {
+        self.failed_epoch
+    }
+    pub(crate) fn validate_consumer(
+        &self,
+        registration: &ActorRegistration,
+        ledger: &crate::transaction::RuntimeLedger,
+    ) -> Result<(), DriverError> {
+        if !self.registration.same_registration(registration)
+            || self.initial_epoch() != registration.initial_epoch()
+            || self.failed_epoch <= self.initial_epoch()
+            || !Arc::ptr_eq(&self.ledger.shared, &ledger.shared)
+        {
+            return Err(DriverError::PublicationTargetMismatch);
+        }
+        Ok(())
+    }
+}
+impl std::fmt::Debug for ActorFailureProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActorFailureProof")
+            .field("registration", &self.registration)
+            .field("initial_epoch", &self.initial_epoch())
+            .field("failed_epoch", &self.failed_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+// Every witness shares one binding. Detachment unloads the old ScopeHandle
+// without changing the original registration's identity.
+struct RegistrationScope {
+    original: ScopeId,
+    original_epoch: Generation,
+    execution: Mutex<ActorExecution>,
+}
+enum ActorExecution {
+    Live {
+        scope: ScopeHandle,
+        failure_work: Option<WorkId>,
+    },
+    Retained {
+        process: ScopeHandle,
+    },
+}
+impl RegistrationScope {
+    fn id(&self) -> ScopeId {
+        self.original
+    }
+    fn current_scope(&self) -> ScopeHandle {
+        match &*self.execution.lock().expect("actor execution binding lock") {
+            ActorExecution::Live { scope, .. } => scope.clone(),
+            ActorExecution::Retained { process } => process.clone(),
+        }
+    }
+    fn matches_live_scope(&self, candidate: &ScopeHandle) -> bool {
+        matches!(&*self.execution.lock().expect("actor execution binding lock"),
+            ActorExecution::Live { scope, .. } if scope.same_scope(candidate))
+    }
+    fn retained(&self) -> bool {
+        matches!(
+            &*self.execution.lock().expect("actor execution binding lock"),
+            ActorExecution::Retained { .. }
+        )
+    }
+    fn failure_work(&self) -> Option<ScopedWorkRef> {
+        match &*self.execution.lock().expect("actor execution binding lock") {
+            ActorExecution::Live {
+                scope,
+                failure_work,
+            } => failure_work.map(|work| ScopedWorkRef {
+                scope: scope.id(),
+                work,
+            }),
+            ActorExecution::Retained { .. } => None,
+        }
     }
 }
 
@@ -191,12 +389,26 @@ pub struct InputCustody {
     pub class: InputClass,
     pub phase: InputPhase,
     pub role: Option<InputRoleId>,
+    /// This original position belongs to the runtime's Workless forwarding port.
+    pub runtime_metadata: bool,
 }
 struct InputRecord {
     source: ActorId,
     class: InputClass,
     phase: InputPhase,
     role: Option<InputRoleId>,
+    author: Option<InputAuthor>,
+    producer: Option<InputAuthor>,
+    metadata_delivery: Option<MetadataDelivery>,
+    header_pins: Vec<crate::lease::WorkHeaderPin>,
+    handoff_at: Option<Tick>,
+}
+impl InputRecord {
+    fn release_header_custody(&mut self, ledger: &mut crate::transaction::LedgerState) {
+        for pin in self.header_pins.drain(..) {
+            pin.release_locked(ledger);
+        }
+    }
 }
 /// Stable identity of one admitted role position; this identity does not mint authority.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -209,6 +421,8 @@ impl InputRoleId {
 struct InputRoleRecord {
     source: ActorId,
     class: InputClass,
+    producer: Option<InputAuthor>,
+    producer_header: Option<crate::lease::WorkHeaderPin>,
     in_flight: Option<InputId>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,13 +432,29 @@ pub struct InputRoleCustody {
     pub class: InputClass,
     pub in_flight: Option<InputId>,
 }
-struct FailurePublicationRecord {
-    generation: Generation,
-    input: InputId,
-    action: ActionId,
-    work: WorkId,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailurePublicationOrigin {
+    SupervisorEffect {
+        input: InputId,
+        action: ActionId,
+    },
+    StartedCleanup {
+        financial_generation: Generation,
+        header: novarocks_control_runtime_core::owned_storage::OwnedPositionId,
+    },
+}
+enum FailurePublicationRecord {
+    Active {
+        generation: Generation,
+        origin: FailurePublicationOrigin,
+        work: ScopedWorkRef,
+    },
+    // The publication phase ended explicitly. No active claim or Work is
+    // retained here, and this failure incarnation cannot be claimed again.
+    Closed,
 }
 struct Inbox<A: Actor> {
+    observation: crate::observation::RuntimeObservation,
     external_open: bool,
     sealed: bool,
     payloads: BTreeMap<InputId, A::Input>,
@@ -232,6 +462,9 @@ struct Inbox<A: Actor> {
     inputs: BTreeMap<InputId, InputRecord>,
     roles: BTreeMap<InputRoleId, InputRoleRecord>,
     counts: [usize; 4],
+    input_limits: [usize; 4],
+    metadata_credit: [MetadataCreditQueue; 4],
+    metadata_closing: bool,
     next_input: u64,
     batches: BTreeMap<InputId, StepEnvelope<A::Effect>>,
     batch_order: BTreeMap<BatchId, InputId>,
@@ -241,6 +474,7 @@ struct Inbox<A: Actor> {
     timer_input: Option<InputId>,
     // Monotonic source closure; an already filled Tick retains its input.
     timer_closed: bool,
+    failed_custodian_timer: Option<FailedCustodianTimer>,
     // This identity is reserved at registration. Normal inputs/batches cannot
     // spend the separate supervisor position. No message payload is invented.
     failure_position: Option<InputId>,
@@ -257,6 +491,9 @@ impl<A: Actor> Inbox<A> {
         &mut self,
         role_id: InputRoleId,
         scope_failed: bool,
+        financial_author: Option<&InputAuthor>,
+        ledger: &mut crate::transaction::LedgerState,
+        observed: Option<Tick>,
         value: A::Input,
     ) -> Result<InputId, (DriverError, A::Input)> {
         if self.sealed {
@@ -272,11 +509,38 @@ impl<A: Actor> Inbox<A> {
             return Err((DriverError::RoleBusy, value));
         }
         let (source, class) = (role.source, role.class);
+        let producer = role.producer.clone();
+        let author = financial_author.cloned().or_else(|| producer.clone());
         let Some(next) = self.next_input.checked_add(1) else {
             return Err((DriverError::IdentityExhausted, value));
         };
         let input = InputId::new(next).expect("incremented role input id");
+        let mut pins = Vec::new();
+        if let Some(pin) = role.producer_header.as_ref() {
+            match pin.retain_locked(ledger) {
+                Ok(original) => pins.push(original),
+                Err(error) => return Err((error.into(), value)),
+            }
+        }
+        if let Some(author) = financial_author
+            && !pins
+                .iter()
+                .any(|pin| pin.reference() == author.work && pin.belongs_to(&author.scope))
+        {
+            match crate::lease::WorkHeaderPin::for_input_author_locked(author, ledger) {
+                Ok(original) => pins.push(original),
+                Err(error) => {
+                    for pin in pins {
+                        pin.release_locked(ledger);
+                    }
+                    return Err((error.into(), value));
+                }
+            }
+        }
         if let Err(error) = self.mailbox.push(class, source, input) {
+            for pin in pins {
+                pin.release_locked(ledger);
+            }
             return Err((error.into(), value));
         }
         self.next_input = next;
@@ -287,6 +551,11 @@ impl<A: Actor> Inbox<A> {
                 class,
                 phase: InputPhase::Filled,
                 role: Some(role_id),
+                author,
+                producer,
+                metadata_delivery: None,
+                header_pins: pins,
+                handoff_at: observed,
             },
         );
         self.payloads.insert(input, value);
@@ -295,6 +564,87 @@ impl<A: Actor> Inbox<A> {
             .expect("idle role retains its paid position")
             .in_flight = Some(input);
         Ok(input)
+    }
+    fn available_input_credit(&self, class: InputClass) -> usize {
+        self.input_limits[class.index()]
+            .checked_sub(
+                self.counts[class.index()]
+                    .checked_add(self.metadata_credit[class.index()].granted)
+                    .expect("bounded input credit"),
+            )
+            .expect("actual input use and grants stay inside the original window")
+    }
+    fn grant_metadata_credit(&mut self, class: InputClass) -> Vec<ActorRegistration> {
+        if self.failed || self.metadata_closing || self.sealed {
+            return Vec::new();
+        }
+        let available = self
+            .available_input_credit(class)
+            .min(METADATA_CREDIT_WAKE_BUDGET);
+        self.metadata_credit[class.index()].grant(available)
+    }
+    fn return_input_credit(&mut self, class: InputClass) -> Vec<ActorRegistration> {
+        self.observation.input_credit_returned(class);
+        self.counts[class.index()] = self.counts[class.index()]
+            .checked_sub(1)
+            .expect("original input credit");
+        self.grant_metadata_credit(class)
+    }
+    fn close_metadata_waiters(&mut self, budget: usize) -> (Vec<ActorRegistration>, bool) {
+        self.metadata_closing = true;
+        let mut wakes = Vec::new();
+        for class in InputClass::ALL {
+            let remaining = budget.saturating_sub(wakes.len());
+            if remaining == 0 {
+                break;
+            }
+            wakes.extend(self.metadata_credit[class.index()].close(remaining));
+        }
+        let remains = self
+            .metadata_credit
+            .iter()
+            .any(|queue| !queue.entries.is_empty());
+        (wakes, remains)
+    }
+    fn retire_metadata_input_if_ready(
+        &mut self,
+        input: InputId,
+        ledger: &mut crate::transaction::LedgerState,
+    ) -> Vec<ActorRegistration> {
+        let Some(record) = self.inputs.get(&input) else {
+            return Vec::new();
+        };
+        if self.failed
+            || record.metadata_delivery.is_none()
+            || !matches!(
+                record.phase,
+                InputPhase::Committed | InputPhase::AbandonedByOwnerFailure
+            )
+            || self.payloads.contains_key(&input)
+        {
+            return Vec::new();
+        }
+        if self.batches.get(&input).is_some_and(|batch| {
+            !batch.state.all_terminal()
+                || !batch.reservations.is_empty()
+                || batch.metadata.iter().any(|item| !item.completed)
+        }) {
+            return Vec::new();
+        }
+        assert!(
+            record.role.is_none() && record.author.is_none() && record.producer.is_none(),
+            "forwarded metadata never owns a Work or producer role"
+        );
+        let class = record.class;
+        if let Some(batch) = self.batches.remove(&input) {
+            let ordinal = batch.ordinal.expect("committed metadata input batch");
+            assert_eq!(self.batch_order.remove(&ordinal), Some(input));
+        }
+        self.inputs
+            .remove(&input)
+            .expect("same original metadata input")
+            .release_header_custody(ledger);
+        self.return_input_credit(class)
     }
     fn next_batch_ordinal(&self) -> Result<BatchId, DriverError> {
         let next = self
@@ -332,6 +682,14 @@ impl<A: Actor> Drop for Inbox<A> {
             "actor panic payload must be transferred to its host failure owner"
         );
         assert!(
+            self.metadata_credit
+                .iter()
+                .all(|queue| queue.entries.is_empty()
+                    && queue.waiting.is_empty()
+                    && queue.granted == 0),
+            "all original metadata scheduler waits must close before actor removal"
+        );
+        assert!(
             self.roles.is_empty(),
             "actor role custody must exit before driver removal"
         );
@@ -349,13 +707,21 @@ struct ActorCell<A: Actor> {
     // Fresh for every registration, including reuse of the same public ActorId.
     origin: Arc<()>,
     id: ActorId,
-    scope: ScopeHandle,
+    scope: Arc<RegistrationScope>,
     attachment: SlotId,
     config: ActorConfig,
-    failure_work: Option<WorkId>,
     failure_policy: ActorFailurePolicy,
     core: Mutex<Option<A>>,
     inbox: Mutex<Inbox<A>>,
+}
+impl<A: Actor> ActorCell<A> {
+    fn history_target(&self) -> novarocks_control_runtime_core::history::HistoryActorTarget {
+        novarocks_control_runtime_core::history::HistoryActorTarget {
+            actor: self.id,
+            attachment: self.attachment,
+            scope_origin: self.scope.id(),
+        }
+    }
 }
 struct DriverState<A: Actor> {
     actors: BTreeMap<ActorId, Arc<ActorCell<A>>>,
@@ -367,13 +733,15 @@ struct DriverState<A: Actor> {
 }
 struct DriverShared<A: Actor> {
     state: Mutex<DriverState<A>>,
-    changed: Notify,
+    changed: Arc<Notify>,
+    header_readiness: Arc<crate::header_readiness::HeaderReadyHub>,
     history: Option<crate::history::HistoryCapture>,
+    observation: crate::observation::RuntimeObservation,
 }
 impl<A: Actor> DriverShared<A> {
-    fn record(&self, fact: HistoryFact) {
+    fn record(&self, fact: impl FnOnce() -> HistoryFact) {
         if let Some(history) = &self.history {
-            history.record(fact);
+            history.record(fact());
         }
     }
 }
@@ -418,11 +786,61 @@ impl<A: Actor> ActorHostTurn<A> {
             origin: self.node.origin.clone(),
         }
     }
+    /// Drain only neutral readiness from this original actor incarnation.
+    /// The caller must match each actual cell to its original Work owner and
+    /// probe real header state; a notice supplies no physical exit authority.
+    pub fn take_header_readiness(
+        &self,
+        budget: usize,
+    ) -> Vec<crate::header_readiness::HeaderReadyNotice> {
+        self.runtime
+            .shared
+            .header_readiness
+            .take(&Self::header_owner(&self.node), budget)
+    }
+    fn header_owner(node: &ActorCell<A>) -> crate::header_readiness::HeaderOwner {
+        crate::header_readiness::HeaderOwner {
+            actor: node.id,
+            attachment: node.attachment,
+            origin: node.origin.clone(),
+        }
+    }
     pub fn matches_registration(&self, registration: &ActorRegistration) -> bool {
         self.node.id == registration.actor
             && self.node.attachment == registration.attachment
-            && self.node.scope.same_scope(&registration.scope)
+            && Arc::ptr_eq(&self.node.scope, &registration.scope)
             && Arc::ptr_eq(&self.node.origin, &registration.origin)
+    }
+    /// Unload execution only after its actual custody retires. The same
+    /// actor registration, scheduler address and builtin timer survive.
+    pub fn detach_execution(&mut self, process: &ScopeHandle) -> Result<(), DriverError> {
+        self.runtime.detach_execution_node(&self.node, process)
+    }
+    /// Taking a notice does not acknowledge its destination's consumption.
+    pub fn take_metadata(
+        &mut self,
+        input: InputId,
+    ) -> Result<Option<MetadataTicket<A::Effect>>, DriverError> {
+        let mut inbox = self.node.inbox.lock().expect("actor inbox lock");
+        let batch = inbox
+            .batches
+            .get_mut(&input)
+            .ok_or(DriverError::UnknownInput)?;
+        let Some((ordinal, record)) = batch
+            .metadata
+            .iter_mut()
+            .enumerate()
+            .find(|(_, item)| item.value.is_some())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(MetadataTicket {
+            actor: self.node.id,
+            input,
+            ordinal,
+            origin: self.node.origin.clone(),
+            value: record.value.take().expect("selected original metadata"),
+        }))
     }
     /// A mark racing this release is retained by the same ready queue, even
     /// when the caller has no currently runnable work of its own.
@@ -456,12 +874,252 @@ impl<A: Actor> Drop for ActorHostTurn<A> {
     }
 }
 
+const METADATA_CREDIT_WAKE_BUDGET: usize = 16;
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct MetadataWaitKey {
+    actor: ActorId,
+    input: InputId,
+    ordinal: usize,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataCreditState {
+    Waiting,
+    Ready,
+    Forwarded,
+    Cancelled,
+    Closed,
+}
+/// Scheduling metadata for the same pending original fact, never another fact,
+/// input position, Work or acknowledgement of destination consumption.
+#[derive(Clone)]
+pub(crate) struct MetadataCreditWait {
+    key: MetadataWaitKey,
+    source: ActorRegistration,
+    target: ActorRegistration,
+    class: InputClass,
+    state: Arc<Mutex<MetadataCreditState>>,
+}
+impl MetadataCreditWait {
+    fn status(&self) -> MetadataCreditState {
+        *self.state.lock().expect("original metadata credit wait")
+    }
+    fn same_wait(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+    fn set(&self, next: MetadataCreditState) {
+        *self.state.lock().expect("original metadata credit wait") = next;
+    }
+}
+struct MetadataCreditQueue {
+    entries: BTreeMap<MetadataWaitKey, MetadataCreditWait>,
+    waiting: BTreeMap<ActorId, BTreeSet<MetadataWaitKey>>,
+    ready: ReadyQueue,
+    granted: usize,
+}
+impl MetadataCreditQueue {
+    fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            waiting: BTreeMap::new(),
+            ready: ReadyQueue::new(),
+            granted: 0,
+        }
+    }
+    fn register(&mut self, waiter: MetadataCreditWait) {
+        assert!(
+            !self.entries.contains_key(&waiter.key),
+            "one waiter per original metadata fact"
+        );
+        if !self.waiting.contains_key(&waiter.key.actor) {
+            self.ready
+                .register(waiter.key.actor)
+                .expect("fresh metadata waiting source");
+        }
+        self.waiting
+            .entry(waiter.key.actor)
+            .or_default()
+            .insert(waiter.key);
+        self.ready
+            .notify(waiter.key.actor)
+            .expect("registered metadata waiting source");
+        self.entries.insert(waiter.key, waiter);
+    }
+    fn grant(&mut self, budget: usize) -> Vec<ActorRegistration> {
+        let mut wakes = Vec::new();
+        for _ in 0..budget {
+            let Some(actor) = self.ready.claim() else {
+                break;
+            };
+            let group = self
+                .waiting
+                .get_mut(&actor)
+                .expect("queued metadata source group");
+            let key = group.pop_first().expect("queued metadata fact");
+            let more = !group.is_empty();
+            self.ready
+                .release(actor, more)
+                .expect("same metadata ready claim");
+            if !more {
+                self.waiting.remove(&actor);
+                self.ready
+                    .unregister(actor)
+                    .expect("idle metadata source group");
+            }
+            let waiter = self
+                .entries
+                .get(&key)
+                .expect("original metadata scheduling entry");
+            assert_eq!(waiter.status(), MetadataCreditState::Waiting);
+            waiter.set(MetadataCreditState::Ready);
+            self.granted = self
+                .granted
+                .checked_add(1)
+                .expect("bounded actual input credit");
+            wakes.push(waiter.source.clone());
+        }
+        wakes
+    }
+    fn remove(&mut self, waiter: &MetadataCreditWait, next: MetadataCreditState) -> bool {
+        let Some(original) = self.entries.get(&waiter.key) else {
+            return false;
+        };
+        assert!(
+            original.same_wait(waiter),
+            "one original metadata scheduling link"
+        );
+        let original = self
+            .entries
+            .remove(&waiter.key)
+            .expect("validated metadata scheduling entry");
+        match original.status() {
+            MetadataCreditState::Ready => {
+                self.granted = self
+                    .granted
+                    .checked_sub(1)
+                    .expect("original granted input credit");
+            }
+            MetadataCreditState::Waiting => {
+                let group = self
+                    .waiting
+                    .get_mut(&waiter.key.actor)
+                    .expect("original waiting source group");
+                assert!(group.remove(&waiter.key));
+                if group.is_empty() {
+                    self.waiting.remove(&waiter.key.actor);
+                    self.ready
+                        .cancel_pending(waiter.key.actor)
+                        .expect("unclaimed original credit waiter");
+                    self.ready
+                        .unregister(waiter.key.actor)
+                        .expect("idle original credit waiter");
+                }
+            }
+            _ => panic!("only pending or granted scheduling entries remain indexed"),
+        }
+        original.set(next);
+        true
+    }
+    fn close(&mut self, budget: usize) -> Vec<ActorRegistration> {
+        let mut wakes = Vec::new();
+        for _ in 0..budget {
+            let Some(waiter) = self
+                .entries
+                .first_key_value()
+                .map(|(_, waiter)| waiter.clone())
+            else {
+                break;
+            };
+            assert!(self.remove(&waiter, MetadataCreditState::Closed));
+            wakes.push(waiter.source.clone());
+        }
+        wakes
+    }
+}
+
+/// Only the actual destination Core can establish consumption of a forwarded
+/// metadata fact. Effect completion and physical exit are independent facts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetadataConsumption {
+    Pending,
+    Consumed,
+    AbandonedByOwnerFailure,
+}
+
+/// Read-only shared receipt for one original source metadata / target input.
+/// Clones issue no input, Work, metadata ticket, or acknowledgement authority.
+#[derive(Clone)]
+pub struct MetadataDelivery {
+    source: ActorRegistration,
+    target: ActorRegistration,
+    input: InputId,
+    state: Arc<Mutex<MetadataConsumption>>,
+}
+impl MetadataDelivery {
+    pub fn consumption(&self) -> MetadataConsumption {
+        *self
+            .state
+            .lock()
+            .expect("original metadata delivery receipt")
+    }
+    pub const fn input(&self) -> InputId {
+        self.input
+    }
+    pub fn target_registration(&self) -> &ActorRegistration {
+        &self.target
+    }
+    fn resolve(&self, next: MetadataConsumption) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("original metadata delivery receipt");
+        if *state != MetadataConsumption::Pending {
+            return false;
+        }
+        *state = next;
+        true
+    }
+}
+impl std::fmt::Debug for MetadataDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataDelivery")
+            .field("source", &self.source.actor)
+            .field("target", &self.target.actor)
+            .field("input", &self.input)
+            .field("consumption", &self.consumption())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Original neutral retained-state notice. It is no Work, I/O or publication
+/// authority. Drop never acknowledges consumption or releases its custody.
+pub struct MetadataTicket<E> {
+    actor: ActorId,
+    input: InputId,
+    ordinal: usize,
+    origin: Arc<()>,
+    value: E,
+}
+impl<E> MetadataTicket<E> {
+    pub fn value(&self) -> &E {
+        &self.value
+    }
+}
+impl<E> std::fmt::Debug for MetadataTicket<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataTicket")
+            .field("actor", &self.actor)
+            .field("input", &self.input)
+            .field("ordinal", &self.ordinal)
+            .finish_non_exhaustive()
+    }
+}
 /// This is neutral input storage, not a host WorkLease. Bound positions remain
 /// resident until captures, effects and report consumers have actually retired.
 #[must_use = "Reserve before binding payloads; fill or explicitly revoke an unused input"]
 pub struct InputPermit<A: Actor> {
     runtime: ActorRuntime<A>,
     actor: ActorId,
+    origin: Arc<()>,
     input: InputId,
 }
 impl<A: Actor> std::fmt::Debug for InputPermit<A> {
@@ -478,6 +1136,7 @@ impl<A: Actor> std::fmt::Debug for InputPermit<A> {
 pub struct InputRole<A: Actor> {
     runtime: ActorRuntime<A>,
     actor: ActorId,
+    origin: Arc<()>,
     role: InputRoleId,
     active: bool,
 }
@@ -491,11 +1150,41 @@ impl<A: Actor> std::fmt::Debug for InputRole<A> {
     }
 }
 impl<A: Actor> InputRole<A> {
+    fn original_node(&self) -> Result<Arc<ActorCell<A>>, DriverError> {
+        let node = self.runtime.node(self.actor)?;
+        if !Arc::ptr_eq(&self.origin, &node.origin) {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        Ok(node)
+    }
     pub const fn id(&self) -> InputRoleId {
         self.role
     }
+    pub fn author(&self) -> Result<InputAuthor, DriverError> {
+        let node = self.original_node()?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        inbox
+            .roles
+            .get(&self.role)
+            .ok_or(DriverError::UnknownRole)?
+            .producer
+            .clone()
+            .ok_or(DriverError::InputAuthorMismatch)
+    }
+    pub fn input_author(&self, input: InputId) -> Result<InputAuthor, DriverError> {
+        let node = self.original_node()?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let record = inbox.inputs.get(&input).ok_or(DriverError::UnknownInput)?;
+        if record.role != Some(self.role) {
+            return Err(DriverError::InputAuthorMismatch);
+        }
+        record
+            .author
+            .clone()
+            .ok_or(DriverError::InputAuthorMismatch)
+    }
     pub fn in_flight(&self) -> Result<Option<InputId>, DriverError> {
-        let node = self.runtime.node(self.actor)?;
+        let node = self.original_node()?;
         let inbox = node.inbox.lock().expect("actor inbox lock");
         Ok(inbox
             .roles
@@ -507,22 +1196,60 @@ impl<A: Actor> InputRole<A> {
     /// Every occurrence receives a fresh monotonic InputId; a prior effect ticket
     /// can never identify this new batch. Error returns the original neutral value.
     pub fn fill(&self, value: A::Input) -> Result<InputId, (DriverError, A::Input)> {
+        self.fill_inner(None, value)
+    }
+    /// The original producer position and financial author remain distinct.
+    pub fn fill_from_author(
+        &self,
+        author: &InputAuthor,
+        value: A::Input,
+    ) -> Result<InputId, (DriverError, A::Input)> {
+        self.fill_inner(Some(author), value)
+    }
+    fn fill_inner(
+        &self,
+        author: Option<&InputAuthor>,
+        value: A::Input,
+    ) -> Result<InputId, (DriverError, A::Input)> {
+        let observed = self.runtime.shared.observation.now();
         if !self.active {
             return Err((DriverError::UnknownRole, value));
         }
-        let node = match self.runtime.node(self.actor) {
+        let node = match self.original_node() {
             Ok(node) => node,
             Err(error) => return Err((error, value)),
         };
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        let execution_scope = node.scope.current_scope();
         if inbox.sealed {
             return Err((DriverError::Closed, value));
         }
-        let scope_failed = match node.scope.gates() {
-            Ok(gates) => gates.failed,
-            Err(error) => return Err((error.into(), value)),
+        let mut ledger = execution_scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let scope_failed = match ledger.scopes.get(&execution_scope.id()) {
+            Some(scope) => !node.scope.retained() && scope.failed(),
+            None => return Err((RuntimeError::UnknownScope.into(), value)),
         };
-        let result = inbox.fill_role(self.role, scope_failed, value);
+        if let Some(author) = author
+            && let Err(error) = ActorRuntime::<A>::validate_input_author(
+                &node, &inbox, &ledger, author, false, true,
+            )
+        {
+            return Err((error, value));
+        }
+        let result = inbox.fill_role(
+            self.role,
+            scope_failed,
+            author,
+            &mut ledger,
+            observed,
+            value,
+        );
+        drop(ledger);
         if result.is_ok() {
             self.runtime
                 .shared
@@ -546,7 +1273,7 @@ impl<A: Actor> InputRole<A> {
             return Err(DriverError::UnknownRole);
         }
         self.runtime
-            .close_role_after_exit(self.actor, self.role, false)?;
+            .close_role_after_exit(self.actor, self.role, false, Some(&self.origin))?;
         self.active = false;
         Ok(())
     }
@@ -557,15 +1284,34 @@ impl<A: Actor> InputPermit<A> {
     }
 }
 impl<A: Actor> InputPermit<A> {
+    fn original_node(&self) -> Result<Arc<ActorCell<A>>, DriverError> {
+        let node = self.runtime.node(self.actor)?;
+        if !Arc::ptr_eq(&self.origin, &node.origin) {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        Ok(node)
+    }
+    pub fn author(&self) -> Result<InputAuthor, DriverError> {
+        let node = self.original_node()?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        inbox
+            .inputs
+            .get(&self.input)
+            .ok_or(DriverError::UnknownInput)?
+            .author
+            .clone()
+            .ok_or(DriverError::InputAuthorMismatch)
+    }
     /// Converts a pure unused reservation into one persistent role authority.
     /// The class charge moves intact; the original InputId is permanently burned.
     pub fn into_role(self) -> Result<InputRole<A>, (DriverError, Self)> {
-        let node = match self.runtime.node(self.actor) {
+        let node = match self.original_node() {
             Ok(node) => node,
             Err(error) => return Err((error, self)),
         };
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
-        let scope_failed = match node.scope.gates() {
+        let execution_scope = node.scope.current_scope();
+        let scope_failed = match execution_scope.gates() {
             Ok(gates) => gates.failed,
             Err(error) => return Err((error.into(), self)),
         };
@@ -580,25 +1326,37 @@ impl<A: Actor> InputPermit<A> {
         }
         let role = InputRoleId(self.input);
         let (source, class) = (input.source, input.class);
+        let producer = input.producer.clone();
+        let mut original = inbox
+            .inputs
+            .remove(&self.input)
+            .expect("same unused original input");
+        let producer_header = original.header_pins.pop();
+        assert!(
+            original.header_pins.is_empty(),
+            "an unused permit owns only its original producer header"
+        );
         inbox.roles.insert(
             role,
             InputRoleRecord {
                 source,
                 class,
+                producer,
+                producer_header,
                 in_flight: None,
             },
         );
-        inbox.inputs.remove(&self.input);
         Ok(InputRole {
             runtime: self.runtime.clone(),
             actor: self.actor,
+            origin: node.origin.clone(),
             role,
             active: true,
         })
     }
     /// Call before attaching any payload/capture. Bound positions cannot take unused revocation.
     pub fn bind(&self) -> Result<(), DriverError> {
-        let node = self.runtime.node(self.actor)?;
+        let node = self.original_node()?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
         let input = inbox
             .inputs
@@ -611,7 +1369,8 @@ impl<A: Actor> InputPermit<A> {
         Ok(())
     }
     pub fn fill(self, value: A::Input) -> Result<InputId, (DriverError, A::Input)> {
-        let node = match self.runtime.node(self.actor) {
+        let observed = self.runtime.shared.observation.now();
+        let node = match self.original_node() {
             Ok(node) => node,
             Err(e) => return Err((e, value)),
         };
@@ -633,11 +1392,9 @@ impl<A: Actor> InputPermit<A> {
             return Err((e.into(), value));
         }
         inbox.payloads.insert(self.input, value);
-        inbox
-            .inputs
-            .get_mut(&self.input)
-            .expect("reserved input")
-            .phase = InputPhase::Filled;
+        let input = inbox.inputs.get_mut(&self.input).expect("reserved input");
+        input.phase = InputPhase::Filled;
+        input.handoff_at = observed;
         self.runtime
             .shared
             .state
@@ -654,7 +1411,7 @@ impl<A: Actor> InputPermit<A> {
     /// report consumers have retired. No command ever reached the actor, so
     /// this is unused-role withdrawal, not fictitious core consumption.
     pub fn revoke_bound_after_exit(self) -> Result<(), DriverError> {
-        let node = self.runtime.node(self.actor)?;
+        let node = self.original_node()?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
         let input = inbox
             .inputs
@@ -664,13 +1421,26 @@ impl<A: Actor> InputPermit<A> {
             return Err(DriverError::InputNotReserved);
         }
         let class = input.class;
-        inbox.inputs.remove(&self.input);
-        inbox.counts[class.index()] -= 1;
+        let mut original = inbox
+            .inputs
+            .remove(&self.input)
+            .expect("same original revoked input");
+        let scope = node.scope.current_scope();
+        let mut ledger = scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("original input header release");
+        original.release_header_custody(&mut ledger);
+        drop(ledger);
+        self.runtime
+            .notify_metadata_credit_sources(inbox.return_input_credit(class));
         Ok(())
     }
     /// The caller proves that no payload or capture has ever been bound.
     pub fn revoke_unused(self) -> Result<(), DriverError> {
-        let node = self.runtime.node(self.actor)?;
+        let node = self.original_node()?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
         let input = inbox
             .inputs
@@ -680,8 +1450,21 @@ impl<A: Actor> InputPermit<A> {
             return Err(DriverError::InputNotReserved);
         }
         let class = input.class;
-        inbox.inputs.remove(&self.input);
-        inbox.counts[class.index()] -= 1;
+        let mut original = inbox
+            .inputs
+            .remove(&self.input)
+            .expect("same original revoked input");
+        let scope = node.scope.current_scope();
+        let mut ledger = scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("original input header release");
+        original.release_header_custody(&mut ledger);
+        drop(ledger);
+        self.runtime
+            .notify_metadata_credit_sources(inbox.return_input_credit(class));
         Ok(())
     }
 }
@@ -694,6 +1477,7 @@ pub struct EffectTicketView<E> {
     pub actor: ActorId,
     pub input: InputId,
     pub generation: Generation,
+    pub author_generation: Generation,
     pub descriptor: EffectDescriptor,
 }
 /// An exclusive effect dispatch ticket from one actual actor incarnation.
@@ -763,6 +1547,43 @@ impl<E> std::fmt::Debug for EffectCompletionRefusal<E> {
             .finish()
     }
 }
+/// An original effect's actual Completed transition, independent of how long
+/// its input/batch remains resident. This immutable receipt grants no Work,
+/// dispatch, publication or exit authority and holds no effect payload.
+#[must_use = "Forward the actual completion fact to its original ordering owner"]
+pub struct CompletedEffect<A: Actor> {
+    runtime: ActorRuntime<A>,
+    registration: ActorRegistration,
+    input: InputId,
+    ordinal: BatchId,
+    generation: Generation,
+    descriptor: EffectDescriptor,
+}
+impl<A: Actor> CompletedEffect<A> {
+    pub fn registration(&self) -> &ActorRegistration {
+        &self.registration
+    }
+    pub const fn input(&self) -> InputId {
+        self.input
+    }
+    pub fn descriptor(&self) -> &EffectDescriptor {
+        &self.descriptor
+    }
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+}
+impl<A: Actor> std::fmt::Debug for CompletedEffect<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletedEffect")
+            .field("registration", &self.registration)
+            .field("input", &self.input)
+            .field("ordinal", &self.ordinal)
+            .field("generation", &self.generation)
+            .field("descriptor", &self.descriptor)
+            .finish()
+    }
+}
 /// Read-only completion evidence from one original Started/Published ticket.
 /// It retains no effect payload, Work permission or actor core. Construction
 /// qualifies the original record; arbitrary missing IDs cannot create it.
@@ -825,16 +1646,16 @@ impl<A: Actor> EffectCompletionObserver<A> {
 #[must_use = "A failure session belongs to its original running cleanup work"]
 pub struct FailurePublicationSession<A: Actor> {
     runtime: ActorRuntime<A>,
+    registration: ActorRegistration,
     actor: ActorId,
     origin: Arc<()>,
-    // ActorIds may be registered again after actual removal, and WorkIds are
-    // scope-local. Preserve the original scope and ledger identity even after
-    // its work exits; a later incarnation cannot inherit this authority.
+    // Preserve the actual cleanup financial Scope independently of the failed
+    // actor origin. A later actor incarnation or scope-local WorkId cannot
+    // inherit this running job's authority.
     scope: ScopeHandle,
-    input: InputId,
     generation: Generation,
-    action: ActionId,
-    work: WorkId,
+    claim: FailurePublicationOrigin,
+    work: ScopedWorkRef,
 }
 impl<A: Actor> std::fmt::Debug for FailurePublicationSession<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -847,6 +1668,11 @@ impl<A: Actor> std::fmt::Debug for FailurePublicationSession<A> {
     }
 }
 impl<A: Actor> FailurePublicationSession<A> {
+    /// Original failed target binding, independent of the cleanup financial Scope.
+    /// Reading it grants no additional Work, report leg or publication action.
+    pub fn registration(&self) -> &ActorRegistration {
+        &self.registration
+    }
     pub const fn generation(&self) -> Generation {
         self.generation
     }
@@ -862,8 +1688,8 @@ impl<A: Actor> FailurePublicationSession<A> {
         }
         let node = runtime.node(actor)?;
         let inbox = node.inbox.lock().expect("actor inbox lock");
-        let ledger = node
-            .scope
+        let execution_scope = node.scope.current_scope();
+        let ledger = execution_scope
             .runtime
             .shared
             .state
@@ -879,37 +1705,62 @@ impl<A: Actor> FailurePublicationSession<A> {
         ledger: &crate::transaction::LedgerState,
         target: &ScopeHandle,
     ) -> Result<(), DriverError> {
-        if !Arc::ptr_eq(&node.origin, &self.origin) {
+        let affiliation = node.scope.current_scope();
+        if node.id != self.actor || !Arc::ptr_eq(&node.origin, &self.origin) {
             return Err(DriverError::EffectTicketOriginMismatch);
         }
-        if node.scope.id() != self.scope.id()
-            || !Arc::ptr_eq(&node.scope.runtime.shared, &self.scope.runtime.shared)
-            || node.scope.id() != target.id()
-            || !Arc::ptr_eq(&node.scope.runtime.shared, &target.runtime.shared)
+        if !Arc::ptr_eq(&affiliation.runtime.shared, &self.scope.runtime.shared)
+            || !Arc::ptr_eq(&self.scope.runtime.shared, &target.runtime.shared)
         {
             return Err(DriverError::PublicationTargetMismatch);
         }
-        ActorRuntime::<A>::validate_failure_work(
-            node,
-            inbox,
-            ledger,
-            self.input,
-            self.generation,
-            self.action,
-            self.work,
-        )?;
-        let claim = inbox
-            .failure_publication
-            .as_ref()
-            .ok_or(DriverError::FailurePublicationRequired)?;
-        if claim.generation != self.generation
-            || claim.input != self.input
-            || claim.action != self.action
-            || claim.work != self.work
-        {
-            return Err(EffectError::StaleGeneration.into());
+        match self.claim {
+            FailurePublicationOrigin::SupervisorEffect { input, action } => {
+                if !affiliation.same_scope(&self.scope) {
+                    return Err(DriverError::PublicationTargetMismatch);
+                }
+                ActorRuntime::<A>::validate_failure_work(
+                    node,
+                    inbox,
+                    ledger,
+                    input,
+                    self.generation,
+                    action,
+                    self.work,
+                )?;
+            }
+            FailurePublicationOrigin::StartedCleanup {
+                financial_generation,
+                header,
+            } => {
+                if !inbox.failed
+                    || inbox.generation != self.generation
+                    || self.generation <= node.scope.original_epoch
+                {
+                    return Err(EffectError::StaleGeneration.into());
+                }
+                let actual =
+                    ActorRuntime::<A>::started_failure_cleanup(ledger, self.scope.id(), self.work)?;
+                if actual != (financial_generation, header) {
+                    return Err(DriverError::FailureWorkInactive);
+                }
+            }
         }
-        Ok(())
+        match inbox.failure_publication.as_ref() {
+            Some(FailurePublicationRecord::Active {
+                generation,
+                origin,
+                work,
+            }) if *generation == self.generation && *origin == self.claim && *work == self.work => {
+                Ok(())
+            }
+            Some(FailurePublicationRecord::Active { .. }) => {
+                Err(EffectError::StaleGeneration.into())
+            }
+            Some(FailurePublicationRecord::Closed) | None => {
+                Err(DriverError::FailurePublicationRequired)
+            }
+        }
     }
     fn next_publication_action(inbox: &Inbox<A>) -> Result<ActionId, DriverError> {
         inbox
@@ -929,27 +1780,55 @@ impl<A: Actor> FailurePublicationSession<A> {
     ) -> Result<EffectTicket<A::Effect>, DriverError> {
         let node = self.runtime.node(self.actor)?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
-        let ledger = node
-            .scope
+        let execution_scope = node.scope.current_scope();
+        let ledger = execution_scope
             .runtime
             .shared
             .state
             .lock()
             .expect("runtime ledger lock");
         self.validate(&node, &inbox, &ledger, &self.scope)?;
-        if input == self.input {
+        if matches!(self.claim, FailurePublicationOrigin::SupervisorEffect { input: own, .. } if input == own)
+        {
             return Err(EffectError::InvalidTransition.into());
         }
+        let author_ref = inbox
+            .batches
+            .get(&input)
+            .ok_or(DriverError::UnknownInput)?
+            .state
+            .record(action)
+            .ok_or(EffectError::UnknownAction)?
+            .descriptor()
+            .work;
+        let author_generation = ledger
+            .scopes
+            .get(&author_ref.scope)
+            .ok_or(RuntimeError::UnknownScope)?
+            .generation();
         let batch = inbox
             .batches
             .get_mut(&input)
             .ok_or(DriverError::UnknownInput)?;
-        if batch.state.scope() != self.scope.id() {
+        if matches!(
+            self.claim,
+            FailurePublicationOrigin::SupervisorEffect { .. }
+        ) && batch.state.scope() != self.scope.id()
+        {
             return Err(DriverError::PublicationTargetMismatch);
         }
         batch
             .state
             .start_after_owner_failure(action, self.generation)?;
+        self.runtime.shared.record(|| HistoryFact::Effect {
+            target: node.history_target(),
+            input,
+            action,
+            actor_generation: batch.state.generation(),
+            financial_work: author_ref,
+            author_generation,
+            phase: novarocks_control_runtime_core::history::EffectHistoryPhase::Dispatched,
+        });
         let effect = batch
             .payloads
             .remove(&action)
@@ -960,6 +1839,7 @@ impl<A: Actor> FailurePublicationSession<A> {
                 actor: self.actor,
                 input,
                 generation: batch.state.generation(),
+                author_generation,
                 descriptor: batch
                     .state
                     .record(action)
@@ -981,8 +1861,8 @@ impl<A: Actor> FailurePublicationSession<A> {
             Err(error) => return Err((error, ManuallyDrop::into_inner(next))),
         };
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
-        let ledger = node
-            .scope
+        let execution_scope = node.scope.current_scope();
+        let ledger = execution_scope
             .runtime
             .shared
             .state
@@ -990,6 +1870,17 @@ impl<A: Actor> FailurePublicationSession<A> {
             .expect("runtime ledger lock");
         let action = match self
             .validate(&node, &inbox, &ledger, &target.owner)
+            .and_then(|()| {
+                ActorRuntime::<A>::validate_target_binding(
+                    &node,
+                    &inbox,
+                    &ledger,
+                    None,
+                    &target.owner,
+                    &target.binding,
+                    true,
+                )
+            })
             .and_then(|()| Self::next_publication_action(&inbox))
         {
             Ok(action) => action,
@@ -997,10 +1888,26 @@ impl<A: Actor> FailurePublicationSession<A> {
         };
         let mut value = target.value.lock().expect("published snapshot lock");
         inbox.failure_action_watermark = action.get();
-        self.runtime.shared.record(HistoryFact::Published {
-            scope: node.scope.id(),
-            generation: self.generation,
+        self.runtime.shared.record(|| HistoryFact::FailurePublication {
+            target: node.history_target(),
+            actor_generation: self.generation,
+            financial_work: self.work,
+            financial_generation: match self.claim {
+                FailurePublicationOrigin::StartedCleanup { financial_generation, .. } => financial_generation,
+                FailurePublicationOrigin::SupervisorEffect { .. } => ledger.scopes
+                    .get(&self.work.scope).expect("the validated original failure Work Scope").generation(),
+            },
             action,
+            origin: match self.claim {
+                FailurePublicationOrigin::SupervisorEffect { input, action } =>
+                    novarocks_control_runtime_core::history::FailurePublicationHistoryOrigin::SupervisorEffect {
+                        input, action,
+                    },
+                FailurePublicationOrigin::StartedCleanup { header, .. } =>
+                    novarocks_control_runtime_core::history::FailurePublicationHistoryOrigin::StartedCleanup {
+                        header,
+                    },
+            },
         });
         // All fallible metadata work precedes the no-callback/no-destructor
         // actual swap. Failure and readers are still excluded by these gates.
@@ -1025,8 +1932,8 @@ impl<A: Actor> FailurePublicationSession<A> {
             Err(error) => return Err((error, ManuallyDrop::into_inner(next))),
         };
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
-        let ledger = node
-            .scope
+        let execution_scope = node.scope.current_scope();
+        let ledger = execution_scope
             .runtime
             .shared
             .state
@@ -1040,6 +1947,17 @@ impl<A: Actor> FailurePublicationSession<A> {
             Err(error) => return Err((error, ManuallyDrop::into_inner(next))),
         };
         let mut reply = target.cell.lock().expect("published reply lock");
+        if let Err(error) = ActorRuntime::<A>::validate_target_binding(
+            &node,
+            &inbox,
+            &ledger,
+            None,
+            &target.owner,
+            &reply.binding,
+            true,
+        ) {
+            return Err((error, ManuallyDrop::into_inner(next)));
+        }
         if reply.phase != crate::publication::ReplyPhase::Empty || reply.value.is_some() {
             return Err((
                 DriverError::ReplyAlreadyCommitted,
@@ -1047,10 +1965,26 @@ impl<A: Actor> FailurePublicationSession<A> {
             ));
         }
         inbox.failure_action_watermark = action.get();
-        self.runtime.shared.record(HistoryFact::Published {
-            scope: node.scope.id(),
-            generation: self.generation,
+        self.runtime.shared.record(|| HistoryFact::FailurePublication {
+            target: node.history_target(),
+            actor_generation: self.generation,
+            financial_work: self.work,
+            financial_generation: match self.claim {
+                FailurePublicationOrigin::StartedCleanup { financial_generation, .. } => financial_generation,
+                FailurePublicationOrigin::SupervisorEffect { .. } => ledger.scopes
+                    .get(&self.work.scope).expect("the validated original failure Work Scope").generation(),
+            },
             action,
+            origin: match self.claim {
+                FailurePublicationOrigin::SupervisorEffect { input, action } =>
+                    novarocks_control_runtime_core::history::FailurePublicationHistoryOrigin::SupervisorEffect {
+                        input, action,
+                    },
+                FailurePublicationOrigin::StartedCleanup { header, .. } =>
+                    novarocks_control_runtime_core::history::FailurePublicationHistoryOrigin::StartedCleanup {
+                        header,
+                    },
+            },
         });
         reply.phase = crate::publication::ReplyPhase::Committed;
         let previous = ManuallyDrop::new(reply.value.replace(ManuallyDrop::into_inner(next)));
@@ -1074,6 +2008,12 @@ pub struct ActorSnapshot {
     pub last_progress: Tick,
 }
 
+impl<A: Actor> Default for ActorRuntime<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<A: Actor> ActorRuntime<A> {
     /// Compares the actual runtime instance only. This grants no work,
     /// capacity, input, or permission to pass a current admission gate.
@@ -1083,27 +2023,45 @@ impl<A: Actor> ActorRuntime<A> {
     /// Read-only original scope identity, not admission, current generation,
     /// publication permission or evidence that any Work has exited.
     pub fn owns_scope(&self, actor: ActorId, scope: &ScopeHandle) -> Result<bool, DriverError> {
-        Ok(self.node(actor)?.scope.same_scope(scope))
+        Ok(self.node(actor)?.scope.matches_live_scope(scope))
     }
-    pub fn new(max_actors: usize) -> Self {
-        Self::build(max_actors, None)
+    pub fn new() -> Self {
+        Self::build(None, Default::default())
     }
-    pub fn with_history(max_actors: usize, history: crate::history::HistoryCapture) -> Self {
-        Self::build(max_actors, Some(history))
+    pub fn with_history(history: crate::history::HistoryCapture) -> Self {
+        Self::build(Some(history), Default::default())
     }
-    fn build(max_actors: usize, history: Option<crate::history::HistoryCapture>) -> Self {
+    pub fn with_observation(
+        history: Option<crate::history::HistoryCapture>,
+        observation: crate::observation::RuntimeObservation,
+    ) -> Self {
+        Self::build(history, observation)
+    }
+    pub fn observation_snapshot(&self) -> Option<crate::observation::RuntimeObservationSnapshot> {
+        self.shared.observation.snapshot()
+    }
+    fn build(
+        history: Option<crate::history::HistoryCapture>,
+        observation: crate::observation::RuntimeObservation,
+    ) -> Self {
+        let changed = Arc::new(Notify::default());
+        let header_readiness = Arc::new(crate::header_readiness::HeaderReadyHub::new(
+            changed.clone(),
+        ));
         Self {
             shared: Arc::new(DriverShared {
                 state: Mutex::new(DriverState {
                     actors: BTreeMap::new(),
-                    ready: ReadyQueue::new(max_actors),
-                    effect_ready: ReadyQueue::new(max_actors),
-                    timers: TimerIndex::new(max_actors),
+                    ready: ReadyQueue::new(),
+                    effect_ready: ReadyQueue::new(),
+                    timers: TimerIndex::new(),
                     open: true,
                     now: Tick(0),
                 }),
-                changed: Notify::default(),
+                changed,
+                header_readiness,
                 history,
+                observation,
             }),
         }
     }
@@ -1338,7 +2296,14 @@ impl<A: Actor> ActorRuntime<A> {
         let registration = ActorRegistration {
             actor: id,
             attachment,
-            scope: scope.clone(),
+            scope: Arc::new(RegistrationScope {
+                original: scope.id(),
+                original_epoch: generation,
+                execution: Mutex::new(ActorExecution::Live {
+                    scope,
+                    failure_work,
+                }),
+            }),
             origin: Arc::new(()),
         };
         state.actors.insert(
@@ -1346,13 +2311,13 @@ impl<A: Actor> ActorRuntime<A> {
             Arc::new(ActorCell {
                 origin: registration.origin.clone(),
                 id,
-                scope,
+                scope: registration.scope.clone(),
                 attachment,
                 config,
-                failure_work,
                 failure_policy,
                 core: Mutex::new(Some(actor)),
                 inbox: Mutex::new(Inbox {
+                    observation: self.shared.observation.clone(),
                     external_open: true,
                     sealed: false,
                     payloads: BTreeMap::new(),
@@ -1360,6 +2325,9 @@ impl<A: Actor> ActorRuntime<A> {
                     inputs: BTreeMap::new(),
                     roles: BTreeMap::new(),
                     counts: [0; 4],
+                    input_limits: config.mailbox,
+                    metadata_credit: std::array::from_fn(|_| MetadataCreditQueue::new()),
+                    metadata_closing: false,
                     next_input: u64::from(failure_policy == ActorFailurePolicy::IsolateScope),
                     batches: BTreeMap::new(),
                     batch_order: BTreeMap::new(),
@@ -1368,6 +2336,7 @@ impl<A: Actor> ActorRuntime<A> {
                     failed: false,
                     timer_input: None,
                     timer_closed: false,
+                    failed_custodian_timer: None,
                     failure_position: (failure_policy == ActorFailurePolicy::IsolateScope)
                         .then(|| InputId::new(1).expect("fixed initial supervisor identity")),
                     failure_input: None,
@@ -1380,6 +2349,87 @@ impl<A: Actor> ActorRuntime<A> {
         );
         Ok(registration)
     }
+    /// A committed input owns every explicit financial author used by its
+    /// effects, including a delayed R reply on a workless Timer turn. Pins
+    /// retain headers only; ordinary effect authorization is unchanged.
+    fn pin_batch_authors(
+        node: &ActorCell<A>,
+        inbox: &mut Inbox<A>,
+        input: InputId,
+        batch: &StepEnvelope<A::Effect>,
+        ledger: &mut crate::transaction::LedgerState,
+    ) -> Result<(), DriverError> {
+        let record = inbox.inputs.get(&input).ok_or(DriverError::UnknownInput)?;
+        let affiliation = node.scope.current_scope();
+        let mut added: Vec<crate::lease::WorkHeaderPin> = Vec::new();
+        for author in batch.authors.values() {
+            if author.actor != node.id
+                || !Arc::ptr_eq(&author.origin, &node.origin)
+                || !Arc::ptr_eq(&author.scope.runtime.shared, &affiliation.runtime.shared)
+            {
+                for pin in added {
+                    pin.release_locked(ledger);
+                }
+                return Err(DriverError::InputAuthorMismatch);
+            }
+            if record
+                .header_pins
+                .iter()
+                .chain(added.iter())
+                .any(|pin| pin.reference() == author.work && pin.belongs_to(&author.scope))
+            {
+                continue;
+            }
+            match crate::lease::WorkHeaderPin::for_input_author_locked(author, ledger) {
+                Ok(pin) => added.push(pin),
+                Err(error) => {
+                    for pin in added {
+                        pin.release_locked(ledger);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        // New business effects can name an original unbound reservation
+        // instead of the incoming producer. The guard itself proves that
+        // header; its batch keeps it even after the guard moves and binds.
+        for guard in batch.reservations.values() {
+            let reference = ScopedWorkRef {
+                scope: guard.scope().id(),
+                work: guard.work_id(),
+            };
+            if record
+                .header_pins
+                .iter()
+                .chain(added.iter())
+                .any(|pin| pin.reference() == reference && pin.belongs_to(guard.scope()))
+            {
+                continue;
+            }
+            if !Arc::ptr_eq(&guard.scope().runtime.shared, &affiliation.runtime.shared) {
+                for pin in added {
+                    pin.release_locked(ledger);
+                }
+                return Err(DriverError::ReservationOwnerMismatch);
+            }
+            match crate::lease::WorkHeaderPin::for_guard_locked(guard, ledger) {
+                Ok(pin) => added.push(pin),
+                Err(error) => {
+                    for pin in added {
+                        pin.release_locked(ledger);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        inbox
+            .inputs
+            .get_mut(&input)
+            .expect("same committing original input")
+            .header_pins
+            .extend(added);
+        Ok(())
+    }
     /// Existing permits may still fill after external admission closes.
     pub fn reserve_input(
         &self,
@@ -1387,7 +2437,7 @@ impl<A: Actor> ActorRuntime<A> {
         source: ActorId,
         class: InputClass,
     ) -> Result<InputPermit<A>, DriverError> {
-        self.reserve_input_position(actor, source, class, None)
+        self.reserve_input_position(actor, source, class, None, None)
     }
     /// Reserve a neutral input for an already admitted holder in this actor's
     /// exact scope. External closure cannot discard that holder's drain work.
@@ -1401,7 +2451,44 @@ impl<A: Actor> ActorRuntime<A> {
         class: InputClass,
         author: &crate::lease::WorkLease,
     ) -> Result<InputPermit<A>, DriverError> {
-        self.reserve_input_position(actor, source, class, Some(author))
+        self.reserve_input_position(actor, source, class, Some(author), None)
+    }
+    /// Cross-owner input admission requires the actual destination registration,
+    /// not a numeric actor address which a later incarnation could reuse.
+    pub fn reserve_admitted_input_for(
+        &self,
+        registration: &ActorRegistration,
+        source: ActorId,
+        class: InputClass,
+        author: &crate::lease::WorkLease,
+    ) -> Result<InputPermit<A>, DriverError> {
+        self.reserve_input_position(
+            registration.actor,
+            source,
+            class,
+            Some(author),
+            Some(registration),
+        )
+    }
+    /// A retained request consumes its actual current process-scope Work.
+    /// No identity alone grants admission and no old execution Work is reused.
+    pub fn reserve_retained_input(
+        &self,
+        registration: &ActorRegistration,
+        source: ActorId,
+        class: InputClass,
+        author: &crate::lease::WorkLease,
+    ) -> Result<InputPermit<A>, DriverError> {
+        if !self.node(registration.actor)?.scope.retained() {
+            return Err(DriverError::RetainedInputRequired);
+        }
+        self.reserve_input_position(
+            registration.actor,
+            source,
+            class,
+            Some(author),
+            Some(registration),
+        )
     }
     fn reserve_input_position(
         &self,
@@ -1409,31 +2496,60 @@ impl<A: Actor> ActorRuntime<A> {
         source: ActorId,
         class: InputClass,
         author: Option<&crate::lease::WorkLease>,
+        retained_registration: Option<&ActorRegistration>,
     ) -> Result<InputPermit<A>, DriverError> {
         if class == InputClass::Timer {
             return Err(DriverError::InvalidConfig);
         }
         let node = self.node(actor)?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        let execution_scope = node.scope.current_scope();
+        if let Some(registration) = retained_registration {
+            if registration.actor != actor
+                || !Arc::ptr_eq(&registration.origin, &node.origin)
+                || !Arc::ptr_eq(&registration.scope, &node.scope)
+            {
+                return Err(DriverError::EffectTicketOriginMismatch);
+            }
+        } else if node.scope.retained() {
+            return Err(DriverError::RetainedInputRequired);
+        }
+        if author.is_some_and(|work| work.scope().id() != execution_scope.id())
+            && retained_registration.is_none()
+        {
+            return Err(DriverError::InputAuthorMismatch);
+        }
+        if node.scope.retained() && author.is_none() {
+            return Err(DriverError::RetainedInputRequired);
+        }
         // Keep the actual author check and position insertion in one order
         // with scope failure. Lock order is the existing inbox -> ledger order;
         // no callback, payload construction or Work admission runs here.
-        let author_state = if let Some(author) = author {
-            if author.scope().id() != node.scope.id()
-                || !Arc::ptr_eq(&author.scope().runtime.shared, &node.scope.runtime.shared)
-            {
+        let mut author_state = if let Some(author) = author {
+            if !Arc::ptr_eq(
+                &author.scope().runtime.shared,
+                &execution_scope.runtime.shared,
+            ) {
                 return Err(DriverError::InputAuthorMismatch);
             }
-            let state = node
-                .scope
+            let state = execution_scope
                 .runtime
                 .shared
                 .state
                 .lock()
                 .expect("runtime ledger lock");
+            if !node.scope.retained()
+                && state
+                    .scopes
+                    .get(&execution_scope.id())
+                    .ok_or(RuntimeError::UnknownScope)?
+                    .failed()
+            {
+                return Err(DriverError::ActorFailed);
+            }
             let scope = state
                 .scopes
-                .get(&node.scope.id())
+                .get(&author.scope().id())
                 .ok_or(DriverError::InputAuthorInactive)?;
             if scope.failed() {
                 return Err(DriverError::ActorFailed);
@@ -1444,7 +2560,9 @@ impl<A: Actor> ActorRuntime<A> {
             if work.unbound_guard
                 || work.body_exited
                 || work.captures_exited
-                || state.unresolved.contains(&(node.scope.id(), author.id()))
+                || state
+                    .unresolved
+                    .contains(&(author.scope().id(), author.id()))
             {
                 return Err(DriverError::InputAuthorInactive);
             }
@@ -1467,7 +2585,7 @@ impl<A: Actor> ActorRuntime<A> {
         if inbox.sealed || author.is_none() && !inbox.external_open {
             return Err(DriverError::Closed);
         }
-        if inbox.counts[class.index()] >= node.config.mailbox[class.index()] {
+        if inbox.available_input_credit(class) == 0 {
             return Err(DriverError::InputCapacity);
         }
         inbox.next_input = inbox
@@ -1475,6 +2593,30 @@ impl<A: Actor> ActorRuntime<A> {
             .checked_add(1)
             .ok_or(DriverError::IdentityExhausted)?;
         let id = InputId::new(inbox.next_input).expect("incremented input id");
+        let binding = author.map(|work| InputAuthor {
+            actor,
+            origin: node.origin.clone(),
+            input: id,
+            actor_generation: inbox.generation,
+            scope: work.scope().clone(),
+            work: work.reference(),
+            generation: author_state
+                .as_ref()
+                .expect("qualified original author ledger")
+                .scopes
+                .get(&work.scope().id())
+                .expect("qualified original author scope")
+                .generation(),
+        });
+        let header_pins = match author {
+            Some(author) => vec![crate::lease::WorkHeaderPin::for_work_locked(
+                author,
+                author_state
+                    .as_mut()
+                    .expect("actual original author ledger"),
+            )?],
+            None => Vec::new(),
+        };
         inbox.inputs.insert(
             id,
             InputRecord {
@@ -1482,13 +2624,20 @@ impl<A: Actor> ActorRuntime<A> {
                 class,
                 phase: InputPhase::Reserved,
                 role: None,
+                author: binding.clone(),
+                producer: binding,
+                metadata_delivery: None,
+                header_pins,
+                handoff_at: None,
             },
         );
         inbox.counts[class.index()] += 1;
+        inbox.observation.input_credit_taken(class);
         drop(author_state);
         Ok(InputPermit {
             runtime: self.clone(),
             actor,
+            origin: node.origin.clone(),
             input: id,
         })
     }
@@ -1522,6 +2671,9 @@ impl<A: Actor> ActorRuntime<A> {
         let node = self.node(actor)?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
         inbox.timer_closed = true;
+        // This withdraws only neutral host-deadline delivery. An original
+        // filled Core Tick still owns its actual input until retire_input.
+        inbox.failed_custodian_timer = None;
         let mut state = self.shared.state.lock().expect("runtime scheduler lock");
         if state
             .actors
@@ -1592,12 +2744,16 @@ impl<A: Actor> ActorRuntime<A> {
         {
             return Err(DriverError::ActorNotRetired);
         }
+        if self.close_metadata_waiters_locked(&node, &mut inbox) {
+            return Err(DriverError::ActorNotRetired);
+        }
         let mut state = self.shared.state.lock().expect("runtime scheduler lock");
         if !state.ready.is_idle(actor)? || !state.effect_ready.is_idle(actor)? {
             return Err(SchedulerError::Busy.into());
         }
         inbox.sealed = true;
         inbox.timer_closed = true;
+        inbox.failed_custodian_timer = None;
         // All actual inputs and scheduler claims are empty under these same
         // locks. Withdrawing the unused builtin cannot race a later Core turn.
         inbox.failure_position = None;
@@ -1634,6 +2790,7 @@ impl<A: Actor> ActorRuntime<A> {
         budget: usize,
         sample: &mut Option<poller_observation::TimerScan>,
     ) -> Result<usize, DriverError> {
+        let handoff_observed = self.shared.observation.now();
         let (actors, now) = {
             let mut state = self.shared.state.lock().expect("runtime scheduler lock");
             let now = observed.max(state.now);
@@ -1666,6 +2823,14 @@ impl<A: Actor> ActorRuntime<A> {
         let mut filled = 0;
         for node in actors {
             let actor = node.id;
+            {
+                let mut inbox = node.inbox.lock().expect("actor timer delivery lock");
+                if inbox.failed {
+                    filled +=
+                        usize::from(self.deliver_failed_custodian_timer(&node, &mut inbox, now)?);
+                    continue;
+                }
+            }
             let timer_value = A::timer_input(now);
             let mut inbox = node.inbox.lock().expect("actor inbox lock");
             if inbox.failed || inbox.sealed || inbox.timer_closed {
@@ -1701,10 +2866,16 @@ impl<A: Actor> ActorRuntime<A> {
                     class: InputClass::Timer,
                     phase: InputPhase::Filled,
                     role: None,
+                    author: None,
+                    producer: None,
+                    metadata_delivery: None,
+                    header_pins: Vec::new(),
+                    handoff_at: handoff_observed,
                 },
             );
             inbox.payloads.insert(input, timer_value);
             inbox.counts[InputClass::Timer.index()] += 1;
+            inbox.observation.input_credit_taken(InputClass::Timer);
             inbox.timer_input = Some(input);
             self.shared
                 .state
@@ -1744,13 +2915,17 @@ impl<A: Actor> ActorRuntime<A> {
             let Some(actor) = state.ready.claim() else {
                 return Ok(false);
             };
-            self.shared.record(HistoryFact::Claimed { actor });
-            state
+            let node = state
                 .actors
                 .get(&actor)
                 .cloned()
-                .expect("registered ready actor")
+                .expect("registered ready actor");
+            self.shared.record(|| HistoryFact::Claimed {
+                target: node.history_target(),
+            });
+            node
         };
+        let execution_scope = node.scope.current_scope();
         let mut budget = TurnBudget::new(node.config.turn_budget)?;
         loop {
             let next = {
@@ -1769,20 +2944,19 @@ impl<A: Actor> ActorRuntime<A> {
                             inbox.mailbox.pop(class)
                         })
                         .map(|input| {
-                            inbox
-                                .inputs
-                                .get_mut(&input.input)
-                                .expect("filled input")
-                                .phase = InputPhase::Consuming;
+                            let original =
+                                inbox.inputs.get_mut(&input.input).expect("filled input");
+                            original.phase = InputPhase::Consuming;
+                            let handoff_at = original.handoff_at;
                             let value = inbox
                                 .payloads
                                 .remove(&input.input)
                                 .expect("filled input owns its neutral payload");
-                            (input, value)
+                            (input, value, handoff_at)
                         })
                 }
             };
-            let Some((input, value)) = next else {
+            let Some((input, value, handoff_at)) = next else {
                 break;
             };
             let observed = clock.map_or(observed, Clock::now);
@@ -1797,14 +2971,38 @@ impl<A: Actor> ActorRuntime<A> {
             let generation = node.inbox.lock().expect("actor inbox lock").generation;
             let mut step = StepContext::new(
                 &mut budget,
-                &node.scope,
+                &execution_scope,
                 generation,
                 input.input,
                 node.config.max_effects_per_step,
                 node.config.max_dependencies_per_effect,
                 node.config.max_step_work,
             );
-            step.set_failure_work(node.failure_work);
+            step.set_failure_work(node.scope.failure_work());
+            let input_author = node
+                .inbox
+                .lock()
+                .expect("actor inbox lock")
+                .inputs
+                .get(&input.input)
+                .expect("consuming original input")
+                .author
+                .clone();
+            step.set_input_author(input_author);
+            let runtime_metadata = node
+                .inbox
+                .lock()
+                .expect("actor inbox lock")
+                .inputs
+                .get(&input.input)
+                .expect("actual consumed input")
+                .metadata_delivery
+                .is_some();
+            step.set_runtime_metadata(runtime_metadata);
+            if node.scope.retained() {
+                step.retained();
+            }
+            let began = self.shared.observation.now();
             let result = {
                 let mut core = node.core.lock().expect("actor core lock");
                 let core = core.as_mut().expect("registered pure actor");
@@ -1813,6 +3011,15 @@ impl<A: Actor> ActorRuntime<A> {
                     core.next_deadline()
                 }))
             };
+            let ended = self.shared.observation.now();
+            self.shared.observation.step(
+                input.class,
+                handoff_at,
+                began,
+                ended,
+                node.config.max_step_work - step.remaining(),
+                result.is_err(),
+            );
             let deadline = match result {
                 Ok(deadline) => {
                     let batch = step.finish();
@@ -1831,21 +3038,22 @@ impl<A: Actor> ActorRuntime<A> {
                         "one committed batch ordinal"
                     );
                     inbox.inputs.get(&input.input).expect("consumed input");
-                    // Only an explicit directive needs this ledger transaction.
-                    // No host lock, callback or rich object enters the gate.
-                    let mut ledger = stop_producing.then(|| {
-                        node.scope
-                            .runtime
-                            .shared
-                            .state
-                            .lock()
-                            .expect("runtime ledger lock")
-                    });
-                    if let Some(ledger) = &ledger {
-                        ledger
-                            .scopes
-                            .get(&node.scope.id())
-                            .expect("registered actor retains its original scope");
+                    // Header custody and atomic commitment share the original
+                    // short ledger gate; no callback or rich Drop runs here.
+                    let mut ledger = execution_scope
+                        .runtime
+                        .shared
+                        .state
+                        .lock()
+                        .expect("runtime ledger lock");
+                    if Self::pin_batch_authors(&node, &mut inbox, input.input, &batch, &mut ledger)
+                        .is_err()
+                    {
+                        // A trusted commitment cannot discard E or an original
+                        // guard on this poller. Preserve this entire refused
+                        // batch and fail-stop before unwinding any captures.
+                        std::mem::forget(batch);
+                        std::process::abort();
                     }
                     inbox
                         .commit_batch(input.input, batch)
@@ -1855,29 +3063,41 @@ impl<A: Actor> ActorRuntime<A> {
                         .get_mut(&input.input)
                         .expect("consumed input")
                         .phase = InputPhase::Committed;
-                    if let Some(ledger) = &mut ledger {
+                    self.resolve_metadata_delivery(
+                        &inbox,
+                        input.input,
+                        MetadataConsumption::Consumed,
+                    );
+                    self.notify_metadata_credit_sources(
+                        inbox.retire_metadata_input_if_ready(input.input, &mut ledger),
+                    );
+                    if stop_producing {
                         ledger
                             .scopes
-                            .get_mut(&node.scope.id())
+                            .get_mut(&execution_scope.id())
                             .expect("registered actor retains its original scope")
                             .request_stop();
-                        node.scope.runtime.shared.record(HistoryFact::ScopeStopped {
-                            scope: node.scope.id(),
-                        });
+                        execution_scope
+                            .runtime
+                            .shared
+                            .record(|| HistoryFact::ScopeStopped {
+                                scope: execution_scope.id(),
+                            });
                     }
                     inbox.last_progress = now;
-                    self.shared.record(HistoryFact::InputConsumed {
-                        actor: node.id,
+                    self.shared.record(|| HistoryFact::InputConsumed {
+                        target: node.history_target(),
                         input: input.input,
                     });
-                    self.shared.record(HistoryFact::BatchCommitted {
-                        scope: node.scope.id(),
+                    self.shared.record(|| HistoryFact::BatchCommitted {
+                        target: node.history_target(),
+                        actor_generation: generation,
                         input: input.input,
                     });
                     drop(ledger);
                     drop(inbox);
                     if stop_producing {
-                        node.scope.runtime.shared.changed.notify();
+                        execution_scope.runtime.shared.changed.notify();
                     }
                     deadline
                 }
@@ -1893,9 +3113,41 @@ impl<A: Actor> ActorRuntime<A> {
                     }
                     // The failed pure state stays in its cell until the host removes it.
                     let mut inbox = node.inbox.lock().expect("actor inbox lock");
-                    let generation = node.scope.fail()?;
+                    if node.scope.retained() {
+                        inbox.generation = inbox
+                            .generation
+                            .next()
+                            .ok_or(DriverError::IdentityExhausted)?;
+                        inbox.failed = true;
+                        self.close_metadata_waiters_locked(&node, &mut inbox);
+                        inbox.failure = Some(ManuallyDrop::new(payload));
+                        inbox
+                            .inputs
+                            .get_mut(&input.input)
+                            .expect("failed original retained input")
+                            .phase = InputPhase::AbandonedByOwnerFailure;
+                        self.resolve_metadata_delivery(
+                            &inbox,
+                            input.input,
+                            MetadataConsumption::AbandonedByOwnerFailure,
+                        );
+                        inbox.last_progress = now;
+                        self.shared.record(|| HistoryFact::InputAbandoned {
+                            target: node.history_target(),
+                            input: input.input,
+                        });
+                        let mut state = self.shared.state.lock().expect("runtime scheduler lock");
+                        state.timers.cancel(node.id);
+                        state.effect_ready.notify(node.id)?;
+                        drop(state);
+                        drop(inbox);
+                        drop(step);
+                        break;
+                    }
+                    let generation = execution_scope.fail()?;
                     inbox.generation = generation;
                     inbox.failed = true;
+                    self.close_metadata_waiters_locked(&node, &mut inbox);
                     inbox.failure = Some(ManuallyDrop::new(payload));
                     let supervisor_input = inbox
                         .failure_position
@@ -1910,6 +3162,11 @@ impl<A: Actor> ActorRuntime<A> {
                             class: InputClass::Lifecycle,
                             phase: InputPhase::Committed,
                             role: None,
+                            author: None,
+                            producer: None,
+                            metadata_delivery: None,
+                            header_pins: Vec::new(),
+                            handoff_at: None,
                         },
                     );
                     drop(inbox);
@@ -1922,33 +3179,69 @@ impl<A: Actor> ActorRuntime<A> {
                     );
                     let mut failure_step = StepContext::new(
                         &mut failure_budget,
-                        &node.scope,
+                        &execution_scope,
                         generation,
                         supervisor_input,
                         node.config.max_effects_per_step,
                         node.config.max_dependencies_per_effect,
                         node.config.max_step_work,
                     );
-                    failure_step.set_failure_work(node.failure_work);
+                    failure_step.set_failure_work(node.scope.failure_work());
                     // A failure projection panic is a shared runtime invariant failure.
-                    A::owner_failed(node.scope.id(), generation, input, &mut failure_step);
+                    let began = self.shared.observation.now();
+                    A::owner_failed(execution_scope.id(), generation, input, &mut failure_step);
+                    let ended = self.shared.observation.now();
+                    self.shared.observation.step(
+                        InputClass::Lifecycle,
+                        None,
+                        began,
+                        ended,
+                        node.config.max_step_work - failure_step.remaining(),
+                        false,
+                    );
                     let mut inbox = node.inbox.lock().expect("actor inbox lock");
                     let batch = failure_step.finish();
                     inbox.failure_action_watermark =
                         batch.state.last_action_id().map_or(0, ActionId::get);
+                    {
+                        let mut ledger = execution_scope
+                            .runtime
+                            .shared
+                            .state
+                            .lock()
+                            .expect("failed original batch header custody");
+                        if Self::pin_batch_authors(
+                            &node,
+                            &mut inbox,
+                            supervisor_input,
+                            &batch,
+                            &mut ledger,
+                        )
+                        .is_err()
+                        {
+                            std::mem::forget(batch);
+                            std::process::abort();
+                        }
+                    }
                     inbox.commit_batch(supervisor_input, batch)?;
                     inbox
                         .inputs
                         .get_mut(&input.input)
                         .expect("failed input custody")
                         .phase = InputPhase::AbandonedByOwnerFailure;
-                    self.shared.record(HistoryFact::InputAbandoned {
-                        actor: node.id,
+                    self.resolve_metadata_delivery(
+                        &inbox,
+                        input.input,
+                        MetadataConsumption::AbandonedByOwnerFailure,
+                    );
+                    self.shared.record(|| HistoryFact::InputAbandoned {
+                        target: node.history_target(),
                         input: input.input,
                     });
                     inbox.last_progress = now;
-                    self.shared.record(HistoryFact::BatchCommitted {
-                        scope: node.scope.id(),
+                    self.shared.record(|| HistoryFact::BatchCommitted {
+                        target: node.history_target(),
+                        actor_generation: generation,
                         input: supervisor_input,
                     });
                     None
@@ -2051,13 +3344,54 @@ impl<A: Actor> ActorRuntime<A> {
     ) -> Result<EffectTicket<A::Effect>, DriverError> {
         let node = self.node(actor)?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
-        let scope = node.scope.gates()?;
-        let generation = scope.generation;
+        let execution_scope = node.scope.current_scope();
+        let ledger = execution_scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let descriptor = inbox
+            .batches
+            .get(&input)
+            .ok_or(DriverError::UnknownInput)?
+            .state
+            .record(action)
+            .ok_or(EffectError::UnknownAction)?
+            .descriptor()
+            .clone();
+        let author_generation =
+            Self::action_author_generation(&node, &inbox, &ledger, input, &descriptor)?;
+        let generation = inbox.generation;
+        if !node.scope.retained()
+            && ledger
+                .scopes
+                .get(&execution_scope.id())
+                .ok_or(RuntimeError::UnknownScope)?
+                .failed()
+            && inbox.failure_input != Some(input)
+        {
+            return Err(DriverError::ActorFailed);
+        }
+        let stopped = (!node.scope.retained()
+            && ledger
+                .scopes
+                .get(&execution_scope.id())
+                .ok_or(RuntimeError::UnknownScope)?
+                .stopped())
+            || ledger
+                .scopes
+                .get(&descriptor.work.scope)
+                .ok_or(RuntimeError::UnknownScope)?
+                .stopped();
+        if inbox.failed && inbox.failure_input != Some(input) {
+            return Err(DriverError::ActorFailed);
+        }
         let batch = inbox
             .batches
             .get_mut(&input)
             .ok_or(DriverError::UnknownInput)?;
-        if scope.stopped
+        if stopped
             && batch.state.record(action).is_some_and(|effect| {
                 effect.descriptor().kind
                     == novarocks_control_runtime_core::effect::EffectKind::Business
@@ -2066,6 +3400,15 @@ impl<A: Actor> ActorRuntime<A> {
             return Err(EffectError::NotReady.into());
         }
         batch.state.start(action, generation)?;
+        self.shared.record(|| HistoryFact::Effect {
+            target: node.history_target(),
+            input,
+            action,
+            actor_generation: generation,
+            financial_work: descriptor.work,
+            author_generation,
+            phase: novarocks_control_runtime_core::history::EffectHistoryPhase::Dispatched,
+        });
         let effect = batch
             .payloads
             .remove(&action)
@@ -2076,6 +3419,7 @@ impl<A: Actor> ActorRuntime<A> {
                 actor,
                 input,
                 generation,
+                author_generation,
                 descriptor: batch
                     .state
                     .record(action)
@@ -2095,14 +3439,14 @@ impl<A: Actor> ActorRuntime<A> {
     ) -> Result<(), DriverError> {
         let node = self.node(ticket.actor)?;
         let inbox = node.inbox.lock().expect("actor inbox lock");
-        let ledger = node
-            .scope
+        let execution_scope = node.scope.current_scope();
+        let ledger = execution_scope
             .runtime
             .shared
             .state
             .lock()
             .expect("runtime ledger lock");
-        self.validate_publication(&node, &inbox, &ledger, ticket, &node.scope)
+        self.validate_publication(&node, &inbox, &ledger, ticket, &execution_scope)
     }
     /// Atomically qualifies the original effect's current publication authority
     /// and fills an already paid role in this same runtime and ledger. No Work,
@@ -2114,6 +3458,27 @@ impl<A: Actor> ActorRuntime<A> {
         target: &InputRole<A>,
         value: A::Input,
     ) -> Result<InputId, (DriverError, A::Input)> {
+        self.fill_from_effect_inner(ticket, target, None, value)
+    }
+    /// Forward the same source effect while retaining the original request's
+    /// financial author independently of the destination role's producer.
+    pub fn fill_from_effect_with_author(
+        &self,
+        ticket: &EffectTicket<A::Effect>,
+        target: &InputRole<A>,
+        author: &InputAuthor,
+        value: A::Input,
+    ) -> Result<InputId, (DriverError, A::Input)> {
+        self.fill_from_effect_inner(ticket, target, Some(author), value)
+    }
+    fn fill_from_effect_inner(
+        &self,
+        ticket: &EffectTicket<A::Effect>,
+        target: &InputRole<A>,
+        author: Option<&InputAuthor>,
+        value: A::Input,
+    ) -> Result<InputId, (DriverError, A::Input)> {
+        let observed = self.shared.observation.now();
         if !self.same_runtime(&target.runtime) {
             return Err((DriverError::PublicationTargetMismatch, value));
         }
@@ -2132,18 +3497,19 @@ impl<A: Actor> ActorRuntime<A> {
                 Err(error) => return Err((error, value)),
             }
         };
-        if !Arc::ptr_eq(
-            &source_node.scope.runtime.shared,
-            &target_node.scope.runtime.shared,
-        ) {
+        if !Arc::ptr_eq(&target.origin, &target_node.origin) {
+            return Err((DriverError::EffectTicketOriginMismatch, value));
+        }
+        let source_scope = source_node.scope.current_scope();
+        let target_scope = target_node.scope.current_scope();
+        if !Arc::ptr_eq(&source_scope.runtime.shared, &target_scope.runtime.shared) {
             return Err((DriverError::PublicationTargetMismatch, value));
         }
         // Every two-inbox operation uses ActorId order. The same-actor case
         // borrows its one inbox twice immutably only for validation.
         let result = if ticket.actor == target.actor {
             let mut inbox = source_node.inbox.lock().expect("actor inbox lock");
-            let ledger = source_node
-                .scope
+            let mut ledger = source_scope
                 .runtime
                 .shared
                 .state
@@ -2155,7 +3521,21 @@ impl<A: Actor> ActorRuntime<A> {
                 (&target_node, &inbox, target.role),
                 &ledger,
             ) {
-                Ok(failed) => inbox.fill_role(target.role, failed, value),
+                Ok(failed) => {
+                    if let Some(author) = author
+                        && let Err(error) = Self::validate_input_author(
+                            &target_node,
+                            &inbox,
+                            &ledger,
+                            author,
+                            false,
+                            true,
+                        )
+                    {
+                        return Err((error, value));
+                    }
+                    inbox.fill_role(target.role, failed, author, &mut ledger, observed, value)
+                }
                 Err(error) => Err((error, value)),
             }
         } else if ticket.actor < target.actor {
@@ -2165,6 +3545,8 @@ impl<A: Actor> ActorRuntime<A> {
                 ticket,
                 (&source_node, &source),
                 (&target_node, &mut destination, target.role),
+                author,
+                observed,
                 value,
             )
         } else {
@@ -2174,6 +3556,8 @@ impl<A: Actor> ActorRuntime<A> {
                 ticket,
                 (&source_node, &source),
                 (&target_node, &mut destination, target.role),
+                author,
+                observed,
                 value,
             )
         };
@@ -2194,11 +3578,12 @@ impl<A: Actor> ActorRuntime<A> {
         ticket: &EffectTicket<A::Effect>,
         source: (&ActorCell<A>, &Inbox<A>),
         target: (&ActorCell<A>, &mut Inbox<A>, InputRoleId),
+        author: Option<&InputAuthor>,
+        observed: Option<Tick>,
         value: A::Input,
     ) -> Result<InputId, (DriverError, A::Input)> {
-        let ledger = source
-            .0
-            .scope
+        let source_scope = source.0.scope.current_scope();
+        let mut ledger = source_scope
             .runtime
             .shared
             .state
@@ -2210,7 +3595,18 @@ impl<A: Actor> ActorRuntime<A> {
             (target.0, target.1, target.2),
             &ledger,
         ) {
-            Ok(failed) => target.1.fill_role(target.2, failed, value),
+            Ok(failed) => {
+                if let Some(author) = author
+                    && let Err(error) = Self::validate_input_author(
+                        target.0, target.1, &ledger, author, false, true,
+                    )
+                {
+                    return Err((error, value));
+                }
+                target
+                    .1
+                    .fill_role(target.2, failed, author, &mut ledger, observed, value)
+            }
             Err(error) => Err((error, value)),
         }
     }
@@ -2221,7 +3617,13 @@ impl<A: Actor> ActorRuntime<A> {
         target: (&ActorCell<A>, &Inbox<A>, InputRoleId),
         ledger: &crate::transaction::LedgerState,
     ) -> Result<bool, DriverError> {
-        self.validate_publication(source.0, source.1, ledger, ticket, &source.0.scope)?;
+        self.validate_publication(
+            source.0,
+            source.1,
+            ledger,
+            ticket,
+            &source.0.scope.current_scope(),
+        )?;
         let role = target
             .1
             .roles
@@ -2232,9 +3634,53 @@ impl<A: Actor> ActorRuntime<A> {
         }
         Ok(ledger
             .scopes
-            .get(&target.0.scope.id())
+            .get(&target.0.scope.current_scope().id())
             .ok_or(RuntimeError::UnknownScope)?
             .failed())
+    }
+    /// Start the exact original host lease while holding both actor and author gates.
+    /// No callback or foreign destructor runs in this inbox -> ledger transaction.
+    pub fn start_effect_work(
+        &self,
+        ticket: &EffectTicket<A::Effect>,
+        work: &mut crate::lease::WorkLease,
+    ) -> Result<(), DriverError> {
+        let node = self.node(ticket.actor)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let affiliation = node.scope.current_scope();
+        if work.reference() != ticket.descriptor.work
+            || !Arc::ptr_eq(&work.scope().runtime.shared, &affiliation.runtime.shared)
+        {
+            return Err(DriverError::InputAuthorMismatch);
+        }
+        let mut ledger = affiliation
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        self.validate_publication(&node, &inbox, &ledger, ticket, &affiliation)?;
+        if !node.scope.retained() {
+            let owner = ledger
+                .scopes
+                .get(&affiliation.id())
+                .ok_or(RuntimeError::UnknownScope)?;
+            if owner.stopped() && ticket.descriptor.kind == EffectKind::Business {
+                return Err(EffectError::NotReady.into());
+            }
+        }
+        let scope = ledger
+            .scopes
+            .get_mut(&ticket.descriptor.work.scope)
+            .ok_or(RuntimeError::UnknownScope)?;
+        scope
+            .start(ticket.descriptor.work.work)
+            .map_err(RuntimeError::from)?;
+        work.scope().runtime.shared.record(|| HistoryFact::Started {
+            scope: ticket.descriptor.work.scope,
+            work: ticket.descriptor.work.work,
+        });
+        Ok(())
     }
     /// Move the original still-unbound reservation into its actual host job.
     /// Starting the exact committed effect and taking its guard share the
@@ -2247,14 +3693,14 @@ impl<A: Actor> ActorRuntime<A> {
         let node = self.node(ticket.actor)?;
         Self::validate_ticket_origin(&node, ticket)?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
-        let ledger = node
-            .scope
+        let execution_scope = node.scope.current_scope();
+        let mut ledger = execution_scope
             .runtime
             .shared
             .state
             .lock()
             .expect("runtime ledger lock");
-        self.validate_publication(&node, &inbox, &ledger, ticket, &node.scope)?;
+        self.validate_publication(&node, &inbox, &ledger, ticket, &execution_scope)?;
         let batch = inbox
             .batches
             .get_mut(&ticket.input)
@@ -2263,13 +3709,22 @@ impl<A: Actor> ActorRuntime<A> {
             .reservations
             .get(&reservation)
             .ok_or(DriverError::UnknownReservation)?;
-        if guard.work_id() != ticket.descriptor.work {
+        if ticket.descriptor.work
+            != (ScopedWorkRef {
+                scope: execution_scope.id(),
+                work: guard.work_id(),
+            })
+        {
             return Err(DriverError::ReservationOwnerMismatch);
         }
-        Ok(batch
+        let guard = batch
             .reservations
             .remove(&reservation)
-            .expect("validated original reservation"))
+            .expect("validated original reservation");
+        self.notify_metadata_credit_sources(
+            inbox.retire_metadata_input_if_ready(ticket.input, &mut ledger),
+        );
+        Ok(guard)
     }
     /// Bounded inventory of the actual guards retained by one committed step.
     /// This remains readable after owner failure without reading its core.
@@ -2319,7 +3774,7 @@ impl<A: Actor> ActorRuntime<A> {
         input: InputId,
         generation: Generation,
         action: ActionId,
-        work: WorkId,
+        work: ScopedWorkRef,
     ) -> Result<(), DriverError> {
         Self::validate_failure_record(
             node,
@@ -2333,12 +3788,13 @@ impl<A: Actor> ActorRuntime<A> {
         node: &ActorCell<A>,
         inbox: &Inbox<A>,
         ledger: &crate::transaction::LedgerState,
-        (input, generation, action, work): (InputId, Generation, ActionId, WorkId),
+        (input, generation, action, work): (InputId, Generation, ActionId, ScopedWorkRef),
         allow_admitted: bool,
     ) -> Result<(), DriverError> {
+        let execution_scope = node.scope.current_scope();
         let scope = ledger
             .scopes
-            .get(&node.scope.id())
+            .get(&execution_scope.id())
             .ok_or(RuntimeError::UnknownScope)?;
         if !inbox.failed
             || !scope.failed()
@@ -2362,7 +3818,12 @@ impl<A: Actor> ActorRuntime<A> {
         {
             return Err(EffectError::InvalidTransition.into());
         }
-        let work = scope.work(work).ok_or(DriverError::FailureWorkInactive)?;
+        if work.scope != execution_scope.id() {
+            return Err(DriverError::FailureWorkInactive);
+        }
+        let work = scope
+            .work(work.work)
+            .ok_or(DriverError::FailureWorkInactive)?;
         if work.kind != WorkKind::Cleanup
             || !(work.phase == WorkPhase::Started
                 || allow_admitted && matches!(work.phase, WorkPhase::Admitted | WorkPhase::Queued))
@@ -2382,8 +3843,8 @@ impl<A: Actor> ActorRuntime<A> {
         let node = self.node(ticket.actor)?;
         Self::validate_ticket_origin(&node, ticket)?;
         let inbox = node.inbox.lock().expect("actor inbox lock");
-        let ledger = node
-            .scope
+        let execution_scope = node.scope.current_scope();
+        let ledger = execution_scope
             .runtime
             .shared
             .state
@@ -2426,8 +3887,8 @@ impl<A: Actor> ActorRuntime<A> {
         let node = self.node(ticket.actor)?;
         Self::validate_ticket_origin(&node, ticket)?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
-        let ledger = node
-            .scope
+        let execution_scope = node.scope.current_scope();
+        let ledger = execution_scope
             .runtime
             .shared
             .state
@@ -2455,20 +3916,28 @@ impl<A: Actor> ActorRuntime<A> {
         if inbox.failure_publication.is_some() {
             return Err(DriverError::FailurePublicationAlreadyClaimed);
         }
-        inbox.failure_publication = Some(FailurePublicationRecord {
-            generation: ticket.generation,
+        let claim = FailurePublicationOrigin::SupervisorEffect {
             input: ticket.input,
             action: ticket.descriptor.id,
+        };
+        inbox.failure_publication = Some(FailurePublicationRecord::Active {
+            generation: ticket.generation,
+            origin: claim,
             work: ticket.descriptor.work,
         });
         Ok(FailurePublicationSession {
             runtime: self.clone(),
+            registration: ActorRegistration {
+                actor: node.id,
+                attachment: node.attachment,
+                scope: node.scope.clone(),
+                origin: node.origin.clone(),
+            },
             actor: ticket.actor,
             origin: ticket.origin.clone(),
-            scope: node.scope.clone(),
-            input: ticket.input,
+            scope: execution_scope.clone(),
             generation: ticket.generation,
-            action: ticket.descriptor.id,
+            claim,
             work: ticket.descriptor.work,
         })
     }
@@ -2481,6 +3950,171 @@ impl<A: Actor> ActorRuntime<A> {
         }
         Ok(())
     }
+    /// Validate an actual bound author without admitting input or publishing.
+    /// Cross-Scope metadata observers require this original registration and
+    /// the same real WorkLease; numeric scope/work identities grant no right.
+    pub fn validate_work_author(
+        &self,
+        registration: &ActorRegistration,
+        work: &crate::lease::WorkLease,
+    ) -> Result<(), DriverError> {
+        self.pending_input_author_for(registration, work)
+            .map(|_| ())
+    }
+    pub(crate) fn pending_input_author_for(
+        &self,
+        registration: &ActorRegistration,
+        work: &crate::lease::WorkLease,
+    ) -> Result<PendingInputAuthor, DriverError> {
+        let node = self.node(registration.actor)?;
+        if !Arc::ptr_eq(&node.origin, &registration.origin)
+            || !Arc::ptr_eq(&node.scope, &registration.scope)
+        {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let affiliation = node.scope.current_scope();
+        if !Arc::ptr_eq(&affiliation.runtime.shared, &work.scope().runtime.shared) {
+            return Err(DriverError::InputAuthorMismatch);
+        }
+        let ledger = affiliation
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        if inbox.failed
+            || (!node.scope.retained()
+                && ledger
+                    .scopes
+                    .get(&affiliation.id())
+                    .ok_or(RuntimeError::UnknownScope)?
+                    .failed())
+        {
+            return Err(DriverError::ActorFailed);
+        }
+        let scope = ledger
+            .scopes
+            .get(&work.scope().id())
+            .ok_or(DriverError::InputAuthorInactive)?;
+        let header = scope
+            .work(work.id())
+            .ok_or(DriverError::InputAuthorInactive)?;
+        if scope.failed()
+            || header.unbound_guard
+            || header.body_exited
+            || header.captures_exited
+            || ledger.unresolved.contains(&(work.scope().id(), work.id()))
+        {
+            return Err(DriverError::InputAuthorInactive);
+        }
+        Ok(PendingInputAuthor {
+            registration: registration.clone(),
+            scope: work.scope().clone(),
+            work: work.reference(),
+            actor_generation: inbox.generation,
+            generation: scope.generation(),
+        })
+    }
+    pub(crate) fn validate_original_input_author(
+        &self,
+        author: &InputAuthor,
+    ) -> Result<(), DriverError> {
+        let node = self.node(author.actor)?;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
+        let affiliation = node.scope.current_scope();
+        let ledger = affiliation
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        if inbox.failed {
+            return Err(DriverError::ActorFailed);
+        }
+        Self::validate_input_author(&node, &inbox, &ledger, author, false, true)
+    }
+    fn validate_input_author(
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        ledger: &crate::transaction::LedgerState,
+        author: &InputAuthor,
+        after_failure: bool,
+        require_active: bool,
+    ) -> Result<(), DriverError> {
+        let affiliation = node.scope.current_scope();
+        if author.actor != node.id
+            || !Arc::ptr_eq(&author.origin, &node.origin)
+            || !Arc::ptr_eq(&author.scope.runtime.shared, &affiliation.runtime.shared)
+            || (!after_failure && author.actor_generation != inbox.generation)
+        {
+            return Err(DriverError::InputAuthorMismatch);
+        }
+        let scope = ledger
+            .scopes
+            .get(&author.work.scope)
+            .ok_or(DriverError::InputAuthorInactive)?;
+        let work = scope
+            .work(author.work.work)
+            .ok_or(DriverError::InputAuthorInactive)?;
+        if scope.failed()
+            || scope.generation() != author.generation
+            || work.unbound_guard
+            || require_active && (work.body_exited || work.captures_exited)
+            || ledger
+                .unresolved
+                .contains(&(author.work.scope, author.work.work))
+        {
+            return Err(DriverError::InputAuthorInactive);
+        }
+        Ok(())
+    }
+    fn action_author_generation(
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        ledger: &crate::transaction::LedgerState,
+        input: InputId,
+        descriptor: &EffectDescriptor,
+    ) -> Result<Generation, DriverError> {
+        if node.scope.retained() && descriptor.kind == EffectKind::Business {
+            return Err(EffectError::InvalidTransition.into());
+        }
+        let batch = inbox.batches.get(&input).ok_or(DriverError::UnknownInput)?;
+        if let Some(proof) = batch.authors.get(&descriptor.id) {
+            if proof.work != descriptor.work {
+                return Err(DriverError::InputAuthorMismatch);
+            }
+            Self::validate_input_author(
+                node,
+                inbox,
+                ledger,
+                proof,
+                false,
+                descriptor.kind == EffectKind::Business,
+            )?;
+        } else if descriptor.work.scope != node.scope.id() || node.scope.retained() {
+            return Err(DriverError::InputAuthorMismatch);
+        }
+        let scope = ledger
+            .scopes
+            .get(&descriptor.work.scope)
+            .ok_or(DriverError::InputAuthorInactive)?;
+        let work = scope
+            .work(descriptor.work.work)
+            .ok_or(DriverError::InputAuthorInactive)?;
+        if (scope.failed()
+            && !(inbox.failed
+                && inbox.failure_input == Some(input)
+                && descriptor.kind == EffectKind::Cleanup))
+            || descriptor.kind == EffectKind::Business && (work.body_exited || work.captures_exited)
+            || ledger
+                .unresolved
+                .contains(&(descriptor.work.scope, descriptor.work.work))
+        {
+            return Err(DriverError::InputAuthorInactive);
+        }
+        Ok(scope.generation())
+    }
     fn validate_publication(
         &self,
         node: &ActorCell<A>,
@@ -2489,25 +4123,33 @@ impl<A: Actor> ActorRuntime<A> {
         ticket: &EffectTicket<A::Effect>,
         target: &ScopeHandle,
     ) -> Result<(), DriverError> {
+        let execution_scope = node.scope.current_scope();
         Self::validate_ticket_origin(node, ticket)?;
-        if node.scope.id() != target.id()
-            || !Arc::ptr_eq(&node.scope.runtime.shared, &target.runtime.shared)
-        {
+        if !Arc::ptr_eq(&execution_scope.runtime.shared, &target.runtime.shared) {
             return Err(DriverError::PublicationTargetMismatch);
         }
-        let scope = ledger
-            .scopes
-            .get(&node.scope.id())
-            .ok_or(RuntimeError::UnknownScope)?;
         let batch = inbox
             .batches
             .get(&ticket.input)
             .ok_or(DriverError::UnknownInput)?;
-        if inbox.failed && ticket.generation == inbox.generation {
+        if !node.scope.retained()
+            && ledger
+                .scopes
+                .get(&execution_scope.id())
+                .ok_or(RuntimeError::UnknownScope)?
+                .failed()
+        {
             return Err(DriverError::FailurePublicationRequired);
         }
-        if scope.generation() != ticket.generation || batch.state.generation() != ticket.generation
-        {
+        if inbox.failed {
+            return Err(DriverError::FailurePublicationRequired);
+        }
+        if inbox.generation != ticket.generation || batch.state.generation() != ticket.generation {
+            return Err(EffectError::StaleGeneration.into());
+        }
+        let author_generation =
+            Self::action_author_generation(node, inbox, ledger, ticket.input, &ticket.descriptor)?;
+        if author_generation != ticket.author_generation {
             return Err(EffectError::StaleGeneration.into());
         }
         let action = batch
@@ -2516,6 +4158,95 @@ impl<A: Actor> ActorRuntime<A> {
             .ok_or(EffectError::UnknownAction)?;
         if action.descriptor() != &ticket.descriptor || action.state() != EffectState::Started {
             return Err(EffectError::InvalidTransition.into());
+        }
+        Ok(())
+    }
+    fn validate_target_binding(
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        ledger: &crate::transaction::LedgerState,
+        ticket: Option<&EffectTicket<A::Effect>>,
+        owner: &ScopeHandle,
+        binding: &crate::publication::PublicationBinding,
+        after_failure: bool,
+    ) -> Result<(), DriverError> {
+        use crate::publication::PublicationBinding;
+        let affiliation = node.scope.current_scope();
+        if !Arc::ptr_eq(&affiliation.runtime.shared, &owner.runtime.shared) {
+            return Err(DriverError::PublicationTargetMismatch);
+        }
+        match binding {
+            PublicationBinding::SameScope => {
+                if node.scope.retained()
+                    || owner.id() != node.scope.id()
+                    || ticket.is_some_and(|ticket| ticket.descriptor.work.scope != owner.id())
+                {
+                    return Err(DriverError::PublicationTargetMismatch);
+                }
+            }
+            PublicationBinding::Actor(registration) => {
+                if registration.actor != node.id
+                    || !Arc::ptr_eq(&registration.origin, &node.origin)
+                    || !Arc::ptr_eq(&registration.scope, &node.scope)
+                {
+                    return Err(DriverError::PublicationTargetMismatch);
+                }
+            }
+            PublicationBinding::PendingInput(author) => {
+                if !after_failure
+                    || !inbox.failed
+                    || author.registration.actor != node.id
+                    || author.registration.attachment != node.attachment
+                    || !Arc::ptr_eq(&author.registration.origin, &node.origin)
+                    || !Arc::ptr_eq(&author.registration.scope, &node.scope)
+                    || !Arc::ptr_eq(&author.scope.runtime.shared, &affiliation.runtime.shared)
+                    || !owner.same_scope(&author.scope)
+                    || author.work.scope != author.scope.id()
+                    || author.actor_generation >= inbox.generation
+                    || author.actor_generation < node.scope.original_epoch
+                {
+                    return Err(DriverError::InputAuthorMismatch);
+                }
+                let financial = ledger
+                    .scopes
+                    .get(&author.work.scope)
+                    .ok_or(DriverError::InputAuthorInactive)?;
+                let work = financial
+                    .work(author.work.work)
+                    .ok_or(DriverError::InputAuthorInactive)?;
+                if financial.failed()
+                    || financial.generation() != author.generation
+                    || work.unbound_guard
+                    || work.body_exited
+                    || work.captures_exited
+                    || ledger
+                        .unresolved
+                        .contains(&(author.work.scope, author.work.work))
+                {
+                    return Err(DriverError::InputAuthorInactive);
+                }
+            }
+            PublicationBinding::Input(author) => {
+                Self::validate_input_author(node, inbox, ledger, author, after_failure, false)?;
+                if owner.id() != author.work.scope {
+                    return Err(DriverError::PublicationTargetMismatch);
+                }
+                if let Some(ticket) = ticket {
+                    let proof = inbox
+                        .batches
+                        .get(&ticket.input)
+                        .ok_or(DriverError::UnknownInput)?
+                        .authors
+                        .get(&ticket.descriptor.id)
+                        .ok_or(DriverError::InputAuthorMismatch)?;
+                    if proof.work != author.work
+                        || proof.input != author.input
+                        || !Arc::ptr_eq(&proof.origin, &author.origin)
+                    {
+                        return Err(DriverError::PublicationTargetMismatch);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -2534,14 +4265,26 @@ impl<A: Actor> ActorRuntime<A> {
             Err(error) => return Err((error, ManuallyDrop::into_inner(next))),
         };
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
-        let ledger = node
-            .scope
+        let execution_scope = node.scope.current_scope();
+        let ledger = execution_scope
             .runtime
             .shared
             .state
             .lock()
             .expect("runtime ledger lock");
-        if let Err(error) = self.validate_publication(&node, &inbox, &ledger, ticket, &target.owner)
+        if let Err(error) = self
+            .validate_publication(&node, &inbox, &ledger, ticket, &target.owner)
+            .and_then(|()| {
+                Self::validate_target_binding(
+                    &node,
+                    &inbox,
+                    &ledger,
+                    Some(ticket),
+                    &target.owner,
+                    &target.binding,
+                    false,
+                )
+            })
         {
             return Err((error, ManuallyDrop::into_inner(next)));
         }
@@ -2555,10 +4298,14 @@ impl<A: Actor> ActorRuntime<A> {
         if let Err(error) = published {
             return Err((error.into(), ManuallyDrop::into_inner(next)));
         }
-        self.shared.record(HistoryFact::Published {
-            scope: node.scope.id(),
-            generation: ticket.generation,
+        self.shared.record(|| HistoryFact::Effect {
+            target: node.history_target(),
+            input: ticket.input,
             action: ticket.descriptor.id,
+            actor_generation: ticket.generation,
+            financial_work: ticket.descriptor.work,
+            author_generation: ticket.author_generation,
+            phase: novarocks_control_runtime_core::history::EffectHistoryPhase::Published,
         });
         // Every validation and potentially failing observation precedes this
         // no-callback, no-destructor commit tail. Readers remain behind value's lock.
@@ -2593,8 +4340,8 @@ impl<A: Actor> ActorRuntime<A> {
             Err(error) => return Err((error, ManuallyDrop::into_inner(next))),
         };
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
-        let ledger = node
-            .scope
+        let execution_scope = node.scope.current_scope();
+        let ledger = execution_scope
             .runtime
             .shared
             .state
@@ -2605,6 +4352,17 @@ impl<A: Actor> ActorRuntime<A> {
             return Err((error, ManuallyDrop::into_inner(next)));
         }
         let mut reply = target.cell.lock().expect("published reply lock");
+        if let Err(error) = Self::validate_target_binding(
+            &node,
+            &inbox,
+            &ledger,
+            Some(ticket),
+            &target.owner,
+            &reply.binding,
+            false,
+        ) {
+            return Err((error, ManuallyDrop::into_inner(next)));
+        }
         if reply.phase != crate::publication::ReplyPhase::Empty || reply.value.is_some() {
             return Err((
                 DriverError::ReplyAlreadyCommitted,
@@ -2620,10 +4378,14 @@ impl<A: Actor> ActorRuntime<A> {
         if let Err(error) = published {
             return Err((error.into(), ManuallyDrop::into_inner(next)));
         }
-        self.shared.record(HistoryFact::Published {
-            scope: node.scope.id(),
-            generation: ticket.generation,
+        self.shared.record(|| HistoryFact::Effect {
+            target: node.history_target(),
+            input: ticket.input,
             action: ticket.descriptor.id,
+            actor_generation: ticket.generation,
+            financial_work: ticket.descriptor.work,
+            author_generation: ticket.author_generation,
+            phase: novarocks_control_runtime_core::history::EffectHistoryPhase::Published,
         });
         reply.phase = crate::publication::ReplyPhase::Committed;
         let previous = ManuallyDrop::new(reply.value.replace(ManuallyDrop::into_inner(next)));
@@ -2657,10 +4419,14 @@ impl<A: Actor> ActorRuntime<A> {
             .ok_or(DriverError::UnknownInput)?
             .state
             .published(ticket.descriptor.id)?;
-        self.shared.record(HistoryFact::Published {
-            scope: node.scope.id(),
-            generation: ticket.generation,
+        self.shared.record(|| HistoryFact::Effect {
+            target: node.history_target(),
+            input: ticket.input,
             action: ticket.descriptor.id,
+            actor_generation: ticket.generation,
+            financial_work: ticket.descriptor.work,
+            author_generation: ticket.author_generation,
+            phase: novarocks_control_runtime_core::history::EffectHistoryPhase::Published,
         });
         self.shared
             .state
@@ -2725,16 +4491,91 @@ impl<A: Actor> ActorRuntime<A> {
         &self,
         ticket: EffectTicket<A::Effect>,
     ) -> Result<(), EffectCompletionRefusal<A::Effect>> {
-        let complete = || -> Result<(), DriverError> {
+        self.complete_effect(ticket, false).map(|_| ())
+    }
+    /// Transfer this actual completion fact out of its original batch before
+    /// automatic metadata retirement can remove that batch. No fake input or
+    /// second completed-action registry is required by a later ordering owner.
+    pub fn effect_completed_with_receipt(
+        &self,
+        ticket: EffectTicket<A::Effect>,
+    ) -> Result<CompletedEffect<A>, EffectCompletionRefusal<A::Effect>> {
+        self.complete_effect(ticket, true)
+            .map(|receipt| receipt.expect("the original completion requested its receipt"))
+    }
+    pub fn effect_completed_for_with_receipt(
+        &self,
+        registration: &ActorRegistration,
+        ticket: EffectTicket<A::Effect>,
+    ) -> Result<CompletedEffect<A>, EffectCompletionRefusal<A::Effect>> {
+        if registration.actor != ticket.actor || !Arc::ptr_eq(&registration.origin, &ticket.origin)
+        {
+            return Err(EffectCompletionRefusal {
+                error: DriverError::EffectTicketOriginMismatch,
+                ticket,
+            });
+        }
+        self.effect_completed_with_receipt(ticket)
+    }
+    fn complete_effect(
+        &self,
+        ticket: EffectTicket<A::Effect>,
+        with_receipt: bool,
+    ) -> Result<Option<CompletedEffect<A>>, EffectCompletionRefusal<A::Effect>> {
+        let complete = || -> Result<Option<CompletedEffect<A>>, DriverError> {
             let node = self.node(ticket.actor)?;
             Self::validate_ticket_origin(&node, &ticket)?;
             let mut inbox = node.inbox.lock().expect("actor inbox lock");
-            inbox
+            let batch = inbox
                 .batches
                 .get_mut(&ticket.input)
-                .ok_or(DriverError::UnknownInput)?
+                .ok_or(DriverError::UnknownInput)?;
+            if batch
                 .state
-                .complete(ticket.descriptor.id)?;
+                .record(ticket.descriptor.id)
+                .ok_or(EffectError::UnknownAction)?
+                .descriptor()
+                != &ticket.descriptor
+            {
+                return Err(EffectError::InvalidTransition.into());
+            }
+            batch.state.complete(ticket.descriptor.id)?;
+            self.shared.record(|| HistoryFact::Effect {
+                target: node.history_target(),
+                input: ticket.input,
+                action: ticket.descriptor.id,
+                actor_generation: ticket.generation,
+                financial_work: ticket.descriptor.work,
+                author_generation: ticket.author_generation,
+                phase: novarocks_control_runtime_core::history::EffectHistoryPhase::Completed,
+            });
+            let completed = with_receipt.then(|| CompletedEffect {
+                runtime: self.clone(),
+                registration: ActorRegistration {
+                    actor: node.id,
+                    attachment: node.attachment,
+                    scope: node.scope.clone(),
+                    origin: node.origin.clone(),
+                },
+                input: ticket.input,
+                ordinal: batch
+                    .ordinal
+                    .expect("actual completion belongs to the original committed batch"),
+                generation: batch.state.generation(),
+                descriptor: ticket.descriptor.clone(),
+            });
+            {
+                let scope = node.scope.current_scope();
+                let mut ledger = scope
+                    .runtime
+                    .shared
+                    .state
+                    .lock()
+                    .expect("original metadata tail header custody");
+                self.notify_metadata_credit_sources(
+                    inbox.retire_metadata_input_if_ready(ticket.input, &mut ledger),
+                );
+            }
             self.shared
                 .state
                 .lock()
@@ -2743,12 +4584,64 @@ impl<A: Actor> ActorRuntime<A> {
                 .notify(ticket.actor)?;
             drop(inbox);
             self.shared.changed.notify();
-            Ok(())
+            Ok(completed)
         };
         match complete() {
-            Ok(()) => Ok(()),
+            Ok(receipt) => Ok(receipt),
             Err(error) => Err(EffectCompletionRefusal { error, ticket }),
         }
+    }
+    /// Apply only the original completed predecessor's declared edges. The
+    /// receipt proves completion without retaining the original input header;
+    /// if that batch remains, its real records still decide every pending edge.
+    pub fn acknowledge_completed_effect(
+        &self,
+        receipt: &CompletedEffect<A>,
+    ) -> Result<(), DriverError> {
+        if !self.same_runtime(&receipt.runtime) {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        let node = self.node(receipt.registration.actor)?;
+        if node.attachment != receipt.registration.attachment
+            || !Arc::ptr_eq(&node.origin, &receipt.registration.origin)
+            || !Arc::ptr_eq(&node.scope, &receipt.registration.scope)
+        {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        let mut inbox = node
+            .inbox
+            .lock()
+            .expect("original completed effect dependency gate");
+        let Some(batch) = inbox.batches.get_mut(&receipt.input) else {
+            // Only the private successful Completed transition can mint this
+            // receipt. A missing numeric input alone never reaches this gate.
+            // Original batch retirement already requires every edge's tail
+            // terminal, so there is no surviving dependency to acknowledge.
+            return Ok(());
+        };
+        if batch.ordinal != Some(receipt.ordinal) || batch.state.generation() != receipt.generation
+        {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        let original = batch
+            .state
+            .record(receipt.descriptor.id)
+            .ok_or(EffectError::UnknownAction)?;
+        if original.descriptor() != &receipt.descriptor
+            || original.state() != EffectState::Completed
+        {
+            return Err(EffectError::InvalidTransition.into());
+        }
+        for (descriptor, state) in batch.state.records(None, node.config.max_effects_per_step) {
+            if state == EffectState::Pending
+                && descriptor.dependencies.contains(&receipt.descriptor.id)
+            {
+                batch
+                    .state
+                    .dependency_published(descriptor.id, receipt.descriptor.id)?;
+            }
+        }
+        Ok(())
     }
     /// The caller acknowledges the exact declared predecessor condition, after its real publication or completion fact.
     pub fn acknowledge_dependency(
@@ -2812,9 +4705,12 @@ impl<A: Actor> ActorRuntime<A> {
         }
         if record.phase != InputPhase::AbandonedByOwnerFailure {
             record.phase = InputPhase::AbandonedByOwnerFailure;
-            self.shared
-                .record(HistoryFact::InputAbandoned { actor, input });
+            self.shared.record(|| HistoryFact::InputAbandoned {
+                target: node.history_target(),
+                input,
+            });
         }
+        self.resolve_metadata_delivery(&inbox, input, MetadataConsumption::AbandonedByOwnerFailure);
         Ok(())
     }
     pub fn take_failed_input(
@@ -2834,8 +4730,13 @@ impl<A: Actor> ActorRuntime<A> {
                 .get_mut(&input.input)
                 .expect("failed filled input")
                 .phase = InputPhase::AbandonedByOwnerFailure;
-            self.shared.record(HistoryFact::InputAbandoned {
-                actor,
+            self.resolve_metadata_delivery(
+                &inbox,
+                input.input,
+                MetadataConsumption::AbandonedByOwnerFailure,
+            );
+            self.shared.record(|| HistoryFact::InputAbandoned {
+                target: node.history_target(),
                 input: input.input,
             });
             let value = inbox
@@ -2854,9 +4755,10 @@ impl<A: Actor> ActorRuntime<A> {
         Ok(payload.map(ManuallyDrop::into_inner))
     }
     /// External captures and all report consumers must already have retired before this release.
-    pub fn retire_input(&self, actor: ActorId, input: InputId) -> Result<(), DriverError> {
-        let node = self.node(actor)?;
-        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+    fn input_retirement_preflight(
+        inbox: &Inbox<A>,
+        input: InputId,
+    ) -> Result<(InputClass, Option<InputRoleId>), DriverError> {
         let record = inbox.inputs.get(&input).ok_or(DriverError::UnknownInput)?;
         if !matches!(
             record.phase,
@@ -2878,6 +4780,13 @@ impl<A: Actor> ActorRuntime<A> {
         {
             return Err(DriverError::ReservationsRemain);
         }
+        if inbox
+            .batches
+            .get(&input)
+            .is_some_and(|batch| batch.metadata.iter().any(|item| !item.completed))
+        {
+            return Err(DriverError::MetadataStillPending);
+        }
         let class = record.class;
         let role = record.role;
         if let Some(role) = role {
@@ -2886,13 +4795,59 @@ impl<A: Actor> ActorRuntime<A> {
                 return Err(DriverError::InputNotReserved);
             }
         }
+        Ok((class, role))
+    }
+    /// The same preflight as real retirement, without releasing any holder.
+    /// Ready is a snapshot; actual retirement must still validate its input.
+    pub fn input_retirement_status(
+        &self,
+        actor: ActorId,
+        input: InputId,
+    ) -> Result<(), DriverError> {
+        let node = self.node(actor)?;
+        let inbox = node.inbox.lock().expect("input retirement observation");
+        Self::input_retirement_preflight(&inbox, input).map(|_| ())
+    }
+    /// Bounded original header-pin identities, with no release authority.
+    pub fn input_header_authors(
+        &self,
+        actor: ActorId,
+        input: InputId,
+        limit: usize,
+    ) -> Result<Vec<ScopedWorkRef>, DriverError> {
+        let node = self.node(actor)?;
+        let inbox = node.inbox.lock().expect("input header custody observation");
+        let record = inbox.inputs.get(&input).ok_or(DriverError::UnknownInput)?;
+        Ok(record
+            .header_pins
+            .iter()
+            .take(limit)
+            .map(|pin| pin.reference())
+            .collect())
+    }
+    pub fn retire_input(&self, actor: ActorId, input: InputId) -> Result<(), DriverError> {
+        let node = self.node(actor)?;
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        let (class, role) = Self::input_retirement_preflight(&inbox, input)?;
         if let Some(batch) = inbox.batches.remove(&input) {
             let ordinal = batch
                 .ordinal
                 .expect("a resident batch was atomically committed");
             assert_eq!(inbox.batch_order.remove(&ordinal), Some(input));
         }
-        inbox.inputs.remove(&input);
+        let mut original = inbox
+            .inputs
+            .remove(&input)
+            .expect("same terminal original input");
+        let scope = node.scope.current_scope();
+        let mut ledger = scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("terminal input header release");
+        original.release_header_custody(&mut ledger);
+        drop(ledger);
         if let Some(role) = role {
             inbox
                 .roles
@@ -2900,7 +4855,7 @@ impl<A: Actor> ActorRuntime<A> {
                 .expect("in-flight role retains its position")
                 .in_flight = None;
         } else if inbox.failure_input != Some(input) {
-            inbox.counts[class.index()] -= 1;
+            self.notify_metadata_credit_sources(inbox.return_input_credit(class));
         }
         if inbox.failure_input == Some(input) {
             inbox.failure_input = None;
@@ -2935,12 +4890,35 @@ impl<A: Actor> ActorRuntime<A> {
             .get(&registration.actor)
             .ok_or(DriverError::UnknownActor)?;
         if node.attachment != registration.attachment
-            || !node.scope.same_scope(&registration.scope)
+            || !Arc::ptr_eq(&node.scope, &registration.scope)
             || !Arc::ptr_eq(&node.origin, &registration.origin)
         {
             return Err(DriverError::EffectTicketOriginMismatch);
         }
         Ok(())
+    }
+    /// Read the actual fenced failure of this same actor incarnation. This
+    /// does not fail a financial scope or inspect the failed protocol state.
+    pub fn failure_proof_for(
+        &self,
+        registration: &ActorRegistration,
+    ) -> Result<ActorFailureProof, DriverError> {
+        let node = self.node(registration.actor)?;
+        if node.attachment != registration.attachment
+            || !Arc::ptr_eq(&node.scope, &registration.scope)
+            || !Arc::ptr_eq(&node.origin, &registration.origin)
+        {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        let inbox = node.inbox.lock().expect("actor failure proof inbox lock");
+        if !inbox.failed || inbox.generation <= registration.initial_epoch() {
+            return Err(DriverError::ActorNotRetired);
+        }
+        Ok(ActorFailureProof {
+            registration: registration.clone(),
+            failed_epoch: inbox.generation,
+            ledger: node.scope.current_scope().runtime.clone(),
+        })
     }
     /// Qualify the actual current registration without scheduling or granting
     /// admission. Equal public IDs in another runtime cannot pass this check.
@@ -2951,6 +4929,25 @@ impl<A: Actor> ActorRuntime<A> {
         let state = self.shared.state.lock().expect("runtime scheduler lock");
         Self::validate_registration_in_state(&state, registration)
     }
+    /// Read the original registration from a currently valid exclusive effect
+    /// ticket. This witness grants no execution, input or publication authority.
+    pub fn registration_from_effect(
+        &self,
+        ticket: &EffectTicket<A::Effect>,
+    ) -> Result<ActorRegistration, DriverError> {
+        self.validate_effect_ticket(ticket)?;
+        let node = self.node(ticket.actor)?;
+        // Validation and this lookup need not share one scheduler lock. Never
+        // return a later incarnation registered at the same public actor ID.
+        Self::validate_ticket_origin(&node, ticket)?;
+        Ok(ActorRegistration {
+            actor: node.id,
+            attachment: node.attachment,
+            scope: node.scope.clone(),
+            origin: node.origin.clone(),
+        })
+    }
+
     /// A host completion/retry mark, including during failure or process drain.
     /// Qualify origin and enqueue under the same scheduler transaction, so an
     /// old witness can never wake an actor registered later at the same ID.
@@ -2962,10 +4959,63 @@ impl<A: Actor> ActorRuntime<A> {
         self.shared.changed.notify();
         Ok(())
     }
+    pub(crate) fn arm_header_readiness(
+        &self,
+        owner: &ActorRegistration,
+        registration: &mut crate::header_readiness::HeaderReadyRegistration,
+        observer: &crate::lease::WorkRetirementObserver,
+    ) -> Result<crate::header_readiness::HeaderWaitState, crate::header_readiness::HeaderReadyError>
+    {
+        let node = self.node(owner.actor)?;
+        // Removal and execution detachment use this same actual inbox gate.
+        // Validate under scheduler, then release it before ledger acquisition:
+        // detachment already has the canonical ledger -> scheduler order.
+        let _inbox = node.inbox.lock().expect("actor inbox lock");
+        {
+            let state = self.shared.state.lock().expect("runtime scheduler lock");
+            Self::validate_registration_in_state(&state, owner)?;
+        }
+        let scope = node.scope.current_scope();
+        if !registration.belongs_to_ledger(&scope) {
+            return Err(crate::header_readiness::HeaderReadyError::WrongOwner);
+        }
+        // The inbox gate retains this actual registration through first bind;
+        // no scheduler lock is held while arm probes the original ledger.
+        registration.arm_for(
+            &self.shared.header_readiness,
+            crate::header_readiness::HeaderOwner {
+                actor: owner.actor,
+                attachment: owner.attachment,
+                origin: owner.origin.clone(),
+            },
+            observer,
+        )
+    }
     /// One poller owns this original actor's host turn. Pure Core dispatch has
     /// its independent queue and can proceed while this metadata turn exists.
     pub fn claim_host_actor(&self) -> Option<ActorHostTurn<A>> {
+        self.claim_host_actor_with_budget(1)
+    }
+    /// One header-ready handoff consumes one budget unit. This is a dispatch
+    /// budget, never an admission limit. Ordinary host turns need no hub row.
+    pub fn claim_host_actor_with_budget(
+        &self,
+        readiness_budget: usize,
+    ) -> Option<ActorHostTurn<A>> {
+        // Never hold the readiness hub while acquiring the scheduler. Actual
+        // release may hold inbox/ledger and can only touch hub + fixed Notify.
+        let owners = self.shared.header_readiness.promote(readiness_budget);
         let mut state = self.shared.state.lock().expect("runtime scheduler lock");
+        for owner in owners {
+            if state.actors.get(&owner.actor).is_some_and(|node| {
+                node.attachment == owner.attachment && Arc::ptr_eq(&node.origin, &owner.origin)
+            }) {
+                state
+                    .effect_ready
+                    .notify(owner.actor)
+                    .expect("actual registered header owner");
+            }
+        }
         let actor = state.effect_ready.claim()?;
         let node = state
             .actors
@@ -2983,6 +5033,20 @@ impl<A: Actor> ActorRuntime<A> {
         node: &Arc<ActorCell<A>>,
         has_runnable: bool,
     ) -> Result<(), DriverError> {
+        let closing_pending = {
+            let mut inbox = node.inbox.lock().expect("actor inbox lock");
+            if inbox.failed || inbox.sealed || inbox.metadata_closing {
+                self.close_metadata_waiters_locked(node, &mut inbox)
+            } else {
+                false
+            }
+        };
+        let has_runnable = has_runnable
+            || closing_pending
+            || self
+                .shared
+                .header_readiness
+                .pending(&ActorHostTurn::<A>::header_owner(node));
         let mut state = self.shared.state.lock().expect("runtime scheduler lock");
         if !state
             .actors
@@ -3048,6 +5112,7 @@ impl<A: Actor> ActorRuntime<A> {
             class: record.class,
             phase: record.phase,
             role: record.role,
+            runtime_metadata: record.metadata_delivery.is_some(),
         }))
     }
     /// Enumerates the same actual input records; a point read grants no start
@@ -3071,6 +5136,7 @@ impl<A: Actor> ActorRuntime<A> {
                 class: record.class,
                 phase: record.phase,
                 role: record.role,
+                runtime_metadata: record.metadata_delivery.is_some(),
             })
             .collect())
     }
@@ -3102,10 +5168,15 @@ impl<A: Actor> ActorRuntime<A> {
         actor: ActorId,
         role: InputRoleId,
         require_failed: bool,
+        origin: Option<&Arc<()>>,
     ) -> Result<(), DriverError> {
         let node = self.node(actor)?;
+        if origin.is_some_and(|original| !Arc::ptr_eq(original, &node.origin)) {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
-        if require_failed && !inbox.failed && !node.scope.gates()?.failed {
+        let execution_scope = node.scope.current_scope();
+        if require_failed && !inbox.failed && !execution_scope.gates()?.failed {
             return Err(DriverError::ActorNotRetired);
         }
         let record = inbox.roles.get(&role).ok_or(DriverError::UnknownRole)?;
@@ -3113,8 +5184,17 @@ impl<A: Actor> ActorRuntime<A> {
             return Err(DriverError::RoleBusy);
         }
         let class = record.class;
-        inbox.roles.remove(&role);
-        inbox.counts[class.index()] -= 1;
+        let original = inbox.roles.remove(&role).expect("same idle original role");
+        if let Some(pin) = original.producer_header {
+            let mut ledger = execution_scope
+                .runtime
+                .shared
+                .state
+                .lock()
+                .expect("original role header release");
+            pin.release_locked(&mut ledger);
+        }
+        self.notify_metadata_credit_sources(inbox.return_input_credit(class));
         drop(inbox);
         self.shared.changed.notify();
         Ok(())
@@ -3126,7 +5206,7 @@ impl<A: Actor> ActorRuntime<A> {
         actor: ActorId,
         role: InputRoleId,
     ) -> Result<(), DriverError> {
-        self.close_role_after_exit(actor, role, true)
+        self.close_role_after_exit(actor, role, true, None)
     }
     /// Returns pure state to its host owner; this method does not drop it on a poller.
     /// Work join is only one prerequisite. The actor attachment itself stays
@@ -3136,14 +5216,29 @@ impl<A: Actor> ActorRuntime<A> {
         self.remove_actor_node(&node, false)
     }
     fn remove_actor_node(&self, node: &Arc<ActorCell<A>>, claimed: bool) -> Result<A, DriverError> {
+        let execution_scope = node.scope.current_scope();
         let actor = node.id;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
         if !inbox.inputs.is_empty()
             || !inbox.roles.is_empty()
             || !inbox.batches.is_empty()
             || inbox.failure.is_some()
-            || !node.scope.join_ready()?
+            || inbox
+                .failed_custodian_timer
+                .as_ref()
+                .is_some_and(FailedCustodianTimer::is_pending)
+            || matches!(
+                inbox.failure_publication.as_ref(),
+                Some(FailurePublicationRecord::Active {
+                    origin: FailurePublicationOrigin::StartedCleanup { .. },
+                    ..
+                })
+            )
+            || !node.scope.retained() && !execution_scope.join_ready()?
         {
+            return Err(DriverError::ActorNotRetired);
+        }
+        if self.close_metadata_waiters_locked(node, &mut inbox) {
             return Err(DriverError::ActorNotRetired);
         }
         let mut state = self.shared.state.lock().expect("runtime scheduler lock");
@@ -3153,6 +5248,13 @@ impl<A: Actor> ActorRuntime<A> {
             .is_some_and(|actual| Arc::ptr_eq(actual, node))
         {
             return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        if self
+            .shared
+            .header_readiness
+            .bound(&ActorHostTurn::<A>::header_owner(node))
+        {
+            return Err(DriverError::ActorNotRetired);
         }
         if !state.ready.is_idle(actor)? {
             return Err(SchedulerError::Busy.into());
@@ -3169,6 +5271,7 @@ impl<A: Actor> ActorRuntime<A> {
         inbox.external_open = false;
         inbox.sealed = true;
         inbox.timer_closed = true;
+        inbox.failed_custodian_timer = None;
         inbox.failure_position = None;
         state.ready.unregister(actor)?;
         if claimed {
@@ -3180,7 +5283,9 @@ impl<A: Actor> ActorRuntime<A> {
         state.timers.acknowledge_tick(actor);
         state.actors.remove(&actor);
         drop(state);
-        node.scope.detach_actor(node.attachment)?;
+        if !node.scope.retained() {
+            execution_scope.detach_actor(node.attachment)?;
+        }
         let actor = node
             .core
             .lock()
@@ -3191,13 +5296,853 @@ impl<A: Actor> ActorRuntime<A> {
         self.shared.changed.notify();
         Ok(actor)
     }
-    pub fn is_empty(&self) -> bool {
+    fn detach_execution_node(
+        &self,
+        node: &Arc<ActorCell<A>>,
+        process: &ScopeHandle,
+    ) -> Result<(), DriverError> {
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        let mut binding = node
+            .scope
+            .execution
+            .lock()
+            .expect("actor execution binding lock");
+        let ActorExecution::Live { scope, .. } = &*binding else {
+            return Err(DriverError::ExecutionAlreadyDetached);
+        };
+        if scope.same_scope(process) || !Arc::ptr_eq(&scope.runtime.shared, &process.runtime.shared)
+        {
+            return Err(DriverError::PublicationTargetMismatch);
+        }
+        if inbox.failed
+            || inbox.sealed
+            || inbox.inputs.values().any(|input| {
+                [input.author.as_ref(), input.producer.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|binding| binding.work.scope == scope.id())
+                    || input.author.is_none()
+            })
+            || inbox.roles.values().any(|role| {
+                role.producer
+                    .as_ref()
+                    .is_none_or(|binding| binding.work.scope == scope.id())
+            })
+            || inbox.batches.values().any(|batch| {
+                batch.state.has_unfinished_author_scope(scope.id())
+                    || batch.state.has_unfinished_business()
+                    || !batch.reservations.is_empty()
+            })
+            || inbox.failure.is_some()
+            || inbox.failure_input.is_some()
+            || inbox.failure_publication.is_some()
+            || inbox.timer_input.is_some()
+        {
+            return Err(DriverError::ActorNotRetired);
+        }
+        let mut ledger = scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let original = ledger
+            .scopes
+            .get(&scope.id())
+            .ok_or(RuntimeError::UnknownScope)?;
+        if !original.join_ready()
+            || original.storage_count() != 1
+            || ledger.ledger.reservation_count_for(scope.id()) != 0
+            || ledger
+                .unresolved
+                .range(
+                    (scope.id(), WorkId::new(1).expect("minimum Work identity"))
+                        ..=(
+                            scope.id(),
+                            WorkId::new(u64::MAX).expect("maximum Work identity"),
+                        ),
+                )
+                .next()
+                .is_some()
+        {
+            return Err(DriverError::ActorNotRetired);
+        }
+        ledger
+            .scopes
+            .get(&process.id())
+            .ok_or(RuntimeError::UnknownScope)?;
+        let state = self.shared.state.lock().expect("runtime scheduler lock");
+        if !state
+            .actors
+            .get(&node.id)
+            .is_some_and(|actual| Arc::ptr_eq(actual, node))
+            || !state.ready.is_idle(node.id)?
+            || !state.effect_ready.is_claimed(node.id)?
+        {
+            return Err(DriverError::ActorNotRetired);
+        }
+        ledger
+            .scopes
+            .get_mut(&scope.id())
+            .expect("validated original scope")
+            .retire_slot(node.attachment)
+            .map_err(RuntimeError::from)?;
+        scope.runtime.shared.record(|| HistoryFact::SlotRetired {
+            slot: node.attachment,
+        });
+        // Original failure Work, holders, captures and reports are all gone.
+        // Withdraw its unused builtin position without creating another Work.
+        inbox.failure_position = None;
+        // Actor epoch is independent of the payer Scope and survives detachment.
+        drop(state);
+        drop(ledger);
+        *binding = ActorExecution::Retained {
+            process: process.clone(),
+        };
+        drop(binding);
+        drop(inbox);
+        process.runtime.shared.changed.notify();
+        self.shared.changed.notify();
+        Ok(())
+    }
+    /// Internal facts wait on their original metadata object's class credit.
+    /// Full registers one waiter atomically with the actual window check.
+    pub fn forward_metadata_for(
+        &self,
+        source: &ActorRegistration,
+        target: &ActorRegistration,
+        ticket: &MetadataTicket<A::Effect>,
+        class: InputClass,
+        value: A::Input,
+    ) -> Result<MetadataDelivery, (DriverError, A::Input)> {
+        let observed = self.shared.observation.now();
+        if !matches!(class, InputClass::Control | InputClass::Lifecycle) {
+            return Err((DriverError::InvalidConfig, value));
+        }
+        let source_node = match self.node(source.actor) {
+            Ok(node) => node,
+            Err(error) => return Err((error, value)),
+        };
+        let target_node = match self.node(target.actor) {
+            Ok(node) => node,
+            Err(error) => return Err((error, value)),
+        };
+        let delivery = if source.actor == target.actor {
+            let mut inbox = source_node.inbox.lock().expect("metadata actor inbox lock");
+            if let Err(error) = Self::validate_metadata_source(&source_node, &inbox, source, ticket)
+            {
+                return Err((error, value));
+            }
+            let current = inbox.batches[&ticket.input].metadata[ticket.ordinal]
+                .credit_waiter
+                .clone();
+            let waiter = match self.prepare_metadata_credit(
+                (&target_node, &mut inbox, target),
+                (source, ticket),
+                class,
+                current,
+            ) {
+                Ok(waiter) => waiter,
+                Err(error) => return Err((error, value)),
+            };
+            inbox
+                .batches
+                .get_mut(&ticket.input)
+                .expect("original metadata batch")
+                .metadata[ticket.ordinal]
+                .credit_waiter = Some(waiter.clone());
+            if waiter.status() != MetadataCreditState::Ready {
+                return Err((DriverError::InputCapacity, value));
+            }
+            let delivery = match Self::insert_metadata_input(
+                &target_node,
+                &mut inbox,
+                source,
+                target,
+                &waiter,
+                observed,
+                value,
+            ) {
+                Ok(delivery) => delivery,
+                Err(error) => {
+                    self.close_metadata_credit(&mut inbox, &waiter);
+                    return Err(error);
+                }
+            };
+            let notice = &mut inbox
+                .batches
+                .get_mut(&ticket.input)
+                .expect("original metadata batch")
+                .metadata[ticket.ordinal];
+            notice.credit_waiter = None;
+            notice.forwarded = Some(delivery.clone());
+            delivery
+        } else if source.actor < target.actor {
+            let mut from = source_node
+                .inbox
+                .lock()
+                .expect("source metadata inbox lock");
+            let mut into = target_node
+                .inbox
+                .lock()
+                .expect("target metadata inbox lock");
+            self.forward_metadata_locked(
+                (&source_node, &mut from, source),
+                (&target_node, &mut into, target),
+                ticket,
+                class,
+                observed,
+                value,
+            )?
+        } else {
+            let mut into = target_node
+                .inbox
+                .lock()
+                .expect("target metadata inbox lock");
+            let mut from = source_node
+                .inbox
+                .lock()
+                .expect("source metadata inbox lock");
+            self.forward_metadata_locked(
+                (&source_node, &mut from, source),
+                (&target_node, &mut into, target),
+                ticket,
+                class,
+                observed,
+                value,
+            )?
+        };
         self.shared
             .state
             .lock()
             .expect("runtime scheduler lock")
+            .ready
+            .notify(target.actor)
+            .expect("forwarded input retains its original destination");
+        self.shared.changed.notify();
+        Ok(delivery)
+    }
+    fn validate_metadata_source(
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        source: &ActorRegistration,
+        ticket: &MetadataTicket<A::Effect>,
+    ) -> Result<(), DriverError> {
+        Self::validate_metadata_ticket_owner(node, inbox, source, ticket)?;
+        if inbox.sealed {
+            return Err(DriverError::Closed);
+        }
+        // Failure cannot revoke an already committed original fact. Its real
+        // host/failure custodian may finish this exact handoff without running
+        // the failed Core, admitting Work or producing another metadata fact.
+        let notice = &inbox.batches[&ticket.input].metadata[ticket.ordinal];
+        if notice.forwarded.is_some() {
+            return Err(DriverError::MetadataAlreadyForwarded);
+        }
+        Ok(())
+    }
+    fn prepare_metadata_credit(
+        &self,
+        (node, inbox, target): (&ActorCell<A>, &mut Inbox<A>, &ActorRegistration),
+        (source, ticket): (&ActorRegistration, &MetadataTicket<A::Effect>),
+        class: InputClass,
+        current: Option<MetadataCreditWait>,
+    ) -> Result<MetadataCreditWait, DriverError> {
+        if node.id != target.actor
+            || !Arc::ptr_eq(&node.origin, &target.origin)
+            || !Arc::ptr_eq(&node.scope, &target.scope)
+        {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        let gate = node.scope.current_scope().gates()?;
+        if inbox.failed || gate.failed || inbox.metadata_closing || inbox.sealed {
+            self.close_metadata_waiters_locked(node, inbox);
+            return Err(if inbox.failed || gate.failed {
+                DriverError::ActorFailed
+            } else {
+                DriverError::Closed
+            });
+        }
+        let waiter = if let Some(waiter) = current {
+            if !waiter.target.same_registration(target) || waiter.class != class {
+                return Err(DriverError::PublicationTargetMismatch);
+            }
+            if !matches!(
+                waiter.status(),
+                MetadataCreditState::Waiting | MetadataCreditState::Ready
+            ) {
+                return Err(DriverError::Closed);
+            }
+            waiter
+        } else {
+            let waiter = MetadataCreditWait {
+                key: MetadataWaitKey {
+                    actor: source.actor,
+                    input: ticket.input,
+                    ordinal: ticket.ordinal,
+                },
+                source: source.clone(),
+                target: target.clone(),
+                class,
+                state: Arc::new(Mutex::new(MetadataCreditState::Waiting)),
+            };
+            inbox.metadata_credit[class.index()].register(waiter.clone());
+            waiter
+        };
+        self.notify_metadata_credit_sources(inbox.grant_metadata_credit(class));
+        Ok(waiter)
+    }
+    fn forward_metadata_locked(
+        &self,
+        (source_node, source_inbox, source): (&ActorCell<A>, &mut Inbox<A>, &ActorRegistration),
+        (target_node, target_inbox, target): (&ActorCell<A>, &mut Inbox<A>, &ActorRegistration),
+        ticket: &MetadataTicket<A::Effect>,
+        class: InputClass,
+        observed: Option<Tick>,
+        value: A::Input,
+    ) -> Result<MetadataDelivery, (DriverError, A::Input)> {
+        if let Err(error) =
+            Self::validate_metadata_source(source_node, source_inbox, source, ticket)
+        {
+            return Err((error, value));
+        }
+        let current = source_inbox.batches[&ticket.input].metadata[ticket.ordinal]
+            .credit_waiter
+            .clone();
+        let waiter = match self.prepare_metadata_credit(
+            (target_node, target_inbox, target),
+            (source, ticket),
+            class,
+            current,
+        ) {
+            Ok(waiter) => waiter,
+            Err(error) => return Err((error, value)),
+        };
+        source_inbox
+            .batches
+            .get_mut(&ticket.input)
+            .expect("original metadata batch")
+            .metadata[ticket.ordinal]
+            .credit_waiter = Some(waiter.clone());
+        if waiter.status() != MetadataCreditState::Ready {
+            return Err((DriverError::InputCapacity, value));
+        }
+        let delivery = match Self::insert_metadata_input(
+            target_node,
+            target_inbox,
+            source,
+            target,
+            &waiter,
+            observed,
+            value,
+        ) {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                self.close_metadata_credit(target_inbox, &waiter);
+                return Err(error);
+            }
+        };
+        let notice = &mut source_inbox
+            .batches
+            .get_mut(&ticket.input)
+            .expect("original metadata batch")
+            .metadata[ticket.ordinal];
+        notice.credit_waiter = None;
+        notice.forwarded = Some(delivery.clone());
+        Ok(delivery)
+    }
+    fn insert_metadata_input(
+        node: &ActorCell<A>,
+        inbox: &mut Inbox<A>,
+        source: &ActorRegistration,
+        target: &ActorRegistration,
+        waiter: &MetadataCreditWait,
+        observed: Option<Tick>,
+        value: A::Input,
+    ) -> Result<MetadataDelivery, (DriverError, A::Input)> {
+        if node.id != target.actor
+            || !Arc::ptr_eq(&node.origin, &target.origin)
+            || !Arc::ptr_eq(&node.scope, &target.scope)
+        {
+            return Err((DriverError::EffectTicketOriginMismatch, value));
+        }
+        let scope = node.scope.current_scope();
+        let ledger = scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("metadata target ledger lock");
+        let owner = match ledger.scopes.get(&scope.id()) {
+            Some(owner) => owner,
+            None => return Err((RuntimeError::UnknownScope.into(), value)),
+        };
+        if inbox.failed || owner.failed() {
+            return Err((DriverError::ActorFailed, value));
+        }
+        if inbox.sealed || inbox.metadata_closing {
+            return Err((DriverError::Closed, value));
+        }
+        let class = waiter.class;
+        let original = inbox.metadata_credit[class.index()]
+            .entries
+            .get(&waiter.key);
+        if !original.is_some_and(|original| original.same_wait(waiter))
+            || waiter.status() != MetadataCreditState::Ready
+        {
+            return Err((DriverError::InputCapacity, value));
+        }
+        let Some(next) = inbox.next_input.checked_add(1) else {
+            return Err((DriverError::IdentityExhausted, value));
+        };
+        let input = InputId::new(next).expect("incremented actual metadata input");
+        if let Err(error) = inbox.mailbox.push(class, source.actor, input) {
+            return Err((error.into(), value));
+        }
+        assert!(
+            inbox.metadata_credit[class.index()].remove(waiter, MetadataCreditState::Forwarded)
+        );
+        let delivery = MetadataDelivery {
+            source: source.clone(),
+            target: target.clone(),
+            input,
+            state: Arc::new(Mutex::new(MetadataConsumption::Pending)),
+        };
+        inbox.next_input = next;
+        inbox.inputs.insert(
+            input,
+            InputRecord {
+                source: source.actor,
+                class,
+                phase: InputPhase::Filled,
+                role: None,
+                author: None,
+                producer: None,
+                metadata_delivery: Some(delivery.clone()),
+                header_pins: Vec::new(),
+                handoff_at: observed,
+            },
+        );
+        inbox.payloads.insert(input, value);
+        inbox.counts[class.index()] += 1;
+        inbox.observation.input_credit_taken(class);
+        Ok(delivery)
+    }
+    fn notify_metadata_credit_sources(&self, sources: Vec<ActorRegistration>) {
+        for source in sources {
+            self.notify_metadata_source(&source);
+        }
+    }
+    /// Consumption and closed-credit state are published before their wake.
+    /// An actual custodian can observe that state, settle the original fact
+    /// and retire its actor before this notification reaches the scheduler.
+    /// The state remains authoritative; this hint must never wake a later
+    /// incarnation or keep an already retired actor artificially alive.
+    fn notify_metadata_source(&self, source: &ActorRegistration) {
+        let mut state = self.shared.state.lock().expect("runtime scheduler lock");
+        match Self::validate_registration_in_state(&state, source) {
+            Ok(()) => {}
+            Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => return,
+            Err(error) => panic!("metadata source registration invariant: {error:?}"),
+        }
+        state
+            .effect_ready
+            .notify(source.actor)
+            .expect("the same registered metadata source retains its ready position");
+        drop(state);
+        self.shared.changed.notify();
+    }
+    fn close_metadata_credit(&self, inbox: &mut Inbox<A>, waiter: &MetadataCreditWait) {
+        if inbox.metadata_credit[waiter.class.index()].remove(waiter, MetadataCreditState::Closed) {
+            self.notify_metadata_credit_sources(vec![waiter.source.clone()]);
+        }
+        inbox.metadata_closing = true;
+    }
+    fn close_metadata_waiters_locked(&self, node: &ActorCell<A>, inbox: &mut Inbox<A>) -> bool {
+        let (wakes, remains) = inbox.close_metadata_waiters(METADATA_CREDIT_WAKE_BUDGET);
+        self.notify_metadata_credit_sources(wakes);
+        if remains {
+            self.shared
+                .state
+                .lock()
+                .expect("runtime scheduler lock")
+                .effect_ready
+                .notify(node.id)
+                .expect("closing metadata destination remains registered");
+        }
+        remains
+    }
+    pub fn metadata_waiting_for(
+        &self,
+        source: &ActorRegistration,
+        ticket: &MetadataTicket<A::Effect>,
+    ) -> Result<bool, DriverError> {
+        let node = self.node(source.actor)?;
+        let inbox = node.inbox.lock().expect("source metadata inbox lock");
+        Self::validate_metadata_ticket_owner(&node, &inbox, source, ticket)?;
+        Ok(inbox.batches[&ticket.input].metadata[ticket.ordinal]
+            .credit_waiter
+            .as_ref()
+            .is_some_and(|waiter| waiter.status() == MetadataCreditState::Waiting))
+    }
+    fn validate_metadata_ticket_owner(
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        source: &ActorRegistration,
+        ticket: &MetadataTicket<A::Effect>,
+    ) -> Result<(), DriverError> {
+        if ticket.actor != source.actor || !Arc::ptr_eq(&ticket.origin, &node.origin) {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        Self::validate_metadata_key_owner(node, inbox, source, (ticket.input, ticket.ordinal))
+    }
+    fn validate_metadata_key_owner(
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        source: &ActorRegistration,
+        (input, ordinal): (InputId, usize),
+    ) -> Result<(), DriverError> {
+        if node.id != source.actor
+            || !Arc::ptr_eq(&source.origin, &node.origin)
+            || !Arc::ptr_eq(&source.scope, &node.scope)
+        {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        let original = inbox.inputs.get(&input).ok_or(DriverError::UnknownInput)?;
+        let batch = inbox.batches.get(&input).ok_or(DriverError::UnknownInput)?;
+        if !matches!(
+            original.phase,
+            InputPhase::Committed | InputPhase::AbandonedByOwnerFailure
+        ) || batch.state.phase() != novarocks_control_runtime_core::effect::BatchPhase::Committed
+        {
+            return Err(EffectError::NotCommitted.into());
+        }
+        let notice = batch
+            .metadata
+            .get(ordinal)
+            .ok_or(DriverError::UnknownInput)?;
+        if notice.completed || notice.value.is_some() {
+            return Err(EffectError::InvalidTransition.into());
+        }
+        Ok(())
+    }
+    /// Cancels only the scheduler wait. The original fact/ticket is neither
+    /// consumed nor acknowledged; failure/shutdown must still settle its owner.
+    pub fn cancel_metadata_wait_for(
+        &self,
+        source: &ActorRegistration,
+        ticket: &MetadataTicket<A::Effect>,
+    ) -> Result<bool, DriverError> {
+        let node = self.node(source.actor)?;
+        let waiter = {
+            let mut inbox = node.inbox.lock().expect("source metadata inbox lock");
+            Self::validate_metadata_ticket_owner(&node, &inbox, source, ticket)?;
+            let notice = &mut inbox
+                .batches
+                .get_mut(&ticket.input)
+                .expect("original metadata batch")
+                .metadata[ticket.ordinal];
+            let Some(waiter) = notice.credit_waiter.clone() else {
+                return Ok(false);
+            };
+            if !matches!(
+                waiter.status(),
+                MetadataCreditState::Waiting | MetadataCreditState::Ready
+            ) {
+                notice.credit_waiter = None;
+                return Ok(true);
+            }
+            waiter
+        };
+        let target = match self.node(waiter.target.actor) {
+            Ok(target) => target,
+            Err(error) => {
+                // Actual destination removal closes each original scheduling
+                // link before removing its actor. Only that positive state can
+                // justify clearing a link after the address disappeared.
+                if waiter.status() != MetadataCreditState::Closed {
+                    return Err(error);
+                }
+                let mut inbox = node.inbox.lock().expect("source metadata inbox lock");
+                Self::validate_metadata_ticket_owner(&node, &inbox, source, ticket)?;
+                let notice = &mut inbox
+                    .batches
+                    .get_mut(&ticket.input)
+                    .expect("original metadata batch")
+                    .metadata[ticket.ordinal];
+                if notice
+                    .credit_waiter
+                    .as_ref()
+                    .is_some_and(|original| original.same_wait(&waiter))
+                {
+                    notice.credit_waiter = None;
+                }
+                return Ok(true);
+            }
+        };
+        if source.actor == target.id {
+            let mut inbox = node.inbox.lock().expect("metadata actor inbox lock");
+            Self::validate_metadata_ticket_owner(&node, &inbox, source, ticket)?;
+            let matches = inbox.batches[&ticket.input].metadata[ticket.ordinal]
+                .credit_waiter
+                .as_ref()
+                .is_some_and(|original| original.same_wait(&waiter));
+            if !matches {
+                return Ok(false);
+            }
+            if waiter.status() != MetadataCreditState::Closed {
+                if !Arc::ptr_eq(&target.origin, &waiter.target.origin) {
+                    return Err(DriverError::EffectTicketOriginMismatch);
+                }
+                inbox.metadata_credit[waiter.class.index()]
+                    .remove(&waiter, MetadataCreditState::Cancelled);
+            }
+            inbox
+                .batches
+                .get_mut(&ticket.input)
+                .expect("original metadata batch")
+                .metadata[ticket.ordinal]
+                .credit_waiter = None;
+            self.notify_metadata_credit_sources(inbox.grant_metadata_credit(waiter.class));
+            Ok(true)
+        } else if source.actor < target.id {
+            let mut from = node.inbox.lock().expect("source metadata inbox lock");
+            let mut into = target.inbox.lock().expect("target metadata inbox lock");
+            self.cancel_metadata_wait_locked(
+                (&node, &mut from, source),
+                (&target, &mut into),
+                (ticket.input, ticket.ordinal),
+                &waiter,
+            )
+        } else {
+            let mut into = target.inbox.lock().expect("target metadata inbox lock");
+            let mut from = node.inbox.lock().expect("source metadata inbox lock");
+            self.cancel_metadata_wait_locked(
+                (&node, &mut from, source),
+                (&target, &mut into),
+                (ticket.input, ticket.ordinal),
+                &waiter,
+            )
+        }
+    }
+    fn cancel_metadata_wait_locked(
+        &self,
+        (source_node, source_inbox, source): (&ActorCell<A>, &mut Inbox<A>, &ActorRegistration),
+        (target_node, target_inbox): (&ActorCell<A>, &mut Inbox<A>),
+        (input, ordinal): (InputId, usize),
+        waiter: &MetadataCreditWait,
+    ) -> Result<bool, DriverError> {
+        Self::validate_metadata_key_owner(source_node, source_inbox, source, (input, ordinal))?;
+        let notice = &mut source_inbox
+            .batches
+            .get_mut(&input)
+            .expect("original metadata batch")
+            .metadata[ordinal];
+        if !notice
+            .credit_waiter
+            .as_ref()
+            .is_some_and(|original| original.same_wait(waiter))
+        {
+            return Ok(false);
+        }
+        // Destination close already removed this exact original wait. Its
+        // numeric actor may now name a replacement; never inspect or mutate
+        // that replacement's queue to finish the source's closed link.
+        if waiter.status() == MetadataCreditState::Closed {
+            notice.credit_waiter = None;
+            return Ok(true);
+        }
+        if !Arc::ptr_eq(&target_node.origin, &waiter.target.origin)
+            || !Arc::ptr_eq(&target_node.scope, &waiter.target.scope)
+        {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        target_inbox.metadata_credit[waiter.class.index()]
+            .remove(waiter, MetadataCreditState::Cancelled);
+        notice.credit_waiter = None;
+        self.notify_metadata_credit_sources(target_inbox.grant_metadata_credit(waiter.class));
+        Ok(true)
+    }
+    /// Recover the same read-only delivery after an interrupted host turn;
+    /// this issues neither another forwarding nor another input position.
+    pub fn metadata_delivery_for(
+        &self,
+        source: &ActorRegistration,
+        ticket: &MetadataTicket<A::Effect>,
+    ) -> Result<Option<MetadataDelivery>, DriverError> {
+        self.validate_registration(source)?;
+        let node = self.node(source.actor)?;
+        if ticket.actor != source.actor || !Arc::ptr_eq(&ticket.origin, &node.origin) {
+            return Err(DriverError::EffectTicketOriginMismatch);
+        }
+        let inbox = node.inbox.lock().expect("source metadata inbox lock");
+        let notice = inbox
+            .batches
+            .get(&ticket.input)
+            .ok_or(DriverError::UnknownInput)?
+            .metadata
+            .get(ticket.ordinal)
+            .ok_or(DriverError::UnknownInput)?;
+        Ok(notice.forwarded.clone())
+    }
+    fn resolve_metadata_delivery(
+        &self,
+        inbox: &Inbox<A>,
+        input: InputId,
+        next: MetadataConsumption,
+    ) {
+        if let Some(delivery) = inbox
+            .inputs
+            .get(&input)
+            .and_then(|record| record.metadata_delivery.as_ref())
+            && delivery.resolve(next)
+        {
+            self.notify_metadata_source(&delivery.source);
+        }
+    }
+    /// Transfer this same original fact to its actual failure custodian. The
+    /// receiver must retain and settle the returned value under the existing
+    /// failure policy; this is neither successful Core consumption nor physical
+    /// exit. A live wait must first be cancelled through its original queue.
+    /// Forwarded facts require the actual target's Abandoned receipt. An
+    /// unforwarded fact requires this original source to have actually failed.
+    pub fn take_failed_metadata_for(
+        &self,
+        registration: &ActorRegistration,
+        ticket: MetadataTicket<A::Effect>,
+    ) -> Result<A::Effect, (DriverError, MetadataTicket<A::Effect>)> {
+        let transfer = || -> Result<(), DriverError> {
+            let node = self.node(registration.actor)?;
+            let mut inbox = node
+                .inbox
+                .lock()
+                .expect("failed metadata custody inbox lock");
+            Self::validate_metadata_ticket_owner(&node, &inbox, registration, &ticket)?;
+            let source_failed = inbox.failed;
+            let notice = &mut inbox
+                .batches
+                .get_mut(&ticket.input)
+                .expect("qualified original committed metadata")
+                .metadata[ticket.ordinal];
+            if notice.credit_waiter.is_some() {
+                return Err(DriverError::MetadataStillPending);
+            }
+            match notice.forwarded.as_ref().map(MetadataDelivery::consumption) {
+                Some(MetadataConsumption::AbandonedByOwnerFailure) => {}
+                Some(MetadataConsumption::Pending) => {
+                    return Err(DriverError::MetadataStillPending);
+                }
+                Some(MetadataConsumption::Consumed) => {
+                    return Err(EffectError::InvalidTransition.into());
+                }
+                None if source_failed => {}
+                None => return Err(DriverError::ActorNotRetired),
+            }
+            // The unique ticket already owns the actual value. Only terminal
+            // source custody changes here; no target receipt becomes Consumed.
+            notice.completed = true;
+            {
+                let scope = node.scope.current_scope();
+                let mut ledger = scope
+                    .runtime
+                    .shared
+                    .state
+                    .lock()
+                    .expect("original metadata tail header custody");
+                self.notify_metadata_credit_sources(
+                    inbox.retire_metadata_input_if_ready(ticket.input, &mut ledger),
+                );
+            }
+            self.shared
+                .state
+                .lock()
+                .expect("runtime scheduler lock")
+                .effect_ready
+                .notify(node.id)?;
+            Ok(())
+        };
+        match transfer() {
+            Ok(()) => {
+                self.shared.changed.notify();
+                Ok(ticket.value)
+            }
+            Err(error) => Err((error, ticket)),
+        }
+    }
+    /// The actual destination consumed this original neutral notice. Refusal
+    /// returns the same ticket; taking or dropping it is never completion.
+    pub fn metadata_completed_for(
+        &self,
+        registration: &ActorRegistration,
+        ticket: MetadataTicket<A::Effect>,
+    ) -> Result<(), (DriverError, MetadataTicket<A::Effect>)> {
+        let complete = || -> Result<(), DriverError> {
+            self.validate_registration(registration)?;
+            let node = self.node(registration.actor)?;
+            if ticket.actor != node.id || !Arc::ptr_eq(&ticket.origin, &node.origin) {
+                return Err(DriverError::EffectTicketOriginMismatch);
+            }
+            let mut inbox = node.inbox.lock().expect("actor inbox lock");
+            let notice = inbox
+                .batches
+                .get_mut(&ticket.input)
+                .ok_or(DriverError::UnknownInput)?
+                .metadata
+                .get_mut(ticket.ordinal)
+                .ok_or(DriverError::UnknownInput)?;
+            if notice.completed || notice.value.is_some() {
+                return Err(EffectError::InvalidTransition.into());
+            }
+            if notice.credit_waiter.is_some() {
+                return Err(DriverError::MetadataStillPending);
+            }
+            if let Some(delivery) = &notice.forwarded {
+                match delivery.consumption() {
+                    MetadataConsumption::Pending => return Err(DriverError::MetadataStillPending),
+                    MetadataConsumption::AbandonedByOwnerFailure => {
+                        return Err(DriverError::MetadataDeliveryAbandoned);
+                    }
+                    MetadataConsumption::Consumed => {}
+                }
+            }
+            notice.completed = true;
+            {
+                let scope = node.scope.current_scope();
+                let mut ledger = scope
+                    .runtime
+                    .shared
+                    .state
+                    .lock()
+                    .expect("original metadata tail header custody");
+                self.notify_metadata_credit_sources(
+                    inbox.retire_metadata_input_if_ready(ticket.input, &mut ledger),
+                );
+            }
+            self.shared
+                .state
+                .lock()
+                .expect("runtime scheduler lock")
+                .effect_ready
+                .notify(node.id)?;
+            Ok(())
+        };
+        match complete() {
+            Ok(()) => {
+                self.shared.changed.notify();
+                Ok(())
+            }
+            Err(error) => Err((error, ticket)),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        let empty = self
+            .shared
+            .state
+            .lock()
+            .expect("runtime scheduler lock")
             .actors
-            .is_empty()
+            .is_empty();
+        empty && self.shared.header_readiness.is_empty()
     }
     pub fn change_version(&self) -> u64 {
         self.shared.changed.version()
@@ -3429,11 +6374,14 @@ mod effect_ticket_incarnation_tests {
     use super::*;
     use crate::transaction::RuntimeLedger;
     use novarocks_control_runtime_core::{
-        capacity::ResourceVector, identity::ScopeId, scope::WorkAdmission,
+        capacity::{ReservationResources, ResourceVector},
+        identity::ScopeId,
+        owned_storage::OwnedSlotNeed,
+        scope::WorkAdmission,
     };
 
     #[derive(Debug)]
-    struct OneEffect(WorkId);
+    struct OneEffect(ScopedWorkRef);
     impl Actor for OneEffect {
         type Input = ();
         type Effect = ();
@@ -3469,30 +6417,39 @@ mod effect_ticket_incarnation_tests {
     }
     #[test]
     fn actual_actor_re_registration_mints_a_fresh_ticket_incarnation() {
-        let ledger = RuntimeLedger::new(ResourceVector::new([]).unwrap(), 8, 8);
-        let runtime = ActorRuntime::new(1);
+        let ledger = RuntimeLedger::new(ResourceVector::new([]).unwrap());
+        let runtime = ActorRuntime::new();
         let actor = ActorId::new(1).unwrap();
         let generation = Generation::new(1).unwrap();
         let mut previous: Option<Arc<()>> = None;
         let mut fresh = true;
         for _ in 0..2 {
-            let scope = ledger.open_scope_next(None, generation, 4, 4).unwrap();
+            let scope = ledger.open_scope_next(None, generation).unwrap();
             let (mut work, mut capacity) = scope
                 .reserve_next(
                     generation,
-                    ResourceVector::new([]).unwrap(),
+                    ReservationResources {
+                        quota: ResourceVector::new([]).unwrap(),
+                        owned_slots: OwnedSlotNeed {
+                            work_headers: 1,
+                            ..OwnedSlotNeed::default()
+                        },
+                    },
                     WorkKind::Business,
                     WorkAdmission::External,
                 )
                 .unwrap()
                 .bind(WorkKind::Business)
                 .unwrap();
+            let mut header_ready = work.header_readiness_registration().unwrap();
+            assert!(work.header_readiness_registration().is_err());
+            let header = work.retirement_observer();
             work.start().unwrap();
             runtime
                 .register_next(
                     actor,
                     scope.clone(),
-                    OneEffect(work.id()),
+                    OneEffect(work.reference()),
                     ActorConfig {
                         mailbox: [1; 4],
                         max_batches: 1,
@@ -3504,7 +6461,7 @@ mod effect_ticket_incarnation_tests {
                 )
                 .unwrap();
             let input = runtime
-                .reserve_input(actor, actor, InputClass::Ordinary)
+                .reserve_admitted_input(actor, actor, InputClass::Ordinary, &work)
                 .unwrap()
                 .fill(())
                 .unwrap();
@@ -3519,17 +6476,50 @@ mod effect_ticket_incarnation_tests {
             // consumed before input retirement or actor removal can succeed.
             previous = Some(ticket.origin.clone());
             runtime.validate_effect_ticket(&ticket).unwrap();
+            let registration = runtime.registration_from_effect(&ticket).unwrap();
             runtime.effect_completed(ticket).unwrap();
-            runtime.retire_input(actor, input).unwrap();
             scope.close_external().unwrap();
             work.body_exited().unwrap();
             work.captures_exited().unwrap();
-            ledger.reap_scope_ready(scope.id(), 1).unwrap();
+            // The real admitted input still owns its original producer pin.
+            assert!(header.header_holders().unwrap().0 > 0);
+            assert_eq!(
+                header_ready.arm(&runtime, &registration, &header).unwrap(),
+                crate::header_readiness::HeaderWaitState::Waiting,
+            );
+            assert!(!ledger.reap_observed_header(&header).unwrap());
+            let turn = runtime.claim_host_actor().unwrap();
+            assert!(turn.take_header_readiness(1).is_empty());
+            turn.release(false).unwrap();
+            assert!(runtime.claim_host_actor().is_none());
+            runtime.retire_input(actor, input).unwrap();
+            let turn = runtime.claim_host_actor().unwrap();
+            let notices = turn.take_header_readiness(1);
+            assert_eq!(notices.len(), 1);
+            assert!(header_ready.matches(&notices[0]));
+            assert_eq!(notices[0].work(), work.reference());
+            assert!(!header.is_retired());
+            assert!(turn.take_header_readiness(1).is_empty());
+            assert_eq!(
+                header_ready.arm(&runtime, &registration, &header).unwrap(),
+                crate::header_readiness::HeaderWaitState::ReadyToReap,
+            );
+            assert!(ledger.reap_observed_header(&header).unwrap());
+            assert!(header.is_retired());
+            assert!(matches!(
+                runtime.remove_actor(actor),
+                Err(DriverError::ActorNotRetired)
+            ));
+            // Cancel withdraws the same newly queued ready/retired notice;
+            // it does not stand in for input exit or header retirement.
+            header_ready.cancel();
+            assert!(!header_ready.matches(&notices[0]));
+            turn.release(false).unwrap();
             while let Some(original_host_turn) = runtime.claim_host_actor() {
                 original_host_turn.release(false).unwrap();
             }
             runtime.remove_actor(actor).unwrap();
-            capacity.release(&capacity.resources().unwrap()).unwrap();
+            capacity.finish().unwrap();
             ledger.remove_scope(scope.id()).unwrap();
         }
         assert!(runtime.is_empty());

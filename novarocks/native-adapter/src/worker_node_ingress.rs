@@ -38,10 +38,11 @@ use novarocks_task_codec::{
 };
 use novarocks_types::NativeCompatibilityId;
 use novarocks_worker::{
-    NodeAdmissionTicketObservation, ReleasedContextEvidence, WorkerContextDelivery,
-    WorkerContextReplyBody, WorkerControlDelivery, WorkerControlReplyBody, WorkerCreateDelivery,
-    WorkerCreateReply, WorkerMonotonicInstant, WorkerRequestError, WorkerRequestRefusal,
-    WorkerRequestResult, WorkerTaskControl, WorkerTaskDelivery,
+    NodeAdmissionTicketObservation, ReleasedContextEvidence, WorkerCancelOutcome,
+    WorkerContextDelivery, WorkerContextReplyBody, WorkerControlDelivery, WorkerControlReplyBody,
+    WorkerCreateDelivery, WorkerCreateReply, WorkerIngressResponsibility, WorkerMonotonicInstant,
+    WorkerRequestError, WorkerRequestRefusal, WorkerRequestResult, WorkerTaskControl,
+    WorkerTaskDelivery,
 };
 use std::{
     fmt,
@@ -85,9 +86,6 @@ impl WorkerNodeTaskIngress {
             .set(controls)
             .map_err(|_| "Native Node ingress test controls were already installed".into())
     }
-    pub(crate) fn control(&self) -> &WorkerTaskControl {
-        &self.control
-    }
     fn deadline(&self, original: Instant) -> WorkerMonotonicInstant {
         // Preserve the one original ingress deadline when moving between the
         // Native and Worker clocks. Never grant a fresh per-poll wait.
@@ -116,11 +114,28 @@ impl WorkerNodeTaskIngress {
 
 #[tonic::async_trait]
 impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
+    fn validate_ingress_ownership(
+        &self,
+        ownership: Option<&Arc<crate::native_ingress::NativeIngressOwnership>>,
+    ) -> Result<(), Status> {
+        ownership.map(|_| ()).ok_or_else(|| {
+            Status::failed_precondition(
+                "the actual Worker operation requires original Native ingress ownership",
+            )
+        })
+    }
+
     async fn apply_task_operation(
         &self,
         operation: DecodedOperation,
         deadline: Instant,
+        ownership: Option<Arc<crate::native_ingress::NativeIngressOwnership>>,
     ) -> Result<Receipt, Status> {
+        let ownership = ownership.ok_or_else(|| {
+            Status::failed_precondition(
+                "the actual Worker operation requires original Native ingress ownership",
+            )
+        })?;
         if let Some(receipt) = self.compatibility_refusal(&operation) {
             return Ok(receipt);
         }
@@ -154,12 +169,74 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                     return Err(Status::unimplemented("the asynchronous restart-after-establish creation hold is not connected"));
                 }
                 let (request, input, retained) = decoded.into_parts_with_retained_bytes();
+                #[cfg(novarocks_dev_controls)]
+                let task_identity = request.identity();
                 match self
                     .control
-                    .create(Arc::new(request), input, retained, deadline)
+                    .create(
+                        Arc::new(request),
+                        input,
+                        retained,
+                        deadline,
+                        WorkerIngressResponsibility::from_admitted(ownership),
+                    )
                     .await
                 {
-                    Ok(original) => encode_create(identity, original),
+                    Ok(original) => {
+                        #[cfg(novarocks_dev_controls)]
+                        let original_outcome = if let Some(controls) = self.test_controls.get() {
+                            check_operation(identity, original.operation())?;
+                            if let WorkerCreateReply::Context(WorkerContextReplyBody::Create {
+                                outcome,
+                                receipt,
+                            }) = original.reply()
+                            {
+                                if receipt.identity() != task_identity {
+                                    return Err(Status::internal(
+                                        "original Create acknowledgement names another Task",
+                                    ));
+                                }
+                                // Claim only after this original Task R carries
+                                // the committed Worker ownership decision. The
+                                // hook drops transport ACK, never admission or
+                                // the later Installed/physical-exit facts.
+                                crate::task_protocol_fault::create_task_ack_dropped(
+                                    controls,
+                                    task_identity,
+                                    *outcome,
+                                )?;
+                                Some(*outcome)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let encoded = encode_create(identity, original)?;
+                        #[cfg(novarocks_dev_controls)]
+                        if let (Some(controls), Some(outcome)) =
+                            (self.test_controls.get(), original_outcome)
+                        {
+                            let mut encoded = encoded;
+                            // Forge only the wire answer after original ownership
+                            // and exact operation/Task identity were verified.
+                            // Identity goes first: rejection removes its ACK.
+                            crate::task_protocol_fault::create_task_receipt_foreign_task(
+                                controls,
+                                task_identity,
+                                outcome,
+                                &mut encoded,
+                            )?;
+                            crate::task_protocol_fault::create_task_rejected_after_apply(
+                                controls,
+                                task_identity,
+                                outcome,
+                                &mut encoded,
+                            )?;
+                            return Ok(encoded);
+                        }
+                        Ok(encoded)
+                    }
                     Err(error) => request_error(identity, error),
                 }
             }
@@ -222,7 +299,11 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                     }
                     UpdateQueryContext::AdvanceDomain(request) => {
                         self.control
-                            .advance_query_context_domain(request, deadline)
+                            .advance_query_context_domain(
+                                request,
+                                deadline,
+                                WorkerIngressResponsibility::from_admitted(ownership),
+                            )
                             .await
                     }
                 };
@@ -232,16 +313,8 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                 }
             }
             DecodedOperation::CancelTask(request) => {
-                let context = self
-                    .control
-                    .context_for_task(request.identity())
-                    .ok_or_else(|| {
-                        Status::failed_precondition(
-                            "the actual Worker Node holds no Context route for this Task",
-                        )
-                    })?;
-                match self.control.cancel(context, request, deadline).await {
-                    Ok(original) => encode_task(identity, original),
+                match self.control.cancel(request, deadline).await {
+                    Ok(original) => encode_cancel(identity, original),
                     Err(error) => request_error(identity, error),
                 }
             }
@@ -269,7 +342,16 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                 let context = self.control.context_for_task(task).ok_or_else(|| {
                     Status::failed_precondition("the Node does not hold this Task's Context")
                 })?;
-                match self.control.update_task(context, request, deadline).await {
+                match self
+                    .control
+                    .update_task(
+                        context,
+                        request,
+                        deadline,
+                        WorkerIngressResponsibility::from_admitted(ownership),
+                    )
+                    .await
+                {
                     Ok(original) => encode_task_domain(identity, task, original),
                     Err(error) => request_error(identity, error),
                 }
@@ -455,12 +537,46 @@ fn encode_context(
         original.released_evidence(),
     )
 }
+fn encode_cancel(
+    operation: TaskOperationId,
+    original: WorkerCancelOutcome,
+) -> Result<Receipt, Status> {
+    match original {
+        WorkerCancelOutcome::Task(original) => encode_task(operation, original),
+        WorkerCancelOutcome::Context(original) => {
+            check_operation(operation, original.operation())?;
+            project_cancel(operation, original.body())
+        }
+        WorkerCancelOutcome::Refused {
+            operation: actual,
+            reason,
+        } => {
+            check_operation(operation, actual)?;
+            Ok(encode_receipt(
+                operation,
+                OperationResult::Verdict {
+                    outcome: reason.outcome(),
+                    detail: Some(novarocks_execution_contract::SafeDetail::truncating(
+                        reason.cancel_safe_detail(),
+                    )),
+                    acknowledgement: None,
+                },
+            ))
+        }
+    }
+}
 fn encode_task(
     operation: TaskOperationId,
     original: WorkerTaskDelivery,
 ) -> Result<Receipt, Status> {
     check_operation(operation, original.operation())?;
-    match original.body() {
+    project_cancel(operation, original.body())
+}
+fn project_cancel(
+    operation: TaskOperationId,
+    body: &WorkerContextReplyBody,
+) -> Result<Receipt, Status> {
+    match body {
         WorkerContextReplyBody::Task { outcome, status } => Ok(verdict(
             operation,
             *outcome,
@@ -626,8 +742,15 @@ impl crate::task_protocol::TaskExecutionIngress for WorkerNodeTaskIngress {
         &self,
         request: proto::ApplyTaskOperationsRequest,
         timing: crate::task_protocol::TaskIngressTiming,
+        ownership: Arc<crate::native_ingress::NativeIngressOwnership>,
     ) -> Result<proto::ApplyTaskOperationsResponse, Status> {
-        crate::task_protocol::apply_task_operations_at(self, request, timing).await
+        crate::task_protocol::apply_task_operations_with_ownership_at(
+            self,
+            request,
+            timing,
+            Some(ownership),
+        )
+        .await
     }
     async fn apply_task_control_operations(
         &self,
@@ -641,8 +764,15 @@ impl crate::task_protocol::TaskExecutionIngress for WorkerNodeTaskIngress {
         &self,
         request: proto::ApplyTaskControlOperationsRequest,
         timing: crate::task_protocol::TaskIngressTiming,
+        ownership: Arc<crate::native_ingress::NativeIngressOwnership>,
     ) -> Result<proto::ApplyTaskOperationsResponse, Status> {
-        crate::task_protocol::apply_task_control_operations_at(self, request, timing).await
+        crate::task_protocol::apply_task_control_operations_with_ownership_at(
+            self,
+            request,
+            timing,
+            Some(ownership),
+        )
+        .await
     }
     fn subscribe_task_status(
         &self,

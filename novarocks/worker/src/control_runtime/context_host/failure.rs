@@ -21,21 +21,23 @@
 
 #[path = "failure_cleanup.rs"]
 mod cleanup;
+#[path = "cold_failure.rs"]
+pub(in crate::control_runtime) mod cold;
 #[path = "failure_driver.rs"]
 mod driver;
 
 use super::*;
-use crate::control_runtime::{
-    context_host::requests::ContextRequestError, open_summary::OpenSummaryError,
-};
+use crate::control_runtime::context_host::requests::ContextRequestError;
+#[cfg(test)]
+use crate::control_runtime::open_summary::OpenSummaryError;
 use crate::settlement::SettlementDispatchError;
 use crate::task_port::{ProjectionError, TaskProjection};
 use novarocks_control_runtime::driver::FailurePublicationSession;
 use novarocks_control_runtime_core::{
     effect::EffectState,
-    identity::{ActionId, WorkId},
+    identity::{ActionId, ScopedWorkRef},
 };
-use std::ops::Bound::{Excluded, Unbounded};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 
 #[derive(Debug)]
 pub(crate) enum FailurePublicationError {
@@ -49,8 +51,62 @@ pub(crate) enum FailurePublicationError {
     Projection(ProjectionError),
     Settlement(SettlementDispatchError),
     Request(ContextRequestError),
+    #[cfg(test)]
     Open(OpenSummaryError),
+    #[cfg(test)]
     HostCall(crate::control_runtime::task_host_call::TaskHostCallError),
+}
+impl std::fmt::Display for FailurePublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongOwner => {
+                f.write_str("Failure publication belongs to another original owner")
+            }
+            Self::AlreadyOwned => f.write_str("Failure publication is already owned"),
+            Self::NotStarted => f.write_str("Failure publication has not started"),
+            Self::NotDrained => f.write_str("Failure publication has not drained"),
+            Self::UnknownTask => f.write_str("Failure publication Task is not owned"),
+            Self::Driver(error) => write!(f, "Failure publication runtime driver failed: {error}"),
+            Self::Runtime(error) => {
+                write!(f, "Failure publication resource operation failed: {error}")
+            }
+            Self::Projection(error) => write!(
+                f,
+                "Failure publication neutral projection failed: {error:?}"
+            ),
+            Self::Settlement(error) => write!(f, "Failure publication settlement failed: {error}"),
+            Self::Request(error) => write!(f, "Failure publication request failed: {error}"),
+            #[cfg(test)]
+            Self::Open(error) => write!(
+                f,
+                "Failure fixture open summary operation failed: {error:?}"
+            ),
+            #[cfg(test)]
+            Self::HostCall(error) => {
+                write!(f, "Failure fixture host-call operation failed: {error}")
+            }
+        }
+    }
+}
+impl std::error::Error for FailurePublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Driver(error) => Some(error),
+            Self::Runtime(error) => Some(error),
+            Self::Settlement(error) => Some(error),
+            Self::Request(error) => Some(error),
+            #[cfg(test)]
+            Self::HostCall(error) => Some(error),
+            #[cfg(test)]
+            Self::Open(_) => None,
+            Self::WrongOwner
+            | Self::AlreadyOwned
+            | Self::NotStarted
+            | Self::NotDrained
+            | Self::UnknownTask
+            | Self::Projection(_) => None,
+        }
+    }
 }
 /// Visits count actual mailbox classes, including empty ones. Taking a neutral
 /// message neither retires its input receipt nor claims any source/R exit.
@@ -76,6 +132,9 @@ pub(crate) struct ScopePublicationsDrained<'a> {
     session: &'a FailurePublicationSession<WorkerActor>,
 }
 impl ScopePublicationsDrained<'_> {
+    pub(crate) fn registration(&self) -> &novarocks_control_runtime::driver::ActorRegistration {
+        self.session.registration()
+    }
     pub(crate) fn validate_scope(
         &self,
         runtime: &ActorRuntime<WorkerActor>,
@@ -107,14 +166,18 @@ enum Phase {
     Tasks(Option<TaskIdentity>),
     TaskProjection(TaskIdentity),
     Barrier(TaskIdentity),
-    Requests(Option<WorkId>),
-    Reply(WorkId),
+    Requests(Option<ScopedWorkRef>),
+    Reply(ScopedWorkRef),
     Batches(Option<InputId>),
     Effects {
         input: InputId,
         after: Option<ActionId>,
     },
     Reservations(InputId),
+    DomainWakes {
+        after: Option<ScopedWorkRef>,
+        until: Option<ScopedWorkRef>,
+    },
     Drained,
 }
 
@@ -122,8 +185,9 @@ enum Phase {
 /// the original refused publication value, not a second protocol/exit ledger.
 #[must_use = "The original failure action stays Started through supervised cleanup"]
 pub(super) struct ScopeFailureOwner {
-    session: FailurePublicationSession<WorkerActor>,
+    session: Option<FailurePublicationSession<WorkerActor>>,
     ticket: Option<EffectTicket<WorkerAction>>,
+    cold: Option<cold::ColdFailureCleanup>,
     phase: Phase,
     pending_projection: Option<Arc<TaskProjection>>,
     pending_projection_task: Option<TaskIdentity>,
@@ -132,7 +196,7 @@ pub(super) struct ScopeFailureOwner {
     physical: Option<(FailurePhysicalPurpose, super::failure_tail::FailureTail)>,
     completed_tail_input: Option<InputId>,
     // Cursor over the original R map, not a second input ownership index.
-    refused_request_input_after: Option<WorkId>,
+    refused_request_input_after: Option<ScopedWorkRef>,
     cleanup_bindings: CleanupBindingCursor,
 }
 enum CleanupBindingCursor {
@@ -148,15 +212,40 @@ enum FailurePhysicalPurpose {
     FinalCarrier,
 }
 impl ScopeFailureOwner {
-    pub(super) fn is_drained(&self) -> bool {
-        matches!(self.phase, Phase::Drained)
+    fn session(&self) -> Result<&FailurePublicationSession<WorkerActor>, FailurePublicationError> {
+        self.session
+            .as_ref()
+            .ok_or(FailurePublicationError::NotStarted)
     }
-    fn drained(&self) -> Result<ScopePublicationsDrained<'_>, FailurePublicationError> {
+    fn session_mut(
+        &mut self,
+    ) -> Result<&mut FailurePublicationSession<WorkerActor>, FailurePublicationError> {
+        self.session
+            .as_mut()
+            .ok_or(FailurePublicationError::NotStarted)
+    }
+    fn close_session(&mut self) -> Result<(), FailurePublicationError> {
+        let Some(session) = self.session.take() else {
+            return Ok(());
+        };
+        if let Err((error, original)) = session.finish() {
+            self.session = Some(original);
+            return Err(FailurePublicationError::Driver(error));
+        }
+        Ok(())
+    }
+    pub(super) fn publication_active(&self) -> bool {
+        self.session.is_some()
+    }
+    pub(super) fn is_drained(&self) -> bool {
+        matches!(self.phase, Phase::DomainWakes { .. } | Phase::Drained)
+    }
+    pub(super) fn drained(&self) -> Result<ScopePublicationsDrained<'_>, FailurePublicationError> {
         if !self.is_drained() {
             return Err(FailurePublicationError::NotDrained);
         }
         Ok(ScopePublicationsDrained {
-            session: &self.session,
+            session: self.session()?,
         })
     }
     fn advance(
@@ -164,7 +253,7 @@ impl ScopeFailureOwner {
         host: &mut ContextHostRecord,
         budget: usize,
     ) -> Result<bool, FailurePublicationError> {
-        self.session
+        self.session()?
             .matches_actor_runtime(&host.control_runtime, host.actor)
             .map_err(FailurePublicationError::Driver)?
             .then_some(())
@@ -208,7 +297,10 @@ impl ScopeFailureOwner {
                                 .map_err(FailurePublicationError::Projection)?,
                         ),
                     };
-                    match self.session.commit_snapshot(port.publication(), next) {
+                    match self
+                        .session_mut()?
+                        .commit_snapshot(port.publication(), next)
+                    {
                         Ok(old) => {
                             // Failure projection preserves the same rich
                             // accepted Arc in the newly published snapshot.
@@ -234,14 +326,17 @@ impl ScopeFailureOwner {
                         && !completion.settlement_barrier_committed()
                     {
                         completion
-                            .commit_failure_settlement_barrier(&mut self.session, &task_host.port())
+                            .commit_failure_settlement_barrier(
+                                self.session_mut()?,
+                                &task_host.port(),
+                            )
                             .map_err(FailurePublicationError::Settlement)?;
                     }
                     self.phase = Phase::Tasks(Some(task));
                 }
                 Phase::Requests(after) => {
                     let lower = after.map_or(Unbounded, Excluded);
-                    let Some((&work, original)) =
+                    let Some((&work, _original)) =
                         host.resources.requests.range_mut((lower, Unbounded)).next()
                     else {
                         self.phase = Phase::Batches(None);
@@ -250,11 +345,13 @@ impl ScopeFailureOwner {
                     self.phase = Phase::Reply(work);
                 }
                 Phase::Reply(work) => {
+                    host.withdraw_failed_unfilled_request(work, self.session()?)
+                        .map_err(FailurePublicationError::Request)?;
                     // R may have genuinely retired after our row visit. It
                     // then has no remaining outbox obligation to publish.
                     if let Some(original) = host.resources.requests.get_mut(&work) {
                         original
-                            .publish_owner_failure(&mut self.session)
+                            .publish_owner_failure(self.session_mut()?)
                             .map_err(FailurePublicationError::Request)?;
                     }
                     self.phase = Phase::Requests(Some(work));
@@ -280,7 +377,14 @@ impl ScopeFailureOwner {
                         // action. No payload was dropped or exit invented.
                         // The neutral dispatch index is still paid and stays
                         // with this Context until its own bounded teardown.
-                        self.phase = Phase::Drained;
+                        self.phase = Phase::DomainWakes {
+                            after: None,
+                            until: host
+                                .resources
+                                .requests
+                                .last_key_value()
+                                .map(|(&work, _)| work),
+                        };
                     }
                 }
                 Phase::Effects { input, after } => {
@@ -339,10 +443,31 @@ impl ScopeFailureOwner {
                         self.phase = Phase::Batches(Some(input));
                     }
                 }
+                Phase::DomainWakes { after, until } => {
+                    // Publication really drained before this finite pass. A
+                    // reply wake may already have run before the stage existed.
+                    // Address only this Context's original, frozen R inventory.
+                    let next = until.and_then(|until| {
+                        host.resources
+                            .requests
+                            .range((after.map_or(Unbounded, Excluded), Included(until)))
+                            .next()
+                            .map(|(&work, _)| work)
+                    });
+                    if let Some(work) = next {
+                        host.notify_failed_domain_request(work);
+                        self.phase = Phase::DomainWakes {
+                            after: Some(work),
+                            until,
+                        };
+                    } else {
+                        self.phase = Phase::Drained;
+                    }
+                }
                 Phase::Drained => return Ok(true),
             }
         }
-        Ok(self.is_drained())
+        Ok(matches!(self.phase, Phase::Drained))
     }
 }
 
@@ -357,7 +482,7 @@ impl ContextHostRecord {
         let error = if self.resources.failure.is_some() {
             Some(FailurePublicationError::AlreadyOwned)
         } else if ticket.actor != self.actor
-            || ticket.descriptor.work != self.resources.roles[FAILURE].work.id()
+            || ticket.descriptor.work != self.resources.roles[FAILURE].work.reference()
             || !matches!(ticket.effect, WorkerAction::OwnerFailed { scope, .. } if scope == self.scope().id())
         {
             Some(FailurePublicationError::WrongOwner)
@@ -389,8 +514,9 @@ impl ContextHostRecord {
             }
         };
         self.resources.failure = Some(ScopeFailureOwner {
-            session,
+            session: Some(session),
             ticket: Some(ticket),
+            cold: None,
             phase: Phase::Tasks(None),
             pending_projection: None,
             pending_projection_task: None,
@@ -488,6 +614,7 @@ impl ContextHostRecord {
     /// Borrow the stage produced by this original Context's completed scope
     /// publication traversal. Its live failure Work is revalidated; a caller
     /// cannot construct this authority from a failed flag or one Task value.
+    #[cfg(test)]
     pub(crate) fn failure_publication_stage(
         &self,
     ) -> Result<ScopePublicationsDrained<'_>, FailurePublicationError> {
@@ -514,7 +641,12 @@ impl ContextHostRecord {
         self.resources
             .internal
             .discard_failed_hint(&stage)
-            .map_err(FailurePublicationError::Driver)
+            .map_err(FailurePublicationError::Driver)?;
+        // The actual failed-source admission has now closed. This is also
+        // the teardown gate for existing observations; waiting for a future
+        // Root RemoveHost here would depend on our own execution retirement.
+        self.resources.control_admission_closed = true;
+        Ok(())
     }
     pub(crate) fn failure_publications_drained(&self) -> bool {
         self.resources
@@ -558,7 +690,13 @@ impl ContextHostRecord {
         stage
             .validate(&self.control_runtime, self.actor)
             .map_err(super::ContextDriverError::Driver)?;
-        if let Some(ticket) = self.resources.pending_host_jobs.driver_close.take() {
+        for index in 0..self.resources.pending_host_jobs.close_fanouts.len() {
+            let Some(ticket) = self.resources.pending_host_jobs.close_fanouts[index]
+                .ticket
+                .take()
+            else {
+                continue;
+            };
             let WorkerAction::Context(
                 novarocks_worker_protocol::context::ContextEffect::CloseExternalAdmission {
                     reason,
@@ -566,39 +704,25 @@ impl ContextHostRecord {
                 },
             ) = ticket.effect
             else {
-                self.resources.pending_host_jobs.driver_close = Some(ticket);
+                self.resources.pending_host_jobs.close_fanouts[index].ticket = Some(ticket);
                 return Err(super::ContextDriverError::WrongOwner);
             };
+            let gate = self.resources.pending_host_jobs.close_fanouts[index]
+                .gate
+                .clone();
             if let Err(refusal) =
-                self.handoff_failed_context_admission_close(ticket, reason, ports, stage)
+                self.handoff_failed_context_admission_close(ticket, reason, ports, stage, gate)
             {
-                self.resources.pending_host_jobs.driver_close = refusal.ticket;
+                self.resources.pending_host_jobs.close_fanouts[index].ticket = refusal.ticket;
                 return Err(super::ContextDriverError::Task(refusal.error));
             }
         }
-        if self.resources.pending_host_jobs.root_release_finished {
-            if let Some(ticket) = self.resources.pending_host_jobs.driver_seal.take()
-                && let Err(refusal) = self.complete_host_effect(ticket)
-            {
-                self.resources.pending_host_jobs.driver_seal = Some(refusal.ticket);
-                return Err(super::ContextDriverError::Driver(refusal.error));
-            }
-            if self.tasks.is_empty() && self.task_driver.is_idle() {
-                self.resources
-                    .host_jobs
-                    .as_ref()
-                    .ok_or(super::ContextDriverError::WrongOwner)?
-                    .request_failed_release(stage)
-                    .map_err(super::ContextDriverError::Host)?;
-                // ReleaseHost means the original R accepted its instruction;
-                // R's actual body/report/header still drain independently.
-                if let Some(ticket) = self.resources.pending_host_jobs.driver_release.take()
-                    && let Err(refusal) = self.complete_host_effect(ticket)
-                {
-                    self.resources.pending_host_jobs.driver_release = Some(refusal.ticket);
-                    return Err(super::ContextDriverError::Driver(refusal.error));
-                }
-            }
+        if self.resources.pending_host_jobs.root_release_finished
+            && let Some(ticket) = self.resources.pending_host_jobs.driver_seal.take()
+            && let Err(refusal) = self.complete_host_effect(ticket)
+        {
+            self.resources.pending_host_jobs.driver_seal = Some(refusal.ticket);
+            return Err(super::ContextDriverError::Driver(refusal.error));
         }
         Ok(())
     }
@@ -670,6 +794,7 @@ impl ContextHostRecord {
     }
     /// Borrow both original owners together. Failure publication and execution
     /// exit remain separate proofs; this method calls no host or destructor.
+    #[cfg(test)]
     pub(crate) fn take_failed_retire_borrowing_job(
         &self,
         task: TaskIdentity,
@@ -688,6 +813,7 @@ impl ContextHostRecord {
     }
     /// Access the original Task's unfilled open segment only after this exact
     /// Context has finished its actual scope-wide failure publication stage.
+    #[cfg(test)]
     pub(crate) fn take_failed_task_open(
         &mut self,
         task: TaskIdentity,
@@ -727,7 +853,8 @@ impl ContextHostRecord {
         assert!(self.resources.request_partials.is_empty());
         assert!(
             original
-                .session
+                .session()
+                .unwrap()
                 .matches_actor_runtime(&self.control_runtime, self.actor)
                 .unwrap()
         );

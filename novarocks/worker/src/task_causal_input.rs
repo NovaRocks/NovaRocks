@@ -18,9 +18,11 @@
 //! A paid causal role can hand off a predecessor summary and its event even
 //! while the predecessor's host effects still retain their original batch.
 
+#[cfg(test)]
+use novarocks_control_runtime::driver::InputRoleId;
 use novarocks_control_runtime::{
     actor::Actor,
-    driver::{ActorRuntime, DriverError, InputRole, InputRoleId},
+    driver::{ActorRegistration, ActorRuntime, DriverError, InputAuthor, InputRole},
     lease::WorkLease,
 };
 use novarocks_control_runtime_core::{
@@ -49,42 +51,20 @@ pub(crate) struct CausalInputRole<A: Actor> {
     event: InputRole<A>,
 }
 impl<A: Actor> CausalInputRole<A> {
-    /// Called by admission before attaching any payload or capture. The common
-    /// runtime moves the class charges intact into persistent role positions.
-    pub(crate) fn reserve(
-        runtime: &ActorRuntime<A>,
-        target: ActorId,
-        source: ActorId,
-        class: InputClass,
-    ) -> Result<Self, DriverError> {
-        Self::reserve_with_author(runtime, target, source, class, None)
-    }
-    /// Cross-scope RPC routing must present the original Context-local Work,
-    /// rather than a numeric WorkId that may also exist in the Root scope.
+    /// Both positions are issued for the original target incarnation and the
+    /// actual already admitted producer Work, including a process-scope R.
     pub(crate) fn reserve_admitted(
         runtime: &ActorRuntime<A>,
-        target: ActorId,
+        target: &ActorRegistration,
         source: ActorId,
         class: InputClass,
         author: &WorkLease,
     ) -> Result<Self, DriverError> {
-        Self::reserve_with_author(runtime, target, source, class, Some(author))
-    }
-    fn reserve_with_author(
-        runtime: &ActorRuntime<A>,
-        target: ActorId,
-        source: ActorId,
-        class: InputClass,
-        author: Option<&WorkLease>,
-    ) -> Result<Self, DriverError> {
         assert!(
             class != InputClass::Timer,
-            "causal roles cannot consume the actor's timer position"
+            "causal roles cannot consume the actor timer"
         );
-        let reserve = |class| match author {
-            Some(author) => runtime.reserve_admitted_input(target, source, class, author),
-            None => runtime.reserve_input(target, source, class),
-        };
+        let reserve = |class| runtime.reserve_admitted_input_for(target, source, class, author);
         let predecessor = reserve(InputClass::Lifecycle)?;
         let event = match reserve(class) {
             Ok(event) => event,
@@ -117,6 +97,12 @@ impl<A: Actor> CausalInputRole<A> {
         };
         Ok(Self { predecessor, event })
     }
+    /// Read only the original event position's actual producer/financial
+    /// binding. It grants no additional Work, reply cell or consumed fact.
+    pub(crate) fn event_author(&self) -> Result<InputAuthor, DriverError> {
+        self.event.author()
+    }
+    #[cfg(test)]
     pub(crate) fn positions(&self) -> [InputRoleId; CAUSAL_INPUT_POSITIONS] {
         [self.predecessor.id(), self.event.id()]
     }
@@ -172,6 +158,11 @@ impl<A: Actor> CausalInputRole<A> {
                 });
             }
         }
+        // These positions already own their original producer proofs. A
+        // physical callback may have exited after queuing its completion fact;
+        // delivery does not borrow new active-work authority from that body.
+        // Each prefix keeps its own original position identity. The event's
+        // proof remains exactly the one used by the RPC once-only reply cell.
         let predecessor = if let Some(value) = predecessor {
             match self.predecessor.fill(value) {
                 Ok(input) => Some(input),
@@ -213,13 +204,13 @@ mod tests {
     use super::*;
     use novarocks_control_runtime::{
         actor::{ActorConfig, StepContext},
-        lease::{CapacityBundle, WorkLease},
+        lease::{ReservationBundle, WorkLease},
         transaction::{RuntimeLedger, ScopeHandle},
     };
     use novarocks_control_runtime_core::{
         capacity::ResourceVector,
         effect::{EffectDescriptor, EffectKind},
-        identity::{ActionId, DimensionId, Generation, ScopeId, Tick, WorkId},
+        identity::{ActionId, DimensionId, Generation, ScopeId, Tick},
         mailbox::InputEnvelope,
         scope::{WorkAdmission, WorkKind},
     };
@@ -239,7 +230,9 @@ mod tests {
                 step.effect(
                     EffectDescriptor {
                         id: ActionId::new(1).unwrap(),
-                        work: WorkId::new(1).unwrap(),
+                        work: step
+                            .input_work()
+                            .expect("the original admitted role authors this effect"),
                         kind: EffectKind::Cleanup,
                         dependencies: vec![],
                     },
@@ -263,19 +256,29 @@ mod tests {
         ledger: RuntimeLedger,
         scope: ScopeHandle,
         work: WorkLease,
-        capacity: CapacityBundle,
+        capacity: ReservationBundle,
         runtime: ActorRuntime<Receiver>,
+        registration: novarocks_control_runtime::driver::ActorRegistration,
     }
     fn fixture(control: usize) -> Fixture {
         let resources = ResourceVector::new([(DimensionId::new(1).unwrap(), 3)]).unwrap();
-        let ledger = RuntimeLedger::new(resources.clone(), 1, 1);
+        let ledger = RuntimeLedger::new(resources.clone());
         let scope = ledger
-            .open_scope_next(None, Generation::new(1).unwrap(), 1, 1)
+            .open_scope_next(None, Generation::new(1).unwrap())
             .unwrap();
         let (mut work, capacity) = scope
             .reserve_next(
                 Generation::new(1).unwrap(),
-                resources,
+                novarocks_control_runtime_core::capacity::ReservationResources::new(
+                    resources,
+                    novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                        work_headers: 1,
+                        inputs: 2,
+                        batches: 2,
+                        effects: 2,
+                        ..Default::default()
+                    },
+                ),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -283,9 +286,9 @@ mod tests {
             .bind(WorkKind::Cleanup)
             .unwrap();
         work.start().unwrap();
-        let runtime = ActorRuntime::new(1);
-        runtime
-            .register_next(
+        let runtime = ActorRuntime::new();
+        let registration = runtime
+            .register_supervised_bound(
                 actor(),
                 scope.clone(),
                 Receiver::default(),
@@ -297,6 +300,7 @@ mod tests {
                     turn_budget: 12,
                     max_step_work: 2,
                 },
+                &work,
             )
             .unwrap();
         Fixture {
@@ -305,6 +309,7 @@ mod tests {
             work,
             capacity,
             runtime,
+            registration,
         }
     }
     impl Fixture {
@@ -313,8 +318,9 @@ mod tests {
             self.work.captures_exited().unwrap();
             self.ledger.reap_scope_ready(self.scope.id(), 1).unwrap();
             self.capacity
-                .release(&self.capacity.resources().unwrap())
+                .release_quota(&self.capacity.resources().unwrap().quota)
                 .unwrap();
+            self.capacity.finish().unwrap();
             self.scope.close_external().unwrap();
             while let Some(original_host_turn) = self.runtime.claim_host_actor() {
                 original_host_turn.release(false).unwrap();
@@ -328,8 +334,14 @@ mod tests {
     #[test]
     fn event_core_consumption_does_not_wait_for_the_predecessors_actual_host_cleanup() {
         let f = fixture(2);
-        let mut role =
-            CausalInputRole::reserve(&f.runtime, actor(), source(), InputClass::Control).unwrap();
+        let mut role = CausalInputRole::reserve_admitted(
+            &f.runtime,
+            &f.registration,
+            source(),
+            InputClass::Control,
+            &f.work,
+        )
+        .unwrap();
         assert_ne!(role.positions()[0], role.positions()[1]);
         let (prefix, event) = role.fill(Some(1), 2).unwrap();
         let other = f
@@ -381,14 +393,26 @@ mod tests {
             .reserve_input(actor(), source(), InputClass::Control)
             .unwrap();
         assert!(matches!(
-            CausalInputRole::reserve(&f.runtime, actor(), source(), InputClass::Control),
+            CausalInputRole::reserve_admitted(
+                &f.runtime,
+                &f.registration,
+                source(),
+                InputClass::Control,
+                &f.work
+            ),
             Err(DriverError::InputCapacity)
         ));
         assert_eq!(f.runtime.snapshot(actor()).unwrap().inputs, 1);
         assert_eq!(f.runtime.snapshot(actor()).unwrap().roles, 0);
         held.revoke_unused().unwrap();
-        let mut role =
-            CausalInputRole::reserve(&f.runtime, actor(), source(), InputClass::Control).unwrap();
+        let mut role = CausalInputRole::reserve_admitted(
+            &f.runtime,
+            &f.registration,
+            source(),
+            InputClass::Control,
+            &f.work,
+        )
+        .unwrap();
         role.close_after_exit().unwrap();
         assert!(f.finish().is_empty());
     }

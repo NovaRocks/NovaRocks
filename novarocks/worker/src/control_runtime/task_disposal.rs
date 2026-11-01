@@ -27,14 +27,14 @@ use crate::{control_runtime_policy::StorageNeed, task_port::TaskPendingNotice};
 use novarocks_control_runtime::{
     driver::{ActorRuntime, DriverError, EffectTicket},
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
-    lease::{CapacityBundle, WorkRetirementObserver},
-    reported_work::ReportedWork,
+    lease::WorkRetirementObserver,
+    reported_work::{ReportedWork, ReportedWorkBindingError},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
     completion::Consumption,
     identity::{ActorId, ConsumerId, Generation, ScopeId, WorkId},
+    owned_storage::OwnedSlotNeed,
     scope::ScopeError,
 };
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
@@ -45,47 +45,6 @@ use novarocks_execution_contract::{
 use novarocks_worker_protocol::{context::ContextEffect, creation::PayloadId};
 use std::sync::{Arc, Mutex};
 
-/// Derive the one prepaid disposal sibling from the actual Context lifetime.
-pub(crate) fn admit_disposal_work(
-    parent: &novarocks_control_runtime::lease::WorkLease,
-) -> Result<ReportedWork, RuntimeError> {
-    use novarocks_control_runtime_core::{
-        completion::ConsumerKind,
-        scope::{WorkAdmission, WorkKind},
-    };
-    let scope = parent.scope();
-    let generation = scope.gates()?.generation;
-    let guard = scope.reserve_next(
-        generation,
-        ResourceVector::default(),
-        WorkKind::Cleanup,
-        WorkAdmission::Derived(parent.id()),
-    )?;
-    let report = novarocks_control_runtime::completion::ReportSlot::reserve_next(
-        scope,
-        generation,
-        guard.work_id(),
-        2,
-        [(ConsumerId::new(2).unwrap(), ConsumerKind::Observer)],
-    )?;
-    let (work, capacity) = match guard.bind(WorkKind::Cleanup) {
-        Ok(bound) => bound,
-        Err(error) => {
-            report.revoke_unused().expect("unbound disposal report");
-            report.body_exited().expect("unbound disposal body");
-            report.captures_exited().expect("unbound disposal captures");
-            assert!(
-                report
-                    .try_retire()
-                    .expect("unbound disposal report retirement")
-            );
-            return Err(error);
-        }
-    };
-    Ok(super::admitted_role::adopt_reported_work(
-        work, capacity, report,
-    ))
-}
 pub(crate) const TASK_DISPOSAL_STORAGE: StorageNeed = StorageNeed {
     work: 1,
     completions: 1,
@@ -114,10 +73,39 @@ pub(crate) enum TaskDisposalError {
     Driver(DriverError),
     Exit(ExitRoleError),
     WrongOwner,
-    WrongPayment,
+    WrongStorage,
+    StorageBinding(ReportedWorkBindingError),
     AlreadyIssued,
-    AwaitingFailurePublication,
 }
+impl std::fmt::Display for TaskDisposalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runtime(error) => write!(f, "Task disposal runtime failure: {error}"),
+            Self::Driver(error) => write!(f, "Task disposal driver failure: {error}"),
+            Self::Exit(error) => write!(f, "Task disposal exit failure: {error}"),
+            Self::WrongOwner => f.write_str("Task disposal has a different original owner"),
+            Self::WrongStorage => {
+                f.write_str("Task disposal has a different original storage profile")
+            }
+            Self::StorageBinding(error) => {
+                write!(f, "Task disposal storage binding failed: {error}")
+            }
+            Self::AlreadyIssued => f.write_str("Task disposal was already issued"),
+        }
+    }
+}
+impl std::error::Error for TaskDisposalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(error) => Some(error),
+            Self::Driver(error) => Some(error),
+            Self::Exit(error) => Some(error),
+            Self::StorageBinding(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 impl From<RuntimeError> for TaskDisposalError {
     fn from(e: RuntimeError) -> Self {
         Self::Runtime(e)
@@ -133,30 +121,6 @@ impl From<ExitRoleError> for TaskDisposalError {
         Self::Exit(e)
     }
 }
-#[must_use]
-pub(crate) enum TaskDisposalPayment {
-    Paid(CapacityBundle),
-    #[cfg(test)]
-    ProtocolModel,
-}
-impl TaskDisposalPayment {
-    pub(crate) fn split_from(
-        payer: &mut CapacityBundle,
-        #[cfg(test)] model: bool,
-    ) -> Result<Self, RuntimeError> {
-        #[cfg(test)]
-        if model {
-            return Ok(Self::ProtocolModel);
-        }
-        payer
-            .split_next(
-                &TASK_DISPOSAL_STORAGE
-                    .resources()
-                    .expect("fixed original Task disposal fee"),
-            )
-            .map(Self::Paid)
-    }
-}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Permission {
     Normal(Generation),
@@ -165,9 +129,9 @@ enum Permission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Handoff {
     Available,
+    AwaitingFailurePublication,
     Authorized(Permission),
     Issued,
-    AwaitingFailurePublication,
     Withdrawn,
     Exited,
     Unresolved,
@@ -175,7 +139,6 @@ enum Handoff {
 struct State {
     handoff: Handoff,
     authority: Option<ExitAuthority>,
-    payment: Option<CapacityBundle>,
 }
 struct Custody {
     task: TaskIdentity,
@@ -217,15 +180,13 @@ pub(crate) struct TaskDisposalJob {
     authority: Option<ExitAuthority>,
 }
 pub(crate) struct TaskDisposalAdmissionRefusal {
-    pub error: TaskDisposalError,
-    pub original: ReportedWork,
-    pub payment: TaskDisposalPayment,
+    pub _original_error: TaskDisposalError,
+    pub _original_work: ReportedWork,
 }
 impl TaskDisposalRole {
     pub(crate) fn from_admitted(
         binding: TaskDisposalBinding,
         original: ReportedWork,
-        mut payment: TaskDisposalPayment,
     ) -> Result<Self, Box<TaskDisposalAdmissionRefusal>> {
         let TaskDisposalBinding {
             runtime,
@@ -234,37 +195,28 @@ impl TaskDisposalRole {
             pending,
             health,
         } = binding;
-        let (work, capacity, report) = original.into_parts();
-        let header = capacity.resources();
-        let original = super::admitted_role::adopt_reported_work(work, capacity, report);
         let checked = (|| -> Result<(), TaskDisposalError> {
-            if header? != ResourceVector::default() {
-                return Err(TaskDisposalError::WrongPayment);
+            let profile = original
+                .bound_storage_profile()
+                .map_err(TaskDisposalError::StorageBinding)?;
+            let expected = OwnedSlotNeed {
+                work_headers: 1,
+                completions: 1,
+                captures: 1,
+                ..OwnedSlotNeed::default()
+            };
+            if profile != expected {
+                return Err(TaskDisposalError::WrongStorage);
             }
             if !runtime.owns_scope(actor, original.work().scope())? {
                 return Err(TaskDisposalError::WrongOwner);
-            }
-            match &mut payment {
-                TaskDisposalPayment::Paid(fee) => {
-                    if fee.resources()?
-                        != TASK_DISPOSAL_STORAGE
-                            .resources()
-                            .expect("fixed original fee")
-                    {
-                        return Err(TaskDisposalError::WrongPayment);
-                    }
-                    fee.transfer(original.work())?;
-                }
-                #[cfg(test)]
-                TaskDisposalPayment::ProtocolModel => {}
             }
             Ok(())
         })();
         if let Err(error) = checked {
             return Err(Box::new(TaskDisposalAdmissionRefusal {
-                error,
-                original,
-                payment,
+                _original_error: error,
+                _original_work: original,
             }));
         }
         let scope = original.work().scope().clone();
@@ -272,11 +224,6 @@ impl TaskDisposalRole {
         let retirement = original.work().retirement_observer();
         let report = original.report().clone();
         let (role, authority) = ExitRole::from_admitted(original);
-        let payment = match payment {
-            TaskDisposalPayment::Paid(p) => Some(p),
-            #[cfg(test)]
-            TaskDisposalPayment::ProtocolModel => None,
-        };
         Ok(Self(Arc::new(Custody {
             task,
             actor,
@@ -289,7 +236,6 @@ impl TaskDisposalRole {
             state: Mutex::new(State {
                 handoff: Handoff::Available,
                 authority: Some(authority),
-                payment,
             }),
             pending,
             health,
@@ -396,15 +342,7 @@ impl TaskDisposalRole {
             && self.0.role.captures_exited()
     }
     pub(crate) fn is_retired(&self) -> bool {
-        self.0.role.phase() == ExitRolePhase::Retired
-            && self.0.retirement.is_retired()
-            && self
-                .0
-                .state
-                .lock()
-                .expect("Task disposal fee")
-                .payment
-                .is_none()
+        self.0.role.phase() == ExitRolePhase::Retired && self.0.retirement.is_retired()
     }
     pub(crate) fn advance_retirement(
         &self,
@@ -432,14 +370,6 @@ impl TaskDisposalRole {
             progress |= before != self.0.role.phase();
         }
         progress |= ledger.reap_scope_ready(self.0.scope.id(), 1)? != 0;
-        if self.0.role.phase() == ExitRolePhase::Retired && self.0.retirement.is_retired() {
-            let mut state = self.0.state.lock().expect("original Task disposal refund");
-            if let Some(payment) = &mut state.payment {
-                payment.release(&payment.resources()?)?;
-                state.payment.take();
-                progress = true;
-            }
-        }
         Ok(progress)
     }
     pub(crate) fn retire_unused(&self, ledger: &RuntimeLedger) -> Result<bool, TaskDisposalError> {

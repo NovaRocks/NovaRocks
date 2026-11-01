@@ -31,7 +31,6 @@ pub enum FairQueueError {
     DuplicateWork,
     UnknownWork,
     WrongRunningWork,
-    ContextCapacity,
     OrderExhausted,
 }
 #[derive(Debug)]
@@ -73,7 +72,6 @@ enum Discipline {
 /// `eligible_fifo` constructor instead preserves each head's enqueue priority.
 #[derive(Debug)]
 pub struct FairWorkQueue<G = ScopeId, W = WorkId> {
-    max_groups: usize,
     max_work: usize,
     per_group: usize,
     groups: BTreeMap<G, GroupQueue<W>>,
@@ -85,22 +83,16 @@ pub struct FairWorkQueue<G = ScopeId, W = WorkId> {
     discipline: Discipline,
 }
 impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
-    pub fn new(max_groups: usize, max_work: usize, per_group: usize) -> Self {
-        Self::with_discipline(max_groups, max_work, per_group, Discipline::RoundRobin)
+    pub fn new(max_work: usize, per_group: usize) -> Self {
+        Self::with_discipline(max_work, per_group, Discipline::RoundRobin)
     }
     /// Select the oldest enqueued head among groups without a running item.
     /// Finishing a body restores its queued head's original priority.
-    pub fn eligible_fifo(max_groups: usize, max_work: usize, per_group: usize) -> Self {
-        Self::with_discipline(max_groups, max_work, per_group, Discipline::EligibleFifo)
+    pub fn eligible_fifo(max_work: usize, per_group: usize) -> Self {
+        Self::with_discipline(max_work, per_group, Discipline::EligibleFifo)
     }
-    fn with_discipline(
-        max_groups: usize,
-        max_work: usize,
-        per_group: usize,
-        discipline: Discipline,
-    ) -> Self {
+    fn with_discipline(max_work: usize, per_group: usize, discipline: Discipline) -> Self {
         Self {
-            max_groups,
             max_work,
             per_group,
             groups: BTreeMap::new(),
@@ -126,9 +118,6 @@ impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
         }
         if self.work.len() >= self.max_work {
             return Err(FairQueueError::Full);
-        }
-        if !self.groups.contains_key(&group) && self.groups.len() >= self.max_groups {
-            return Err(FairQueueError::ContextCapacity);
         }
         if let Some(queue) = self.groups.get(&group) {
             if queue.queued + usize::from(queue.running.is_some()) >= self.per_group {

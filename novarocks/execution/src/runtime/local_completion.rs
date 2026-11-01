@@ -25,13 +25,14 @@ use novarocks_control_runtime::{
     completion::ReportSlot,
     continuation::{ContinuationPhase, ContinuationSlot, InvocationResult, RegistrationToken},
     exit_role::{ExitAuthority, ExitRole, ExitRolePhase as Phase},
-    lease::{CapacityBundle, WorkLease},
-    transaction::{RuntimeLedger, ScopeHandle},
+    lease::{ReservationBundle, WorkLease},
+    transaction::{RoleSpec, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     completion::ConsumerKind,
-    identity::{ConsumerId, DimensionId, Generation},
+    identity::{ConsumerId, Generation},
+    owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
 };
 use novarocks_execution_contract::{
@@ -135,29 +136,37 @@ impl SettlementCapability<ExecutionFailure> for Registration {
 fn consumer() -> ConsumerId {
     ConsumerId::new(1).unwrap()
 }
-fn resources() -> ResourceVector {
-    ResourceVector::new([(DimensionId::new(1).unwrap(), 1)]).unwrap()
-}
-fn report(scope: &ScopeHandle, work: &WorkLease) -> ReportSlot {
-    ReportSlot::reserve_next(
-        scope,
-        Generation::new(1).unwrap(),
-        work.id(),
-        1,
-        [(consumer(), ConsumerKind::Observer)],
+fn resources() -> ReservationResources {
+    // One real role owns its header, reliable report and capture container.
+    // The three OnceRoles and sole continuation do not consume a global quota.
+    ReservationResources::new(
+        ResourceVector::default(),
+        OwnedSlotNeed {
+            work_headers: 1,
+            completions: 1,
+            captures: 1,
+            ..OwnedSlotNeed::default()
+        },
     )
-    .expect("one prepaid report per local completion role")
 }
 fn admit(
     scope: &ScopeHandle,
     admission: WorkAdmission,
     kind: WorkKind,
-) -> (WorkLease, CapacityBundle) {
-    scope
-        .reserve_next(Generation::new(1).unwrap(), resources(), kind, admission)
-        .expect("finite original local completion roles")
-        .bind(kind)
-        .expect("original local role holder")
+    resources: ReservationResources,
+) -> (WorkLease, ReservationBundle, ReportSlot) {
+    let mut guard = scope
+        .reserve_next(Generation::new(1).unwrap(), resources, kind, admission)
+        .expect("finite original local completion roles");
+    let report = ReportSlot::reserve_next(
+        &mut guard,
+        Generation::new(1).unwrap(),
+        1,
+        [(consumer(), ConsumerKind::Observer)],
+    )
+    .expect("one original completion position per local role");
+    let (work, capacity) = guard.bind(kind).expect("original local role holder");
+    (work, capacity, report)
 }
 impl LocalCompletionDriver {
     pub(crate) fn admit(
@@ -165,36 +174,32 @@ impl LocalCompletionDriver {
     ) -> (AdmittedFragmentRoles<ExecutionFailure>, Self) {
         // This geometry follows the three named OnceRoles and the sole child
         // continuation. It is unrelated to SQL data size or backend topology.
-        let ledger = RuntimeLedger::new(
-            ResourceVector::new([(DimensionId::new(1).unwrap(), RESPONSIBILITIES as u64)]).unwrap(),
-            RESPONSIBILITIES,
-            1,
-        );
+        let ledger = RuntimeLedger::new(ResourceVector::default());
         let scope = ledger
-            .open_scope_next(
-                None,
-                Generation::new(1).unwrap(),
-                RESPONSIBILITIES,
-                RESPONSIBILITIES,
-            )
+            .open_scope_next(None, Generation::new(1).unwrap())
             .unwrap();
-        let (finisher, finisher_capacity) =
-            admit(&scope, WorkAdmission::External, WorkKind::Cleanup);
-        let (child, child_capacity) = admit(
+        let (finisher, mut finisher_capacity, finisher_report) = admit(
             &scope,
-            WorkAdmission::Derived(finisher.id()),
-            WorkKind::Settlement,
+            WorkAdmission::External,
+            WorkKind::Cleanup,
+            resources()
+                .checked_add(&resources())
+                .expect("finisher and its one real child"),
         );
-        let child_report = report(&scope, &child);
-        let (settlement, token) = ContinuationSlot::from_admitted(
-            novarocks_control_runtime::reported_work::ReportedWork::try_new(
-                child,
-                child_capacity,
-                child_report.clone(),
+        let child = scope
+            .reserve_child_from(
+                &mut finisher_capacity,
+                &finisher,
+                RoleSpec {
+                    generation: Generation::new(1).unwrap(),
+                    kind: WorkKind::Settlement,
+                    resources: resources(),
+                    consumers: vec![(consumer(), ConsumerKind::Observer)],
+                },
             )
-            .unwrap(),
-        );
-        let finisher_report = report(&scope, &finisher);
+            .expect("one original settlement child from the finisher inventory");
+        let child_report = child.report().clone();
+        let (settlement, token) = ContinuationSlot::from_admitted(child);
         let make_role = |work, capacity, report: ReportSlot| {
             let (slot, authority) = ExitRole::from_admitted(
                 novarocks_control_runtime::reported_work::ReportedWork::try_new(
@@ -217,9 +222,13 @@ impl LocalCompletionDriver {
         let mut roles = vec![finisher];
         let mut authorities = vec![authority];
         for _ in 1..ROLES {
-            let (work, capacity) = admit(&scope, WorkAdmission::External, WorkKind::Cleanup);
-            let slot = report(&scope, &work);
-            let (role, authority) = make_role(work, capacity, slot);
+            let (work, capacity, report) = admit(
+                &scope,
+                WorkAdmission::External,
+                WorkKind::Cleanup,
+                resources(),
+            );
+            let (role, authority) = make_role(work, capacity, report);
             roles.push(role);
             authorities.push(authority);
         }
@@ -417,8 +426,9 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(driver.0.scope.snapshot().unwrap().work, ROLES);
         assert_eq!(
-            driver.0.ledger.used(DimensionId::new(1).unwrap()),
-            ROLES as u64
+            driver.0.scope.snapshot().unwrap().storage,
+            ROLES,
+            "the original OnceRoles still hold their actual completion reports"
         );
         work.completed();
         drop(wall_time);
@@ -491,7 +501,11 @@ mod tests {
         drop(wall_time);
         drop(publisher);
         assert_eq!(driver.0.scope.snapshot().unwrap().work, 2);
-        assert_eq!(driver.0.ledger.used(DimensionId::new(1).unwrap()), 2);
+        assert_eq!(
+            driver.0.scope.snapshot().unwrap().storage,
+            2,
+            "the unresolved continuation and its original parent keep their actual reports"
+        );
         assert!(!driver.0.scope.snapshot().unwrap().join_ready);
     }
 }

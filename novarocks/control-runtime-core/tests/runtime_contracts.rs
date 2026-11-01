@@ -19,20 +19,23 @@
 //! no clock, thread, executor, database fixture or cleanup is required.
 
 use novarocks_control_runtime_core::{
-    capacity::{CapacityError, CapacityLedger, ReservationRequest, ResourceVector},
+    capacity::{
+        CapacityError, CapacityLedger, ReservationRequest, ReservationResources, ResourceVector,
+    },
     completion::{CompletionSlot, ConsumerKind, Consumption},
     effect::{EffectBatchState, EffectDescriptor, EffectKind, EffectState},
     fair_queue::FairWorkQueue,
     history::{HistoryBuffer, HistoryError, HistoryFact},
     identity::*,
     mailbox::{InputClass, MailboxError, MailboxState},
-    scheduler::{ReadyQueue, TurnBudget},
+    owned_storage::{OwnedSlotNeed, OwnedStorageError},
+    scheduler::{ReadyQueue, SchedulerError, TurnBudget},
     scope::{ScopeError, ScopeState, WorkAdmission, WorkKind},
     timer::{TimerError, TimerIndex},
 };
 
 fn scope(id: u64) -> ScopeState {
-    ScopeState::new(ScopeId::new(id).unwrap(), None, generation(), 8, 8)
+    ScopeState::new(ScopeId::new(id).unwrap(), None, generation())
 }
 fn generation() -> Generation {
     Generation::new(1).unwrap()
@@ -52,12 +55,15 @@ fn dimension(id: u64) -> DimensionId {
 fn vector(values: &[(u64, u64)]) -> ResourceVector {
     ResourceVector::new(values.iter().map(|(id, amount)| (dimension(*id), *amount))).unwrap()
 }
+fn quota_partition(values: &[(u64, u64)]) -> ReservationResources {
+    ReservationResources::new(vector(values), OwnedSlotNeed::default())
+}
 fn request(id: u64, values: &[(u64, u64)]) -> ReservationRequest {
     ReservationRequest {
         id: ReservationId::new(id).unwrap(),
         generation: generation(),
         guard: work(id),
-        resources: vector(values),
+        resources: ReservationResources::for_work(vector(values)),
         admission: WorkAdmission::External,
         kind: WorkKind::Business,
     }
@@ -70,7 +76,7 @@ fn finish(scope: &mut ScopeState, id: WorkId) {
 
 #[test]
 fn bundle_failure_does_not_charge_any_dimension_or_publish_a_guard() {
-    let mut ledger = CapacityLedger::new(vector(&[(1, 2), (2, 10)]), 8);
+    let mut ledger = CapacityLedger::new(vector(&[(1, 2), (2, 10)]));
     let mut a = scope(1);
     let id = ledger
         .try_reserve_bundle(&mut a, request(1, &[(1, 1), (2, 9)]))
@@ -103,7 +109,7 @@ fn bundle_failure_does_not_charge_any_dimension_or_publish_a_guard() {
 
 #[test]
 fn bound_queued_payload_cannot_rollback_or_release_work_on_terminal() {
-    let mut ledger = CapacityLedger::new(vector(&[(1, 1), (2, 100)]), 8);
+    let mut ledger = CapacityLedger::new(vector(&[(1, 1), (2, 100)]));
     let mut s = scope(1);
     let id = ledger
         .try_reserve_bundle(&mut s, request(1, &[(1, 1), (2, 100)]))
@@ -118,20 +124,21 @@ fn bound_queued_payload_cannot_rollback_or_release_work_on_terminal() {
     assert_eq!(ledger.used(dimension(2)), 100);
     s.body_exited(work(1)).unwrap();
     assert_eq!(s.retire_work(work(1)), Err(ScopeError::ExitUnobserved));
-    ledger.release(id, &vector(&[(1, 1)])).unwrap();
+    ledger.release_quota(id, &vector(&[(1, 1)])).unwrap();
     assert_eq!(
         (ledger.used(dimension(1)), ledger.used(dimension(2))),
         (0, 100)
     );
     s.captures_exited(work(1)).unwrap();
-    ledger.release(id, &vector(&[(2, 100)])).unwrap();
+    ledger.release_quota(id, &vector(&[(2, 100)])).unwrap();
     s.retire_work(work(1)).unwrap();
+    ledger.finish(&s, id).unwrap();
     assert!(s.join_ready());
 }
 
 #[test]
 fn splitting_and_transfer_preserve_total_charge_and_exact_holder() {
-    let mut ledger = CapacityLedger::new(vector(&[(1, 2), (2, 100)]), 8);
+    let mut ledger = CapacityLedger::new(vector(&[(1, 2), (2, 100)]));
     let mut a = scope(1);
     let mut b = scope(2);
     let id = ledger
@@ -139,7 +146,9 @@ fn splitting_and_transfer_preserve_total_charge_and_exact_holder() {
         .unwrap();
     ledger.bind(&mut a, id, WorkKind::Business).unwrap();
     let retained = ReservationId::new(2).unwrap();
-    ledger.split(id, retained, &vector(&[(2, 100)])).unwrap();
+    ledger
+        .split(id, retained, &quota_partition(&[(2, 100)]))
+        .unwrap();
     b.admit(
         generation(),
         work(2),
@@ -150,11 +159,15 @@ fn splitting_and_transfer_preserve_total_charge_and_exact_holder() {
     ledger.transfer(retained, &b, work(2)).unwrap();
     assert_eq!(ledger.reservation(retained).unwrap().scope, b.id());
     assert_eq!(ledger.used(dimension(2)), 100);
-    ledger.release(id, &vector(&[(1, 1)])).unwrap();
+    ledger.release_quota(id, &vector(&[(1, 1)])).unwrap();
     finish(&mut a, work(1));
+    ledger.finish(&a, id).unwrap();
     assert_eq!(ledger.used(dimension(2)), 100);
-    ledger.release(retained, &vector(&[(2, 100)])).unwrap();
+    ledger
+        .release_quota(retained, &vector(&[(2, 100)]))
+        .unwrap();
     finish(&mut b, work(2));
+    ledger.finish(&b, retained).unwrap();
     assert_eq!(ledger.reservation_count(), 0);
 }
 
@@ -232,7 +245,7 @@ fn stopped_cleanup_bundle_cannot_be_rebound_as_business() {
     )
     .unwrap();
     s.request_stop();
-    let mut ledger = CapacityLedger::new(vector(&[(1, 2)]), 4);
+    let mut ledger = CapacityLedger::new(vector(&[(1, 2)]));
     let mut r = request(2, &[(1, 1)]);
     r.admission = WorkAdmission::Derived(work(1));
     r.kind = WorkKind::Cleanup;
@@ -343,7 +356,7 @@ fn revoked_unused_completion_still_waits_for_actual_exit() {
 
 #[test]
 fn ready_claim_coalesces_wakes_and_preserves_wake_during_turn_release() {
-    let mut q = ReadyQueue::new(2);
+    let mut q = ReadyQueue::new();
     q.register(actor(1)).unwrap();
     q.register(actor(2)).unwrap();
     for _ in 0..10 {
@@ -360,6 +373,55 @@ fn ready_claim_coalesces_wakes_and_preserves_wake_during_turn_release() {
     assert_eq!(q.claim(), Some(actor(1)));
     q.release(actor(1), false).unwrap();
     assert_eq!(q.claim(), None);
+    // Actor metadata follows actual registration rather than a global count.
+    for id in 3..=6 {
+        q.register(actor(id)).unwrap();
+        q.notify(actor(id)).unwrap();
+    }
+    assert_eq!(q.actor_count(), 6);
+    assert_eq!(q.register(actor(3)), Err(SchedulerError::DuplicateActor));
+    for id in 3..=6 {
+        assert_eq!(q.claim(), Some(actor(id)));
+        q.release(actor(id), false).unwrap();
+    }
+    assert_eq!(q.claim(), None);
+    // An independent metadata owner may cancel a queued middle address, but
+    // ordinary retirement still rejects it until the explicit cancellation.
+    for id in 3..=5 {
+        q.notify(actor(id)).unwrap();
+    }
+    assert_eq!(q.unregister(actor(4)), Err(SchedulerError::Busy));
+    q.cancel_pending(actor(4)).unwrap();
+    q.unregister(actor(4)).unwrap();
+    assert_eq!(q.ready_count(), 2);
+    assert_eq!(q.actor_count(), 5);
+    assert_eq!(q.claim(), Some(actor(3)));
+    q.notify(actor(3)).unwrap();
+    assert_eq!(
+        q.cancel_pending(actor(3)),
+        Err(SchedulerError::AlreadyClaimed)
+    );
+    q.release(actor(3), false).unwrap();
+    assert_eq!(q.claim(), Some(actor(5)));
+    q.release(actor(5), false).unwrap();
+    assert_eq!(q.claim(), Some(actor(3)));
+    q.release(actor(3), false).unwrap();
+    assert_eq!(q.claim(), None);
+    assert_eq!(
+        q.cancel_pending(actor(9)),
+        Err(SchedulerError::UnknownActor)
+    );
+    q.register(actor(4)).unwrap();
+    q.notify(actor(4)).unwrap();
+    q.cancel_pending(actor(4)).unwrap();
+    assert_eq!(q.claim(), None);
+    q.notify(actor(4)).unwrap();
+    assert_eq!(q.claim(), Some(actor(4)));
+    q.release(actor(4), false).unwrap();
+    for id in 1..=6 {
+        q.unregister(actor(id)).unwrap();
+    }
+    assert_eq!(q.actor_count(), 0);
 }
 
 #[test]
@@ -405,7 +467,7 @@ fn turn_guarantees_every_class_before_round_robin_excess() {
 fn preparation_is_fifo_with_one_body_per_context_and_context_fairness() {
     let a = ScopeId::new(1).unwrap();
     let b = ScopeId::new(2).unwrap();
-    let mut q = FairWorkQueue::new(2, 4, 3);
+    let mut q = FairWorkQueue::new(4, 3);
     q.enqueue(a, work(1)).unwrap();
     q.enqueue(a, work(2)).unwrap();
     q.enqueue(b, work(3)).unwrap();
@@ -425,7 +487,7 @@ fn preparation_is_fifo_with_one_body_per_context_and_context_fairness() {
 #[test]
 fn indexed_queued_cancellation_preserves_remaining_fifo() {
     let s = ScopeId::new(1).unwrap();
-    let mut q = FairWorkQueue::new(1, 4, 4);
+    let mut q = FairWorkQueue::new(4, 4);
     for id in 1..=4 {
         q.enqueue(s, work(id)).unwrap();
     }
@@ -440,7 +502,7 @@ fn indexed_queued_cancellation_preserves_remaining_fifo() {
 
 #[test]
 fn mutable_timer_nodes_and_pending_ticks_are_coalesced_and_budgeted() {
-    let mut t = TimerIndex::new(2);
+    let mut t = TimerIndex::new();
     for deadline in 1..=100 {
         t.set(actor(1), Tick(deadline)).unwrap();
     }
@@ -454,6 +516,21 @@ fn mutable_timer_nodes_and_pending_ticks_are_coalesced_and_budgeted() {
     assert_eq!(t.pending_count(), 2);
     assert!(t.acknowledge_tick(actor(1)));
     assert_eq!(t.advance(Tick(99), 1), Err(TimerError::TimeWentBackwards));
+    // More distinct actors add one node each; per-turn work and a pending
+    // Tick remain bounded independently of that metadata population.
+    for id in 3..=6 {
+        t.set(actor(id), Tick(101)).unwrap();
+    }
+    assert_eq!(t.advance(Tick(101), 2).unwrap(), [actor(1), actor(3)]);
+    assert_eq!(t.advance(Tick(101), 2).unwrap(), [actor(4), actor(5)]);
+    assert_eq!(t.advance(Tick(101), 2).unwrap(), [actor(6)]);
+    assert_eq!(t.pending_count(), 6);
+    assert_eq!(t.advance(Tick(101), 2).unwrap(), []);
+    for id in 1..=6 {
+        assert!(t.acknowledge_tick(actor(id)));
+    }
+    assert_eq!(t.pending_count(), 0);
+    assert_eq!(t.deadline_count(), 0);
 }
 
 #[test]
@@ -465,7 +542,10 @@ fn effects_wait_for_commit_and_publication_and_started_effects_survive_fencing()
     batch
         .push(EffectDescriptor {
             id: a,
-            work: work(1),
+            work: ScopedWorkRef {
+                scope: ScopeId::new(1).unwrap(),
+                work: work(1),
+            },
             kind: EffectKind::Publication,
             dependencies: vec![],
         })
@@ -473,7 +553,10 @@ fn effects_wait_for_commit_and_publication_and_started_effects_survive_fencing()
     batch
         .push(EffectDescriptor {
             id: b,
-            work: work(2),
+            work: ScopedWorkRef {
+                scope: sid,
+                work: work(2),
+            },
             kind: EffectKind::Settlement,
             dependencies: vec![a],
         })
@@ -500,7 +583,10 @@ fn pending_business_effect_cannot_start_under_a_failed_generation() {
     batch
         .push(EffectDescriptor {
             id,
-            work: work(1),
+            work: ScopedWorkRef {
+                scope: ScopeId::new(1).unwrap(),
+                work: work(1),
+            },
             kind: EffectKind::Business,
             dependencies: vec![],
         })
@@ -517,15 +603,20 @@ fn pending_business_effect_cannot_start_under_a_failed_generation() {
 
 #[test]
 fn history_is_bounded_and_preserves_complete_order_without_affecting_state() {
+    let target = |n| novarocks_control_runtime_core::history::HistoryActorTarget {
+        actor: actor(n),
+        attachment: SlotId::new(n).unwrap(),
+        scope_origin: ScopeId::new(1).unwrap(),
+    };
     let mut h = HistoryBuffer::new(1);
-    h.record(Tick(1), HistoryFact::Claimed { actor: actor(1) })
+    h.record(Tick(1), HistoryFact::Claimed { target: target(1) })
         .unwrap();
     assert_eq!(
-        h.record(Tick(2), HistoryFact::Claimed { actor: actor(2) }),
+        h.record(Tick(2), HistoryFact::Claimed { target: target(2) }),
         Err(HistoryError::Full)
     );
     assert_eq!(h.pop().unwrap().ordinal, 1);
-    h.record(Tick(2), HistoryFact::Claimed { actor: actor(2) })
+    h.record(Tick(2), HistoryFact::Claimed { target: target(2) })
         .unwrap();
     assert_eq!(h.pop().unwrap().ordinal, 2);
 }
@@ -544,7 +635,7 @@ fn effect_work_cannot_spend_other_classes_guaranteed_units() {
 
 #[test]
 fn overflow_rejection_keeps_all_previous_units_and_scope_work_unchanged() {
-    let mut ledger = CapacityLedger::new(vector(&[(1, u64::MAX), (2, 2)]), 4);
+    let mut ledger = CapacityLedger::new(vector(&[(1, u64::MAX), (2, 2)]));
     let mut a = scope(1);
     ledger
         .try_reserve_bundle(&mut a, request(1, &[(1, u64::MAX), (2, 1)]))
@@ -600,7 +691,7 @@ fn owner_failure_fences_new_business_and_preserves_existing_work_until_exit() {
 
 #[test]
 fn newer_deadline_due_during_pending_tick_is_rearmed_after_ack() {
-    let mut timers = TimerIndex::new(1);
+    let mut timers = TimerIndex::new();
     timers.set(actor(1), Tick(10)).unwrap();
     assert_eq!(timers.advance(Tick(10), 1).unwrap(), [actor(1)]);
     timers.set(actor(1), Tick(20)).unwrap();
@@ -618,7 +709,7 @@ fn newer_deadline_due_during_pending_tick_is_rearmed_after_ack() {
 
 #[test]
 fn deferred_due_timer_does_not_block_other_actors_and_latest_update_wins() {
-    let mut timers = TimerIndex::new(2);
+    let mut timers = TimerIndex::new();
     timers.set(actor(1), Tick(1)).unwrap();
     assert_eq!(timers.advance(Tick(1), 1).unwrap(), [actor(1)]);
     timers.set(actor(1), Tick(2)).unwrap();
@@ -634,7 +725,7 @@ fn deferred_due_timer_does_not_block_other_actors_and_latest_update_wins() {
 
 #[test]
 fn canceling_deferred_due_deadline_preserves_only_the_existing_tick() {
-    let mut timers = TimerIndex::new(1);
+    let mut timers = TimerIndex::new();
     timers.set(actor(1), Tick(1)).unwrap();
     assert_eq!(timers.advance(Tick(1), 1).unwrap(), [actor(1)]);
     timers.set(actor(1), Tick(2)).unwrap();
@@ -650,7 +741,7 @@ fn canceling_deferred_due_deadline_preserves_only_the_existing_tick() {
 
 #[test]
 fn reservation_owner_index_follows_split_transfer_rollback_and_final_release() {
-    let mut ledger = CapacityLedger::new(vector(&[(1, 8)]), 8);
+    let mut ledger = CapacityLedger::new(vector(&[(1, 8)]));
     let mut a = scope(1);
     let mut b = scope(2);
     let id = ledger
@@ -659,7 +750,9 @@ fn reservation_owner_index_follows_split_transfer_rollback_and_final_release() {
     assert_eq!(ledger.reservation_count_for(a.id()), 1);
     ledger.bind(&mut a, id, WorkKind::Business).unwrap();
     let split = ReservationId::new(2).unwrap();
-    ledger.split(id, split, &vector(&[(1, 1)])).unwrap();
+    ledger
+        .split(id, split, &quota_partition(&[(1, 1)]))
+        .unwrap();
     assert_eq!(ledger.reservation_count_for(a.id()), 2);
     b.admit(
         generation(),
@@ -671,11 +764,16 @@ fn reservation_owner_index_follows_split_transfer_rollback_and_final_release() {
     ledger.transfer(split, &b, work(1)).unwrap();
     assert_eq!(ledger.reservation_count_for(a.id()), 1);
     assert_eq!(ledger.reservation_count_for(b.id()), 1);
-    ledger.release(id, &vector(&[(1, 2)])).unwrap();
+    ledger.release_quota(id, &vector(&[(1, 2)])).unwrap();
     assert_eq!(ledger.reservation_count_for(a.id()), 1);
-    ledger.release(id, &vector(&[(1, 1)])).unwrap();
+    ledger.release_quota(id, &vector(&[(1, 1)])).unwrap();
+    assert_eq!(ledger.reservation_count_for(a.id()), 1);
+    finish(&mut a, work(1));
+    ledger.finish(&a, id).unwrap();
     assert_eq!(ledger.reservation_count_for(a.id()), 0);
-    ledger.release(split, &vector(&[(1, 1)])).unwrap();
+    ledger.release_quota(split, &vector(&[(1, 1)])).unwrap();
+    finish(&mut b, work(1));
+    ledger.finish(&b, split).unwrap();
     assert_eq!(ledger.reservation_count_for(b.id()), 0);
     let unbound = ledger
         .try_reserve_bundle(&mut a, request(3, &[(1, 1)]))
@@ -689,7 +787,7 @@ fn reservation_owner_index_follows_split_transfer_rollback_and_final_release() {
 fn independent_scope_work_ordinals_never_collide_or_cancel_each_other() {
     let a = ScopeId::new(1).unwrap();
     let b = ScopeId::new(2).unwrap();
-    let mut queue = FairWorkQueue::new(2, 4, 2);
+    let mut queue = FairWorkQueue::new(4, 2);
     for scope in [a, b] {
         queue.enqueue(scope, work(1)).unwrap();
         queue.enqueue(scope, work(2)).unwrap();
@@ -714,14 +812,10 @@ fn independent_scope_work_ordinals_never_collide_or_cancel_each_other() {
 
 #[test]
 fn indexed_owner_usage_follows_split_partial_release_and_cross_scope_transfer() {
-    let mut ledger = CapacityLedger::with_owner_usage_dimensions(
-        vector(&[(1, 8), (2, 100)]),
-        8,
-        4,
-        [dimension(1)],
-    )
-    .unwrap();
-    assert_eq!(ledger.owner_usage_metadata_entries(dimension(1)), Some(9));
+    let mut ledger =
+        CapacityLedger::with_owner_usage_dimensions(vector(&[(1, 8), (2, 100)]), [dimension(1)])
+            .unwrap();
+    assert_eq!(ledger.owner_usage_metadata_entries(dimension(1)), Some(1));
     assert_eq!(ledger.max_owner_usage(dimension(2)), None);
     let mut a = scope(1);
     let mut b = scope(2);
@@ -729,10 +823,12 @@ fn indexed_owner_usage_follows_split_partial_release_and_cross_scope_transfer() 
         .try_reserve_bundle(&mut a, request(1, &[(1, 4), (2, 20)]))
         .unwrap();
     ledger.bind(&mut a, first, WorkKind::Business).unwrap();
+    assert_eq!(ledger.owner_usage_metadata_entries(dimension(1)), Some(3));
     let second = ledger
         .try_reserve_bundle(&mut b, request(2, &[(1, 2), (2, 10)]))
         .unwrap();
     ledger.bind(&mut b, second, WorkKind::Business).unwrap();
+    assert_eq!(ledger.owner_usage_metadata_entries(dimension(1)), Some(5));
     assert_eq!(
         (
             ledger.used(dimension(1)),
@@ -742,9 +838,10 @@ fn indexed_owner_usage_follows_split_partial_release_and_cross_scope_transfer() 
     );
     let split = ReservationId::new(3).unwrap();
     ledger
-        .split(first, split, &vector(&[(1, 1), (2, 5)]))
+        .split(first, split, &quota_partition(&[(1, 1), (2, 5)]))
         .unwrap();
     assert_eq!(ledger.max_owner_usage(dimension(1)), Some(4));
+    assert_eq!(ledger.owner_usage_metadata_entries(dimension(1)), Some(5));
     b.admit(
         generation(),
         work(3),
@@ -753,6 +850,7 @@ fn indexed_owner_usage_follows_split_partial_release_and_cross_scope_transfer() 
     )
     .unwrap();
     ledger.transfer(split, &b, work(3)).unwrap();
+    assert_eq!(ledger.owner_usage_metadata_entries(dimension(1)), Some(4));
     assert_eq!(
         (
             ledger.used(dimension(1)),
@@ -760,10 +858,15 @@ fn indexed_owner_usage_follows_split_partial_release_and_cross_scope_transfer() 
         ),
         (6, Some(3))
     );
-    ledger.release(first, &vector(&[(1, 2)])).unwrap();
+    ledger.release_quota(first, &vector(&[(1, 2)])).unwrap();
+    assert_eq!(ledger.owner_usage_metadata_entries(dimension(1)), Some(5));
     assert_eq!(ledger.max_owner_usage(dimension(1)), Some(3));
-    ledger.release(second, &vector(&[(1, 2), (2, 10)])).unwrap();
+    ledger
+        .release_quota(second, &vector(&[(1, 2), (2, 10)]))
+        .unwrap();
+    assert_eq!(ledger.owner_usage_metadata_entries(dimension(1)), Some(4));
     finish(&mut b, work(2));
+    ledger.finish(&b, second).unwrap();
     assert_eq!(
         (
             ledger.used(dimension(1)),
@@ -771,23 +874,27 @@ fn indexed_owner_usage_follows_split_partial_release_and_cross_scope_transfer() 
         ),
         (2, Some(1))
     );
-    ledger.release(first, &vector(&[(1, 1), (2, 15)])).unwrap();
+    ledger
+        .release_quota(first, &vector(&[(1, 1), (2, 15)]))
+        .unwrap();
+    assert_eq!(ledger.owner_usage_metadata_entries(dimension(1)), Some(3));
     finish(&mut a, work(1));
-    ledger.release(split, &vector(&[(1, 1), (2, 5)])).unwrap();
+    ledger.finish(&a, first).unwrap();
+    ledger
+        .release_quota(split, &vector(&[(1, 1), (2, 5)]))
+        .unwrap();
     finish(&mut b, work(3));
+    ledger.finish(&b, split).unwrap();
     assert_eq!(ledger.max_owner_usage(dimension(1)), Some(0));
     assert_eq!(ledger.reservation_count(), 0);
+    assert_eq!(ledger.owner_usage_metadata_entries(dimension(1)), Some(1));
 }
 
 #[test]
 fn indexed_owner_usage_survives_refused_transactions_and_real_unbound_rollback() {
-    let mut ledger = CapacityLedger::with_owner_usage_dimensions(
-        vector(&[(1, 2), (2, 10)]),
-        8,
-        2,
-        [dimension(1)],
-    )
-    .unwrap();
+    let mut ledger =
+        CapacityLedger::with_owner_usage_dimensions(vector(&[(1, 2), (2, 10)]), [dimension(1)])
+            .unwrap();
     let mut a = scope(1);
     let mut b = scope(2);
     let original = ledger
@@ -817,7 +924,11 @@ fn indexed_owner_usage_survives_refused_transactions_and_real_unbound_rollback()
     ledger.bind(&mut a, original, WorkKind::Business).unwrap();
     assert!(
         ledger
-            .split(original, ReservationId::new(3).unwrap(), &vector(&[(1, 3)]))
+            .split(
+                original,
+                ReservationId::new(3).unwrap(),
+                &quota_partition(&[(1, 3)])
+            )
             .is_err()
     );
     assert_eq!(
@@ -838,10 +949,20 @@ fn indexed_owner_usage_survives_refused_transactions_and_real_unbound_rollback()
         WorkAdmission::External,
     )
     .unwrap();
-    ledger.transfer(original, &b, work(1)).unwrap();
-    ledger.release(original, &vector(&[(1, 1)])).unwrap();
+    assert_eq!(
+        ledger.transfer(original, &b, work(1)),
+        Err(CapacityError::OwnedStorage(
+            OwnedStorageError::BoundPosition
+        ))
+    );
+    let moved = ReservationId::new(3).unwrap();
+    ledger
+        .split(original, moved, &quota_partition(&[(1, 2)]))
+        .unwrap();
+    ledger.transfer(moved, &b, work(1)).unwrap();
+    ledger.release_quota(moved, &vector(&[(1, 1)])).unwrap();
     let last = ledger
-        .try_reserve_bundle(&mut a, request(3, &[(1, 1)]))
+        .try_reserve_bundle(&mut a, request(4, &[(1, 1)]))
         .unwrap();
     ledger.bind(&mut a, last, WorkKind::Business).unwrap();
     assert_eq!(
@@ -851,11 +972,14 @@ fn indexed_owner_usage_survives_refused_transactions_and_real_unbound_rollback()
         ),
         (2, Some(1))
     );
-    ledger.release(original, &vector(&[(1, 1)])).unwrap();
+    ledger.release_quota(moved, &vector(&[(1, 1)])).unwrap();
     finish(&mut b, work(1));
+    ledger.finish(&b, moved).unwrap();
     finish(&mut a, work(2));
-    ledger.release(last, &vector(&[(1, 1)])).unwrap();
-    finish(&mut a, work(3));
+    ledger.finish(&a, original).unwrap();
+    ledger.release_quota(last, &vector(&[(1, 1)])).unwrap();
+    finish(&mut a, work(4));
+    ledger.finish(&a, last).unwrap();
     assert_eq!(
         (
             ledger.reservation_count(),

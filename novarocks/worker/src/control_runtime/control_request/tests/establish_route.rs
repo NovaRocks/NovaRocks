@@ -25,6 +25,7 @@ use super::*;
 use crate::{
     control_runtime::{
         context_host::{CONTEXT_BOOTSTRAP_STORAGE, ContextHostBinding, ContextHostRecord},
+        control_internal::{CONTROL_INTERNAL_STORAGE, InternalAdvance},
         effect_dispatch::EffectRef,
         establish_ingress::{EstablishDisposalJob, EstablishIngressOutcome},
     },
@@ -142,6 +143,41 @@ impl Drop for Credential {
     }
 }
 
+struct ConflictObservation {
+    context: QueryContextRef,
+    caller: thread::ThreadId,
+    calls: AtomicUsize,
+}
+impl crate::TaskProtocolObserver for ConflictObservation {
+    fn observe(&self, event: crate::TaskProtocolEvent) {
+        assert_ne!(
+            thread::current().id(),
+            self.caller,
+            "the actual observer callback runs on the physical host"
+        );
+        assert!(
+            matches!(event,
+            crate::TaskProtocolEvent::ContextEstablishConflict { context }
+            if context == self.context),
+            "the original replay owes exactly its ContextConflict event"
+        );
+        assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+    }
+}
+impl crate::TaskResultLifecycle for ConflictObservation {
+    fn discard_task(&self, _: novarocks_execution_contract::TaskIdentity) {
+        panic!("this Context-only replay admitted no Task result");
+    }
+    fn retire_task_result(&self, _: novarocks_execution_contract::TaskIdentity) {
+        panic!("this Context-only replay admitted no Task result");
+    }
+}
+impl crate::TaskExecutionMetrics for ConflictObservation {
+    fn record_task_created(&self) {
+        panic!("this Context-only replay admitted no Task");
+    }
+}
+
 struct RouteFixture {
     f: Fixture,
     ticket: AdmissionTicketId,
@@ -174,20 +210,13 @@ impl RouteFixture {
         })
         .unwrap();
         let context_storage = CONTEXT_BOOTSTRAP_STORAGE.resources().unwrap();
-        let context = context_storage
-            .checked_add(&ResourceVector::new([(Dimension::Contexts.id(), 1)]).unwrap())
-            .unwrap();
-        let ticket_storage = ResourceVector::new([(Dimension::Work.id(), 1)]).unwrap();
-        let ticket = ticket_storage
-            .checked_add(&ResourceVector::new([(Dimension::Tickets.id(), 1)]).unwrap())
-            .unwrap();
+        let context = context_storage.clone();
         let storage = AdmissionStorage {
             loading: policy.loading.resources().unwrap(),
             accepted: policy.accepted.resources().unwrap(),
-            // The admission port adds the business Context/Ticket unit once;
-            // these fields contain only their already funded metadata.
+            // The admission port adds the real Context unit once;
+            // this field contains only its already funded metadata.
             context: context_storage,
-            ticket: ticket_storage,
         };
         let host_storage = StorageNeed {
             inputs: 1,
@@ -197,7 +226,7 @@ impl RouteFixture {
             ..StorageNeed::default()
         };
         let mut additional = context
-            .checked_add(&ticket)
+            .checked_add(&CONTROL_INTERNAL_STORAGE.resources().unwrap())
             .unwrap()
             .checked_add(&host_storage.resources().unwrap())
             .unwrap()
@@ -214,20 +243,10 @@ impl RouteFixture {
                 )
                 .unwrap();
         }
-        // The baseline has at most sixteen actual reservations. Each extra
-        // ingress source adds its remainder, escrow, source root and link;
-        // separately paid fixture Work supplies its own additional records.
-        let reservations = 16 + 4 * (positions - 2) + extra.work;
-        let f = Fixture::with_geometry_records(
-            positions,
-            positions,
-            positions + 2,
-            storage.clone(),
-            additional,
-            positions + 1,
-            2,
-            reservations,
-        );
+        let mut f =
+            Fixture::with_control_storage(positions, positions, storage.clone(), additional);
+        f.root.enable_internal_source().unwrap();
+        assert_eq!(f.root.advance_internal().unwrap(), InternalAdvance::Idle);
         let snapshot = PublishedSnapshot::new(
             &f.root.resources().scope,
             Arc::new(QueryContextState::Absent),
@@ -297,7 +316,13 @@ impl RouteFixture {
             .unwrap();
         this.f.runtime.poll_one(Tick(1)).unwrap();
         this.f.root.index_control_effects(64).unwrap();
-        let materialize = this.f.root.take_control_effect(64).unwrap().unwrap();
+        let mut materialize = this.f.root.take_control_effect(64).unwrap().unwrap();
+        if matches!(&materialize.effect, WorkerAction::AdmissionEpoch(_)) {
+            // The same committed directory inventory is published before the
+            // original Materialize effect, just as the production driver does.
+            this.complete_metadata(materialize);
+            materialize = this.f.root.take_control_effect(64).unwrap().unwrap();
+        }
         let establishment = match &materialize.effect {
             WorkerAction::Control {
                 effect: ControlEffect::Materialize { establishment, .. },
@@ -313,13 +338,14 @@ impl RouteFixture {
                 establishment,
                 ContextConfig {
                     max_tasks: 1,
-                    max_creation_waiters: 1,
-                    max_pending_requests: 4,
+                    max_creation_waiters: positions,
+                    max_pending_requests: positions,
                     max_preparing: 1,
                     max_task_bytes: 1024,
                     step_budget: ContextCore::MAX_STEP_WORK,
                     lease_bounds: LeaseBounds::DEFAULT,
                     metric_publish_interval: Duration::from_millis(100),
+                    request_horizon: crate::RequestHorizon::DEFAULT,
                 },
             )
             .unwrap(),
@@ -350,70 +376,84 @@ impl RouteFixture {
         self.f.root.control_completion_observed(reference).unwrap();
     }
     fn drain_root(&mut self) {
-        self.f.root.index_control_effects(64).unwrap();
-        while let Some(ticket) = self.f.root.take_control_effect(64).unwrap() {
-            match &ticket.effect {
-                WorkerAction::ControlReply(_) => self.f.root.publish_request_reply(ticket).unwrap(),
-                WorkerAction::Control {
-                    effect: ControlEffect::AdmissionReply { .. },
-                    ..
-                } => {
-                    self.f.root.adopt_ticket(&ticket).unwrap();
-                    self.complete_metadata(ticket);
-                }
-                WorkerAction::Control {
-                    effect: ControlEffect::Reply { .. } | ControlEffect::DomainFailureReply { .. },
-                    ..
-                } => self.complete_metadata(ticket),
-                WorkerAction::Control {
-                    effect: ControlEffect::Route { state, .. },
-                    ..
-                } => {
-                    drop(
-                        self.f
-                            .runtime
-                            .commit_snapshot(&ticket, &self.snapshot, Arc::new(*state))
-                            .unwrap(),
-                    );
-                    self.f.root.control_publication_committed(&ticket).unwrap();
-                    self.f.complete_body(ticket);
-                }
-                WorkerAction::Control {
-                    effect: ControlEffect::RetireReservation(id),
-                    ..
-                } => {
-                    if self
-                        .removed
-                        .as_ref()
-                        .is_some_and(|owner| owner.admission() == *id)
-                    {
-                        self.removed
-                            .as_mut()
-                            .unwrap()
-                            .authorize_parent_retirement(&ticket)
-                            .unwrap();
-                    } else {
-                        assert!(self.f.root.retire_ticket(&ticket).unwrap());
+        for _ in 0..64 {
+            self.f.root.index_control_effects(64).unwrap();
+            while let Some(ticket) = self.f.root.take_control_effect(64).unwrap() {
+                match &ticket.effect {
+                    WorkerAction::Control {
+                        effect: ControlEffect::WakeInternal,
+                        admitted: None,
+                    } => self.f.root.handoff_internal_wake(ticket).unwrap(),
+                    WorkerAction::AdmissionEpoch(_) => self.complete_metadata(ticket),
+                    WorkerAction::ControlReply(_) => {
+                        self.f.root.publish_request_reply(ticket).unwrap()
                     }
-                    self.complete_metadata(ticket);
+                    WorkerAction::Control {
+                        effect: ControlEffect::AdmissionReply { .. },
+                        ..
+                    } => {
+                        self.complete_metadata(ticket);
+                    }
+                    WorkerAction::Control {
+                        effect:
+                            ControlEffect::Reply { .. } | ControlEffect::DomainFailureReply { .. },
+                        ..
+                    } => self.complete_metadata(ticket),
+                    WorkerAction::Control {
+                        effect: ControlEffect::Route { state, .. },
+                        ..
+                    } => {
+                        drop(
+                            self.f
+                                .runtime
+                                .commit_snapshot(&ticket, &self.snapshot, Arc::new(*state))
+                                .unwrap(),
+                        );
+                        self.f.root.control_publication_committed(&ticket).unwrap();
+                        self.f.complete_body(ticket);
+                    }
+                    WorkerAction::Control {
+                        effect: ControlEffect::RetireReservation(id),
+                        ..
+                    } => {
+                        if let Some(owner) = self.removed.as_mut() {
+                            assert_eq!(owner.admission(), *id);
+                            owner.authorize_parent_retirement(&ticket).unwrap();
+                        } else {
+                            let address = self.f.root.service().context(self.f.context).unwrap();
+                            let mut owner = address.lock().unwrap();
+                            assert_eq!(owner.admission(), *id);
+                            owner.authorize_parent_retirement(&ticket).unwrap();
+                        }
+                        self.complete_metadata(ticket);
+                    }
+                    WorkerAction::Control {
+                        effect: ControlEffect::RemoveHost { .. },
+                        ..
+                    } => {
+                        let owner = self
+                            .f
+                            .root
+                            .service()
+                            .take_removing_context(&ticket)
+                            .unwrap()
+                            .unwrap();
+                        assert!(self.removed.replace(owner).is_none());
+                        self.f.complete_body(ticket);
+                    }
+                    other => panic!("unexpected component Root effect: {other:?}"),
                 }
-                WorkerAction::Control {
-                    effect: ControlEffect::RemoveHost { .. },
-                    ..
-                } => {
-                    let owner = self
-                        .f
-                        .root
-                        .service()
-                        .take_removing_context(&ticket)
-                        .unwrap()
-                        .unwrap();
-                    assert!(self.removed.replace(owner).is_none());
-                    self.f.complete_body(ticket);
+            }
+            match self.f.root.advance_internal().unwrap() {
+                InternalAdvance::Idle | InternalAdvance::Waiting(_) => return,
+                InternalAdvance::Submitted(_) => {
+                    // The actual runtime clamps this to its current observed
+                    // time; this does not advance any deadline or horizon.
+                    assert!(self.f.runtime.poll_one(Tick(0)).unwrap());
                 }
-                other => panic!("unexpected component Root effect: {other:?}"),
             }
         }
+        panic!("the original bounded Root metadata source must settle its ready turn");
     }
     fn begin_route(
         &mut self,
@@ -521,8 +561,106 @@ impl RouteFixture {
             }) if request.token == input => result.clone(),
             _ => panic!("actual Context owner probe"),
         };
-        host.handoff_establish_probe(probe).unwrap();
+        drop(host);
+        self.assert_original_probe_author(&probe, input);
+        host_address
+            .lock()
+            .unwrap()
+            .handoff_establish_probe(probe)
+            .unwrap();
         result
+    }
+    fn assert_original_probe_author(
+        &mut self,
+        ticket: &EffectTicket<WorkerAction>,
+        input: InputId,
+    ) {
+        let original = &self.f.root.resources().requests[&input];
+        let original_request = original.request();
+        let route = original
+            .route
+            .as_ref()
+            .expect("the same original R route")
+            .clone();
+        assert_eq!(route.request(), original_request);
+        assert_eq!(
+            ticket.descriptor.work.scope,
+            self.f.root.resources().scope.id()
+        );
+        assert_ne!(
+            ticket.descriptor.work, original_request.author,
+            "the replay leg is its own originally prepaid role, not a new R"
+        );
+        let actual_pins = self
+            .f
+            .runtime
+            .input_header_authors(
+                context_actor(),
+                ticket.input,
+                2 * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS + 2,
+            )
+            .unwrap();
+        assert!(
+            actual_pins.contains(&ticket.descriptor.work),
+            "the original probe batch really holds that financial header"
+        );
+        let address = self.f.root.service().context(self.f.context).unwrap();
+        let mut host = address.lock().unwrap();
+        assert!(route.target_matches(
+            &self.f.runtime,
+            host.registration(),
+            self.f.context,
+            actor()
+        ));
+        assert!(Arc::ptr_eq(host.establish_route(input).unwrap(), &route));
+        let execution_scope = host.resources_for_test().scope.as_ref().unwrap().clone();
+        assert_ne!(
+            ticket.descriptor.work.scope,
+            execution_scope.id(),
+            "the hot Context scope does not fund its original R tail"
+        );
+    }
+    fn finish_conflict_observation(&mut self, input: InputId) {
+        let original = &self.f.root.resources().requests[&input];
+        assert!(original.protocol_observation.has_pending());
+        assert!(!original.protocol_observation.is_idle());
+        assert!(original.endpoint.external_ended());
+        let paid = self.f.ledger.used(Dimension::Requests.id());
+        assert!(paid > 0);
+        assert_eq!(
+            self.f.root.reap_ready_requests(32).unwrap(),
+            0,
+            "raw disposal and external reply exit do not finish the real observer"
+        );
+        assert_eq!(self.f.ledger.used(Dimension::Requests.id()), paid);
+        assert!(self.f.root.resources().requests.contains_key(&input));
+        let observed = Arc::new(ConflictObservation {
+            context: self.f.context,
+            caller: thread::current().id(),
+            calls: AtomicUsize::new(0),
+        });
+        let ports = crate::TaskExecutionPorts::new(
+            observed.clone(),
+            observed.clone(),
+            observed.clone(),
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::new()),
+        );
+        let original_job = self
+            .f
+            .root
+            .take_protocol_observation_for_test(input, &ports)
+            .unwrap()
+            .expect("the same original R's already staged physical observation");
+        let original = &self.f.root.resources().requests[&input];
+        assert!(!original.protocol_observation.is_idle());
+        assert_eq!(self.f.ledger.used(Dimension::Requests.id()), paid);
+        thread::spawn(move || original_job.run()).join().unwrap();
+        assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            self.f.root.resources().requests[&input]
+                .protocol_observation
+                .is_idle()
+        );
     }
     fn dispose_context_metadata(&mut self) {
         let runtime = self.f.runtime.clone();
@@ -565,8 +703,9 @@ impl RouteFixture {
         ledger.reap_scope_ready(scope.id(), 32).unwrap();
         for role in &mut resources.roles {
             role.capacity
-                .release(&role.capacity.resources().unwrap())
+                .release_quota(&role.capacity.resources().unwrap().quota)
                 .unwrap();
+            role.capacity.finish().unwrap();
         }
         drop(runtime.remove_actor(context_actor()).unwrap());
         resources.registered = false;
@@ -578,9 +717,14 @@ impl RouteFixture {
         assert!(self.f.root.resources().requests.contains_key(&self.creator));
         self.dispose_context_metadata();
         let refusal = self.f.host_input(
-            ControlInput::ContextBootstrapFailed {
+            ControlInput::EstablishmentDecided {
                 context: self.f.context,
-                refusal: OperationOutcome::OwnerFailed.into(),
+                decision: novarocks_worker_protocol::context::ContextEstablishmentDecision {
+                    state: QueryContextState::Aborting,
+                    outcome: Ok(OperationOutcome::OwnerFailed),
+                    acknowledgement: None,
+                    decided_at: MonotonicInstant::from_origin(Duration::from_nanos(100)),
+                },
             },
             self.host_storage,
         );
@@ -597,54 +741,34 @@ impl RouteFixture {
         drop(handle);
         assert_eq!(self.f.root.reap_ready_requests(32).unwrap(), 1);
         let retained = self.f.host_input(
-            ControlInput::Retained {
+            ControlInput::ExecutionRetired {
                 context: self.f.context,
-                normal_close: false,
+                retirement:
+                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        close_epoch: generation(),
+                    },
             },
             self.host_storage,
         );
         self.f.runtime.poll_one(Tick(101)).unwrap();
         self.drain_root();
         self.f.finish_host_input(retained);
-        assert_eq!(self.f.ledger.used(Dimension::Tickets.id()), 0);
-        // Real builtin Root timer, not a guessed RemoveHost effect.
-        assert_eq!(
-            self.f
-                .runtime
-                .advance_time(Tick(11_000_000_000), 2)
-                .unwrap(),
-            1
+
+        // Expiry is reported by the original Context lifecycle, not a second
+        // Root retention timer. This model has already removed that child.
+        let expired = self.f.host_input(
+            ControlInput::ContextExpired {
+                context: self.f.context,
+                retirement:
+                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        close_epoch: generation(),
+                    },
+            },
+            self.host_storage,
         );
         self.f.runtime.poll_one(Tick(11_000_000_000)).unwrap();
-        self.f.root.index_control_effects(64).unwrap();
-        let timer_input = self
-            .f
-            .root
-            .take_control_effect(64)
-            .unwrap()
-            .map(|ticket| {
-                let input = ticket.input;
-                assert!(matches!(
-                    &ticket.effect,
-                    WorkerAction::Control {
-                        effect: ControlEffect::RemoveHost { .. },
-                        ..
-                    }
-                ));
-                let owner = self
-                    .f
-                    .root
-                    .service()
-                    .take_removing_context(&ticket)
-                    .unwrap()
-                    .unwrap();
-                assert!(self.removed.replace(owner).is_none());
-                self.f.complete_body(ticket);
-                input
-            })
-            .expect("actual retention timer removal");
         self.drain_root();
-        self.f.runtime.retire_input(actor(), timer_input).unwrap();
+        self.f.finish_host_input(expired);
         let removed = self.f.host_input(
             ControlInput::HostRemoved {
                 context: self.f.context,
@@ -659,7 +783,7 @@ impl RouteFixture {
         assert!(resources.routes.is_empty());
         assert!(resources.scope.is_none());
         assert!(!resources.registered);
-        assert_eq!(self.f.ledger.used(Dimension::Contexts.id()), 0);
+        assert!(resources.scope.is_none());
         resources.admission.work.body_exited().unwrap();
         resources.admission.work.captures_exited().unwrap();
         self.f
@@ -669,10 +793,47 @@ impl RouteFixture {
         resources
             .admission
             .capacity
-            .release(&resources.admission.capacity.resources().unwrap())
+            .release_quota(&resources.admission.capacity.resources().unwrap().quota)
+            .and_then(|()| resources.admission.capacity.finish())
             .unwrap();
         self.f.runtime.close_timer_source(actor()).unwrap();
-        self.f.finish();
+        self.drain_root();
+        assert!(self.f.requests.is_empty());
+        assert!(self.f.root.resources().requests.is_empty());
+        assert_eq!(self.f.root.request_ready().registered(), 0);
+        let (_service, mut root_resources) = self.f.root.into_parts();
+        root_resources.scope.close_external().unwrap();
+        root_resources
+            .internal
+            .as_mut()
+            .expect("the original paid Root internal source")
+            .close_after_drain()
+            .unwrap();
+        self.f.runtime.close_actor_admission(actor()).unwrap();
+        while let Some(original_host_turn) = self.f.runtime.claim_host_actor() {
+            original_host_turn.release(false).unwrap();
+        }
+        self.f.runtime.seal_actor(actor()).unwrap();
+        for role in root_resources.roles.iter_mut().rev() {
+            role.work.body_exited().unwrap();
+            role.work.captures_exited().unwrap();
+        }
+        self.f
+            .ledger
+            .reap_scope_ready(root_resources.scope.id(), 32)
+            .unwrap();
+        drop(self.f.runtime.remove_actor(actor()).unwrap());
+        for role in root_resources.roles.iter_mut().rev() {
+            role.capacity
+                .release_quota(&role.capacity.resources().unwrap().quota)
+                .unwrap();
+            role.capacity.finish().unwrap();
+        }
+        self.f
+            .ledger
+            .remove_scope(root_resources.scope.id())
+            .unwrap();
+        assert!(self.f.ledger.is_empty());
     }
 }
 
@@ -708,7 +869,7 @@ fn the_context_leg_retires_before_root_consumes_its_original_routed_reply() {
     f.dispose_context_metadata();
     assert!(f.f.runtime.snapshot(context_actor()).is_err());
     assert!(f.f.root.resources().requests.contains_key(&input));
-    assert_eq!(f.f.ledger.used(Dimension::Replies.id()), 2);
+    assert_eq!(f.f.ledger.used(Dimension::Requests.id()), 2);
     assert!(
         handle.try_take().is_none(),
         "the original Root return has not run"
@@ -729,10 +890,11 @@ fn the_context_leg_retires_before_root_consumes_its_original_routed_reply() {
     drop(delivery);
     drop(handle);
     assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 0);
-    assert_eq!(f.f.ledger.used(Dimension::Replies.id()), 2);
+    assert_eq!(f.f.ledger.used(Dimension::Requests.id()), 2);
     assert!(thread::spawn(move || disposal.run()).join().unwrap());
+    f.finish_conflict_observation(input);
     assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 1);
-    assert_eq!(f.f.ledger.used(Dimension::Replies.id()), 1);
+    assert_eq!(f.f.ledger.used(Dimension::Requests.id()), 1);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 4);
     f.finish_model_refusal();
@@ -783,7 +945,7 @@ fn a_root_timeout_cannot_dispose_raw_until_the_real_context_leg_and_cleanup_job_
     let cleanup = thread::spawn(move || disposal.run());
     gate.entered.wait();
     let retained = f.f.root.reap_ready_requests(32);
-    let paid = f.f.ledger.used(Dimension::Replies.id()) == 2;
+    let paid = f.f.ledger.used(Dimension::Requests.id()) == 2;
     let present = f.f.root.resources().requests.contains_key(&input);
     gate.resume.wait();
     let exited = cleanup.join().unwrap();
@@ -796,6 +958,6 @@ fn a_root_timeout_cannot_dispose_raw_until_the_real_context_leg_and_cleanup_job_
     assert_eq!(retired, 1);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 4);
-    assert_eq!(f.f.ledger.used(Dimension::Replies.id()), 1);
+    assert_eq!(f.f.ledger.used(Dimension::Requests.id()), 1);
     f.finish_model_refusal();
 }

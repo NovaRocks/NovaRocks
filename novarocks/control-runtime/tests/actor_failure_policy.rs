@@ -23,7 +23,7 @@ use novarocks_control_runtime::{
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     effect::{EffectDescriptor, EffectKind},
     identity::{ActionId, ActorId, DimensionId, Generation, ScopeId, Tick, WorkId},
     mailbox::{InputClass, InputEnvelope},
@@ -86,7 +86,7 @@ impl Actor for ControlledActor {
                     .scope
                     .reserve_next(
                         generation(),
-                        resources(1),
+                        ReservationResources::for_work(resources(1)),
                         WorkKind::Business,
                         WorkAdmission::Derived(self.parent),
                     )
@@ -126,19 +126,19 @@ impl Drop for PanicDropTripwire {
     }
 }
 fn child(mode: &str) {
-    let ledger = RuntimeLedger::new(resources(2), 2, 1);
-    let scope = ledger.open_scope_next(None, generation(), 2, 1).unwrap();
+    let ledger = RuntimeLedger::new(resources(2));
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
     let (mut failure, mut capacity) = scope
         .reserve_next(
             generation(),
-            resources(1),
+            ReservationResources::for_work(resources(1)),
             WorkKind::Cleanup,
             WorkAdmission::External,
         )
         .unwrap()
         .bind(WorkKind::Cleanup)
         .unwrap();
-    let runtime = ActorRuntime::new(1);
+    let runtime = ActorRuntime::new();
     let value = ControlledActor {
         scope: scope.clone(),
         parent: failure.id(),
@@ -243,7 +243,10 @@ fn child(mode: &str) {
         assert!(actual.host_failure_seen);
     }
     drop(actual);
-    capacity.release(&capacity.resources().unwrap()).unwrap();
+    capacity
+        .release_quota(&capacity.resources().unwrap().quota)
+        .unwrap();
+    capacity.finish().unwrap();
     ledger.remove_scope(scope.id()).unwrap();
     assert!(runtime.is_empty());
     assert!(ledger.is_empty());
@@ -297,14 +300,14 @@ fn a_typed_host_failure_is_an_input_result_not_an_unexpected_process_crash() {
 }
 #[test]
 fn explicit_policy_still_rejects_a_foreign_original_supervisor_with_equal_numeric_ids() {
-    let ledger = RuntimeLedger::new(resources(1), 1, 1);
-    let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-    let other = RuntimeLedger::new(resources(1), 1, 1);
-    let foreign_scope = other.open_scope_next(None, generation(), 1, 1).unwrap();
+    let ledger = RuntimeLedger::new(resources(1));
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
+    let other = RuntimeLedger::new(resources(1));
+    let foreign_scope = other.open_scope_next(None, generation()).unwrap();
     let (mut work, mut capacity) = scope
         .reserve_next(
             generation(),
-            resources(1),
+            ReservationResources::for_work(resources(1)),
             WorkKind::Cleanup,
             WorkAdmission::External,
         )
@@ -314,7 +317,7 @@ fn explicit_policy_still_rejects_a_foreign_original_supervisor_with_equal_numeri
     let (mut foreign, mut foreign_capacity) = foreign_scope
         .reserve_next(
             generation(),
-            resources(1),
+            ReservationResources::for_work(resources(1)),
             WorkKind::Cleanup,
             WorkAdmission::External,
         )
@@ -323,7 +326,7 @@ fn explicit_policy_still_rejects_a_foreign_original_supervisor_with_equal_numeri
         .unwrap();
     assert_eq!(scope.id(), foreign_scope.id());
     assert_eq!(work.id(), foreign.id());
-    let runtime = ActorRuntime::new(1);
+    let runtime = ActorRuntime::new();
     let actor_value = ControlledActor {
         scope: scope.clone(),
         parent: work.id(),
@@ -350,10 +353,14 @@ fn explicit_policy_still_rejects_a_foreign_original_supervisor_with_equal_numeri
     work.captures_exited().unwrap();
     foreign.body_exited().unwrap();
     foreign.captures_exited().unwrap();
-    capacity.release(&capacity.resources().unwrap()).unwrap();
-    foreign_capacity
-        .release(&foreign_capacity.resources().unwrap())
+    capacity
+        .release_quota(&capacity.resources().unwrap().quota)
         .unwrap();
+    capacity.finish().unwrap();
+    foreign_capacity
+        .release_quota(&foreign_capacity.resources().unwrap().quota)
+        .unwrap();
+    foreign_capacity.finish().unwrap();
     ledger.reap_scope_ready(scope.id(), 1).unwrap();
     other.reap_scope_ready(foreign_scope.id(), 1).unwrap();
     scope.close_external().unwrap();

@@ -223,6 +223,7 @@ impl LoadingJobReturned {
     }
     /// Primitive access for an already matched owner or component tests.
     /// Service routing retains the complete envelope on every refusal.
+    #[cfg(test)]
     pub(crate) fn into_parts(self) -> (LoadingEventOutcome, Option<LoadingAuthorReturn>) {
         (self.outcome, self.author_return)
     }
@@ -344,22 +345,9 @@ impl LoadingEvents {
                     LOADED,
                     ContextInput::LoadedTask {
                         task: self.0.task,
-                        result,
+                        result: *result,
                         shape,
                         initial_domains,
-                    },
-                ) {
-                    LoadingEventOutcome::Loaded
-                } else {
-                    LoadingEventOutcome::Rejected
-                }
-            }
-            LoaderOutcome::Measured(result) => {
-                if self.send(
-                    LOADED,
-                    ContextInput::Loaded {
-                        task: self.0.task,
-                        result,
                     },
                 ) {
                     LoadingEventOutcome::Loaded
@@ -738,10 +726,8 @@ impl LoadingEventJob {
 
 impl QueuedPreparation for LoadingEventJob {
     fn queue_key(&self) -> (ScopeId, WorkId) {
-        (
-            self.events.0.loader.scope_id(),
-            self.events.0.loader.work_id(),
-        )
+        let work = self.events.0.loader.work_id();
+        (work.scope, work.work)
     }
 }
 impl Drop for LoadingEventJob {
@@ -855,7 +841,7 @@ mod tests {
             "two real causal authors, each with its original prefix and event input"
         );
         let loader = host.loader().unwrap();
-        assert_eq!(job.queue_key(), (loader.scope_id(), loader.work_id()));
+        assert_eq!(job.queue_key(), (loader.scope_id(), loader.work_id().work));
         (f, host, job, getters, drops)
     }
     fn world(f: &mut Fixture, command: ContextInput) -> Vec<WorkerAction> {
@@ -898,8 +884,8 @@ mod tests {
             .unwrap()
             .map(|probe| probe.observe_reaped().unwrap());
         let detached = ingress.release_owned_pair(&retired.pair, reaped).unwrap();
-        for mut storage in detached {
-            storage.release().unwrap();
+        for storage in detached {
+            drop(storage);
         }
         drop(retired);
     }
@@ -921,6 +907,21 @@ mod tests {
             "a removed original role is an error, never inferred exit"
         );
     }
+    fn retire_unused_disposal(
+        f: &Fixture,
+        role: &crate::control_runtime::task_disposal::TaskDisposalRole,
+    ) {
+        // The original never-issued cleanup role is a Context lifetime child.
+        // Dropping its Arc cannot replace unused-author withdrawal and reaping.
+        let mut retired = false;
+        for _ in 0..64 {
+            if role.retire_unused(&f.ledger).unwrap() {
+                retired = true;
+                break;
+            }
+        }
+        assert!(retired && role.is_retired());
+    }
     fn finish(f: Fixture, host: TaskHostRecord) {
         let mut resources = host.into_resources();
         assert!(resources.causal.is_empty());
@@ -928,28 +929,41 @@ mod tests {
         assert!(resources.loader.as_ref().unwrap().is_retired());
         let ingress = resources.port.ingress().clone();
         finish_source_routes(&f, &ingress);
-        // The closed original routes cannot issue another lifecycle Source.
-        // Return only the Accepted pool's still-unbound original remainder.
-        if let Some(mut storage) = resources.accepted_source_storage.take() {
-            storage.release(&storage.resources().unwrap()).unwrap();
-        }
+
         assert!(resources.source_partials.is_empty());
         assert!(resources.pending_preparation_adoption.is_none());
         crate::control_runtime::task::retire_unused_host_calls_for_test(
             &resources.host_calls,
             &f.ledger,
         );
+        retire_unused_disposal(&f, &resources.disposal);
+        let retirement = resources.lifetime.retirement_observer();
+        assert!(!retirement.is_retired());
         resources.lifetime.body_exited().unwrap();
         resources.lifetime.captures_exited().unwrap();
         assert!(resources.lifetime.actual_exit_ready().unwrap());
         if let Some(mut remainder) = resources.preparation_remainder.take() {
-            remainder.release(&remainder.resources().unwrap()).unwrap();
+            remainder
+                .release_quota(&remainder.resources().unwrap().quota)
+                .unwrap();
+            remainder.finish().unwrap();
+        }
+        if let Some(mut storage) = resources.accepted_role_storage.take() {
+            // No accepted lifecycle input was issued by this component teardown.
+            // Return the same unused storage after its original preparation exit.
+            assert!(storage.resources().unwrap().quota.is_empty());
+            storage.finish().unwrap();
         }
         resources
             .active
-            .release(&resources.active.resources().unwrap())
+            .release_quota(&resources.active.resources().unwrap().quota)
             .unwrap();
+        resources.active.finish().unwrap();
         f.ledger.reap_scope_ready(f.scope.id(), 64).unwrap();
+        assert!(
+            retirement.is_retired(),
+            "the same original Task header exited"
+        );
         drop(resources);
         drop(ingress);
         f.finish();
@@ -964,14 +978,22 @@ mod tests {
             &resources.host_calls,
             &f.ledger,
         );
+        retire_unused_disposal(&f, &resources.disposal);
+        let retirement = resources.lifetime.retirement_observer();
+        assert!(!retirement.is_retired());
         resources.lifetime.body_exited().unwrap();
         resources.lifetime.captures_exited().unwrap();
         assert!(resources.lifetime.actual_exit_ready().unwrap());
         resources
             .active
-            .release(&resources.active.resources().unwrap())
+            .release_quota(&resources.active.resources().unwrap().quota)
             .unwrap();
+        resources.active.finish().unwrap();
         f.ledger.reap_scope_ready(f.scope.id(), 64).unwrap();
+        assert!(
+            retirement.is_retired(),
+            "the same original Task header exited"
+        );
         drop(resources);
         f.finish();
     }
@@ -1066,7 +1088,7 @@ mod tests {
         );
         let mut wrong_inbox = TaskCausalInbox::new(
             other_fixture.runtime.clone(),
-            actor(),
+            other_fixture.registration.clone(),
             ActorId::new(2).unwrap(),
             returned.events.0.task,
             generation(),
@@ -1223,7 +1245,25 @@ mod tests {
         dispatch
             .publication_committed(&f.runtime, &publication)
             .unwrap();
+        // LoadedTask retains its actual initial-domain journal. Hand its
+        // original wake to the fixture's already paid metadata author before
+        // taking the separately ordered Accepted preparation reservation.
+        let wake = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
+        assert!(matches!(
+            &wake.effect,
+            WorkerAction::Context(ContextEffect::WakeInternal)
+        ));
+        let initial = f.send(ContextInput::NextInternal, None, InputClass::Lifecycle, 2);
+        f.runtime.effect_completed(wake).unwrap();
         let preparation = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
+        assert!(matches!(
+            &preparation.effect,
+            WorkerAction::Context(ContextEffect::EnqueuePreparation {
+                task,
+                initial_pending: true,
+                ..
+            }) if *task == host.port().identity()
+        ));
         let job = host.adopt_preparation(&f.runtime, &preparation).unwrap();
         assert!(
             !host.causal().observe_effects_exited(loaded.cut).unwrap(),
@@ -1239,6 +1279,24 @@ mod tests {
                 .is_none()
         );
         assert!(host.causal().observe_effects_exited(loaded.cut).unwrap());
+        // The same real LoadedTask carried no initial domains. Consume its
+        // Core-authored plan through this component's neutral receiver; the
+        // original preparation stays dormant until that actual plan arrives.
+        let initial_effects = committed_world_input(&mut f, initial);
+        let [
+            WorkerAction::Context(ContextEffect::InitialPreparationReady {
+                task,
+                progressions,
+                refusal,
+            }),
+        ] = initial_effects.as_slice()
+        else {
+            panic!("the original empty initial journal supplies its preparation plan");
+        };
+        assert_eq!(*task, host.port().identity());
+        assert!(progressions.is_empty());
+        assert!(refusal.is_none());
+        let initial_plan = progressions.clone();
         host.port().ingress().consume_cut(loaded.cut, 0).unwrap();
         let missing_return = host
             .causal()
@@ -1264,7 +1322,10 @@ mod tests {
         assert!(host.loader().unwrap().ready_for_exit().unwrap());
         commit_exit(&mut f, &mut host);
         assert!(matches!(
-            job.run(|_, input, _| drop(input)),
+            job.run(move |_, input, _| {
+                assert!(initial_plan.is_empty());
+                drop(input);
+            }),
             PreparationOutcome::Returned(())
         ));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -1338,7 +1399,7 @@ mod tests {
         // the (empty) role table; deleting that check would yield UnknownRole.
         let wrong_inbox = TaskCausalInbox::new(
             other_fixture.runtime.clone(),
-            actor(),
+            other_fixture.registration.clone(),
             ActorId::new(2).unwrap(),
             origin.0.task,
             generation(),
@@ -1487,7 +1548,7 @@ mod tests {
         let [loaded, exit] = events.take_rejected();
         assert!(exit.is_none());
         assert!(
-            matches!(loaded, Some(ContextInput::Loaded { task, result: Ok(_) }) if task == resources.port.identity())
+            matches!(loaded, Some(ContextInput::LoadedTask { task, result: Ok(_), .. }) if task == resources.port.identity())
         );
         assert!(events.take_rejected().iter().all(Option::is_none));
         assert_eq!(

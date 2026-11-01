@@ -24,7 +24,6 @@ use super::{
     context_executors::ContextExecutorHandles,
     context_host::{ContextHostBinding, ContextHostRecord, TaskDriverPorts},
     control_request::{ControlRequestHandle, ControlRequestReady},
-    effect_dispatch::EffectRef,
     establish_executors::EstablishExecutorHandles,
     process_control::{ProcessControlOwner, RootHostCell},
     service::ContextDirectory,
@@ -83,7 +82,6 @@ pub(crate) struct NodeContextConfig {
     pub storage: AdmissionStorage,
     pub max_live_tasks: usize,
     pub max_live_roots: usize,
-    pub max_contexts: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ContextRoute {
@@ -111,6 +109,11 @@ pub(crate) enum NodeTaskReadHandle {
     ),
     Sealed(super::context_host::ContextRequestHandle),
 }
+pub(crate) enum NodeCancelHandle {
+    Task(super::context_host::TaskContextRequestHandle),
+    Context(super::context_host::ContextRequestHandle),
+    Refused(novarocks_worker_protocol::context::TaskControlRefusal),
+}
 pub(crate) enum NodeCreateHandle {
     Context(super::context_host::ContextRequestHandle),
     BeforeContext(ControlRequestHandle),
@@ -133,6 +136,41 @@ impl std::fmt::Debug for NodeHostRefusal {
         {
             debug.field("cause", original);
         }
+        if let Some((error, ticket)) = self.original.downcast_ref::<(
+            super::effect_dispatch::DispatchError,
+            novarocks_control_runtime::driver::EffectTicket<WorkerAction>,
+        )>() {
+            // Original dispatch facts only; never format the effect payload.
+            debug
+                .field("error", error)
+                .field("actor", &ticket.actor)
+                .field("input", &ticket.input)
+                .field("descriptor", &ticket.descriptor);
+        }
+        if let Some(error) = self
+            .original
+            .downcast_ref::<super::effect_dispatch::DispatchError>()
+        {
+            debug.field("error", error);
+        }
+        if let Some(error) = self
+            .original
+            .downcast_ref::<super::process_control::RootRequestAdvanceError>()
+        {
+            // Only closed runtime, route and source-phase facts are present.
+            // This does not format the original request, host or rich source.
+            debug.field("error", error);
+        }
+        if let Some((refusal, ticket)) = self.original.downcast_ref::<(
+            super::context_removal::ContextRemovalRefusal,
+            novarocks_control_runtime::driver::EffectTicket<WorkerAction>,
+        )>() {
+            debug
+                .field("error", &refusal.error)
+                .field("retains_partial", &refusal.partial.is_some())
+                .field("actor", &ticket.actor)
+                .field("input", &ticket.input);
+        }
         if let Some((error, turn)) = self.original.downcast_ref::<(
             super::context_host::ContextDriverError,
             ActorHostTurn<WorkerActor>,
@@ -152,16 +190,28 @@ impl NodeHostRefusal {
         }
     }
 }
+/// A supported control submission can be refused before it owns any R.
+/// Driver invariants retain their complete original custody separately.
+#[derive(Debug)]
+pub(crate) enum NodeRequestRefusal {
+    OwnerFailed,
+    Invariant(NodeHostRefusal),
+}
+impl From<NodeHostRefusal> for NodeRequestRefusal {
+    fn from(original: NodeHostRefusal) -> Self {
+        Self::Invariant(original)
+    }
+}
 #[derive(Debug, Default)]
 pub(crate) struct NodeHostProgress {
     pub root_effects: usize,
-    pub context_effects: usize,
     pub runnable: bool,
 }
 
 /// There is no user callback table and no second host scheduler. Root's cell
 /// is released before any per-Context lock or actual host submission is taken.
 pub(crate) struct WorkerNodeHost {
+    clock: Arc<dyn Clock>,
     runtime: ActorRuntime<WorkerActor>,
     root_registration: ActorRegistration,
     root: RootHostCell,
@@ -180,6 +230,30 @@ pub(crate) struct WorkerNodeHost {
     rows: Mutex<ContextRows>,
 }
 impl WorkerNodeHost {
+    #[cfg(test)]
+    pub(crate) fn original_request_inventory_for_test(
+        &self,
+        context: QueryContextRef,
+    ) -> Option<Vec<String>> {
+        let address = self.directory.context(context)?;
+        let host = address.lock()?;
+        Some(host.original_request_inventory_for_test())
+    }
+    #[cfg(test)]
+    pub(crate) fn original_task_request_for_test(
+        &self,
+        context: QueryContextRef,
+        work: novarocks_control_runtime_core::identity::ScopedWorkRef,
+    ) -> Option<(
+        novarocks_worker_protocol::creation::RequestContext,
+        novarocks_execution_contract::TaskIdentity,
+        bool,
+        bool,
+    )> {
+        let address = self.directory.context(context)?;
+        let host = address.lock()?;
+        host.original_task_request_for_test(work)
+    }
     /// RPC sources share the same checked process identity origin as Contexts
     /// and Tasks. This number is a routing address, never admission authority.
     pub(crate) fn next_source(&self) -> ActorId {
@@ -193,7 +267,12 @@ impl WorkerNodeHost {
     pub(crate) fn admission_epoch_capability(
         &self,
     ) -> novarocks_execution_contract::AdmissionEpochCapability {
-        *self.root.lock().resources().admission_epoch.borrow()
+        self.root
+            .lock()
+            .resources()
+            .admission_snapshot
+            .borrow()
+            .epoch
     }
 
     pub(crate) fn task_context(
@@ -275,7 +354,7 @@ impl WorkerNodeHost {
                 .map_err(|original| {
                     NodeHostRefusal::new("Task sealed read R admission", original)
                 })?;
-            match host.submit_retired_task_read(work, command) {
+            match host.submit_retired_task_command(work, command) {
                 Ok(()) => Ok(NodeTaskReadHandle::Sealed(handle)),
                 Err(original) => Err(NodeHostRefusal::new(
                     "Task sealed read original handoff",
@@ -316,33 +395,95 @@ impl WorkerNodeHost {
         }
     }
 
+    fn reject_failed_ingress(
+        &self,
+        context: QueryContextRef,
+        payload: super::process_control::rejected_ingress::RejectedIngressPayload,
+        ingress: super::node_api::WorkerIngressResponsibility,
+    ) -> NodeRequestRefusal {
+        // The caller releases its Context guard before this Root handoff.
+        // Only the admitted original payload and Native responsibility move;
+        // no Root RPC, reply cell, or second R is created.
+        match self
+            .root
+            .lock()
+            .adopt_rejected_ingress(context, payload, ingress)
+        {
+            Ok(()) => NodeRequestRefusal::OwnerFailed,
+            Err(original) => {
+                NodeHostRefusal::new("failed ingress original disposal handoff", original).into()
+            }
+        }
+    }
+    fn reject_failed_admission_partial(
+        host: &mut super::context_host::ContextHostRecord,
+        admission: super::context_host::requests::ContextRequestAdmissionRefusal,
+        payload: super::process_control::rejected_ingress::RejectedIngressPayload,
+        ingress: super::node_api::WorkerIngressResponsibility,
+    ) -> NodeRequestRefusal {
+        let Some(work) = admission.partial else {
+            return NodeHostRefusal::new(
+                "Rejected admission has no original partial",
+                (admission, payload, ingress),
+            )
+            .into();
+        };
+        match host.capture_failed_admission_partial(work, payload, ingress) {
+            Ok(()) => NodeRequestRefusal::OwnerFailed,
+            Err(original) => NodeHostRefusal::new(
+                "Rejected admission original partial capture",
+                (admission, original),
+            )
+            .into(),
+        }
+    }
     pub(crate) fn submit_task_domain(
         &self,
         context: QueryContextRef,
         original: novarocks_execution_contract::UpdateTask,
         deadline: MonotonicInstant,
-    ) -> Result<super::context_host::TaskContextRequestHandle, NodeHostRefusal> {
+        ingress: super::node_api::WorkerIngressResponsibility,
+    ) -> Result<super::context_host::TaskContextRequestHandle, NodeRequestRefusal> {
+        use super::context_host::requests::ContextRequestError;
+        use super::process_control::rejected_ingress::RejectedIngressPayload;
         if self.draining.load(Ordering::Acquire) || !self.tasks.intake_open() {
-            return Err(NodeHostRefusal::new(
-                "Task domain intake is closed",
-                original,
-            ));
+            return Err(
+                NodeHostRefusal::new("Task domain intake is closed", (original, ingress)).into(),
+            );
         }
         if original.identity().verify_query_context(context).is_err() {
-            return Err(NodeHostRefusal::new(
-                "Task domain Context identity",
-                original,
-            ));
+            return Err(
+                NodeHostRefusal::new("Task domain Context identity", (original, ingress)).into(),
+            );
         }
         let Some(address) = self.directory.context(context) else {
-            return Err(NodeHostRefusal::new(
-                "Task domain Context address",
-                original,
-            ));
+            return Err(
+                NodeHostRefusal::new("Task domain Context address", (original, ingress)).into(),
+            );
         };
         let Some(mut host) = address.lock() else {
-            return Err(NodeHostRefusal::new("Task domain Context owner", original));
+            return Err(
+                NodeHostRefusal::new("Task domain Context owner", (original, ingress)).into(),
+            );
         };
+        let snapshot = match self.runtime.snapshot(host.actor()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Err(NodeHostRefusal::new(
+                    "Task domain original owner gate",
+                    (error, original, ingress),
+                )
+                .into());
+            }
+        };
+        if snapshot.failed {
+            drop(host);
+            return Err(self.reject_failed_ingress(
+                context,
+                RejectedIngressPayload::TaskDomain(original),
+                ingress,
+            ));
+        }
         let (work, handle) = match host.admit_task_request(
             &self.requests,
             original.identity(),
@@ -351,11 +492,31 @@ impl WorkerNodeHost {
             deadline,
         ) {
             Ok(admitted) => admitted,
+            Err(error)
+                if error.partial.is_none()
+                    && matches!(error.error, ContextRequestError::OwnerFailed) =>
+            {
+                drop(host);
+                return Err(self.reject_failed_ingress(
+                    context,
+                    RejectedIngressPayload::TaskDomain(original),
+                    ingress,
+                ));
+            }
+            Err(error) if error.partial.is_some() => {
+                return Err(Self::reject_failed_admission_partial(
+                    &mut host,
+                    error,
+                    RejectedIngressPayload::TaskDomain(original),
+                    ingress,
+                ));
+            }
             Err(error) => {
                 return Err(NodeHostRefusal::new(
                     "Task domain original R admission",
-                    (error, original),
-                ));
+                    (error, original, ingress),
+                )
+                .into());
             }
         };
         match host.capture_task_domain(
@@ -369,29 +530,58 @@ impl WorkerNodeHost {
             self.next_payload(),
         ) {
             Ok(()) => Ok(handle),
-            Err(original) => Err(NodeHostRefusal::new(
-                "Task domain original source capture",
-                (original, handle),
-            )),
+            Err((error, original)) => {
+                match host.capture_refused_task_domain(work, original, ingress) {
+                    Ok(()) => Ok(handle),
+                    Err(original) => Err(NodeHostRefusal::new(
+                        "Task domain original source capture",
+                        (error, original, handle),
+                    )
+                    .into()),
+                }
+            }
         }
     }
     pub(crate) fn submit_context_domain(
         &self,
         original: novarocks_execution_contract::AdvanceQueryContextDomain,
         deadline: MonotonicInstant,
-    ) -> Result<super::context_host::ContextRequestHandle, NodeHostRefusal> {
+        ingress: super::node_api::WorkerIngressResponsibility,
+    ) -> Result<super::context_host::ContextRequestHandle, NodeRequestRefusal> {
+        use super::context_host::requests::ContextRequestError;
+        use super::process_control::rejected_ingress::RejectedIngressPayload;
         if self.draining.load(Ordering::Acquire) || !self.tasks.intake_open() {
             return Err(NodeHostRefusal::new(
                 "Context domain intake is closed",
-                original,
-            ));
+                (original, ingress),
+            )
+            .into());
         }
-        let Some(address) = self.directory.context(original.context()) else {
-            return Err(NodeHostRefusal::new("Context domain address", original));
+        let context = original.context();
+        let Some(address) = self.directory.context(context) else {
+            return Err(NodeHostRefusal::new("Context domain address", (original, ingress)).into());
         };
         let Some(mut host) = address.lock() else {
-            return Err(NodeHostRefusal::new("Context domain owner", original));
+            return Err(NodeHostRefusal::new("Context domain owner", (original, ingress)).into());
         };
+        let snapshot = match self.runtime.snapshot(host.actor()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Err(NodeHostRefusal::new(
+                    "Context domain original owner gate",
+                    (error, original, ingress),
+                )
+                .into());
+            }
+        };
+        if snapshot.failed {
+            drop(host);
+            return Err(self.reject_failed_ingress(
+                context,
+                RejectedIngressPayload::ContextDomain(original),
+                ingress,
+            ));
+        }
         let (work, handle) = match host.admit_request(
             &self.requests,
             self.next_source(),
@@ -400,21 +590,146 @@ impl WorkerNodeHost {
             deadline,
         ) {
             Ok(admitted) => admitted,
+            Err(error)
+                if error.partial.is_none()
+                    && matches!(error.error, ContextRequestError::OwnerFailed) =>
+            {
+                drop(host);
+                return Err(self.reject_failed_ingress(
+                    context,
+                    RejectedIngressPayload::ContextDomain(original),
+                    ingress,
+                ));
+            }
+            Err(error) if error.partial.is_some() => {
+                return Err(Self::reject_failed_admission_partial(
+                    &mut host,
+                    error,
+                    RejectedIngressPayload::ContextDomain(original),
+                    ingress,
+                ));
+            }
             Err(error) => {
                 return Err(NodeHostRefusal::new(
                     "Context domain original R admission",
-                    (error, original),
-                ));
+                    (error, original, ingress),
+                )
+                .into());
             }
         };
         match host.capture_context_domain(work, original, self.next_payload()) {
             Ok(()) => Ok(handle),
-            Err(original) => Err(NodeHostRefusal::new(
-                "Context domain original source capture",
-                (original, handle),
-            )),
+            Err((error, original)) => {
+                match host.capture_refused_context_domain(work, original, ingress) {
+                    Ok(()) => Ok(handle),
+                    Err(original) => Err(NodeHostRefusal::new(
+                        "Context domain original source capture",
+                        (error, original, handle),
+                    )
+                    .into()),
+                }
+            }
         }
     }
+    /// Task-identity cancellation is routed by the actual Worker directory.
+    /// Missing ownership is a protocol refusal before R/Work admission, never
+    /// a Cancel tombstone or a fabricated successful Task delivery.
+    pub(crate) fn submit_cancel_task(
+        &self,
+        request: novarocks_execution_contract::CancelTask,
+        deadline: MonotonicInstant,
+    ) -> Result<NodeCancelHandle, NodeRequestRefusal> {
+        use super::context_host::requests::ContextRequestError;
+        use novarocks_worker_protocol::context::{ContextCommand, TaskControlRefusal};
+        let task = request.identity();
+        let Some(context) = self.directory.task_context(task) else {
+            return Ok(NodeCancelHandle::Refused(TaskControlRefusal::NotOwned));
+        };
+        let Some(address) = self.directory.context(context) else {
+            return Ok(NodeCancelHandle::Refused(TaskControlRefusal::NotOwned));
+        };
+        let Some(mut host) = address.lock() else {
+            // This exact cell has already moved to its actual removed owner.
+            return Ok(NodeCancelHandle::Refused(TaskControlRefusal::NotOwned));
+        };
+        let operation = request.envelope().operation_id();
+        let command = ContextCommand::Cancel {
+            task,
+            reason: request.reason(),
+        };
+        if host.has_retired_task_read(task) {
+            // The original physical retirement proof replaces the departed
+            // producer; the same Context Core still owns its replay answer.
+            let (work, handle) = match host.admit_request(
+                &self.requests,
+                self.next_source(),
+                novarocks_control_runtime_core::mailbox::InputClass::Control,
+                operation,
+                deadline,
+            ) {
+                Ok(original) => original,
+                Err(original)
+                    if original.partial.is_none()
+                        && matches!(original.error, ContextRequestError::OwnerFailed) =>
+                {
+                    return Err(NodeRequestRefusal::OwnerFailed);
+                }
+                Err(original) => {
+                    return Err(NodeHostRefusal::new(
+                        "Cancel retained Task R admission",
+                        (original, command),
+                    )
+                    .into());
+                }
+            };
+            return match host.submit_retired_task_command(work, command) {
+                Ok(()) => Ok(NodeCancelHandle::Context(handle)),
+                Err(original) => Err(NodeHostRefusal::new(
+                    "Cancel retained Task original handoff",
+                    (original, handle),
+                )
+                .into()),
+            };
+        }
+        let (work, handle) = match host.admit_task_request(
+            &self.requests,
+            task,
+            novarocks_control_runtime_core::mailbox::InputClass::Control,
+            operation,
+            deadline,
+        ) {
+            Ok(original) => original,
+            Err(original)
+                if original.partial.is_none()
+                    && matches!(original.error, ContextRequestError::UnknownTask) =>
+            {
+                return Ok(NodeCancelHandle::Refused(TaskControlRefusal::NotOwned));
+            }
+            Err(original)
+                if original.partial.is_none()
+                    && matches!(original.error, ContextRequestError::OwnerFailed) =>
+            {
+                return Err(NodeRequestRefusal::OwnerFailed);
+            }
+            Err(original) => {
+                return Err(NodeHostRefusal::new(
+                    "Cancel Task original R admission",
+                    (original, command),
+                )
+                .into());
+            }
+        };
+        match host.submit_request(work, command) {
+            Ok(()) => Ok(NodeCancelHandle::Task(handle)),
+            Err(original) => Err(NodeHostRefusal::new(
+                "Cancel Task original causal handoff",
+                (original, handle),
+            )
+            .into()),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn submit_task_command(
         &self,
         context: QueryContextRef,
@@ -483,6 +798,7 @@ impl WorkerNodeHost {
         if let Some(address) = self.directory.context(context)
             && let Some(mut host) = address.lock()
         {
+            host.print_original_execution_inventory();
             host.print_neutral_task_driver_inventory(task);
             if let Some(owner) = host.task(task) {
                 owner.print_neutral_production_inventory();
@@ -499,9 +815,9 @@ impl WorkerNodeHost {
         factory: Arc<dyn QueryContextHostFactory>,
         config: NodeContextConfig,
         actor_ids: NodeActorIds,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self, NodeHostRefusal> {
-        if config.max_contexts != root.service().directory_capacity().get()
-            || config.max_live_tasks != config.core.max_tasks
+        if config.max_live_tasks != config.core.max_tasks
             || config.core.step_budget != ContextCore::MAX_STEP_WORK
             || tasks.lifecycle.is_none()
             || tasks.capacity.is_none()
@@ -510,7 +826,9 @@ impl WorkerNodeHost {
         {
             return Err(NodeHostRefusal::new(
                 "node geometry",
-                (root, contexts, tasks, establish, factory, config, actor_ids),
+                (
+                    root, contexts, tasks, establish, factory, config, actor_ids, clock,
+                ),
             ));
         }
         if let Some(signal) = &tasks.capacity {
@@ -521,14 +839,17 @@ impl WorkerNodeHost {
                         "Task capacity source",
                         (
                             error, root, contexts, tasks, establish, factory, config, actor_ids,
+                            clock,
                         ),
                     ));
                 }
             };
-            if !original.same_signal(signal) {
+            if !original.same_signal(signal) || !original.same_signal(contexts.capacity_signal()) {
                 return Err(NodeHostRefusal::new(
                     "Task capacity source origin",
-                    (root, contexts, tasks, establish, factory, config, actor_ids),
+                    (
+                        root, contexts, tasks, establish, factory, config, actor_ids, clock,
+                    ),
                 ));
             }
         }
@@ -536,11 +857,12 @@ impl WorkerNodeHost {
             return Err(NodeHostRefusal::new(
                 "Root internal source",
                 (
-                    error, root, contexts, tasks, establish, factory, config, actor_ids,
+                    error, root, contexts, tasks, establish, factory, config, actor_ids, clock,
                 ),
             ));
         }
         Ok(Self {
+            clock,
             runtime: root.runtime().clone(),
             root_registration: root.registration().clone(),
             directory: root.service().directory(),
@@ -685,7 +1007,7 @@ impl WorkerNodeHost {
         operation: TaskOperationId,
         deadline: MonotonicInstant,
         command: novarocks_worker_protocol::context::ContextCommand,
-    ) -> Result<super::context_host::ContextRequestHandle, NodeHostRefusal> {
+    ) -> Result<super::context_host::ContextRequestHandle, NodeRequestRefusal> {
         self.submit_context_selected(context, source, operation, deadline, command, false)
     }
     #[cfg(novarocks_dev_controls)]
@@ -696,7 +1018,7 @@ impl WorkerNodeHost {
         operation: TaskOperationId,
         deadline: MonotonicInstant,
         command: novarocks_worker_protocol::context::ContextCommand,
-    ) -> Result<super::context_host::ContextRequestHandle, NodeHostRefusal> {
+    ) -> Result<super::context_host::ContextRequestHandle, NodeRequestRefusal> {
         if !matches!(
             &command,
             novarocks_worker_protocol::context::ContextCommand::Renew { .. }
@@ -704,7 +1026,8 @@ impl WorkerNodeHost {
             return Err(NodeHostRefusal::new(
                 "declared owner panic requires its original Renew",
                 command,
-            ));
+            )
+            .into());
         }
         self.submit_context_selected(context, source, operation, deadline, command, true)
     }
@@ -716,7 +1039,7 @@ impl WorkerNodeHost {
         deadline: MonotonicInstant,
         command: novarocks_worker_protocol::context::ContextCommand,
         _panic_on_renew: bool,
-    ) -> Result<super::context_host::ContextRequestHandle, NodeHostRefusal> {
+    ) -> Result<super::context_host::ContextRequestHandle, NodeRequestRefusal> {
         use novarocks_worker_protocol::context::ContextCommand;
         if !matches!(
             &command,
@@ -730,13 +1053,14 @@ impl WorkerNodeHost {
             return Err(NodeHostRefusal::new(
                 "Context control command requires its original source",
                 command,
-            ));
+            )
+            .into());
         }
         let Some(address) = self.directory.context(context) else {
-            return Err(NodeHostRefusal::new("Context request address", command));
+            return Err(NodeHostRefusal::new("Context request address", command).into());
         };
         let Some(mut host) = address.lock() else {
-            return Err(NodeHostRefusal::new("Context request owner", command));
+            return Err(NodeHostRefusal::new("Context request owner", command).into());
         };
         let (work, handle) = match host.admit_request(
             &self.requests,
@@ -747,10 +1071,20 @@ impl WorkerNodeHost {
         ) {
             Ok(original) => original,
             Err(error) => {
-                return Err(NodeHostRefusal::new(
-                    "Context request admission",
-                    (error, command),
-                ));
+                if matches!(
+                    error.error,
+                    super::context_host::ContextRequestError::OwnerFailed
+                ) && error.partial.is_none()
+                {
+                    // Only these four plain control commands enter this port.
+                    // No R, rich input or partial was admitted on this branch.
+                    drop(host);
+                    drop(command);
+                    return Err(NodeRequestRefusal::OwnerFailed);
+                }
+                return Err(
+                    NodeHostRefusal::new("Context request admission", (error, command)).into(),
+                );
             }
         };
         #[cfg(novarocks_dev_controls)]
@@ -763,10 +1097,21 @@ impl WorkerNodeHost {
         let submitted = host.submit_request(work, command);
         match submitted {
             Ok(()) => Ok(handle),
-            Err(error) => Err(NodeHostRefusal::new(
-                "Context request submission",
-                (error, handle),
-            )),
+            Err(error) => {
+                // A real Core failure can race the original admitted fill.
+                // The same R already retains that refused neutral message;
+                // its failure supervisor publishes and drains the same cell.
+                if error.command.is_none()
+                    && host
+                        .retains_refused_context_control(work)
+                        .map_err(|error| {
+                            NodeHostRefusal::new("Context original refused control input", error)
+                        })?
+                {
+                    return Ok(handle);
+                }
+                Err(NodeHostRefusal::new("Context request submission", (error, handle)).into())
+            }
         }
     }
     /// The original Create payload is captured by its admitted R before the
@@ -776,27 +1121,48 @@ impl WorkerNodeHost {
         source: ActorId,
         deadline: MonotonicInstant,
         payload: super::loading::TaskCreatePayload,
-    ) -> Result<NodeCreateHandle, NodeHostRefusal> {
+        ingress: super::node_api::WorkerIngressResponsibility,
+    ) -> Result<NodeCreateHandle, NodeRequestRefusal> {
+        use super::context_host::requests::{
+            ContextCreationInspectionRefusal, ContextRequestError,
+        };
+        use super::process_control::rejected_ingress::RejectedIngressPayload;
         if self.draining.load(Ordering::Acquire) || !self.tasks.intake_open() {
-            return Err(NodeHostRefusal::new("Task intake is not open", payload));
+            return Err(NodeHostRefusal::new("Task intake is not open", (payload, ingress)).into());
         }
         let context = payload.request.context();
         let operation = payload.request.envelope().operation_id();
         let Some(address) = self.directory.context(context) else {
-            return self.create_before_context(source, deadline, payload);
+            return self
+                .create_before_context(source, deadline, payload)
+                .map_err(Into::into);
         };
         let Some(mut host) = address.lock() else {
-            return self.create_before_context(source, deadline, payload);
+            return self
+                .create_before_context(source, deadline, payload)
+                .map_err(Into::into);
         };
         let admission = match self.runtime.snapshot(host.actor()) {
             Ok(snapshot) => snapshot,
             Err(original) => {
                 return Err(NodeHostRefusal::new(
                     "Create original Context gate",
-                    (original, payload),
-                ));
+                    (original, payload, ingress),
+                )
+                .into());
             }
         };
+        if admission.failed {
+            drop(host);
+            return Err(self.reject_failed_ingress(
+                context,
+                RejectedIngressPayload::Create {
+                    payload,
+                    binding: None,
+                },
+                ingress,
+            ));
+        }
         if !admission.external_open {
             let inspection = host.inspect_creation(
                 &self.requests,
@@ -805,18 +1171,46 @@ impl WorkerNodeHost {
                 deadline,
                 payload.request.identity(),
             );
-            drop(host);
             return match inspection {
                 Ok(handle) => {
                     // The actual Native caller still owns this unadmitted
                     // carrier. Its foreign Drop runs after the owner unlocks.
+                    drop(host);
                     drop(payload);
                     Ok(NodeCreateHandle::Context(handle))
                 }
+                Err(ContextCreationInspectionRefusal::Admission(error))
+                    if error.partial.is_none()
+                        && matches!(error.error, ContextRequestError::OwnerFailed) =>
+                {
+                    drop(host);
+                    Err(self.reject_failed_ingress(
+                        context,
+                        RejectedIngressPayload::Create {
+                            payload,
+                            binding: None,
+                        },
+                        ingress,
+                    ))
+                }
+                Err(ContextCreationInspectionRefusal::Admission(error))
+                    if error.partial.is_some() =>
+                {
+                    Err(Self::reject_failed_admission_partial(
+                        &mut host,
+                        error,
+                        RejectedIngressPayload::Create {
+                            payload,
+                            binding: None,
+                        },
+                        ingress,
+                    ))
+                }
                 Err(original) => Err(NodeHostRefusal::new(
                     "Create closed inspection",
-                    (original, payload),
-                )),
+                    (original, payload, ingress),
+                )
+                .into()),
             };
         }
         let protocol_generation = match host.scope().gates() {
@@ -824,12 +1218,14 @@ impl WorkerNodeHost {
             Err(original) => {
                 return Err(NodeHostRefusal::new(
                     "Create scope generation",
-                    (original, payload),
-                ));
+                    (original, payload, ingress),
+                )
+                .into());
             }
         };
         let binding = super::task::TaskHostBinding {
             context,
+            registration: host.registration().clone(),
             task_source: self.actor_ids.next(),
             protocol_generation,
             max_cuts: self.config.policy.max_task_cuts,
@@ -840,8 +1236,6 @@ impl WorkerNodeHost {
                 .as_ref()
                 .expect("original role execution ports were validated at Node startup")
                 .execution_health(),
-            #[cfg(test)]
-            source_storage_model: false,
         };
         let (work, handle) = match host.admit_request(
             &self.requests,
@@ -851,22 +1245,71 @@ impl WorkerNodeHost {
             deadline,
         ) {
             Ok(original) => original,
+            Err(error)
+                if error.partial.is_none()
+                    && matches!(error.error, ContextRequestError::OwnerFailed) =>
+            {
+                drop(host);
+                return Err(self.reject_failed_ingress(
+                    context,
+                    RejectedIngressPayload::Create {
+                        payload,
+                        binding: Some(binding),
+                    },
+                    ingress,
+                ));
+            }
+            Err(error) if error.partial.is_some() => {
+                return Err(Self::reject_failed_admission_partial(
+                    &mut host,
+                    error,
+                    RejectedIngressPayload::Create {
+                        payload,
+                        binding: Some(binding),
+                    },
+                    ingress,
+                ));
+            }
             Err(error) => {
                 tracing::warn!(error = ?error.error, "Create original request admission refused");
                 return Err(NodeHostRefusal::new(
                     "Create request admission",
-                    (error, payload, binding),
-                ));
+                    (error, payload, binding, ingress),
+                )
+                .into());
             }
         };
         match host.submit_task_create(work, payload, binding) {
             Ok(()) => Ok(NodeCreateHandle::Context(handle)),
             Err(original) => {
+                if original.originals.is_none() {
+                    match host.retains_refused_create_input(work) {
+                        Ok(true) => {
+                            return match host.capture_refused_create_ingress(work, ingress) {
+                                Ok(()) => Ok(NodeCreateHandle::Context(handle)),
+                                Err((error, ingress)) => Err(NodeHostRefusal::new(
+                                    "Create original refused ingress capture",
+                                    (error, original, handle, ingress),
+                                )
+                                .into()),
+                            };
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            return Err(NodeHostRefusal::new(
+                                "Create original refused input proof",
+                                (error, original, handle, ingress),
+                            )
+                            .into());
+                        }
+                    }
+                }
                 tracing::warn!(error = ?original.error, "Create original source handoff refused");
                 Err(NodeHostRefusal::new(
                     "Create original source handoff",
-                    (original, handle),
-                ))
+                    (original, handle, ingress),
+                )
+                .into())
             }
         }
     }
@@ -945,21 +1388,26 @@ impl WorkerNodeHost {
     }
     pub(crate) fn start_pollers(
         self: &Arc<Self>,
-        clock: Arc<dyn Clock>,
         workers: usize,
     ) -> Result<PollerPool<WorkerActor>, std::io::Error> {
         let node = self.clone();
-        PollerPool::start_with_host(self.runtime.clone(), clock, workers, move |now, turn| {
-            if let Err(original) = node.advance(now, turn, 8) {
-                tracing::error!(failure = ?original, "Worker host driver invariant failed");
-                #[cfg(test)]
-                eprintln!("Worker host driver invariant failed: {original:?}");
-                // Reaching this boundary is a fixed driver invariant failure.
-                // Preserve the original refused captures across process exit.
-                std::mem::forget(original);
-                std::process::abort();
-            }
-        })
+        PollerPool::start_with_host(
+            self.runtime.clone(),
+            self.clock.clone(),
+            workers,
+            move |now, turn| {
+                if let Err(original) = node.advance(now, turn, 8) {
+                    tracing::error!(failure = ?original, "Worker host driver invariant failed");
+                    // Preserve the fatal boundary in standalone integration
+                    // tests too, where no tracing subscriber may be installed.
+                    eprintln!("Worker host driver invariant failed: {original:?}");
+                    // Reaching this boundary is a fixed driver invariant failure.
+                    // Preserve the original refused captures across process exit.
+                    std::mem::forget(original);
+                    std::process::abort();
+                }
+            },
+        )
     }
     pub(crate) fn advance(
         &self,
@@ -968,6 +1416,14 @@ impl WorkerNodeHost {
         budget: usize,
     ) -> Result<NodeHostProgress, NodeHostRefusal> {
         if turn.matches_registration(&self.root_registration) {
+            for notice in turn.take_header_readiness(budget) {
+                self.root
+                    .lock()
+                    .notify_request_header_readiness(&notice)
+                    .map_err(|error| {
+                        NodeHostRefusal::new("Root original header readiness", error)
+                    })?;
+            }
             match self.advance_root(&turn, budget) {
                 Ok(mut progress) => {
                     let rows_empty = self
@@ -1066,7 +1522,7 @@ impl WorkerNodeHost {
         let mut root = self.root.lock();
         root.advance_internal()
             .map_err(|original| NodeHostRefusal::new("Root internal progress", original))?;
-        progress.runnable = remaining > 0
+        progress.runnable |= remaining > 0
             || progress.root_effects == budget
             || io.runnable
             || root
@@ -1105,21 +1561,32 @@ impl WorkerNodeHost {
     fn complete_root(
         &self,
         ticket: novarocks_control_runtime::driver::EffectTicket<WorkerAction>,
-        ordered: bool,
     ) -> Result<(), NodeHostRefusal> {
-        let reference = EffectRef {
-            input: ticket.input,
-            action: ticket.descriptor.id,
+        let ordered = match self
+            .root
+            .lock()
+            .resources()
+            .dispatch
+            .requires_completion(&ticket)
+        {
+            Ok(ordered) => ordered,
+            Err(error) => {
+                return Err(NodeHostRefusal::new(
+                    "Root original dispatch policy",
+                    (error, ticket),
+                ));
+            }
         };
-        self.runtime
-            .effect_completed(ticket)
+        let completed = self
+            .runtime
+            .effect_completed_with_receipt(ticket)
             .map_err(|original| NodeHostRefusal::new("Root effect completion", original))?;
         let mut root = self.root.lock();
         if ordered {
-            root.control_completion_observed(reference)
+            root.control_completion_observed_with_receipt(&completed)
                 .map_err(|original| NodeHostRefusal::new("Root ordered completion", original))?;
         } else {
-            root.note_control_input_progress(reference.input);
+            root.note_control_input_progress(completed.input());
         }
         Ok(())
     }
@@ -1130,7 +1597,7 @@ impl WorkerNodeHost {
         // Only frozen neutral facts are cloned; no rich source enters this switch.
         match ticket.effect.clone() {
             WorkerAction::AdmissionEpoch(epoch) => {
-                let projection = self.root.lock().resources().admission_epoch.clone();
+                let projection = self.root.lock().resources().admission_snapshot.clone();
                 if let Err((error, original)) =
                     self.runtime
                         .commit_snapshot(&ticket, &projection, Arc::new(epoch))
@@ -1140,7 +1607,7 @@ impl WorkerNodeHost {
                         (error, original, ticket),
                     ));
                 }
-                self.complete_root(ticket, true)
+                self.complete_root(ticket)
             }
             WorkerAction::ControlReply(_) => self
                 .root
@@ -1148,24 +1615,16 @@ impl WorkerNodeHost {
                 .publish_request_reply(ticket)
                 .map_err(|original| NodeHostRefusal::new("Root reply publication", original)),
             WorkerAction::Control {
-                effect: ControlEffect::AdmissionReply { result: Ok(_), .. },
-                ..
-            } => {
-                if let Err(error) = self.root.lock().adopt_ticket(&ticket) {
-                    return Err(NodeHostRefusal::new("ticket adoption", (error, ticket)));
-                }
-                self.complete_root(ticket, true)
-            }
-            WorkerAction::Control {
                 effect:
-                    ControlEffect::AdmissionReply { result: Err(_), .. }
+                    ControlEffect::AdmissionReply { .. }
                     | ControlEffect::DomainFailureReply { .. }
                     | ControlEffect::Reply { .. },
-                ..
+                admitted: None,
             } => {
-                // These neutral markers are followed by the independently
-                // addressed full ControlReply. They invoke no host operation.
-                self.complete_root(ticket, true)
+                // The Core owns ticket metadata. This marker borrows its
+                // original neutral receipt; the following ControlReply owns
+                // delivery, without another ticket Work or holder inventory.
+                self.complete_root(ticket)
             }
             WorkerAction::Control {
                 effect:
@@ -1187,10 +1646,16 @@ impl WorkerNodeHost {
                             ));
                         }
                     };
+                let initial_route = PublishedSnapshot::new(
+                    &self.root.lock().resources().scope,
+                    Arc::new(ContextRoute {
+                        state: QueryContextState::Establishing,
+                        generation,
+                    }),
+                );
                 {
                     let mut rows = self.rows.lock().expect("original Context route rows");
-                    if rows.contexts.len() >= self.config.max_contexts
-                        || rows.contexts.contains_key(&context)
+                    if rows.contexts.contains_key(&context)
                         || rows.reservations.contains_key(&reservation)
                     {
                         return Err(NodeHostRefusal::new("Context row geometry", ticket));
@@ -1203,13 +1668,7 @@ impl WorkerNodeHost {
                             reservation,
                             removed: None,
                             retire_requested: false,
-                            route: PublishedSnapshot::new(
-                                &self.root.lock().resources().scope,
-                                Arc::new(ContextRoute {
-                                    state: QueryContextState::Establishing,
-                                    generation,
-                                }),
-                            ),
+                            route: initial_route,
                         },
                     );
                     rows.reservations.insert(reservation, context);
@@ -1266,7 +1725,7 @@ impl WorkerNodeHost {
                         (error, ticket),
                     ));
                 }
-                self.complete_root(ticket, false)
+                self.complete_root(ticket)
             }
             WorkerAction::Control {
                 effect: ControlEffect::RouteEstablish { .. },
@@ -1299,7 +1758,7 @@ impl WorkerNodeHost {
                 if let Err(error) = self.directory.handoff_owner_fence(&ticket) {
                     return Err(NodeHostRefusal::new("Context owner fence", (error, ticket)));
                 }
-                self.complete_root(ticket, false)
+                self.complete_root(ticket)
             }
             WorkerAction::Control {
                 effect: ControlEffect::RemoveHost { context },
@@ -1308,9 +1767,62 @@ impl WorkerNodeHost {
                 let Some(target) = self.directory.context(context) else {
                     return Err(NodeHostRefusal::new("Context removal address", ticket));
                 };
-                self.root
-                    .handoff_context_removal(ticket, target)
-                    .map_err(|original| NodeHostRefusal::new("Context holder removal", original))
+                let notice = {
+                    let host = target.lock().ok_or_else(|| {
+                        NodeHostRefusal::new("Context removal original owner", context)
+                    })?;
+                    host.ready_notice().clone()
+                };
+                let Some(execution) = self.tasks.execution.as_ref().cloned() else {
+                    return Err(NodeHostRefusal::new(
+                        "Context removal execution host",
+                        ticket,
+                    ));
+                };
+                let original = {
+                    let root = self.root.lock();
+                    super::context_removal::ContextRemovalOwner::from_actual_effect(
+                        self.runtime.clone(),
+                        self.root_registration.clone(),
+                        &root.resources().roles[0].work,
+                        &ticket,
+                        context,
+                        notice,
+                        execution,
+                    )
+                };
+                let (owner, job) = match original {
+                    Ok(original) => original,
+                    Err(refusal) => {
+                        return Err(NodeHostRefusal::new(
+                            "Context removal original admission",
+                            (refusal, ticket),
+                        ));
+                    }
+                };
+                let mut host = target.lock().ok_or_else(|| {
+                    NodeHostRefusal::new("Context removal owner disappeared", context)
+                })?;
+                if let Err(error) = host.authorize_owner_control_removal(&ticket) {
+                    return Err(NodeHostRefusal::new(
+                        "Context removal intake fence",
+                        (error, owner, job, ticket),
+                    ));
+                }
+                if let Err(original) = host.stage_removal(owner, job) {
+                    return Err(NodeHostRefusal::new(
+                        "Context removal custody handoff",
+                        (original, ticket),
+                    ));
+                }
+                self.runtime
+                    .close_actor_admission(target.registration().actor())
+                    .map_err(|e| NodeHostRefusal::new("Context removal mailbox fence", e))?;
+                self.runtime
+                    .close_timer_source(target.registration().actor())
+                    .map_err(|e| NodeHostRefusal::new("Context removal timer closure", e))?;
+                drop(host);
+                self.complete_root(ticket)
             }
             WorkerAction::Control {
                 effect: ControlEffect::RetireReservation(reservation),
@@ -1357,13 +1869,13 @@ impl WorkerNodeHost {
                         ));
                     }
                     row.retire_requested = true;
-                } else if let Err(error) = self.root.lock().retire_ticket(&ticket) {
+                } else {
                     return Err(NodeHostRefusal::new(
-                        "ticket holder retirement",
-                        (error, ticket),
+                        "Context reservation retirement owner missing",
+                        ticket,
                     ));
                 }
-                self.complete_root(ticket, true)
+                self.complete_root(ticket)
             }
             // Continuation hints are consumed by the pure actor projection.
             // A Context action or Root failure is never a default host ACK.
@@ -1371,6 +1883,9 @@ impl WorkerNodeHost {
         }
     }
     fn advance_parent_rows(&self, budget: usize) -> Result<bool, NodeHostRefusal> {
+        // This finite Root turn acquires its owner before the routing rows.
+        // Removed Context tails contain no live Context lock or foreign call.
+        let mut root = self.root.lock();
         let mut rows = self.rows.lock().expect("original Context route rows");
         let mut runnable = false;
         // Freeze this pass's actual length; a not-yet-decided Root input
@@ -1393,9 +1908,9 @@ impl WorkerNodeHost {
                 .removed
                 .as_mut()
                 .expect("original parent owner")
-                .advance_parent_teardown()
+                .advance_removed_root_tail(&mut root)
                 .map_err(|original| {
-                    NodeHostRefusal::new("Context original parent teardown", original)
+                    NodeHostRefusal::new("Context original removal tail", original)
                 })?;
             if retired {
                 let row = rows
@@ -1414,7 +1929,7 @@ impl WorkerNodeHost {
     }
     fn advance_context(
         &self,
-        turn: ActorHostTurn<WorkerActor>,
+        mut turn: ActorHostTurn<WorkerActor>,
         budget: usize,
     ) -> Result<NodeHostProgress, NodeHostRefusal> {
         let Some(address) = self.directory.host_turn(&turn) else {
@@ -1423,6 +1938,50 @@ impl WorkerNodeHost {
         let Some(mut host) = address.lock() else {
             return Err(NodeHostRefusal::new("removed Context host turn", turn));
         };
+        for notice in turn.take_header_readiness(budget) {
+            host.notify_header_readiness(&notice);
+        }
+        let cold_proof = host.cold_failure_admission_needed().map_err(|original| {
+            NodeHostRefusal::new("Context actual cold failure proof", original)
+        })?;
+        if let Some(proof) = cold_proof {
+            drop(host);
+            let admission = {
+                let root = self.root.lock();
+                super::context_host::failure::cold::ColdFailureAdmission::admit(
+                    &self.runtime,
+                    &self.root_registration,
+                    root.lifetime_author(),
+                    &proof,
+                )
+            }
+            .map_err(|original| {
+                NodeHostRefusal::new("Context original cold failure Cleanup", original)
+            })?;
+            host = match address.lock() {
+                Some(host) => host,
+                None => {
+                    return Err(NodeHostRefusal::new(
+                        "Context cold failure install disappeared",
+                        admission,
+                    ));
+                }
+            };
+            if let Err(original) = host.install_cold_failure(admission) {
+                return Err(NodeHostRefusal::new(
+                    "Context original cold failure install",
+                    original,
+                ));
+            }
+        }
+        let metadata_runnable =
+            host.advance_lifecycle_metadata(&mut turn, budget)
+                .map_err(|original| {
+                    NodeHostRefusal::new("Context original lifecycle metadata", original)
+                })?;
+        let removal_runnable = host
+            .advance_removal(&self.tasks)
+            .map_err(|original| NodeHostRefusal::new("Context actual forget progress", original))?;
         let advanced =
             match host.advance_driver(&self.contexts, &self.requests, &self.tasks, budget) {
                 Ok(advanced) => advanced,
@@ -1433,9 +1992,73 @@ impl WorkerNodeHost {
                     ));
                 }
             };
+        let detached = host
+            .try_detach_execution(&mut turn, self.clock.as_ref())
+            .map_err(|original| {
+                NodeHostRefusal::new("Context actual execution detachment", original)
+            })?;
+        // Only neutral proof/fact/notice leave this Context borrow. Root's
+        // original internal Source serializes delivery without a second R.
+        let intent = if self
+            .runtime
+            .snapshot(address.registration().actor())
+            .map_err(|original| NodeHostRefusal::new("Context custodian failure state", original))?
+            .failed
+        {
+            let proof = self
+                .runtime
+                .failure_proof_for(address.registration())
+                .map_err(|original| {
+                    NodeHostRefusal::new("Context custodian original proof", original)
+                })?;
+            let notice = host.ready_notice().clone();
+            let now =
+                MonotonicInstant::from_origin(std::time::Duration::from_nanos(self.clock.now().0));
+            let fact = host
+                .failed_lifecycle_intent(&proof, now)
+                .map_err(|original| {
+                    NodeHostRefusal::new("Context custodian lifecycle intent", original)
+                })?;
+            fact.map(|fact| (proof, fact, notice))
+        } else {
+            None
+        };
+        if let Some((proof, fact, notice)) = intent {
+            drop(host);
+            let receipt = self
+                .root
+                .lock()
+                .enqueue_failed_lifecycle(&proof, fact, notice)
+                .map_err(|original| {
+                    NodeHostRefusal::new("Root original failed lifecycle Source", original)
+                })?;
+            host = match address.lock() {
+                Some(host) => host,
+                None => {
+                    return Err(NodeHostRefusal::new(
+                        "Context failed lifecycle receipt disappeared",
+                        receipt,
+                    ));
+                }
+            };
+            host.install_failed_lifecycle_receipt(&proof, fact, receipt)
+                .map_err(|original| {
+                    NodeHostRefusal::new("Context original failed lifecycle receipt", original)
+                })?;
+        }
+        let parent_runnable = if host.parent_retirement_ready() {
+            !host.advance_parent_teardown().map_err(|original| {
+                NodeHostRefusal::new("Context hot parent retirement", original)
+            })?
+        } else {
+            false
+        };
         let progress = NodeHostProgress {
-            context_effects: advanced.effects,
-            runnable: advanced.runnable,
+            runnable: advanced.runnable
+                || metadata_runnable
+                || detached
+                || parent_runnable
+                || removal_runnable,
             ..Default::default()
         };
         if advanced.metadata_teardown_ready {
@@ -1448,11 +2071,15 @@ impl WorkerNodeHost {
                 .get_mut(&address.context())
                 .expect("same original Context row");
             assert!(row.removed.replace(host.take_for_parent()).is_none());
-            rows.removed_ready.push_back(address.context());
             drop(rows);
             drop(host);
             drop(pure);
             self.directory.remove_original(&address);
+            self.rows
+                .lock()
+                .expect("original Context route rows")
+                .removed_ready
+                .push_back(address.context());
             self.runtime
                 .notify_host_actor(&self.root_registration)
                 .map_err(|original| {
@@ -1479,12 +2106,12 @@ impl WorkerNodeHost {
             .contexts
             .first_key_value()
             .map(|(&context, _)| context);
-        if let Some(address) = context.and_then(|context| self.directory.context(context)) {
-            if let Some(host) = address.lock() {
-                // A bounded diagnostic prefix, never an exit predicate or a
-                // request-path global owner scan.
-                host.trace_drain_inventory(8);
-            }
+        if let Some(address) = context.and_then(|context| self.directory.context(context))
+            && let Some(host) = address.lock()
+        {
+            // A bounded diagnostic prefix, never an exit predicate or a
+            // request-path global owner scan.
+            host.trace_drain_inventory(8);
         }
     }
     pub(crate) fn try_preparation_snapshot(
@@ -1504,9 +2131,12 @@ impl WorkerNodeHost {
         )
     }
     pub(crate) fn metrics_snapshot(&self) -> super::node_metrics::WorkerNodeMetricsSnapshot {
-        // This is the same ledger retained at original composition, without
-        // a Root/Context inventory lock, enumeration or foreign callback.
-        super::node_metrics::WorkerNodeMetricsSnapshot::sample(&self.metrics_ledger)
+        // Resource units and the metadata row count come from their original
+        // owners; neither observation grants capacity or proves actual exit.
+        super::node_metrics::WorkerNodeMetricsSnapshot::sample(
+            &self.metrics_ledger,
+            self.directory.len(),
+        )
     }
 }
 
@@ -1517,9 +2147,7 @@ impl WorkerNodeHost {
     pub(crate) fn try_root_ownership_snapshot(
         &self,
     ) -> Option<crate::root_result_channel::RootOwnershipSnapshot> {
-        let addresses = self
-            .directory
-            .try_census_addresses(self.config.max_contexts)?;
+        let addresses = self.directory.try_census_addresses()?;
         let mut total = crate::root_result_channel::RootOwnershipSnapshot::default();
         for address in &addresses {
             let host = address.try_lock()?;
@@ -1545,15 +2173,42 @@ impl WorkerNodeHost {
     ) -> Option<super::node_metrics::WorkerControlPlaneSnapshot> {
         self.poller_observation.get()?.snapshot()
     }
+    pub(crate) fn runtime_observation_snapshot(
+        &self,
+    ) -> Option<super::node_metrics::WorkerRuntimeObservationSnapshot> {
+        self.runtime.observation_snapshot()
+    }
+    pub(crate) fn try_runtime_inventory_page(
+        &self,
+        budget: usize,
+    ) -> Result<
+        Option<super::node_metrics::WorkerRuntimeInventoryPage>,
+        super::node_metrics::WorkerRuntimeObservationError,
+    > {
+        self.metrics_ledger.try_observation_inventory(budget)
+    }
 }
 
 impl WorkerNodeHost {
+    /// Read only original neutral metadata. Busy, poison or missing samples
+    /// are unavailable, never a default zero or an inferred ticket closure.
+    pub(crate) fn try_admission_snapshot(
+        &self,
+    ) -> Option<super::node_metrics::WorkerAdmissionSnapshot> {
+        let logical_live_grants = {
+            let root = self.root.try_lock()?;
+            let admission = root.resources().admission_snapshot.try_borrow()?;
+            admission.logical_live_grants
+        };
+        Some(super::node_metrics::WorkerAdmissionSnapshot {
+            logical_live_grants: u64::try_from(logical_live_grants).ok()?,
+        })
+    }
+
     pub(crate) fn try_execution_quiescence_snapshot(
         &self,
     ) -> Option<super::node_metrics::WorkerExecutionQuiescenceSnapshot> {
-        let addresses = self
-            .directory
-            .try_census_addresses(self.config.max_contexts)?;
+        let addresses = self.directory.try_census_addresses()?;
         let mut roots = crate::root_result_channel::RootOwnershipSnapshot::default();
         let mut active_contexts = 0u64;
         for address in &addresses {
@@ -1565,10 +2220,102 @@ impl WorkerNodeHost {
         let sample = super::node_metrics::WorkerExecutionQuiescenceSnapshot::sample(
             &self.metrics_ledger,
             active_contexts,
+            addresses.len(),
             roots,
         )?;
         self.directory
             .census_addresses_unchanged(&addresses)
             .then_some(sample)
+    }
+}
+
+// Strictly cfg(test): no role, scope, report, receipt or cleanup authority escapes.
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct PreparationFixtureInventory {
+    pub scope: novarocks_control_runtime::transaction::ScopeSnapshot,
+    pub roles: Vec<novarocks_control_runtime::driver::InputRoleCustody>,
+    pub preparation_key: Option<(
+        novarocks_control_runtime_core::identity::ScopeId,
+        novarocks_control_runtime_core::identity::WorkId,
+    )>,
+    pub body_exited: bool,
+    pub host_borrowers_exited: bool,
+    pub body_report_retired: bool,
+    pub whole_report_retired: bool,
+    pub stopped: bool,
+    pub stop_call_exited: bool,
+    pub lifecycle_ids: Vec<(
+        crate::control_runtime_policy::TaskLifecycleRole,
+        novarocks_control_runtime_core::identity::ScopedWorkRef,
+        novarocks_worker_protocol::proposal_summary::CutId,
+        novarocks_control_runtime::exit_role::ExitRolePhase,
+    )>,
+    pub settlement_work: Option<novarocks_control_runtime_core::identity::ScopedWorkRef>,
+}
+#[cfg(test)]
+impl WorkerNodeHost {
+    pub(crate) fn preparation_fixture_inventory(
+        &self,
+        context: QueryContextRef,
+        task: novarocks_execution_contract::TaskIdentity,
+    ) -> Option<PreparationFixtureInventory> {
+        let address = self.directory.context(context)?;
+        let mut host = address.lock()?;
+        let scope = host.scope().snapshot().ok()?;
+        let budget = self.runtime.snapshot(host.actor()).ok()?.roles;
+        let roles = self
+            .runtime
+            .role_inventory(host.actor(), None, budget)
+            .ok()?;
+        let owner = host.task(task)?;
+        let resources = owner.resources_for_retirement();
+        let preparation = owner.preparation();
+        Some(PreparationFixtureInventory {
+            scope,
+            roles,
+            preparation_key: preparation.map(|p| p.key()),
+            body_exited: preparation.is_some_and(|p| p.body_and_captures_exited()),
+            host_borrowers_exited: preparation.is_some_and(|p| p.host_borrowers_exited()),
+            body_report_retired: preparation.is_some_and(|p| p.body_report_retired()),
+            whole_report_retired: preparation.is_some_and(|p| p.exit_report_retired()),
+            stopped: resources.port.is_stopped(),
+            stop_call_exited: owner
+                .host_call(crate::control_runtime::task_host_call::TaskHostCallKind::Stop)
+                .actual_call_exited(),
+            lifecycle_ids: resources
+                .lifecycle_inputs
+                .iter()
+                .map(|(kind, input)| (*kind, input.work_id(), input.cut(), input.phase()))
+                .collect(),
+            settlement_work: resources
+                .completion
+                .as_ref()
+                .map(|completion| completion.settlement_work()),
+        })
+    }
+}
+
+impl WorkerNodeHost {
+    pub(crate) fn try_protocol_retention_snapshot(
+        &self,
+    ) -> Option<super::node_metrics::WorkerProtocolRetentionSnapshot> {
+        let projection = {
+            let root = self.root.try_lock()?;
+            let snapshot = root.resources().admission_snapshot.try_borrow()?;
+            *snapshot
+        };
+        let addresses = self.directory.try_census_addresses()?;
+        let mut contexts = super::node_metrics::WorkerContextRetentionSnapshot::empty();
+        for address in &addresses {
+            contexts.try_add(address.try_lock()?.retention_snapshot()?)?;
+        }
+        self.directory
+            .census_addresses_unchanged(&addresses)
+            .then_some(super::node_metrics::WorkerProtocolRetentionSnapshot {
+                contexts,
+                admission: projection.admission_retention,
+                control: projection.control_retention,
+            })
     }
 }

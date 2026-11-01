@@ -185,6 +185,36 @@ pub(crate) enum StatisticsError {
     OwnerFailed { input: InputId },
     FailurePublicationRequired,
 }
+impl std::fmt::Display for StatisticsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Driver(error) => write!(f, "Task statistics driver failure: {error}"),
+            Self::Runtime(error) => write!(f, "Task statistics runtime failure: {error}"),
+            Self::Role(error) => write!(f, "Task statistics role failure: {error}"),
+            Self::MissingOccurrence => f.write_str("Task statistics has no original occurrence"),
+            Self::RefusedInput => f.write_str("Task statistics original input was refused"),
+            Self::Unresolved => f.write_str("Task statistics actual exit is unresolved"),
+            Self::OwnerFailed { input } => write!(
+                f,
+                "Task statistics owner failed at original input {input:?}"
+            ),
+            Self::FailurePublicationRequired => {
+                f.write_str("Task statistics requires the actual owner failure publication")
+            }
+        }
+    }
+}
+impl std::error::Error for StatisticsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Driver(error) => Some(error),
+            Self::Runtime(error) => Some(error),
+            Self::Role(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 impl From<DriverError> for StatisticsError {
     fn from(error: DriverError) -> Self {
         Self::Driver(error)
@@ -289,6 +319,7 @@ impl TaskStatisticsInbox {
     pub(crate) fn phase(&self) -> ExitRolePhase {
         self.custody.role.phase()
     }
+    #[cfg(test)]
     pub(crate) fn report(&self) -> &ReportSlot {
         &self.custody.report
     }
@@ -501,7 +532,10 @@ impl TaskStatisticsInbox {
         } = turn;
         if let Some(snapshot) = snapshot {
             let input = WorkerMessage::Context(ContextMessage::Command {
-                work: self.work,
+                work: novarocks_control_runtime_core::identity::ScopedWorkRef {
+                    scope: self.custody.scope.id(),
+                    work: self.work,
+                },
                 request: None,
                 command: ContextInput::OperatorStatistics {
                     task: self.custody.task,

@@ -33,13 +33,15 @@ pub(crate) enum LoadingHostJobError {
 #[must_use = "Both the original job and return sender remain owned on refusal"]
 pub(crate) struct LoadingHostJobRefusal {
     pub error: LoadingHostJobError,
-    pub job: LoadingEventJob,
+    // The refused original remains here for recovery or fail-stop custody.
+    pub _original_job: LoadingEventJob,
     pub sender: OwnedReturnSender<LoadingJobReturned>,
 }
 impl std::fmt::Debug for LoadingHostJobRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoadingHostJobRefusal")
             .field("error", &self.error)
+            .field("original_job", &"retained")
             .field("sender", &self.sender)
             .finish_non_exhaustive()
     }
@@ -60,7 +62,7 @@ impl LoadingHostJob {
         if !job.report_slot().same_slot(sender.report_slot()) {
             return Err(LoadingHostJobRefusal {
                 error: LoadingHostJobError::WrongReport,
-                job,
+                _original_job: job,
                 sender,
             });
         }
@@ -240,8 +242,8 @@ mod tests {
             .unwrap()
             .map(|probe| probe.observe_reaped().unwrap());
         let detached = ingress.release_owned_pair(&retired.pair, reaped).unwrap();
-        for mut storage in detached {
-            storage.release().unwrap();
+        for storage in detached {
+            drop(storage);
         }
         drop(retired);
     }
@@ -293,13 +295,23 @@ mod tests {
             &resources.host_calls,
             &f.ledger,
         );
+        // This unissued disposal is the original Context child, outside Task join.
+        let mut disposal_retired = false;
+        for _ in 0..64 {
+            if resources.disposal.retire_unused(&f.ledger).unwrap() {
+                disposal_retired = true;
+                break;
+            }
+        }
+        assert!(disposal_retired && resources.disposal.is_retired());
         resources.lifetime.body_exited().unwrap();
         resources.lifetime.captures_exited().unwrap();
         assert!(resources.lifetime.actual_exit_ready().unwrap());
         resources
             .active
-            .release(&resources.active.resources().unwrap())
+            .release_quota(&resources.active.resources().unwrap().quota)
             .unwrap();
+        resources.active.finish().unwrap();
         f.ledger.reap_scope_ready(f.scope.id(), 64).unwrap();
         drop(resources);
         drop(ingress);
@@ -356,7 +368,7 @@ mod tests {
             .err()
             .expect("foreign report must refuse");
         assert_eq!(refusal.error, LoadingHostJobError::WrongReport);
-        assert!(refusal.job.report_slot().same_slot(&first_report));
+        assert!(refusal._original_job.report_slot().same_slot(&first_report));
         assert!(refusal.sender.report_slot().same_slot(&second_report));
         assert_eq!(first_getters.load(Ordering::SeqCst), 0);
         assert_eq!(second_getters.load(Ordering::SeqCst), 0);
@@ -368,7 +380,7 @@ mod tests {
             second_report.owned_return_state().unwrap(),
             ReturnState::Reserved
         );
-        let first = LoadingHostJob::from_admitted(refusal.job, first_sender)
+        let first = LoadingHostJob::from_admitted(refusal._original_job, first_sender)
             .unwrap_or_else(|_| panic!("same original first pair"));
         let second = LoadingHostJob::from_admitted(second_job, refusal.sender)
             .unwrap_or_else(|_| panic!("same original second pair"));
@@ -389,12 +401,10 @@ mod tests {
     }
 
     fn executor(
-        backend: novarocks_types::BackendProcessId,
+        _backend: novarocks_types::BackendProcessId,
     ) -> HostExecutor<LoadingHostJob, fn(LoadingHostJob)> {
-        let mut config = crate::TaskExecutionRegistryConfig::for_process(backend, 1, 1);
-        config.max_prepare_workers = 1;
-        let limits = HostExecutorLimits::for_loading(&config, NonZeroUsize::new(1).unwrap())
-            .expect("the same actual fixed-Task inventory");
+        let limits =
+            HostExecutorLimits::for_loading(1, 1, 1).expect("the same actual fixed-Task inventory");
         match HostExecutor::start(limits, LoadingHostJob::run_on_host as fn(LoadingHostJob)) {
             Ok(executor) => executor,
             Err((error, _original)) => panic!("actual host executor start failed: {error}"),

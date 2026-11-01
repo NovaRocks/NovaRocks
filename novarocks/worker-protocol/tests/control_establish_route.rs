@@ -20,7 +20,9 @@
 //! Pure Root request routing only. The admission stub records exact policy
 //! calls; these tests prove no Work, I/O, source exit or Native publication.
 
-use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId};
+use novarocks_control_runtime_core::identity::{
+    Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, WorkId,
+};
 use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, AdmissionTicketId, ContentFingerprint, CredentialEpoch,
     CredentialLeaseId, LeaseValidFor, OperationOutcome, QueryContextRef, QueryContextState,
@@ -44,6 +46,16 @@ use novarocks_worker_protocol::{
     lease::MonotonicInstant,
 };
 use std::time::Duration;
+
+// One explicit model process owns these requests. The fixture's non-reused
+// input issuance ordinal also names its original R Work; this is plain protocol
+// metadata and cannot create runtime Work, capacity or an InputAuthor proof.
+fn model_request_author(token: InputId) -> ScopedWorkRef {
+    ScopedWorkRef {
+        scope: ScopeId::new(1).expect("the model process Scope"),
+        work: WorkId::new(token.get()).expect("the original model request ordinal"),
+    }
+}
 
 fn at(seconds: u64) -> MonotonicInstant {
     MonotonicInstant::from_origin(Duration::from_secs(seconds))
@@ -76,6 +88,7 @@ fn context(value: u64) -> QueryContextRef {
 }
 fn request(token: u64, operation: TaskOperationId, deadline: u64) -> RequestContext {
     RequestContext {
+        author: model_request_author(InputId::new(token).unwrap()),
         token: InputId::new(token).unwrap(),
         operation,
         deadline: at(deadline),
@@ -113,13 +126,8 @@ impl Fixture {
     fn new(max_pending: usize, original_deadline: u64) -> Self {
         let root = ControlCore::new(
             ControlConfig {
-                max_contexts: 4,
-                max_waiters: 4,
                 max_pending_requests: max_pending,
                 step_budget: ControlCore::MAX_STEP_WORK,
-                retained_contexts: 4,
-                gone_fences: 4,
-                retention: Duration::from_secs(10),
             },
             AdmissionTicketConfig::DEFAULT,
             [1; 8],
@@ -173,7 +181,7 @@ impl Fixture {
                     semantics: semantics(),
                     elected_at: at(1),
                 },
-                reservation: ReservationId::new(2).unwrap(),
+                reservation: ReservationId::new(1).unwrap(),
                 generation: Generation::new(1).unwrap(),
             }]
         );
@@ -284,15 +292,10 @@ impl Fixture {
     fn assert_original_admissions(&self) {
         assert_eq!(
             self.capacity.calls,
-            [
-                AdmissionNeed::Ticket {
-                    context: context(1)
-                },
-                AdmissionNeed::Context {
-                    context: context(1),
-                    generation: Generation::new(1).unwrap()
-                }
-            ]
+            [AdmissionNeed::Context {
+                context: context(1),
+                generation: Generation::new(1).unwrap()
+            }]
         );
     }
 }
@@ -301,6 +304,36 @@ fn assert_verdict(step: &ControlStep, expected: RequestContext, outcome: Request
     assert_eq!(step.requests[0].request, expected);
     assert_eq!(step.requests[0].result, outcome);
     assert_eq!(step.requests[0].body, ControlReplyBody::Verdict(outcome));
+}
+
+fn assert_establishment_acknowledgement(
+    step: &ControlStep,
+    expected: RequestContext,
+    outcome: OperationOutcome,
+    state: QueryContextState,
+) {
+    assert_eq!(step.requests.len(), 1);
+    assert_eq!(step.requests[0].request, expected);
+    assert_eq!(step.requests[0].result, RequestResult::Outcome(outcome));
+    let ControlReplyBody::Context(ack) = &step.requests[0].body else {
+        panic!("the original entity decision keeps its complete Context acknowledgement");
+    };
+    assert_eq!(ack.outcome, outcome);
+    assert_eq!(ack.receipt.context(), context(1));
+    assert_eq!(ack.receipt.state(), state);
+    assert_eq!(
+        ack.receipt.lease(),
+        Some(novarocks_execution_contract::LeaseReceipt::new(
+            novarocks_execution_contract::LeaseSequence::INITIAL,
+            semantics().initial_lease_valid_for,
+            Duration::from_secs(30),
+        ))
+    );
+    assert!(
+        ack.receipt.domains().is_empty(),
+        "this fixture's original M authors no domain journal"
+    );
+    assert_eq!(ack.termination_cause, None);
 }
 
 #[test]
@@ -316,10 +349,11 @@ fn same_operation_routes_each_existing_context_request_without_joining_the_origi
     // Root's original operation body or a second context admission.
     f.route(2, second, ticket(8), PayloadId(9), changed);
     let first = f.decide_original(4, QueryContextState::Active, OperationOutcome::Accepted);
-    assert_verdict(
+    assert_establishment_acknowledgement(
         &first,
         f.original,
-        RequestResult::Outcome(OperationOutcome::Accepted),
+        OperationOutcome::Accepted,
+        QueryContextState::Active,
     );
     // The read was decided before its own deadline; delivery after that
     // deadline must not substitute the Root's current time or first body.
@@ -386,10 +420,11 @@ fn wrong_route_correlation_or_decision_time_cannot_consume_the_original_pending_
             RequestResult::Outcome(OperationOutcome::ContextConflict),
         );
         let original = f.decide_original(7, QueryContextState::Active, OperationOutcome::Accepted);
-        assert_verdict(
+        assert_establishment_acknowledgement(
             &original,
             f.original,
-            RequestResult::Outcome(OperationOutcome::Accepted),
+            OperationOutcome::Accepted,
+            QueryContextState::Active,
         );
     }
 }
@@ -421,10 +456,11 @@ fn exact_deadline_cancels_only_the_original_route_and_late_returns_do_not_settle
         RequestResult::Outcome(OperationOutcome::ContextConflict),
     );
     let original = f.decide_original(8, QueryContextState::Active, OperationOutcome::Accepted);
-    assert_verdict(
+    assert_establishment_acknowledgement(
         &original,
         f.original,
-        RequestResult::Outcome(OperationOutcome::Accepted),
+        OperationOutcome::Accepted,
+        QueryContextState::Active,
     );
     f.assert_original_admissions();
 }
@@ -453,10 +489,11 @@ fn existing_closing_and_retained_contexts_still_choose_their_own_replay_verdict(
     ] {
         let mut f = Fixture::new(4, 100);
         let original = f.decide_original(2, state, OperationOutcome::ContextTerminalReceipt);
-        assert_verdict(
+        assert_establishment_acknowledgement(
             &original,
             f.original,
-            RequestResult::Outcome(OperationOutcome::ContextTerminalReceipt),
+            OperationOutcome::ContextTerminalReceipt,
+            state,
         );
         let second = request(3, f.original.operation, 10);
         f.route(3, second, f.ticket, PayloadId(1), semantics());
@@ -473,7 +510,7 @@ fn existing_closing_and_retained_contexts_still_choose_their_own_replay_verdict(
 }
 
 #[test]
-fn permanent_frontend_fence_and_gone_take_priority_without_reentering_admission() {
+fn permanent_fence_and_original_context_expiry_win_until_actual_route_removal() {
     let mut f = Fixture::new(1, 100);
     f.event(
         2,
@@ -501,93 +538,100 @@ fn permanent_frontend_fence_and_gone_take_priority_without_reentering_admission(
         QueryContextState::TerminalRetained,
         OperationOutcome::ContextTerminalReceipt,
     );
-    let removing = f.event(12, ControlInput::Tick);
+    // Terminal M cannot prove execution exit. These explicit original facts
+    // model P06 retirement and ContextCore's H, not an actual Native exit.
+    f.event(
+        2,
+        ControlInput::ExecutionRetired {
+            context: context(1),
+            retirement: novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                close_epoch: Generation::new(3).unwrap(),
+            },
+        },
+    );
+    let removing = f.event(
+        122,
+        ControlInput::ContextExpired {
+            context: context(1),
+            retirement: novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                close_epoch: Generation::new(3).unwrap(),
+            },
+        },
+    );
     assert!(removing.effects.contains(&ControlEffect::RemoveHost {
         context: context(1)
     }));
+    // The original expired Context still owns Gone until its actual route is
+    // removed. Its fact takes priority even at this new request's deadline.
+    let probe = request(3, f.original.operation, 122);
+    let input = f.establish(probe, f.ticket, PayloadId(1), semantics());
+    let gone = f
+        .root
+        .handle_request(at(122), probe, input, &mut f.capacity)
+        .unwrap();
+    assert_verdict(&gone, probe, RequestResult::Outcome(OperationOutcome::Gone));
+    assert!(gone.effects.is_empty());
     // These are pure protocol inputs, not claims of an actual Native removal.
     f.event(
-        13,
+        123,
         ControlInput::HostRemoved {
             context: context(1),
         },
     );
-    assert_eq!(f.root.route(context(1)), QueryContextState::Gone);
-    let probe = request(3, f.original.operation, 14);
+    assert_eq!(f.root.route(context(1)), QueryContextState::Absent);
+    // No second Root-owned Gone timer survives the original request horizon.
+    // An expired new request sees its own deadline without issuing admission.
+    let probe = request(4, f.original.operation, 124);
     let input = f.establish(probe, f.ticket, PayloadId(1), semantics());
-    let gone = f
+    let absent = f
         .root
-        .handle_request(at(14), probe, input, &mut f.capacity)
+        .handle_request(at(124), probe, input, &mut f.capacity)
         .unwrap();
-    assert_verdict(&gone, probe, RequestResult::Outcome(OperationOutcome::Gone));
-    assert!(gone.effects.is_empty());
+    assert_verdict(
+        &absent,
+        probe,
+        RequestResult::Outcome(OperationOutcome::OperationTimedOut),
+    );
+    assert!(absent.effects.is_empty());
     f.assert_original_admissions();
 }
 
 #[test]
-fn routed_waiters_share_the_same_pending_limit_with_original_requests_and_acquire() {
-    let mut f = Fixture::new(2, 100);
-    let second = request(3, f.original.operation, 20);
-    f.route(2, second, f.ticket, PayloadId(1), semantics());
-    let denied = request(4, f.original.operation, 20);
-    let input = f.establish(denied, f.ticket, PayloadId(1), semantics());
-    let full = f
-        .root
-        .handle_request(at(3), denied, input, &mut f.capacity)
-        .unwrap();
-    assert_verdict(
-        &full,
-        denied,
-        RequestResult::Outcome(OperationOutcome::ResourceExhausted),
-    );
-    assert!(full.effects.is_empty());
-    let acquiring = request(5, operation(8), 20);
-    let acquire = AcquireQueryContextAdmissionTicket::new(
-        acquiring.operation,
-        context(2),
-        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
-        NativeCompatibilityId::new([3; 32]),
-        f.root.admission().capability(),
-    );
-    let full = f
-        .root
-        .handle_request(
-            at(3),
-            acquiring,
+fn routed_waiters_share_the_original_r_inventory_and_overflow_is_owner_failure() {
+    for acquire_overflow in [false, true] {
+        let mut f = Fixture::new(2, 100);
+        let second = request(3, f.original.operation, 20);
+        f.route(2, second, f.ticket, PayloadId(1), semantics());
+        let excess = if acquire_overflow {
+            request(4, operation(8), 20)
+        } else {
+            request(4, f.original.operation, 20)
+        };
+        let input = if acquire_overflow {
             ControlInput::Acquire {
-                request: acquire,
+                request: AcquireQueryContextAdmissionTicket::new(
+                    excess.operation,
+                    context(2),
+                    LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+                    NativeCompatibilityId::new([3; 32]),
+                    f.root.admission().capability(),
+                ),
                 ticket: ticket(8),
-            },
-            &mut f.capacity,
-        )
-        .unwrap();
-    assert_verdict(
-        &full,
-        acquiring,
-        RequestResult::Outcome(OperationOutcome::ResourceExhausted),
-    );
-    f.assert_original_admissions();
-    let original = f.decide_original(4, QueryContextState::Active, OperationOutcome::Accepted);
-    assert_verdict(
-        &original,
-        f.original,
-        RequestResult::Outcome(OperationOutcome::Accepted),
-    );
-    let third = request(6, f.original.operation, 20);
-    f.route(5, third, f.ticket, PayloadId(1), semantics());
-    let replay = f.complete_route(6, second, 5, Ok(OperationOutcome::ContextConflict));
-    assert_verdict(
-        &replay,
-        second,
-        RequestResult::Outcome(OperationOutcome::ContextConflict),
-    );
-    let replay = f.complete_route(7, third, 6, Ok(OperationOutcome::Idempotent));
-    assert_verdict(
-        &replay,
-        third,
-        RequestResult::Outcome(OperationOutcome::Idempotent),
-    );
-    f.assert_original_admissions();
+            }
+        } else {
+            f.establish(excess, f.ticket, PayloadId(1), semantics())
+        };
+        let failure = f
+            .root
+            .handle_request(at(3), excess, input, &mut f.capacity)
+            .unwrap_err();
+        assert_eq!(
+            failure,
+            novarocks_worker_protocol::context::CoreError::IllegalFact
+        );
+        f.assert_original_admissions();
+        // The invalid owner is not reused as a healthy request manager.
+    }
 }
 
 #[test]
@@ -619,10 +663,11 @@ fn a_routed_domain_failure_keeps_its_exact_token_body_and_original_decision_time
     );
     assert_eq!(result.requests[0].body, ControlReplyBody::Domain(refusal));
     let original = f.decide_original(7, QueryContextState::Active, OperationOutcome::Accepted);
-    assert_verdict(
+    assert_establishment_acknowledgement(
         &original,
         f.original,
-        RequestResult::Outcome(OperationOutcome::Accepted),
+        OperationOutcome::Accepted,
+        QueryContextState::Active,
     );
     f.assert_original_admissions();
 }

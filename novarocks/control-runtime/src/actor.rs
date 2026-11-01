@@ -18,8 +18,8 @@
 //! Actor state is plain data; resource execution is performed by host owners.
 
 use novarocks_control_runtime_core::{
-    effect::{EffectBatchState, EffectDescriptor, EffectError},
-    identity::{BatchId, Generation, InputId, ReservationId, ScopeId, Tick, WorkId},
+    effect::{EffectBatchState, EffectDescriptor, EffectError, EffectKind},
+    identity::{BatchId, Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, Tick},
     mailbox::InputEnvelope,
     scheduler::TurnBudget,
 };
@@ -65,7 +65,15 @@ pub struct StepContext<'a, E> {
     payloads: std::collections::BTreeMap<novarocks_control_runtime_core::identity::ActionId, E>,
     reservations: std::collections::BTreeMap<ReservationId, crate::lease::StepGuard>,
     max_reservations: usize,
-    failure_work: Option<WorkId>,
+    failure_work: Option<ScopedWorkRef>,
+    retained: bool,
+    runtime_metadata: bool,
+    input_author: Option<crate::driver::InputAuthor>,
+    authors: std::collections::BTreeMap<
+        novarocks_control_runtime_core::identity::ActionId,
+        crate::driver::InputAuthor,
+    >,
+    metadata: Vec<MetadataEffect<E>>,
     stop_producing: bool,
 }
 impl<'a, E> StepContext<'a, E> {
@@ -86,6 +94,11 @@ impl<'a, E> StepContext<'a, E> {
             reservations: std::collections::BTreeMap::new(),
             max_reservations: max_effects,
             failure_work: None,
+            retained: false,
+            runtime_metadata: false,
+            input_author: None,
+            authors: std::collections::BTreeMap::new(),
+            metadata: Vec::new(),
             stop_producing: false,
             batch: EffectBatchState::new(
                 scope.id(),
@@ -96,18 +109,69 @@ impl<'a, E> StepContext<'a, E> {
             ),
         }
     }
-    pub(crate) fn set_failure_work(&mut self, work: Option<WorkId>) {
+    pub(crate) fn set_input_author(&mut self, author: Option<crate::driver::InputAuthor>) {
+        self.input_author = author;
+    }
+    pub(crate) fn retained(&mut self) {
+        self.retained = true;
+    }
+    /// The current retained request's already admitted original work. A cold
+    /// timer has no work; this observation never admits or derives any work.
+    pub fn input_work(&self) -> Option<ScopedWorkRef> {
+        self.input_author
+            .as_ref()
+            .map(crate::driver::InputAuthor::work)
+    }
+    pub fn input_author(&self) -> Option<&crate::driver::InputAuthor> {
+        self.input_author.as_ref()
+    }
+    pub(crate) fn set_runtime_metadata(&mut self, value: bool) {
+        self.runtime_metadata = value;
+    }
+    /// True only for an input issued by the actual Workless forwarding port.
+    pub const fn is_runtime_metadata(&self) -> bool {
+        self.runtime_metadata
+    }
+    /// The driver's actual execution-detachment mode, never a protocol phase.
+    pub const fn is_retained(&self) -> bool {
+        self.retained
+    }
+    /// Stage a neutral retained-state notice without execution or publication
+    /// authority. Custody remains until its actual destination consumes it.
+    pub fn metadata(&mut self, effect: E) -> Result<(), (EffectEmissionError, E)> {
+        if !self.retained {
+            return Err((EffectEmissionError::Unfunded, effect));
+        }
+        if !self.charge(1) {
+            return Err((EffectEmissionError::Yield, effect));
+        }
+        if self.metadata.len() + self.payloads.len() >= self.max_reservations {
+            return Err((EffectEmissionError::Invalid(EffectError::BatchFull), effect));
+        }
+        self.metadata.push(MetadataEffect {
+            value: Some(effect),
+            completed: false,
+            forwarded: None,
+            credit_waiter: None,
+        });
+        Ok(())
+    }
+    pub(crate) fn set_failure_work(&mut self, work: Option<ScopedWorkRef>) {
         self.failure_work = work;
     }
     /// Immutable registration metadata, independent of the suspect core. The
     /// registration owner retains this admitted cleanup lease until removal.
-    pub fn failure_work(&self) -> Option<WorkId> {
+    pub fn failure_work(&self) -> Option<ScopedWorkRef> {
         self.failure_work
     }
     /// Stage a stop of new business starts in this step's original scope.
     /// The gate changes only when the driver commits the whole normal step.
     /// This neither signals running tasks nor observes any work or capture exit.
     pub fn stop_producing(&mut self) {
+        assert!(
+            !self.retained,
+            "retained state cannot stop its process payer"
+        );
         self.stop_producing = true;
     }
     /// Transfer a still-unbound synchronous reservation into the same atomic
@@ -118,7 +182,7 @@ impl<'a, E> StepContext<'a, E> {
         &mut self,
         guard: crate::lease::StepGuard,
     ) -> Result<(), (ReservationHandoffError, crate::lease::StepGuard)> {
-        let error = if !guard.belongs_to(self.scope) {
+        let error = if self.retained || !guard.belongs_to(self.scope) {
             Some(ReservationHandoffError::WrongScope)
         } else if self.reservations.contains_key(&guard.reservation_id()) {
             Some(ReservationHandoffError::Duplicate)
@@ -148,12 +212,50 @@ impl<'a, E> StepContext<'a, E> {
         descriptor: EffectDescriptor,
         effect: E,
     ) -> Result<(), (EffectEmissionError, E)> {
+        let author = self
+            .input_author
+            .as_ref()
+            .filter(|author| author.work() == descriptor.work)
+            .cloned();
+        self.effect_inner(author, descriptor, effect)
+    }
+    /// A delayed reply must borrow its original admitted author binding.
+    pub fn effect_from_author(
+        &mut self,
+        author: &crate::driver::InputAuthor,
+        descriptor: EffectDescriptor,
+        effect: E,
+    ) -> Result<(), (EffectEmissionError, E)> {
+        if descriptor.work != author.work() {
+            return Err((EffectEmissionError::Unfunded, effect));
+        }
+        self.effect_inner(Some(author.clone()), descriptor, effect)
+    }
+    fn effect_inner(
+        &mut self,
+        author: Option<crate::driver::InputAuthor>,
+        descriptor: EffectDescriptor,
+        effect: E,
+    ) -> Result<(), (EffectEmissionError, E)> {
+        if (descriptor.work.scope != self.scope.id() && author.is_none())
+            || (self.retained && (author.is_none() || descriptor.kind == EffectKind::Business))
+        {
+            return Err((EffectEmissionError::Unfunded, effect));
+        }
         if !self.charge(1) {
             return Err((EffectEmissionError::Yield, effect));
+        }
+        if !self.metadata.is_empty()
+            && self.metadata.len() + self.payloads.len() >= self.max_reservations
+        {
+            return Err((EffectEmissionError::Invalid(EffectError::BatchFull), effect));
         }
         let id = descriptor.id;
         if let Err(error) = self.batch.push(descriptor) {
             return Err((EffectEmissionError::Invalid(error), effect));
+        }
+        if let Some(author) = author {
+            self.authors.insert(id, author);
         }
         let previous = self.payloads.insert(id, effect);
         assert!(
@@ -175,9 +277,17 @@ impl<'a, E> StepContext<'a, E> {
             state: self.batch,
             payloads: self.payloads,
             reservations: self.reservations,
+            metadata: self.metadata,
+            authors: self.authors,
             stop_producing: self.stop_producing,
         }
     }
+}
+pub(crate) struct MetadataEffect<E> {
+    pub(crate) value: Option<E>,
+    pub(crate) completed: bool,
+    pub(crate) forwarded: Option<crate::driver::MetadataDelivery>,
+    pub(crate) credit_waiter: Option<crate::driver::MetadataCreditWait>,
 }
 pub(crate) struct StepEnvelope<E> {
     pub(crate) ordinal: Option<BatchId>,
@@ -186,6 +296,11 @@ pub(crate) struct StepEnvelope<E> {
     pub(crate) payloads:
         std::collections::BTreeMap<novarocks_control_runtime_core::identity::ActionId, E>,
     pub(crate) reservations: std::collections::BTreeMap<ReservationId, crate::lease::StepGuard>,
+    pub(crate) metadata: Vec<MetadataEffect<E>>,
+    pub(crate) authors: std::collections::BTreeMap<
+        novarocks_control_runtime_core::identity::ActionId,
+        crate::driver::InputAuthor,
+    >,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReservationHandoffError {
@@ -196,6 +311,7 @@ pub enum ReservationHandoffError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EffectEmissionError {
     Yield,
+    Unfunded,
     Invalid(EffectError),
 }
 

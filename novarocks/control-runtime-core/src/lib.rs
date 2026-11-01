@@ -27,6 +27,7 @@ pub mod fair_queue;
 pub mod history;
 pub mod identity;
 pub mod mailbox;
+pub mod owned_storage;
 pub mod scheduler;
 pub mod scope;
 pub mod timer;

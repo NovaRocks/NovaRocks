@@ -21,13 +21,12 @@
 
 use super::super::actors::WorkerActor;
 use novarocks_control_runtime::{
-    driver::{ActorRegistration, ActorRuntime, DriverError},
+    driver::{ActorRegistration, ActorRuntime, DriverError, EffectTicket},
     reply_notification::{ReplyNotification, ReplyNotificationError},
-    transaction::ScopeHandle,
 };
-use novarocks_control_runtime_core::identity::{ScopeId, WorkId};
+use novarocks_control_runtime_core::identity::ScopedWorkRef;
 use novarocks_execution_contract::{
-    QueryContextConvergenceReceipt, QueryContextRef, TaskConvergenceReceipt, TaskConvergenceVersion,
+    QueryContextRef, TaskConvergenceReceipt, TaskConvergenceVersion,
 };
 use novarocks_worker_protocol::{
     context::{ContextEffect, ContextReplyBody},
@@ -132,25 +131,64 @@ pub(crate) enum ContextObservationError {
     Projection(ObservationProjectionError),
 }
 
+impl std::fmt::Display for ObservationProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidFact => "Observation projection fact is invalid",
+            Self::SizeOverflow => "Observation projection size overflowed",
+        })
+    }
+}
+impl std::error::Error for ObservationProjectionError {}
+impl std::fmt::Display for ContextObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Driver(error) => write!(f, "Context observation driver failed: {error}"),
+            Self::WrongRequest => {
+                f.write_str("Context observation belongs to another original request")
+            }
+            Self::Source(error) => write!(
+                f,
+                "Context observation source rejected the request: {error}"
+            ),
+            Self::Notification(error) => {
+                write!(f, "Context observation notification failed: {error:?}")
+            }
+            Self::InvalidConvergenceVersion => {
+                f.write_str("Context observation convergence version is invalid")
+            }
+            Self::MissingProjection => f.write_str("Context observation projection is missing"),
+            Self::Projection(error) => write!(f, "Context observation projection failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for ContextObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Driver(error) => Some(error),
+            Self::Source(error) => Some(error),
+            Self::Projection(error) => Some(error),
+            Self::Notification(ReplyNotificationError::Driver(error)) => Some(error),
+            Self::Notification(
+                ReplyNotificationError::WrongWorkScope
+                | ReplyNotificationError::WorkNotLive
+                | ReplyNotificationError::ObserverEnded
+                | ReplyNotificationError::Failed,
+            )
+            | Self::WrongRequest
+            | Self::InvalidConvergenceVersion
+            | Self::MissingProjection => None,
+        }
+    }
+}
 /// Metadata of one already admitted R, not another admission or Work token.
 /// The same original R custody retains this non-Clone handle through bounded
 /// unsubscribe and actual external/notification capture retirement.
 #[derive(Debug)]
 pub(crate) struct ObservationSubscription {
     id: SubscriptionId,
-    scope: ScopeId,
-    work: WorkId,
+    work: ScopedWorkRef,
     owner: Arc<()>,
-}
-impl ObservationSubscription {
-    pub(crate) fn request_key(&self) -> (ScopeId, WorkId) {
-        (self.scope, self.work)
-    }
-}
-#[derive(Clone, Copy)]
-struct RequestKey {
-    scope: ScopeId,
-    work: WorkId,
 }
 struct WakeSweep {
     after: Option<SubscriptionId>,
@@ -158,7 +196,7 @@ struct WakeSweep {
 }
 #[must_use = "Notify these same original R owners before completing publication"]
 pub(crate) struct ObservationWakeBatch {
-    pub requests: Vec<(ScopeId, WorkId)>,
+    pub requests: Vec<ScopedWorkRef>,
     pub progress: ObservationProgress,
 }
 
@@ -167,7 +205,8 @@ pub(crate) struct ContextObservation {
     owner: Arc<()>,
     runtime: ActorRuntime<WorkerActor>,
     registration: ActorRegistration,
-    requests: BTreeMap<SubscriptionId, RequestKey>,
+    requests: BTreeMap<SubscriptionId, ScopedWorkRef>,
+    last_subscription: u64,
     publication: Option<WakeSweep>,
     fanout_complete: bool,
 }
@@ -198,6 +237,7 @@ impl ContextObservation {
             runtime: runtime.clone(),
             registration: registration.clone(),
             requests: BTreeMap::new(),
+            last_subscription: 0,
             publication: None,
             fanout_complete: true,
         })
@@ -209,39 +249,53 @@ impl ContextObservation {
         self.requests.len()
     }
 
-    /// Called only by the original R custody after actual admission. Scope
-    /// provenance here grants no additional Work or subscription capacity.
+    /// Only the original Subscribe effect may bind this already-admitted R.
+    /// The financial author and destination Context need not share a Scope.
     pub(super) fn begin_original_request(
         &mut self,
-        scope: &ScopeHandle,
-        work: WorkId,
+        ticket: &EffectTicket<crate::control_runtime::actors::WorkerAction>,
+        work: ScopedWorkRef,
         generation: u64,
         position: Arc<CoveredSubscriptionRequest>,
     ) -> Result<ObservationSubscription, ContextObservationError> {
         self.runtime
             .validate_registration(&self.registration)
             .map_err(ContextObservationError::Driver)?;
-        if !self.registration.matches_scope(scope) {
+        // The original Subscribe effect carries the admitted financial author;
+        // a numeric Work address or the destination's Scope cannot replace it.
+        self.runtime
+            .validate_effect_ticket(ticket)
+            .map_err(ContextObservationError::Driver)?;
+        if ticket.actor != self.registration.actor()
+            || ticket.descriptor.work != work
+            || !matches!(&ticket.effect,
+                crate::control_runtime::actors::WorkerAction::Context(ContextEffect::Subscribe {
+                    generation: original_generation, position: original_position, ..
+                }) if *original_generation == generation && Arc::ptr_eq(original_position, &position))
+        {
             return Err(ContextObservationError::WrongRequest);
         }
-        let id = SubscriptionId(work.get());
+        let next = self
+            .last_subscription
+            .checked_add(1)
+            .ok_or(ContextObservationError::Driver(
+                DriverError::IdentityExhausted,
+            ))?;
+        let id = SubscriptionId(next);
         let initial = self
             .source
             .begin_shared_covered_subscription(id, generation, position)
             .map_err(ContextObservationError::Source)?;
         let _initial_cut = initial;
-        let key = RequestKey {
-            scope: scope.id(),
-            work,
-        };
+        self.last_subscription = next;
+        let key = work;
         assert!(
             self.requests.insert(id, key).is_none(),
             "one source subscriber per original R"
         );
         Ok(ObservationSubscription {
             id,
-            scope: key.scope,
-            work: key.work,
+            work: key,
             owner: self.owner.clone(),
         })
     }
@@ -250,9 +304,10 @@ impl ContextObservation {
         subscription: &ObservationSubscription,
     ) -> Result<(), ContextObservationError> {
         let matches = Arc::ptr_eq(&self.owner, &subscription.owner)
-            && self.requests.get(&subscription.id).is_some_and(|original| {
-                original.scope == subscription.scope && original.work == subscription.work
-            });
+            && self
+                .requests
+                .get(&subscription.id)
+                .is_some_and(|original| *original == subscription.work);
         if matches {
             Ok(())
         } else {
@@ -337,7 +392,7 @@ impl ContextObservation {
                 break;
             };
             sweep.after = Some(*id);
-            requests.push((key.scope, key.work));
+            requests.push(*key);
             work += 1;
         }
         let more = sweep.last.is_some_and(|last| {
@@ -446,7 +501,7 @@ impl ContextObservation {
             | ContextEffect::PublishMetrics { snapshot, .. } => {
                 Some(CoveredObservationFact::Status(snapshot.clone()))
             }
-            ContextEffect::PublishContextConvergence { receipt } => {
+            ContextEffect::PublishContextConvergence { receipt, .. } => {
                 Some(CoveredObservationFact::ContextConvergence(*receipt))
             }
             ContextEffect::PublishTaskConvergence { task, snapshot, .. }
@@ -470,9 +525,6 @@ impl ContextObservation {
             }
             _ => None,
         }
-    }
-    pub(crate) fn context_fact(receipt: QueryContextConvergenceReceipt) -> CoveredObservationFact {
-        CoveredObservationFact::ContextConvergence(receipt)
     }
 }
 
@@ -560,11 +612,11 @@ impl super::ContextHostRecord {
         };
         let progress = source.continue_publication(budget);
         let wakes = source.take_notification_targets(budget);
-        for (scope, work) in wakes.requests {
+        for work in wakes.requests {
             // Unsubscribe can retire a target after the publication's frozen
             // frontier. No later numeric Work can replace that original R.
             if let Some(original) = self.resources.requests.get_mut(&work) {
-                if original.scope_id() != scope {
+                if original.scope_id() != work.scope {
                     return Err(ContextObservationError::WrongRequest);
                 }
                 original.observation_published();
@@ -583,13 +635,12 @@ impl super::ContextHostRecord {
         if !self.resources.control_admission_closed || !self.resources.requests.is_empty() {
             return false;
         }
-        if let Some(source) = self.resources.observation.as_mut() {
-            if source.publication_pending()
+        if let Some(source) = self.resources.observation.as_mut()
+            && (source.publication_pending()
                 || source.subscriptions() != 0
-                || !source.source.drain_unsubscribed(budget).complete
-            {
-                return false;
-            }
+                || !source.source.drain_unsubscribed(budget).complete)
+        {
+            return false;
         }
         // These are original sealed neutral read observations, not rich Task
         // owners. Retire one indexed snapshot per charged metadata unit.

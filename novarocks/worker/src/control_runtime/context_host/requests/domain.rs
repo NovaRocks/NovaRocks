@@ -38,7 +38,7 @@ use novarocks_control_runtime::{
     reported_work::ReportedWork,
     transaction::{RuntimeError, ScopeHandle},
 };
-use novarocks_control_runtime_core::identity::{Generation, InputId, ScopeId, WorkId};
+use novarocks_control_runtime_core::identity::{Generation, InputId, ScopeId, ScopedWorkRef};
 use novarocks_execution_contract::{
     AdvanceQueryContextDomain, DomainProgression, QueryContextDomainUpdate, QueryContextRef,
     TaskConclusionProposal, TaskDescriptor, TaskDomainUpdate, TaskFailurePhase, TaskIdentity,
@@ -67,6 +67,29 @@ pub(crate) enum DomainHostError {
     Unresolved,
 }
 
+impl std::fmt::Display for DomainHostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Driver(error) => write!(f, "Domain host driver failed: {error}"),
+            Self::Runtime(error) => write!(f, "Domain host resource operation failed: {error}"),
+            Self::Role(error) => write!(f, "Domain host original role operation failed: {error}"),
+            Self::WrongOwner => f.write_str("Domain host belongs to another original owner"),
+            Self::WrongPhase => f.write_str("Domain host is in the wrong lifecycle phase"),
+            Self::WrongPlan => f.write_str("Domain host input differs from the original plan"),
+            Self::Unresolved => f.write_str("Domain host original capture remains unresolved"),
+        }
+    }
+}
+impl std::error::Error for DomainHostError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Driver(error) => Some(error),
+            Self::Runtime(error) => Some(error),
+            Self::Role(error) => Some(error),
+            Self::WrongOwner | Self::WrongPhase | Self::WrongPlan | Self::Unresolved => None,
+        }
+    }
+}
 /// Constructed by the actual R factory, after its whole payment and return
 /// roles exist. These metadata identify originals; they grant no capacity.
 pub(crate) struct DomainHostBinding {
@@ -75,10 +98,26 @@ pub(crate) struct DomainHostBinding {
     pub scope: ScopeHandle,
     pub generation: Generation,
     pub context: QueryContextRef,
-    pub work: WorkId,
+    pub work: ScopedWorkRef,
+    // A context-local canonical credential identity, never a financial author.
+    pub credential_resource: Option<ScopedWorkRef>,
     pub operation: TaskOperationId,
     pub payload: PayloadId,
     pub ready: Arc<RequestReadySlot>,
+}
+
+impl DomainHostBinding {
+    fn credential_resource(&self) -> Result<u64, DomainHostError> {
+        let original = self
+            .credential_resource
+            .ok_or(DomainHostError::WrongOwner)?;
+        if original.scope != self.scope.id() {
+            return Err(DomainHostError::WrongOwner);
+        }
+        // All canonical credential resources belong to this actual Context
+        // scope. Work IDs there are monotonic and never reused after exit.
+        Ok(original.work.get())
+    }
 }
 
 /// The actual Task owner supplies its descriptor and original weak runtime
@@ -97,7 +136,7 @@ struct TaskCaptures {
 }
 impl TaskCaptures {
     fn descriptor(&self) -> Option<&TaskDescriptor> {
-        self.descriptor.as_ref().map(|descriptor| &**descriptor)
+        self.descriptor.as_deref()
     }
     fn port(&self) -> &TaskRuntimePort {
         self.port.as_ref().expect("original Task port")
@@ -173,7 +212,8 @@ impl DomainCustody {
         ),
     > {
         let error = Self::binding_valid(&binding).err().or_else(|| {
-            (original.envelope().operation_id() != binding.operation
+            (binding.credential_resource.is_some()
+                || original.envelope().operation_id() != binding.operation
                 || target
                     .descriptor
                     .as_ref()
@@ -201,9 +241,10 @@ impl DomainCustody {
         ))
     }
     pub(crate) fn capture_context(
-        binding: DomainHostBinding,
+        mut binding: DomainHostBinding,
         original: AdvanceQueryContextDomain,
         instance: ContextDomainInstance,
+        credential_resource: ScopedWorkRef,
     ) -> Result<
         Self,
         (
@@ -214,7 +255,9 @@ impl DomainCustody {
         ),
     > {
         let error = Self::binding_valid(&binding).err().or_else(|| {
-            (original.envelope().operation_id() != binding.operation
+            (binding.credential_resource.is_some()
+                || credential_resource.scope != binding.scope.id()
+                || original.envelope().operation_id() != binding.operation
                 || original.context() != binding.context
                 || !instance.matches_owner(&binding.runtime, &binding.scope, binding.context))
             .then_some(DomainHostError::WrongOwner)
@@ -222,6 +265,7 @@ impl DomainCustody {
         if let Some(error) = error {
             return Err((error, binding, original, instance));
         }
+        binding.credential_resource = Some(credential_resource);
         let (_, _, update) = original.into_parts();
         Ok(Self::capture(
             binding,
@@ -297,7 +341,7 @@ impl DomainCustody {
                         let input = instance
                             .as_mut()
                             .expect("original Context instance")
-                            .credential_on_host(update, self.0.binding.work.get())
+                            .credential_on_host(update, self.0.binding.credential_resource()?)
                             .map_err(|_| DomainHostError::WrongPhase)?;
                         *credential = Some(input);
                         instance
@@ -379,10 +423,10 @@ impl DomainCustody {
         if state.phase != Phase::Projected {
             return Err((DomainHostError::WrongPhase, author));
         }
-        if let DomainReturn::Context(original) = &author {
-            if !original.scope.same_scope(&self.0.binding.scope) {
-                return Err((DomainHostError::WrongOwner, author));
-            }
+        if let DomainReturn::Context(original) = &author
+            && !original.scope.same_scope(&self.0.binding.scope)
+        {
+            return Err((DomainHostError::WrongOwner, author));
         }
         let operation = match &ticket.effect {
             WorkerAction::Context(ContextEffect::ApplyTaskDomains {
@@ -512,7 +556,13 @@ impl DomainCustody {
             let Some(author) = supplied else {
                 return Err((DomainHostError::WrongOwner, None));
             };
-            if !self.author_matches(&state, &author) {
+            // The same never-exposed Task funding may already have been
+            // converted into its original direct disposal return. As on the
+            // healthy disposal path, this is a Context-local prepaid author,
+            // not a new Task callback or application authority.
+            if !self.author_matches(&state, &author)
+                && !matches!(&author, DomainReturn::Context(author) if author.scope.same_scope(&self.0.binding.scope))
+            {
                 return Err((DomainHostError::WrongOwner, Some(author)));
             }
             author
@@ -581,11 +631,86 @@ impl DomainCustody {
             .expect("original domain start refusal")
             .start_refusal
     }
+    /// A failure stage resolves only the old Core leg. Physical capture and
+    /// author return remain separate positive observations of the same body.
+    pub(super) fn abandon_failed_core(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+    ) -> Result<(), DomainHostError> {
+        stage
+            .validate(&self.0.binding.runtime, self.0.binding.registration.actor())
+            .map_err(DomainHostError::Driver)?;
+        self.0
+            .state
+            .lock()
+            .expect("original failed Domain Core leg")
+            .completed = true;
+        Ok(())
+    }
+    /// Some(true) retains the actual never-started author from its refused
+    /// Job; Some(false) needs one of the original prepaid unused authors.
+    pub(super) fn failed_disposal_author(&self) -> Option<bool> {
+        match self
+            .0
+            .state
+            .lock()
+            .expect("original Domain disposal phase")
+            .phase
+        {
+            Phase::AwaitingFailure => Some(true),
+            Phase::Projected => Some(false),
+            _ => None,
+        }
+    }
+    pub(super) fn request_bound(&self) -> bool {
+        self.0
+            .state
+            .lock()
+            .expect("original Domain request binding")
+            .request
+            .is_some()
+    }
+    pub(super) fn matches_feedback(&self, input: &ContextInput) -> bool {
+        let state = self
+            .0
+            .state
+            .lock()
+            .expect("original Domain feedback identity");
+        match input {
+            ContextInput::ContextUpdateApplied { request, .. }
+            | ContextInput::ContextCredentialCompared { request, .. } => {
+                state.task.is_none() && state.request == Some(*request)
+            }
+            ContextInput::TaskUpdateApplied { request, task, .. } => {
+                state.task == Some(*task) && state.request == Some(*request)
+            }
+            _ => false,
+        }
+    }
+    pub(super) fn matches_projection(&self, command: &ContextCommand) -> bool {
+        let state = self
+            .0
+            .state
+            .lock()
+            .expect("original Domain projection identity");
+        match command {
+            ContextCommand::UpdateTask { task, payload, .. } => {
+                state.task == Some(*task) && *payload == self.0.binding.payload
+            }
+            ContextCommand::UpdateContext { payload, .. } => {
+                state.task.is_none() && *payload == self.0.binding.payload
+            }
+            _ => false,
+        }
+    }
     pub(super) fn notify(&self) {
         self.0.binding.ready.notify();
     }
-    pub(super) fn work(&self) -> WorkId {
+    pub(super) fn work(&self) -> ScopedWorkRef {
         self.0.binding.work
+    }
+    pub(super) fn context(&self) -> QueryContextRef {
+        self.0.binding.context
     }
     pub(super) fn task(&self) -> Option<TaskIdentity> {
         self.0.state.lock().expect("original Domain Task").task
@@ -711,7 +836,7 @@ pub(crate) struct ContextDomainReceipt {
 }
 pub(crate) struct ContextDomainAuthor {
     scope: ScopeHandle,
-    work: WorkId,
+    work: ScopedWorkRef,
     authority: Option<ExitAuthority>,
     sender: Option<OwnedReturnSender<ContextInput>>,
 }
@@ -724,7 +849,7 @@ impl ContextDomainAuthor {
             Err(error) => return Err((error, original)),
         };
         let scope = original.work().scope().clone();
-        let work = original.work().id();
+        let work = original.work().reference();
         let (role, authority) = ExitRole::from_admitted(original);
         Ok((
             ContextDomainReceipt { role, reader },
@@ -755,7 +880,7 @@ impl DomainReturn {
     fn is_context(&self) -> bool {
         matches!(self, Self::Context(_))
     }
-    fn work(&self) -> WorkId {
+    fn work(&self) -> ScopedWorkRef {
         match self {
             Self::Task(author) => author.custody().work_id(),
             Self::Context(author) => author.work,
@@ -793,7 +918,7 @@ impl DomainReturn {
                         .map_err(|_| PublicationRefusal::RetainedTask),
                     Err(refusal) => {
                         author.sender = Some(refusal.sender);
-                        Err(PublicationRefusal::Context(refusal.value, author))
+                        Err(PublicationRefusal::Context(Box::new(refusal.value), author))
                     }
                 }
             }
@@ -826,7 +951,7 @@ impl DomainReturn {
 
 enum PublicationRefusal {
     RetainedTask,
-    Context(ContextInput, ContextDomainAuthor),
+    Context(Box<ContextInput>, ContextDomainAuthor),
 }
 enum UnusedRefusal {
     Retained,
@@ -858,14 +983,23 @@ pub(crate) struct DomainHostJob {
     generation: Generation,
 }
 impl QueuedPreparation for DomainHostJob {
-    fn queue_key(&self) -> (ScopeId, WorkId) {
-        (
-            self.owner.0.binding.scope.id(),
-            self.author.as_ref().expect("original domain author").work(),
+    fn queue_key(&self) -> (ScopeId, novarocks_control_runtime_core::identity::WorkId) {
+        let author = self.author.as_ref().expect("original domain author").work();
+        (author.scope, author.work)
+    }
+    fn fairness_group(&self, _: ScopeId) -> crate::control_runtime::preparation::HostFairnessGroup {
+        crate::control_runtime::preparation::HostFairnessGroup::Context(
+            self.owner.0.binding.context,
         )
     }
 }
 impl DomainHostJob {
+    pub(super) fn author_work(&self) -> ScopedWorkRef {
+        self.author
+            .as_ref()
+            .expect("same original Domain job author")
+            .work()
+    }
     pub(crate) fn run_on_host(mut self) {
         let mut author = self.author.take().expect("original domain return author");
         if let Err(error) = author.start(self.generation) {
@@ -895,13 +1029,12 @@ impl DomainHostJob {
             Ok(Ok(input)) => {
                 let comparison = matches!(operation, Operation::Compare { .. });
                 let disposal = matches!(operation, Operation::Dispose);
-                if !comparison {
-                    if let Err(panic) =
+                if !comparison
+                    && let Err(panic) =
                         catch_unwind(AssertUnwindSafe(|| dispose_on_host(&mut rich)))
-                    {
-                        self.retain_unknown(rich, author, Some(panic));
-                        return;
-                    }
+                {
+                    self.retain_unknown(rich, author, Some(panic));
+                    return;
                 }
                 // Transfer retained rich back before the once-only publisher
                 // seals the current Task proposal prefix and reports its exit.
@@ -932,7 +1065,7 @@ impl DomainHostJob {
                             .lock()
                             .expect("original refused domain return");
                         if let PublicationRefusal::Context(input, author) = refused {
-                            state.refused = Some((input, DomainReturn::Context(author)));
+                            state.refused = Some((*input, DomainReturn::Context(author)));
                         }
                         state.phase = Phase::Unknown;
                     }
@@ -1100,7 +1233,7 @@ impl DomainHostJob {
                 let input = instance
                     .as_mut()
                     .expect("original Context instance")
-                    .credential_on_host(update, self.owner.0.binding.work.get())
+                    .credential_on_host(update, self.owner.0.binding.credential_resource()?)
                     .map_err(|_| DomainHostError::WrongPhase)?;
                 if input.current_resource != expected.resource
                     || update.lease_id() != expected.lease

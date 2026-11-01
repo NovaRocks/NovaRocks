@@ -24,7 +24,7 @@ use novarocks_control_runtime_core::completion::ReturnState;
 
 #[test]
 fn a_live_getter_and_its_projection_cannot_submit_an_owner_failure() {
-    let mut f = fixture(2);
+    let mut f = fixture();
     let getter = Gate::new();
     let (raw, getters, drops) = request(&f, Some(getter.clone()), None, false);
     let (input, external) = admit(&mut f);
@@ -71,7 +71,7 @@ fn a_live_getter_and_its_projection_cannot_submit_an_owner_failure() {
 
 #[test]
 fn an_actual_stopped_rpc_start_is_not_an_unknown_getter_failure() {
-    let mut f = fixture(2);
+    let mut f = fixture();
     let (raw, getters, drops) = request(&f, None, None, false);
     let (input, external) = admit(&mut f);
     let job = f
@@ -84,7 +84,7 @@ fn an_actual_stopped_rpc_start_is_not_an_unknown_getter_failure() {
     host(job);
     let start_refused = matches!(
         f.root.take_establish_ingress(input).unwrap(),
-        Some(EstablishIngressOutcome::StartRefused(_))
+        Some(EstablishIngressOutcome::StartRefused { .. })
     );
     let failure_refused = matches!(
         f.root.submit_establish_ingress_failure(input),
@@ -157,7 +157,7 @@ fn dispatch_owner_failure(
 ) {
     f.runtime.poll_one(now).unwrap();
     f.root.index_control_effects(64).unwrap();
-    let failure_reply = f.root.take_control_effect(64).unwrap().unwrap();
+    let failure_reply = f.next_control_body();
     let reply_uses_original_input = failure_reply.input == input;
     let disposal = f
         .root
@@ -173,7 +173,7 @@ fn dispatch_owner_failure(
 
 #[test]
 fn an_observed_getter_panic_drains_one_return_and_reply_but_waits_for_actual_raw_drop() {
-    let mut f = fixture(2);
+    let mut f = fixture();
     let dropping = Gate::new();
     let (raw, getters, drops) = symbolic_panicking_source(&f, Some(dropping.clone()));
     let (input, mut external) = admit(&mut f);
@@ -183,10 +183,9 @@ fn an_observed_getter_panic_drains_one_return_and_reply_but_waits_for_actual_raw
         .unwrap();
     host(job);
     let original_return_is_filled = f.root.resources().requests[&input]
-        .report
-        .owned_return_state()
+        .ingress_return_state()
         .unwrap()
-        == ReturnState::Filled;
+        == Some(ReturnState::Filled);
     let filled_refused = matches!(
         f.root.submit_establish_ingress_failure(input),
         Err(ControlRequestError::IngressPending)
@@ -212,7 +211,7 @@ fn an_observed_getter_panic_drains_one_return_and_reply_but_waits_for_actual_raw
     let cleaner = thread::spawn(move || disposal.unwrap().run());
     dropping.entered.wait();
     let retired_while_dropping = f.root.reap_ready_requests(8).unwrap();
-    let fee_while_dropping = f.ledger.used(Dimension::Replies.id());
+    let fee_while_dropping = f.ledger.used(Dimension::Requests.id());
     let still_registered = f.root.request_ready().registered();
     // Unblock and join the actual destructor before any behavioral assertion.
     dropping.resume.wait();
@@ -220,7 +219,7 @@ fn an_observed_getter_panic_drains_one_return_and_reply_but_waits_for_actual_raw
     let no_second_reply = f.root.take_control_effect(64).unwrap().is_none();
     let retired = f.root.reap_ready_requests(8).unwrap();
     let input_retired = f.runtime.input_custody(actor(), input).unwrap().is_none();
-    let fee_after_exit = f.ledger.used(Dimension::Replies.id());
+    let fee_after_exit = f.ledger.used(Dimension::Requests.id());
     let registered_after_exit = f.root.request_ready().registered();
     f.finish();
 
@@ -249,22 +248,19 @@ fn an_observed_getter_panic_drains_one_return_and_reply_but_waits_for_actual_raw
 fn five_observed_getter_panics_reuse_one_paid_rpc_position_after_actual_retirement() {
     // R is exactly one: five independently admitted requests must each return
     // the same finite capacity before the next request can be admitted.
-    let mut f = Fixture::with_scopes(
+    let mut f = Fixture::with_control_storage(
         1,
         1,
-        2,
         AdmissionStorage {
-            loading: ResourceVector::default(),
-            accepted: ResourceVector::default(),
-            context: ResourceVector::default(),
-            ticket: ResourceVector::default(),
+            loading: Default::default(),
+            accepted: Default::default(),
+            context: Default::default(),
         },
         ESTABLISH_REQUEST_STORAGE
             .checked_sub(CONTROL_REQUEST_STORAGE)
             .unwrap()
             .resources()
             .unwrap(),
-        2,
     );
     let mut inputs = Vec::new();
     let mut all_panicked = true;
@@ -297,7 +293,7 @@ fn five_observed_getter_panics_reuse_one_paid_rpc_position_after_actual_retireme
             .unwrap();
         retired += f.root.reap_ready_requests(8).unwrap();
         all_positions_released &= f.root.request_ready().registered() == 0
-            && f.ledger.used(Dimension::Replies.id()) == 0
+            && f.ledger.used(Dimension::Requests.id()) == 0
             && f.runtime.input_custody(actor(), input).unwrap().is_none();
         getter_count += getters.load(Ordering::SeqCst);
         drop_count += drops.load(Ordering::SeqCst);
@@ -317,7 +313,7 @@ fn five_observed_getter_panics_reuse_one_paid_rpc_position_after_actual_retireme
 
 #[test]
 fn a_lost_original_job_remains_unknown_after_its_failure_reply_without_fake_raw_cleanup() {
-    let mut f = fixture(2);
+    let mut f = fixture();
     let (raw, getters, drops) = request(&f, None, None, false);
     let (input, mut external) = admit(&mut f);
     let job = f
@@ -328,12 +324,13 @@ fn a_lost_original_job_remains_unknown_after_its_failure_reply_without_fake_raw_
     // sender and authority; no getter result or source-exit fact is invented.
     drop(job);
     let return_unknown = f.root.resources().requests[&input]
-        .report
-        .owned_return_state()
+        .ingress_return_state()
         .unwrap()
-        == ReturnState::Unknown;
-    let original_unresolved =
-        f.root.resources().requests[&input].role.phase() == ExitRolePhase::Unresolved;
+        == Some(ReturnState::Unknown);
+    let source_unresolved =
+        f.root.establish_source_phase(input).unwrap() == Some(ExitRolePhase::Unresolved);
+    let supervisor_started =
+        f.root.resources().requests[&input].role.phase() == ExitRolePhase::Started;
     f.root.submit_establish_ingress_failure(input).unwrap();
     let (disposal, same_input, owner_failed) =
         dispatch_owner_failure(&mut f, input, &mut external, Tick(1));
@@ -342,7 +339,7 @@ fn a_lost_original_job_remains_unknown_after_its_failure_reply_without_fake_raw_
     drop(external);
     let retired = f.root.reap_ready_requests(8).unwrap();
     let input_retired = f.runtime.input_custody(actor(), input).unwrap().is_none();
-    let fee = f.ledger.used(Dimension::Replies.id());
+    let fee = f.ledger.used(Dimension::Requests.id());
     let registered = f.root.request_ready().registered();
     // Only the real outbox/input/external legs drained. The untouched raw
     // fields and their source role remain in one bounded self-retained owner.
@@ -350,7 +347,7 @@ fn a_lost_original_job_remains_unknown_after_its_failure_reply_without_fake_raw_
     std::mem::forget(f);
 
     assert!(return_unknown);
-    assert!(original_unresolved);
+    assert!(source_unresolved && supervisor_started);
     assert!(same_input);
     assert!(owner_failed);
     assert!(no_disposal_authority);

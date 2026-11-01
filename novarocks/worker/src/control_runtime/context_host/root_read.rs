@@ -20,7 +20,7 @@
 
 use super::{
     ContextHostRecord,
-    requests::{ContextRequestAdmissionRefusal, ContextRequestError, TaskContextRequestHandle},
+    requests::{ContextRequestAdmissionRefusal, TaskContextRequestHandle},
 };
 use crate::{
     control_runtime::{
@@ -39,7 +39,7 @@ use novarocks_control_runtime::{
     exit_role::{ExitAuthority, ExitRole},
     lease::WorkRetirementObserver,
 };
-use novarocks_control_runtime_core::identity::{ActorId, WorkId};
+use novarocks_control_runtime_core::identity::{ActorId, ScopedWorkRef};
 use novarocks_execution_contract::{
     TaskIdentity, TaskOperationId, TaskStatusVersion,
     root_result::{RootResultRead, RootResultReply},
@@ -59,15 +59,16 @@ use std::{
 
 #[derive(Debug)]
 pub(crate) enum RootReadError {
+    ForeignProcess,
     UnknownContext,
     ContextRemoved,
     Request(ContextRequestAdmissionRefusal),
     Task(TaskRootReadError),
     Channel(RootChannelError),
+    Closed { accepted_consumed: u64 },
     UnknownTask,
     Capacity(novarocks_execution_contract::failure::ResourceFacts),
     WrongOwner,
-    BodyFailed,
 }
 fn root_position_capacity(
     limit: usize,
@@ -80,7 +81,7 @@ fn root_position_capacity(
         constraint_scope: Some(scope),
         dimension: ResourceDimension::Positions,
         requested: Some(1),
-        required_growth: Some(1),
+        required_growth: None,
         limit: u64::try_from(limit).ok(),
         committed: u64::try_from(committed).ok(),
         live: None,
@@ -98,7 +99,7 @@ pub(super) struct DeferredRootRequest {
     pub(super) retained: bool,
     pub(super) cut_waiting: bool,
     pub(super) binding_refusal: Option<super::requests::TaskRequestBindPartial>,
-    pub(super) direct_outer: Option<novarocks_control_runtime::lease::CapacityBundle>,
+    pub(super) direct_outer: Option<novarocks_control_runtime::lease::ReservationBundle>,
 }
 struct RootSlot {
     // Installation transfers this original channel; task_retired separately
@@ -107,10 +108,10 @@ struct RootSlot {
     retained: Option<ManuallyDrop<crate::control_runtime::task::RootContextRetention>>,
     // Installed ownership is not proof that the Task causal prefix retired.
     task_retired: bool,
-    readers: BTreeSet<WorkId>,
-    cut_waiters: BTreeSet<WorkId>,
-    cut_after: Option<WorkId>,
-    cut_until: Option<WorkId>,
+    readers: BTreeSet<ScopedWorkRef>,
+    cut_waiters: BTreeSet<ScopedWorkRef>,
+    cut_after: Option<ScopedWorkRef>,
+    cut_until: Option<ScopedWorkRef>,
     cut_notified_again: bool,
 }
 pub(in crate::control_runtime) struct RootReadState {
@@ -125,15 +126,13 @@ impl RootReadState {
             max_roots,
             per_root,
             roots: BTreeMap::new(),
-            cut_ready: novarocks_control_runtime_core::fair_queue::FairWorkQueue::new(
-                max_roots, max_roots, 1,
-            ),
+            cut_ready: novarocks_control_runtime_core::fair_queue::FairWorkQueue::new(max_roots, 1),
         }
     }
     pub(super) fn reserve(
         &mut self,
         task: TaskIdentity,
-        work: WorkId,
+        work: ScopedWorkRef,
     ) -> Result<(), RootReadError> {
         if !self.roots.contains_key(&task) {
             if self.roots.len() >= self.max_roots {
@@ -167,7 +166,7 @@ impl RootReadState {
         assert!(row.readers.insert(work));
         Ok(())
     }
-    pub(super) fn release(&mut self, task: TaskIdentity, work: WorkId) {
+    pub(super) fn release(&mut self, task: TaskIdentity, work: ScopedWorkRef) {
         if let Some(row) = self.roots.get_mut(&task) {
             row.readers.remove(&work);
             row.cut_waiters.remove(&work);
@@ -195,7 +194,12 @@ impl RootReadState {
             }
         }
     }
-    pub(super) fn set_cut_waiting(&mut self, task: TaskIdentity, work: WorkId, waiting: bool) {
+    pub(super) fn set_cut_waiting(
+        &mut self,
+        task: TaskIdentity,
+        work: ScopedWorkRef,
+        waiting: bool,
+    ) {
         let row = self
             .roots
             .get_mut(&task)
@@ -227,7 +231,7 @@ impl RootReadState {
             .enqueue(task, ())
             .expect("same bounded original Root source notice");
     }
-    pub(super) fn take_cut_retries(&mut self, budget: usize) -> Vec<WorkId> {
+    pub(super) fn take_cut_retries(&mut self, budget: usize) -> Vec<ScopedWorkRef> {
         use std::ops::Bound::{Excluded, Included, Unbounded};
         let mut result = Vec::new();
         for _ in 0..budget {
@@ -379,6 +383,19 @@ impl RootReadState {
             .begin_original_root_read(read)
             .map_err(RootReadError::Task)
     }
+    pub(super) fn closed_read_frontier(
+        &self,
+        read: &RootResultRead,
+    ) -> Result<Option<u64>, RootReadError> {
+        match self
+            .roots
+            .get(&read.root_task())
+            .and_then(|row| row.retained.as_ref())
+        {
+            Some(root) => root.closed_read_frontier(read).map_err(RootReadError::Task),
+            None => Ok(None),
+        }
+    }
     pub(crate) fn readers_empty(&self) -> bool {
         self.roots.values().all(|row| row.readers.is_empty()) && self.cut_ready.is_empty()
     }
@@ -437,7 +454,7 @@ pub(super) struct RootReadData {
     pub(super) role: ExitRole,
     pub(super) report: ReportSlot,
     pub(super) observer: WorkRetirementObserver,
-    pub(super) work: WorkId,
+    pub(super) work: ScopedWorkRef,
     pub(super) consumed: bool,
 }
 struct DataBody {
@@ -670,7 +687,7 @@ impl ContextHostRecord {
             return Err(RootReadError::WrongOwner);
         }
         let (work, handle, shared) =
-            self.admit_deferred_root_request(ready, task, operation, deadline)?;
+            self.admit_deferred_root_request(ready, read, operation, deadline)?;
         let holder = match self.admit_root_read_data(work) {
             Ok(holder) => holder,
             Err(error) => {
@@ -678,7 +695,7 @@ impl ContextHostRecord {
                 return Err(RootReadError::Request(error));
             }
         };
-        let read = if self.resources.root_reads.has_root(task) {
+        let channel_read = if self.resources.root_reads.has_root(task) {
             self.resources.root_reads.begin_retained(read)
         } else {
             match self.tasks.get(&task) {
@@ -688,11 +705,20 @@ impl ContextHostRecord {
                 _ => self.resources.root_reads.begin_retained(read),
             }
         };
-        let mut read = match read {
+        let mut read = match channel_read {
             Ok(read) => read,
             Err(error) => {
                 drop(handle);
                 drop(holder);
+                if matches!(
+                    error,
+                    RootReadError::Channel(RootChannelError::Closed)
+                        | RootReadError::Task(TaskRootReadError::Channel(RootChannelError::Closed))
+                ) && let Some(accepted_consumed) =
+                    self.resources.root_reads.closed_read_frontier(read)?
+                {
+                    return Err(RootReadError::Closed { accepted_consumed });
+                }
                 return Err(error);
             }
         };

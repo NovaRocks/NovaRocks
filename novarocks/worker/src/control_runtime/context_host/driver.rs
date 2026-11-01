@@ -48,6 +48,56 @@ pub(crate) enum ContextDriverError {
     Task(TaskDriverError),
     Capacity(crate::control_runtime::task_capacity::TaskCapacityError),
 }
+impl std::fmt::Display for ContextDriverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongOwner => f.write_str("Context driver does not belong to the original owner"),
+            Self::Observation(error) => {
+                write!(f, "Context driver observation operation failed: {error:?}")
+            }
+            Self::Driver(error) => write!(f, "Context driver runtime operation failed: {error}"),
+            Self::Dispatch(error) => write!(f, "Context driver effect dispatch failed: {error}"),
+            Self::Host(error) => write!(f, "Context driver host job failed: {error}"),
+            Self::HostProgress(error) => {
+                write!(f, "Context driver host progress failed: {error:?}")
+            }
+            Self::Route(error) => write!(f, "Context driver establishment route failed: {error:?}"),
+            Self::Request(error) => write!(f, "Context driver original request failed: {error}"),
+            Self::Failure(error) => {
+                write!(f, "Context driver failure publication failed: {error:?}")
+            }
+            Self::Metadata(error) => write!(
+                f,
+                "Context driver original metadata operation failed: {error}"
+            ),
+            Self::Task(error) => {
+                write!(f, "Context driver original Task operation failed: {error}")
+            }
+            Self::Capacity(error) => {
+                write!(f, "Context driver capacity notification failed: {error:?}")
+            }
+        }
+    }
+}
+impl std::error::Error for ContextDriverError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Driver(error) => Some(error),
+            Self::Dispatch(error) => Some(error),
+            Self::Host(error) => Some(error),
+            Self::Request(error) => Some(error),
+            Self::Metadata(error) => Some(error),
+            Self::Task(error) => Some(error),
+            Self::WrongOwner
+            | Self::Observation(_)
+            | Self::HostProgress(_)
+            | Self::Route(_)
+            | Self::Failure(_)
+            | Self::Capacity(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ContextDriverProgress {
     pub indexed: usize,
@@ -82,12 +132,27 @@ impl ContextHostRecord {
             | ContextDriverError::Task(TaskDriverError::DynamicFilter(crate::control_runtime::dynamic_filters::DynamicFilterError::Driver(error)))
             | ContextDriverError::Task(TaskDriverError::Request(super::requests::ContextRequestError::DynamicFilter(crate::control_runtime::dynamic_filters::DynamicFilterError::Driver(error))))
             | ContextDriverError::Task(TaskDriverError::Host(crate::control_runtime::task::TaskHostError::Driver(error)))
+            | ContextDriverError::Task(TaskDriverError::Task(super::ContextHostError::Task(crate::control_runtime::task::TaskHostError::Driver(error))))
             | ContextDriverError::Host(ContextHostJobError::Driver(error))
             | ContextDriverError::HostProgress(ContextHostProgressError::Host(ContextHostJobError::Driver(error)))
             | ContextDriverError::Request(super::requests::ContextRequestError::Driver(error))
             | ContextDriverError::Request(super::requests::ContextRequestError::Causal(crate::control_runtime::causal::CausalError::Driver(error)))
             | ContextDriverError::Task(TaskDriverError::Request(super::requests::ContextRequestError::Causal(crate::control_runtime::causal::CausalError::Driver(error))))
             | ContextDriverError::Task(TaskDriverError::Host(crate::control_runtime::task::TaskHostError::Causal(crate::control_runtime::causal::CausalError::Driver(error)))) => fence(error),
+            ContextDriverError::Task(TaskDriverError::Task(super::ContextHostError::Task(
+                crate::control_runtime::task::TaskHostError::Runtime(
+                    novarocks_control_runtime::transaction::RuntimeError::Scope(
+                        novarocks_control_runtime_core::scope::ScopeError::GenerationMismatch,
+                    ),
+                )
+                | crate::control_runtime::task::TaskHostError::SourceSlots(
+                    crate::control_runtime::source_slot_issuer::SourceSlotIssueError::Runtime(
+                        novarocks_control_runtime::transaction::RuntimeError::Scope(
+                            novarocks_control_runtime_core::scope::ScopeError::GenerationMismatch,
+                        ),
+                    ),
+                ),
+            ))) => true,
             ContextDriverError::Task(TaskDriverError::Host(crate::control_runtime::task::TaskHostError::OwnerFailed)) => true,
             ContextDriverError::Task(TaskDriverError::Host(crate::control_runtime::task::TaskHostError::Statistics(
                 crate::control_runtime::operator_statistics::StatisticsError::FailurePublicationRequired,
@@ -136,7 +201,22 @@ impl ContextHostRecord {
                 .map_err(|(error, ticket)| {
                     self.retain_driver_refusal(ticket, ContextDriverError::Request(error))
                 }),
-            WorkerAction::Context(ContextEffect::PublishContextConvergence { .. }) => {
+            WorkerAction::Context(ContextEffect::PublishContextConvergence {
+                close_epoch, ..
+            }) => {
+                if let Err(error) = self.control_runtime.validate_effect_ticket(&ticket) {
+                    return Err(
+                        self.retain_driver_refusal(ticket, ContextDriverError::Driver(error))
+                    );
+                }
+                if self
+                    .resources
+                    .execution_close_epoch
+                    .is_some_and(|original| original != *close_epoch)
+                {
+                    return Err(self.retain_driver_refusal(ticket, ContextDriverError::WrongOwner));
+                }
+                self.resources.execution_close_epoch = Some(*close_epoch);
                 self.complete_host_effect(ticket).map_err(|refusal| {
                     self.retain_driver_refusal(
                         refusal.ticket,
@@ -163,63 +243,13 @@ impl ContextHostRecord {
                     self.retain_driver_refusal(ticket, ContextDriverError::Host(error))
                 }),
             WorkerAction::Context(ContextEffect::ReleaseHost { .. }) => {
-                let sealed = self.task_driver_roots_sealed()
-                    && self.resources.pending_host_jobs.driver_seal.is_none();
-                if !sealed {
-                    assert!(
-                        self.resources
-                            .pending_host_jobs
-                            .driver_release
-                            .replace(ticket)
-                            .is_none()
-                    );
-                    return Ok(());
-                }
-                if !self.resources.pending_host_jobs.root_release_finished {
-                    let next = self
-                        .resources
-                        .root_reads
-                        .next_release_root(self.resources.pending_host_jobs.root_release_after);
-                    if let Some((task, idle)) = next {
-                        if idle {
-                            self.resources.pending_host_jobs.root_release_after = Some(task);
-                            self.ready_notice().notify();
-                        }
-                        assert!(
-                            self.resources
-                                .pending_host_jobs
-                                .driver_release
-                                .replace(ticket)
-                                .is_none()
-                        );
-                        return Ok(());
-                    }
-                    self.resources.pending_host_jobs.root_release_finished = true;
-                }
-                // R samples the original normal-close retention bank. Core's
-                // terminal/RetireTask intent does not prove that the physical
-                // Finalize/Retire call has installed its normal-close record.
-                // Roots are already sealed and fully idle above; now wait for
-                // the same Task cleanup and its real Context notices, not R.
-                if !self.tasks.is_empty() || !self.task_driver.is_idle() {
-                    assert!(
-                        self.resources
-                            .pending_host_jobs
-                            .driver_release
-                            .replace(ticket)
-                            .is_none()
-                    );
-                    return Ok(());
-                }
+                // R accepts this original instruction independently of the
+                // Task cut that carried it. Its physical job still waits for
+                // the original Root/Task/M/loan gates in host progress.
                 self.handoff_host_release(ticket)
                     .map_err(|(error, ticket)| {
                         self.retain_driver_refusal(ticket, ContextDriverError::Host(error))
                     })
-            }
-            WorkerAction::Context(ContextEffect::RetainContext { .. }) => {
-                self.handoff_retention(ticket).map_err(|(error, ticket)| {
-                    self.retain_driver_refusal(ticket, ContextDriverError::Host(error))
-                })
             }
             WorkerAction::Context(ContextEffect::CloseExternalAdmission {
                 context,
@@ -237,22 +267,49 @@ impl ContextHostRecord {
                 }
                 match self.close_task_driver_admission(*context, *generation, tasks) {
                     Ok(true) => {
-                        let reason = *reason;
-                        self.handoff_context_admission_close(ticket, reason, tasks)
-                            .map_err(|refusal| {
-                                let error = ContextDriverError::Task(refusal.error);
-                                match refusal.ticket {
-                                    Some(ticket) => self.retain_driver_refusal(ticket, error),
-                                    None => error,
-                                }
-                            })
+                        let (generation, reason) = (*generation, *reason);
+                        self.stage_context_admission_close(ticket, generation, reason);
+                        Ok(())
                     }
                     result => {
-                        assert!(self.resources.pending_host_jobs.driver_close.is_none());
-                        self.resources.pending_host_jobs.driver_close = Some(ticket);
-                        result.map(|_| ()).map_err(ContextDriverError::Task)
+                        let error = result
+                            .err()
+                            .map(ContextDriverError::Task)
+                            .unwrap_or(ContextDriverError::WrongOwner);
+                        Err(self.retain_driver_refusal(ticket, error))
                     }
                 }
+            }
+            WorkerAction::Context(ContextEffect::CloseFanoutPrepared {
+                context,
+                generation,
+                reason,
+                targets,
+            }) if *context == self.identity => {
+                if let Err(error) = self.control_runtime.validate_effect_ticket(&ticket) {
+                    return Err(
+                        self.retain_driver_refusal(ticket, ContextDriverError::Driver(error))
+                    );
+                }
+                let Some(fanout) = self
+                    .resources
+                    .pending_host_jobs
+                    .close_fanouts
+                    .iter_mut()
+                    .find(|fanout| fanout.generation == *generation && fanout.reason == *reason)
+                else {
+                    return Err(self.retain_driver_refusal(ticket, ContextDriverError::WrongOwner));
+                };
+                if fanout.targets.is_some() || fanout.staged > *targets {
+                    return Err(self.retain_driver_refusal(ticket, ContextDriverError::WrongOwner));
+                }
+                fanout.targets = Some(*targets);
+                self.complete_host_effect(ticket).map_err(|refusal| {
+                    self.retain_driver_refusal(
+                        refusal.ticket,
+                        ContextDriverError::Driver(refusal.error),
+                    )
+                })
             }
             WorkerAction::Context(ContextEffect::SealRoot {
                 context,
@@ -441,14 +498,50 @@ impl ContextHostRecord {
         if !handles.accepts_owner(jobs) {
             return Err(ContextDriverError::WrongOwner);
         }
-        jobs.bind_execution_host(tasks.execution.as_ref())
-            .map_err(ContextDriverError::Host)?;
+        let detached = self.resources.scope.is_none();
+        if !detached {
+            jobs.bind_execution_host(tasks.execution.as_ref())
+                .map_err(ContextDriverError::Host)?;
+        }
+        // Admission partials belong to the Context's request custody, not
+        // its execution Scope. Every host turn advances this bounded class
+        // once, including healthy retained actors and failed cleanup actors.
+        self.advance_admission_partials(tasks, budget)
+            .map_err(ContextDriverError::Request)?;
         let failed = self
             .control_runtime
             .snapshot(self.actor)
             .map_err(ContextDriverError::Driver)?
             .failed;
-        if failed {
+        if failed && detached {
+            let publication_active = self
+                .resources
+                .failure
+                .as_ref()
+                .is_some_and(|owner| owner.publication_active())
+                && !self.failure_tail_started();
+            if publication_active {
+                progress.failure_publications_drained = self
+                    .advance_failure_publications(budget)
+                    .map_err(ContextDriverError::Failure)?;
+                if progress.failure_publications_drained {
+                    let inputs = self
+                        .advance_failed_runtime_inputs(budget)
+                        .map_err(ContextDriverError::Failure)?;
+                    progress.runnable |= !inputs.empty;
+                } else {
+                    progress.runnable = true;
+                }
+            }
+            if self
+                .resources
+                .failure
+                .as_ref()
+                .is_some_and(|owner| owner.is_drained())
+            {
+                progress.runnable |= self.advance_cold_failure_tail(tasks, budget)?;
+            }
+        } else if failed {
             if self.failure_tail_started() {
                 progress.runnable |= self.advance_failed_cleanup_tail(tasks, budget)?;
             }
@@ -466,6 +559,15 @@ impl ContextHostRecord {
                         .advance_failed_runtime_inputs(budget)
                         .map_err(ContextDriverError::Failure)?;
                     progress.runnable |= !inputs.empty;
+                    let proof = self
+                        .control_runtime
+                        .failure_proof_for(self.registration())
+                        .map_err(ContextDriverError::Driver)?;
+                    if let Some(lifecycle) = self.resources.lifecycle.as_mut() {
+                        lifecycle
+                            .withdraw_failed_callback(&proof)
+                            .map_err(ContextDriverError::Host)?;
+                    }
                     self.advance_failed_root_release(tasks, budget)?;
                     progress.runnable |= self.advance_failed_task_cleanup(tasks, budget)?;
                 } else {
@@ -473,13 +575,7 @@ impl ContextHostRecord {
                 }
             }
         } else {
-            if let Some(original) = self.resources.pending_host_jobs.driver_close.take() {
-                self.handoff_driver_effect(original, tasks)?;
-            }
             if let Some(original) = self.resources.pending_host_jobs.driver_seal.take() {
-                self.handoff_driver_effect(original, tasks)?;
-            }
-            if let Some(original) = self.resources.pending_host_jobs.driver_release.take() {
                 self.handoff_driver_effect(original, tasks)?;
             }
             let allowance = budget.saturating_mul(ContextActor::MAX_STEP_ACTIONS + 1);
@@ -539,7 +635,13 @@ impl ContextHostRecord {
                 .dispatch
                 .has_unindexed(&self.control_runtime)
                 .map_err(ContextDriverError::Dispatch)?;
+            self.advance_context_admission_closes(tasks)
+                .map_err(ContextDriverError::Task)?;
         }
+        // Failure takeover preserves the same physical close and gate. Its
+        // real return must also drain the original neutral ready addresses;
+        // a failed Core never waits for the normal scan-completion marker.
+        progress.runnable |= self.advance_context_close_notifications(budget);
         progress.runnable |= self
             .advance_observation_publication(budget)
             .map_err(ContextDriverError::Observation)?;
@@ -600,6 +702,14 @@ impl ContextHostRecord {
                     break;
                 };
                 self.resources.pending_host_jobs.route_after = Some(input);
+                if failed
+                    && let Some(failure) = &self.resources.failure
+                    && let Ok(stage) = failure.drained()
+                {
+                    self.resources.routes[&input]
+                        .fail_after_publications_drained(&stage)
+                        .map_err(ContextDriverError::Route)?;
+                }
                 if self.resources.routes[&input].context_cleanup_ready()
                     && self
                         .advance_establish_route(input)
@@ -628,28 +738,39 @@ impl ContextHostRecord {
             .pending_timer_input(self.actor)
             .map_err(ContextDriverError::Driver)?
         {
-            match self.control_runtime.retire_input(self.actor, input) {
-                Ok(()) => progress.timer_inputs_retired += 1,
-                Err(
-                    DriverError::EffectsRemain
-                    | DriverError::ReservationsRemain
-                    | DriverError::InputStillQueued,
-                ) => {}
-                Err(error) => return Err(ContextDriverError::Driver(error)),
+            // Metadata completion and cursor release are distinct facts. The
+            // next original bounded scan must finish borrowing this batch
+            // before its Timer input is removed from the runtime.
+            let scanning = self
+                .resources
+                .lifecycle
+                .as_ref()
+                .is_some_and(|original| original.scans_input(input));
+            if !scanning {
+                match self.control_runtime.retire_input(self.actor, input) {
+                    Ok(()) => progress.timer_inputs_retired += 1,
+                    Err(
+                        DriverError::EffectsRemain
+                        | DriverError::ReservationsRemain
+                        | DriverError::InputStillQueued
+                        | DriverError::MetadataStillPending,
+                    ) => {}
+                    Err(error) => return Err(ContextDriverError::Driver(error)),
+                }
             }
         }
-        if !failed {
+        if !failed && !detached {
             let task_progress = self
                 .advance_task_driver(tasks, budget)
                 .map_err(ContextDriverError::Task)?;
             progress.runnable |= task_progress.runnable;
             progress.tasks = Some(task_progress);
         }
-        if failed {
+        if failed && !detached {
             if progress.failure_publications_drained {
                 progress.host = Some(self.advance_failed_host_io(handles, tasks, budget)?);
             }
-        } else {
+        } else if !detached {
             progress.host = Some(
                 self.advance_host_io(handles)
                     .map_err(ContextDriverError::HostProgress)?,
@@ -659,13 +780,17 @@ impl ContextHostRecord {
             .advance_root_reads(tasks, budget)
             .map_err(ContextDriverError::Request)?;
         if self.advance_observation_teardown(budget) {
-            if failed && !self.failed_owner_completed() && !self.failure_tail_started() {
+            if failed && !detached && !self.failed_owner_completed() && !self.failure_tail_started()
+            {
                 progress.runnable |= self.advance_failed_cleanup_tail(tasks, budget)?;
             }
             progress.metadata_teardown_ready = self
                 .advance_metadata_teardown()
                 .map_err(ContextDriverError::Metadata)?;
-        } else if self.resources.control_admission_closed && self.resources.requests.is_empty() {
+        } else if !detached
+            && self.resources.control_admission_closed
+            && self.resources.requests.is_empty()
+        {
             progress.runnable = true;
         }
         if progress.metadata_teardown_ready

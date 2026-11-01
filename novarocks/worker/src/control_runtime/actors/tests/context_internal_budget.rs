@@ -91,13 +91,14 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
             _ => None,
         })
         .unwrap();
-    // Split existing Task.loading Source fees. This is the production paid
-    // constructor, not the empty-vector protocol_model source fixture.
+    // Bind the Task.loading inventory's actual Source roles from the same
+    // original Work and payer, using the production atomic issuer.
+    let (parent_work, payer) = f.jobs.get_mut(&parent).unwrap();
     let originals = reserve_source_slots::<4>(
         &f.scope,
-        parent,
-        generation(),
-        SourceSlotPayer::Retained(&mut f.jobs.get_mut(&parent).unwrap().1),
+        parent_work,
+        (f.scope.id(), generation()),
+        SourceSlotPayer::Retained(payer),
     )
     .unwrap();
     let ingress = Arc::new(
@@ -112,7 +113,7 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
     );
     let inbox = TaskCausalInbox::new(
         f.runtime.clone(),
-        actor(),
+        f.registration.clone(),
         ActorId::new(7001).unwrap(),
         task,
         generation(),
@@ -126,8 +127,6 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
                 input_retained_bytes: 1,
                 ingress_retained_bytes: 1,
                 structural_bytes: 1,
-                inbound_records: 0,
-                inbound_bytes: 0,
             }),
         },
         None,
@@ -160,22 +159,31 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
         source_parent: parent,
     };
     let work = h.work();
+    let (parent_work, payer) = h.fixture.jobs.get_mut(&parent).unwrap();
     let source_slots = reserve_source_slots::<2>(
         &h.fixture.scope,
-        parent,
-        generation(),
-        SourceSlotPayer::Retained(&mut h.fixture.jobs.get_mut(&parent).unwrap().1),
+        parent_work,
+        (h.fixture.scope.id(), generation()),
+        SourceSlotPayer::Retained(payer),
     )
     .unwrap();
+    let producer = &h
+        .fixture
+        .roles
+        .iter()
+        .find(|(original, _)| original.id() == work)
+        .unwrap()
+        .0;
     let (cut, mut sender) = h
         .inbox
         .admit_settlement(
+            producer,
             1,
             Arc::new(CausalPending),
             CutSourceAdmission::Fresh(source_slots),
         )
         .unwrap();
-    sender.bind_work(work);
+    sender.bind_work(producer.reference());
     // A source-free original predecessor is legal and has no rich payload
     // whose consumption proof could be inferred from another prefix.
     h.fixture.run(
@@ -277,8 +285,14 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
         .iter()
         .chain(&event_effects)
         .any(|effect| matches!(effect, WorkerAction::Reply(_)));
-    let fees_before = [Dimension::Work, Dimension::Completions, Dimension::Captures]
-        .map(|dimension| h.fixture.ledger.used(dimension.id()));
+    let original_sources: Vec<_> = h
+        .ingress
+        .pair_inventory(PairRoute::Cut(cut))
+        .unwrap()
+        .into_iter()
+        .map(|row| row.custody)
+        .collect();
+    let headers_live_before = original_sources.iter().all(|source| !source.reusable());
     let mut actual_source_receipts = true;
     for source in &sources {
         actual_source_receipts &=
@@ -302,10 +316,7 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
         .ledger
         .reap_scope_ready(h.fixture.scope.id(), 256)
         .unwrap();
-    let still_paid_after_source_reap =
-        [Dimension::Work, Dimension::Completions, Dimension::Captures]
-            .map(|dimension| h.fixture.ledger.used(dimension.id()))
-            == fees_before;
+    let actual_headers_reaped = original_sources.iter().all(|source| source.reusable());
     let reaped = h
         .ingress
         .prepare_pair_reap(PairRoute::Cut(cut))
@@ -319,38 +330,34 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
         .inbox
         .retire_after_exit(cut, CausalSourceRetirement::Reaped(reaped))
         .unwrap();
-    let detached = dispose_retired_pair(&h.fixture, &h.ingress, retired);
-    let fees_after = [Dimension::Work, Dimension::Completions, Dimension::Captures]
-        .map(|dimension| h.fixture.ledger.used(dimension.id()));
+    let before_detach = h.fixture.scope.snapshot().unwrap();
+    let crate::task_proposal_ingress::RetiredCut { pair, funding, .. } = retired;
+    let witnesses = h
+        .ingress
+        .prepare_owned_pair_reap(&pair)
+        .unwrap()
+        .map(|probe| probe.observe_reaped().unwrap());
+    let detached = h.ingress.release_owned_pair(&pair, witnesses).unwrap();
+    let detached_count = detached.len();
+    drop(detached); // Original neutral rows leave the ingress lock before Drop.
+    drop((pair, funding));
+    let detach_retires_no_work = h.fixture.scope.snapshot().unwrap() == before_detach;
     // The Wake represented a real remaining close scan. Follow that existing
     // neutral cursor only after the original prefix's batch really retired.
     let next = h.fixture.run(ContextInput::NextInternal, None);
-    let close_generation = next
-        .iter()
-        .find_map(|effect| match effect {
-            WorkerAction::Context(ContextEffect::ApplyTaskClose {
-                task: id,
-                generation,
-                ..
-            }) if *id == task => Some(*generation),
-            _ => None,
-        })
-        .expect("the actual remaining close cursor reaches this retained Task record");
-    let applied = h.fixture.run(
-        ContextInput::ApplyTaskClose {
-            task,
-            generation: close_generation,
-            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
-                novarocks_execution_contract::AbortCause::LeaseExpired,
-            ),
-        },
-        None,
+    assert!(
+        next.iter().any(|effect| matches!(
+            effect,
+            WorkerAction::Context(ContextEffect::CloseFanoutPrepared { targets: 0, .. })
+        )),
+        "the finite scan completes without reviving an already terminal Task"
     );
-    let no_duplicate_task_publication = !applied.iter().any(|effect| {
+    let no_duplicate_task_publication = !next.iter().any(|effect| {
         matches!(
             effect,
             WorkerAction::Context(
-                ContextEffect::StopTask { .. }
+                ContextEffect::ApplyTaskClose { .. }
+                    | ContextEffect::StopTask { .. }
                     | ContextEffect::PublishTask { .. }
                     | ContextEffect::RetireTask { .. }
             )
@@ -364,9 +371,9 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
     assert_eq!(sources.len(), 2);
     assert!(actual_source_receipts);
     assert_eq!(drops.load(Ordering::SeqCst), 2);
-    assert_eq!(detached, 2);
-    assert!(still_paid_after_source_reap);
-    assert_eq!(fees_after, fees_before.map(|fee| fee - 2));
+    assert_eq!(detached_count, 2);
+    assert!(headers_live_before && actual_headers_reaped);
+    assert!(detach_retires_no_work);
     assert_eq!(wakes, 1);
     assert!(!leaked_hints);
     assert!(
@@ -376,13 +383,38 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
     assert_eq!(disposed, 1);
     assert_eq!(retained, 1);
     assert_eq!(publications, 3);
-    // Body14 includes one original summary record. Removing its one pure
-    // ContinueClose and adding one actual Wake leaves 13 actual output slots.
-    // This is measured output, not an assertion that the pure upper15 is hit.
-    assert_eq!(prefix_count, 13);
+    // The pure bound charges 15 units, including one record visit: three
+    // lease-close effects, two five-effect cuts and the original cut receipt.
+    // The Actor removes ContinueClose and adds its one prepaid Wake; neither
+    // operation removes that record visit from the output inventory twice.
+    assert_eq!(
+        prefix_effects
+            .iter()
+            .filter(|effect| matches!(
+                effect,
+                WorkerAction::Context(ContextEffect::CloseExternalAdmission { .. })
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        prefix_effects
+            .iter()
+            .filter(|effect| matches!(
+                effect,
+                WorkerAction::Context(ContextEffect::SealRoot { .. })
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(prefix_count, 3 + 5 + 5 + 1 - 1 + wakes);
     assert_eq!(prefix_effects.len(), prefix_count);
     assert!(no_duplicate_task_publication);
-    assert_eq!(policy.context_actor(1).unwrap().max_step_work, 22);
-    assert_eq!(policy.context_actor(1).unwrap().max_effects_per_step, 16);
-    assert_eq!(policy.context_actor(1).unwrap().turn_budget, 92);
+    let config = policy.context_actor(1).unwrap();
+    assert_eq!(config.max_step_work, ContextCore::MAX_STEP_WORK + 1);
+    assert_eq!(
+        config.max_effects_per_step,
+        ContextCore::MAX_STEP_ACTIONS + 1
+    );
+    assert_eq!(config.turn_budget, 4 * (config.max_step_work + 1));
 }

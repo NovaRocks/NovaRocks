@@ -17,15 +17,18 @@
 
 use super::*;
 use crate::{
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     transaction::RuntimeLedger,
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector, identity::DimensionId, scope::WorkAdmission,
+    capacity::{ReservationResources, ResourceVector},
+    identity::DimensionId,
+    owned_storage::OwnedSlotNeed,
+    scope::WorkAdmission,
 };
 
 #[derive(Debug)]
-struct Original(WorkId);
+struct Original(ScopedWorkRef);
 impl Actor for Original {
     type Input = u64;
     type Effect = u64;
@@ -55,6 +58,28 @@ impl Actor for Original {
 fn paid() -> ResourceVector {
     ResourceVector::new([(DimensionId::new(1).unwrap(), 2)]).unwrap()
 }
+fn work_resources(quota: ResourceVector) -> ReservationResources {
+    ReservationResources {
+        quota,
+        owned_slots: OwnedSlotNeed {
+            work_headers: 1,
+            ..OwnedSlotNeed::default()
+        },
+    }
+}
+fn request_resources() -> ReservationResources {
+    ReservationResources {
+        quota: paid(),
+        owned_slots: OwnedSlotNeed {
+            work_headers: 1,
+            inputs: 1,
+            batches: 1,
+            effects: 1,
+            replies: 1,
+            ..OwnedSlotNeed::default()
+        },
+    }
+}
 fn actor() -> ActorId {
     ActorId::new(1).unwrap()
 }
@@ -64,17 +89,17 @@ struct Fixture {
     scope: ScopeHandle,
     registration: ActorRegistration,
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     input: InputId,
 }
 impl Fixture {
     fn new(ledger: RuntimeLedger, runtime: ActorRuntime<Original>) -> (Self, EffectTicket<u64>) {
         let generation = Generation::new(1).unwrap();
-        let scope = ledger.open_scope_next(None, generation, 8, 8).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
         let (mut work, capacity) = scope
             .reserve_next(
                 generation,
-                paid(),
+                work_resources(paid()),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -86,7 +111,7 @@ impl Fixture {
             .register_supervised_bound(
                 actor(),
                 scope.clone(),
-                Original(work.id()),
+                Original(work.reference()),
                 ActorConfig {
                     mailbox: [1; 4],
                     max_batches: 1,
@@ -121,7 +146,7 @@ impl Fixture {
         )
     }
     fn independent() -> (Self, EffectTicket<u64>) {
-        Self::new(RuntimeLedger::new(paid(), 8, 8), ActorRuntime::new(1))
+        Self::new(RuntimeLedger::new(paid()), ActorRuntime::new())
     }
     fn finish(mut self, ticket: EffectTicket<u64>) {
         self.runtime
@@ -137,8 +162,9 @@ impl Fixture {
         }
         self.runtime.remove_actor(actor()).unwrap();
         self.capacity
-            .release(&self.capacity.resources().unwrap())
+            .release_quota(&self.capacity.resources().unwrap().quota)
             .unwrap();
+        self.capacity.finish().unwrap();
         self.ledger.remove_scope(self.scope.id()).unwrap();
         assert!(self.runtime.is_empty());
         assert!(self.ledger.is_empty());
@@ -147,8 +173,8 @@ impl Fixture {
 
 #[test]
 fn retired_registration_cannot_complete_reused_actor_in_the_same_runtime() {
-    let ledger = RuntimeLedger::new(paid(), 8, 8);
-    let runtime = ActorRuntime::new(1);
+    let ledger = RuntimeLedger::new(paid());
+    let runtime = ActorRuntime::new();
     let (old, old_ticket) = Fixture::new(ledger.clone(), runtime.clone());
     let witness = old.registration.clone();
     old.finish(old_ticket);
@@ -205,6 +231,248 @@ fn original_registration_can_complete_a_physical_fact_after_scope_failure() {
     assert_ne!(original_generation, failed_generation);
     assert_eq!(
         current_publication,
-        Err(DriverError::Effect(EffectError::StaleGeneration))
+        Err(DriverError::FailurePublicationRequired)
     );
+}
+
+#[derive(Debug)]
+enum RetainedInput {
+    Read(u64),
+    Tick,
+    Expired(u64),
+}
+#[derive(Debug)]
+struct RetainedActor {
+    deadline: Option<Tick>,
+    consumed_expiry: Option<u64>,
+}
+impl Actor for RetainedActor {
+    type Input = RetainedInput;
+    type Effect = u64;
+    fn timer_input(_: Tick) -> Self::Input {
+        RetainedInput::Tick
+    }
+    fn handle(
+        &mut self,
+        _: Tick,
+        _: InputEnvelope,
+        input: Self::Input,
+        step: &mut StepContext<'_, Self::Effect>,
+    ) {
+        match input {
+            RetainedInput::Read(value) => step
+                .effect(
+                    EffectDescriptor {
+                        id: ActionId::new(1).unwrap(),
+                        work: step.input_work().expect("current original request"),
+                        kind: EffectKind::Reply,
+                        dependencies: vec![],
+                    },
+                    value,
+                )
+                .unwrap(),
+            RetainedInput::Tick => {
+                self.deadline = None;
+                assert!(step.input_work().is_none());
+                step.metadata(73).unwrap();
+            }
+            RetainedInput::Expired(original) => self.consumed_expiry = Some(original),
+        }
+    }
+    fn next_deadline(&self) -> Option<Tick> {
+        self.deadline
+    }
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, u64>) {
+        unreachable!("this pure protocol does not panic")
+    }
+}
+
+#[test]
+fn retained_registration_releases_execution_and_keeps_current_request_and_expiry_custody() {
+    let generation = Generation::new(1).unwrap();
+    let ledger = RuntimeLedger::new(paid());
+    let runtime = ActorRuntime::new();
+    let process = ledger.open_scope_next(None, generation).unwrap();
+    let (mut control_work, mut control_capacity) = process
+        .reserve_next(
+            generation,
+            work_resources(ResourceVector::default()),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    control_work.start().unwrap();
+    let control = ActorId::new(2).unwrap();
+    let config = ActorConfig {
+        mailbox: [1; 4],
+        max_batches: 1,
+        max_effects_per_step: 1,
+        max_dependencies_per_effect: 0,
+        turn_budget: 8,
+        max_step_work: 1,
+    };
+    let control_registration = runtime
+        .register_supervised_bound(
+            control,
+            process.clone(),
+            RetainedActor {
+                deadline: None,
+                consumed_expiry: None,
+            },
+            config,
+            &control_work,
+        )
+        .unwrap();
+    let execution = ledger
+        .open_scope_next(
+            Some(crate::transaction::ScopeParentAdmission {
+                scope: process.id(),
+                generation,
+                kind: WorkKind::Cleanup,
+                admission: WorkAdmission::Derived(control_work.id()),
+            }),
+            generation,
+        )
+        .unwrap();
+    let (mut original, mut original_capacity) = execution
+        .reserve_next(
+            generation,
+            work_resources(paid()),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    original.start().unwrap();
+    let registration = runtime
+        .register_supervised_bound(
+            actor(),
+            execution.clone(),
+            RetainedActor {
+                deadline: Some(Tick(10)),
+                consumed_expiry: None,
+            },
+            config,
+            &original,
+        )
+        .unwrap();
+    let witness = registration.clone();
+    runtime.notify_host_actor(&registration).unwrap();
+    let mut host = runtime.claim_host_actor().unwrap();
+    assert_eq!(
+        host.detach_execution(&process),
+        Err(DriverError::ActorNotRetired)
+    );
+    execution.close_external().unwrap();
+    original.body_exited().unwrap();
+    original.captures_exited().unwrap();
+    ledger.reap_scope_ready(execution.id(), 1).unwrap();
+    original_capacity.release_quota(&paid()).unwrap();
+    original_capacity.finish().unwrap();
+    host.detach_execution(&process).unwrap();
+    assert!(registration.same_registration(&witness));
+    assert_eq!(registration.scope_id(), execution.id());
+    assert!(!registration.matches_scope(&execution));
+    runtime.validate_registration(&witness).unwrap();
+    host.release(false).unwrap();
+    ledger.remove_scope(execution.id()).unwrap();
+    ledger.reap_scope_ready(process.id(), 1).unwrap();
+    assert_eq!(ledger.used(DimensionId::new(1).unwrap()), 0);
+    assert!(matches!(
+        runtime.reserve_input(actor(), actor(), InputClass::Ordinary),
+        Err(DriverError::RetainedInputRequired)
+    ));
+
+    let (mut request, mut request_capacity) = process
+        .reserve_child_next(
+            generation,
+            control_capacity.id(),
+            request_resources(),
+            WorkKind::Settlement,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    request.start().unwrap();
+    let permit = runtime
+        .reserve_retained_input(&registration, actor(), InputClass::Ordinary, &request)
+        .unwrap();
+    let reply = crate::publication::PublishedReply::new_for_input(&permit.author().unwrap());
+    let input = permit.fill(RetainedInput::Read(29)).unwrap();
+    runtime.poll_one(Tick(2)).unwrap();
+    let ticket = runtime
+        .take_effect(actor(), input, ActionId::new(1).unwrap())
+        .unwrap();
+    assert_eq!(ticket.descriptor.work, request.reference());
+    runtime.commit_reply(&ticket, &reply, Arc::new(29)).unwrap();
+    assert_eq!(reply.take_once().as_deref(), Some(&29));
+    runtime.effect_completed_for(&registration, ticket).unwrap();
+    runtime.retire_input(actor(), input).unwrap();
+    request.body_exited().unwrap();
+    request.captures_exited().unwrap();
+    ledger.reap_scope_ready(process.id(), 1).unwrap();
+    request_capacity.release_quota(&paid()).unwrap();
+    request_capacity.finish().unwrap();
+
+    assert_eq!(runtime.advance_time(Tick(10), 2).unwrap(), 1);
+    let tick = runtime.pending_timer_input(actor()).unwrap().unwrap();
+    runtime.poll_one(Tick(10)).unwrap();
+    let mut host = runtime.claim_host_actor().unwrap();
+    assert_eq!(host.actor(), actor());
+    let notice = host.take_metadata(tick).unwrap().unwrap();
+    assert_eq!(*notice.value(), 73);
+    assert_eq!(
+        runtime.retire_input(actor(), tick),
+        Err(DriverError::MetadataStillPending)
+    );
+    let delivery = runtime
+        .forward_metadata_for(
+            &registration,
+            &control_registration,
+            &notice,
+            InputClass::Lifecycle,
+            RetainedInput::Expired(*notice.value()),
+        )
+        .unwrap();
+    runtime.poll_one(Tick(10)).unwrap();
+    assert!(
+        delivery
+            .target_registration()
+            .same_registration(&control_registration)
+    );
+    assert_eq!(delivery.consumption(), MetadataConsumption::Consumed);
+    runtime
+        .metadata_completed_for(&registration, notice)
+        .unwrap();
+    runtime.retire_input(actor(), tick).unwrap();
+    runtime.close_actor_admission(actor()).unwrap();
+    // This original host turn still owns its scheduler claim. Its atomic
+    // retire_actor path seals under that claim after checking all custody.
+    // The process's actual Control work is still running. A retained Context
+    // has no execution join debt to it, and its original expiry was consumed.
+    let retired = host.retire_actor().unwrap();
+    assert!(retired.deadline.is_none());
+    assert!(!process.join_ready().unwrap());
+
+    // The actual Control consumption queued its own host-ready notice.
+    // Consume that real host turn before using the unclaimed seal API.
+    while let Some(turn) = runtime.claim_host_actor() {
+        assert_eq!(turn.actor(), control);
+        turn.release(false).unwrap();
+    }
+    runtime.close_actor_admission(control).unwrap();
+    runtime.seal_actor(control).unwrap();
+    process.close_external().unwrap();
+    control_work.body_exited().unwrap();
+    control_work.captures_exited().unwrap();
+    ledger.reap_scope_ready(process.id(), 1).unwrap();
+    let control = runtime.remove_actor(control).unwrap();
+    assert_eq!(control.consumed_expiry, Some(73));
+    control_capacity.finish().unwrap();
+    ledger.remove_scope(process.id()).unwrap();
+    assert!(runtime.is_empty());
+    assert!(ledger.is_empty());
 }

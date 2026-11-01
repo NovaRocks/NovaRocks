@@ -16,11 +16,11 @@
 // under the License.
 
 use novarocks_control_runtime::{
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeError, RuntimeLedger},
 };
 use novarocks_control_runtime_core::{
-    capacity::{CapacityError, ResourceVector},
+    capacity::{CapacityError, ReservationResources, ResourceVector},
     identity::{DimensionId, Generation},
     scope::{ScopeError, WorkAdmission, WorkKind},
 };
@@ -33,9 +33,10 @@ fn dimension() -> DimensionId {
 fn resources() -> ResourceVector {
     ResourceVector::new([(dimension(), 1)]).unwrap()
 }
-fn release(mut capacity: CapacityBundle) {
+fn release(mut capacity: ReservationBundle) {
     let resources = capacity.resources().unwrap();
-    capacity.release(&resources).unwrap();
+    capacity.release_quota(&resources.quota).unwrap();
+    capacity.finish().unwrap();
 }
 fn exit(work: &mut WorkLease) {
     work.body_exited().unwrap();
@@ -45,12 +46,12 @@ fn exit(work: &mut WorkLease) {
 #[test]
 fn bound_reservation_derives_from_the_actual_parent_after_external_close_but_not_after_parent_exit()
 {
-    let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap(), 4, 1);
-    let scope = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+    let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap());
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
     let (mut parent, parent_capacity) = scope
         .reserve_next(
             generation(),
-            resources(),
+            ReservationResources::for_work(resources()),
             WorkKind::Business,
             WorkAdmission::External,
         )
@@ -64,7 +65,7 @@ fn bound_reservation_derives_from_the_actual_parent_after_external_close_but_not
         .reserve_child_next(
             generation(),
             parent_capacity.id(),
-            resources(),
+            ReservationResources::for_work(resources()),
             WorkKind::Business,
         )
         .unwrap()
@@ -77,7 +78,7 @@ fn bound_reservation_derives_from_the_actual_parent_after_external_close_but_not
         scope.reserve_child_next(
             generation(),
             parent_capacity.id(),
-            ResourceVector::default(),
+            ReservationResources::work_only(),
             WorkKind::Cleanup
         ),
         Err(RuntimeError::Capacity(CapacityError::Scope(
@@ -95,28 +96,39 @@ fn bound_reservation_derives_from_the_actual_parent_after_external_close_but_not
 
 #[test]
 fn child_resolution_requires_a_bound_exact_owner_and_follows_actual_bundle_transfer() {
-    let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap(), 8, 2);
-    let a = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
-    let b = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+    let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap());
+    let a = ledger.open_scope_next(None, generation()).unwrap();
+    let b = ledger.open_scope_next(None, generation()).unwrap();
     let guard = a
         .reserve_next(
             generation(),
-            resources(),
+            ReservationResources::for_work(resources()),
             WorkKind::Business,
             WorkAdmission::External,
         )
         .unwrap();
     let parent_id = guard.reservation_id();
     assert!(matches!(
-        a.reserve_child_next(generation(), parent_id, resources(), WorkKind::Business),
+        a.reserve_child_next(
+            generation(),
+            parent_id,
+            ReservationResources::for_work(resources()),
+            WorkKind::Business
+        ),
         Err(RuntimeError::Capacity(CapacityError::UnboundReservation))
     ));
     assert_eq!(ledger.used(dimension()), 1);
-    let (mut aw, mut capacity) = guard.bind(WorkKind::Business).unwrap();
+    let (mut aw, mut parent_capacity) = guard.bind(WorkKind::Business).unwrap();
+    // Only this actual unused quota parcel moves. The original bound Work
+    // header/primary carrier stay with aw and retire through its real exit.
+    let mut capacity = parent_capacity
+        .split_next(&ReservationResources::new(resources(), Default::default()))
+        .unwrap();
+    let parent_id = capacity.id();
     let (mut bw, bc) = b
         .reserve_next(
             generation(),
-            ResourceVector::default(),
+            ReservationResources::work_only(),
             WorkKind::Cleanup,
             WorkAdmission::External,
         )
@@ -124,23 +136,43 @@ fn child_resolution_requires_a_bound_exact_owner_and_follows_actual_bundle_trans
         .bind(WorkKind::Cleanup)
         .unwrap();
     assert!(matches!(
-        b.reserve_child_next(generation(), parent_id, resources(), WorkKind::Business),
+        b.reserve_child_next(
+            generation(),
+            parent_id,
+            ReservationResources::for_work(resources()),
+            WorkKind::Business
+        ),
         Err(RuntimeError::Capacity(CapacityError::WrongOwner))
     ));
     capacity.transfer(&bw).unwrap();
     assert!(matches!(
-        a.reserve_child_next(generation(), parent_id, resources(), WorkKind::Business),
+        a.reserve_child_next(
+            generation(),
+            parent_id,
+            ReservationResources::for_work(resources()),
+            WorkKind::Business
+        ),
         Err(RuntimeError::Capacity(CapacityError::WrongOwner))
     ));
     let generation = b.fail().unwrap();
     assert!(matches!(
-        b.reserve_child_next(generation, parent_id, resources(), WorkKind::Business),
+        b.reserve_child_next(
+            generation,
+            parent_id,
+            ReservationResources::for_work(resources()),
+            WorkKind::Business
+        ),
         Err(RuntimeError::Capacity(CapacityError::Scope(
             ScopeError::Stopped
         )))
     ));
     let (mut child, cc) = b
-        .reserve_child_next(generation, parent_id, resources(), WorkKind::Cleanup)
+        .reserve_child_next(
+            generation,
+            parent_id,
+            ReservationResources::for_work(resources()),
+            WorkKind::Cleanup,
+        )
         .unwrap()
         .bind(WorkKind::Cleanup)
         .unwrap();
@@ -152,6 +184,7 @@ fn child_resolution_requires_a_bound_exact_owner_and_follows_actual_bundle_trans
     ledger.reap_scope_ready(a.id(), 4).unwrap();
     ledger.reap_scope_ready(b.id(), 4).unwrap();
     assert!(bw.actual_exit_ready().unwrap());
+    release(parent_capacity);
     release(capacity);
     release(bc);
     release(cc);
@@ -164,12 +197,12 @@ fn child_resolution_requires_a_bound_exact_owner_and_follows_actual_bundle_trans
 
 #[test]
 fn rollback_of_the_last_unbound_child_requeues_its_already_exited_parent() {
-    let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap(), 4, 1);
-    let scope = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+    let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap());
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
     let (mut parent, capacity) = scope
         .reserve_next(
             generation(),
-            resources(),
+            ReservationResources::for_work(resources()),
             WorkKind::Business,
             WorkAdmission::External,
         )
@@ -177,7 +210,12 @@ fn rollback_of_the_last_unbound_child_requeues_its_already_exited_parent() {
         .bind(WorkKind::Business)
         .unwrap();
     let child = scope
-        .reserve_child_next(generation(), capacity.id(), resources(), WorkKind::Business)
+        .reserve_child_next(
+            generation(),
+            capacity.id(),
+            ReservationResources::for_work(resources()),
+            WorkKind::Business,
+        )
         .unwrap();
     exit(&mut parent);
     assert_eq!(ledger.reap_scope_ready(scope.id(), 1).unwrap(), 0);

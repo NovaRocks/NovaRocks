@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! An original RPC lends its Step authority to one host getter. The raw
+//! The original RPC supervises its admitted child through getter and disposal. The raw
 //! fields remain with a separately paid Cleanup child until real disposal or
 //! an explicit, funded handoff. No opaque source enters the protocol core.
 
@@ -25,8 +25,8 @@ use novarocks_control_runtime::driver::ActorRuntime;
 use novarocks_control_runtime::{
     completion::ReportSlot,
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
-    lease::{CapacityBundle, WorkLease},
-    owned_return::OwnedReturnSender,
+    lease::{ReservationBundle, WorkLease},
+    owned_return::{OwnedReturnReader, OwnedReturnSender},
     reported_work::ReportedWork,
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
@@ -169,6 +169,8 @@ struct Custody {
     work: WorkId,
     ledger: RuntimeLedger,
     parent: ScopeId,
+    parent_scope: ScopeHandle,
+    parent_generation: Generation,
     role: ExitRole,
     report: ReportSlot,
     state: Mutex<SourceState>,
@@ -183,7 +185,7 @@ pub(crate) struct EstablishIngressOwner(Arc<Custody>);
 pub(crate) struct EstablishIngressPartial {
     pub scope: ScopeHandle,
     pub work: WorkLease,
-    pub capacity: CapacityBundle,
+    pub capacity: ReservationBundle,
 }
 pub(crate) struct EstablishIngressBootstrapRefusal {
     pub error: ExitRoleError,
@@ -193,11 +195,14 @@ pub(crate) struct EstablishIngressBootstrapRefusal {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum EstablishIngressOutcome {
     Projected(EstablishProjection),
-    StartRefused(ExitRoleError),
+    StartRefused {
+        _original_error: ExitRoleError,
+    },
+    #[cfg(test)]
     CancelledBeforeStart,
     GetterPanicked,
 }
-#[must_use = "Restore the same original RPC authority before submitting its input"]
+#[must_use = "Restore the same original source authority before continuing cleanup"]
 pub(crate) struct EstablishIngressReturned {
     pub authority: Option<ExitAuthority>,
     pub outcome: EstablishIngressOutcome,
@@ -302,6 +307,9 @@ impl Drop for EstablishMaterializationLoan {
 }
 
 impl EstablishIngressOwner {
+    pub(super) fn belongs_to(&self, ready: &super::control_request::ControlRequestReady) -> bool {
+        self.0.notice.belongs_to(ready)
+    }
     pub(super) fn phase(&self) -> ExitRolePhase {
         self.0.role.phase()
     }
@@ -311,23 +319,34 @@ impl EstablishIngressOwner {
         authority: &mut ExitAuthority,
         generation: Generation,
         ledger: &RuntimeLedger,
-        parent: ScopeId,
+        parent: &ScopeHandle,
         notice: ControlRequestNotice,
     ) -> Result<Self, EstablishIngressBootstrapRefusal> {
         let (scope, guard) = authority
-            .open_child_scope_with_root(generation, 1, 1, WorkKind::Cleanup)
+            .open_child_scope_with_root(
+                generation,
+                WorkKind::Cleanup,
+                novarocks_control_runtime_core::capacity::ReservationResources::new(
+                    Default::default(),
+                    novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 1,
+                        captures: 1,
+                        ..Default::default()
+                    },
+                ),
+            )
             .map_err(|error| EstablishIngressBootstrapRefusal {
                 error,
                 partial: None,
             })?;
-        let (work, capacity) = match guard.bind(WorkKind::Cleanup) {
+        let (work, mut capacity) = match guard.bind(WorkKind::Cleanup) {
             Ok(parts) => parts,
             Err(_) => std::process::abort(),
         };
         let report = match ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             scope.gates().expect("original child gates").generation,
-            work.id(),
             1,
             [(source_consumer(), ConsumerKind::Observer)],
         ) {
@@ -356,7 +375,9 @@ impl EstablishIngressOwner {
             scope,
             work: work_id,
             ledger: ledger.clone(),
-            parent,
+            parent: parent.id(),
+            parent_scope: parent.clone(),
+            parent_generation: generation,
             role,
             report,
             state: Mutex::new(SourceState {
@@ -379,30 +400,56 @@ impl EstablishIngressOwner {
         &self,
         request: EstablishQueryContext,
         payload: PayloadId,
-        authority: ExitAuthority,
-        sender: OwnedReturnSender<EstablishIngressReturned>,
-    ) -> EstablishIngressJob {
+    ) -> (
+        EstablishIngressJob,
+        OwnedReturnReader<EstablishIngressReturned>,
+    ) {
         // Splitting the owned transport fields invokes no getter or Drop.
         let sources = Sources::new(request, payload);
         let context = sources.context;
+        // The child owns the getter return; R's report remains its terminal report.
+        let (sender, reader) = self
+            .0
+            .report
+            .claim_owned_return()
+            .unwrap_or_else(|_| std::process::abort());
         let mut state = self.0.state.lock().expect("ingress source metadata");
         if state.sources.is_some() || state.getter_finished || state.disposal_issued {
-            std::mem::forget(authority);
             std::mem::forget(sender);
             std::process::abort();
         }
+        let authority = state.authority.take().expect("original source authority");
         state.sources = Some(sources);
         drop(state);
-        EstablishIngressJob {
-            owner: self.clone(),
-            context,
-            authority: Some(authority),
-            sender: Some(sender),
+        (
+            EstablishIngressJob {
+                owner: self.clone(),
+                context,
+                authority: Some(authority),
+                sender: Some(sender),
+            },
+            reader,
+        )
+    }
+    pub(super) fn restore_getter_return(
+        &self,
+        returned: EstablishIngressReturned,
+    ) -> EstablishIngressOutcome {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .expect("original source authority return");
+        if state.authority.is_some() || returned.authority.is_none() || !state.getter_finished {
+            std::mem::forget(returned);
+            std::process::abort();
         }
+        state.authority = returned.authority;
+        returned.outcome
     }
     pub(super) fn take_disposal(&self) -> Option<EstablishDisposalJob> {
         let mut state = self.0.state.lock().expect("ingress source metadata");
-        if !state.getter_finished || state.disposal_issued {
+        if !state.getter_finished || state.disposal_issued || state.authority.is_none() {
             return None;
         }
         let sources = state.sources.take()?;
@@ -427,6 +474,19 @@ impl EstablishIngressOwner {
         Some(EstablishMaterializationLoan {
             owner: self.clone(),
             sources: Some(sources),
+        })
+    }
+    /// A routed replay may lend the same raw fields to one real comparison.
+    /// Taking Sources, rather than an identity or cloned DTO, excludes both
+    /// another comparison and disposal until this physical loan returns.
+    pub(super) fn take_replay_comparison(&self) -> Option<EstablishMaterializationLoan> {
+        let mut state = self.0.state.lock().expect("original replay source loan");
+        if !state.getter_finished || state.disposal_issued || state.materialization_issued {
+            return None;
+        }
+        Some(EstablishMaterializationLoan {
+            owner: self.clone(),
+            sources: Some(state.sources.take()?),
         })
     }
     pub(super) fn try_close(&self) -> Result<bool, ExitRoleError> {
@@ -471,7 +531,9 @@ impl EstablishIngressPartial {
             self.work.captures_exited()?;
             self.scope.close_external()?;
             ledger.reap_scope_ready(self.scope.id(), 1)?;
-            self.capacity.release(&self.capacity.resources()?)?;
+            self.capacity
+                .release_quota(&self.capacity.resources()?.quota)?;
+            self.capacity.finish()?;
             ledger.remove_scope(self.scope.id())?;
             ledger.reap_scope_ready(parent, 1)?;
             Ok::<(), RuntimeError>(())
@@ -502,6 +564,7 @@ impl EstablishIngressJob {
     pub(super) fn belongs_to(&self, ready: &super::control_request::ControlRequestReady) -> bool {
         self.owner.0.notice.belongs_to(ready)
     }
+    #[cfg(test)]
     pub(crate) fn cancel_before_start(mut self) {
         self.owner
             .0
@@ -525,9 +588,15 @@ impl EstablishIngressJob {
         self.owner.0.notice.notify();
     }
     pub(crate) fn run(mut self) {
-        let mut authority = self.authority.take().expect("original RPC authority");
-        let outcome = match authority.start() {
-            Err(error) => EstablishIngressOutcome::StartRefused(error),
+        let mut authority = self.authority.take().expect("original source authority");
+        // The getter keeps the original Root stop/failure/generation cut even
+        // though its child also owns cleanup that may run after stopping.
+        let outcome = match authority
+            .start_in_parent_generation(&self.owner.0.parent_scope, self.owner.0.parent_generation)
+        {
+            Err(error) => EstablishIngressOutcome::StartRefused {
+                _original_error: error,
+            },
             Ok(()) => {
                 let sources = self
                     .owner
@@ -558,8 +627,8 @@ impl EstablishIngressJob {
             .getter_finished = true;
         // The borrowed invocation has returned through this supervision
         // boundary, including on unwind. Its complete Sources loan was restored
-        // above. Preserve the same authority until the actual RPC, raw fields
-        // and retained panic payload all exit; failure is not unknown exit.
+        // above. Return this same child authority to the source custodian.
+        // It stays Started until raw fields and panic captures really exit.
         let returned = EstablishIngressReturned {
             authority: Some(authority),
             outcome,
@@ -587,6 +656,7 @@ impl Drop for EstablishIngressJob {
     }
 }
 impl EstablishDisposalJob {
+    #[cfg(test)]
     pub(super) fn belongs_to_owner(&self, original: &EstablishIngressOwner) -> bool {
         Arc::ptr_eq(&self.owner.0, &original.0)
     }
@@ -603,7 +673,14 @@ impl EstablishDisposalJob {
             .authority
             .take()
             .expect("one original source cleanup authority");
-        if authority.start().is_err() {
+        // Continue the getter's same child. Only a never-started cancellation
+        // or refused getter needs to start its original Cleanup work here.
+        let started = match self.owner.0.role.phase() {
+            ExitRolePhase::Started => true,
+            ExitRolePhase::Admitted => authority.start().is_ok(),
+            _ => false,
+        };
+        if !started {
             drop(authority);
             self.owner
                 .0

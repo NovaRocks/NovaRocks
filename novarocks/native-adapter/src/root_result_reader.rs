@@ -471,6 +471,9 @@ fn worker_refusal(
     cause: WorkerRootReadError,
     phase: &'static str,
 ) -> NativeRootReadResponse {
+    if let Some(accepted_consumed) = cause.closed_frontier() {
+        return NativeRootReadResponse::AwaitTerminalControl { accepted_consumed };
+    }
     if let Some(reason) = cause.deferral() {
         return deferred(request, reason);
     }
@@ -491,7 +494,12 @@ fn worker_refusal(
     NativeRootReadResponse::Refused(Box::new(RootReadRefusal::for_request(
         request,
         fact,
-        SafeDetail::truncating("root read was refused by its original Worker owner"),
+        SafeDetail::truncating(match cause.kind() {
+            novarocks_worker::WorkerRootReadErrorKind::ForeignProcess => {
+                "root read was refused by its owning channel"
+            }
+            _ => "root read was refused by its original Worker owner",
+        }),
     )))
 }
 fn deferred(request: &RootResultRead, reason: RootReadDeferral) -> NativeRootReadResponse {

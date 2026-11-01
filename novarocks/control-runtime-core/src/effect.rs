@@ -17,7 +17,7 @@
 
 //! Atomic batch custody does not make external effects atomic.
 
-use crate::identity::{ActionId, Generation, InputId, ScopeId, WorkId};
+use crate::identity::{ActionId, Generation, InputId, ScopeId, ScopedWorkRef};
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,7 +66,7 @@ pub enum EffectError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectDescriptor {
     pub id: ActionId,
-    pub work: WorkId,
+    pub work: ScopedWorkRef,
     pub kind: EffectKind,
     pub dependencies: Vec<ActionId>,
 }
@@ -182,6 +182,28 @@ impl EffectBatchState {
         }
         self.phase = BatchPhase::Committed;
         Ok(())
+    }
+    /// A retained actor can finish request cleanup/publication, but cannot
+    /// begin business execution from a batch committed before detachment.
+    pub fn has_unfinished_business(&self) -> bool {
+        self.effects.values().any(|record| {
+            record.descriptor.kind == EffectKind::Business
+                && !matches!(
+                    record.state,
+                    EffectState::Completed | EffectState::AbandonedByOwnerFailure
+                )
+        })
+    }
+    /// Execution detachment ignores completed publication history, but never
+    /// discards a pending or physically in-flight original author obligation.
+    pub fn has_unfinished_author_scope(&self, scope: ScopeId) -> bool {
+        self.effects.values().any(|record| {
+            record.descriptor.work.scope == scope
+                && !matches!(
+                    record.state,
+                    EffectState::Completed | EffectState::AbandonedByOwnerFailure
+                )
+        })
     }
     pub fn record(&self, id: ActionId) -> Option<&EffectRecord> {
         self.effects.get(&id)

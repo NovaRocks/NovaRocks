@@ -25,9 +25,10 @@ use novarocks_control_runtime::{
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     completion::ConsumerKind,
     identity::{ConsumerId, DimensionId, Generation, WorkId},
+    owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
 };
 use std::sync::{
@@ -50,14 +51,34 @@ fn generation() -> Generation {
 fn dimension() -> DimensionId {
     DimensionId::new(1).unwrap()
 }
+fn work_resources(quota: ResourceVector) -> ReservationResources {
+    ReservationResources {
+        quota,
+        owned_slots: OwnedSlotNeed {
+            work_headers: 1,
+            ..OwnedSlotNeed::default()
+        },
+    }
+}
+fn role_resources(quota: ResourceVector) -> ReservationResources {
+    ReservationResources {
+        quota,
+        owned_slots: OwnedSlotNeed {
+            work_headers: 1,
+            completions: 1,
+            captures: 1,
+            ..OwnedSlotNeed::default()
+        },
+    }
+}
 fn fixture<T: Send + 'static>() -> Fixture<T> {
     let resources = ResourceVector::new([(dimension(), 1)]).unwrap();
-    let ledger = RuntimeLedger::new(resources.clone(), 1, 1);
-    let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-    let (work, capacity) = scope
+    let ledger = RuntimeLedger::new(resources.clone());
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
+    let (work, mut capacity) = scope
         .reserve_next(
             generation(),
-            resources,
+            role_resources(resources),
             WorkKind::Settlement,
             WorkAdmission::External,
         )
@@ -67,9 +88,8 @@ fn fixture<T: Send + 'static>() -> Fixture<T> {
     let owner = ConsumerId::new(1).unwrap();
     let observer = ConsumerId::new(2).unwrap();
     let report = ReportSlot::reserve_next(
-        &scope,
+        &mut capacity,
         generation(),
-        work.id(),
         2,
         [
             (
@@ -392,13 +412,13 @@ fn exited_continuation_keeps_its_capacity_until_the_admitted_child_tree_retires(
     // retained real WorkLease asks whether its actual family has exited.
     for reaping_budget in [1, 2] {
         let resources = ResourceVector::new([(dimension(), 1)]).unwrap();
-        let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap(), 4, 2);
-        let scope = ledger.open_scope_next(None, generation(), 2, 1).unwrap();
-        let contender = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let contender = ledger.open_scope_next(None, generation()).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation(),
-                resources.clone(),
+                role_resources(resources.clone()),
                 WorkKind::Settlement,
                 WorkAdmission::External,
             )
@@ -411,7 +431,7 @@ fn exited_continuation_keeps_its_capacity_until_the_admitted_child_tree_retires(
                 id: ReservationId::new(2).unwrap(),
                 generation: generation(),
                 guard: WorkId::new(2).unwrap(),
-                resources: resources.clone(),
+                resources: work_resources(resources.clone()),
                 admission: WorkAdmission::External, // derive replaces this with the original parent.
                 kind: WorkKind::Settlement,
             })
@@ -421,9 +441,8 @@ fn exited_continuation_keeps_its_capacity_until_the_admitted_child_tree_retires(
         child.start().unwrap();
         let consumer = ConsumerId::new(1).unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            work.id(),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
@@ -457,7 +476,7 @@ fn exited_continuation_keeps_its_capacity_until_the_admitted_child_tree_retires(
             contender
                 .reserve_next(
                     generation(),
-                    resources.clone(),
+                    work_resources(resources.clone()),
                     WorkKind::Business,
                     WorkAdmission::External
                 )
@@ -472,7 +491,8 @@ fn exited_continuation_keeps_its_capacity_until_the_admitted_child_tree_retires(
         );
         child.captures_exited().unwrap();
         assert!(child.actual_exit_ready().unwrap());
-        child_capacity.release(&resources).unwrap();
+        child_capacity.release_quota(&resources).unwrap();
+        child_capacity.finish().unwrap();
         assert_eq!(
             ledger.used(dimension()),
             1,
@@ -499,7 +519,7 @@ fn exited_continuation_keeps_its_capacity_until_the_admitted_child_tree_retires(
         let next = contender
             .reserve_next(
                 generation(),
-                resources.clone(),
+                work_resources(resources.clone()),
                 WorkKind::Business,
                 WorkAdmission::External,
             )

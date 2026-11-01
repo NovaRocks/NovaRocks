@@ -27,10 +27,10 @@ use super::{
         HostShutdownError, HostSubmitError,
     },
     preparation::{HostFairnessGroup, QueuedPreparation},
+    task_capacity::TaskCapacitySignal,
 };
 use novarocks_control_runtime::{driver::ActorRuntime, transaction::RuntimeError};
 use novarocks_control_runtime_core::identity::{ActorId, ScopeId, WorkId};
-use std::num::NonZeroUsize;
 
 struct Queued(ContextHostJob);
 impl QueuedPreparation for Queued {
@@ -48,9 +48,27 @@ fn run(original: Queued) {
 #[derive(Debug)]
 pub(crate) enum ContextExecutorStartError {
     AlreadyStarted,
-    GeometryOverflow,
     Spawn(std::io::Error),
 }
+impl std::fmt::Display for ContextExecutorStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyStarted => f.write_str("Context host executors have already started"),
+            Self::Spawn(error) => {
+                write!(f, "Context host executor thread could not start: {error}")
+            }
+        }
+    }
+}
+impl std::error::Error for ContextExecutorStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AlreadyStarted => None,
+            Self::Spawn(error) => Some(error),
+        }
+    }
+}
+
 #[must_use = "A partial startup retains its actual physical workers and queues"]
 pub(crate) struct ContextExecutorStartRefusal {
     pub error: ContextExecutorStartError,
@@ -84,56 +102,30 @@ pub(crate) enum ContextCancelError {
     Queue(novarocks_control_runtime_core::fair_queue::FairQueueError),
 }
 
-/// Fixed physical tails can briefly outlive their original reported role.
-/// Cover all C admitted original call holders plus at most N running tails;
-/// the logical per-Context role bound is one M or the two successive R/H.
-fn limits(
-    contexts: NonZeroUsize,
-    workers: NonZeroUsize,
-    roles: usize,
-) -> Option<HostExecutorLimits> {
-    Some(HostExecutorLimits {
-        contexts: NonZeroUsize::new(contexts.get().checked_add(workers.get())?)?,
-        jobs: NonZeroUsize::new(
-            contexts
-                .get()
-                .checked_mul(roles)?
-                .checked_add(workers.get())?,
-        )?,
-        per_context: NonZeroUsize::new(roles.checked_add(workers.get())?)?,
-        workers,
-    })
-}
 #[must_use = "Context producers drain before closing and joining these original pools"]
 pub(crate) struct ContextExecutors {
     runtime: ActorRuntime<WorkerActor>,
     control: ActorId,
     pools: HostExecutorPair<Queued>,
+    capacity: TaskCapacitySignal,
 }
 impl ContextExecutors {
     /// Called by the registered Service before publishing a request facade.
-    /// The Context bound comes from that same Control's actual directory.
+    /// Composition supplies actual bounded queue and worker windows. A busy
+    /// queue retains the original Context job; directory size grants no slot.
     pub(super) fn start(
         runtime: ActorRuntime<WorkerActor>,
         control: ActorId,
-        contexts: NonZeroUsize,
-        materialization_workers: NonZeroUsize,
-        cleanup_workers: NonZeroUsize,
+        materialization: HostExecutorLimits,
+        cleanup: HostExecutorLimits,
+        capacity: TaskCapacitySignal,
     ) -> Result<Self, ContextExecutorStartRefusal> {
-        let (Some(m), Some(c)) = (
-            limits(contexts, materialization_workers, 1),
-            limits(contexts, cleanup_workers, 2),
-        ) else {
-            return Err(ContextExecutorStartRefusal {
-                error: ContextExecutorStartError::GeometryOverflow,
-                owner: None,
-            });
-        };
-        match HostExecutorPair::start(m, c, run) {
+        match HostExecutorPair::start_with_waker(materialization, cleanup, run, capacity.waker()) {
             Ok(pools) => Ok(Self {
                 runtime,
                 control,
                 pools,
+                capacity,
             }),
             Err((error, pools)) => Err(ContextExecutorStartRefusal {
                 error: ContextExecutorStartError::Spawn(error),
@@ -141,6 +133,7 @@ impl ContextExecutors {
                     runtime,
                     control,
                     pools,
+                    capacity,
                 })),
             }),
         }
@@ -153,6 +146,7 @@ impl ContextExecutors {
             control: self.control,
             materialization,
             cleanup,
+            capacity: self.capacity.clone(),
         })
     }
     /// Caller has first drained the real Context scopes and producer leases.
@@ -163,6 +157,7 @@ impl ContextExecutors {
             runtime,
             control,
             pools,
+            capacity,
         } = self;
         pools.shutdown().map_err(|(error, pools)| {
             let error = match error {
@@ -179,6 +174,7 @@ impl ContextExecutors {
                     runtime,
                     control,
                     pools,
+                    capacity,
                 },
             )
         })
@@ -190,8 +186,21 @@ pub(crate) struct ContextExecutorHandles {
     control: ActorId,
     materialization: HostExecutorHandle<Queued>,
     cleanup: HostExecutorHandle<Queued>,
+    capacity: TaskCapacitySignal,
 }
 impl ContextExecutorHandles {
+    #[cfg(test)]
+    pub(crate) fn original_materialization_queue_snapshot(
+        &self,
+    ) -> Result<
+        Option<super::preparation::PreparationQueueSnapshot>,
+        super::preparation::PreparationQueueSnapshotError,
+    > {
+        self.materialization.try_preparation_snapshot()
+    }
+    pub(crate) fn capacity_signal(&self) -> &TaskCapacitySignal {
+        &self.capacity
+    }
     pub(super) fn accepts_owner(&self, owner: &ContextHostJobs) -> bool {
         owner.belongs_to(&self.runtime, self.control)
     }

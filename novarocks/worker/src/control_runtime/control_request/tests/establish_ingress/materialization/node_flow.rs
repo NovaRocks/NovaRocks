@@ -18,6 +18,17 @@
 //! One real Node lifecycle, without manual effect dispatch, acknowledgement,
 //! Scope exit or report consumption. Only the foreign Context I/O is symbolic.
 
+mod materialization_boundaries;
+pub(super) fn accepted_creator_retains_only_context_custody() {
+    materialization_boundaries::accepted_creator_retains_only_context_custody();
+}
+pub(super) fn blocked_materialization_keeps_control_live() {
+    materialization_boundaries::blocked_materialization_keeps_control_live();
+}
+pub(super) fn queued_materialization_withdraws_without_factory() {
+    materialization_boundaries::queued_materialization_withdraws_without_factory();
+}
+
 use super::*;
 use crate::control_runtime::{
     context_host::TaskDriverPorts,
@@ -26,7 +37,15 @@ use crate::control_runtime::{
     request_endpoint::{RequestDelivery, RequestHandle},
 };
 use novarocks_control_runtime::driver::{Clock, PollerPool};
-use novarocks_worker_protocol::context::{ContextCommand, ContextReplyBody, RequestResult};
+use novarocks_worker_protocol::{
+    context::{ContextCommand, ContextReplyBody},
+    creation::RequestContext,
+};
+
+pub(super) type HeldTaskDelivery = (
+    RequestDelivery<ContextReplyBody, crate::task_proposal_ingress::RequestMetadata>,
+    RequestContext,
+);
 use std::{mem::ManuallyDrop, num::NonZeroU64, sync::atomic::AtomicU64, time::Duration};
 
 #[derive(Default)]
@@ -125,14 +144,30 @@ impl<T: Send + 'static> Scenario<T> {
             self.node.print_neutral_task_inventory(context, task);
         }
         eprintln!(
-            "Node scenario failure at {stage}; clock={:?}; Root={:?}; Context={:?}; Requests={}; Contexts={}; Tickets={}; Work={}",
+            "Node scenario failure at {stage}; clock={:?}; Root={:?}; Context={:?}; Requests={}; ContextRoles={:?}; RootRoles={:?}",
             self.clock.now(),
             self.runtime.snapshot(actor()),
             self.runtime.snapshot(context_actor()),
             self.ledger.used(Dimension::Requests.id()),
-            self.ledger.used(Dimension::Contexts.id()),
-            self.ledger.used(Dimension::Tickets.id()),
-            self.ledger.used(Dimension::Work.id())
+            self.runtime
+                .snapshot(context_actor())
+                .map(|snapshot| snapshot.roles),
+            self.runtime
+                .snapshot(actor())
+                .map(|snapshot| snapshot.roles)
+        );
+        eprintln!(
+            "original execution observation={:?}; original charge observation={:?}",
+            self.node.try_execution_quiescence_snapshot(),
+            self.ledger.try_capacity_usage(
+                [
+                    Dimension::ActiveTasks.id(),
+                    Dimension::PreparingTasks.id(),
+                    Dimension::PreparingBytes.id(),
+                    Dimension::Requests.id(),
+                ],
+                Dimension::PreparingTasks.id()
+            )
         );
         retain_failure(stage, (self, original));
     }
@@ -184,28 +219,15 @@ pub(super) enum NodeClose {
     Release,
     Abort,
 }
-pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
+fn start_scenario<T: Send + 'static>(
     workers: usize,
-    close: NodeClose,
-    task_geometry: ResourceVector,
+    positions: usize,
+    task_geometry: ReservationResources,
     start_task_ports: impl FnOnce(
         &mut ProcessControlOwner,
     ) -> Result<(TaskDriverPorts, T), Box<dyn std::any::Any + Send>>,
-    exercise_task: impl FnOnce(
-        &Scenario<T>,
-        QueryContextRef,
-        &mut T,
-    ) -> Result<(), Box<dyn std::any::Any + Send>>,
-    shutdown_task_ports: impl FnOnce(T) -> Result<(), Box<dyn std::any::Any + Send>>,
-) {
-    let close_kind = match &close {
-        NodeClose::Release => "QuiesceRelease",
-        NodeClose::Abort => "AbortQueryFailed",
-    };
-    eprintln!(
-        "actual Node branch begin: workers={workers}, close={close_kind}, task_enabled={}",
-        task_geometry.get(Dimension::ActiveTasks.id()) > 0,
-    );
+    make_factory: impl FnOnce(Arc<Calls>) -> Arc<dyn QueryContextHostFactory>,
+) -> StartedScenario<T> {
     let policy = ControlRuntimePolicy::try_new(IngressRoleLimits {
         ordinary_running: 1,
         ordinary_waiting: 0,
@@ -215,17 +237,28 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
         root_read_holders: 1,
     })
     .unwrap();
-    let ticket_storage = StorageNeed {
-        work: 1,
-        captures: 1,
-        ..StorageNeed::default()
-    };
+    // Empty-Context scenarios still compose the same production execution
+    // observer. Declare its actual four-dimension limits from the existing
+    // compiled-host fixture; missing dimensions mean unavailable, never zero.
+    // This grants no Task/Work, and already configured Task geometry stays exact.
+    let mut task_geometry = task_geometry;
+    for (dimension, limit) in super::node_task_flow::compiled_task_geometry().quota.iter() {
+        if task_geometry.quota.get(dimension) == 0 {
+            task_geometry.quota = task_geometry
+                .quota
+                .checked_add(
+                    &novarocks_control_runtime_core::capacity::ResourceVector::new([(
+                        dimension, limit,
+                    )])
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    }
     let additional = ESTABLISH_REQUEST_STORAGE
         .checked_sub(CONTROL_REQUEST_STORAGE)
         .unwrap()
         .checked_add(CONTEXT_BOOTSTRAP_STORAGE)
-        .unwrap()
-        .checked_add(ticket_storage)
         .unwrap()
         .checked_add(BRIDGE_STORAGE.checked_mul(2).unwrap())
         .unwrap()
@@ -233,42 +266,45 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
         .unwrap()
         .resources()
         .unwrap()
-        .checked_add(
-            &ResourceVector::new([(Dimension::Tickets.id(), 1), (Dimension::Contexts.id(), 1)])
-                .unwrap(),
-        )
-        .unwrap()
         .checked_add(&task_geometry)
         .unwrap();
     let storage = AdmissionStorage {
         loading: policy.loading.resources().unwrap(),
         accepted: policy.accepted.resources().unwrap(),
         context: CONTEXT_BOOTSTRAP_STORAGE.resources().unwrap(),
-        ticket: ticket_storage.resources().unwrap(),
     };
     // Fixture supplies only the original Root/bootstrap geometry. No Fixture
     // method polls, dispatches, publishes or tears down after this point.
-    let extra_headers = [
-        Dimension::Work,
-        Dimension::Inputs,
-        Dimension::Completions,
-        Dimension::Captures,
-    ]
-    .into_iter()
-    .try_fold(0usize, |sum, dimension| {
-        sum.checked_add(usize::try_from(task_geometry.get(dimension.id())).unwrap())
-    })
-    .unwrap();
-    let reservations = 128usize.checked_add(extra_headers).unwrap();
-    let mut f =
-        Fixture::with_geometry_records(2, 2, 64, storage.clone(), additional, 8, 3, reservations);
+    // The production Node configures this actual usage index at bootstrap.
+    // A missing index is an unavailable observation, never a zero sample.
+    let mut f = Fixture::with_control_storage_and_usage(
+        positions,
+        positions,
+        storage.clone(),
+        additional,
+        [Dimension::PreparingTasks.id()],
+    );
+    let configured = f
+        .ledger
+        .try_capacity_usage(
+            [
+                Dimension::ActiveTasks.id(),
+                Dimension::PreparingTasks.id(),
+                Dimension::PreparingBytes.id(),
+                Dimension::Requests.id(),
+            ],
+            Dimension::PreparingTasks.id(),
+        )
+        .unwrap()
+        .expect("no physical producer or poller exists during this original ledger check");
+    assert!(configured.used.iter().all(|used| *used == 0));
     let (raw, getters, source_drops) = request(&f, None, None, false);
     let one = NonZeroUsize::new(1).unwrap();
     let sources = match f.root.start_establish_executors(one, one) {
         Ok(owner) => owner,
         Err(original) => retain_failure("source pool startup", (f, raw, original)),
     };
-    let contexts = match f.root.service().start_context_executors(one, one) {
+    let contexts = match start_original_context_executors(&mut f) {
         Ok(owner) => owner,
         Err(original) => retain_failure("Context pool startup", (f, raw, sources, original)),
     };
@@ -288,6 +324,7 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
         ),
     };
     let Fixture {
+        positions,
         root,
         runtime,
         ledger,
@@ -302,30 +339,33 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
         );
     }
     let calls = Arc::new(Calls::default());
+    let clock = Arc::new(ScenarioClock::default());
+    let request_horizon = crate::RequestHorizon::DEFAULT;
     let node = match WorkerNodeHost::from_started(
         root,
         context_handles,
         task_ports,
         source_handles,
-        Arc::new(Factory(calls.clone())),
+        make_factory(calls.clone()),
         NodeContextConfig {
             core: ContextConfig {
                 max_tasks: 1,
-                max_creation_waiters: 1,
-                max_pending_requests: 4,
+                max_creation_waiters: positions,
+                max_pending_requests: positions,
                 max_preparing: 1,
                 max_task_bytes: 1024,
                 step_budget: ContextCore::MAX_STEP_WORK,
                 lease_bounds: LeaseBounds::DEFAULT,
                 metric_publish_interval: Duration::from_millis(100),
+                request_horizon,
             },
             policy,
             storage,
             max_live_tasks: 1,
             max_live_roots: 1,
-            max_contexts: 2,
         },
         NodeActorIds::new(NonZeroU64::new(4).unwrap()),
+        clock.clone(),
     ) {
         Ok(node) => Arc::new(node),
         Err(original) => retain_failure(
@@ -333,15 +373,14 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
             (raw, sources, contexts, task_resources, original),
         ),
     };
-    let clock = Arc::new(ScenarioClock::default());
-    let pollers = match node.start_pollers(clock.clone(), workers) {
+    let pollers = match node.start_pollers(workers) {
         Ok(pool) => pool,
         Err(original) => retain_failure(
             "Common poller startup",
             (node, raw, sources, contexts, task_resources, original),
         ),
     };
-    let mut scene = Scenario {
+    let scene = Scenario {
         node,
         pollers,
         sources,
@@ -353,6 +392,59 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
         task_resources: Some(task_resources),
         diagnostic_task: Mutex::new(None),
     };
+    StartedScenario {
+        scene,
+        raw,
+        getters,
+        source_drops,
+        context,
+        capability,
+    }
+}
+
+struct StartedScenario<T> {
+    scene: Scenario<T>,
+    raw: EstablishQueryContext,
+    getters: Arc<AtomicUsize>,
+    source_drops: Arc<AtomicUsize>,
+    context: QueryContextRef,
+    capability: AdmissionEpochCapability,
+}
+
+pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
+    workers: usize,
+    close: NodeClose,
+    task_geometry: ReservationResources,
+    start_task_ports: impl FnOnce(
+        &mut ProcessControlOwner,
+    ) -> Result<(TaskDriverPorts, T), Box<dyn std::any::Any + Send>>,
+    exercise_task: impl FnOnce(
+        &Scenario<T>,
+        QueryContextRef,
+        &mut T,
+    ) -> Result<Option<HeldTaskDelivery>, Box<dyn std::any::Any + Send>>,
+    shutdown_task_ports: impl FnOnce(T) -> Result<(), Box<dyn std::any::Any + Send>>,
+) {
+    let close_kind = match &close {
+        NodeClose::Release => "QuiesceRelease",
+        NodeClose::Abort => "AbortQueryFailed",
+    };
+    eprintln!(
+        "actual Node branch begin: workers={workers}, close={close_kind}, task_enabled={}",
+        task_geometry.quota.get(Dimension::ActiveTasks.id()) > 0,
+    );
+    let StartedScenario {
+        mut scene,
+        raw,
+        getters,
+        source_drops,
+        context,
+        capability,
+    } = start_scenario(workers, 2, task_geometry, start_task_ports, |calls| {
+        Arc::new(Factory(calls))
+    });
+    let clock_origin = scene.clock.now();
+    let request_horizon = crate::RequestHorizon::DEFAULT;
     let deadline = MonotonicInstant::from_origin(Duration::from_secs(100));
     let acquisition = operation_number(12);
     let mut acquire = match scene.node.submit_control(
@@ -424,8 +516,15 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
         .task_resources
         .take()
         .expect("same original Task pools");
-    if let Err(original) = exercise_task(&scene, context, &mut task_resources) {
-        scene.fail("actual Task lifecycle", (task_resources, original));
+    let held_task_delivery = match exercise_task(&scene, context, &mut task_resources) {
+        Ok(original) => original,
+        Err(original) => scene.fail("actual Task lifecycle", (task_resources, original)),
+    };
+    // This count follows the real retained delivery, never a synthetic switch.
+    let held_requests = u64::from(held_task_delivery.is_some());
+    if let Some((delivery, request)) = &held_task_delivery {
+        assert_eq!(delivery.request().operation, request.operation);
+        assert_eq!(delivery.request().deadline, request.deadline);
     }
     scene.task_resources = Some(task_resources);
     match close {
@@ -456,7 +555,7 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
             }
             drop(delivery);
             drop(quiesce);
-            if !wait_until(|| scene.ledger.used(Dimension::Requests.id()) == 0) {
+            if !wait_until(|| scene.ledger.used(Dimension::Requests.id()) == held_requests) {
                 scene.fail("Quiesce external/physical retirement timeout", ());
             }
             // FE retries only the ordinary ReleaseNotReady verdict. Every attempt
@@ -522,7 +621,7 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
                 }
                 last_not_ready = true;
                 if !wait_until_deadline(release_expires, || {
-                    scene.ledger.used(Dimension::Requests.id()) == 0
+                    scene.ledger.used(Dimension::Requests.id()) == held_requests
                 }) {
                     eprintln!(
                         "actual Release retry retirement timeout: attempts={attempts}, last={:?}",
@@ -569,7 +668,7 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
             }
             drop(delivery);
             drop(abort);
-            if !wait_until(|| scene.ledger.used(Dimension::Requests.id()) == 0) {
+            if !wait_until(|| scene.ledger.used(Dimension::Requests.id()) == held_requests) {
                 scene.fail("Abort original R retirement timeout", ());
             }
         }
@@ -584,13 +683,103 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
     }) {
         scene.fail("actual retained route publication timeout", ());
     }
-    scene.clock.0.store(11_000_000_000, Ordering::SeqCst);
+    if !wait_until(|| {
+        scene
+            .node
+            .try_execution_quiescence_snapshot()
+            .is_some_and(|snapshot| {
+                snapshot.active_tasks == 0
+                    && snapshot.preparing_tasks == 0
+                    && snapshot.preparing_bytes == 0
+                    && snapshot.requests == held_requests
+            })
+    }) {
+        scene.fail(
+            "actual execution custody did not retire before advancing the original clock",
+            held_task_delivery,
+        );
+    }
+    if let Some((delivery, request)) = held_task_delivery {
+        let mut held_snapshot = None;
+        if !wait_until(|| {
+            scene
+                .node
+                .original_task_request_for_test(context, request.author)
+                .is_some_and(|(actual, task, attached, scope_present)| {
+                    actual == request
+                        && Some((context, task)) == *scene.diagnostic_task.lock().unwrap()
+                        && !attached
+                        && !scope_present
+                })
+                && scene
+                    .node
+                    .try_execution_quiescence_snapshot()
+                    .is_some_and(|snapshot| {
+                        if snapshot.active_tasks == 0
+                            && snapshot.preparing_tasks == 0
+                            && snapshot.preparing_bytes == 0
+                            && snapshot.requests == 1
+                        {
+                            held_snapshot = Some(snapshot);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+        }) {
+            scene.fail(
+                "same held Task R outlives actual Task/Context execution custody",
+                (delivery, request),
+            );
+        }
+        assert_eq!(delivery.request().operation, request.operation);
+        assert_eq!(delivery.request().deadline, request.deadline);
+        assert_eq!(scene.ledger.used(Dimension::Requests.id()), 1);
+        // Keep the actual successful nonblocking observation from this wait.
+        // A later try-lock miss supplies no different lifecycle fact.
+        let held_snapshot = held_snapshot.expect("the same retained R inventory is observable");
+        assert!(
+            held_snapshot.contexts_with_execution_custody >= 1,
+            "this diagnostic inventory still counts the actual live R"
+        );
+        eprintln!(
+            "same original GetFinalInfo delivery held after actual Scope removal: request={request:?}, inventory={held_snapshot:?}"
+        );
+        drop(delivery);
+        if !wait_until(|| {
+            scene.ledger.used(Dimension::Requests.id()) == 0
+                && scene
+                    .node
+                    .try_execution_quiescence_snapshot()
+                    .is_some_and(|snapshot| {
+                        snapshot.contexts_with_execution_custody == 0 && snapshot.requests == 0
+                    })
+                && scene
+                    .node
+                    .original_task_request_for_test(context, request.author)
+                    .is_none()
+        }) {
+            scene.fail(
+                "the same held GetFinalInfo R did not actually retire",
+                request,
+            );
+        }
+    }
+    // This deterministic clock never advanced during execution retirement.
+    // Production captured retired_at from this same clock after actual Scope
+    // and parent-link removal, so its original horizon starts at clock_origin.
+    assert_eq!(scene.clock.now(), clock_origin);
+    let horizon_nanos = u64::try_from(request_horizon.total().as_nanos())
+        .expect("the frozen original request horizon fits the clock");
+    let expiry = clock_origin
+        .0
+        .checked_add(horizon_nanos)
+        .and_then(|deadline| deadline.checked_add(1))
+        .expect("the original request horizon has a representable due tick");
+    scene.clock.0.store(expiry, Ordering::SeqCst);
     scene.runtime.notify_pollers();
     if !wait_until(|| {
-        scene.node.route(context).is_none()
-            && scene.ledger.used(Dimension::Contexts.id()) == 0
-            && scene.ledger.used(Dimension::Requests.id()) == 0
-            && scene.ledger.used(Dimension::Tickets.id()) == 0
+        scene.node.route(context).is_none() && scene.ledger.used(Dimension::Requests.id()) == 0
     }) {
         scene.fail("H/child/parent actual retirement timeout", ());
     }
@@ -610,9 +799,23 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
     if let Err(original) = scene.node.begin_drain() {
         scene.fail("Node begin_drain", original);
     }
+    // This fixture exposes no Native listener. Match the production role's
+    // explicit ingress-close confirmation before waiting for Root retirement.
+    if let Err(original) = scene.node.confirm_ingress_closed() {
+        scene.fail("Node actual ingress close", original);
+    }
     if !wait_until(|| scene.runtime.is_empty() && scene.ledger.is_empty()) {
         scene.fail("Root actual metadata and Scope drain timeout", ());
     }
+    finish_scene(scene, workers, close_kind, shutdown_task_ports);
+}
+
+fn finish_scene<T: Send + 'static>(
+    scene: Scenario<T>,
+    workers: usize,
+    close_kind: &str,
+    shutdown_task_ports: impl FnOnce(T) -> Result<(), Box<dyn std::any::Any + Send>>,
+) {
     let completed_task = *scene.diagnostic_task.lock().unwrap();
     let Scenario {
         node,
@@ -664,58 +867,18 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
     );
 }
 
-// A Context still owns real RPC notification callbacks when Task intake is
-// closed. This pool has no preparation/execution/loading capability.
-type ColdNotificationPool = crate::control_runtime::host_executor::HostExecutor<
-    crate::control_runtime::context_host::task_driver::TaskDriverHostJob,
-    fn(crate::control_runtime::context_host::task_driver::TaskDriverHostJob),
->;
-fn run_cold_notification(
-    job: crate::control_runtime::context_host::task_driver::TaskDriverHostJob,
-) {
-    job.run_on_host();
-}
+// An empty Context still requires the actual execution-host close boundary.
+// Reuse the existing compiled host and joined pools; no Task is submitted.
+type ColdNotificationPool = super::node_task_flow::TaskResources;
 fn start_cold_notifications(
     root: &mut ProcessControlOwner,
 ) -> Result<(TaskDriverPorts, ColdNotificationPool), Box<dyn std::any::Any + Send>> {
-    use crate::control_runtime::host_executor::{HostExecutor, HostExecutorLimits};
-    let capacity = root
-        .task_capacity_signal()
-        .map_err(|error| Box::new(error) as Box<dyn std::any::Any + Send>)?;
-    let workers = NonZeroUsize::new(1).unwrap();
-    let bound = NonZeroUsize::new(
-        root.request_ready()
-            .limit()
-            .get()
-            .checked_add(workers.get())
-            .unwrap(),
-    )
-    .unwrap();
-    let limits = HostExecutorLimits {
-        contexts: bound,
-        jobs: bound,
-        per_context: bound,
-        workers,
-    };
-    let lifecycle =
-        HostExecutor::start_with_waker(limits, run_cold_notification as fn(_), capacity.waker())
-            .map_err(|original| Box::new(original) as Box<dyn std::any::Any + Send>)?;
-    Ok((
-        TaskDriverPorts {
-            lifecycle: Some(lifecycle.handle()),
-            capacity: Some(capacity),
-            ..TaskDriverPorts::default()
-        },
-        lifecycle,
-    ))
+    super::node_task_flow::start_tasks(root)
 }
 fn shutdown_cold_notifications(
     original: ColdNotificationPool,
 ) -> Result<(), Box<dyn std::any::Any + Send>> {
-    original
-        .shutdown()
-        .map(drop)
-        .map_err(|original| Box::new(original) as Box<dyn std::any::Any + Send>)
+    super::node_task_flow::shutdown(original)
 }
 
 #[test]
@@ -724,9 +887,9 @@ fn real_node_context_lifecycle_runs_on_one_and_two_common_pollers() {
         run_node_lifecycle_with_task(
             workers,
             NodeClose::Release,
-            ResourceVector::default(),
+            ReservationResources::default(),
             start_cold_notifications,
-            |_, _, _| Ok(()),
+            |_, _, _| Ok(None),
             shutdown_cold_notifications,
         );
     }

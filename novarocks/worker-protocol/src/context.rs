@@ -30,7 +30,7 @@ use crate::{
     proposal_summary::{CutId, Proposal, ProposalSummary, SourceId},
     task::{CreationPhase, TaskRecord},
 };
-use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId, WorkId};
+use novarocks_control_runtime_core::identity::{Generation, InputId, ReservationId, ScopedWorkRef};
 use novarocks_execution_contract::operation::DomainFailureOutcome;
 use novarocks_execution_contract::{
     AbortCause, AdmissionTicketId, LeaseSequence, LeaseValidFor, OperationOutcome, QueryContextRef,
@@ -42,7 +42,7 @@ use novarocks_execution_contract::{
 };
 use novarocks_execution_contract::{
     DynamicFilterAdvertisement, FINAL_TASK_INFO_MAX_OPERATORS, FinalTaskInfo, OperatorStatistics,
-    TaskStatus, TaskStatusVersion, TaskWriterFacts,
+    TaskStatus, TaskWriterFacts,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -50,7 +50,12 @@ use std::sync::Arc;
 mod initial_creation;
 pub(crate) use initial_creation::InitialCreation;
 
+mod answers;
+mod compact;
 mod domain_waiters;
+mod requests;
+
+pub use compact::ContextCore;
 mod reply;
 pub use reply::{ContextAcknowledgement, ContextReplyBody, ContextRequestSettlement};
 
@@ -118,6 +123,7 @@ pub struct ContextConfig {
     pub step_budget: usize,
     pub lease_bounds: LeaseBounds,
     pub metric_publish_interval: std::time::Duration,
+    pub request_horizon: crate::lease::RequestHorizon,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoreError {
@@ -446,7 +452,7 @@ pub enum ContextInput {
     /// Work and callback custody remain outside the pure protocol owner.
     Settle {
         task: TaskIdentity,
-        work: WorkId,
+        work: ScopedWorkRef,
     },
     Finish {
         task: TaskIdentity,
@@ -463,11 +469,32 @@ pub enum ContextInput {
         fact: PhysicalFact,
     },
     HostReleased,
+    /// Actual Task ownership, source/cut reports and captures have retired.
+    /// Only the original P06 custody owner may publish this neutral fact.
+    TaskExecutionCustodyRetired {
+        task: TaskIdentity,
+        payload: PayloadId,
+        close_epoch: Generation,
+    },
+    /// Actual execution custody is gone. Visible terminal state or an RPC
+    /// deadline cannot supply this independent physical handoff.
+    ExecutionCustodyRetired {
+        context: QueryContextRef,
+        close_epoch: Generation,
+        origin: crate::retention::RetentionOrigin,
+    },
     ContinueClose,
+    ContinueCompaction,
     Tick,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContextEffect {
+    /// The original Context's own retention horizon elapsed. This is no
+    /// physical host-removal proof; Control continues its actual cleanup.
+    Expired {
+        context: QueryContextRef,
+        close_epoch: Generation,
+    },
     /// Coalescible scheduling metadata. The Core retains every actual cursor.
     WakeInternal,
     EstablishProbed {
@@ -514,6 +541,9 @@ pub enum ContextEffect {
         diagnostics: crate::proposal_summary::Diagnostics,
     },
     PublishContextConvergence {
+        /// This terminal decision's protocol epoch, carried into the later
+        /// independent observation of actual execution custody retirement.
+        close_epoch: Generation,
         receipt: novarocks_execution_contract::QueryContextConvergenceReceipt,
     },
     PublishTaskConvergence {
@@ -616,7 +646,7 @@ pub enum ContextEffect {
     },
     SettlementBarrier {
         task: TaskIdentity,
-        work: WorkId,
+        work: ScopedWorkRef,
     },
     DisposeSource {
         task: TaskIdentity,
@@ -645,6 +675,14 @@ pub enum ContextEffect {
         /// The original close winner; None is normal Quiesce, not Abort.
         reason: Option<AbortCause>,
     },
+    /// The bounded scan emitted exactly this many original Task close cuts.
+    /// Physical fencing waits for their actual host handoff, not this hint alone.
+    CloseFanoutPrepared {
+        context: QueryContextRef,
+        generation: Generation,
+        reason: Option<AbortCause>,
+        targets: usize,
+    },
     ContinueClose {
         generation: Generation,
     },
@@ -657,6 +695,8 @@ pub enum ContextEffect {
     },
     RetireTask {
         task: TaskIdentity,
+        /// The original Task close epoch, independent of a later Context fence.
+        close_epoch: Generation,
         /// Frozen entity decision; Retained alone does not prove non-admission.
         never_accepted: bool,
         payload: PayloadId,
@@ -667,6 +707,8 @@ pub enum ContextEffect {
     },
     RetainContext {
         context: QueryContextRef,
+        close_epoch: Generation,
+        inventory: crate::retention::RetainedContextInventory,
     },
 }
 #[derive(Debug, Default)]
@@ -697,6 +739,25 @@ pub struct RequestSettlement {
     pub request: RequestContext,
     pub result: RequestResult,
 }
+/// An actual Worker lookup refusal before any Task command is admitted.
+/// This fact creates no Task, Context, cancellation latch or reply owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskControlRefusal {
+    NotOwned,
+}
+impl TaskControlRefusal {
+    pub const fn outcome(self) -> OperationOutcome {
+        match self {
+            Self::NotOwned => OperationOutcome::InvalidStateOrRequest,
+        }
+    }
+    pub const fn cancel_safe_detail(self) -> &'static str {
+        match self {
+            Self::NotOwned => "cancel names a task this backend does not own",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestResult {
     Outcome(OperationOutcome),
@@ -720,8 +781,10 @@ struct PendingReply {
 #[derive(Debug)]
 struct PendingQuiesce {
     request: InputId,
+    generation: Generation,
     cursor: Option<TaskIdentity>,
     accepted: Vec<TaskIdentity>,
+    scheduled: usize,
 }
 #[derive(Debug)]
 struct QuiesceDecision {
@@ -734,6 +797,7 @@ struct Closing {
     cause: AbortCause,
     request: Option<InputId>,
     scan_finished: bool,
+    scheduled: usize,
 }
 #[derive(Clone, Copy, Debug)]
 enum InternalClass {
@@ -743,22 +807,24 @@ enum InternalClass {
     Quiesce,
     Close,
     Maintenance,
+    Compaction,
 }
 impl InternalClass {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::TaskDomain,
         Self::RequestReplies,
         Self::CreationReplies,
         Self::Quiesce,
         Self::Close,
         Self::Maintenance,
+        Self::Compaction,
     ];
     const fn index(self) -> usize {
         self as usize
     }
 }
 #[derive(Debug)]
-pub struct ContextCore {
+struct LiveContextCore {
     identity: QueryContextRef,
     generation: Generation,
     establishment: ContextEstablishment,
@@ -767,6 +833,11 @@ pub struct ContextCore {
     now: MonotonicInstant,
     lease: InstalledLease,
     tasks: BTreeMap<TaskIdentity, TaskRecord>,
+    decided_tasks: BTreeMap<TaskIdentity, crate::retention::DecidedTask>,
+    custody_retired: BTreeSet<TaskIdentity>,
+    retirement_origin: Option<crate::retention::RetentionOrigin>,
+    retention_expired: bool,
+    materialization_decided: bool,
     spent: usize,
     preparing: usize,
     unretired_tasks: usize,
@@ -794,10 +865,7 @@ pub struct ContextCore {
     pending_quiesce: Option<PendingQuiesce>,
     quiesce_waiters: BTreeSet<InputId>,
     quiesce_decision: Option<QuiesceDecision>,
-    requests: BTreeMap<InputId, RequestContext>,
-    request_tasks: BTreeMap<InputId, TaskIdentity>,
-    request_deadlines: BTreeSet<(MonotonicInstant, InputId)>,
-    pending_replies: BTreeMap<InputId, PendingReply>,
+    replies: requests::RequestState,
     // Ready indexes contain only keys into the original protocol owners.
     // Awaiting host returns never occupy a runnable class. Task identities
     // are cumulative and bounded by max_tasks; each rotating cursor is one
@@ -808,7 +876,7 @@ pub struct ContextCore {
     domain_cursor: Option<TaskIdentity>,
     creation_reply_cursor: Option<TaskIdentity>,
 }
-impl ContextCore {
+impl LiveContextCore {
     /// One slice visits at most one task/domain member/request/catch-up member.
     /// A conclusion cut has at most two candidates and four diagnostics. Its
     /// largest batch is the two-cut Summary input: 3 lease-close effects +
@@ -816,14 +884,14 @@ impl ContextCore {
     /// 1 record visit = 15. Request-producing inputs have only one such cut;
     /// reply fanout and every variable-size traversal use a continuation.
     pub const MAX_BODY_WORK: usize = 15;
-    /// Effects and replies are outputs; class probes need no output slots.
-    pub const MAX_STEP_ACTIONS: usize = 15;
+    /// One body output batch plus the actual representation-swap notice.
+    /// Class probes need no output slots.
+    pub const MAX_STEP_ACTIONS: usize = 15 + 1;
     pub const INTERNAL_CLASSES: usize = InternalClass::ALL.len();
-    /// One existing body plus at most one probe of each internal class.
-    pub const MAX_STEP_WORK: usize = Self::MAX_BODY_WORK + Self::INTERNAL_CLASSES;
-    pub fn max_step_work(&self) -> usize {
-        Self::MAX_STEP_WORK
-    }
+    /// One existing body, each internal-class probe, and the actual swap's
+    /// record visit plus its one notice effect. The public wrapper and this
+    /// live constructor validate the same complete step budget.
+    pub const MAX_STEP_WORK: usize = Self::MAX_BODY_WORK + Self::INTERNAL_CLASSES + 2;
 
     pub fn new(
         identity: QueryContextRef,
@@ -854,6 +922,11 @@ impl ContextCore {
             now,
             lease,
             tasks: BTreeMap::new(),
+            decided_tasks: BTreeMap::new(),
+            custody_retired: BTreeSet::new(),
+            retirement_origin: None,
+            retention_expired: false,
+            materialization_decided: false,
             spent: 0,
             preparing: 0,
             unretired_tasks: 0,
@@ -880,10 +953,7 @@ impl ContextCore {
             pending_quiesce: None,
             quiesce_waiters: BTreeSet::new(),
             quiesce_decision: None,
-            requests: BTreeMap::new(),
-            request_tasks: BTreeMap::new(),
-            request_deadlines: BTreeSet::new(),
-            pending_replies: BTreeMap::new(),
+            replies: requests::RequestState::default(),
             runnable_task_domains: BTreeSet::new(),
             creation_reply_tasks: BTreeSet::new(),
             internal_cursor: 0,
@@ -891,37 +961,14 @@ impl ContextCore {
             creation_reply_cursor: None,
         })
     }
-    pub fn identity(&self) -> QueryContextRef {
-        self.identity
-    }
-    pub const fn establishment(&self) -> ContextEstablishment {
-        self.establishment
-    }
     /// Accepted neutral domain facts, never host material or an access right.
-    pub const fn current_credential(&self) -> Option<CredentialState> {
-        self.context_domains.credential()
-    }
-    pub fn state(&self) -> QueryContextState {
-        self.state
-    }
-    pub fn generation(&self) -> Generation {
-        self.generation
-    }
-    pub fn task(&self, task: TaskIdentity) -> Option<&TaskRecord> {
-        self.tasks.get(&task)
-    }
     /// The public observer projection excludes Creating and rejected entities.
     pub fn status(&self, task: TaskIdentity) -> Option<&TaskStatus> {
         self.tasks
             .get(&task)
             .filter(|record| record.accepted())
             .map(|record| &record.published)
-    }
-    pub fn tasks(&self) -> impl Iterator<Item = &TaskRecord> {
-        self.tasks.values()
-    }
-    pub fn spent_identities(&self) -> usize {
-        self.spent
+            .or_else(|| self.decided_tasks.get(&task).map(|record| &record.status))
     }
     pub fn next_deadline(&self) -> Option<MonotonicInstant> {
         matches!(
@@ -933,15 +980,21 @@ impl ContextCore {
         .then_some(self.lease.expires_at())
         .into_iter()
         .chain(self.metric_deadlines.first().map(|(at, _)| *at))
-        .chain(self.request_deadlines.first().map(|(at, _)| *at))
+        .chain(self.replies.request_deadlines.first().map(|(at, _)| *at))
+        .chain(
+            self.retirement_origin
+                .filter(|_| !self.retention_expired)
+                .map(|origin| origin.expires_at()),
+        )
         .min()
     }
     /// Pure readiness, not permission to start a host job or to consume a reply.
     /// Future deadlines and owners awaiting a host return do not cause a wake.
     pub fn has_internal_work(&self) -> bool {
-        self.context_domain_runnable()
+        !self.custody_retired.is_empty()
+            || self.context_domain_runnable()
             || !self.runnable_task_domains.is_empty()
-            || !self.pending_replies.is_empty()
+            || !self.replies.pending_replies.is_empty()
             || !self.creation_reply_tasks.is_empty()
             || self.pending_quiesce.is_some()
             || (self.quiesce_decision.is_some() && !self.quiesce_waiters.is_empty())
@@ -979,6 +1032,7 @@ impl ContextCore {
                 // Original tokens, not wire operation IDs. Always select the
                 // lowest ready token; higher-token churn cannot pass it.
                 InternalClass::RequestReplies => self
+                    .replies
                     .pending_replies
                     .first_key_value()
                     .map(|(&operation, _)| ContextInput::ContinueRequestReplies { operation }),
@@ -1005,6 +1059,9 @@ impl ContextCore {
                     .next_deadline()
                     .is_some_and(|at| at <= self.now)
                     .then_some(ContextInput::Tick),
+                InternalClass::Compaction => {
+                    (!self.custody_retired.is_empty()).then_some(ContextInput::ContinueCompaction)
+                }
             };
             if let Some(input) = input {
                 self.internal_cursor = (class.index() + 1) % Self::INTERNAL_CLASSES;
@@ -1032,7 +1089,7 @@ impl ContextCore {
         if now < self.now {
             return Err(CoreError::TimeRegressed);
         }
-        if self.requests.contains_key(&request.token) {
+        if self.replies.requests.contains_key(&request.token) {
             return Err(CoreError::WrongIdentity);
         }
         self.now = now;
@@ -1054,34 +1111,23 @@ impl ContextCore {
             }
             _ => None,
         };
+        if self
+            .retirement_origin
+            .is_some_and(|origin| origin.has_expired(now))
+        {
+            let mut step = ContextStep::default();
+            self.expire_retention(&mut step);
+            step.requests.push(ContextRequestSettlement::verdict(
+                request,
+                task,
+                RequestResult::Outcome(OperationOutcome::Gone),
+            ));
+            step.effects.extend(refused_domain);
+            step.records_visited = 1;
+            return Ok(step);
+        }
         if now.has_reached(request.deadline) {
-            let body = match &command {
-                ContextCommand::Create { task, .. } | ContextCommand::InspectCreation { task } => {
-                    match self.tasks.get(task) {
-                        Some(record) => match &record.creation_refusal {
-                            Some(AdmissionRefusal::Domain(outcome, failure)) => {
-                                ContextReplyBody::Domain(DomainRefusal {
-                                    outcome: *outcome,
-                                    failure: failure.clone(),
-                                })
-                            }
-                            _ => ContextReplyBody::Verdict(match record.pending_reply_outcome {
-                                Some(OperationOutcome::Accepted) => {
-                                    RequestResult::Outcome(OperationOutcome::Idempotent)
-                                }
-                                Some(outcome) => RequestResult::Outcome(outcome),
-                                None => RequestResult::TimeoutWhileAccepted,
-                            }),
-                        },
-                        None => ContextReplyBody::Verdict(RequestResult::Outcome(
-                            OperationOutcome::OperationTimedOut,
-                        )),
-                    }
-                }
-                _ => ContextReplyBody::Verdict(RequestResult::Outcome(
-                    OperationOutcome::OperationTimedOut,
-                )),
-            };
+            let body = answers::AnswerView::from_live(self).expired_request(&command);
             return Ok(ContextStep {
                 records_visited: 1,
                 requests: vec![ContextRequestSettlement::new(request, task, Arc::new(body))],
@@ -1089,23 +1135,15 @@ impl ContextCore {
                 ..ContextStep::default()
             });
         }
-        if self.requests.len() >= self.config.max_pending_requests {
-            return Ok(ContextStep {
-                records_visited: 0,
-                requests: vec![ContextRequestSettlement::verdict(
-                    request,
-                    task,
-                    RequestResult::Outcome(OperationOutcome::ResourceExhausted),
-                )],
-                effects: refused_domain.into_iter().collect(),
-                ..ContextStep::default()
-            });
+        if self.replies.requests.len() >= self.config.max_pending_requests {
+            return Err(CoreError::IllegalFact);
         }
         if let Some(task) = task {
-            self.request_tasks.insert(request.token, task);
+            self.replies.request_tasks.insert(request.token, task);
         }
-        self.requests.insert(request.token, request);
-        self.request_deadlines
+        self.replies.requests.insert(request.token, request);
+        self.replies
+            .request_deadlines
             .insert((request.deadline, request.token));
         self.handle_bound(
             now,
@@ -1140,7 +1178,7 @@ impl ContextCore {
         task: TaskIdentity,
         capacity: &mut impl AdmissionPort,
     ) -> Result<ContextStep, CoreError> {
-        if self.requests.contains_key(&original.token) {
+        if self.replies.requests.contains_key(&original.token) {
             return Err(CoreError::WrongIdentity);
         }
         self.handle_bound(
@@ -1569,6 +1607,7 @@ impl ContextCore {
                 ) {
                     return Err(CoreError::IllegalFact);
                 }
+                self.materialization_decided = true;
                 step.effects.push(ContextEffect::EstablishmentDecided {
                     context: self.identity,
                     close_epoch: self.generation,
@@ -1630,6 +1669,7 @@ impl ContextCore {
                         }
                     }
                 };
+                self.materialization_decided = true;
                 step.effects.push(ContextEffect::EstablishmentDecided {
                     context: self.identity,
                     close_epoch: self.generation,
@@ -1807,6 +1847,46 @@ impl ContextCore {
                 self.try_finish_completion_intent(task, &mut step)?;
                 self.retire_if_ready(task, &mut step)?;
             }
+            ContextInput::TaskExecutionCustodyRetired {
+                task,
+                payload,
+                close_epoch,
+            } => {
+                self.note_task_custody_retired(task, payload, close_epoch, &mut step)?;
+            }
+            ContextInput::ExecutionCustodyRetired {
+                context,
+                close_epoch,
+                origin,
+            } => {
+                if context != self.identity
+                    || close_epoch != self.generation
+                    || origin.retired_at() > now
+                {
+                    return Err(CoreError::WrongIdentity);
+                }
+                if self.state != QueryContextState::TerminalRetained
+                    || !self.materialization_decided
+                {
+                    return Err(CoreError::IllegalFact);
+                }
+                if origin
+                    != crate::retention::RetentionOrigin::new(
+                        origin.retired_at(),
+                        self.config.request_horizon,
+                    )
+                {
+                    return Err(CoreError::IllegalFact);
+                }
+                if self
+                    .retirement_origin
+                    .is_some_and(|original| original != origin)
+                {
+                    return Err(CoreError::IllegalFact);
+                }
+                self.retirement_origin = Some(origin);
+            }
+            ContextInput::ContinueCompaction => self.advance_compaction(&mut step)?,
             ContextInput::HostReleased => {
                 if !self.host_releasing || self.unretired_tasks != 0 {
                     return Err(CoreError::IllegalFact);
@@ -1819,12 +1899,10 @@ impl ContextCore {
                         self.release_reply(novarocks_execution_contract::ReleaseOutcome::Released),
                     );
                 }
-                step.effects.push(ContextEffect::RetainContext {
-                    context: self.identity,
-                });
                 // The original HostReleased fact follows actual Task/host
                 // retirement and the same Context admission fence.
                 step.effects.push(ContextEffect::PublishContextConvergence {
+                    close_epoch: self.generation,
                     receipt: novarocks_execution_contract::QueryContextConvergenceReceipt::new(
                         self.identity,
                         novarocks_execution_contract::QueryContextConvergenceVersion::FIRST,
@@ -1887,6 +1965,7 @@ impl ContextCore {
                 generation: self.generation,
             });
         }
+        self.expire_retention(&mut step);
         let decisions_visited = self.settle_request_decisions(&mut step);
         step.records_visited +=
             1 + decisions_visited + usize::from(!step.requests.is_empty()) + internal_probes;
@@ -1896,10 +1975,32 @@ impl ContextCore {
         &mut self,
         now: MonotonicInstant,
         request: InputId,
-        command: ContextCommand,
+        mut command: ContextCommand,
         capacity: &mut impl AdmissionPort,
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
+        if self.state == QueryContextState::TerminalRetained {
+            if let ContextCommand::Cancel { task, .. }
+            | ContextCommand::GetFinalInfo { task }
+            | ContextCommand::GetDynamicFilters { task, .. } = &command
+                && self.tasks.contains_key(task)
+            {
+                if !self.task_request_cut(request, *task, step)? {
+                    return Ok(());
+                }
+                self.try_finish_completion_intent(*task, step)?;
+            }
+            answers::AnswerView::from_live(self)
+                .terminal_command(request, &mut command)?
+                .emit(request, step);
+            return Ok(());
+        }
+        if let Some(answer) =
+            answers::AnswerView::from_live(self).decided_task_command(request, &command)?
+        {
+            answer.emit(request, step);
+            return Ok(());
+        }
         match command {
             ContextCommand::Cancel { task, reason } => {
                 if self.task_request_cut(request, task, step)? {
@@ -2064,19 +2165,7 @@ impl ContextCore {
                 );
             }
             ContextCommand::Quiesce => {
-                if self.state == QueryContextState::TerminalRetained
-                    && let Some(decision) = self.quiesce_decision.as_ref()
-                {
-                    // Release retains the exact previously committed fence;
-                    // replay grants no new admission or close authority.
-                    step.reply(
-                        request,
-                        ContextReplyBody::Quiesce {
-                            outcome: OperationOutcome::ContextTerminalReceipt,
-                            receipt: decision.receipt.clone(),
-                        },
-                    );
-                } else if !matches!(
+                if !matches!(
                     self.state,
                     QueryContextState::Establishing
                         | QueryContextState::Active
@@ -2114,22 +2203,17 @@ impl ContextCore {
                     }
                     self.pending_quiesce = Some(PendingQuiesce {
                         request,
+                        generation: self.generation,
                         cursor: None,
                         accepted: Vec::new(),
+                        scheduled: 0,
                     });
                     step.effects.push(ContextEffect::ContinueQuiesce);
                 }
             }
             ContextCommand::Abort { cause } => self.begin_abort(Some(request), cause, step)?,
             ContextCommand::Release => {
-                if self.state == QueryContextState::TerminalRetained {
-                    step.reply(
-                        request,
-                        self.release_reply(
-                            novarocks_execution_contract::ReleaseOutcome::AlreadyTerminal,
-                        ),
-                    );
-                } else if self.state != QueryContextState::Quiescing
+                if self.state != QueryContextState::Quiescing
                     || self.closing.is_some()
                     || self.quiesce_decision.is_none()
                     || self.pending_quiesce.is_some()
@@ -2162,27 +2246,7 @@ impl ContextCore {
         Ok(())
     }
     fn compose(task: &TaskRecord) -> Result<TaskStatus, CoreError> {
-        let termination = match task.conclusion.accepted.as_ref() {
-            Some(TaskConclusion::Terminated(detail)) => Some(detail.clone()),
-            _ => None,
-        };
-        let mut snapshot = TaskStatus::try_new_with_installed(
-            task.identity,
-            TaskStatusVersion::new(task.version).map_err(|_| CoreError::VersionExhausted)?,
-            task.state,
-            termination,
-            task.output,
-            task.installed,
-        )
-        .map_err(|_| CoreError::IllegalFact)?
-        .with_resources(task.resources);
-        if let Some(writer) = task.writer {
-            snapshot = snapshot.with_writer(writer);
-        }
-        if let Some(filter) = task.filter_advertisement {
-            snapshot = snapshot.with_dynamic_filters(filter);
-        }
-        Ok(snapshot)
+        task.compose_status()
     }
     fn publish(task: &mut TaskRecord, step: &mut ContextStep) -> Result<(), CoreError> {
         if !task.accepted() {
@@ -2201,75 +2265,19 @@ impl ContextCore {
         Ok(())
     }
     fn context_acknowledgement(&self, outcome: OperationOutcome) -> ContextAcknowledgement {
-        ContextAcknowledgement {
-            outcome,
-            receipt: Arc::new(
-                novarocks_execution_contract::QueryContextReceipt::new(self.identity, self.state)
-                    .with_lease(self.lease.receipt()),
-            ),
-            termination_cause: self.closing.map(|closing| closing.cause),
-        }
+        answers::AnswerView::from_live(self).acknowledgement(outcome)
     }
     fn establishment_acknowledgement(&self, outcome: OperationOutcome) -> ContextAcknowledgement {
-        let mut ack = self.context_acknowledgement(outcome);
-        if let Some(current) = self.context_domains.credential() {
-            let initial = self.establishment.semantics;
-            let catalog = ContextDomainInput::Catalog {
-                version: DomainVersion::FIRST,
-                fingerprint: initial.catalog,
-            };
-            let filter = ContextDomainInput::Filter {
-                version: DomainVersion::FIRST,
-                fingerprint: initial.shared_filter,
-            };
-            let credential = ContextDomainInput::Credential(crate::domain::CredentialInput {
-                lease: current.lease,
-                epoch: current.epoch,
-                current_resource: current.resource,
-                replacement_resource: current.resource,
-                same_material: true,
-            });
-            let progression = |input| {
-                if outcome == OperationOutcome::Accepted {
-                    DomainProgression::Apply
-                } else {
-                    self.context_domains.classify(input)
-                }
-            };
-            let domains = vec![
-                self.context_domains.receipt(catalog, progression(catalog)),
-                self.context_domains.receipt(filter, progression(filter)),
-                self.context_domains
-                    .receipt(credential, progression(credential)),
-            ];
-            ack.receipt = Arc::new(
-                novarocks_execution_contract::QueryContextReceipt::new(self.identity, self.state)
-                    .with_lease(self.lease.receipt())
-                    .with_domains(domains),
-            );
-        }
-        ack
+        answers::AnswerView::from_live(self).establishment_acknowledgement(outcome)
     }
     fn release_reply(
         &self,
         release: novarocks_execution_contract::ReleaseOutcome,
     ) -> ContextReplyBody {
-        ContextReplyBody::Release {
-            context: self.identity,
-            release,
-            state: self.state,
-            termination_cause: self.closing.map(|closing| closing.cause),
-        }
+        answers::AnswerView::from_live(self).release(release)
     }
     fn closed_outcome(&self) -> OperationOutcome {
-        if self
-            .closing
-            .is_some_and(|c| c.cause == AbortCause::LeaseExpired)
-        {
-            OperationOutcome::LeaseExpired
-        } else {
-            OperationOutcome::ContextTerminalReceipt
-        }
+        answers::AnswerView::from_live(self).closed_outcome()
     }
     /// Preserve Create's exact identity/entity priority for the business and
     /// read-only entries. A closed Context still owes existing Task replays.
@@ -2294,15 +2302,9 @@ impl ContextCore {
                     return Ok(true);
                 }
                 if t.waiting_replies.len() >= self.config.max_creation_waiters {
-                    step.reply(
-                        request,
-                        ContextReplyBody::Verdict(RequestResult::Outcome(
-                            OperationOutcome::ResourceExhausted,
-                        )),
-                    );
-                } else {
-                    t.waiting_replies.insert(request);
+                    return Err(CoreError::IllegalFact);
                 }
+                t.waiting_replies.insert(request);
             } else if let Some(refusal) = &t.creation_refusal {
                 Self::refusal_reply(request, refusal.clone(), step);
             } else {
@@ -2419,7 +2421,6 @@ impl ContextCore {
         let cost = result.and_then(|c| {
             c.preparation_bytes()
                 .filter(|b| *b <= self.config.max_task_bytes)
-                .map(|bytes| (c, bytes))
                 .ok_or(AdmissionRefusal::Verdict(
                     OperationOutcome::ResourceExhausted,
                 ))
@@ -2428,7 +2429,7 @@ impl ContextCore {
         let reserved = if self.state != QueryContextState::Active {
             Err(AdmissionRefusal::Verdict(self.closed_outcome()))
         } else {
-            cost.and_then(|(c, bytes)| {
+            cost.and_then(|bytes| {
                 if preparing >= self.config.max_preparing {
                     return Err(AdmissionRefusal::Verdict(OperationOutcome::PreparationBusy));
                 }
@@ -2439,8 +2440,6 @@ impl ContextCore {
                     generation: self.generation,
                     preparing_in_context: preparing,
                     bytes,
-                    inbound_records: c.inbound_records,
-                    inbound_bytes: c.inbound_bytes,
                 })
             })
         };
@@ -2590,6 +2589,7 @@ impl ContextCore {
             self.unretired_tasks -= 1;
             step.effects.push(ContextEffect::RetireTask {
                 task,
+                close_epoch: t.applied_close_generation,
                 never_accepted: !t.accepted(),
                 payload: t.payload,
                 state: t.state,
@@ -2806,6 +2806,7 @@ impl ContextCore {
             cause,
             request,
             scan_finished: false,
+            scheduled: 0,
         });
         self.close_applied = false;
         step.effects.push(ContextEffect::CloseExternalAdmission {
@@ -2958,6 +2959,7 @@ impl ContextCore {
             {
                 record.scheduled_close_generation = Some(self.generation);
                 self.scheduled_closes += 1;
+                closing.scheduled += 1;
                 step.effects.push(ContextEffect::ApplyTaskClose {
                     task: *task,
                     generation: self.generation,
@@ -2972,6 +2974,14 @@ impl ContextCore {
                 .is_some()
         });
         closing.scan_finished = !more;
+        if !more {
+            step.effects.push(ContextEffect::CloseFanoutPrepared {
+                context: self.identity,
+                generation: self.generation,
+                reason: Some(closing.cause),
+                targets: closing.scheduled,
+            });
+        }
         self.closing = Some(closing);
         if more {
             step.effects.push(ContextEffect::ContinueClose {
@@ -2990,7 +3000,7 @@ impl ContextCore {
         let outcome = if task.verify_query_context(self.identity).is_err() {
             Some(OperationOutcome::IdentityMismatch)
         } else if !self.tasks.contains_key(&task) {
-            Some(OperationOutcome::InvalidStateOrRequest)
+            Some(TaskControlRefusal::NotOwned.outcome())
         } else {
             None
         };
@@ -3271,6 +3281,14 @@ impl ContextCore {
         candidate: EstablishReplayRequest,
         comparison: Option<EstablishCredentialComparison>,
     ) -> Result<EstablishReplayResult, CoreError> {
+        if self
+            .retirement_origin
+            .is_some_and(|origin| origin.has_expired(self.now))
+        {
+            return Ok(EstablishReplayResult::Decided(
+                self.establishment_acknowledgement(OperationOutcome::Gone),
+            ));
+        }
         match self.state {
             QueryContextState::Quiescing | QueryContextState::TerminalRetained => {
                 return Ok(EstablishReplayResult::Decided(
@@ -3405,6 +3423,12 @@ impl ContextCore {
                 OperationOutcome::IdentityMismatch,
             )));
         }
+        if let Some(record) = self.decided_tasks.get_mut(&task) {
+            record.output = TaskOutputFacts::new(true);
+            return Ok(ContextReplyBody::RootDrain(
+                RootDrainVerdict::AlreadyTerminal(record.status.state()),
+            ));
+        }
         if !self.tasks.contains_key(&task) {
             return Ok(ContextReplyBody::Verdict(RequestResult::Outcome(
                 OperationOutcome::InvalidStateOrRequest,
@@ -3475,7 +3499,6 @@ impl ContextCore {
         Ok(())
     }
     fn advance_quiesce(&mut self, step: &mut ContextStep) -> Result<(), CoreError> {
-        use std::ops::Bound::{Excluded, Unbounded};
         let Some(mut pending) = self.pending_quiesce.take() else {
             if let Some(request) = self.quiesce_waiters.pop_first() {
                 let decision = self
@@ -3500,41 +3523,44 @@ impl ContextCore {
             }
             return Ok(());
         };
-        let records = match pending.cursor {
-            Some(cursor) => self.tasks.range_mut((Excluded(cursor), Unbounded)),
-            None => self.tasks.range_mut(..),
-        };
-        for (identity, record) in records.take(1) {
-            pending.cursor = Some(*identity);
-            if record.pending_reply_outcome == Some(OperationOutcome::Accepted) {
-                pending.accepted.push(*identity);
-                // This scan freezes membership and requests one causal cancellation;
-                // only the returned original close input may adjudicate the Task.
-                if self.closing.is_none()
-                    && !record.state.is_terminal()
-                    && record.phase != CreationPhase::Retained
-                    && record.scheduled_quiesce_generation.is_none()
-                    && record.applied_quiesce_generation.is_none()
-                {
-                    record.scheduled_quiesce_generation = Some(self.generation);
-                    step.effects.push(ContextEffect::ApplyTaskClose {
-                        task: *identity,
-                        generation: self.generation,
-                        intent: TaskCloseIntent::Quiesce,
-                    });
+        if let Some(identity) = self.next_task_identity(pending.cursor) {
+            pending.cursor = Some(identity);
+            if let Some(record) = self.tasks.get_mut(&identity) {
+                if record.pending_reply_outcome == Some(OperationOutcome::Accepted) {
+                    pending.accepted.push(identity);
+                    if self.closing.is_none()
+                        && !record.state.is_terminal()
+                        && record.phase != CreationPhase::Retained
+                        && record.scheduled_quiesce_generation.is_none()
+                        && record.applied_quiesce_generation.is_none()
+                    {
+                        record.scheduled_quiesce_generation = Some(self.generation);
+                        pending.scheduled += 1;
+                        step.effects.push(ContextEffect::ApplyTaskClose {
+                            task: identity,
+                            generation: self.generation,
+                            intent: TaskCloseIntent::Quiesce,
+                        });
+                    }
                 }
+            } else {
+                // Actual exit removes execution state, never accepted membership.
+                pending.accepted.push(identity);
             }
         }
-        let more = pending.cursor.is_some_and(|cursor| {
-            self.tasks
-                .range((Excluded(cursor), Unbounded))
-                .next()
-                .is_some()
-        });
+        let more = pending
+            .cursor
+            .is_some_and(|cursor| self.next_task_identity(Some(cursor)).is_some());
         if more {
             self.pending_quiesce = Some(pending);
             step.effects.push(ContextEffect::ContinueQuiesce);
         } else {
+            step.effects.push(ContextEffect::CloseFanoutPrepared {
+                context: self.identity,
+                generation: pending.generation,
+                reason: None,
+                targets: pending.scheduled,
+            });
             let outcome = if self.quiesce_decision.is_some() {
                 OperationOutcome::Idempotent
             } else {
@@ -3580,55 +3606,34 @@ impl ContextCore {
         settled_at: MonotonicInstant,
         step: &mut ContextStep,
     ) {
-        if !self.requests.contains_key(&token) {
-            return;
-        }
-        self.pending_replies
-            .entry(token)
-            .or_insert(PendingReply { body, settled_at });
-        self.flush_request_replies(token, step);
+        let before = step.requests.len();
+        self.replies.complete(token, body, settled_at, step);
+        self.cleanup_emitted_request(before, step);
     }
-    fn flush_request_replies(&mut self, token: InputId, step: &mut ContextStep) {
-        if !step.requests.is_empty() {
-            return;
+    fn cleanup_emitted_request(&mut self, before: usize, step: &ContextStep) {
+        if let Some(reply) = step.requests.get(before) {
+            self.cleanup_request_membership(reply.request.token, reply.task);
         }
-        let Some(reply) = self.pending_replies.remove(&token) else {
-            return;
-        };
-        let task = self.request_tasks.get(&token).copied();
-        let request = self
-            .remove_request(token)
-            .expect("pending reply has its original request");
-        step.requests
-            .push(if reply.settled_at.has_reached(request.deadline) {
-                ContextRequestSettlement::verdict(
-                    request,
-                    task,
-                    RequestResult::TimeoutWhileAccepted,
-                )
-            } else {
-                ContextRequestSettlement::new(request, task, reply.body)
-            });
     }
-    fn remove_request(&mut self, token: InputId) -> Option<RequestContext> {
-        let request = self.requests.remove(&token)?;
-        self.request_deadlines.remove(&(request.deadline, token));
-        self.pending_replies.remove(&token);
+    fn cleanup_request_membership(&mut self, token: InputId, task: Option<TaskIdentity>) {
         self.abort_waiters.remove(&token);
         self.quiesce_waiters.remove(&token);
-        if let Some(task) = self.request_tasks.remove(&token)
+        if let Some(task) = task
             && let Some(record) = self.tasks.get_mut(&task)
         {
-            // Remove only this RPC waiter, never the entity's admitted work.
             record.waiting_replies.remove(&token);
             if record.waiting_replies.is_empty() {
                 self.creation_reply_tasks.remove(&task);
             }
         }
-        Some(request)
+    }
+    fn flush_request_replies(&mut self, token: InputId, step: &mut ContextStep) {
+        let before = step.requests.len();
+        self.replies.flush(token, step);
+        self.cleanup_emitted_request(before, step);
     }
     fn expire_requests(&mut self, step: &mut ContextStep) {
-        let Some((at, token)) = self.request_deadlines.first().copied() else {
+        let Some((at, token)) = self.replies.request_deadlines.first().copied() else {
             return;
         };
         if self.now < at {
@@ -3637,6 +3642,7 @@ impl ContextCore {
         // A complete body decided before the deadline remains its original
         // fact even if bounded delivery reaches this token on a later turn.
         if self
+            .replies
             .pending_replies
             .get(&token)
             .is_some_and(|reply| reply.settled_at < at)
@@ -3647,7 +3653,7 @@ impl ContextCore {
         // The entity may have decided all its original waiters while bounded
         // fanout has not yet selected this one. Membership, not same Task or
         // operation identity, grants access to that original decision time.
-        let creation = self.request_tasks.get(&token).and_then(|task| {
+        let creation = self.replies.request_tasks.get(&token).and_then(|task| {
             let record = self.tasks.get(task)?;
             if !record.waiting_replies.contains(&token) {
                 return None;
@@ -3687,15 +3693,9 @@ impl ContextCore {
             self.complete_request_at(token, Arc::new(body), decided_at, step);
             return;
         }
-        let task = self.request_tasks.get(&token).copied();
-        let request = self
-            .remove_request(token)
-            .expect("deadline has its original request");
-        step.requests.push(ContextRequestSettlement::verdict(
-            request,
-            task,
-            RequestResult::TimeoutWhileAccepted,
-        ));
+        let before = step.requests.len();
+        self.replies.expire(self.now, step);
+        self.cleanup_emitted_request(before, step);
     }
     fn settle_request_decisions(&mut self, step: &mut ContextStep) -> usize {
         let decisions = std::mem::take(&mut step.decisions);
@@ -3703,7 +3703,7 @@ impl ContextCore {
         for (token, body) in decisions {
             self.complete_request(token, body, step);
         }
-        if let Some((&operation, _)) = self.pending_replies.first_key_value() {
+        if let Some((&operation, _)) = self.replies.pending_replies.first_key_value() {
             step.effects
                 .push(ContextEffect::ContinueRequestReplies { operation });
         }

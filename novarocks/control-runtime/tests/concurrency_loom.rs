@@ -35,10 +35,11 @@ use novarocks_control_runtime::{
     transaction::{RuntimeError, RuntimeLedger},
 };
 use novarocks_control_runtime_core::{
-    capacity::{ReservationRequest, ResourceVector},
+    capacity::{ReservationRequest, ReservationResources, ResourceVector},
     completion::{CompletionError, ConsumerKind},
     identity::*,
     mailbox::{InputClass, InputEnvelope},
+    owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
 };
 fn model(f: impl Fn() + Send + Sync + 'static) {
@@ -66,22 +67,34 @@ fn resources(n: u64) -> ResourceVector {
     ])
     .unwrap()
 }
+fn work_resources(n: u64) -> ReservationResources {
+    ReservationResources::for_work(resources(n))
+}
+fn report_resources(n: u64) -> ReservationResources {
+    ReservationResources::new(
+        resources(n),
+        OwnedSlotNeed {
+            completions: 1,
+            ..OwnedSlotNeed::work_only()
+        },
+    )
+}
 fn request(scope_index: u64) -> ReservationRequest {
     ReservationRequest {
         id: ReservationId::new(scope_index).unwrap(),
         generation: generation(),
         guard: wid(1),
         kind: WorkKind::Business,
-        resources: resources(1),
+        resources: work_resources(1),
         admission: WorkAdmission::External,
     }
 }
 #[test]
 fn multi_dimension_competition_is_atomic_with_two_preemptions() {
     model(|| {
-        let ledger = RuntimeLedger::new(resources(1), 4, 2);
-        let first = ledger.open_scope(sid(1), None, generation(), 4, 4).unwrap();
-        let second = ledger.open_scope(sid(2), None, generation(), 4, 4).unwrap();
+        let ledger = RuntimeLedger::new(resources(1));
+        let first = ledger.open_scope(sid(1), None, generation()).unwrap();
+        let second = ledger.open_scope(sid(2), None, generation()).unwrap();
         let one = thread::spawn(move || {
             first
                 .reserve(request(1))
@@ -101,7 +114,8 @@ fn multi_dimension_competition_is_atomic_with_two_preemptions() {
         for (mut work, mut bundle) in values.into_iter().flatten() {
             work.body_exited().unwrap();
             work.captures_exited().unwrap();
-            bundle.release(&resources(1)).unwrap();
+            bundle.release_quota(&resources(1)).unwrap();
+            bundle.finish().unwrap();
         }
         ledger.reap_ready(2).unwrap();
         assert_eq!(ledger.used(DimensionId::new(1).unwrap()), 0);
@@ -110,8 +124,8 @@ fn multi_dimension_competition_is_atomic_with_two_preemptions() {
 #[test]
 fn close_and_reserve_have_one_order_with_two_preemptions() {
     model(|| {
-        let ledger = RuntimeLedger::new(resources(1), 4, 1);
-        let scope = ledger.open_scope(sid(1), None, generation(), 4, 4).unwrap();
+        let ledger = RuntimeLedger::new(resources(1));
+        let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
         let closer = scope.clone();
         let reserver = scope.clone();
         let close = thread::spawn(move || closer.close_external().unwrap());
@@ -127,7 +141,8 @@ fn close_and_reserve_have_one_order_with_two_preemptions() {
             work.start().unwrap();
             work.body_exited().unwrap();
             work.captures_exited().unwrap();
-            bundle.release(&resources(1)).unwrap();
+            bundle.release_quota(&resources(1)).unwrap();
+            bundle.finish().unwrap();
         }
         ledger.reap_ready(4).unwrap();
         assert!(scope.snapshot().unwrap().retirement_ready);
@@ -136,22 +151,20 @@ fn close_and_reserve_have_one_order_with_two_preemptions() {
 #[test]
 fn report_publication_and_last_capture_are_distinct_with_two_preemptions() {
     model(|| {
-        let ledger = RuntimeLedger::new(resources(1), 4, 1);
-        let scope = ledger.open_scope(sid(1), None, generation(), 4, 4).unwrap();
-        let mut work = scope
-            .admit_work(
-                generation(),
-                wid(1),
-                WorkKind::Business,
-                WorkAdmission::External,
-            )
+        let ledger = RuntimeLedger::new(resources(1));
+        let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+        let mut paid = request(1);
+        paid.resources = report_resources(0);
+        let (mut work, mut bundle) = scope
+            .reserve(paid)
+            .unwrap()
+            .bind(WorkKind::Business)
             .unwrap();
         let consumer = ConsumerId::new(1).unwrap();
         let report = ReportSlot::reserve(
-            &scope,
+            &mut bundle,
             SlotId::new(1).unwrap(),
             generation(),
-            wid(1),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
@@ -195,6 +208,8 @@ fn report_publication_and_last_capture_are_distinct_with_two_preemptions() {
         if scope.snapshot().unwrap().storage != 0 {
             assert!(report.try_retire().unwrap());
         }
+        bundle.release_quota(&resources(0)).unwrap();
+        bundle.finish().unwrap();
         scope.close_external().unwrap();
         ledger.reap_ready(4).unwrap();
         assert!(scope.snapshot().unwrap().retirement_ready);
@@ -232,9 +247,9 @@ impl Actor for Counter {
 #[test]
 fn enqueue_racing_claim_release_cannot_lose_readiness_with_two_preemptions() {
     model(|| {
-        let ledger = RuntimeLedger::new(resources(1), 4, 1);
-        let scope = ledger.open_scope(sid(1), None, generation(), 4, 4).unwrap();
-        let runtime = ActorRuntime::new(1);
+        let ledger = RuntimeLedger::new(resources(1));
+        let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+        let runtime = ActorRuntime::new();
         let config = ActorConfig {
             mailbox: [4; 4],
             max_batches: 4,
@@ -284,19 +299,20 @@ fn enqueue_racing_claim_release_cannot_lose_readiness_with_two_preemptions() {
 #[test]
 fn capacity_release_report_cannot_precede_its_release_with_two_preemptions() {
     model(|| {
-        let ledger = RuntimeLedger::new(resources(1), 4, 1);
-        let scope = ledger.open_scope(sid(1), None, generation(), 4, 4).unwrap();
+        let ledger = RuntimeLedger::new(resources(1));
+        let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+        let mut paid = request(1);
+        paid.resources = report_resources(1);
         let (mut work, mut bundle) = scope
-            .reserve(request(1))
+            .reserve(paid)
             .unwrap()
             .bind(WorkKind::Business)
             .unwrap();
         let consumer = ConsumerId::new(1).unwrap();
         let report = ReportSlot::reserve(
-            &scope,
+            &mut bundle,
             SlotId::new(1).unwrap(),
             generation(),
-            wid(1),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
@@ -304,8 +320,9 @@ fn capacity_release_report_cannot_precede_its_release_with_two_preemptions() {
         let producer_report = report.clone();
         let release = thread::spawn(move || {
             bundle
-                .release_with_report(&resources(1), &producer_report)
+                .release_quota_with_report(&resources(1), &producer_report)
                 .unwrap();
+            bundle
         });
         let reader_report = report.clone();
         let reader_ledger = ledger.clone();
@@ -319,7 +336,7 @@ fn capacity_release_report_cannot_precede_its_release_with_two_preemptions() {
             Err(RuntimeError::Completion(CompletionError::NotFilled)) => {}
             Err(error) => panic!("unexpected release report failure: {error}"),
         });
-        release.join().unwrap();
+        let mut bundle = release.join().unwrap();
         read.join().unwrap();
         if !consumed.load(Ordering::Relaxed) {
             report.consume(consumer).unwrap();
@@ -329,13 +346,16 @@ fn capacity_release_report_cannot_precede_its_release_with_two_preemptions() {
         report.body_exited().unwrap();
         report.captures_exited().unwrap();
         assert!(report.try_retire().unwrap());
+        bundle.finish().unwrap();
         scope.close_external().unwrap();
         ledger.reap_ready(1).unwrap();
         assert!(scope.snapshot().unwrap().retirement_ready);
     });
 }
 
-struct SnapshotActor;
+struct SnapshotActor {
+    work: ScopedWorkRef,
+}
 impl Actor for SnapshotActor {
     type Input = ();
     type Effect = ();
@@ -343,14 +363,14 @@ impl Actor for SnapshotActor {
     fn handle(
         &mut self,
         _now: Tick,
-        input: InputEnvelope,
+        _input: InputEnvelope,
         _value: (),
         step: &mut StepContext<'_, ()>,
     ) {
         step.effect(
             novarocks_control_runtime_core::effect::EffectDescriptor {
                 id: ActionId::new(1).unwrap(),
-                work: wid(input.input.get()),
+                work: self.work,
                 kind: novarocks_control_runtime_core::effect::EffectKind::Publication,
                 dependencies: vec![],
             },
@@ -374,10 +394,22 @@ fn snapshot_commit_and_scope_failure_have_one_publication_order_with_two_preempt
     model(|| {
         use novarocks_control_runtime::driver::DriverError;
         use novarocks_control_runtime::publication::PublishedSnapshot;
-        use novarocks_control_runtime_core::effect::EffectError;
-        let ledger = RuntimeLedger::new(resources(1), 4, 1);
-        let scope = ledger.open_scope(sid(1), None, generation(), 4, 4).unwrap();
-        let runtime = ActorRuntime::new(1);
+        let ledger = RuntimeLedger::new(resources(1));
+        let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+        let (mut work, mut capacity) = scope
+            .reserve_next(
+                generation(),
+                ReservationResources::work_only(),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Business)
+            .unwrap();
+        let mut header_ready = work.header_readiness_registration().unwrap();
+        let header = work.retirement_observer();
+        work.start().unwrap();
+        let runtime = ActorRuntime::new();
         let config = ActorConfig {
             mailbox: [4; 4],
             max_batches: 4,
@@ -391,12 +423,14 @@ fn snapshot_commit_and_scope_failure_have_one_publication_order_with_two_preempt
                 aid(1),
                 scope.clone(),
                 SlotId::new(1).unwrap(),
-                SnapshotActor,
+                SnapshotActor {
+                    work: work.reference(),
+                },
                 config,
             )
             .unwrap_or_else(|_| panic!("register actor"));
         let input = runtime
-            .reserve_input(aid(1), aid(2), InputClass::Ordinary)
+            .reserve_admitted_input(aid(1), aid(2), InputClass::Ordinary, &work)
             .unwrap()
             .fill(())
             .unwrap();
@@ -404,6 +438,7 @@ fn snapshot_commit_and_scope_failure_have_one_publication_order_with_two_preempt
         let ticket = runtime
             .take_effect(aid(1), input, ActionId::new(1).unwrap())
             .unwrap();
+        let registration = runtime.registration_from_effect(&ticket).unwrap();
         let snapshot = PublishedSnapshot::new(&scope, Arc::new(0usize));
         let writer_snapshot = snapshot.clone();
         let writer_runtime = runtime.clone();
@@ -414,7 +449,7 @@ fn snapshot_commit_and_scope_failure_have_one_publication_order_with_two_preempt
                         assert_eq!(*old, 0);
                         true
                     }
-                    Err((DriverError::Effect(EffectError::StaleGeneration), value)) => {
+                    Err((DriverError::FailurePublicationRequired, value)) => {
                         assert_eq!(*value, 1);
                         false
                     }
@@ -428,10 +463,66 @@ fn snapshot_commit_and_scope_failure_have_one_publication_order_with_two_preempt
         failure.join().unwrap();
         assert_eq!(*snapshot.read(), usize::from(committed));
         runtime.effect_completed(ticket).unwrap();
-        runtime.retire_input(aid(1), input).unwrap();
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        assert!(!header.is_retired());
+        assert!(
+            header.header_holders().unwrap().0 > 0,
+            "the actual admitted input still retains its original producer header"
+        );
+        // The real committed input owns the last author pin. First arm may
+        // precede or follow its actual release; both orders must route once.
+        let retiring = runtime.clone();
+        let retire = thread::spawn(move || retiring.retire_input(aid(1), input).unwrap());
+        let armed = header_ready.arm(&runtime, &registration, &header).unwrap();
+        assert!(matches!(
+            armed,
+            novarocks_control_runtime::header_readiness::HeaderWaitState::Waiting
+                | novarocks_control_runtime::header_readiness::HeaderWaitState::ReadyToReap
+        ));
+        retire.join().unwrap();
+        let turn = runtime
+            .claim_host_actor()
+            .expect("actual header ready actor");
+        let notices = turn.take_header_readiness(1);
+        assert_eq!(notices.len(), 1);
+        assert!(header_ready.matches(&notices[0]));
+        assert_eq!(notices[0].work(), work.reference());
+        assert!(turn.take_header_readiness(1).is_empty());
+        turn.release(false).unwrap();
+        assert!(!header.is_retired());
+        // Re-arm the same original source, then race cancellation against
+        // actual global -> actor-pending -> host take, without self-notify.
+        assert_eq!(
+            header_ready.arm(&runtime, &registration, &header).unwrap(),
+            novarocks_control_runtime::header_readiness::HeaderWaitState::ReadyToReap
+        );
+        let dispatching = runtime.clone();
+        let dispatch = thread::spawn(move || {
+            let Some(turn) = dispatching.claim_host_actor() else {
+                return Vec::new();
+            };
+            let notices = turn.take_header_readiness(1);
+            turn.release(false).unwrap();
+            notices
+        });
+        header_ready.cancel();
+        let cancelled_notices = dispatch.join().unwrap();
+        assert!(cancelled_notices.len() <= 1);
+        for notice in &cancelled_notices {
+            assert_eq!(notice.work(), work.reference());
+            assert!(!header_ready.matches(notice));
+        }
+        assert!(
+            !header.is_retired(),
+            "cancel cannot invent physical header exit"
+        );
         while let Some(original_host_turn) = runtime.claim_host_actor() {
+            assert!(original_host_turn.take_header_readiness(1).is_empty());
             original_host_turn.release(false).unwrap();
         }
+        capacity.finish().unwrap();
+        ledger.reap_scope_ready(scope.id(), 1).unwrap();
         runtime.remove_actor(aid(1)).unwrap();
         ledger.remove_scope(sid(1)).unwrap();
     });
@@ -442,9 +533,9 @@ fn prepaid_role_fill_and_retirement_have_one_reuse_order_after_close_with_two_pr
     model(|| {
         use loom::sync::Mutex;
         use novarocks_control_runtime::driver::DriverError;
-        let ledger = RuntimeLedger::new(resources(1), 4, 1);
-        let scope = ledger.open_scope(sid(1), None, generation(), 4, 4).unwrap();
-        let runtime = ActorRuntime::new(1);
+        let ledger = RuntimeLedger::new(resources(1));
+        let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+        let runtime = ActorRuntime::new();
         let config = ActorConfig {
             mailbox: [1; 4],
             max_batches: 2,
@@ -501,24 +592,23 @@ fn prepaid_role_fill_and_retirement_have_one_reuse_order_after_close_with_two_pr
 #[test]
 fn concurrent_id_selection_and_admission_never_reorder_the_owner_watermark() {
     model(|| {
-        let ledger = RuntimeLedger::new(resources(2), 2, 1);
-        let scope = ledger.open_scope_next(None, generation(), 2, 2).unwrap();
+        let ledger = RuntimeLedger::new(resources(2));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let mut threads = vec![];
         for _ in 0..2 {
             let scope = scope.clone();
             threads.push(thread::spawn(move || {
-                let (work, bundle) = scope
+                let (work, mut bundle) = scope
                     .reserve_next(
                         generation(),
-                        resources(1),
+                        report_resources(1),
                         WorkKind::Business,
                         WorkAdmission::External,
                     )
                     .unwrap()
                     .bind(WorkKind::Business)
                     .unwrap();
-                let report =
-                    ReportSlot::reserve_next(&scope, generation(), work.id(), 0, []).unwrap();
+                let report = ReportSlot::reserve_next(&mut bundle, generation(), 0, []).unwrap();
                 (work, bundle, report)
             }));
         }
@@ -541,7 +631,8 @@ fn concurrent_id_selection_and_admission_never_reorder_the_owner_watermark() {
             assert!(report.try_retire().unwrap());
             work.body_exited().unwrap();
             work.captures_exited().unwrap();
-            bundle.release(&resources(1)).unwrap();
+            bundle.release_quota(&resources(1)).unwrap();
+            bundle.finish().unwrap();
         }
         assert_eq!(ledger.reap_ready(2).unwrap(), 2);
         scope.close_external().unwrap();
@@ -554,9 +645,9 @@ fn concurrent_id_selection_and_admission_never_reorder_the_owner_watermark() {
 fn input_reservation_racing_removal_cannot_reopen_a_stale_node_with_two_preemptions() {
     model(|| {
         use novarocks_control_runtime::driver::DriverError;
-        let ledger = RuntimeLedger::new(resources(0), 1, 1);
-        let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-        let runtime = ActorRuntime::new(1);
+        let ledger = RuntimeLedger::new(resources(0));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let runtime = ActorRuntime::new();
         runtime
             .register_next(
                 aid(1),
@@ -600,12 +691,12 @@ fn input_reservation_racing_removal_cannot_reopen_a_stale_node_with_two_preempti
 fn reservation_parent_exit_and_unused_child_rollback_share_one_retirement_order() {
     model(|| {
         use novarocks_control_runtime_core::{capacity::CapacityError, scope::ScopeError};
-        let ledger = RuntimeLedger::new(resources(2), 4, 1);
-        let scope = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+        let ledger = RuntimeLedger::new(resources(2));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (mut parent, mut capacity) = scope
             .reserve_next(
                 generation(),
-                resources(1),
+                work_resources(1),
                 WorkKind::Business,
                 WorkAdmission::External,
             )
@@ -625,7 +716,7 @@ fn reservation_parent_exit_and_unused_child_rollback_share_one_retirement_order(
             match deriving.reserve_child_next(
                 generation(),
                 parent_reservation,
-                resources(1),
+                work_resources(1),
                 WorkKind::Business,
             ) {
                 Ok(unbound) => drop(unbound),
@@ -639,7 +730,8 @@ fn reservation_parent_exit_and_unused_child_rollback_share_one_retirement_order(
         child.join().unwrap();
         assert!(parent.actual_exit_ready().unwrap());
         assert_eq!(ledger.reap_scope_ready(scope.id(), 1).unwrap(), 1);
-        capacity.release(&resources(1)).unwrap();
+        capacity.release_quota(&resources(1)).unwrap();
+        capacity.finish().unwrap();
         ledger.remove_scope(scope.id()).unwrap();
         assert!(ledger.is_empty());
     });
@@ -677,12 +769,12 @@ impl Actor for ClosingTimerActor {
 fn timer_source_close_and_advance_preserve_real_pending_input_with_two_preemptions() {
     model(|| {
         use novarocks_control_runtime::driver::TimerSourceState;
-        let ledger = RuntimeLedger::new(resources(1), 4, 1);
-        let scope = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+        let ledger = RuntimeLedger::new(resources(1));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (mut work, mut capacity) = scope
             .reserve_next(
                 generation(),
-                resources(1),
+                work_resources(1),
                 WorkKind::Step,
                 WorkAdmission::External,
             )
@@ -690,7 +782,7 @@ fn timer_source_close_and_advance_preserve_real_pending_input_with_two_preemptio
             .bind(WorkKind::Step)
             .unwrap();
         work.start().unwrap();
-        let runtime = ActorRuntime::new(1);
+        let runtime = ActorRuntime::new();
         runtime
             .register_next(
                 aid(1),
@@ -743,7 +835,8 @@ fn timer_source_close_and_advance_preserve_real_pending_input_with_two_preemptio
         work.captures_exited().unwrap();
         ledger.reap_scope_ready(scope.id(), 1).unwrap();
         let actual = runtime.remove_actor(aid(1)).unwrap();
-        capacity.release(&resources(1)).unwrap();
+        capacity.release_quota(&resources(1)).unwrap();
+        capacity.finish().unwrap();
         ledger.remove_scope(scope.id()).unwrap();
         assert_eq!(filled, inputs.len());
         assert_eq!(
@@ -765,12 +858,12 @@ fn timer_source_close_and_advance_preserve_real_pending_input_with_two_preemptio
 #[test]
 fn split_next_and_reserve_next_share_the_production_identity_transaction() {
     model(|| {
-        let ledger = RuntimeLedger::new(resources(5), 3, 1);
-        let scope = ledger.open_scope_next(None, generation(), 2, 0).unwrap();
+        let ledger = RuntimeLedger::new(resources(5));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (mut original_work, mut original_capacity) = scope
             .reserve_next(
                 generation(),
-                resources(4),
+                work_resources(4),
                 WorkKind::Step,
                 WorkAdmission::External,
             )
@@ -780,7 +873,10 @@ fn split_next_and_reserve_next_share_the_production_identity_transaction() {
         original_work.start().unwrap();
         let original_id = original_capacity.id();
         let split = thread::spawn(move || {
-            let split = original_capacity.split_next(&resources(1));
+            let split = original_capacity.split_next(&ReservationResources::new(
+                resources(1),
+                OwnedSlotNeed::default(),
+            ));
             (original_capacity, split)
         });
         let reserving_scope = scope.clone();
@@ -788,7 +884,7 @@ fn split_next_and_reserve_next_share_the_production_identity_transaction() {
             reserving_scope
                 .reserve_next(
                     generation(),
-                    resources(1),
+                    work_resources(1),
                     WorkKind::Step,
                     WorkAdmission::External,
                 )
@@ -810,17 +906,24 @@ fn split_next_and_reserve_next_share_the_production_identity_transaction() {
         original_work.body_exited().unwrap();
         original_work.captures_exited().unwrap();
         original_capacity
-            .release(&original_capacity.resources().unwrap())
+            .release_quota(&original_capacity.resources().unwrap().quota)
             .unwrap();
+        original_capacity.finish().unwrap();
         if let Ok(mut capacity) = split {
-            capacity.release(&capacity.resources().unwrap()).unwrap();
+            capacity
+                .release_quota(&capacity.resources().unwrap().quota)
+                .unwrap();
+            capacity.finish().unwrap();
         }
         let mut retired_work = 1;
         if let Ok((mut work, mut capacity)) = reserved {
             work.start().unwrap();
             work.body_exited().unwrap();
             work.captures_exited().unwrap();
-            capacity.release(&capacity.resources().unwrap()).unwrap();
+            capacity
+                .release_quota(&capacity.resources().unwrap().quota)
+                .unwrap();
+            capacity.finish().unwrap();
             retired_work += 1;
         }
         scope.close_external().unwrap();
@@ -842,12 +945,12 @@ fn split_next_and_reserve_next_share_the_production_identity_transaction() {
 fn admitted_neutral_input_and_scope_failure_share_the_actual_author_transaction() {
     model(|| {
         use novarocks_control_runtime::driver::DriverError;
-        let ledger = RuntimeLedger::new(resources(1), 1, 1);
-        let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
+        let ledger = RuntimeLedger::new(resources(1));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (mut work, mut capacity) = scope
             .reserve_next(
                 generation(),
-                resources(1),
+                work_resources(1),
                 WorkKind::Settlement,
                 WorkAdmission::External,
             )
@@ -855,7 +958,7 @@ fn admitted_neutral_input_and_scope_failure_share_the_actual_author_transaction(
             .bind(WorkKind::Settlement)
             .unwrap();
         work.start().unwrap();
-        let runtime = ActorRuntime::new(1);
+        let runtime = ActorRuntime::new();
         runtime
             .register_next(
                 aid(1),
@@ -906,7 +1009,10 @@ fn admitted_neutral_input_and_scope_failure_share_the_actual_author_transaction(
         work.captures_exited().unwrap();
         let reaped = ledger.reap_scope_ready(scope.id(), 1).unwrap();
         let actor = runtime.remove_actor(aid(1)).unwrap();
-        capacity.release(&capacity.resources().unwrap()).unwrap();
+        capacity
+            .release_quota(&capacity.resources().unwrap().quota)
+            .unwrap();
+        capacity.finish().unwrap();
         ledger.remove_scope(scope.id()).unwrap();
         assert!(matches!(result, Ok(()) | Err(DriverError::ActorFailed)));
         assert_eq!(inputs, 0);
@@ -928,7 +1034,7 @@ enum EffectForwardInput {
 }
 #[derive(Debug)]
 struct EffectForwardActor {
-    work: WorkId,
+    work: ScopedWorkRef,
     seen: Vec<u64>,
 }
 impl Actor for EffectForwardActor {
@@ -968,7 +1074,7 @@ struct EffectForwardOwner {
     actor: ActorId,
     scope: novarocks_control_runtime::transaction::ScopeHandle,
     work: novarocks_control_runtime::lease::WorkLease,
-    capacity: novarocks_control_runtime::lease::CapacityBundle,
+    capacity: novarocks_control_runtime::lease::ReservationBundle,
 }
 struct EffectForwardFixture {
     ledger: RuntimeLedger,
@@ -977,15 +1083,15 @@ struct EffectForwardFixture {
 }
 impl EffectForwardFixture {
     fn new() -> Self {
-        let ledger = RuntimeLedger::new(resources(2), 2, 2);
-        let runtime = ActorRuntime::new(2);
+        let ledger = RuntimeLedger::new(resources(2));
+        let runtime = ActorRuntime::new();
         let mut owners = Vec::with_capacity(2);
         for actor in [aid(1), aid(2)] {
-            let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
+            let scope = ledger.open_scope_next(None, generation()).unwrap();
             let (mut work, capacity) = scope
                 .reserve_next(
                     generation(),
-                    resources(1),
+                    work_resources(1),
                     WorkKind::Settlement,
                     WorkAdmission::External,
                 )
@@ -998,7 +1104,7 @@ impl EffectForwardFixture {
                     actor,
                     scope.clone(),
                     EffectForwardActor {
-                        work: work.id(),
+                        work: work.reference(),
                         seen: vec![],
                     },
                     ActorConfig {
@@ -1085,7 +1191,8 @@ impl EffectForwardFixture {
         for owner in &mut self.owners {
             self.runtime.seal_actor(owner.actor).unwrap();
             seen.push(self.runtime.remove_actor(owner.actor).unwrap().seen);
-            owner.capacity.release(&resources(1)).unwrap();
+            owner.capacity.release_quota(&resources(1)).unwrap();
+            owner.capacity.finish().unwrap();
             self.ledger.remove_scope(owner.scope.id()).unwrap();
         }
         assert!(self.runtime.is_empty());
@@ -1098,7 +1205,6 @@ impl EffectForwardFixture {
 fn effect_input_forwarding_and_source_failure_have_one_ledger_order_with_two_preemptions() {
     model(|| {
         use novarocks_control_runtime::driver::DriverError;
-        use novarocks_control_runtime_core::effect::EffectError;
         let f = EffectForwardFixture::new();
         let ticket = f.ticket(aid(1));
         let role = f.role(aid(2), aid(1));
@@ -1130,20 +1236,14 @@ fn effect_input_forwarding_and_source_failure_have_one_ledger_order_with_two_pre
                 assert_eq!(receipt, Some(input));
                 assert_eq!(seen, vec![vec![], vec![53]]);
             }
-            Err((
-                DriverError::Effect(EffectError::StaleGeneration),
-                EffectForwardInput::Value(value),
-            )) => {
+            Err((DriverError::FailurePublicationRequired, EffectForwardInput::Value(value))) => {
                 assert_eq!(value, 53);
                 assert_eq!(receipt, None);
                 assert_eq!(seen, vec![vec![], vec![]]);
             }
             other => panic!("unexpected actual forwarding order: {other:?}"),
         }
-        assert_eq!(
-            current_ticket,
-            Err(DriverError::Effect(EffectError::StaleGeneration))
-        );
+        assert_eq!(current_ticket, Err(DriverError::FailurePublicationRequired));
         assert_eq!(paid, [2, 2]);
     });
 }
@@ -1202,7 +1302,7 @@ mod staged_scope_stop_model {
     };
 
     struct StopActor {
-        work: WorkId,
+        work: ScopedWorkRef,
     }
     impl Actor for StopActor {
         type Input = ();
@@ -1231,13 +1331,18 @@ mod staged_scope_stop_model {
     fn actual_step_stop_commit_and_business_start_share_the_original_ledger_with_two_preemptions() {
         model(|| {
             let history = HistoryCapture::new(256);
-            let ledger = RuntimeLedger::with_history(resources(3), 3, 1, history.clone());
-            let scope = ledger.open_scope_next(None, generation(), 3, 1).unwrap();
+            let ledger = RuntimeLedger::with_history(resources(3), history.clone());
+            let scope = ledger.open_scope_next(None, generation()).unwrap();
             let mut roles = Vec::with_capacity(3);
             for kind in [WorkKind::Settlement, WorkKind::Business, WorkKind::Cleanup] {
                 roles.push(
                     scope
-                        .reserve_next(generation(), resources(1), kind, WorkAdmission::External)
+                        .reserve_next(
+                            generation(),
+                            work_resources(1),
+                            kind,
+                            WorkAdmission::External,
+                        )
                         .unwrap()
                         .bind(kind)
                         .unwrap(),
@@ -1248,13 +1353,13 @@ mod staged_scope_stop_model {
             let (mut cleanup, mut cleanup_capacity) = roles.remove(0);
             let business_id = business.id();
             metadata.start().unwrap();
-            let runtime = ActorRuntime::with_history(1, history.clone());
+            let runtime = ActorRuntime::with_history(history.clone());
             runtime
                 .register_next(
                     aid(1),
                     scope.clone(),
                     StopActor {
-                        work: metadata.id(),
+                        work: metadata.reference(),
                     },
                     ActorConfig {
                         mailbox: [1; 4],
@@ -1316,7 +1421,8 @@ mod staged_scope_stop_model {
                 &mut business_capacity,
                 &mut cleanup_capacity,
             ] {
-                capacity.release(&resources(1)).unwrap();
+                capacity.release_quota(&resources(1)).unwrap();
+                capacity.finish().unwrap();
             }
             ledger.remove_scope(scope.id()).unwrap();
             let observed = history.drain(256);

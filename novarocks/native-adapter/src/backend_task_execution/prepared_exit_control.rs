@@ -91,7 +91,12 @@ impl PreparedExitGate {
         // check. The existing Native I/O reactor wakes the original Task;
         // no extra async task, polling timer or Work is created.
         let _entered = runtime.enter();
-        let stream = tokio::io::unix::AsyncFd::new(stream).map_err(|error| error.to_string())?;
+        // SAFETY: this owned UnixStream supplies its one live descriptor. The
+        // AsyncFd keeps ownership until deregistration and drop; our readiness
+        // helpers only borrow it for I/O or shutdown, never replace/close the
+        // descriptor or change its underlying file description.
+        let stream = unsafe { tokio::io::unix::AsyncFd::register(stream) }
+            .map_err(|error| error.to_string())?;
         let cancellation = claim.cancellation();
         let cancellation = Box::pin(async move { cancellation.cancelled().await });
         Ok(Self {

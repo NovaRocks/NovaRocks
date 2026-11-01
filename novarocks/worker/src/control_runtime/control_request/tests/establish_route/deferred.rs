@@ -34,7 +34,13 @@ fn probe_in_handoff_order(f: &mut RouteFixture, input: InputId) -> EstablishRepl
                 }) if request.token == input => result.clone(),
                 _ => panic!("the next actual Context probe follows route handoff order"),
             };
-            host.handoff_establish_probe(probe).unwrap();
+            drop(host);
+            f.assert_original_probe_author(&probe, input);
+            host_address
+                .lock()
+                .unwrap()
+                .handoff_establish_probe(probe)
+                .unwrap();
             return result;
         }
         if claimed < 2 {
@@ -71,6 +77,7 @@ fn finish_conflict_return(
     drop(handle);
     assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 0);
     assert!(thread::spawn(move || disposal.run()).join().unwrap());
+    f.finish_conflict_observation(input);
     assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 1);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 4);
@@ -84,13 +91,16 @@ fn a_deferred_route_releases_its_root_input_and_binds_only_after_real_context_re
     assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 0);
     assert!(f.f.runtime.input_custody(actor(), input).unwrap().is_none());
     assert!(f.f.root.resources().requests.contains_key(&input));
-    assert_eq!(f.f.ledger.used(Dimension::Replies.id()), 2);
+    assert_eq!(f.f.ledger.used(Dimension::Requests.id()), 2);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert!(handle.try_take().is_none());
-    let pending_work = f.f.ledger.used(Dimension::Work.id());
+    let pending_work = f.f.root.resources().scope.snapshot().unwrap().work;
     assert_eq!(advance_route_bindings(&mut f.f.root, 32).unwrap(), 0);
-    assert_eq!(f.f.ledger.used(Dimension::Work.id()), pending_work);
+    assert_eq!(
+        f.f.root.resources().scope.snapshot().unwrap().work,
+        pending_work
+    );
     assert!(f.f.root.take_control_effect(64).unwrap().is_none());
 
     f.adopt_pending_context();
@@ -106,7 +116,42 @@ fn a_deferred_route_releases_its_root_input_and_binds_only_after_real_context_re
             .routes
             .is_empty()
     );
+    let address = f.f.root.service().context(f.f.context).unwrap();
+    let execution_scope = address
+        .lock()
+        .unwrap()
+        .resources_for_test()
+        .scope
+        .as_ref()
+        .unwrap()
+        .clone();
+    let execution_before = execution_scope.snapshot().unwrap();
+    let financial_before = f.f.root.resources().scope.snapshot().unwrap();
+    let original_r = f.f.root.resources().requests[&input].request();
+    assert!(f.f.root.resources().requests[&input].route.is_none());
     assert_eq!(advance_route_bindings(&mut f.f.root, 1).unwrap(), 1);
+    assert_eq!(execution_scope.snapshot().unwrap(), execution_before);
+    let financial_after = f.f.root.resources().scope.snapshot().unwrap();
+    assert_eq!(financial_after.work, financial_before.work + 1);
+    assert_eq!(financial_after.storage, financial_before.storage + 1);
+    assert_eq!(f.f.root.resources().requests[&input].request(), original_r);
+    let route = f.f.root.resources().requests[&input]
+        .route
+        .as_ref()
+        .unwrap();
+    let return_role = route
+        .return_role()
+        .expect("the actual admitted original Root backchannel");
+    assert!(
+        f.f.runtime
+            .role_inventory(actor(), None, 16)
+            .unwrap()
+            .iter()
+            .any(|record| record.role == return_role
+                && record.in_flight.is_none()
+                && record.source == context_actor()
+                && record.class == InputClass::Control)
+    );
     {
         let original_address = f.f.root.service().context(f.f.context).unwrap();
         let mut original_context = original_address.lock().unwrap();
@@ -130,7 +175,7 @@ fn a_deferred_route_releases_its_root_input_and_binds_only_after_real_context_re
             .unwrap()
     );
     finish_conflict_return(&mut f, input, handle, getters, drops);
-    assert_eq!(f.f.ledger.used(Dimension::Replies.id()), 1);
+    assert_eq!(f.f.ledger.used(Dimension::Requests.id()), 1);
     f.finish_model_refusal();
 }
 
@@ -170,12 +215,12 @@ fn cancelling_a_never_registered_target_clears_only_that_original_route_address(
     f.f.runtime.retire_input(actor(), timer_input).unwrap();
     assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 0);
     assert!(f.f.root.resources().requests.contains_key(&input));
-    assert_eq!(f.f.ledger.used(Dimension::Replies.id()), 2);
+    assert_eq!(f.f.ledger.used(Dimension::Requests.id()), 2);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert!(f.f.runtime.snapshot(context_actor()).is_err());
     assert!(thread::spawn(move || disposal.run()).join().unwrap());
     assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 1);
-    assert_eq!(f.f.ledger.used(Dimension::Replies.id()), 1);
+    assert_eq!(f.f.ledger.used(Dimension::Requests.id()), 1);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 4);
     assert!(!f.f.root.resources().requests.contains_key(&input));
@@ -307,7 +352,7 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(f.f.ledger.used(Dimension::Replies.id()), 3);
+    assert_eq!(f.f.ledger.used(Dimension::Requests.id()), 3);
 
     f.adopt_pending_context();
     assert_eq!(advance_route_bindings(&mut f.f.root, 0).unwrap(), 0);
@@ -381,7 +426,7 @@ fn deferred_routes_bind_in_actual_handoff_order_instead_of_root_token_order() {
         earlier_getters,
         earlier_drops,
     );
-    assert_eq!(f.f.ledger.used(Dimension::Replies.id()), 1);
+    assert_eq!(f.f.ledger.used(Dimension::Requests.id()), 1);
     f.finish_model_refusal();
 }
 
@@ -465,19 +510,15 @@ fn a_prepared_transfer_to_an_actually_removed_context_parks_without_work_until_i
         f.f.runtime.snapshot(context_actor()),
         Err(DriverError::UnknownActor)
     );
-    let dimensions = [
-        Dimension::Inputs,
-        Dimension::Batches,
-        Dimension::Effects,
-        Dimension::Work,
-        Dimension::Completions,
-        Dimension::Captures,
-        Dimension::Replies,
-    ];
+    let dimensions = [Dimension::Requests];
     let fees_after_removal = dimensions.map(|dimension| f.f.ledger.used(dimension.id()));
+    let owner_after_removal = f.f.root.resources().scope.snapshot().unwrap();
     let late = prepared.bind();
     let no_new_payment =
-        dimensions.map(|dimension| f.f.ledger.used(dimension.id())) == fees_after_removal;
+        dimensions.map(|dimension| f.f.ledger.used(dimension.id())) == fees_after_removal && {
+            let actual = f.f.root.resources().scope.snapshot().unwrap();
+            actual.work == owner_after_removal.work && actual.storage == owner_after_removal.storage
+        };
     let no_alias = address
         .lock()
         .unwrap()

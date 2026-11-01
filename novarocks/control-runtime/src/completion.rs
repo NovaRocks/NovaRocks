@@ -17,13 +17,50 @@
 
 //! Completion storage has explicit production and consumption legs.
 
+mod actor_consumer;
+pub use actor_consumer::ActorReportConsumer;
+
 use crate::transaction::{LedgerState, RuntimeError, RuntimeLedger, ScopeHandle};
 use novarocks_control_runtime_core::{
-    completion::{CompletionSlot, ConsumerKind, ReturnState},
+    completion::{CompletionError, CompletionSlot, ConsumerKind, ReturnState},
     history::HistoryFact,
-    identity::{ConsumerId, Generation, SlotId, WorkId},
+    identity::{ConsumerId, Generation, ReservationId, SlotId, WorkId},
+    owned_storage::{OwnedPosition, OwnedSlotKind, OwnedStorageError},
 };
 
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+/// Only an original unbound guard or unique reservation bundle can supply the
+/// actual completion position. Raw Scope/Work numbers never implement this.
+pub trait ReportStorageOwner: sealed::Sealed {
+    #[doc(hidden)]
+    fn report_storage(&self) -> (&ScopeHandle, ReservationId);
+}
+pub(crate) struct ReportRecord {
+    value: CompletionSlot,
+    storage: OwnedPosition,
+}
+impl ReportRecord {
+    pub(crate) fn new(value: CompletionSlot, storage: OwnedPosition) -> Self {
+        assert_eq!(storage.kind(), OwnedSlotKind::Completion);
+        Self { value, storage }
+    }
+    pub(crate) fn storage_reservation(&self) -> Option<ReservationId> {
+        self.storage.reservation()
+    }
+}
+impl std::ops::Deref for ReportRecord {
+    type Target = CompletionSlot;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+impl std::ops::DerefMut for ReportRecord {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
 #[derive(Clone)]
 pub struct ReportSlot {
     pub(crate) runtime: RuntimeLedger,
@@ -63,93 +100,100 @@ impl ReportSlot {
         crate::owned_return::claim(self.clone())
     }
     pub fn reserve(
-        scope: &ScopeHandle,
+        owner: &mut impl ReportStorageOwner,
         id: SlotId,
         generation: Generation,
-        producer: WorkId,
         max_consumers: usize,
         consumers: impl IntoIterator<Item = (ConsumerId, ConsumerKind)>,
     ) -> Result<Self, RuntimeError> {
-        let slot =
-            CompletionSlot::new(id, scope.id, generation, producer, max_consumers, consumers)?;
-        let mut state = scope
-            .runtime
-            .shared
-            .state
-            .lock()
-            .expect("runtime ledger lock");
-        if state.slots.contains_key(&id) {
-            return Err(RuntimeError::DuplicateSlot);
-        }
-        let owner = state
-            .scopes
-            .get_mut(&scope.id)
-            .ok_or(RuntimeError::UnknownScope)?;
-        if owner.generation() != generation {
-            return Err(
-                novarocks_control_runtime_core::scope::ScopeError::GenerationMismatch.into(),
-            );
-        }
-        if owner.work(producer).is_none() {
-            return Err(novarocks_control_runtime_core::scope::ScopeError::UnknownWork.into());
-        }
-        state.reserve_slot(scope.id, id)?;
-        state.slots.insert(id, slot);
-        scope.runtime.shared.record(HistoryFact::SlotReserved {
-            scope: scope.id,
-            slot: id,
-        });
-        Ok(Self {
-            runtime: scope.runtime.clone(),
-            id,
-        })
+        Self::reserve_inner(owner, Some(id), generation, max_consumers, consumers)
     }
-    /// Chooses and reserves the globally unique storage identity while holding
-    /// the same ledger transaction as the owner gate and actual slot binding.
+    /// Claims one original completion position and its actual report under the
+    /// same ledger transaction. Iterator execution stays outside every lock.
     pub fn reserve_next(
-        scope: &ScopeHandle,
+        owner: &mut impl ReportStorageOwner,
         generation: Generation,
-        producer: WorkId,
+        max_consumers: usize,
+        consumers: impl IntoIterator<Item = (ConsumerId, ConsumerKind)>,
+    ) -> Result<Self, RuntimeError> {
+        Self::reserve_inner(owner, None, generation, max_consumers, consumers)
+    }
+    fn reserve_inner(
+        owner: &mut impl ReportStorageOwner,
+        explicit: Option<SlotId>,
+        generation: Generation,
         max_consumers: usize,
         consumers: impl IntoIterator<Item = (ConsumerId, ConsumerKind)>,
     ) -> Result<Self, RuntimeError> {
         let read_limit = max_consumers
             .checked_add(1)
-            .ok_or(crate::transaction::RuntimeError::IdentityExhausted)?;
-        // User iterator execution is outside every ledger lock. Only this owned,
-        // bounded vector of neutral identities enters the actual transaction.
+            .ok_or(RuntimeError::IdentityExhausted)?;
         let consumers: Vec<_> = consumers.into_iter().take(read_limit).collect();
+        let (scope, reservation) = owner.report_storage();
         let mut state = scope
             .runtime
             .shared
             .state
             .lock()
             .expect("runtime ledger lock");
-        let owner = state
+        let funding = state
+            .ledger
+            .reservation(reservation)
+            .ok_or(novarocks_control_runtime_core::capacity::CapacityError::UnknownReservation)?;
+        if funding.scope != scope.id {
+            return Err(OwnedStorageError::WrongOwner.into());
+        }
+        if funding.owned_slots().completions == 0 {
+            return Err(OwnedStorageError::MissingPosition(OwnedSlotKind::Completion).into());
+        }
+        let producer = funding.work;
+        let scope_state = state
             .scopes
             .get(&scope.id)
             .ok_or(RuntimeError::UnknownScope)?;
-        if owner.generation() != generation {
+        if scope_state.generation() != generation {
             return Err(
                 novarocks_control_runtime_core::scope::ScopeError::GenerationMismatch.into(),
             );
         }
-        if owner.work(producer).is_none() {
+        if scope_state.work(producer).is_none() {
             return Err(novarocks_control_runtime_core::scope::ScopeError::UnknownWork.into());
         }
-        let id = state.next_slot_id(scope.id)?;
-        let slot =
+        let id = match explicit {
+            Some(id) => {
+                if state.slots.contains_key(&id) {
+                    return Err(RuntimeError::DuplicateSlot);
+                }
+                if scope_state
+                    .next_slot_id()
+                    .map_or(true, |next| id.get() < next.get())
+                {
+                    return Err(
+                        novarocks_control_runtime_core::scope::ScopeError::DuplicateSlot.into(),
+                    );
+                }
+                id
+            }
+            None => state.next_slot_id(scope.id)?,
+        };
+        let value =
             CompletionSlot::new(id, scope.id, generation, producer, max_consumers, consumers)?;
         state.reserve_slot(scope.id, id)?;
-        let previous = state.slots.insert(id, slot);
+        let position = state
+            .ledger
+            .take_owned(reservation, OwnedSlotKind::Completion)
+            .expect("preflighted original completion position");
+        let previous = state.slots.insert(id, ReportRecord::new(value, position));
         assert!(
             previous.is_none(),
-            "monotonic process slot identity is unique"
+            "actual original report position is unique"
         );
-        scope.runtime.shared.record(HistoryFact::SlotReserved {
+        scope.runtime.shared.record(|| HistoryFact::SlotReserved {
             scope: scope.id,
             slot: id,
         });
+        drop(state);
+        scope.runtime.shared.changed.notify();
         Ok(Self {
             runtime: scope.runtime.clone(),
             id,
@@ -185,10 +229,25 @@ impl ReportSlot {
             .expect("validated report is filled exactly once");
         self.runtime
             .shared
-            .record(HistoryFact::SlotFilled { slot: self.id });
+            .record(|| HistoryFact::SlotFilled { slot: self.id });
     }
     pub const fn id(&self) -> SlotId {
         self.id
+    }
+    /// The original declared consumer kind, without granting consumption.
+    pub fn consumer_kind(&self, consumer: ConsumerId) -> Result<ConsumerKind, RuntimeError> {
+        let state = self
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        state
+            .slots
+            .get(&self.id)
+            .ok_or(RuntimeError::UnknownSlot)?
+            .consumer_kind(consumer)
+            .ok_or(RuntimeError::Completion(CompletionError::UnknownConsumer))
     }
     /// Observe this original report's consumer leg. Reading metadata grants
     /// no publication, consumption, producer exit or retirement authority.
@@ -223,7 +282,7 @@ impl ReportSlot {
             .fill()?;
         self.runtime
             .shared
-            .record(HistoryFact::SlotFilled { slot: self.id });
+            .record(|| HistoryFact::SlotFilled { slot: self.id });
         drop(state);
         self.runtime.shared.changed.notify();
         Ok(())
@@ -242,7 +301,10 @@ impl ReportSlot {
             .consume(consumer)?;
         self.runtime
             .shared
-            .record(HistoryFact::CompletionConsumed { slot: self.id });
+            .record(|| HistoryFact::CompletionConsumed {
+                slot: self.id,
+                consumer,
+            });
         drop(state);
         self.runtime.shared.changed.notify();
         Ok(())
@@ -276,9 +338,10 @@ impl ReportSlot {
             .get_mut(&self.id)
             .ok_or(RuntimeError::UnknownSlot)?
             .abandon_owner(consumer, owner.id, failed_generation)?;
-        self.runtime
-            .shared
-            .record(HistoryFact::SlotAbandoned { slot: self.id });
+        self.runtime.shared.record(|| HistoryFact::SlotAbandoned {
+            slot: self.id,
+            consumer,
+        });
         drop(state);
         self.runtime.shared.changed.notify();
         Ok(())
@@ -322,6 +385,21 @@ impl ReportSlot {
         self.runtime.shared.changed.notify();
         Ok(())
     }
+    /// Observe the original report's real producer and consumer exits. This
+    /// does not retire its slot, Work header or any actual child Work.
+    pub fn retirement_ready(&self) -> Result<bool, RuntimeError> {
+        let state = self
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        Ok(state
+            .slots
+            .get(&self.id)
+            .ok_or(RuntimeError::UnknownSlot)?
+            .retirable())
+    }
     pub fn try_retire(&self) -> Result<bool, RuntimeError> {
         let mut state = self
             .runtime
@@ -342,7 +420,7 @@ impl ReportSlot {
         state.slots.remove(&self.id);
         self.runtime
             .shared
-            .record(HistoryFact::SlotRetired { slot: self.id });
+            .record(|| HistoryFact::SlotRetired { slot: self.id });
         drop(state);
         self.runtime.shared.changed.notify();
         Ok(true)

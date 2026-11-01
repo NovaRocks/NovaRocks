@@ -21,11 +21,12 @@
 use crate::control_admission::{AdmissionStorage, ScopeAdmissionPort};
 use novarocks_control_runtime::{
     actor::{Actor, StepContext},
+    driver::InputAuthor,
     transaction::ScopeHandle,
 };
 use novarocks_control_runtime_core::{
     effect::{EffectDescriptor, EffectKind},
-    identity::{ActionId, Generation, InputId, ScopeId, Tick, WorkId},
+    identity::{ActionId, Generation, InputId, ScopeId, ScopedWorkRef, Tick},
     mailbox::InputEnvelope,
 };
 use novarocks_execution_contract::{QueryContextState, TaskIdentity};
@@ -38,14 +39,10 @@ use std::{collections::BTreeMap, time::Duration};
 
 pub(crate) use crate::task_proposal_ingress::RequestMetadata;
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The admitted input already pays for the neutral protocol command; no opaque payload is stored here."
-)]
 #[derive(Debug)]
 pub(crate) enum ContextMessage {
     Command {
-        work: WorkId,
+        work: ScopedWorkRef,
         request: Option<RequestMetadata>,
         command: ContextInput,
     },
@@ -53,7 +50,7 @@ pub(crate) enum ContextMessage {
     /// It changes no pure protocol input and allocates no additional position.
     #[cfg(novarocks_dev_controls)]
     TestOwnerPanicOnRenew {
-        work: WorkId,
+        work: ScopedWorkRef,
         request: RequestMetadata,
         command: ContextInput,
     },
@@ -66,12 +63,12 @@ pub(crate) enum ContextMessage {
 )]
 #[derive(Clone, Debug)]
 pub(crate) enum WorkerAction {
-    AdmissionEpoch(novarocks_execution_contract::AdmissionEpochCapability),
+    AdmissionEpoch(super::node_metrics::ControlAdmissionProjection),
     Context(ContextEffect),
     Control {
         effect: novarocks_worker_protocol::control::ControlEffect,
-        /// The original guard is in the same batch. Ticket grants have no
-        /// host I/O effect of their own, so their body adopts it here.
+        /// Only actual Context materialization has an original guard in this
+        /// batch. Ticket grants carry protocol metadata without a reservation.
         admitted: Option<novarocks_control_runtime_core::identity::ReservationId>,
     },
     Reply(ContextRequestSettlement),
@@ -89,12 +86,18 @@ pub(crate) struct ContextActor {
     scope: ScopeHandle,
     runtime_generation: Generation,
     storage: AdmissionStorage,
-    timer_work: WorkId,
-    lifetime_work: WorkId,
+    timer_work: ScopedWorkRef,
+    lifetime_work: ScopedWorkRef,
+    // Read-only origins only. Reply decisions/once cells remain in their
+    // original pure Core/host owners; no credit is cloned by these proofs.
+    request_authors: BTreeMap<InputId, InputAuthor>,
+    // The builtin timer is the retained actor's one coalesced continuation.
+    // It allocates no Work or second self-mailbox position.
+    retained_continuation: Option<Tick>,
 }
 impl ContextActor {
-    // One pure bounded body, at most six selector probes, and at most one
-    // coalesced scheduling effect. CPU work and paid output slots differ.
+    // The pure bound includes its selector probes and representation swap.
+    // The adapter adds at most one coalesced scheduling effect.
     pub(crate) const MAX_STEP_WORK: usize = ContextCore::MAX_STEP_WORK + 1;
     pub(crate) const MAX_STEP_ACTIONS: usize = ContextCore::MAX_STEP_ACTIONS + 1;
     pub(crate) const TURN_BUDGET: usize = 4 * (Self::MAX_STEP_WORK + 1);
@@ -102,9 +105,15 @@ impl ContextActor {
         core: ContextCore,
         scope: ScopeHandle,
         storage: AdmissionStorage,
-        timer_work: WorkId,
-        lifetime_work: WorkId,
+        timer_work: ScopedWorkRef,
+        lifetime_work: ScopedWorkRef,
     ) -> Self {
+        assert_eq!(timer_work.scope, scope.id(), "original Context timer scope");
+        assert_eq!(
+            lifetime_work.scope,
+            scope.id(),
+            "original Context lifetime scope"
+        );
         let runtime_generation = scope.gates().expect("live context scope").generation;
         Self {
             core,
@@ -113,6 +122,8 @@ impl ContextActor {
             storage,
             timer_work,
             lifetime_work,
+            request_authors: BTreeMap::new(),
+            retained_continuation: None,
         }
     }
 }
@@ -130,6 +141,16 @@ impl Actor for ContextActor {
         step: &mut StepContext<'_, WorkerAction>,
     ) {
         let now = MonotonicInstant::from_origin(Duration::from_nanos(now.0));
+        let metadata_timer = step.is_retained() && matches!(&message, ContextMessage::Timer);
+        if metadata_timer {
+            assert!(
+                matches!(
+                    self.core.state(),
+                    QueryContextState::TerminalRetained | QueryContextState::Gone
+                ),
+                "an original retained actor keeps only terminal protocol state"
+            );
+        }
         #[cfg(novarocks_dev_controls)]
         let panic_on_renew = matches!(&message, ContextMessage::TestOwnerPanicOnRenew { .. });
         let (work, request, command) = match message {
@@ -155,7 +176,17 @@ impl Actor for ContextActor {
                 );
                 (work, Some(request), command)
             }
-            ContextMessage::Timer => (self.timer_work, None, ContextInput::Tick),
+            ContextMessage::Timer => {
+                let command = if metadata_timer
+                    && self.retained_continuation.take().is_some()
+                    && self.core.has_internal_work()
+                {
+                    ContextInput::NextInternal
+                } else {
+                    ContextInput::Tick
+                };
+                (self.timer_work, None, command)
+            }
         };
         let mut admission = ScopeAdmissionPort::new(
             self.scope.clone(),
@@ -163,7 +194,7 @@ impl Actor for ContextActor {
             Some(self.core.identity()),
             self.storage.clone(),
         )
-        .with_parent(self.lifetime_work);
+        .with_parent(self.lifetime_work.work);
         // Keep failure diagnostics neutral and finite. The command may own
         // large domain inputs; never format its payload during unwinding.
         let (input_kind, input_task) = match &command {
@@ -175,9 +206,25 @@ impl Actor for ContextActor {
             ContextInput::Request(_) => ("Request", None),
             _ => ("OtherContextInput", None),
         };
+        let current_author = step.input_author().cloned();
+        if let Some(proof) = &current_author {
+            assert!(
+                proof.work() == work
+                    || (request.is_none() && !step.is_retained() && work.scope == self.scope.id()),
+                "a request keeps its exact author; internal duty stays in the live execution scope"
+            );
+        }
+        if request.is_some() {
+            let proof = current_author.expect("an admitted R has its original runtime author");
+            assert!(
+                self.request_authors.insert(envelope.input, proof).is_none(),
+                "one original proof per R token"
+            );
+        }
         let result = match request {
             Some(request) => {
                 let original = RequestContext {
+                    author: work,
                     token: envelope.input,
                     operation: request.operation,
                     deadline: request.deadline,
@@ -191,6 +238,7 @@ impl Actor for ContextActor {
             None => self.core.handle(now, command, &mut admission),
         }
         .unwrap_or_else(|error| {
+            self.request_authors.clear();
             panic!(
                 "context protocol input preserves its frozen invariants: input={input_kind}, task={input_task:?}, error={error:?}"
             )
@@ -199,6 +247,7 @@ impl Actor for ContextActor {
         if panic_on_renew && request.is_some_and(|request| !now.has_reached(request.deadline)) {
             // The pure decision exists but no effect/reply has left this turn.
             // Common catches this panic and owns the actual scope-failure path.
+            self.request_authors.clear();
             panic!(
                 "declared Context owner panic context={:?} operation={}",
                 self.core.identity(),
@@ -206,12 +255,14 @@ impl Actor for ContextActor {
             );
         }
         let internal_ready = self.core.has_internal_work();
-        if matches!(
-            self.core.state(),
-            QueryContextState::Aborting
-                | QueryContextState::Releasing
-                | QueryContextState::TerminalRetained
-        ) {
+        if !step.is_retained()
+            && matches!(
+                self.core.state(),
+                QueryContextState::Aborting
+                    | QueryContextState::Releasing
+                    | QueryContextState::TerminalRetained
+            )
+        {
             // Commit the start fence with this same pure decision, before a
             // host consumes any stop/release effect. Already started work and
             // conclusion-before-stop publication keep their separate duties.
@@ -224,7 +275,13 @@ impl Actor for ContextActor {
         let guards = admission.take_guards();
         let mut reservations = BTreeMap::new();
         for guard in guards {
-            reservations.insert(guard.reservation_id(), guard.work_id());
+            reservations.insert(
+                guard.reservation_id(),
+                ScopedWorkRef {
+                    scope: guard.scope().id(),
+                    work: guard.work_id(),
+                },
+            );
             if let Err((error, guard)) = step.reservation(guard) {
                 // Still pure and unbound. Roll back outside every ledger lock.
                 drop(guard);
@@ -247,6 +304,24 @@ impl Actor for ContextActor {
             ) {
                 continue;
             }
+            if step.is_retained()
+                && matches!(
+                    &effect,
+                    ContextEffect::RetainContext { .. }
+                        | ContextEffect::Expired { .. }
+                        | ContextEffect::WakeInternal
+                )
+            {
+                step.metadata(WorkerAction::Context(effect))
+                    .unwrap_or_else(|(error, _)| {
+                        panic!("bounded Context metadata handoff: {error:?}")
+                    });
+                continue;
+            }
+            assert!(
+                !metadata_timer,
+                "a retained timer emits only original neutral metadata"
+            );
             let mut dependencies = Vec::new();
             let mut effect_work = work;
             let kind = match &effect {
@@ -349,10 +424,20 @@ impl Actor for ContextActor {
             } else {
                 dependencies.extend(publications.values().copied());
             }
-            step.effect(
+            let proof = self
+                .request_authors
+                .remove(&reply.request.token)
+                .expect("the pure reply returns its original R origin");
+            assert_eq!(
+                proof.work(),
+                reply.request.author,
+                "pure request metadata preserves the original author"
+            );
+            step.effect_from_author(
+                &proof,
                 EffectDescriptor {
                     id: ActionId::new(next).unwrap(),
-                    work,
+                    work: reply.request.author,
                     kind: EffectKind::Reply,
                     dependencies,
                 },
@@ -360,7 +445,10 @@ impl Actor for ContextActor {
             )
             .unwrap_or_else(|(error, _)| panic!("bounded context reply handoff: {error:?}"));
         }
-        if internal_ready {
+        self.retained_continuation = (internal_ready && step.is_retained()).then_some(Tick(
+            u64::try_from(now.since_origin().as_nanos()).expect("runtime Tick fits its origin"),
+        ));
+        if internal_ready && !step.is_retained() {
             next += 1;
             step.effect(
                 EffectDescriptor {
@@ -378,6 +466,9 @@ impl Actor for ContextActor {
         self.core
             .next_deadline()
             .map(|at| Tick(u64::try_from(at.since_origin().as_nanos()).unwrap_or(u64::MAX)))
+            .into_iter()
+            .chain(self.retained_continuation)
+            .min()
     }
     fn owner_failed(
         scope: ScopeId,

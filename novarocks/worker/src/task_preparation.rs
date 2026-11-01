@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Reservation-owned preparation exit, preceding optional Task acceptance.
-//! No observer here owns a session, Task control, reporter, or execution work.
+//! Provider-child rollback and adoption under the original preparation holder.
+//! Input, body unwind and whole-report custody belong to control_runtime::preparation.
 
 use crate::failure_reason::WorkerFailureReason as R;
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
@@ -103,21 +103,8 @@ enum Step {
     Adopt,
     ChildDrop,
     Publication,
-    StandDown,
-    BodyPanic,
 }
-pub(crate) const STEPS: usize = Step::BodyPanic as usize + 1;
-// Each role belongs to one lexically bounded, once-only body boundary. A
-// retained-bytes unwind and its independent input destructor may both fail.
-#[derive(Clone, Copy)]
-#[repr(usize)]
-pub(crate) enum PreparationUnwindRole {
-    Admission,
-    Preparation,
-    Input,
-    Tail,
-}
-pub(crate) const BODY_ROLES: usize = PreparationUnwindRole::Tail as usize + 1;
+const STEPS: usize = Step::Publication as usize + 1;
 type Payload = Box<dyn Any + Send>;
 type PanicCustody = [Option<ManuallyDrop<Payload>>; STEPS];
 
@@ -125,13 +112,6 @@ struct State {
     mode: Mode,
     body_exited: bool,
     registered: bool,
-    settled: bool,
-    handed_off: bool,
-    admission_exited: bool,
-    body_roles: [Phase; BODY_ROLES],
-    body_payloads: [Option<ManuallyDrop<Payload>>; BODY_ROLES],
-    body_secondary: [Option<ManuallyDrop<Payload>>; BODY_ROLES],
-    body_publication: [Option<ManuallyDrop<Payload>>; BODY_ROLES],
     child: Option<Arc<dyn TaskPreparationChild>>,
     output_exit: Option<TaskPreparationOutputExit>,
     phases: [Phase; STEPS],
@@ -143,9 +123,6 @@ struct State {
 pub(crate) struct TaskPreparationScope {
     identity: TaskIdentity,
     health: Arc<ExecutionHealth>,
-    // A reserved input remains owned even before there is Accepted Task status.
-    // This separate, private loan lock never spans foreign destruction.
-    input: Mutex<Option<ManuallyDrop<novarocks_execution_contract::TaskCreationInput>>>,
     state: Mutex<State>,
 }
 
@@ -186,18 +163,10 @@ impl TaskPreparationScope {
         Self {
             identity,
             health,
-            input: Mutex::new(None),
             state: Mutex::new(State {
                 mode: Mode::Preparing,
                 body_exited: false,
                 registered: false,
-                settled: false,
-                handed_off: false,
-                admission_exited: true,
-                body_roles: [Phase::NotStarted; BODY_ROLES],
-                body_payloads: std::array::from_fn(|_| None),
-                body_secondary: std::array::from_fn(|_| None),
-                body_publication: std::array::from_fn(|_| None),
                 child: None,
                 output_exit: None,
                 phases: [Phase::NotStarted; STEPS],
@@ -208,163 +177,6 @@ impl TaskPreparationScope {
     pub(crate) fn identity(&self) -> TaskIdentity {
         self.identity
     }
-    pub(crate) fn install_input(&self, input: novarocks_execution_contract::TaskCreationInput) {
-        let mut slot = self.input.lock().expect("preparation input loan lock");
-        assert!(slot.is_none(), "one original reserved input");
-        *slot = Some(ManuallyDrop::new(input));
-    }
-    pub(crate) fn input_retained_bytes(&self) -> usize {
-        let input = self.input.lock().expect("preparation input loan lock");
-        // Catch while borrowing the holder, then release the loan normally.
-        // A foreign size method cannot poison the original holder's mutex.
-        let measured = catch_unwind(AssertUnwindSafe(|| {
-            input
-                .as_ref()
-                .expect("original reserved input")
-                .retained_bytes()
-        }));
-        drop(input);
-        match measured {
-            Ok(bytes) => bytes,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-    }
-    pub(crate) fn take_input(&self) -> novarocks_execution_contract::TaskCreationInput {
-        let input = self
-            .input
-            .lock()
-            .expect("preparation input loan lock")
-            .take()
-            .expect("one original reserved input transfer");
-        ManuallyDrop::into_inner(input)
-    }
-    pub(crate) fn dispose_input(&self) -> Result<(), Payload> {
-        let input = self
-            .input
-            .lock()
-            .expect("preparation input loan lock")
-            .take();
-        catch_unwind(AssertUnwindSafe(|| {
-            drop(input.map(ManuallyDrop::into_inner))
-        }))
-    }
-    pub(crate) fn begin_admission(&self) {
-        self.state
-            .lock()
-            .expect("preparation child scope lock")
-            .admission_exited = false;
-    }
-    pub(crate) fn admission_exited(&self) {
-        self.state
-            .lock()
-            .expect("preparation child scope lock")
-            .admission_exited = true;
-    }
-    pub(crate) fn hand_off_body(&self) {
-        self.state
-            .lock()
-            .expect("preparation child scope lock")
-            .handed_off = true;
-    }
-    pub(crate) fn body_handed_off(&self) -> bool {
-        self.state
-            .lock()
-            .expect("preparation child scope lock")
-            .handed_off
-    }
-    fn body_obligations_exited(state: &State) -> bool {
-        state.admission_exited
-            && state
-                .body_roles
-                .iter()
-                .all(|phase| matches!(phase, Phase::NotStarted | Phase::Exited))
-            && state.body_publication.iter().all(Option::is_none)
-    }
-    pub(crate) fn allows_runtime_exit_publication(&self) -> bool {
-        let state = self.state.lock().expect("preparation child scope lock");
-        // Preserve the established normal no-child publication tail. Only an
-        // actual body-unwind obligation closes this gate, before its author
-        // can wake any runtime cleanup through the Task conclusion port.
-        state
-            .body_roles
-            .iter()
-            .all(|phase| matches!(phase, Phase::NotStarted | Phase::Exited))
-            && state.body_publication.iter().all(Option::is_none)
-    }
-    fn report_body_fault(&self, reason: R) {
-        // Identity here is neutral location metadata, including before Accepted.
-        self.health.report_unresolved(
-            ExecutionExitOrigin::Task {
-                identity: self.identity,
-                phase: TaskFailurePhase::Preparation,
-            },
-            FailureFact::new(FailureClass::Unexpected, reason.reason()),
-        );
-    }
-    pub(crate) fn retain_body_panic(&self, role: PreparationUnwindRole, payload: Payload) {
-        let payload = ManuallyDrop::new(payload);
-        let mut state = self.state.lock().expect("preparation child scope lock");
-        let role = role as usize;
-        assert!(
-            state.body_roles[role] == Phase::NotStarted,
-            "one unwind per original body boundary"
-        );
-        state.body_roles[role] = Phase::Started;
-        state.phases[Step::BodyPanic as usize] = Phase::Started;
-        state.body_payloads[role] = Some(payload);
-    }
-    pub(crate) fn body_failure_publication_panicked(
-        &self,
-        role: PreparationUnwindRole,
-        payload: Payload,
-    ) {
-        let payload = ManuallyDrop::new(payload);
-        {
-            let mut state = self.state.lock().expect("preparation child scope lock");
-            let slot = &mut state.body_publication[role as usize];
-            assert!(slot.is_none(), "one original failure publication attempt");
-            *slot = Some(payload);
-            state.phases[Step::BodyPanic as usize] = Phase::Unresolved;
-        }
-        self.report_body_fault(R::PreparationExitPublication);
-    }
-    pub(crate) fn dispose_body_panic(&self, role: PreparationUnwindRole) {
-        let role = role as usize;
-        let payload = {
-            let mut state = self.state.lock().expect("preparation child scope lock");
-            assert!(
-                state.body_roles[role] == Phase::Started,
-                "once-only opaque disposal"
-            );
-            state.body_payloads[role]
-                .take()
-                .expect("original opaque payload custody")
-        };
-        let dropped = catch_unwind(AssertUnwindSafe(|| drop(ManuallyDrop::into_inner(payload))));
-        let mut state = self.state.lock().expect("preparation child scope lock");
-        match dropped {
-            Ok(()) => state.body_roles[role] = Phase::Exited,
-            Err(payload) => {
-                state.body_roles[role] = Phase::Unresolved;
-                state.body_secondary[role] = Some(ManuallyDrop::new(payload));
-                state.phases[Step::BodyPanic as usize] = Phase::Unresolved;
-                drop(state);
-                self.report_body_fault(R::PreparationPanicPayloadDrop);
-                return;
-            }
-        }
-        let opaque_exited = state
-            .body_roles
-            .iter()
-            .all(|phase| matches!(phase, Phase::NotStarted | Phase::Exited))
-            && state.body_publication.iter().all(Option::is_none);
-        state.phases[Step::BodyPanic as usize] = if opaque_exited {
-            Phase::Exited
-        } else {
-            Phase::Unresolved
-        };
-    }
-
     pub(crate) fn register(
         &self,
         child: Arc<dyn TaskPreparationChild>,
@@ -463,9 +275,14 @@ impl TaskPreparationScope {
         };
         self.once(step, reason, action);
     }
+    /// Read only this original provider owner's physical body observation.
+    /// Source disposal and provider-child exit do not create this fact.
+    #[cfg(test)]
     pub(crate) fn physical_bodies_exited(&self) -> bool {
-        let state = self.state.lock().expect("preparation child scope lock");
-        state.body_exited && state.admission_exited
+        self.state
+            .lock()
+            .expect("preparation child scope lock")
+            .body_exited
     }
     pub(crate) fn body_exited(&self) {
         self.state
@@ -479,7 +296,6 @@ impl TaskPreparationScope {
     pub(crate) fn host_captures_exited(&self) -> bool {
         let state = self.state.lock().expect("preparation child scope lock");
         state.body_exited
-            && Self::body_obligations_exited(&state)
             && Self::started_actions_exited(&state)
             && state.phases[Step::ChildDrop as usize] == Phase::Exited
             && match state.mode {
@@ -552,8 +368,7 @@ impl TaskPreparationScope {
                 Phase::Exited => {
                     drop(state);
                     let child_exited = self.clear_child();
-                    let state = self.state.lock().expect("preparation child scope lock");
-                    return child_exited && Self::body_obligations_exited(&state);
+                    return child_exited;
                 }
                 Phase::NotStarted => state.phases[Step::Poll as usize] = Phase::Started,
             }
@@ -587,9 +402,7 @@ impl TaskPreparationScope {
                     state.output_exit = Some(output);
                     state.phases[Step::Poll as usize] = Phase::Exited;
                 }
-                let child_exited = self.clear_child();
-                let state = self.state.lock().expect("preparation child scope lock");
-                child_exited && Self::body_obligations_exited(&state)
+                self.clear_child()
             }
             Ok(TaskPreparationChildExit::Unresolved) => {
                 self.fault(R::PreparationChildUnresolved, Step::Poll, None);
@@ -611,7 +424,6 @@ impl TaskPreparationScope {
         if state.mode != Mode::Rollback
             || state.phases[Step::Adopt as usize] != Phase::NotStarted
             || !state.body_exited
-            || !Self::body_obligations_exited(&state)
             || !Self::started_actions_exited(&state)
             || state.child.is_some()
             || state.output_exit.is_none()
@@ -639,10 +451,9 @@ impl TaskPreparationScope {
             let mut state = self.state.lock().expect("preparation child scope lock");
             tracing::debug!(pid = std::process::id(), task = ?self.identity,
                 mode = ?state.mode, body_exited = state.body_exited,
-                admission_exited = state.admission_exited,
                 child_present = state.child.is_some(),
                 "Original preparation received its physical activation attempt");
-            if !state.body_exited || !state.admission_exited {
+            if !state.body_exited {
                 return false;
             }
             match state.mode {
@@ -681,13 +492,6 @@ impl TaskPreparationScope {
         state.mode = Mode::Adopted;
         true
     }
-    pub(crate) fn stand_down(&self, action: impl FnOnce()) -> bool {
-        let done = self.once(Step::StandDown, R::PreparationRuntimeStandDown, action);
-        if !done && self.is_unresolved(Step::StandDown) {
-            self.request_rollback();
-        }
-        done
-    }
     /// Runtime activation is independent owned cleanup work. Unknown opaque
     /// body custody keeps the original P, but cannot strand installed operators
     /// after their original Task cause has already stood them down.
@@ -724,46 +528,7 @@ impl TaskPreparationScope {
         }
         let child_retired = self.clear_child();
         let state = self.state.lock().expect("preparation child scope lock");
-        Ok(child_retired
-            && state.mode == Mode::Adopted
-            && Self::body_obligations_exited(&state)
-            && Self::started_actions_exited(&state))
-    }
-    pub(crate) fn finish(&self, action: impl FnOnce()) -> bool {
-        if !Self::body_obligations_exited(&self.state.lock().expect("preparation child scope lock"))
-        {
-            return false;
-        }
-        // Claim before any observable publication. A panic is never retried.
-        if !self.once(Step::Publication, R::PreparationExitPublication, action) {
-            if self.is_unresolved(Step::Publication) {
-                self.request_rollback();
-            }
-            return false;
-        }
-        self.clear_child()
-    }
-    /// A legacy caller may supply genuine runtime actual-stop before its
-    /// preparation's final metadata tail returned. Only an originally empty
-    /// child scope can complete that way; a retired record is not evidence.
-    pub(crate) fn complete_empty_after_actual_runtime_exit(
-        &self,
-        actual_stopped: bool,
-        publish: impl FnOnce(),
-    ) -> bool {
-        let empty_body_exited = {
-            let state = self.state.lock().expect("preparation child scope lock");
-            state.body_exited && !state.registered
-        };
-        actual_stopped && empty_body_exited && self.adopt_runtime() && self.finish(publish)
-    }
-    pub(crate) fn claim_settlement(&self) -> bool {
-        let mut state = self.state.lock().expect("preparation child scope lock");
-        if state.settled {
-            return false;
-        }
-        state.settled = true;
-        true
+        Ok(child_retired && state.mode == Mode::Adopted && Self::started_actions_exited(&state))
     }
 }
 

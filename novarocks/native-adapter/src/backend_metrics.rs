@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+mod runtime_control;
 
 use crate::management_http::RoleMetricsRenderer;
 use novarocks_memory::attribution::readout::{
@@ -47,8 +48,14 @@ pub struct BackendMetricsRegistry {
     root_ownership_snapshot_available: IntGauge,
     control_plane_gauges: IntGaugeVec,
     control_plane_snapshot_available: IntGauge,
+    runtime_control: runtime_control::RuntimeControlMetrics,
     execution_quiescence_gauges: IntGaugeVec,
     execution_quiescence_snapshot_available: IntGauge,
+    admission_gauges: IntGaugeVec,
+    admission_snapshot_available: IntGauge,
+    protocol_retention_gauges: IntGaugeVec,
+    protocol_retention_available: IntGaugeVec,
+    inbound_retention: Option<Arc<novarocks_worker::TaskInboundCapabilities>>,
     process_memory: Option<(ProcessMemoryObservation, ProcessMemoryGauges)>,
     scrape_lock: std::sync::Mutex<()>,
 }
@@ -475,6 +482,40 @@ impl BackendMetricsRegistry {
         registry
             .register(Box::new(execution_quiescence_snapshot_available.clone()))
             .map_err(|error| format!("register execution quiescence availability: {error}"))?;
+        let protocol_retention_gauges = IntGaugeVec::new(
+            Opts::new(
+                "novarocks_backend_protocol_retention",
+                "Original retained-owner records and metadata_bytes_estimate over independent nonblocking samples. Estimates cover documented inline fields/container elements only; indirect Arc backing, tree/hash nodes and allocator overhead are unmeasured, never actual allocation/RSS or capacity. Compact contexts and failed custodians may overlap after cold owner failure.",
+            ), &["owner", "resource"],
+        ).map_err(|error| format!("construct protocol retention metrics: {error}"))?;
+        registry
+            .register(Box::new(protocol_retention_gauges.clone()))
+            .map_err(|error| format!("register protocol retention metrics: {error}"))?;
+        let protocol_retention_available = IntGaugeVec::new(
+            Opts::new("novarocks_backend_protocol_retention_snapshot_available", "Whether this scrape obtained the original nonblocking owner inventory. Missing/busy/poisoned owners omit that owner's rows, never stale or default zero records."),
+            &["owner"],
+        ).map_err(|error| format!("construct protocol retention availability: {error}"))?;
+        registry
+            .register(Box::new(protocol_retention_available.clone()))
+            .map_err(|error| format!("register protocol retention availability: {error}"))?;
+        let admission_gauges = IntGaugeVec::new(
+            Opts::new(
+                "novarocks_backend_worker_admission",
+                "Original committed Issued/Redeemed grants not yet terminal (logical_live_grants). This metadata count grants no capacity and proves no physical exit.",
+            ), &[
+                "resource",
+            ],
+        ).map_err(|error| format!("construct original admission metrics: {error}"))?;
+        registry
+            .register(Box::new(admission_gauges.clone()))
+            .map_err(|error| format!("register original admission metrics: {error}"))?;
+        let admission_snapshot_available = IntGauge::with_opts(Opts::new(
+            "novarocks_backend_worker_admission_snapshot_available",
+            "Whether all original admission fields were available without blocking. Busy, poisoned or unrepresentable observations omit the whole family; no stale or default zero grant count is substituted.",
+        )).map_err(|error| format!("construct original admission availability: {error}"))?;
+        registry
+            .register(Box::new(admission_snapshot_available.clone()))
+            .map_err(|error| format!("register original admission availability: {error}"))?;
         let preparation_gauges = IntGaugeVec::new(
             Opts::new("novarocks_backend_task_preparation", "Actual preparation charges and independently sampled original physical fair-queue occupancy. Charges include retained/exiting holders; queue/worker counts do not prove whole exit."),
             &["resource", "dimension"],
@@ -511,7 +552,6 @@ impl BackendMetricsRegistry {
             Box::new(Lazy::force(&BACKEND_NATIVE_TRANSPORT_REFUSED).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_LANE_CONNECTIONS).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_LANE_STREAMS).clone()),
-            Box::new(Lazy::force(&BACKEND_NATIVE_CONTROL_QUEUE_WAIT).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_BLOCKING_QUEUE_WAIT).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_ASYNC_FIRST_POLL_LAG).clone()),
             Box::new(Lazy::force(&BACKEND_SATURATION_SOURCE_AVAILABLE).clone()),
@@ -538,6 +578,7 @@ impl BackendMetricsRegistry {
         )?;
         novarocks_execution::runtime::scan_stream_metrics::register_scan_stream_metrics(&registry)?;
         Ok(Self {
+            runtime_control: runtime_control::RuntimeControlMetrics::new(&registry)?,
             registry,
             native_query_resources: None,
             worker_node: None,
@@ -551,6 +592,11 @@ impl BackendMetricsRegistry {
             control_plane_snapshot_available,
             execution_quiescence_gauges,
             execution_quiescence_snapshot_available,
+            admission_gauges,
+            admission_snapshot_available,
+            protocol_retention_gauges,
+            protocol_retention_available,
+            inbound_retention: None,
             process_memory: None,
             scrape_lock: std::sync::Mutex::new(()),
         })
@@ -643,9 +689,19 @@ impl BackendMetricsRegistry {
         self
     }
 
+    /// Composition supplies the same original inbound owner used by listeners.
+    pub fn with_inbound_retention(
+        mut self,
+        capabilities: Arc<novarocks_worker::TaskInboundCapabilities>,
+    ) -> Self {
+        self.inbound_retention = Some(capabilities);
+        self
+    }
+
     fn gather(&self) -> Result<Vec<prometheus::proto::MetricFamily>, String> {
         // Keep owner sampling, gauge projection and collection in one scrape order.
         let _scrape = self.scrape_lock.lock().expect("backend metric scrape lock");
+        self.runtime_control.sample(self.worker_node.as_ref());
         let node = self
             .worker_node
             .as_ref()
@@ -658,7 +714,6 @@ impl BackendMetricsRegistry {
                 ("preparing_tasks", snapshot.preparing_tasks),
                 ("preparing_bytes", snapshot.preparing_bytes),
                 ("requests", snapshot.requests),
-                ("tickets", snapshot.tickets),
                 ("contexts", snapshot.contexts),
             ] {
                 self.worker_node_gauges
@@ -719,6 +774,60 @@ impl BackendMetricsRegistry {
                 self.execution_quiescence_gauges
                     .with_label_values(&[resource])
                     .set(i64::try_from(used).expect("checked execution quiescence metric"));
+            }
+        }
+        let admission = self
+            .worker_node
+            .as_ref()
+            .and_then(|owner| owner.try_admission_snapshot())
+            .and_then(|sample| {
+                Some([(
+                    "logical_live_grants",
+                    i64::try_from(sample.logical_live_grants).ok()?,
+                )])
+            });
+        self.admission_snapshot_available
+            .set(i64::from(admission.is_some()));
+        if let Some(rows) = admission {
+            for (resource, value) in rows {
+                self.admission_gauges
+                    .with_label_values(&[resource])
+                    .set(value);
+            }
+        }
+        // Reset before sampling so partial/unknown owners cannot leave stale
+        // labels behind. These observations never invoke Core or advance time.
+        self.protocol_retention_gauges.reset();
+        let protocol = self
+            .worker_node
+            .as_ref()
+            .and_then(|owner| owner.try_protocol_retention_snapshot())
+            .and_then(protocol_retention_values);
+        for owner in ["context", "ticket", "control"] {
+            self.protocol_retention_available
+                .with_label_values(&[owner])
+                .set(i64::from(protocol.is_some()));
+        }
+        if let Some(rows) = protocol {
+            for (owner, resource, value) in rows {
+                self.protocol_retention_gauges
+                    .with_label_values(&[owner, resource])
+                    .set(value);
+            }
+        }
+        let inbound = self
+            .inbound_retention
+            .as_ref()
+            .and_then(|owner| owner.try_normal_close_retention_snapshot())
+            .and_then(inbound_retention_values);
+        self.protocol_retention_available
+            .with_label_values(&["inbound"])
+            .set(i64::from(inbound.is_some()));
+        if let Some(rows) = inbound {
+            for (resource, value) in rows {
+                self.protocol_retention_gauges
+                    .with_label_values(&["inbound", resource])
+                    .set(value);
             }
         }
         let preparation = match &self.worker_node {
@@ -797,8 +906,116 @@ impl BackendMetricsRegistry {
         if preparation.is_none() {
             families.retain(|family| family.get_name() != "novarocks_backend_task_preparation");
         }
+        if admission.is_none() {
+            families.retain(|family| family.get_name() != "novarocks_backend_worker_admission");
+        }
         Ok(families)
     }
+}
+
+fn protocol_retention_values(
+    snapshot: novarocks_worker::WorkerProtocolRetentionSnapshot,
+) -> Option<Vec<(&'static str, &'static str, i64)>> {
+    let mut rows = Vec::with_capacity(16);
+    for (owner, resource, value) in [
+        (
+            "context",
+            "compact_contexts",
+            snapshot.contexts.compact_contexts,
+        ),
+        (
+            "context",
+            "failed_custodians",
+            snapshot.contexts.failed_custodians,
+        ),
+        (
+            "ticket",
+            "ticket_records",
+            snapshot.admission.ticket_records,
+        ),
+        (
+            "ticket",
+            "acquisition_decisions",
+            snapshot.admission.acquisition_decisions,
+        ),
+        (
+            "ticket",
+            "replay_decisions",
+            snapshot.admission.replay_decisions,
+        ),
+        (
+            "ticket",
+            "expiry_entries",
+            snapshot.admission.expiry_entries,
+        ),
+        (
+            "control",
+            "directory_records",
+            snapshot.control.directory_records,
+        ),
+        (
+            "control",
+            "frontend_fences",
+            snapshot.control.frontend_fences,
+        ),
+    ] {
+        rows.push((owner, resource, i64::try_from(value).ok()?));
+    }
+    for (owner, resource, value) in [
+        (
+            "context",
+            "decided_task_records",
+            snapshot.contexts.decided_task_records,
+        ),
+        (
+            "context",
+            "metadata_bytes_estimate",
+            snapshot.contexts.metadata_bytes_estimate,
+        ),
+        (
+            "ticket",
+            "metadata_bytes_estimate",
+            snapshot.admission.metadata_bytes_estimate,
+        ),
+        (
+            "control",
+            "metadata_bytes_estimate",
+            snapshot.control.metadata_bytes_estimate,
+        ),
+    ] {
+        rows.push((
+            owner,
+            match resource {
+                "decided_task_records" => "decided_task_records_available",
+                _ => "metadata_bytes_estimate_available",
+            },
+            i64::from(value.is_some()),
+        ));
+        if let Some(value) = value {
+            rows.push((owner, resource, i64::try_from(value).ok()?));
+        }
+    }
+    // Explicitly unknown: these structural estimates are not complete heaps.
+    for owner in ["context", "ticket", "control"] {
+        rows.push((owner, "indirect_backing_bytes_available", 0));
+    }
+    Some(rows)
+}
+fn inbound_retention_values(
+    snapshot: novarocks_worker::InboundRetentionSnapshot,
+) -> Option<Vec<(&'static str, i64)>> {
+    let mut rows = vec![
+        ("records", i64::try_from(snapshot.records).ok()?),
+        (
+            "metadata_bytes_estimate_available",
+            i64::from(snapshot.metadata_bytes_estimate.is_some()),
+        ),
+        ("indirect_backing_bytes_available", 0),
+    ];
+    if let Some(bytes) = snapshot.metadata_bytes_estimate {
+        rows.push(("metadata_bytes_estimate", i64::try_from(bytes).ok()?));
+    }
+    Some(rows)
 }
 
 /// Encode only the original bounded atomic records; no owner locks or
@@ -848,13 +1065,12 @@ fn control_plane_values(
 /// Pure scalar projection; the original owner supplied every field.
 fn execution_quiescence_values(
     sample: novarocks_worker::WorkerExecutionQuiescenceSnapshot,
-) -> [(&'static str, u64); 16] {
+) -> [(&'static str, u64); 15] {
     [
         ("active_tasks", sample.active_tasks),
         ("preparing_tasks", sample.preparing_tasks),
         ("preparing_bytes", sample.preparing_bytes),
         ("requests", sample.requests),
-        ("tickets", sample.tickets),
         (
             "contexts_with_execution_custody",
             sample.contexts_with_execution_custody,
@@ -1096,18 +1312,6 @@ pub fn backend_native_transport_observer()
 -> std::sync::Arc<dyn crate::native_lane::NativeTransportObserver> {
     std::sync::Arc::new(BackendNativeTransportMetrics)
 }
-
-static BACKEND_NATIVE_CONTROL_QUEUE_WAIT: Lazy<HistogramVec> = Lazy::new(|| {
-    HistogramVec::new(
-        HistogramOpts::new(
-            "novarocks_backend_native_control_queue_wait_seconds",
-            "Wait from bounded control executor enqueue to work start.",
-        )
-        .buckets(vec![0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 300.0]),
-        &["outcome"],
-    )
-    .expect("construct Native control queue wait histogram")
-});
 
 static BACKEND_NATIVE_BLOCKING_QUEUE_WAIT: Lazy<HistogramVec> = Lazy::new(|| {
     HistogramVec::new(
@@ -1448,12 +1652,6 @@ pub(crate) fn native_response_backing_change(class: &'static str, kind: &'static
         .add(delta);
 }
 
-pub(crate) fn native_control_queue_wait(outcome: &'static str, duration: std::time::Duration) {
-    BACKEND_NATIVE_CONTROL_QUEUE_WAIT
-        .with_label_values(&[outcome])
-        .observe(duration.as_secs_f64());
-}
-
 pub(crate) fn native_blocking_queue_wait(method: &'static str, duration: std::time::Duration) {
     BACKEND_NATIVE_BLOCKING_QUEUE_WAIT
         .with_label_values(&[method])
@@ -1684,6 +1882,13 @@ mod tests {
             _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
         ) {
         }
+        fn retire_receiver_checked(
+            &self,
+            _: &novarocks_execution_contract::TaskDescriptor,
+            _: novarocks_worker::TaskIngressRetirement,
+        ) -> Result<(), novarocks_worker::HostRejection> {
+            panic!("metrics fixture must not retire a receiver")
+        }
         fn install_inbound_capability(
             &self,
             _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
@@ -1713,37 +1918,29 @@ mod tests {
         }
     }
 
-    fn preparation_owner() -> Arc<novarocks_worker::TaskExecutionRegistry> {
-        novarocks_worker::TaskExecutionRegistry::new(
-            novarocks_worker::TaskExecutionRegistryConfig::for_process(
-                novarocks_types::BackendProcessId::new_v7(),
-                17,
-                29,
-            ),
-            Arc::new(novarocks_worker::ManualClock::new()),
+    fn preparation_owner() -> crate::backend_task_execution::tests::node_fixture::NativeNodeFixture
+    {
+        use crate::backend_task_execution::tests::node_fixture::{
+            NativeNodeFixture, factory_from_host,
+        };
+        NativeNodeFixture::start(
+            novarocks_types::BackendProcessId::new_v7(),
+            factory_from_host(Arc::new(UnusedPreparationHost)),
             Arc::new(UnusedPreparationHost),
-            Arc::new(UnusedPreparationHost),
-            crate::task_execution_observation::backend_task_execution_ports(
-                Arc::new(
-                    novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
-                ),
-                #[cfg(novarocks_dev_controls)]
-                None,
-            ),
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
+            17,
+            1,
         )
     }
 
     #[cfg(novarocks_dev_controls)]
     #[test]
-    fn root_ownership_scrape_omits_stale_or_absent_samples_in_both_formats() {
+    fn root_ownership_scrape_observes_original_node_and_omits_absent_samples_in_both_formats() {
         let absent = BackendMetricsRegistry::new().unwrap();
-        let absent_text = render_metrics(&absent).unwrap();
-        assert!(absent_text.contains("novarocks_backend_root_ownership_snapshot_available 0"));
-        assert!(!absent_text.contains("novarocks_backend_root_ownership{"));
-        let owner = preparation_owner();
-        let backend = BackendMetricsRegistry::new()
-            .unwrap()
-            .with_task_preparation(Arc::clone(&owner));
+        absent
+            .root_ownership_gauges
+            .with_label_values(&["channels"])
+            .set(123);
         for (render, is_text) in [
             (
                 render_metrics as fn(&BackendMetricsRegistry) -> Result<String, String>,
@@ -1751,32 +1948,39 @@ mod tests {
             ),
             (render_metrics_json, false),
         ] {
+            let text = render(&absent).unwrap();
+            if is_text {
+                assert!(text.contains("novarocks_backend_root_ownership_snapshot_available 0"));
+                assert!(!text.contains("novarocks_backend_root_ownership{"));
+            } else {
+                let rows: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert!(
+                    !rows
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["tags"]["metric"] == "novarocks_backend_root_ownership")
+                );
+                assert!(
+                    rows.as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["tags"]["metric"]
+                            == "novarocks_backend_root_ownership_snapshot_available"
+                            && row["value"].as_f64() == Some(0.0))
+                );
+            }
+        }
+        let owner = preparation_owner();
+        let backend = BackendMetricsRegistry::new()
+            .unwrap()
+            .with_worker_node(owner.control.clone());
+        for render in [
+            render_metrics as fn(&BackendMetricsRegistry) -> Result<String, String>,
+            render_metrics_json,
+        ] {
             let text = render(&backend).unwrap();
-            assert!(text.contains("novarocks_backend_root_ownership"));
-            owner.with_registry_lock_for_test(|| {
-                let text = render(&backend).unwrap();
-                if is_text {
-                    assert!(text.contains("novarocks_backend_root_ownership_snapshot_available 0"));
-                    assert!(!text.contains("novarocks_backend_root_ownership{"));
-                } else {
-                    let rows: serde_json::Value = serde_json::from_str(&text).unwrap();
-                    assert!(
-                        !rows
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .any(|row| row["tags"]["metric"] == "novarocks_backend_root_ownership")
-                    );
-                    assert!(
-                        rows.as_array()
-                            .unwrap()
-                            .iter()
-                            .any(|row| row["tags"]["metric"]
-                                == "novarocks_backend_root_ownership_snapshot_available"
-                                && row["value"].as_f64() == Some(0.0))
-                    );
-                }
-            });
+            assert!(text.contains("novarocks_backend_root_ownership"), "{text}");
         }
         assert!(
             render_metrics(&backend)
@@ -1807,24 +2011,48 @@ mod tests {
     fn preparation_without_owner_is_unavailable_in_both_formats() {
         let backend = BackendMetricsRegistry::new().expect("Backend metrics");
         backend
-            .task_preparation_gauges
+            .preparation_gauges
             .with_label_values(&["positions", "used"])
             .set(123);
         assert_preparation_unavailable(
             &render_metrics(&backend).unwrap(),
             &render_metrics_json(&backend).unwrap(),
         );
+        backend
+            .protocol_retention_gauges
+            .with_label_values(&["inbound", "records"])
+            .set(123);
+        let text = render_metrics(&backend).unwrap();
+        assert!(!text.contains("novarocks_backend_protocol_retention{"));
+        for owner in ["context", "ticket", "control", "inbound"] {
+            assert!(text.contains(&format!(
+                "novarocks_backend_protocol_retention_snapshot_available{{owner=\"{owner}\"}} 0"
+            )));
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(&render_metrics_json(&backend).unwrap()).unwrap();
+        assert!(
+            !json
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["tags"]["metric"] == "novarocks_backend_protocol_retention")
+        );
     }
 
     #[test]
     fn preparation_projects_exact_owner_ledger_in_both_formats() {
         let owner = preparation_owner();
-        let snapshot = owner.preparation_snapshot();
+        let snapshot = owner
+            .control
+            .try_preparation_snapshot()
+            .unwrap()
+            .expect("actual preparation owner sample");
         let backend = BackendMetricsRegistry::new()
             .expect("Backend metrics")
-            .with_task_preparation(owner);
+            .with_worker_node(owner.control.clone());
         backend
-            .task_preparation_gauges
+            .preparation_gauges
             .with_label_values(&["positions", "used"])
             .set(123);
         let prometheus = render_metrics(&backend).expect("exact preparation scrape");
@@ -1861,112 +2089,6 @@ mod tests {
                     "{json}"
                 );
             }
-        }
-    }
-
-    #[cfg(novarocks_dev_controls)]
-    #[test]
-    fn preparation_busy_scrape_omits_stale_values_without_blocking_control_metrics() {
-        let owner = preparation_owner();
-        let backend = Arc::new(
-            BackendMetricsRegistry::new()
-                .unwrap()
-                .with_task_preparation(Arc::clone(&owner))
-                .with_worker_registry_lock(owner.registry_lock_observation()),
-        );
-        assert!(
-            render_metrics(&backend)
-                .unwrap()
-                .contains("novarocks_backend_task_preparation_snapshot_available 1")
-        );
-        backend
-            .task_preparation_gauges
-            .with_label_values(&["positions", "used"])
-            .set(123);
-        let _ = BACKEND_NATIVE_INGRESS_SLOTS.with_label_values(&["control", "running", "used"]);
-        native_control_queue_wait("started", std::time::Duration::from_millis(2));
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            owner.with_registry_lock_for_test(|| {
-                entered_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-            })
-        });
-        entered_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("actual registry lock acquired");
-        let metrics = Arc::clone(&backend);
-        let (rendered_tx, rendered_rx) = std::sync::mpsc::channel();
-        let scrape = std::thread::spawn(move || {
-            rendered_tx
-                .send((render_metrics(&metrics), render_metrics_json(&metrics)))
-                .unwrap();
-        });
-        let rendered = rendered_rx.recv_timeout(std::time::Duration::from_secs(5));
-        // Always release the real lock before asserting the nonblocking oracle.
-        release_tx.send(()).unwrap();
-        holder.join().unwrap();
-        scrape.join().unwrap();
-        let (prometheus, json) =
-            rendered.expect("both metrics formats must finish while the registry lock is held");
-        let prometheus = prometheus.unwrap();
-        let json = json.unwrap();
-        assert_preparation_unavailable(&prometheus, &json);
-        assert!(prometheus.contains("novarocks_backend_native_ingress_slots{class=\"control\",dimension=\"used\",phase=\"running\"}"));
-        assert!(prometheus.contains(
-            "novarocks_backend_native_control_queue_wait_seconds_count{outcome=\"started\"}"
-        ));
-        assert!(prometheus.contains("novarocks_backend_worker_registry_lock_observation"));
-        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let rows = rows.as_array().unwrap();
-        for name in [
-            "novarocks_backend_native_ingress_slots",
-            "novarocks_backend_native_control_queue_wait_seconds_count",
-            "novarocks_backend_worker_registry_lock_observation",
-        ] {
-            assert!(
-                rows.iter().any(|row| row["tags"]["metric"] == name),
-                "{json}"
-            );
-        }
-        assert!(
-            render_metrics(&backend)
-                .unwrap()
-                .contains("novarocks_backend_task_preparation_snapshot_available 1")
-        );
-        assert!(
-            render_metrics_json(&backend)
-                .unwrap()
-                .contains("novarocks_backend_task_preparation\"")
-        );
-        assert_eq!(
-            backend
-                .task_preparation_gauges
-                .with_label_values(&["positions", "used"])
-                .get(),
-            0
-        );
-    }
-
-    #[cfg(novarocks_dev_controls)]
-    #[test]
-    fn preparation_poison_is_an_error_in_both_formats() {
-        let owner = preparation_owner();
-        let backend = BackendMetricsRegistry::new()
-            .unwrap()
-            .with_task_preparation(Arc::clone(&owner));
-        let poison = std::thread::spawn(move || {
-            owner.with_registry_lock_for_test(|| panic!("poison actual registry mutex"))
-        });
-        assert!(poison.join().is_err());
-        for result in [render_metrics(&backend), render_metrics_json(&backend)] {
-            let error = result.expect_err("poison must not become busy or zero usage");
-            assert!(
-                error.contains("sample Worker preparation charge ledger"),
-                "{error}"
-            );
-            assert!(error.to_ascii_lowercase().contains("poison"), "{error}");
         }
     }
 
@@ -2013,6 +2135,11 @@ mod tests {
         assert!(rendered.contains("novarocks_backend_task_execution_tasks_created_total"));
         assert!(rendered.contains("novarocks_exchange_shuffle_bytes_total"));
         assert!(!rendered.contains("novarocks_frontend_only_fixture"));
+        assert!(rendered.contains(
+            "novarocks_backend_control_runtime_observation_available{source=\"counters\"} 0"
+        ));
+        assert!(!rendered.contains("novarocks_backend_control_runtime_inputs{"));
+        assert!(!rendered.contains("novarocks_backend_control_runtime_inventory{"));
         assert!(
             rendered.contains(
                 "novarocks_backend_saturation_source_available{source=\"exchange_slot\"} 0"
@@ -2022,35 +2149,86 @@ mod tests {
 
     #[test]
     fn worker_projection_and_unavailable_exchange_are_rendered_in_both_formats() {
-        let observation = Arc::new(novarocks_worker::AdmissionReservationObservation::default());
-        let lock_observation = Arc::new(novarocks_worker::RegistryLockObservation::default());
+        let owner = preparation_owner();
+        let inbound = novarocks_worker::TaskInboundCapabilities::new();
         let backend = BackendMetricsRegistry::new()
             .expect("construct Backend registry")
-            .with_worker_reservations(observation, 1024)
-            .with_worker_registry_lock(lock_observation);
+            .with_worker_node(owner.control.clone())
+            .with_inbound_retention(Arc::clone(&inbound));
         let rendered = render_metrics(&backend).expect("render Backend metrics");
-        assert!(
-            rendered.contains("novarocks_backend_worker_context_reservations{dimension=\"used\"}")
-        );
-        assert!(
-            rendered.contains("novarocks_backend_worker_context_reservations{dimension=\"limit\"}")
-        );
-        assert!(
-            rendered
-                .contains("novarocks_backend_worker_reservation_last_published_unixtime_seconds")
-        );
-        assert!(rendered.contains("novarocks_backend_worker_registry_lock_observation{phase=\"wait\",statistic=\"samples\"}"));
-        assert!(
-            rendered
-                .contains("novarocks_backend_worker_registry_lock_last_sample_age_nanoseconds -1")
-        );
+        for (owner, resource) in [
+            ("context", "compact_contexts"),
+            ("context", "failed_custodians"),
+            ("ticket", "ticket_records"),
+            ("control", "directory_records"),
+            ("inbound", "records"),
+        ] {
+            assert!(rendered.contains(&format!(
+                "novarocks_backend_protocol_retention{{owner=\"{owner}\",resource=\"{resource}\"}} 0"
+            )), "{rendered}");
+        }
+        assert!(rendered.contains("novarocks_backend_worker_node_snapshot_available 1"));
+        assert!(rendered.contains(
+            "novarocks_backend_control_runtime_observation_available{source=\"counters\"} 1"
+        ));
+        assert!(rendered.contains(
+            "novarocks_backend_control_runtime_inputs{class=\"lifecycle\",resource=\"steps\"}"
+        ));
+        assert!(rendered.contains(
+            "novarocks_backend_control_runtime_ledger{resource=\"blocking_lock_attempts\"}"
+        ));
+        for resource in [
+            "active_tasks",
+            "preparing_tasks",
+            "preparing_bytes",
+            "requests",
+            "contexts",
+        ] {
+            assert!(
+                rendered.contains(&format!(
+                    "novarocks_backend_worker_node_resources{{resource=\"{resource}\"}} 0"
+                )),
+                "{rendered}"
+            );
+        }
         let json = render_metrics_json(&backend).expect("render Backend JSON");
         let rows: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert!(rows.as_array().is_some_and(|rows| rows.iter().any(|row| {
+            row["tags"]["metric"] == "novarocks_backend_control_runtime_inputs"
+                && row["tags"]["class"] == "control"
+                && row["tags"]["resource"] == "steps"
+                && row["value"].as_f64().is_some_and(|value| value >= 0.0)
+        })));
+        assert!(rows.as_array().is_some_and(|rows| rows.iter().any(|row| {
+            row["tags"]["metric"] == "novarocks_backend_protocol_retention"
+                && row["tags"]["owner"] == "ticket"
+                && row["tags"]["resource"] == "ticket_records"
+                && row["value"].as_f64() == Some(0.0)
+        })));
         assert!(rows.as_array().is_some_and(|rows| rows.iter().any(|row| {
             row["tags"]["metric"] == "novarocks_backend_saturation_source_available"
                 && row["tags"]["source"] == "exchange_slot"
                 && row["value"].as_f64() == Some(0.0)
         })));
+        for resource in [
+            "active_tasks",
+            "preparing_tasks",
+            "preparing_bytes",
+            "requests",
+            "contexts",
+        ] {
+            assert!(
+                rows.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(
+                        |row| row["tags"]["metric"] == "novarocks_backend_worker_node_resources"
+                            && row["tags"]["resource"] == resource
+                            && row["value"].as_f64() == Some(0.0)
+                    ),
+                "{json}"
+            );
+        }
     }
 
     fn process_memory(

@@ -47,7 +47,7 @@ pub(super) struct ContextDomainComparison {
     expected: CredentialState,
 }
 
-impl ContextCore {
+impl LiveContextCore {
     pub(super) fn context_domain_runnable(&self) -> bool {
         self.pending_context_update.is_none()
             && self.context_domain_comparison.is_none()

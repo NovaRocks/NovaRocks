@@ -1294,7 +1294,6 @@ mod tests {
     };
 
     use super::TaskCompletionSupervisor;
-    use novarocks_execution_contract::TaskConclusionPort;
 
     fn test_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
@@ -1927,92 +1926,6 @@ mod tests {
         assert_eq!(exits.load(Ordering::Acquire), 1);
     }
 
-    fn status_owner(task: TaskIdentity) -> Arc<crate::TaskStatusOwner> {
-        Arc::new(crate::TaskStatusOwner::new(
-            task,
-            Arc::new(crate::TaskStatusSource::new()),
-            Arc::new(crate::ManualClock::new()),
-            Duration::from_millis(250),
-            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
-        ))
-    }
-
-    #[test]
-    fn native_exit_evidence_follows_the_actual_action_capture_destruction() {
-        let runtime = test_runtime();
-        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 1);
-        let task = identity(101_001, 1);
-        let fragment = UniqueId::new(101_003, 101_004);
-        let owner = status_owner(task);
-        let reporter = crate::TaskStatusReporter::new(Arc::clone(&owner));
-        reporter.canceling(novarocks_execution_contract::task_execution::status::CancelReason::UpstreamNoLongerNeeded);
-        let accepted = owner.accepted().unwrap();
-        let gate = Arc::new(CompletionExitGate::default());
-        let release = ReleaseCompletionExitGate(Arc::clone(&gate));
-        let exits = Arc::new(AtomicUsize::new(0));
-        let captured = CompletionCaptureExit {
-            gate: Some(Arc::clone(&gate)),
-            body_entries: Arc::new(AtomicUsize::new(0)),
-            exited: Arc::clone(&exits),
-        };
-        let reservation = supervisor
-            .reserve_with_status(
-                task,
-                fragment,
-                Box::new(move |_| captured.observe_body()),
-                Some(reporter),
-            )
-            .unwrap();
-        reservation.commit_creation();
-        reservation.publish(terminal(task, fragment));
-        let disposing = gate.wait_entered();
-        let before = owner.convergence();
-        release.release();
-        let joined = supervisor.shutdown();
-        assert!(
-            joined.is_ok(),
-            "the original work must really join: {joined:?}"
-        );
-        assert!(disposing);
-        assert!(
-            !before.actual_stopped() && !before.resources_converged(),
-            "logical control cannot cover a live capture destructor"
-        );
-        assert_eq!(exits.load(Ordering::Acquire), 1);
-        assert!(owner.convergence().actual_stopped() && owner.convergence().resources_converged());
-        assert!(
-            Arc::ptr_eq(&accepted, &owner.accepted().unwrap()),
-            "exit publication never accepts another Task conclusion"
-        );
-    }
-
-    #[test]
-    fn an_exit_reporter_for_another_task_is_refused_before_admission() {
-        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
-        let runtime = test_runtime();
-        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 1);
-        let reserved = identity(102_001, 1);
-        let foreign = identity(102_011, 1);
-        let owner = status_owner(foreign);
-        let reporter = crate::TaskStatusReporter::new(Arc::clone(&owner));
-        let refusal = supervisor
-            .reserve_with_status(
-                reserved,
-                UniqueId::new(102_003, 102_004),
-                Box::new(|_| panic!("refused work cannot run")),
-                Some(reporter),
-            )
-            .err()
-            .unwrap();
-        assert!(
-            matches!(refusal, super::CompletionReservationError::StatusIdentity { reserved: actual, reporter: other } if actual == reserved && other == foreign)
-        );
-        assert_eq!(refusal.failure_fact().class(), FailureClass::Invariant);
-        assert!(supervisor.shared.state.lock().unwrap().slots.is_empty());
-        assert!(!owner.convergence().actual_stopped());
-        supervisor.shutdown().unwrap();
-    }
-
     #[test]
     fn a_runtime_that_never_polled_its_owner_cannot_admit_a_task() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2090,15 +2003,14 @@ mod tests {
     }
 
     #[test]
-    fn opaque_panic_disposal_keeps_custody_and_cannot_replace_the_accepted_task() {
+    fn opaque_panic_disposal_keeps_completion_custody_and_secondary_payload() {
         let runtime = test_runtime();
         let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 2);
         let task = identity(105_001, 1);
         let fragment = UniqueId::new(105_003, 105_004);
-        let owner = status_owner(task);
-        let reporter = crate::TaskStatusReporter::new(Arc::clone(&owner));
-        reporter.canceling(novarocks_execution_contract::task_execution::status::CancelReason::UpstreamNoLongerNeeded);
-        let accepted = owner.accepted().unwrap();
+        // This is the physical supervisor's bounded opaque-disposal contract.
+        // Task convergence is exercised by the real Node capture test, never
+        // inferred from a standalone callback or a synthetic status owner.
         let gate = Arc::new(CompletionExitGate::default());
         let release = ReleaseCompletionExitGate(Arc::clone(&gate));
         let exits = Arc::new(AtomicUsize::new(0));
@@ -2109,19 +2021,17 @@ mod tests {
             secondary_exits: Arc::clone(&secondary_exits),
         });
         let action = supervisor
-            .reserve_with_status(
+            .reserve(
                 task,
                 fragment,
                 Box::new(move |_| {
                     std::panic::panic_any(payload.take().expect("one original opaque payload"));
                 }),
-                Some(reporter),
             )
             .unwrap();
         action.commit_creation();
         action.publish(terminal(task, fragment));
         let disposing = gate.wait_entered();
-        let during = owner.convergence();
         // A is inside the original payload destructor, not an async readiness
         // callback. An independently accepted sibling must still really exit.
         let sibling = identity(105_011, 1);
@@ -2162,14 +2072,18 @@ mod tests {
             0,
             "the secondary opaque holder stays in its original bounded custody"
         );
-        assert!(!during.actual_stopped() && !during.resources_converged());
-        assert!(
-            !owner.convergence().actual_stopped() && !owner.convergence().resources_converged()
+        let state = supervisor.shared.state.lock().unwrap();
+        assert_eq!(
+            state.slots.len(),
+            1,
+            "the exited sibling returned its independent slot"
         );
+        assert_eq!(state.slots[&task].phase, super::CompletionPhase::Unresolved);
         assert!(
-            Arc::ptr_eq(&accepted, &owner.accepted().unwrap()),
-            "cleanup does not accept or refine a Task conclusion"
+            state.custody.is_some(),
+            "the original unresolved slot keeps its finite custody"
         );
+        drop(state);
         assert!(supervisor.poll_failure().is_some());
     }
 }

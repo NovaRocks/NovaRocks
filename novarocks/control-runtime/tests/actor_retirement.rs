@@ -68,14 +68,14 @@ fn quiet<A: Actor>(runtime: &ActorRuntime<A>) {
 }
 #[test]
 fn one_actor_closes_new_positions_but_drains_both_prepaid_input_kinds_before_seal() {
-    let ledger = RuntimeLedger::new(ResourceVector::default(), 8, 2);
+    let ledger = RuntimeLedger::new(ResourceVector::default());
     let scope = ledger
-        .open_scope_next(None, Generation::new(1).unwrap(), 8, 4)
+        .open_scope_next(None, Generation::new(1).unwrap())
         .unwrap();
     let other = ledger
-        .open_scope_next(None, Generation::new(1).unwrap(), 8, 4)
+        .open_scope_next(None, Generation::new(1).unwrap())
         .unwrap();
-    let runtime = ActorRuntime::new(2);
+    let runtime = ActorRuntime::new();
     runtime
         .register_next(actor(), scope.clone(), Recorder::default(), config())
         .unwrap();
@@ -184,11 +184,11 @@ impl Drop for TimerThread {
 fn an_already_selected_timer_cannot_resurrect_a_removed_actor_or_poison_the_poller() {
     let pause = Arc::new((Mutex::new(Pause::default()), Condvar::new()));
     assert!(TIMER_PAUSE.set(pause.clone()).is_ok());
-    let ledger = RuntimeLedger::new(ResourceVector::default(), 1, 1);
+    let ledger = RuntimeLedger::new(ResourceVector::default());
     let scope = ledger
-        .open_scope_next(None, Generation::new(1).unwrap(), 1, 1)
+        .open_scope_next(None, Generation::new(1).unwrap())
         .unwrap();
-    let runtime = ActorRuntime::new(1);
+    let runtime = ActorRuntime::new();
     runtime
         .register_next(actor(), scope.clone(), PausedTimer, config())
         .unwrap();

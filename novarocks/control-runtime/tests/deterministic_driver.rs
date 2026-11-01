@@ -20,16 +20,18 @@
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, StepContext},
     completion::ReportSlot,
-    driver::{ActorRuntime, DriverError},
+    driver::{ActorRuntime, DriverError, FailureSourceState},
+    lease::{ReservationBundle, WorkLease},
     resource::{ResourceError, ResourceStore},
-    transaction::{RuntimeLedger, ScopeParent},
+    transaction::{RuntimeLedger, ScopeHandle, ScopeParent},
 };
 use novarocks_control_runtime_core::{
-    capacity::{ReservationRequest, ResourceVector},
+    capacity::{ReservationRequest, ReservationResources, ResourceVector},
     completion::ConsumerKind,
     effect::{EffectDescriptor, EffectKind},
     identity::*,
     mailbox::{InputClass, InputEnvelope},
+    owned_storage::OwnedSlotNeed,
     scope::{ScopeError, WorkAdmission, WorkKind},
 };
 fn sid(n: u64) -> ScopeId {
@@ -53,18 +55,32 @@ fn generation() -> Generation {
 fn vector(n: u64) -> ResourceVector {
     ResourceVector::new([(DimensionId::new(1).unwrap(), n)]).unwrap()
 }
+fn work_resources(quota: ResourceVector) -> ReservationResources {
+    ReservationResources {
+        quota,
+        owned_slots: OwnedSlotNeed {
+            work_headers: 1,
+            ..OwnedSlotNeed::default()
+        },
+    }
+}
 fn ledger() -> RuntimeLedger {
-    RuntimeLedger::new(vector(8), 16, 8)
+    RuntimeLedger::new(vector(8))
 }
 fn request(n: u64, amount: u64) -> ReservationRequest {
     ReservationRequest {
         id: ReservationId::new(n).unwrap(),
         generation: generation(),
         guard: wid(n),
-        resources: vector(amount),
+        resources: work_resources(vector(amount)),
         admission: WorkAdmission::External,
         kind: WorkKind::Business,
     }
+}
+fn request_with_reports(n: u64, amount: u64, reports: usize) -> ReservationRequest {
+    let mut original = request(n, amount);
+    original.resources.owned_slots.completions = reports;
+    original
 }
 fn config() -> ActorConfig {
     ActorConfig {
@@ -80,6 +96,7 @@ fn config() -> ActorConfig {
 struct Recorder {
     seen: Vec<(u64, u64)>,
     effects: bool,
+    publication_work: Option<ScopedWorkRef>,
     panic_on: Option<u64>,
     deadline: Option<Tick>,
 }
@@ -102,10 +119,14 @@ impl Actor for Recorder {
         self.seen.push((input.source.get(), value));
         self.deadline = None;
         if self.effects {
+            let work = step
+                .input_work()
+                .or(self.publication_work)
+                .expect("original admitted Recorder business author");
             step.effect(
                 EffectDescriptor {
                     id: action(1),
-                    work: wid(input.input.get()),
+                    work,
                     kind: EffectKind::Publication,
                     dependencies: vec![],
                 },
@@ -115,7 +136,7 @@ impl Actor for Recorder {
             step.effect(
                 EffectDescriptor {
                     id: action(2),
-                    work: wid(input.input.get()),
+                    work,
                     kind: EffectKind::Business,
                     dependencies: vec![action(1)],
                 },
@@ -130,13 +151,16 @@ impl Actor for Recorder {
     fn owner_failed(
         _scope: ScopeId,
         _generation: Generation,
-        input: InputEnvelope,
+        _input: InputEnvelope,
         step: &mut StepContext<'_, u64>,
     ) {
+        let work = step
+            .failure_work()
+            .expect("original admitted cleanup supervisor");
         step.effect(
             EffectDescriptor {
                 id: action(1),
-                work: wid(input.input.get()),
+                work,
                 kind: EffectKind::Cleanup,
                 dependencies: vec![],
             },
@@ -158,15 +182,87 @@ fn recorder(effects: bool) -> Recorder {
     Recorder {
         seen: vec![],
         effects,
+        publication_work: None,
         panic_on: None,
         deadline: None,
     }
 }
 
+struct RecorderRoles {
+    ledger: RuntimeLedger,
+    business: WorkLease,
+    business_storage: ReservationBundle,
+    cleanup: WorkLease,
+    cleanup_storage: ReservationBundle,
+}
+impl RecorderRoles {
+    fn finish(mut self) {
+        for (work, storage) in [
+            (&mut self.business, &mut self.business_storage),
+            (&mut self.cleanup, &mut self.cleanup_storage),
+        ] {
+            work.body_exited().unwrap();
+            work.captures_exited().unwrap();
+            storage.finish().unwrap();
+        }
+        self.ledger
+            .reap_scope_ready(self.business.scope().id(), 2)
+            .unwrap();
+    }
+}
+fn register_recording_roles(
+    runtime: &ActorRuntime<Recorder>,
+    ledger: &RuntimeLedger,
+    scope: &ScopeHandle,
+    mut actor: Recorder,
+    policy: ActorConfig,
+) -> RecorderRoles {
+    let (mut business, business_storage) = scope
+        .reserve_next(
+            generation(),
+            work_resources(ResourceVector::new([]).unwrap()),
+            WorkKind::Business,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Business)
+        .unwrap();
+    let (mut cleanup, cleanup_storage) = scope
+        .reserve_next(
+            generation(),
+            work_resources(ResourceVector::new([]).unwrap()),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    business.start().unwrap();
+    cleanup.start().unwrap();
+    actor.publication_work = Some(business.reference());
+    runtime
+        .register_supervised_bound(aid(1), scope.clone(), actor, policy, &cleanup)
+        .unwrap();
+    RecorderRoles {
+        ledger: ledger.clone(),
+        business,
+        business_storage,
+        cleanup,
+        cleanup_storage,
+    }
+}
+fn original_failure_input(runtime: &ActorRuntime<Recorder>) -> InputId {
+    let FailureSourceState::ClosedPending(input) = runtime.failure_source_state(aid(1)).unwrap()
+    else {
+        panic!("the original supervisor input remains pending");
+    };
+    input
+}
+
 #[test]
 fn reserve_guard_is_scope_visible_and_only_unbound_guard_rolls_back() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
     let guard = scope.reserve(request(1, 3)).unwrap();
     scope.close_external().unwrap();
     assert_eq!(scope.snapshot().unwrap().work, 1);
@@ -183,23 +279,26 @@ fn capacity_refusal_keeps_the_same_transaction_snapshot_and_no_partial_charge() 
     use novarocks_control_runtime::transaction::{CapacityDenial, RuntimeError};
     let first = DimensionId::new(1).unwrap();
     let second = DimensionId::new(2).unwrap();
-    let ledger = RuntimeLedger::new(
+    let observation = novarocks_control_runtime::observation::RuntimeObservation::new(None);
+    let ledger = RuntimeLedger::with_owner_usage_dimensions_and_observation(
         ResourceVector::new([(first, 8), (second, 4)]).unwrap(),
-        4,
-        1,
-    );
-    let scope = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+        [],
+        None,
+        observation.clone(),
+    )
+    .unwrap();
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
     let held = scope
         .reserve_next(
             generation(),
-            ResourceVector::new([(first, 6)]).unwrap(),
+            work_resources(ResourceVector::new([(first, 6)]).unwrap()),
             WorkKind::Business,
             WorkAdmission::External,
         )
         .unwrap();
     let denied = scope.reserve_next(
         generation(),
-        ResourceVector::new([(first, 2), (second, 5)]).unwrap(),
+        work_resources(ResourceVector::new([(first, 2), (second, 5)]).unwrap()),
         WorkKind::Business,
         WorkAdmission::External,
     );
@@ -215,6 +314,34 @@ fn capacity_refusal_keeps_the_same_transaction_snapshot_and_no_partial_charge() 
     assert_eq!(ledger.used(first), 6);
     assert_eq!(ledger.used(second), 0);
     assert_eq!(scope.snapshot().unwrap().work, 1);
+    let observed = observation.snapshot().unwrap();
+    assert_eq!(observed.capacity_operations, 2);
+    assert_eq!(
+        observed.capacity_refusals
+            [novarocks_control_runtime::observation::CapacityRefusalKind::Exhausted as usize],
+        1
+    );
+    assert!(
+        observed
+            .inputs
+            .iter()
+            .all(|input| input.handoff_to_step.is_none() && input.step_elapsed.is_none())
+    );
+    let mut completed = None;
+    for _ in 0..16 {
+        let page = ledger.try_observation_inventory(1).unwrap().unwrap();
+        assert!(page.visited <= 1);
+        if page.completed.is_some() {
+            completed = page.completed;
+            break;
+        }
+    }
+    let completed = completed.expect("the original frozen finite inventory is completely visited");
+    assert_eq!(completed.scopes, 1);
+    assert_eq!(completed.admitted_work, 1);
+    assert_eq!(completed.queued_work + completed.started_work, 0);
+    assert_eq!(completed.reservations, 1);
+    assert!(completed.began_at.is_none() && completed.ended_at.is_none());
     drop(held);
     scope.close_external().unwrap();
     assert!(scope.snapshot().unwrap().retirement_ready);
@@ -223,7 +350,7 @@ fn capacity_refusal_keeps_the_same_transaction_snapshot_and_no_partial_charge() 
 #[test]
 fn dropping_a_bound_lease_or_capacity_never_invents_exit() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
     let (work, bundle) = scope
         .reserve(request(1, 3))
         .unwrap()
@@ -243,18 +370,17 @@ fn dropping_a_bound_lease_or_capacity_never_invents_exit() {
 #[test]
 fn work_join_and_storage_or_capacity_retirement_are_distinct() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
     let (mut work, mut bundle) = scope
-        .reserve(request(1, 3))
+        .reserve(request_with_reports(1, 3, 1))
         .unwrap()
         .bind(WorkKind::Business)
         .unwrap();
     let consumer = ConsumerId::new(1).unwrap();
     let report = ReportSlot::reserve(
-        &scope,
+        &mut bundle,
         slot(1),
         generation(),
-        wid(1),
         2,
         [(
             consumer,
@@ -279,14 +405,15 @@ fn work_join_and_storage_or_capacity_retirement_are_distinct() {
     report.consume(consumer).unwrap();
     assert!(report.try_retire().unwrap());
     assert!(!scope.snapshot().unwrap().retirement_ready);
-    bundle.release(&vector(3)).unwrap();
+    bundle.release_quota(&vector(3)).unwrap();
+    bundle.finish().unwrap();
     assert!(scope.snapshot().unwrap().retirement_ready);
     ledger.remove_scope(sid(1)).unwrap();
 }
 #[test]
 fn parent_scope_counts_actual_child_scope_until_complete_retirement() {
     let ledger = ledger();
-    let parent = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
+    let parent = ledger.open_scope(sid(1), None, generation()).unwrap();
     let child = ledger
         .open_scope(
             sid(2),
@@ -298,8 +425,6 @@ fn parent_scope_counts_actual_child_scope_until_complete_retirement() {
                 admission: WorkAdmission::External,
             }),
             generation(),
-            8,
-            8,
         )
         .unwrap();
     parent.close_external().unwrap();
@@ -314,7 +439,7 @@ fn parent_scope_counts_actual_child_scope_until_complete_retirement() {
 #[test]
 fn close_allows_existing_parent_drain_and_stop_allows_only_cleanup() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
     let (mut parent, mut bundle) = scope
         .reserve(request(1, 1))
         .unwrap()
@@ -344,35 +469,41 @@ fn close_allows_existing_parent_drain_and_stop_allows_only_cleanup() {
     cleanup.start().unwrap();
     cleanup.body_exited().unwrap();
     cleanup.captures_exited().unwrap();
-    cleanup_bundle.release(&vector(1)).unwrap();
+    cleanup_bundle.release_quota(&vector(1)).unwrap();
     child.body_exited().unwrap();
     child.captures_exited().unwrap();
-    child_bundle.release(&vector(1)).unwrap();
+    child_bundle.release_quota(&vector(1)).unwrap();
     parent.body_exited().unwrap();
     parent.captures_exited().unwrap();
-    bundle.release(&vector(1)).unwrap();
+    bundle.release_quota(&vector(1)).unwrap();
     ledger.reap_ready(8).unwrap();
+    cleanup_bundle.finish().unwrap();
+    child_bundle.finish().unwrap();
+    bundle.finish().unwrap();
     assert!(scope.snapshot().unwrap().retirement_ready);
 }
 #[test]
 fn failed_owner_abandons_only_its_leg_and_still_waits_for_captures() {
-    let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let mut work = scope
-        .admit_work(
-            generation(),
-            wid(1),
-            WorkKind::Business,
-            WorkAdmission::External,
-        )
+    let observation = novarocks_control_runtime::observation::RuntimeObservation::new(None);
+    let ledger = RuntimeLedger::with_owner_usage_dimensions_and_observation(
+        vector(8),
+        [],
+        None,
+        observation.clone(),
+    )
+    .unwrap();
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let (mut work, mut bundle) = scope
+        .reserve(request_with_reports(1, 0, 1))
+        .unwrap()
+        .bind(WorkKind::Business)
         .unwrap();
     let owner = ConsumerId::new(1).unwrap();
     let observer = ConsumerId::new(2).unwrap();
     let report = ReportSlot::reserve(
-        &scope,
+        &mut bundle,
         slot(1),
         generation(),
-        wid(1),
         2,
         [
             (
@@ -387,6 +518,9 @@ fn failed_owner_abandons_only_its_leg_and_still_waits_for_captures() {
     )
     .unwrap();
     scope.fail().unwrap();
+    assert_eq!(observation.snapshot().unwrap().scope_failures, 1);
+    scope.fail().unwrap();
+    assert_eq!(observation.snapshot().unwrap().scope_failures, 1);
     report.fill().unwrap();
     report
         .abandon_failed_owner(owner, &scope, generation())
@@ -398,25 +532,55 @@ fn failed_owner_abandons_only_its_leg_and_still_waits_for_captures() {
     assert!(report.try_retire().unwrap());
     work.body_exited().unwrap();
     work.captures_exited().unwrap();
+    bundle.finish().unwrap();
     ledger.reap_ready(1).unwrap();
     assert!(scope.snapshot().unwrap().retirement_ready);
 }
 #[test]
 fn reserved_input_remains_bounded_until_effects_and_explicit_retirement() {
-    let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    use novarocks_control_runtime::{
+        driver::Clock, history::HistoryCapture, observation::RuntimeObservation,
+    };
+    use novarocks_control_runtime_core::history::{EffectHistoryPhase, HistoryFact};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    struct ObservedClock(AtomicU64);
+    impl Clock for ObservedClock {
+        fn now(&self) -> Tick {
+            Tick(self.0.load(Ordering::Relaxed))
+        }
+    }
+    let clock = Arc::new(ObservedClock(AtomicU64::new(5)));
+    let observation = RuntimeObservation::new(Some(clock.clone()));
+    let history = HistoryCapture::new(64);
+    let ledger = RuntimeLedger::with_owner_usage_dimensions_and_observation(
+        vector(8),
+        [],
+        Some(history.clone()),
+        observation.clone(),
+    )
+    .unwrap();
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::with_observation(Some(history.clone()), observation.clone());
     let mut c = config();
     c.mailbox[2] = 1;
-    runtime
-        .register(aid(1), scope.clone(), slot(1), recorder(true), c)
-        .unwrap();
+    let roles = register_recording_roles(&runtime, &ledger, &scope, recorder(true), c);
     let permit = runtime
         .reserve_input(aid(1), aid(2), InputClass::Ordinary)
         .unwrap();
     let input = permit.id();
     permit.fill(7).unwrap();
+    clock.0.store(45, Ordering::Relaxed);
     runtime.poll_one(Tick(1)).unwrap();
+    let ordinary = runtime.observation_snapshot().unwrap().inputs[InputClass::Ordinary.index()];
+    assert_eq!(ordinary.steps, 1);
+    assert_eq!(ordinary.charged_work, 2);
+    assert_eq!(ordinary.maximum_step_work, 2);
+    assert_eq!(ordinary.input_credits_held, 1);
+    assert_eq!(ordinary.handoff_to_step.unwrap().total_ns, 40);
+    assert_eq!(ordinary.step_elapsed.unwrap().samples, 1);
     assert_eq!(
         runtime
             .reserve_input(aid(1), aid(2), InputClass::Ordinary)
@@ -462,22 +626,53 @@ fn reserved_input_remains_bounded_until_effects_and_explicit_retirement() {
     assert_eq!(second.effect, 107);
     runtime.effect_completed(second).unwrap();
     runtime.retire_input(aid(1), input).unwrap();
+    assert_eq!(
+        observation.snapshot().unwrap().inputs[InputClass::Ordinary.index()].input_credits_held,
+        0
+    );
     let unused = runtime
         .reserve_input(aid(1), aid(2), InputClass::Ordinary)
         .unwrap();
     unused.revoke_unused().unwrap();
     scope.close_external().unwrap();
+    roles.finish();
     assert!(scope.snapshot().unwrap().join_ready);
     assert!(!scope.snapshot().unwrap().retirement_ready);
     let actor = remove_actor(&runtime, aid(1)).unwrap();
     assert_eq!(actor.seen, vec![(2, 7)]);
     ledger.remove_scope(sid(1)).unwrap();
+    let trace = history.drain(64);
+    assert!(trace.complete);
+    let actions: Vec<_> = trace
+        .entries
+        .iter()
+        .filter_map(|entry| match entry.fact {
+            HistoryFact::Effect {
+                target,
+                input: original,
+                action,
+                phase,
+                ..
+            } if target.actor == aid(1) && original == input => Some((action, phase)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        actions,
+        vec![
+            (action(1), EffectHistoryPhase::Dispatched),
+            (action(1), EffectHistoryPhase::Published),
+            (action(1), EffectHistoryPhase::Completed),
+            (action(2), EffectHistoryPhase::Dispatched),
+            (action(2), EffectHistoryPhase::Completed),
+        ]
+    );
 }
 #[test]
 fn exact_source_pair_fifo_is_preserved_across_control_priority() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     runtime
         .register(aid(1), scope.clone(), slot(1), recorder(false), config())
         .unwrap();
@@ -503,8 +698,8 @@ fn exact_source_pair_fifo_is_preserved_across_control_priority() {
 #[test]
 fn existing_input_permits_fill_after_external_close_but_new_reservations_fail() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     runtime
         .register(aid(1), scope.clone(), slot(1), recorder(false), config())
         .unwrap();
@@ -527,8 +722,8 @@ fn existing_input_permits_fill_after_external_close_but_new_reservations_fail() 
 #[test]
 fn initial_timer_uses_same_actor_turn_and_its_own_bounded_cell() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut actor = recorder(false);
     actor.deadline = Some(Tick(5));
     runtime
@@ -537,23 +732,20 @@ fn initial_timer_uses_same_actor_turn_and_its_own_bounded_cell() {
     assert_eq!(runtime.advance_time(Tick(4), 8).unwrap(), 0);
     assert_eq!(runtime.advance_time(Tick(5), 8).unwrap(), 1);
     assert_eq!(runtime.advance_time(Tick(6), 8).unwrap(), 0);
+    let timer_input = runtime.pending_timer_input(aid(1)).unwrap().unwrap();
     runtime.poll_one(Tick(6)).unwrap();
-    runtime
-        .retire_input(aid(1), InputId::new(1).unwrap())
-        .unwrap();
+    runtime.retire_input(aid(1), timer_input).unwrap();
     scope.close_external().unwrap();
     assert_eq!(remove_actor(&runtime, aid(1)).unwrap().seen, vec![(1, 5)]);
 }
 #[test]
 fn owner_failure_fences_old_business_but_keeps_published_commitments() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut actor = recorder(true);
     actor.panic_on = Some(2);
-    runtime
-        .register(aid(1), scope.clone(), slot(1), actor, config())
-        .unwrap();
+    let roles = register_recording_roles(&runtime, &ledger, &scope, actor, config());
     let first = runtime
         .reserve_input(aid(1), aid(2), InputClass::Ordinary)
         .unwrap()
@@ -575,11 +767,14 @@ fn owner_failure_fences_old_business_but_keeps_published_commitments() {
         .abandon_unstarted_effect(aid(1), first, action(2))
         .unwrap();
     runtime.retire_input(aid(1), first).unwrap();
-    let cleanup = runtime.take_effect(aid(1), failed, action(1)).unwrap();
+    let supervisor = original_failure_input(&runtime);
+    let cleanup = runtime.take_effect(aid(1), supervisor, action(1)).unwrap();
     assert_eq!(cleanup.effect, 999);
     runtime.effect_completed(cleanup).unwrap();
+    runtime.retire_input(aid(1), supervisor).unwrap();
     runtime.retire_input(aid(1), failed).unwrap();
     drop(runtime.take_failure_payload(aid(1)).unwrap().unwrap());
+    roles.finish();
     remove_actor(&runtime, aid(1)).unwrap();
 }
 #[test]
@@ -609,7 +804,7 @@ fn resource_recovery_uses_actual_entry_and_never_double_takes_or_scans_unbounded
 #[test]
 fn global_external_close_keeps_healthy_parent_drain_and_cleanup_capacity() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
     let (mut parent, mut bundle) = scope
         .reserve(request(1, 1))
         .unwrap()
@@ -618,7 +813,7 @@ fn global_external_close_keeps_healthy_parent_drain_and_cleanup_capacity() {
     parent.start().unwrap();
     ledger.close_admission();
     assert_eq!(
-        ledger.open_scope(sid(2), None, generation(), 8, 8).err(),
+        ledger.open_scope(sid(2), None, generation()).err(),
         Some(novarocks_control_runtime::transaction::RuntimeError::Scope(
             ScopeError::Closed
         ))
@@ -651,20 +846,28 @@ fn global_external_close_keeps_healthy_parent_drain_and_cleanup_capacity() {
         work.captures_exited().unwrap();
     }
     for charge in [&mut child_bundle, &mut cleanup_bundle, &mut bundle] {
-        charge.release(&vector(1)).unwrap();
+        charge.release_quota(&vector(1)).unwrap();
     }
     ledger.reap_ready(8).unwrap();
+    for charge in [&mut child_bundle, &mut cleanup_bundle, &mut bundle] {
+        charge.finish().unwrap();
+    }
     assert!(scope.snapshot().unwrap().retirement_ready);
 }
 
 #[test]
 fn shared_history_observes_real_handoffs_without_becoming_a_policy_input() {
-    use novarocks_control_runtime::{history::HistoryCapture, transaction::RuntimeLedger};
-    use novarocks_control_runtime_core::history::HistoryFact;
+    use novarocks_control_runtime::{
+        history::HistoryCapture,
+        transaction::{RuntimeError, RuntimeLedger},
+    };
+    use novarocks_control_runtime_core::history::{
+        CapacityHistoryRefusal, CapacityHistoryRequest, HistoryFact,
+    };
     let history = HistoryCapture::new(64);
-    let ledger = RuntimeLedger::with_history(vector(8), 16, 8, history.clone());
-    let runtime = ActorRuntime::with_history(1, history.clone());
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
+    let ledger = RuntimeLedger::with_history(vector(8), history.clone());
+    let runtime = ActorRuntime::with_history(history.clone());
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
     let mut work = scope
         .admit_work(
             generation(),
@@ -673,6 +876,39 @@ fn shared_history_observes_real_handoffs_without_becoming_a_policy_input() {
             WorkAdmission::External,
         )
         .unwrap();
+    let before_denial = scope.snapshot().unwrap();
+    let request_resources = ReservationResources::new(
+        vector(9),
+        novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::work_only(),
+    );
+    assert!(matches!(
+        scope.reserve_next(
+            generation(),
+            request_resources.clone(),
+            WorkKind::Business,
+            WorkAdmission::External
+        ),
+        Err(RuntimeError::CapacityDenied(_))
+    ));
+    assert_eq!(scope.snapshot().unwrap(), before_denial);
+    assert_eq!(ledger.used(DimensionId::new(1).unwrap()), 0);
+    // A real subsequent admission still owns the same budget, then rolls back
+    // only its genuinely unbound guard. The refusal invented no accepted ID.
+    let next = scope
+        .reserve_next(
+            generation(),
+            ReservationResources::new(
+                vector(1),
+                novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::work_only(),
+            ),
+            WorkKind::Business,
+            WorkAdmission::External,
+        )
+        .unwrap();
+    assert_eq!(ledger.used(DimensionId::new(1).unwrap()), 1);
+    let admitted_after_denial = next.reservation_id();
+    drop(next);
+    assert_eq!(ledger.used(DimensionId::new(1).unwrap()), 0);
     runtime
         .register(aid(1), scope.clone(), slot(1), recorder(false), config())
         .unwrap();
@@ -699,9 +935,35 @@ fn shared_history_observes_real_handoffs_without_becoming_a_policy_input() {
     );
     assert!(slice.entries.iter().any(|entry| entry.fact
         == HistoryFact::BatchCommitted {
-            scope: sid(1),
+            target: novarocks_control_runtime_core::history::HistoryActorTarget {
+                actor: aid(1),
+                attachment: slot(1),
+                scope_origin: sid(1),
+            },
+            actor_generation: generation(),
             input
         }));
+    let refused = slice.entries.iter().find(|entry| matches!(&entry.fact,
+        HistoryFact::CapacityRefused {
+            request: CapacityHistoryRequest::Reserve {
+                scope: original, generation: epoch, admission: WorkAdmission::External,
+                kind: WorkKind::Business, requested,
+            },
+            reason: CapacityHistoryRefusal::CapacityDenied {
+                requested: 9, committed: 0, limit: 8, ..
+            },
+        } if *original == scope.id() && *epoch == generation() && *requested == request_resources
+    )).expect("the exact ordinary capacity refusal is an ordered actual ledger fact");
+    let later_admission = slice
+        .entries
+        .iter()
+        .find(|entry| {
+            matches!(entry.fact,
+                HistoryFact::Admitted { reservation, .. } if reservation == admitted_after_denial
+            )
+        })
+        .unwrap();
+    assert!(refused.ordinal < later_admission.ordinal);
     let exits: Vec<_> = slice
         .entries
         .iter()
@@ -721,8 +983,8 @@ fn history_pressure_invalidates_history_but_does_not_reject_work() {
     use novarocks_control_runtime::history::HistoryCapture;
     use novarocks_control_runtime_core::history::HistoryError;
     let history = HistoryCapture::new(1);
-    let ledger = RuntimeLedger::with_history(vector(8), 16, 8, history.clone());
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
+    let ledger = RuntimeLedger::with_history(vector(8), history.clone());
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
     let mut work = scope
         .admit_work(
             generation(),
@@ -746,16 +1008,14 @@ fn history_pressure_invalidates_history_but_does_not_reject_work() {
 #[test]
 fn complete_step_budget_is_reserved_before_core_mutation_for_all_four_classes() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut actor = recorder(true);
     actor.deadline = Some(Tick(1));
     let mut policy = config();
     policy.turn_budget = 12;
     policy.max_step_work = 2;
-    runtime
-        .register(aid(1), scope.clone(), slot(1), actor, policy)
-        .unwrap();
+    let roles = register_recording_roles(&runtime, &ledger, &scope, actor, policy);
     for (source, class, value) in [
         (2, InputClass::Lifecycle, 10),
         (3, InputClass::Control, 20),
@@ -783,6 +1043,7 @@ fn complete_step_budget_is_reserved_before_core_mutation_for_all_four_classes() 
         runtime.retire_input(aid(1), input).unwrap();
     }
     scope.close_external().unwrap();
+    roles.finish();
     let actor = remove_actor(&runtime, aid(1)).unwrap();
     assert_eq!(actor.seen, vec![(2, 10), (3, 20), (4, 30), (1, 1)]);
 }
@@ -800,8 +1061,8 @@ fn impossible_whole_step_quota_is_rejected_at_configuration_time() {
 #[test]
 fn unused_whole_step_reservation_returns_to_the_same_fair_turn() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut policy = config();
     policy.turn_budget = 64;
     policy.max_step_work = 15;
@@ -835,47 +1096,46 @@ fn reliable_exit_report_validation_precedes_capacity_or_work_mutation() {
     use novarocks_control_runtime::transaction::RuntimeError;
     use novarocks_control_runtime_core::completion::CompletionError;
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
     let (mut work, mut bundle) = scope
-        .reserve(request(1, 3))
+        .reserve(request_with_reports(1, 3, 3))
         .unwrap()
         .bind(WorkKind::Business)
         .unwrap();
     let consumer = ConsumerId::new(1).unwrap();
     let body = ReportSlot::reserve(
-        &scope,
+        &mut bundle,
         slot(1),
         generation(),
-        wid(1),
         1,
         [(consumer, ConsumerKind::Observer)],
     )
     .unwrap();
     let released = ReportSlot::reserve(
-        &scope,
+        &mut bundle,
         slot(2),
         generation(),
-        wid(1),
         1,
         [(consumer, ConsumerKind::Observer)],
     )
     .unwrap();
     let captures = ReportSlot::reserve(
-        &scope,
+        &mut bundle,
         slot(3),
         generation(),
-        wid(1),
         1,
         [(consumer, ConsumerKind::Observer)],
     )
     .unwrap();
     work.body_exited_with_report(&body).unwrap();
     assert_eq!(
-        bundle.release_with_report(&vector(3), &body),
+        bundle.release_quota_with_report(&vector(3), &body),
         Err(RuntimeError::Completion(CompletionError::AlreadyFilled))
     );
     assert_eq!(ledger.used(DimensionId::new(1).unwrap()), 3);
-    bundle.release_with_report(&vector(3), &released).unwrap();
+    bundle
+        .release_quota_with_report(&vector(3), &released)
+        .unwrap();
     assert_eq!(ledger.used(DimensionId::new(1).unwrap()), 0);
     work.captures_exited_with_report(&captures).unwrap();
     for report in [&body, &released, &captures] {
@@ -884,6 +1144,7 @@ fn reliable_exit_report_validation_precedes_capacity_or_work_mutation() {
         report.captures_exited().unwrap();
         assert!(report.try_retire().unwrap());
     }
+    bundle.finish().unwrap();
     scope.close_external().unwrap();
     ledger.reap_ready(1).unwrap();
     assert!(scope.snapshot().unwrap().retirement_ready);
@@ -892,8 +1153,8 @@ fn reliable_exit_report_validation_precedes_capacity_or_work_mutation() {
 #[test]
 fn bound_unfilled_role_can_withdraw_after_its_holder_exit_without_owner_failure() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut policy = config();
     policy.mailbox[2] = 1;
     runtime
@@ -937,34 +1198,33 @@ fn finish_failed_publication_test(
     old_input: InputId,
     failed_input: InputId,
     ticket: novarocks_control_runtime::driver::EffectTicket<u64>,
+    roles: RecorderRoles,
 ) {
     runtime.effect_completed(ticket).unwrap();
     runtime
         .abandon_unstarted_effect(aid(1), old_input, action(2))
         .unwrap();
     runtime.retire_input(aid(1), old_input).unwrap();
-    let cleanup = runtime
-        .take_effect(aid(1), failed_input, action(1))
-        .unwrap();
+    let supervisor = original_failure_input(runtime);
+    let cleanup = runtime.take_effect(aid(1), supervisor, action(1)).unwrap();
     runtime.effect_completed(cleanup).unwrap();
+    runtime.retire_input(aid(1), supervisor).unwrap();
     runtime.retire_input(aid(1), failed_input).unwrap();
     drop(runtime.take_failure_payload(aid(1)).unwrap().unwrap());
+    roles.finish();
     remove_actor(runtime, aid(1)).unwrap();
 }
 
 #[test]
 fn taken_old_ticket_cannot_replace_snapshot_after_owner_failure() {
     use novarocks_control_runtime::publication::PublishedSnapshot;
-    use novarocks_control_runtime_core::effect::EffectError;
     use std::sync::Arc;
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut actor = recorder(true);
     actor.panic_on = Some(2);
-    runtime
-        .register(aid(1), scope.clone(), slot(1), actor, config())
-        .unwrap();
+    let roles = register_recording_roles(&runtime, &ledger, &scope, actor, config());
     let snapshot = PublishedSnapshot::new(&scope, Arc::new(0u64));
     let input = runtime
         .reserve_input(aid(1), aid(2), InputClass::Ordinary)
@@ -982,10 +1242,13 @@ fn taken_old_ticket_cannot_replace_snapshot_after_owner_failure() {
     let (error, rejected) = runtime
         .commit_snapshot(&ticket, &snapshot, Arc::new(7))
         .unwrap_err();
-    assert_eq!(error, DriverError::Effect(EffectError::StaleGeneration));
+    let unchanged = *snapshot.read();
+    finish_failed_publication_test(&runtime, input, failed, ticket, roles);
+    // Failed ownership bars every ordinary publication, including a previously
+    // taken ticket; only the original failure session may publish now.
+    assert_eq!(error, DriverError::FailurePublicationRequired);
     assert_eq!(*rejected, 7);
-    assert_eq!(*snapshot.read(), 0);
-    finish_failed_publication_test(&runtime, input, failed, ticket);
+    assert_eq!(unchanged, 0);
 }
 
 #[test]
@@ -993,13 +1256,11 @@ fn committed_snapshot_survives_later_owner_failure_and_old_arc_is_returned() {
     use novarocks_control_runtime::publication::PublishedSnapshot;
     use std::sync::Arc;
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut actor = recorder(true);
     actor.panic_on = Some(2);
-    runtime
-        .register(aid(1), scope.clone(), slot(1), actor, config())
-        .unwrap();
+    let roles = register_recording_roles(&runtime, &ledger, &scope, actor, config());
     let initial = Arc::new(0u64);
     let snapshot = PublishedSnapshot::new(&scope, initial.clone());
     let input = runtime
@@ -1021,7 +1282,7 @@ fn committed_snapshot_survives_later_owner_failure_and_old_arc_is_returned() {
         .unwrap();
     runtime.poll_one(Tick(2)).unwrap();
     assert_eq!(*snapshot.read(), 7);
-    finish_failed_publication_test(&runtime, input, failed, ticket);
+    finish_failed_publication_test(&runtime, input, failed, ticket, roles);
 }
 
 #[test]
@@ -1029,12 +1290,10 @@ fn publication_ticket_cannot_target_another_scope_snapshot() {
     use novarocks_control_runtime::publication::PublishedSnapshot;
     use std::sync::Arc;
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let other = ledger.open_scope(sid(2), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
-    runtime
-        .register(aid(1), scope.clone(), slot(1), recorder(true), config())
-        .unwrap();
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let other = ledger.open_scope(sid(2), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
+    let roles = register_recording_roles(&runtime, &ledger, &scope, recorder(true), config());
     let snapshot = PublishedSnapshot::new(&other, Arc::new(0u64));
     let input = runtime
         .reserve_input(aid(1), aid(2), InputClass::Ordinary)
@@ -1059,6 +1318,7 @@ fn publication_ticket_cannot_target_another_scope_snapshot() {
     runtime.effect_completed(second).unwrap();
     runtime.retire_input(aid(1), input).unwrap();
     scope.close_external().unwrap();
+    roles.finish();
     remove_actor(&runtime, aid(1)).unwrap();
     other.close_external().unwrap();
 }
@@ -1068,13 +1328,11 @@ fn committed_reply_remains_once_ever_after_failure_and_take() {
     use novarocks_control_runtime::publication::PublishedReply;
     use std::sync::Arc;
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut actor = recorder(true);
     actor.panic_on = Some(2);
-    runtime
-        .register(aid(1), scope.clone(), slot(1), actor, config())
-        .unwrap();
+    let roles = register_recording_roles(&runtime, &ledger, &scope, actor, config());
     let reply = PublishedReply::new(&scope);
     let input = runtime
         .reserve_input(aid(1), aid(2), InputClass::Ordinary)
@@ -1093,7 +1351,8 @@ fn committed_reply_remains_once_ever_after_failure_and_take() {
     assert_eq!(*reply.take_once().unwrap(), 7);
     assert!(reply.take_once().is_none());
     assert!(reply.is_committed());
-    let cleanup = runtime.take_effect(aid(1), failed, action(1)).unwrap();
+    let supervisor = original_failure_input(&runtime);
+    let cleanup = runtime.take_effect(aid(1), supervisor, action(1)).unwrap();
     assert_eq!(
         runtime
             .commit_reply(&cleanup, &reply, Arc::new(999))
@@ -1102,6 +1361,7 @@ fn committed_reply_remains_once_ever_after_failure_and_take() {
         DriverError::FailurePublicationRequired
     );
     runtime.effect_completed(cleanup).unwrap();
+    runtime.retire_input(aid(1), supervisor).unwrap();
     runtime.retire_input(aid(1), failed).unwrap();
     runtime.effect_completed(first).unwrap();
     runtime
@@ -1109,14 +1369,15 @@ fn committed_reply_remains_once_ever_after_failure_and_take() {
         .unwrap();
     runtime.retire_input(aid(1), input).unwrap();
     drop(runtime.take_failure_payload(aid(1)).unwrap().unwrap());
+    roles.finish();
     remove_actor(&runtime, aid(1)).unwrap();
 }
 
 #[test]
 fn prepaid_role_advances_cursor_after_global_external_close_without_new_credit() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut policy = config();
     policy.mailbox[0] = 1;
     runtime
@@ -1163,13 +1424,11 @@ fn role_inflight_credit_waits_for_effect_retirement_and_never_reuses_input_id() 
     use novarocks_control_runtime::publication::PublishedSnapshot;
     use std::sync::Arc;
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut policy = config();
     policy.mailbox[2] = 1;
-    runtime
-        .register(aid(1), scope.clone(), slot(1), recorder(true), policy)
-        .unwrap();
+    let roles = register_recording_roles(&runtime, &ledger, &scope, recorder(true), policy);
     let mut role = runtime
         .reserve_input(aid(1), aid(2), InputClass::Ordinary)
         .unwrap()
@@ -1221,14 +1480,15 @@ fn role_inflight_credit_waits_for_effect_retirement_and_never_reuses_input_id() 
     runtime.retire_input(aid(1), second).unwrap();
     role.close_after_exit().unwrap();
     scope.close_external().unwrap();
+    roles.finish();
     remove_actor(&runtime, aid(1)).unwrap();
 }
 
 #[test]
 fn dropped_idle_role_stays_charged_and_is_visible_to_failed_scope_teardown() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut policy = config();
     policy.mailbox[2] = 1;
     runtime
@@ -1271,13 +1531,11 @@ fn dropped_idle_role_stays_charged_and_is_visible_to_failed_scope_teardown() {
 #[test]
 fn failed_role_still_waits_for_its_started_failure_effect_and_input_retirement() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut actor = recorder(false);
     actor.panic_on = Some(7);
-    runtime
-        .register(aid(1), scope.clone(), slot(1), actor, config())
-        .unwrap();
+    let roles = register_recording_roles(&runtime, &ledger, &scope, actor, config());
     let role = runtime
         .reserve_input(aid(1), aid(2), InputClass::Lifecycle)
         .unwrap()
@@ -1291,12 +1549,15 @@ fn failed_role_still_waits_for_its_started_failure_effect_and_input_retirement()
         runtime.close_failed_role_after_exit(aid(1), id),
         Err(DriverError::RoleBusy)
     );
-    let cleanup = runtime.take_effect(aid(1), input, action(1)).unwrap();
+    let supervisor = original_failure_input(&runtime);
+    let cleanup = runtime.take_effect(aid(1), supervisor, action(1)).unwrap();
     runtime.effect_completed(cleanup).unwrap();
+    runtime.retire_input(aid(1), supervisor).unwrap();
     runtime.retire_input(aid(1), input).unwrap();
     runtime.close_failed_role_after_exit(aid(1), id).unwrap();
     drop(role);
     drop(runtime.take_failure_payload(aid(1)).unwrap().unwrap());
+    roles.finish();
     remove_actor(&runtime, aid(1)).unwrap();
 }
 
@@ -1339,8 +1600,8 @@ fn production_turn_observes_current_time_for_each_input_before_lease_decisions()
         }
     }
     let ledger = ledger();
-    let scope = ledger.open_scope_next(None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     runtime
         .register_next(aid(1), scope.clone(), LeaseRecorder(vec![]), config())
         .unwrap();
@@ -1375,8 +1636,8 @@ fn production_turn_observes_current_time_for_each_input_before_lease_decisions()
 #[test]
 fn late_clock_observation_cannot_put_old_time_into_a_due_timer_payload() {
     let ledger = ledger();
-    let scope = ledger.open_scope_next(None, generation(), 8, 8).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let mut actor = recorder(false);
     actor.deadline = Some(Tick(10));
     runtime
@@ -1384,10 +1645,9 @@ fn late_clock_observation_cannot_put_old_time_into_a_due_timer_payload() {
         .unwrap();
     assert_eq!(runtime.advance_time(Tick(20), 0).unwrap(), 0);
     assert_eq!(runtime.advance_time(Tick(5), 1).unwrap(), 1);
+    let timer_input = runtime.pending_timer_input(aid(1)).unwrap().unwrap();
     runtime.poll_one(Tick(5)).unwrap();
-    runtime
-        .retire_input(aid(1), InputId::new(1).unwrap())
-        .unwrap();
+    runtime.retire_input(aid(1), timer_input).unwrap();
     scope.close_external().unwrap();
     assert_eq!(remove_actor(&runtime, aid(1)).unwrap().seen, vec![(1, 20)]);
     ledger.remove_scope(scope.id()).unwrap();
@@ -1398,9 +1658,9 @@ fn targeted_scope_reaping_excludes_other_owners_and_budgets_the_ready_parent() {
     use novarocks_control_runtime::{history::HistoryCapture, transaction::RuntimeError};
     use novarocks_control_runtime_core::history::HistoryFact;
     let history = HistoryCapture::new(64);
-    let ledger = RuntimeLedger::with_history(vector(8), 16, 8, history.clone());
-    let earlier = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let target = ledger.open_scope(sid(2), None, generation(), 8, 8).unwrap();
+    let ledger = RuntimeLedger::with_history(vector(8), history.clone());
+    let earlier = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let target = ledger.open_scope(sid(2), None, generation()).unwrap();
     let mut unrelated = earlier
         .admit_work(
             generation(),
@@ -1492,8 +1752,8 @@ fn targeted_scope_reaping_excludes_other_owners_and_budgets_the_ready_parent() {
 #[test]
 fn host_batch_cursor_preserves_core_commit_order_across_fair_input_reordering_and_retirement() {
     let ledger = ledger();
-    let scope = ledger.open_scope(sid(1), None, generation(), 4, 4).unwrap();
-    let runtime = ActorRuntime::new(1);
+    let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     runtime
         .register(
             aid(1),
@@ -1502,6 +1762,7 @@ fn host_batch_cursor_preserves_core_commit_order_across_fair_input_reordering_an
             Recorder {
                 seen: Vec::new(),
                 effects: false,
+                publication_work: None,
                 panic_on: None,
                 deadline: None,
             },

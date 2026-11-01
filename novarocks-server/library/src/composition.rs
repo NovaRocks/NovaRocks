@@ -456,11 +456,6 @@ pub fn compose_backend_server_config(
             config.runtime.task_preparation_max_workers,
         )
         .map_err(|error| anyhow::anyhow!("resolve preparation limits: {error}"))?,
-        inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits::try_new(
-            runtime_config.task_normal_close_max_records,
-            runtime_config.task_normal_close_max_bytes,
-        )
-        .map_err(|error| anyhow::anyhow!("resolve normal-close capacity limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
         scan_preparation_config: novarocks_worker::ScanPreparationConfig::try_new(
             runtime_config.prefetch_input_bytes_per_stream,

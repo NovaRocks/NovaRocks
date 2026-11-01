@@ -26,7 +26,7 @@ use crate::{
 use novarocks_control_runtime::{
     completion::ReportSlot,
     exit_role::{ExitAuthority, ExitRole, ExitRolePhase},
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
 };
 use novarocks_execution::runtime::{
     execution_health::{ExecutionExitOrigin, ExecutionHealth},
@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 /// Task bundle, whose owner retains funding until every child/report retires.
 pub(crate) struct AdmittedCompletionRole {
     pub work: WorkLease,
-    pub capacity: CapacityBundle,
+    pub capacity: ReservationBundle,
     pub report: ReportSlot,
 }
 struct Original {
@@ -191,9 +191,12 @@ impl TaskCompletionRoles {
     pub(crate) fn settlement_phase(&self) -> SettlementPhase {
         self.settlement.phase()
     }
-    pub(crate) fn settlement_work(&self) -> novarocks_control_runtime_core::identity::WorkId {
+    pub(crate) fn settlement_work(
+        &self,
+    ) -> novarocks_control_runtime_core::identity::ScopedWorkRef {
         self.settlement.work_id()
     }
+    #[cfg(test)]
     pub(crate) fn commit_settlement_barrier(
         &self,
         runtime: &novarocks_control_runtime::driver::ActorRuntime<
@@ -371,7 +374,7 @@ mod tests {
     }
     struct Registered(Arc<AtomicUsize>);
     impl RegistrationNotice for Registered {
-        fn bind_work(&mut self, _: novarocks_control_runtime_core::identity::WorkId) {}
+        fn bind_work(&mut self, _: novarocks_control_runtime_core::identity::ScopedWorkRef) {}
         fn registered(self: Box<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
@@ -412,10 +415,18 @@ mod tests {
         kind: WorkKind,
         admission: WorkAdmission,
     ) -> AdmittedCompletionRole {
-        let (work, capacity) = scope
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation(),
-                ResourceVector::new([(dimension(), 1)]).unwrap(),
+                novarocks_control_runtime_core::capacity::ReservationResources::new(
+                    ResourceVector::new([(dimension(), 1)]).unwrap(),
+                    novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 1,
+                        captures: 1,
+                        ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
+                    },
+                ),
                 kind,
                 admission,
             )
@@ -423,9 +434,8 @@ mod tests {
             .bind(kind)
             .unwrap();
         let report = ReportSlot::reserve_next(
-            scope,
+            &mut capacity,
             generation(),
-            work.id(),
             2,
             [
                 (
@@ -446,8 +456,8 @@ mod tests {
         }
     }
     fn fixture() -> Fixture {
-        let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 4)]).unwrap(), 4, 1);
-        let scope = ledger.open_scope_next(None, generation(), 4, 4).unwrap();
+        let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 4)]).unwrap());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let finisher = role(&scope, WorkKind::Cleanup, WorkAdmission::External);
         let child = role(
             &scope,

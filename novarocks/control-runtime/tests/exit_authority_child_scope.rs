@@ -25,9 +25,10 @@ use novarocks_control_runtime::{
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::{CapacityError, ResourceVector},
+    capacity::{ReservationResources, ResourceVector},
     completion::{CompletionError, ConsumerKind},
     identity::{ConsumerId, DimensionId, Generation},
+    owned_storage::OwnedSlotNeed,
     scope::{ScopeError, WorkAdmission, WorkKind},
 };
 fn generation() -> Generation {
@@ -48,15 +49,21 @@ struct Parent {
     consumer: ConsumerId,
 }
 impl Parent {
-    fn new(scopes: usize, reservations: usize, parent_work: usize) -> Self {
-        let ledger = RuntimeLedger::new(paid(), reservations, scopes);
-        let scope = ledger
-            .open_scope_next(None, generation(), parent_work, 1)
-            .unwrap();
-        let (work, capacity) = scope
+    fn new() -> Self {
+        let ledger = RuntimeLedger::new(paid());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation(),
-                paid(),
+                ReservationResources::new(
+                    paid(),
+                    OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 1,
+                        captures: 1,
+                        ..OwnedSlotNeed::default()
+                    },
+                ),
                 WorkKind::Step,
                 WorkAdmission::External,
             )
@@ -65,9 +72,8 @@ impl Parent {
             .unwrap();
         let consumer = ConsumerId::new(1).unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            work.id(),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
@@ -89,11 +95,14 @@ impl Parent {
         child.close_external().unwrap();
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
-        self.ledger.reap_scope_ready(child.id(), 1).unwrap();
-        capacity.release(&ResourceVector::default()).unwrap();
+        assert_eq!(self.ledger.reap_scope_ready(child.id(), 1).unwrap(), 1);
+        capacity.finish().unwrap();
+        assert!(child.snapshot().unwrap().retirement_ready);
+        let parent_work = self.scope.snapshot().unwrap().work;
         self.ledger.remove_scope(child.id()).unwrap();
-        // The parent link is its own real Work and retires separately.
-        self.ledger.reap_scope_ready(self.scope.id(), 1).unwrap();
+        // Actual child removal retires its intrinsic parent link in the same
+        // transaction. Only the original parent's own exit remains for finish.
+        assert_eq!(self.scope.snapshot().unwrap().work, parent_work - 1);
     }
     fn finish(mut self) {
         if let Some(authority) = self.authority.take() {
@@ -115,7 +124,7 @@ impl Parent {
 #[test]
 fn original_parent_exit_and_report_ack_cannot_return_fee_before_its_real_child_scope() {
     for started in [false, true] {
-        let mut f = Parent::new(2, 2, 2);
+        let mut f = Parent::new();
         if started {
             f.authority.as_mut().unwrap().start().unwrap();
         }
@@ -123,7 +132,11 @@ fn original_parent_exit_and_report_ack_cannot_return_fee_before_its_real_child_s
             .authority
             .as_mut()
             .unwrap()
-            .open_child_scope_with_root(generation(), 1, 0, WorkKind::Business)
+            .open_child_scope_with_root(
+                generation(),
+                WorkKind::Business,
+                ReservationResources::work_only(),
+            )
             .unwrap();
         let held_before = f.ledger.used(dimension());
         f.authority.take().unwrap().exited().unwrap();
@@ -145,56 +158,38 @@ fn original_parent_exit_and_report_ack_cannot_return_fee_before_its_real_child_s
 }
 
 #[test]
-fn ordinary_child_bootstrap_capacity_refusals_preserve_the_original_parent_inventory() {
-    // Each refusal is a real current metadata bound, not a fabricated scope ID.
-    for (scopes, reservations, parent_work, child_work, expected) in [
-        (1, 2, 2, 1, RuntimeError::ScopeCapacity),
-        (
-            2,
-            1,
-            2,
-            1,
-            RuntimeError::Capacity(CapacityError::Scope(ScopeError::SlotCapacity)),
-        ),
-        (2, 2, 1, 1, RuntimeError::Scope(ScopeError::WorkCapacity)),
-        (
-            2,
-            2,
-            2,
-            0,
-            RuntimeError::Capacity(CapacityError::Scope(ScopeError::WorkCapacity)),
-        ),
-    ] {
-        let mut f = Parent::new(scopes, reservations, parent_work);
-        let before = f.scope.snapshot().unwrap();
-        let outcome = f.authority.as_mut().unwrap().open_child_scope_with_root(
-            generation(),
-            child_work,
-            0,
-            WorkKind::Business,
+fn original_authority_keeps_dynamic_children_under_the_same_report_and_funding() {
+    let mut f = Parent::new();
+    let mut children = Vec::new();
+    for _ in 0..16 {
+        children.push(
+            f.authority
+                .as_mut()
+                .unwrap()
+                .open_child_scope_with_root(
+                    generation(),
+                    WorkKind::Business,
+                    ReservationResources::work_only(),
+                )
+                .unwrap(),
         );
-        let (error, unexpected) = match outcome {
-            Err(error) => (Some(error), None),
-            Ok(child) => (None, Some(child)),
-        };
-        let after = f.scope.snapshot().unwrap();
-        let fee = f.ledger.used(dimension());
-        let report_unfilled = f.report.consume(f.consumer)
-            == Err(RuntimeError::Completion(CompletionError::NotFilled));
-        if let Some((scope, root)) = unexpected {
-            f.finish_child(scope, root, WorkKind::Business);
-        }
-        f.finish();
-        assert_eq!(error, Some(ExitRoleError::Runtime(expected)));
-        assert_eq!(after, before);
-        assert_eq!(fee, 3);
-        assert!(report_unfilled);
     }
+    assert_eq!(f.scope.snapshot().unwrap().work, 17);
+    assert_eq!(f.ledger.used(dimension()), 3);
+    assert_eq!(
+        f.report.consume(f.consumer),
+        Err(RuntimeError::Completion(CompletionError::NotFilled)),
+    );
+    for (scope, root) in children {
+        f.finish_child(scope, root, WorkKind::Business);
+    }
+    assert_eq!(f.scope.snapshot().unwrap().work, 1);
+    f.finish();
 }
 
 #[test]
 fn original_authority_derives_after_external_close_but_not_new_business_after_stop() {
-    let mut f = Parent::new(3, 3, 3);
+    let mut f = Parent::new();
     f.authority.as_mut().unwrap().start().unwrap();
     f.ledger.close_admission();
     f.scope.close_external().unwrap();
@@ -202,16 +197,19 @@ fn original_authority_derives_after_external_close_but_not_new_business_after_st
         .authority
         .as_mut()
         .unwrap()
-        .open_child_scope_with_root(generation(), 1, 0, WorkKind::Step)
+        .open_child_scope_with_root(
+            generation(),
+            WorkKind::Step,
+            ReservationResources::work_only(),
+        )
         .unwrap();
     let inherited_closed = !child.gates().unwrap().external_open;
     f.scope.request_stop().unwrap();
     let before = f.scope.snapshot().unwrap();
     let rejected = f.authority.as_mut().unwrap().open_child_scope_with_root(
         generation(),
-        1,
-        0,
         WorkKind::Business,
+        ReservationResources::work_only(),
     );
     let error = match rejected {
         Err(error) => Some(error),

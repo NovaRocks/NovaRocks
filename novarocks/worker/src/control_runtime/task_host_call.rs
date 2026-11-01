@@ -16,12 +16,11 @@
 // under the License.
 
 //! A concrete once-only Task host call. It carries the original reported
-//! cleanup Work and a separately owned, already-paid slot fee. Foreign code
-//! runs only on its physical host runner; queue return never signs Work exit.
+//! cleanup Work and its actual bound Header/report/capture positions. Foreign
+//! code runs only on its physical host runner; queue return never signs exit.
 
 use super::{
     actors::{WorkerAction, WorkerActor},
-    admitted_role::adopt_reported_work,
     adopted_cleanup::AdoptedCleanupEffect,
     failure::ScopePublicationsDrained,
     preparation::QueuedPreparation,
@@ -35,14 +34,14 @@ use novarocks_control_runtime::{
     completion::ReportSlot,
     driver::{ActorRuntime, DriverError, EffectTicket},
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
-    lease::{CapacityBundle, WorkRetirementObserver},
+    lease::WorkRetirementObserver,
     owned_return::{OwnedReturnReader, OwnedReturnSender},
-    reported_work::ReportedWork,
+    reported_work::{ReportedWork, ReportedWorkBindingError},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
     identity::{ActorId, ConsumerId, Generation, ScopeId, WorkId},
+    owned_storage::OwnedSlotNeed,
     scope::ScopeError,
 };
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
@@ -83,6 +82,19 @@ pub(crate) enum TaskHostCallOutcome {
     CleanupUnresolved,
     StartRefused(ExitRoleError),
 }
+
+impl std::fmt::Display for TaskHostCallOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Completed => f.write_str("Task host call completed"),
+            Self::Panicked => f.write_str("Task host call panicked"),
+            Self::CleanupRefused => f.write_str("Task host cleanup returned a typed refusal"),
+            Self::CleanupUnresolved => f.write_str("Task host cleanup actual exit is unresolved"),
+            Self::StartRefused(error) => write!(f, "Task host call start was refused: {error}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum TaskHostCallError {
     Runtime(RuntimeError),
@@ -91,6 +103,7 @@ pub(crate) enum TaskHostCallError {
     WrongScope,
     WrongTask,
     WrongStorage,
+    StorageBinding(ReportedWorkBindingError),
     AlreadyIssued,
     Withdrawn,
     AwaitingFailurePublication,
@@ -100,6 +113,51 @@ pub(crate) enum TaskHostCallError {
     MissingPort,
     MissingConclusion,
 }
+impl std::fmt::Display for TaskHostCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runtime(error) => write!(f, "Task host call runtime failure: {error}"),
+            Self::Driver(error) => write!(f, "Task host call driver failure: {error}"),
+            Self::Exit(error) => write!(f, "Task host call exit failure: {error}"),
+            Self::WrongScope => f.write_str("Task host call has a different original scope"),
+            Self::WrongTask => f.write_str("Task host call names a different Task"),
+            Self::WrongStorage => {
+                f.write_str("Task host call has a different original storage profile")
+            }
+            Self::StorageBinding(error) => {
+                write!(f, "Task host call storage binding failed: {error}")
+            }
+            Self::AlreadyIssued => f.write_str("Task host call was already issued"),
+            Self::Withdrawn => f.write_str("Task host call was withdrawn before issuance"),
+            Self::AwaitingFailurePublication => {
+                f.write_str("Task host call requires the actual owner failure publication")
+            }
+            Self::BorrowerExitRequired => {
+                f.write_str("Task host call requires actual execution borrower exit")
+            }
+            Self::AlreadyCaptured => {
+                f.write_str("Task host call already retains its original capture")
+            }
+            Self::PortAlreadyAttached => {
+                f.write_str("Task host call already has its original port")
+            }
+            Self::MissingPort => f.write_str("Task host call has no attached original port"),
+            Self::MissingConclusion => f.write_str("Task host stop has no published conclusion"),
+        }
+    }
+}
+impl std::error::Error for TaskHostCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(error) => Some(error),
+            Self::Driver(error) => Some(error),
+            Self::Exit(error) => Some(error),
+            Self::StorageBinding(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 impl From<RuntimeError> for TaskHostCallError {
     fn from(error: RuntimeError) -> Self {
         Self::Runtime(error)
@@ -116,15 +174,6 @@ impl From<ExitRoleError> for TaskHostCallError {
     }
 }
 
-pub(crate) struct TaskHostCallBinding {
-    pub kind: TaskHostCallKind,
-    pub runtime: ActorRuntime<WorkerActor>,
-    pub actor: ActorId,
-    pub task: TaskIdentity,
-    pub port: Arc<TaskRuntimePort>,
-    pub pending: Arc<dyn TaskPendingNotice>,
-    pub health: Arc<ExecutionHealth>,
-}
 /// The already elected Task owns these original host roles before its port
 /// exists. This is custody, never permission to execute an unbound callback.
 pub(crate) struct TaskHostCallOwner {
@@ -135,54 +184,15 @@ pub(crate) struct TaskHostCallOwner {
     pub pending: Arc<dyn TaskPendingNotice>,
     pub health: Arc<ExecutionHealth>,
 }
-#[must_use = "The same unbound reported role, owner and payment require disposition"]
+#[must_use = "The same unbound reported role and owner require disposition"]
 pub(crate) struct TaskHostCallUnboundRefusal {
     pub error: TaskHostCallError,
-    pub owner: TaskHostCallOwner,
+    pub _original_owner: TaskHostCallOwner,
     pub original: ReportedWork,
-    pub payment: TaskHostCallPayment,
 }
 impl std::fmt::Debug for TaskHostCallUnboundRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TaskHostCallUnboundRefusal")
-            .field("error", &self.error)
-            .field("original", &self.original)
-            .finish_non_exhaustive()
-    }
-}
-/// Protocol fixtures explicitly admit finite zero-resource headers. Absence
-/// of a payment is never inferred to be production admission.
-pub(crate) enum TaskHostCallPayment {
-    Paid(CapacityBundle),
-    #[cfg(test)]
-    ProtocolModel,
-}
-impl TaskHostCallPayment {
-    /// Split only the already paid Task inventory; this takes no new quota.
-    pub(super) fn split_from(
-        payer: &mut CapacityBundle,
-        #[cfg(test)] protocol_model: bool,
-    ) -> Result<Self, RuntimeError> {
-        #[cfg(test)]
-        if protocol_model {
-            return Ok(Self::ProtocolModel);
-        }
-        let resources = HOST_CALL_STORAGE
-            .resources()
-            .expect("fixed Task host-call storage");
-        payer.split_next(&resources).map(Self::Paid)
-    }
-}
-#[must_use = "Admission refusal retains the complete original binding, Work and payment"]
-pub(crate) struct TaskHostCallRefusal {
-    pub error: TaskHostCallError,
-    pub binding: TaskHostCallBinding,
-    pub original: ReportedWork,
-    pub payment: TaskHostCallPayment,
-}
-impl std::fmt::Debug for TaskHostCallRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TaskHostCallRefusal")
             .field("error", &self.error)
             .field("original", &self.original)
             .finish_non_exhaustive()
@@ -215,7 +225,6 @@ struct State {
     panic: Option<PanicPayload>,
     handoff: CallHandoff,
     observer_consumed: bool,
-    payment: Option<CapacityBundle>,
     retired: bool,
     effect: Option<AdoptedCleanupEffect>,
 }
@@ -250,119 +259,36 @@ enum StartPermission {
     FailurePublicationsDrained,
 }
 impl TaskHostCall {
-    pub(crate) fn from_admitted(
-        binding: TaskHostCallBinding,
-        original: ReportedWork,
-        payment: TaskHostCallPayment,
-    ) -> Result<Self, TaskHostCallRefusal> {
-        let error = if binding.port.identity() != binding.task {
-            Some(TaskHostCallError::WrongTask)
-        } else if !binding.port.publication().owned_by(original.work().scope()) {
-            Some(TaskHostCallError::WrongScope)
-        } else {
-            None
-        };
-        if let Some(error) = error {
-            return Err(TaskHostCallRefusal {
-                error,
-                binding,
-                original,
-                payment,
-            });
-        }
-        let TaskHostCallBinding {
-            kind,
-            runtime,
-            actor,
-            task,
-            port,
-            pending,
-            health,
-        } = binding;
-        let owner = TaskHostCallOwner {
-            kind,
-            runtime,
-            actor,
-            task,
-            pending,
-            health,
-        };
-        let call = match Self::from_unbound_admitted(owner, original, payment) {
-            Ok(call) => call,
-            Err(refusal) => {
-                let TaskHostCallOwner {
-                    kind,
-                    runtime,
-                    actor,
-                    task,
-                    pending,
-                    health,
-                } = refusal.owner;
-                return Err(TaskHostCallRefusal {
-                    error: refusal.error,
-                    binding: TaskHostCallBinding {
-                        kind,
-                        runtime,
-                        actor,
-                        task,
-                        port,
-                        pending,
-                        health,
-                    },
-                    original: refusal.original,
-                    payment: refusal.payment,
-                });
-            }
-        };
-        if let Err(error) = call.attach_port(&port) {
-            // Both original origins were validated before custody. A broken
-            // trusted composition may not unwind through its original owners.
-            std::mem::forget((error, call, port));
-            std::process::abort();
-        }
-        Ok(call)
-    }
     pub(crate) fn from_unbound_admitted(
         owner: TaskHostCallOwner,
         original: ReportedWork,
-        mut payment: TaskHostCallPayment,
     ) -> Result<Self, TaskHostCallUnboundRefusal> {
-        let (work, capacity, report) = original.into_parts();
-        let header = capacity.resources();
-        let original = adopt_reported_work(work, capacity, report);
         let checked = (|| -> Result<(), TaskHostCallError> {
-            if header? != ResourceVector::default() {
+            let profile = original
+                .bound_storage_profile()
+                .map_err(TaskHostCallError::StorageBinding)?;
+            let expected = OwnedSlotNeed {
+                work_headers: 1,
+                completions: 1,
+                captures: 1,
+                ..OwnedSlotNeed::default()
+            };
+            if profile != expected {
                 return Err(TaskHostCallError::WrongStorage);
             }
-
             if !owner
                 .runtime
                 .owns_scope(owner.actor, original.work().scope())?
             {
                 return Err(TaskHostCallError::WrongScope);
             }
-            match &mut payment {
-                TaskHostCallPayment::Paid(paid) => {
-                    if paid.resources()?
-                        != HOST_CALL_STORAGE
-                            .resources()
-                            .expect("fixed host-call storage")
-                    {
-                        return Err(TaskHostCallError::WrongStorage);
-                    }
-                    paid.transfer(original.work())?;
-                }
-                #[cfg(test)]
-                TaskHostCallPayment::ProtocolModel => {}
-            }
             Ok(())
         })();
         if let Err(error) = checked {
             return Err(TaskHostCallUnboundRefusal {
                 error,
-                owner,
+                _original_owner: owner,
                 original,
-                payment,
             });
         }
         let scope = original.work().scope().clone();
@@ -374,18 +300,12 @@ impl TaskHostCall {
             Err(error) => {
                 return Err(TaskHostCallUnboundRefusal {
                     error: TaskHostCallError::Runtime(error),
-                    owner,
+                    _original_owner: owner,
                     original,
-                    payment,
                 });
             }
         };
         let (role, authority) = ExitRole::from_admitted(original);
-        let payment = match payment {
-            TaskHostCallPayment::Paid(payment) => Some(payment),
-            #[cfg(test)]
-            TaskHostCallPayment::ProtocolModel => None,
-        };
         let shared = Arc::new(Custody {
             kind: owner.kind,
             runtime: owner.runtime,
@@ -409,7 +329,6 @@ impl TaskHostCall {
                 panic: None,
                 handoff: CallHandoff::Available,
                 observer_consumed: false,
-                payment,
                 retired: false,
                 effect: None,
             }),
@@ -455,6 +374,7 @@ impl TaskHostCall {
     pub(crate) fn kind(&self) -> TaskHostCallKind {
         self.0.kind
     }
+    #[cfg(test)]
     pub(crate) fn phase(&self) -> ExitRolePhase {
         self.0.role.phase()
     }
@@ -470,6 +390,7 @@ impl TaskHostCall {
     pub(crate) fn is_retired(&self) -> bool {
         self.0.state.lock().expect("host-call retirement").retired
     }
+    #[cfg(test)]
     pub(crate) fn has_panic(&self) -> bool {
         self.0
             .state
@@ -525,7 +446,7 @@ impl TaskHostCall {
     }
     /// The actual once-only call owns the original effect as well as its
     /// preadmitted callback/report. Refusal returns the same exclusive ticket.
-    pub(crate) fn handoff_stop_effect(
+    pub(in crate::control_runtime) fn handoff_stop_effect(
         &self,
         ticket: EffectTicket<WorkerAction>,
         notice: Option<RequestNotice>,
@@ -770,14 +691,7 @@ impl TaskHostCall {
             return Ok(false);
         }
         {
-            let mut state = self.0.state.lock().expect("actual host-call payment");
-            if let Some(payment) = &mut state.payment
-                && !payment.is_released()
-            {
-                let resources = payment.resources()?;
-                payment.release(&resources)?;
-            }
-            state.payment = None;
+            let mut state = self.0.state.lock().expect("actual host-call retirement");
             state.retired = true;
         }
         let retained = self

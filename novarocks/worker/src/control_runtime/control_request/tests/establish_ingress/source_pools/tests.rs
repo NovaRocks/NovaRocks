@@ -37,21 +37,19 @@ fn wait_original_ready(f: &Fixture, input: InputId) {
         f.runtime.wait_after_timeout(version, remaining);
     }
 }
-pub(super) fn original_fees(f: &Fixture) -> [u64; 5] {
+pub(super) fn original_fees(f: &Fixture) -> [u64; 3] {
+    let actual = f.root.resources().scope.snapshot().unwrap();
     [
-        Dimension::Work,
-        Dimension::Captures,
-        Dimension::Inputs,
-        Dimension::Replies,
-        Dimension::Completions,
+        f.ledger.used(Dimension::Requests.id()),
+        actual.work as u64,
+        actual.storage as u64,
     ]
-    .map(|dimension| f.ledger.used(dimension.id()))
 }
 
 #[test]
 fn only_the_original_root_source_pools_can_take_getter_and_disposal_jobs() {
-    let mut f = fixture(2);
-    let mut foreign = fixture(2);
+    let mut f = fixture();
+    let mut foreign = fixture();
     let mut pools = SourcePoolGuard::start(&mut f);
     let foreign_pools = SourcePoolGuard::start(&mut foreign);
     let repeated_refused = match f
@@ -116,7 +114,7 @@ fn only_the_original_root_source_pools_can_take_getter_and_disposal_jobs() {
     pools.finish();
     foreign_pools.finish();
     let retired = f.root.reap_ready_requests(8).unwrap();
-    let charged = f.ledger.used(Dimension::Replies.id());
+    let charged = f.ledger.used(Dimension::Requests.id());
     f.finish();
     foreign.finish();
     assert!(repeated_refused);

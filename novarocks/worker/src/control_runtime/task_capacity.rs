@@ -23,8 +23,8 @@
 use super::actors::WorkerActor;
 use novarocks_control_runtime::driver::{ActorRegistration, ActorRuntime, DriverError};
 use novarocks_control_runtime_core::{
-    fair_queue::{FairQueueError, FairWorkQueue},
     identity::ActorId,
+    scheduler::{ReadyQueue, SchedulerError},
 };
 use std::{
     collections::BTreeMap,
@@ -37,13 +37,36 @@ use std::{
 
 #[derive(Debug)]
 pub(crate) enum TaskCapacityError {
-    InvalidGeometry,
     WrongOwner,
     ForeignRegistration,
     FutureRevision,
-    Full,
     Driver(DriverError),
-    Queue(FairQueueError),
+    Queue(SchedulerError),
+}
+impl std::fmt::Display for TaskCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongOwner => f.write_str("Task capacity signal belongs to another runtime"),
+            Self::ForeignRegistration => {
+                f.write_str("Task capacity waiter has a foreign registration")
+            }
+            Self::FutureRevision => f.write_str("Task capacity waiter refers to a future revision"),
+            Self::Driver(error) => write!(f, "Task capacity notification failed: {error}"),
+            Self::Queue(error) => write!(f, "Task capacity waiter queue failed: {error:?}"),
+        }
+    }
+}
+impl std::error::Error for TaskCapacityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Driver(error) => Some(error),
+            // SchedulerError is a closed neutral leaf without an Error impl.
+            Self::Queue(_)
+            | Self::WrongOwner
+            | Self::ForeignRegistration
+            | Self::FutureRevision => None,
+        }
+    }
 }
 struct Waiter {
     registration: ActorRegistration,
@@ -51,7 +74,7 @@ struct Waiter {
 }
 struct Waiters {
     original: BTreeMap<ActorId, Waiter>,
-    fifo: FairWorkQueue<ActorId, ()>,
+    fifo: ReadyQueue,
     sweep_revision: u64,
     sweep_remaining: usize,
     rescan: bool,
@@ -59,37 +82,31 @@ struct Waiters {
 struct Shared {
     runtime: ActorRuntime<WorkerActor>,
     root: ActorRegistration,
-    limit: usize,
     revision: AtomicU64,
     waiters: Mutex<Waiters>,
 }
-/// Cloning shares only the same bounded metadata index and tail event source.
+/// Cloning shares only the same per-actor metadata index and tail event source.
 /// It grants no Work, input, original job, publication or resource capacity.
 #[derive(Clone)]
 pub(crate) struct TaskCapacitySignal(Arc<Shared>);
 
 impl TaskCapacitySignal {
-    /// Process composition supplies the original Root's actual directory C.
-    /// `ProcessControlOwner::task_capacity_signal` derives that value directly.
+    /// The original Root authenticates this process-local notification index.
+    /// Registration allocates one address row for that actor, with no C limit.
     pub(crate) fn new(
         runtime: ActorRuntime<WorkerActor>,
         root: ActorRegistration,
-        max_contexts: usize,
     ) -> Result<Self, TaskCapacityError> {
-        if max_contexts == 0 {
-            return Err(TaskCapacityError::InvalidGeometry);
-        }
         runtime
             .validate_registration(&root)
             .map_err(TaskCapacityError::Driver)?;
         Ok(Self(Arc::new(Shared {
             runtime,
             root,
-            limit: max_contexts,
             revision: AtomicU64::new(0),
             waiters: Mutex::new(Waiters {
                 original: BTreeMap::new(),
-                fifo: FairWorkQueue::new(max_contexts, max_contexts, 1),
+                fifo: ReadyQueue::new(),
                 sweep_revision: 0,
                 sweep_remaining: 0,
                 rescan: false,
@@ -99,20 +116,13 @@ impl TaskCapacitySignal {
     pub(crate) fn same_signal(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
-    pub(crate) fn belongs_to(
-        &self,
-        runtime: &ActorRuntime<WorkerActor>,
-        root: &ActorRegistration,
-    ) -> bool {
-        self.0.runtime.same_runtime(runtime) && self.0.root.same_registration(root)
-    }
     pub(crate) fn is_empty(&self) -> bool {
         let state = self
             .0
             .waiters
             .lock()
             .expect("original Task capacity addresses");
-        state.original.is_empty() && state.fifo.is_empty()
+        state.original.is_empty() && state.fifo.actor_count() == 0
     }
     pub(crate) fn revision(&self) -> u64 {
         self.0.revision.load(Ordering::Acquire)
@@ -154,13 +164,11 @@ impl TaskCapacitySignal {
             // position. A duplicate registration cannot jump a waiting sibling.
             original.before = original.before.min(before);
         } else {
-            if state.original.len() >= self.0.limit {
-                return Err(TaskCapacityError::Full);
-            }
             state
                 .fifo
-                .enqueue(actor, ())
+                .register(actor)
                 .map_err(TaskCapacityError::Queue)?;
+            state.fifo.notify(actor).map_err(TaskCapacityError::Queue)?;
             state.original.insert(
                 actor,
                 Waiter {
@@ -182,7 +190,8 @@ impl TaskCapacitySignal {
     }
     /// Actual Context teardown may remove only its identical queued address.
     /// This supplies no job/body/Scope exit fact; those gates precede the call.
-    /// Removing it before real directory reuse keeps the index bounded by C.
+    /// Each live registered actor owns at most one row; no record count grants
+    /// or refuses Context admission.
     pub(crate) fn unregister_waiter(
         &self,
         registration: &ActorRegistration,
@@ -201,10 +210,14 @@ impl TaskCapacitySignal {
         }
         state
             .fifo
-            .remove_queued(actor, ())
+            .cancel_pending(actor)
+            .map_err(TaskCapacityError::Queue)?;
+        state
+            .fifo
+            .unregister(actor)
             .map_err(TaskCapacityError::Queue)?;
         state.original.remove(&actor);
-        state.sweep_remaining = state.sweep_remaining.min(state.fifo.len());
+        state.sweep_remaining = state.sweep_remaining.min(state.fifo.ready_count());
         Ok(())
     }
     /// The actual physical key/tail has been released before this event. This
@@ -244,22 +257,18 @@ impl TaskCapacitySignal {
         let revision = self.revision();
         if state.sweep_revision != revision || state.rescan {
             state.sweep_revision = revision;
-            state.sweep_remaining = state.fifo.len();
+            state.sweep_remaining = state.fifo.ready_count();
             state.rescan = false;
         }
-        state.sweep_remaining = state.sweep_remaining.min(state.fifo.len());
+        state.sweep_remaining = state.sweep_remaining.min(state.fifo.ready_count());
         for _ in 0..budget {
             if state.sweep_remaining == 0 {
                 break;
             }
-            let Some((actor, ())) = state.fifo.pop() else {
+            let Some(actor) = state.fifo.claim() else {
                 state.sweep_remaining = 0;
                 break;
             };
-            state
-                .fifo
-                .finish(actor, ())
-                .map_err(TaskCapacityError::Queue)?;
             state.sweep_remaining -= 1;
             let original = state
                 .original
@@ -272,13 +281,17 @@ impl TaskCapacitySignal {
                 match self.0.runtime.notify_host_actor(&original.registration) {
                     Ok(())
                     | Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => {
+                        state
+                            .fifo
+                            .unregister_claimed(actor)
+                            .map_err(TaskCapacityError::Queue)?;
                         state.original.remove(&actor);
                     }
                     Err(error) => {
                         // The original metadata remains registered on refusal.
                         state
                             .fifo
-                            .enqueue(actor, ())
+                            .release(actor, true)
                             .map_err(TaskCapacityError::Queue)?;
                         state.rescan = true;
                         return Err(TaskCapacityError::Driver(error));
@@ -287,7 +300,7 @@ impl TaskCapacitySignal {
             } else {
                 state
                     .fifo
-                    .enqueue(actor, ())
+                    .release(actor, true)
                     .map_err(TaskCapacityError::Queue)?;
             }
         }

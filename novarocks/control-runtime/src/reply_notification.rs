@@ -43,7 +43,7 @@ type PanicPayload = ManuallyDrop<Box<dyn Any + Send>>;
 pub enum ReplyNotificationError {
     Driver(DriverError),
     WrongWorkScope,
-    WorkNotQueued,
+    WorkNotLive,
     ObserverEnded,
     Failed,
 }
@@ -187,7 +187,7 @@ pub struct ReplyNotificationJob<A: Actor> {
 impl<A: Actor> ReplyNotification<A> {
     /// Construct once for the caller's already-paid original request before
     /// its first callback capture. Matching public IDs is insufficient: both
-    /// the actual registration/runtime and the original Scope must match.
+    /// the actual registration, runtime and bound author must match.
     /// This check does not prove that the caller paid notification geometry.
     pub fn for_admitted_work(
         runtime: &ActorRuntime<A>,
@@ -195,11 +195,8 @@ impl<A: Actor> ReplyNotification<A> {
         work: &WorkLease,
     ) -> Result<(Self, ReplyObserver<A>), ReplyNotificationError> {
         runtime
-            .validate_registration(registration)
+            .validate_work_author(registration, work)
             .map_err(ReplyNotificationError::Driver)?;
-        if !registration.matches_scope(work.scope()) {
-            return Err(ReplyNotificationError::WrongWorkScope);
-        }
         {
             let state = work
                 .scope()
@@ -212,13 +209,17 @@ impl<A: Actor> ReplyNotification<A> {
                 .scopes
                 .get(&work.scope().id())
                 .and_then(|scope| scope.work(work.id()))
-                .ok_or(ReplyNotificationError::WorkNotQueued)?;
+                .ok_or(ReplyNotificationError::WorkNotLive)?;
+            // Supervision may already have started before this first foreign
+            // callback endpoint is exposed. Starting does not grant another
+            // notification payment or excuse a physically exited/unknown owner.
             if original.unbound_guard
-                || original.phase != WorkPhase::Queued
+                || !matches!(original.phase, WorkPhase::Queued | WorkPhase::Started)
                 || original.body_exited
                 || original.captures_exited
+                || state.unresolved.contains(&(work.scope().id(), work.id()))
             {
-                return Err(ReplyNotificationError::WorkNotQueued);
+                return Err(ReplyNotificationError::WorkNotLive);
             }
         }
         let shared = Arc::new(Shared {

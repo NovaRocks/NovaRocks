@@ -16,7 +16,7 @@
 // under the License.
 
 //! The original process Root's final drain. External intake closes before
-//! waiting; its timer remains alive until real tickets and Contexts retire.
+//! waiting; live requests and Context execution retain their actual custody.
 
 use super::{ControlInternalError, KINDS, ProcessControlOwner, RuntimeError, WorkerActor};
 use novarocks_control_runtime::driver::{ActorHostTurn, DriverError, TimerSourceState};
@@ -39,10 +39,46 @@ pub(crate) enum RootDrainError {
     Driver(DriverError),
     Internal(ControlInternalError),
 }
+impl std::fmt::Display for RootDrainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotDraining => f.write_str("Process control has not begun draining"),
+            Self::InventoryPending => {
+                f.write_str("Process control still owns pending drain inventory")
+            }
+            Self::RootFailed => f.write_str("Process control Root actor failed"),
+            Self::WrongOwner => {
+                f.write_str("Process control drain does not belong to the original owner")
+            }
+            Self::Runtime(error) => {
+                write!(f, "Process control drain runtime operation failed: {error}")
+            }
+            Self::Driver(error) => {
+                write!(f, "Process control drain actor operation failed: {error}")
+            }
+            Self::Internal(error) => {
+                write!(f, "Process control internal source drain failed: {error}")
+            }
+        }
+    }
+}
+impl std::error::Error for RootDrainError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(error) => Some(error),
+            Self::Driver(error) => Some(error),
+            Self::Internal(error) => Some(error),
+            Self::NotDraining | Self::InventoryPending | Self::RootFailed | Self::WrongOwner => {
+                None
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct RootDrainProgress {
     pub ready: bool,
-    /// Only finite ready-header work. A ticket, delivery, Source or future
+    /// Only finite ready-header work. A delivery, Source or future
     /// lease keeps the owner parked until its actual timer/exit notification.
     pub runnable: bool,
 }
@@ -54,7 +90,7 @@ pub(crate) enum RootDrainRefusal {
     },
     AfterActor {
         error: RootDrainError,
-        actor: WorkerActor,
+        _actor: WorkerActor,
     },
 }
 impl std::fmt::Debug for RootDrainRefusal {
@@ -76,8 +112,8 @@ impl std::fmt::Debug for RootDrainRefusal {
 impl ProcessControlOwner {
     /// Close the actual external Work gate and mailbox intake. Already
     /// admitted RPCs and cleanup producers retain all their original rights.
-    /// Stopping the timer here would strand unexpired tickets/retention, so
-    /// the same timer continues until the actual inventory is empty below.
+    /// The timer continues while existing requests and live Context work may
+    /// still need it. Pure ticket history does not delay process shutdown.
     pub(crate) fn begin_drain(&mut self) -> Result<(), RootDrainError> {
         if self.resources.teardown.scope_removed || self.resources.teardown.draining {
             return Ok(());
@@ -126,7 +162,8 @@ impl ProcessControlOwner {
 
     /// The Node must first empty its original removed-Context parent rows.
     /// This method separately verifies Root's own actual owners, and never
-    /// removes an unexpired ticket or manufactures any Context/Source exit.
+    /// manufactures any Context/Source exit. Once ingress has actually closed,
+    /// process-local ticket history imposes no further shutdown obligation.
     pub(crate) fn advance_drain(&mut self) -> Result<RootDrainProgress, RootDrainError> {
         let mut progress = RootDrainProgress::default();
         if self.resources.teardown.scope_removed {
@@ -143,10 +180,15 @@ impl ProcessControlOwner {
         if snapshot.failed {
             return Err(RootDrainError::RootFailed);
         }
-        if !self.resources.request_partials.is_empty()
+        if self
+            .resources
+            .rejected_ingress
+            .as_ref()
+            .is_some_and(|original| !original.is_empty())
+            || !self.resources.request_partials.is_empty()
             || !self.resources.requests.is_empty()
+            || !self.resources.request_header_routes.is_empty()
             || self.resources.request_ready.registered() != 0
-            || !self.resources.tickets.is_empty()
             || !self.service.directory().is_empty()
             || !self.resources.route_waiters.is_empty()
             || !self.resources.ready_routes.is_empty()
@@ -160,7 +202,7 @@ impl ProcessControlOwner {
         {
             return Ok(progress);
         }
-        // No future ticket, Context callback or source owner can require a
+        // No live Context callback or source owner can require a
         // deadline now. An already filled Tick still has its real batch.
         self.runtime()
             .close_timer_source(self.actor)
@@ -233,10 +275,7 @@ impl ProcessControlOwner {
                 progress.runnable = true;
                 return Ok(progress);
             }
-            let resources = role.capacity.resources().map_err(RootDrainError::Runtime)?;
-            role.capacity
-                .release(&resources)
-                .map_err(RootDrainError::Runtime)?;
+            role.capacity.finish().map_err(RootDrainError::Runtime)?;
         }
         // Child-scope links can be the last genuine ready headers after their
         // actual parent owners moved out. Do not confuse work>0 with readiness.
@@ -286,7 +325,7 @@ impl ProcessControlOwner {
         if let Err(error) = self.ledger().remove_scope(self.resources.scope.id()) {
             return Err(RootDrainRefusal::AfterActor {
                 error: RootDrainError::Runtime(error),
-                actor,
+                _actor: actor,
             });
         }
         self.resources.teardown.scope_removed = true;

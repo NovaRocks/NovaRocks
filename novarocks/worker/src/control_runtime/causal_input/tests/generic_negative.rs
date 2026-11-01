@@ -19,18 +19,13 @@
 
 use super::*;
 
-fn original_fees(f: &Fixture) -> [u64; 8] {
-    [
-        Dimension::ActiveTasks,
-        Dimension::Work,
-        Dimension::Captures,
-        Dimension::Inputs,
-        Dimension::Batches,
-        Dimension::Effects,
-        Dimension::Cuts,
-        Dimension::Completions,
-    ]
-    .map(|dimension| f.runtime.ledger.used(dimension.id()))
+fn original_fees(f: &Fixture) -> (u64, usize, usize) {
+    let original = f.runtime.scope.snapshot().unwrap();
+    (
+        f.runtime.ledger.used(Dimension::ActiveTasks.id()),
+        original.work,
+        original.storage,
+    )
 }
 
 #[test]
@@ -92,7 +87,7 @@ fn another_real_core_cannot_consume_a_generic_authors_original_core_leg() {
     // This empty alias owns no input, cut or Work in either Core.
     let mut wrong_core = TaskCausalInbox::new(
         other.runtime.runtime.clone(),
-        actor(),
+        other.runtime.registration.clone(),
         ActorId::new(7002).unwrap(),
         f.custody.task(),
         generation(),
@@ -206,7 +201,7 @@ fn a_start_permit_dropped_after_scope_failure_withdraws_only_its_original_unused
     assert!(!f.runtime.scope.join_ready().unwrap());
     assert_eq!(
         f.runtime.ledger.used(Dimension::ActiveTasks.id()) + 1,
-        funded[0]
+        funded.0
     );
     assert!(f.health.failure().is_none());
     // The standard fixture now supplies the remaining actual unused Source

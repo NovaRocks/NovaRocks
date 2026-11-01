@@ -30,16 +30,10 @@ use novarocks_task_codec::TransportBudget;
 use novarocks_worker::{
     LeaseBounds, METRIC_PUBLISH_MIN_INTERVAL, NODE_CONTEXT_STEP_BUDGET, NODE_CONTROL_STEP_BUDGET,
     NodeAdmissionTicketConfig, NodeContextCoreConfig, NodeControlConfig, NodeGeometry,
-    NodeGeometryError, NodeGeometryInputs, NodeWorkers, RequestHorizon,
-    TaskInboundCapabilityLimits, TaskPreparationLimits,
+    NodeGeometryError, NodeGeometryInputs, NodeWorkers, RequestHorizon, TaskPreparationLimits,
     control_runtime_policy::{ControlRuntimePolicy, IngressRoleLimits, PolicyError},
 };
 use std::{fmt, num::NonZeroUsize, time::Duration};
-
-/// An explicit total owned-record policy: active, retained and physically
-/// removing Contexts all hold this same budget until their actual exit.
-pub(super) const DEFAULT_TOTAL_CONTEXT_RECORDS: NonZeroUsize =
-    NonZeroUsize::new(1024).expect("the explicit Context record policy is positive");
 
 #[derive(Debug)]
 pub(super) enum WorkerNodeConfigError {
@@ -80,8 +74,6 @@ impl ResolvedWorkerNodeConfig {
     pub(super) fn try_new(
         native: NativeIngressConfig,
         preparation: TaskPreparationLimits,
-        inbound: TaskInboundCapabilityLimits,
-        contexts: NonZeroUsize,
         workers: NodeWorkers,
     ) -> Result<Self, WorkerNodeConfigError> {
         let transport = TransportBudget::DEFAULT;
@@ -134,7 +126,6 @@ impl ResolvedWorkerNodeConfig {
         .map_err(WorkerNodeConfigError::Policy)?;
         let tickets = NodeAdmissionTicketConfig::DEFAULT;
         let geometry = NodeGeometry::try_new(NodeGeometryInputs {
-            contexts,
             tasks_per_context: tasks,
             active_tasks: active,
             preparing_tasks: NonZeroUsize::new(preparation.tasks()).ok_or(
@@ -143,28 +134,17 @@ impl ResolvedWorkerNodeConfig {
             preparing_bytes: NonZeroUsize::new(preparation.bytes()).ok_or(
                 WorkerNodeConfigError::Invalid("preparation bytes must be positive"),
             )?,
-            ticket_live: NonZeroUsize::new(tickets.max_reservations()).ok_or(
-                WorkerNodeConfigError::Invalid("admission ticket positions must be positive"),
-            )?,
-            ticket_records: NonZeroUsize::new(tickets.max_records()).ok_or(
-                WorkerNodeConfigError::Invalid("admission ticket records must be positive"),
-            )?,
-            inbound,
             policy,
             native_root_data_holders: root_holders,
         })
         .map_err(WorkerNodeConfigError::Geometry)?;
         let request_positions = geometry.request_positions().get();
         let control = NodeControlConfig {
-            max_contexts: contexts.get(),
-            max_waiters: request_positions,
             max_pending_requests: request_positions,
             step_budget: NODE_CONTROL_STEP_BUDGET,
-            retained_contexts: contexts.get(),
-            gone_fences: tasks.get(),
-            retention: RequestHorizon::DEFAULT.total(),
         };
         let context = NodeContextCoreConfig {
+            request_horizon: RequestHorizon::DEFAULT,
             max_tasks: tasks.get(),
             max_creation_waiters: request_positions,
             max_pending_requests: request_positions,

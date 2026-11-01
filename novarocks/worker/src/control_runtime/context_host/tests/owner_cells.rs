@@ -24,12 +24,8 @@ use std::{
     time::Duration,
 };
 
-fn charges(fixture: &Harness) -> [u64; 3] {
-    [
-        fixture.ledger.used(Dimension::Work.id()),
-        fixture.ledger.used(Dimension::Captures.id()),
-        fixture.ledger.used(Dimension::Completions.id()),
-    ]
+fn charges(fixture: &Harness) -> [u64; 4] {
+    actual_admission_usage(fixture)
 }
 
 #[test]

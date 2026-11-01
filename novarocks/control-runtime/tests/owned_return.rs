@@ -24,9 +24,10 @@ use novarocks_control_runtime::{
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     completion::{CompletionError, ConsumerKind, Consumption, ReturnState},
     identity::{ConsumerId, DimensionId, Generation},
+    owned_storage::OwnedSlotNeed,
     scope::{ScopeError, WorkAdmission, WorkKind},
 };
 use std::{
@@ -52,6 +53,17 @@ fn consumer() -> ConsumerId {
 fn resources(n: u64) -> ResourceVector {
     ResourceVector::new([(dimension(), n)]).unwrap()
 }
+fn reported_resources() -> ReservationResources {
+    ReservationResources::new(
+        resources(1),
+        OwnedSlotNeed {
+            work_headers: 1,
+            completions: 1,
+            captures: 1,
+            ..OwnedSlotNeed::default()
+        },
+    )
+}
 struct Fixture<T: Send + 'static> {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
@@ -63,12 +75,12 @@ struct Fixture<T: Send + 'static> {
 }
 impl<T: Send + 'static> Fixture<T> {
     fn new() -> Self {
-        let ledger = RuntimeLedger::new(resources(2), 4, 2);
-        let scope = ledger.open_scope_next(None, generation(), 4, 2).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(resources(2));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation(),
-                resources(1),
+                reported_resources(),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -76,9 +88,8 @@ impl<T: Send + 'static> Fixture<T> {
             .bind(WorkKind::Cleanup)
             .unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            work.id(),
             1,
             [(consumer(), ConsumerKind::Observer)],
         )
@@ -186,20 +197,19 @@ fn live_payload_blocks_report_and_capacity_retirement_after_all_other_legs() {
 #[test]
 fn claim_requires_the_original_bound_not_started_producer_and_reserved_report() {
     for exited in [false, true] {
-        let ledger = RuntimeLedger::new(resources(1), 1, 1);
-        let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-        let guard = scope
+        let ledger = RuntimeLedger::new(resources(1));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let mut guard = scope
             .reserve_next(
                 generation(),
-                resources(1),
+                reported_resources(),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
             .unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut guard,
             generation(),
-            guard.work_id(),
             1,
             [(consumer(), ConsumerKind::Observer)],
         )
@@ -382,11 +392,11 @@ impl Drop for BlockingDrop {
     }
 }
 fn advance_peer(ledger: &RuntimeLedger) -> Result<(), RuntimeError> {
-    let scope = ledger.open_scope_next(None, generation(), 1, 0)?;
+    let scope = ledger.open_scope_next(None, generation())?;
     let (mut work, mut capacity) = scope
         .reserve_next(
             generation(),
-            resources(1),
+            ReservationResources::for_work(resources(1)),
             WorkKind::Cleanup,
             WorkAdmission::External,
         )?
@@ -394,7 +404,8 @@ fn advance_peer(ledger: &RuntimeLedger) -> Result<(), RuntimeError> {
     work.start()?;
     work.body_exited()?;
     work.captures_exited()?;
-    capacity.release(&capacity.resources()?)?;
+    capacity.release_quota(&capacity.resources()?.quota)?;
+    capacity.finish()?;
     ledger.reap_scope_ready(scope.id(), 1)?;
     scope.close_external()?;
     ledger.remove_scope(scope.id())?;

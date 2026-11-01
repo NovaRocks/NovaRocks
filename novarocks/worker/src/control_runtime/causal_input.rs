@@ -65,6 +65,45 @@ pub(crate) enum CausalInputError {
     Role(ExitRoleError),
     Report(RuntimeError),
 }
+impl std::fmt::Display for CausalInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // CausalError is a closed Copy vocabulary containing only neutral
+            // protocol/runtime errors, never the retained input or its owner.
+            Self::Causal(error) => write!(f, "causal input protocol failed: {error:?}"),
+            Self::HandoffRejected => f.write_str("causal input handoff was rejected"),
+            Self::Role(error) => write!(f, "causal input role failed: {error}"),
+            Self::Report(error) => write!(f, "causal input report failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for CausalInputError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Causal(error) => match error {
+                CausalError::Driver(error) => Some(error),
+                CausalError::Role(error) => Some(error),
+                // These closed protocol leaves do not implement Error. Their
+                // original typed detail remains in this error's Display.
+                CausalError::Cut(_)
+                | CausalError::Source(_)
+                | CausalError::UnknownRole
+                | CausalError::AlreadyAdmitted
+                | CausalError::NotDelivered
+                | CausalError::InputObservationMissing
+                | CausalError::IngressGeometry
+                | CausalError::WrongTask
+                | CausalError::UnknownSource
+                | CausalError::InvalidRequestClass
+                | CausalError::RequestAdmissionClosed
+                | CausalError::WrongAuthor => None,
+            },
+            Self::HandoffRejected => None,
+            Self::Role(error) => Some(error),
+            Self::Report(error) => Some(error),
+        }
+    }
+}
 #[must_use = "Publish, withdraw or retain the original author's Unknown responsibility"]
 pub(crate) struct InputAuthor {
     custody: CausalInputCustody,
@@ -91,7 +130,7 @@ impl CausalInputCustody {
         // An invariant violation fails before an exit authority or callback is
         // constructed; it never converts a different producer into this role.
         let binding = inbox
-            .author_binding(task, cut, admitted.work.id(), &sender)
+            .author_binding(task, cut, admitted.work.reference(), &sender)
             .expect("the original input author uses its exact admitted sender and Work");
         let scope = admitted.work.scope().clone();
         let report = admitted.report.clone();
@@ -128,7 +167,7 @@ impl CausalInputCustody {
         };
         (owner, author)
     }
-    pub(crate) fn work_id(&self) -> novarocks_control_runtime_core::identity::WorkId {
+    pub(crate) fn work_id(&self) -> novarocks_control_runtime_core::identity::ScopedWorkRef {
         self.0.binding.work_id()
     }
     pub(crate) fn cut(&self) -> CutId {
@@ -146,6 +185,24 @@ impl CausalInputCustody {
     pub(crate) fn actual_exit_ready(&self) -> Result<bool, ExitRoleError> {
         self.0.role.actual_exit_ready()
     }
+    /// The unique holder really exited its own body and captures. Children
+    /// and report consumers still retain their independent original duties.
+    pub(crate) fn body_and_captures_exited(&self) -> bool {
+        matches!(self.phase(), ExitRolePhase::Exited | ExitRolePhase::Retired)
+            && self.0.role.body_exited()
+            && self.0.role.captures_exited()
+    }
+    /// Removing the cut receipt is safe only after the same report resolves
+    /// every original leg. This never retires its parent Work or children.
+    pub(crate) fn cut_tail_ready(&self) -> Result<bool, ExitRoleError> {
+        if self.phase() == ExitRolePhase::Retired {
+            return Ok(true);
+        }
+        if !self.body_and_captures_exited() {
+            return Ok(false);
+        }
+        self.report().retirement_ready().map_err(Into::into)
+    }
     /// Called by the exclusive host custodian before retiring causal inputs.
     /// Actual action exit and its exact event commit acknowledge different
     /// report legs. Neither waits for the Source pair's later open segment.
@@ -156,7 +213,7 @@ impl CausalInputCustody {
         if self.phase() == ExitRolePhase::Retired {
             return Ok(true);
         }
-        if !self.actual_exit_ready().map_err(CausalInputError::Role)? {
+        if !self.body_and_captures_exited() {
             return Ok(false);
         }
         // A failed/missing Core observation must not suppress this independent
@@ -172,16 +229,15 @@ impl CausalInputCustody {
                 .consume(observer)
                 .map_err(CausalInputError::Report)?;
         }
-        let core_consumed = inbox
-            .bound_author_report_consumed(&self.0.binding)
-            .map_err(CausalInputError::Causal)?;
         let core = ConsumerId::new(1).unwrap();
-        if core_consumed
-            && self
-                .report()
-                .consumption(core)
-                .map_err(CausalInputError::Report)?
-                == Consumption::Pending
+        if self
+            .report()
+            .consumption(core)
+            .map_err(CausalInputError::Report)?
+            == Consumption::Pending
+            && inbox
+                .bound_author_report_consumed(&self.0.binding)
+                .map_err(CausalInputError::Causal)?
         {
             self.report()
                 .consume(core)
@@ -203,10 +259,21 @@ impl CausalInputCustody {
         if self.phase() == ExitRolePhase::Retired {
             return Ok(true);
         }
-        let receipt = inbox
-            .failed_author_consumption(stage, &self.0.binding)
-            .map_err(CausalInputError::Causal)?;
         let core = ConsumerId::new(1).unwrap();
+        let receipt = if self
+            .report()
+            .consumption(core)
+            .map_err(CausalInputError::Report)?
+            == Consumption::Pending
+        {
+            inbox
+                .failed_author_consumption(stage, &self.0.binding)
+                .map_err(CausalInputError::Causal)?
+        } else {
+            self.report()
+                .consumption(core)
+                .map_err(CausalInputError::Report)?
+        };
         if receipt == Consumption::AbandonedByOwnerFailure
             && self
                 .report()
@@ -218,7 +285,7 @@ impl CausalInputCustody {
                 .abandon_failed_owner(core, &self.0.scope, original_generation)
                 .map_err(CausalInputError::Report)?;
         }
-        if !self.actual_exit_ready().map_err(CausalInputError::Role)? {
+        if !self.body_and_captures_exited() {
             return Ok(false);
         }
         for consumer in [ConsumerId::new(2).unwrap(), core] {
@@ -240,6 +307,7 @@ impl CausalInputCustody {
     }
     /// Failure takeover can transfer the precise refused payload. Taking it
     /// supplies no positive action exit or input-consumption observation.
+    #[cfg(test)]
     pub(crate) fn take_rejected(&self) -> Option<ContextInput> {
         self.0
             .rejected
@@ -405,7 +473,7 @@ mod tests {
     use novarocks_control_runtime::{
         actor::ActorConfig,
         driver::ActorRuntime,
-        lease::{CapacityBundle, WorkLease},
+        lease::{ReservationBundle, WorkLease},
         transaction::{RuntimeLedger, ScopeHandle},
     };
     use novarocks_control_runtime_core::{
@@ -462,16 +530,17 @@ mod tests {
         TaskOperationId::try_from_bytes(bytes).unwrap()
     }
 
-    fn empty() -> ResourceVector {
-        ResourceVector::default()
+    fn empty() -> novarocks_control_runtime_core::capacity::ReservationResources {
+        novarocks_control_runtime_core::capacity::ReservationResources::work_only()
     }
     struct RuntimeFixture {
         ledger: RuntimeLedger,
         scope: ScopeHandle,
         runtime: ActorRuntime<WorkerActor>,
+        registration: novarocks_control_runtime::driver::ActorRegistration,
         identity: QueryContextRef,
-        roles: Vec<(WorkLease, CapacityBundle)>,
-        jobs: BTreeMap<ReservationId, (WorkLease, CapacityBundle)>,
+        roles: Vec<(WorkLease, ReservationBundle)>,
+        jobs: BTreeMap<ReservationId, (WorkLease, ReservationBundle)>,
     }
     impl RuntimeFixture {
         fn new() -> Self {
@@ -489,22 +558,17 @@ mod tests {
                     (Dimension::ActiveTasks.id(), 2),
                     (Dimension::PreparingTasks.id(), 1),
                     (Dimension::PreparingBytes.id(), bytes),
-                    (Dimension::InboundRecords.id(), 4),
-                    (Dimension::InboundBytes.id(), bytes),
-                    (Dimension::Tickets.id(), 1),
-                    (Dimension::Contexts.id(), 1),
                 ])
                 .unwrap(),
-                32 + 6, // Four base Source roles and the cut's two original roles.
-                2,
             );
-            let scope = ledger
-                .open_scope_next(None, generation(), 32 + 6, 32 + 6)
-                .unwrap();
+            let scope = ledger.open_scope_next(None, generation()).unwrap();
             let mut roles = Vec::new();
-            for kind in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step] {
+            for (index, kind) in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step]
+                .into_iter()
+                .enumerate()
+            {
                 let (mut work, capacity) = scope
-                    .reserve_next(generation(), empty(), kind, WorkAdmission::External)
+                    .reserve_next(generation(), novarocks_control_runtime_core::capacity::ReservationResources::new(ResourceVector::default(), novarocks_control_runtime_core::owned_storage::OwnedSlotNeed { work_headers: 1, inputs: if index == 2 {48} else if index == 1 {1} else {0}, batches: if index == 2 {48} else if index == 1 {1} else {0}, effects: (if index == 2 {48} else if index == 1 {1} else {0}) * ContextActor::MAX_STEP_ACTIONS, replies: if index == 2 {48} else {0}, ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default() }), kind, WorkAdmission::External)
                     .unwrap()
                     .bind(kind)
                     .unwrap();
@@ -527,24 +591,50 @@ mod tests {
                     step_budget: ContextCore::MAX_STEP_WORK,
                     lease_bounds: LeaseBounds::DEFAULT,
                     metric_publish_interval: Duration::from_millis(100),
+                    request_horizon: crate::RequestHorizon::DEFAULT,
                 },
             )
             .unwrap();
-            let runtime = ActorRuntime::new(2);
+            let runtime = ActorRuntime::new();
             let bound = ContextActor::new(
                 core,
                 scope.clone(),
                 AdmissionStorage {
-                    loading: empty(),
-                    accepted: empty(),
+                    loading: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(
+                        crate::control_runtime_policy::IngressRoleLimits {
+                            ordinary_running: 1,
+                            ordinary_waiting: 0,
+                            control_running: 1,
+                            control_waiting: 0,
+                            max_batch_items: 1,
+                            root_read_holders: 1,
+                        },
+                    )
+                    .unwrap())
+                    .loading
+                    .resources()
+                    .unwrap(),
+                    accepted: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(
+                        crate::control_runtime_policy::IngressRoleLimits {
+                            ordinary_running: 1,
+                            ordinary_waiting: 0,
+                            control_running: 1,
+                            control_waiting: 0,
+                            max_batch_items: 1,
+                            root_read_holders: 1,
+                        },
+                    )
+                    .unwrap())
+                    .accepted
+                    .resources()
+                    .unwrap(),
                     context: empty(),
-                    ticket: empty(),
                 },
-                roles[1].0.id(),
-                roles[2].0.id(),
+                roles[1].0.reference(),
+                roles[2].0.reference(),
             );
-            runtime
-                .register_supervised_next(
+            let registration = runtime
+                .register_supervised_bound(
                     actor(),
                     scope.clone(),
                     WorkerActor::Context(Box::new(bound)),
@@ -565,6 +655,7 @@ mod tests {
                 ledger,
                 scope,
                 runtime,
+                registration,
                 identity,
                 roles,
                 jobs: BTreeMap::new(),
@@ -589,10 +680,15 @@ mod tests {
             source: u64,
         ) -> InputId {
             self.runtime
-                .reserve_input(actor(), ActorId::new(source).unwrap(), class)
+                .reserve_admitted_input_for(
+                    &self.registration,
+                    ActorId::new(source).unwrap(),
+                    class,
+                    &self.roles[2].0,
+                )
                 .unwrap()
                 .fill(WorkerMessage::Context(ContextMessage::Command {
-                    work: self.roles[2].0.id(),
+                    work: self.roles[2].0.reference(),
                     request: request.map(|operation| RequestMetadata {
                         operation,
                         deadline: MonotonicInstant::from_origin(Duration::from_secs(10)),
@@ -668,7 +764,13 @@ mod tests {
                             .runtime
                             .take_step_reservation(&ticket, reservation)
                             .unwrap();
-                        assert_eq!(guard.work_id(), ticket.descriptor.work);
+                        assert_eq!(
+                            novarocks_control_runtime_core::identity::ScopedWorkRef {
+                                scope: guard.scope().id(),
+                                work: guard.work_id()
+                            },
+                            ticket.descriptor.work
+                        );
                         let (mut work, capacity) = guard.bind(WorkKind::Business).unwrap();
                         work.start().unwrap();
                         assert!(self.jobs.insert(reservation, (work, capacity)).is_none());
@@ -686,7 +788,10 @@ mod tests {
                         work.body_exited().unwrap();
                         work.captures_exited().unwrap();
                         self.ledger.reap_scope_ready(work.scope().id(), 32).unwrap();
-                        capacity.release(&capacity.resources().unwrap()).unwrap();
+                        capacity
+                            .release_quota(&capacity.resources().unwrap().quota)
+                            .unwrap();
+                        capacity.finish().unwrap();
                     }
                     if let WorkerAction::OwnerFailed { scope, .. } = &ticket.effect {
                         assert_eq!(*scope, self.scope.id());
@@ -710,13 +815,19 @@ mod tests {
                 .unwrap();
             for (work, capacity) in &mut jobs {
                 assert!(work.actual_exit_ready().unwrap());
-                capacity.release(&capacity.resources().unwrap()).unwrap();
+                capacity
+                    .release_quota(&capacity.resources().unwrap().quota)
+                    .unwrap();
+                capacity.finish().unwrap();
             }
             for (mut work, mut capacity) in self.roles.drain(..) {
                 work.body_exited().unwrap();
                 work.captures_exited().unwrap();
                 self.ledger.reap_scope_ready(work.scope().id(), 32).unwrap();
-                capacity.release(&capacity.resources().unwrap()).unwrap();
+                capacity
+                    .release_quota(&capacity.resources().unwrap().quota)
+                    .unwrap();
+                capacity.finish().unwrap();
             }
             while let Some(original_host_turn) = self.runtime.claim_host_actor() {
                 original_host_turn.release(false).unwrap();
@@ -726,6 +837,7 @@ mod tests {
             self.runtime
                 .remove_actor(actor())
                 .unwrap_or_else(|e| panic!("context removal: {e:?}"));
+            self.ledger.reap_scope_ready(self.scope.id(), 3).unwrap();
             self.ledger.remove_scope(self.scope.id()).unwrap();
             assert!(self.ledger.is_empty());
         }
@@ -758,23 +870,37 @@ mod tests {
         parent: ReservationId,
     ) -> [crate::control_runtime::source_positions::SourceSlotAdmission; N] {
         std::array::from_fn(|_| {
-            let guard = scope
-                .reserve_child_next(generation(), parent, empty(), WorkKind::Cleanup)
+            let mut guard = scope
+                .reserve_child_next(
+                    generation(),
+                    parent,
+                    novarocks_control_runtime_core::capacity::ReservationResources::new(
+                        ResourceVector::default(),
+                        novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                            work_headers: 1,
+                            completions: 1,
+                            captures: 1,
+                            ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default(
+                            )
+                        },
+                    ),
+                    WorkKind::Cleanup,
+                )
                 .unwrap();
             // These Source roles belong to this real host observer. All four
             // cases carry no rich source; a Core source receipt is not issued.
             let report = ReportSlot::reserve_next(
-                scope,
+                &mut guard,
                 generation(),
-                guard.work_id(),
                 1,
                 [(observer(), ConsumerKind::Observer)],
             )
             .unwrap();
             let (work, capacity) = guard.bind(WorkKind::Cleanup).unwrap();
-            crate::control_runtime::source_positions::SourceSlotAdmission::protocol_model(
+            crate::control_runtime::source_positions::SourceSlotAdmission::from_admitted(
                 crate::control_runtime::admitted_role::adopt_reported_work(work, capacity, report),
             )
+            .unwrap()
         })
     }
     fn fixture() -> Fixture {
@@ -812,18 +938,28 @@ mod tests {
                     input_retained_bytes: 1,
                     ingress_retained_bytes: 1,
                     structural_bytes: 1,
-                    inbound_records: 0,
-                    inbound_bytes: 0,
                 }),
             },
             None,
         );
         assert!(accepted.iter().any(|effect| matches!(effect, WorkerAction::Reply(reply) if reply.result == RequestResult::Outcome(OperationOutcome::Accepted))));
-        let (work, capacity) = runtime
+        let (work, mut capacity) = runtime
             .scope
             .reserve_next(
                 generation(),
-                ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap(),
+                novarocks_control_runtime_core::capacity::ReservationResources::new(
+                    ResourceVector::new([(Dimension::ActiveTasks.id(), 1)]).unwrap(),
+                    novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 1,
+                        captures: 1,
+                        inputs: 2,
+                        batches: 2,
+                        effects: 2 * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                        replies: 1,
+                        ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
+                    },
+                ),
                 kind,
                 WorkAdmission::External,
             )
@@ -831,9 +967,8 @@ mod tests {
             .bind(kind)
             .unwrap();
         let report = ReportSlot::reserve_next(
-            &runtime.scope,
+            &mut capacity,
             generation(),
-            work.id(),
             2,
             [
                 (
@@ -861,7 +996,7 @@ mod tests {
         );
         let mut inbox = TaskCausalInbox::new(
             runtime.runtime.clone(),
-            actor(),
+            runtime.registration.clone(),
             ActorId::new(7002).unwrap(),
             task,
             generation(),
@@ -983,12 +1118,12 @@ mod tests {
                 .prepare_owned_pair_reap(&retired.pair)
                 .unwrap()
                 .map(|probe| probe.observe_reaped().unwrap());
-            for mut storage in self
+            for storage in self
                 .ingress
                 .release_owned_pair(&retired.pair, witnesses)
                 .unwrap_or_else(|_| panic!("the same returned pair really retired"))
             {
-                storage.release().unwrap();
+                drop(storage);
             }
         }
         fn retire_cut(&mut self, cut: CutId) {

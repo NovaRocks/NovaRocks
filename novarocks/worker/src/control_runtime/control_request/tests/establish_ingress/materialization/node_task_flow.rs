@@ -18,9 +18,11 @@
 //! One real compiled CountOnly Root Task on the same original Node lifecycle. The host
 //! replaces only codec/connector I/O; Execution owns its real kernel lifecycle.
 
+mod completion_contracts;
+
 use super::node_flow::{
-    NodeClose, Scenario, operation_number, retain_failure, run_node_lifecycle_with_task,
-    wait_delivery, wait_until,
+    HeldTaskDelivery, NodeClose, Scenario, operation_number, retain_failure,
+    run_node_lifecycle_with_task, wait_delivery, wait_until,
 };
 use super::*;
 use crate::{
@@ -31,6 +33,7 @@ use crate::{
         host_executor::{HostExecutor, HostExecutorLimits},
         loading::TaskCreatePayload,
         loading_host_job::LoadingHostJob,
+        node::WorkerNodeHost,
     },
 };
 use novarocks_connector_contract::PureProviderProgramCatalog;
@@ -76,9 +79,17 @@ use novarocks_type_contract::{
     ExpressionEvaluationDomain, PureCompileControl, SemanticParameters,
 };
 use novarocks_types::{StageId, TaskId, UniqueId};
+use novarocks_worker_protocol::context::{ContextCommand, ContextReplyBody};
 use std::{any::Any, collections::BTreeMap, num::NonZeroU64, sync::Weak};
 
 type Failure = Box<dyn Any + Send>;
+
+// This component owns one real ingress position. Native permit geometry is
+// verified separately at the actual adapter boundary.
+struct ComponentIngressBacking {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl crate::WorkerIngressBacking for ComponentIngressBacking {}
 #[derive(Debug)]
 struct UnexpectedInbound;
 impl std::fmt::Display for UnexpectedInbound {
@@ -91,7 +102,7 @@ impl novarocks_execution_contract::failure::FailureProjection for UnexpectedInbo
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
         novarocks_execution_contract::failure::FailureFact::new(
             novarocks_execution_contract::failure::FailureClass::Invariant,
-            crate::failure_reason::WorkerFailureReason::InboundReservationConflict.reason(),
+            crate::failure_reason::WorkerFailureReason::InboundCloseContract.reason(),
         )
     }
 }
@@ -554,12 +565,159 @@ impl std::fmt::Debug for Runnable {
             .finish()
     }
 }
+// This gate holds a real physical callback/job. Releasing it supplies no exit
+// fact: the original body/child still has to return through its normal owner.
+#[derive(Default)]
+struct PreparationGate {
+    entered: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+    mutex: Mutex<()>,
+    changed: Condvar,
+}
+impl PreparationGate {
+    fn wait(&self) {
+        let mut guard = self.mutex.lock().unwrap();
+        self.entered.store(true, Ordering::Release);
+        self.changed.notify_all();
+        while !self.released.load(Ordering::Acquire) {
+            guard = self.changed.wait(guard).unwrap();
+        }
+    }
+    fn release(&self) {
+        let guard = self.mutex.lock().unwrap();
+        self.released.store(true, Ordering::Release);
+        drop(guard);
+        self.changed.notify_all();
+    }
+    fn entered(&self) -> bool {
+        self.entered.load(Ordering::Acquire)
+    }
+}
+struct ReleasePreparationGate(Arc<PreparationGate>);
+impl Drop for ReleasePreparationGate {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+struct BundleFixture {
+    stopped_before_host: bool,
+    prepare: Arc<PreparationGate>,
+    adoption: Arc<PreparationGate>,
+    original: Mutex<Option<(Weak<WorkerNodeHost>, QueryContextRef)>>,
+    host_entries: AtomicUsize,
+    whole_refusals: AtomicUsize,
+    transfers: AtomicUsize,
+    second_take_refusals: AtomicUsize,
+}
+impl BundleFixture {
+    fn new(stopped_before_host: bool) -> Self {
+        Self {
+            stopped_before_host,
+            prepare: Arc::new(PreparationGate::default()),
+            adoption: Arc::new(PreparationGate::default()),
+            original: Mutex::new(None),
+            host_entries: AtomicUsize::new(0),
+            whole_refusals: AtomicUsize::new(0),
+            transfers: AtomicUsize::new(0),
+            second_take_refusals: AtomicUsize::new(0),
+        }
+    }
+    fn inventory(
+        &self,
+        task: TaskIdentity,
+    ) -> crate::control_runtime::node::PreparationFixtureInventory {
+        let (node, context) = self
+            .original
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("same Node fixture binding");
+        node.upgrade()
+            .expect("actual Node still owns this preparation")
+            .preparation_fixture_inventory(context, task)
+            .expect("same original preparation inventory")
+    }
+    fn take_original_roles(
+        &self,
+        preparation: &mut TaskPreparationContext<'_>,
+        health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
+    ) -> TaskPreparationRoles {
+        self.host_entries.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !self.stopped_before_host,
+            "the stopped preparation must not enter the host"
+        );
+        let identity = preparation.view().identity();
+        let children = preparation.original_children_for_test().clone();
+        let (owner, cadence) = preparation.view().control();
+        let owner = owner.expect("same original execution port");
+        let waker = preparation.readiness_waker();
+        let roles = preparation.take_roles().unwrap();
+        let before = self.inventory(identity);
+        let wrong_identity = TaskIdentity::new(
+            identity.query_execution_id(),
+            identity.stage_id(),
+            TaskId::new(999).unwrap(),
+            identity.backend_process_id(),
+        );
+        let wrong = Arc::new(crate::task_preparation::TaskPreparationScope::new(
+            wrong_identity,
+            health,
+        ));
+        let (_, returned) = match TaskPreparationContext::from_admitted(
+            owner.clone(),
+            &wrong,
+            cadence,
+            roles,
+            waker.clone(),
+        ) {
+            Err(original) => original,
+            Ok(_) => panic!("wrong child must return the whole original bundle"),
+        };
+        assert!(returned.matches(identity));
+        assert_eq!(
+            self.inventory(identity),
+            before,
+            "wrong-child refusal cannot change original role IDs, inventory or payment"
+        );
+        self.whole_refusals.fetch_add(1, Ordering::SeqCst);
+        let mut rebound =
+            TaskPreparationContext::from_admitted(owner, &children, cadence, returned, waker)
+                .unwrap_or_else(|_| {
+                    panic!("the returned whole bundle binds to its original children")
+                });
+        assert_eq!(
+            self.inventory(identity),
+            before,
+            "rebinding moves originals without reserving replacement roles"
+        );
+        let original = rebound.take_roles().unwrap();
+        assert!(original.matches(identity));
+        assert!(matches!(
+            rebound.take_roles(),
+            Err(crate::TaskPreparationRolesTaken)
+        ));
+        assert!(matches!(
+            preparation.take_roles(),
+            Err(crate::TaskPreparationRolesTaken)
+        ));
+        assert_eq!(
+            self.inventory(identity),
+            before,
+            "a repeated take cannot issue another original role"
+        );
+        self.transfers.fetch_add(1, Ordering::SeqCst);
+        self.second_take_refusals.fetch_add(1, Ordering::SeqCst);
+        original
+    }
+}
 struct PreparedChild {
     dormant: Mutex<Option<DormantFragmentHandle>>,
     target: Mutex<Weak<Runnable>>,
     root_exit: Mutex<Option<crate::root_result_channel::RootPhysicalExitObservation>>,
     rollback_requested: std::sync::atomic::AtomicBool,
     rolling_back: std::sync::atomic::AtomicBool,
+    adoption_gate: Option<Arc<PreparationGate>>,
 }
 impl crate::TaskPreparationChild for PreparedChild {
     fn request_rollback(&self) {
@@ -594,6 +752,9 @@ impl crate::TaskPreparationChild for PreparedChild {
         }
     }
     fn adopt_runtime(&self) {
+        if let Some(gate) = &self.adoption_gate {
+            gate.wait();
+        }
         let dormant = self
             .dormant
             .lock()
@@ -656,6 +817,8 @@ struct CompiledTaskHost {
     observed: Arc<Observations>,
     result_budget: Arc<crate::result_buffer::ResultRetainedBudget>,
     result_limits: crate::WorkerResultRetainedLimits,
+    bundle: Option<Arc<BundleFixture>>,
+    completion_contract: Mutex<Option<Arc<completion_contracts::CompletionFixture>>>,
 }
 impl TaskExecutionHost for CompiledTaskHost {
     fn close_context_admission(&self, _: QueryContextRef) {}
@@ -667,6 +830,14 @@ impl TaskExecutionHost for CompiledTaskHost {
         input: TaskCreationInput,
         mut preparation: TaskPreparationContext<'_>,
     ) -> Result<PreparedTaskInstallation, HostRejection> {
+        // Validate the whole binding before moving/dropping the actual input;
+        // its source still belongs to this original physical preparation.
+        let original_roles = match &self.bundle {
+            Some(bundle) => {
+                bundle.take_original_roles(&mut preparation, self.execution.execution_health())
+            }
+            None => preparation.take_roles().unwrap(),
+        };
         let (fragment, assignment) = input.into_parts();
         assert_eq!(fragment.bytes().as_ref(), b"root");
         assert!(assignment.into_stored().downcast::<Assignment>().is_ok());
@@ -679,13 +850,14 @@ impl TaskExecutionHost for CompiledTaskHost {
             dynamic_filters,
             final_statistics,
             completion_exit,
-        } = preparation.take_roles().unwrap();
+        } = original_roles;
         let child = Arc::new(PreparedChild {
             dormant: Mutex::new(None),
             target: Mutex::new(Weak::new()),
             root_exit: Mutex::new(None),
             rollback_requested: std::sync::atomic::AtomicBool::new(false),
             rolling_back: std::sync::atomic::AtomicBool::new(false),
+            adoption_gate: self.bundle.as_ref().map(|bundle| bundle.adoption.clone()),
         });
         // Register the same physical child before opening output. Construction
         // unwind cannot turn a lost, already-born Root into NoOutputCreated.
@@ -780,7 +952,7 @@ impl TaskExecutionHost for CompiledTaskHost {
         Ok(())
     }
     fn install_inbound_capability(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
-        if crate::task_creation_cost::inbound_record_bytes(descriptor) != Some(0) {
+        if !descriptor.topology().inbound().is_empty() {
             return Err(HostRejection::from_domain(
                 novarocks_execution_contract::TaskFailureCategory::Protocol,
                 UnexpectedInbound,
@@ -788,29 +960,8 @@ impl TaskExecutionHost for CompiledTaskHost {
         }
         Ok(())
     }
-    fn reserve_inbound_close_capacity_with_permit(
-        &self,
-        descriptor: &TaskDescriptor,
-        permit: Option<crate::TaskInboundPermit>,
-    ) -> Result<(), crate::InboundCloseReservationRefusal> {
-        if crate::task_creation_cost::inbound_record_bytes(descriptor) == Some(0)
-            && permit.is_none()
-        {
-            return Ok(());
-        }
-        Err(crate::InboundCloseReservationRefusal {
-            rejection: HostRejection::from_domain(
-                novarocks_execution_contract::TaskFailureCategory::Protocol,
-                UnexpectedInbound,
-            ),
-            permit,
-        })
-    }
     fn remove_inbound_capability(&self, descriptor: &TaskDescriptor) {
-        assert_eq!(
-            crate::task_creation_cost::inbound_record_bytes(descriptor),
-            Some(0)
-        );
+        assert!(descriptor.topology().inbound().is_empty());
     }
     fn submit_runnable(
         &self,
@@ -828,15 +979,20 @@ impl TaskExecutionHost for CompiledTaskHost {
                 state.root.take().expect("original installed Root"),
             )
         };
-        let mut completion = self
-            .completion
-            .reserve_task_slot(
-                descriptor.identity(),
-                descriptor.fragment_instance_id(),
-                reporter,
-                exit,
-            )
-            .unwrap();
+        let contract = self.completion_contract.lock().unwrap().clone();
+        let mut completion = match &contract {
+            Some(contract) => contract.reserve(&self.completion, descriptor, reporter, exit),
+            None => self
+                .completion
+                .reserve_task_slot(
+                    descriptor.identity(),
+                    descriptor.fragment_instance_id(),
+                    reporter,
+                    exit,
+                )
+                .unwrap(),
+        };
+        let original_capture = contract.as_ref().and_then(|contract| contract.capture());
         let weak = Arc::downgrade(&runnable);
         completion
             .bind_action(TaskTerminalAction::new(
@@ -849,6 +1005,9 @@ impl TaskExecutionHost for CompiledTaskHost {
                         .observed
                         .completion_entered
                         .fetch_add(1, Ordering::SeqCst);
+                    if let Some(capture) = &original_capture {
+                        capture.observe_body();
+                    }
                     assert!(matches!(fact.outcome(), FragmentOutcome::Succeeded));
                     let final_statistics = final_statistics.take().unwrap().seal_for_terminal(None);
                     let (statistics, dynamic_filters, running) = {
@@ -899,10 +1058,11 @@ fn loading_body(job: LoadingHostJob) {
 fn preparation_body(job: TaskDriverHostJob) {
     job.run_on_host();
 }
-struct TaskResources {
+type PreparationRunner = Box<dyn Fn(TaskDriverHostJob) + Send + Sync>;
+pub(super) struct TaskResources {
     host: Arc<CompiledTaskHost>,
     loading: HostExecutor<LoadingHostJob, fn(LoadingHostJob)>,
-    preparation: HostExecutor<TaskDriverHostJob, fn(TaskDriverHostJob)>,
+    preparation: HostExecutor<TaskDriverHostJob, PreparationRunner>,
     lifecycle: HostExecutor<TaskDriverHostJob, fn(TaskDriverHostJob)>,
     _async_runtime: tokio::runtime::Runtime,
 }
@@ -944,9 +1104,16 @@ fn observation_fact_bytes(
     .map(|wire| wire.encoded_len())
     .map_err(|_| crate::ObservationProjectionError::InvalidFact)
 }
-fn start_tasks(
+pub(super) fn start_tasks(
     root: &mut ProcessControlOwner,
 ) -> Result<(TaskDriverPorts, TaskResources), Failure> {
+    start_tasks_with_bundle(root, None)
+}
+fn start_tasks_with_bundle(
+    root: &mut ProcessControlOwner,
+    mode: Option<bool>,
+) -> Result<(TaskDriverPorts, TaskResources), Failure> {
+    let bundle = mode.map(|stopped| Arc::new(BundleFixture::new(stopped)));
     let capacity = root
         .task_capacity_signal()
         .map_err(|original| Box::new(original) as Failure)?;
@@ -954,7 +1121,6 @@ fn start_tasks(
     // One admitted Task plus one physical tail; two contexts are metadata
     // groups, and no pool-size choice signs a Task exit.
     let limits = HostExecutorLimits {
-        contexts: NonZeroUsize::new(3).unwrap(),
         jobs: NonZeroUsize::new(2).unwrap(),
         per_context: NonZeroUsize::new(2).unwrap(),
         workers: one,
@@ -964,11 +1130,19 @@ fn start_tasks(
             Ok(owner) => owner,
             Err(original) => return Err(Box::new(original)),
         };
-    let preparation =
-        match HostExecutor::start_with_waker(limits, preparation_body as fn(_), capacity.waker()) {
-            Ok(owner) => owner,
-            Err(original) => return Err(Box::new((loading, original))),
-        };
+    let original_bundle = bundle.clone();
+    let runner: PreparationRunner = Box::new(move |job| {
+        if matches!(&job, TaskDriverHostJob::Prepare { .. })
+            && let Some(bundle) = &original_bundle
+        {
+            bundle.prepare.wait();
+        }
+        job.run_on_host();
+    });
+    let preparation = match HostExecutor::start_with_waker(limits, runner, capacity.waker()) {
+        Ok(owner) => owner,
+        Err(original) => return Err(Box::new((loading, original))),
+    };
     // Cleanup execution is independent of preparation, whose body can wait
     // for its own real cancellation/settlement. More preparation threads do
     // not provide that progress guarantee.
@@ -1002,6 +1176,8 @@ fn start_tasks(
         observed: Arc::new(Observations::default()),
         result_budget,
         result_limits,
+        bundle,
+        completion_contract: Mutex::new(None),
     });
     let ports = TaskDriverPorts {
         protocol_events: Some(crate::TaskExecutionPorts::new(
@@ -1033,28 +1209,63 @@ fn exercise(
     scene: &Scenario<TaskResources>,
     context: QueryContextRef,
     resources: &mut TaskResources,
-) -> Result<(), Failure> {
+) -> Result<Option<HeldTaskDelivery>, Failure> {
     exercise_root(scene, context, resources, true)
 }
 fn exercise_unread_root(
     scene: &Scenario<TaskResources>,
     context: QueryContextRef,
     resources: &mut TaskResources,
-) -> Result<(), Failure> {
+) -> Result<Option<HeldTaskDelivery>, Failure> {
     exercise_root(scene, context, resources, false)
+}
+fn trace_original_preparation_stage(
+    scene: &Scenario<TaskResources>,
+    context: QueryContextRef,
+    task: TaskIdentity,
+    bundle: &BundleFixture,
+    stage: &'static str,
+) {
+    eprintln!(
+        "original stopped preparation stage={stage} task={task:?} prepare_entered={} prepare_released={} host_entries={} requests={} preparing={} bytes={} inventory={:?}",
+        bundle.prepare.entered(),
+        bundle.prepare.released.load(Ordering::Acquire),
+        bundle.host_entries.load(Ordering::SeqCst),
+        scene.ledger.used(Dimension::Requests.id()),
+        scene.ledger.used(Dimension::PreparingTasks.id()),
+        scene.ledger.used(Dimension::PreparingBytes.id()),
+        scene.node.preparation_fixture_inventory(context, task),
+    );
+    eprintln!(
+        "original stopped preparation stage={stage} original_request_inventory={:?}",
+        scene.node.original_request_inventory_for_test(context),
+    );
 }
 fn exercise_root(
     scene: &Scenario<TaskResources>,
     context: QueryContextRef,
     resources: &mut TaskResources,
     read_root: bool,
-) -> Result<(), Failure> {
+) -> Result<Option<HeldTaskDelivery>, Failure> {
     let task = TaskIdentity::new(
         context.query_execution_id(),
         StageId::new(1).unwrap(),
         TaskId::new(1).unwrap(),
         context.backend_process_id(),
     );
+    let _prepare_release = resources
+        .host
+        .bundle
+        .as_ref()
+        .map(|bundle| ReleasePreparationGate(bundle.prepare.clone()));
+    let _adoption_release = resources
+        .host
+        .bundle
+        .as_ref()
+        .map(|bundle| ReleasePreparationGate(bundle.adoption.clone()));
+    if let Some(bundle) = &resources.host.bundle {
+        *bundle.original.lock().unwrap() = Some((Arc::downgrade(&scene.node), context));
+    }
     *scene.diagnostic_task.lock().unwrap() = Some((context, task));
     let descriptor = TaskDescriptor::try_new(
         task,
@@ -1075,12 +1286,20 @@ fn exercise_root(
         ),
         ingress_retained_bytes: 0,
     };
+    let ingress_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let ingress = Arc::new(ComponentIngressBacking {
+        _permit: ingress_gate
+            .clone()
+            .try_acquire_owned()
+            .expect("the caller owns one actual component Create ingress position"),
+    });
     let handle = scene
         .node
         .submit_task_create(
             ActorId::new(3).unwrap(),
             MonotonicInstant::from_origin(Duration::from_secs(100)),
             payload,
+            crate::WorkerIngressResponsibility::from_admitted(ingress.clone()),
         )
         .map_err(|original| Box::new(original) as Failure)?;
     let mut handle = match handle {
@@ -1105,6 +1324,282 @@ fn exercise_root(
     }
     drop(delivery);
     drop(handle);
+    drop(ingress);
+    if let Some(bundle) = &resources.host.bundle {
+        trace_original_preparation_stage(
+            scene,
+            context,
+            task,
+            bundle,
+            "before preparation-entry/Create-R-retirement wait",
+        );
+        if !wait_until(|| {
+            bundle.prepare.entered() && scene.ledger.used(Dimension::Requests.id()) == 0
+        }) {
+            trace_original_preparation_stage(
+                scene,
+                context,
+                task,
+                bundle,
+                "ERR preparation-entry/Create-R-retirement wait",
+            );
+            return Err(Box::new(
+                "original preparation was not handed to its physical runner",
+            ));
+        }
+        let held_bytes = scene.ledger.used(Dimension::PreparingBytes.id());
+        let before = bundle.inventory(task);
+        assert!(before.preparation_key.is_some());
+        assert!(!before.body_exited);
+        assert!(!before.whole_report_retired);
+        assert_eq!(scene.ledger.used(Dimension::PreparingTasks.id()), 1);
+        assert!(held_bytes > 0);
+        if bundle.stopped_before_host {
+            trace_original_preparation_stage(
+                scene,
+                context,
+                task,
+                bundle,
+                "before GetFinalInfo admission",
+            );
+            let operation = operation_number(26);
+            let mut final_info = scene
+                .node
+                .submit_task_command(
+                    context,
+                    operation,
+                    MonotonicInstant::from_origin(Duration::from_secs(100)),
+                    ContextCommand::GetFinalInfo { task },
+                )
+                .map_err(|original| {
+                    trace_original_preparation_stage(
+                        scene,
+                        context,
+                        task,
+                        bundle,
+                        "ERR GetFinalInfo admission/submission",
+                    );
+                    eprintln!("original GetFinalInfo Node refusal: {original:?}");
+                    Box::new(original) as Failure
+                })?;
+            let (actual_actor, original_work) = final_info
+                .endpoint
+                .external
+                .slot()
+                .context_author()
+                .expect("the actual Task R has a registered address");
+            assert_eq!(actual_actor, context_actor());
+            let original_metadata = final_info.request();
+            trace_original_preparation_stage(
+                scene,
+                context,
+                task,
+                bundle,
+                "before GetFinalInfo delivery wait",
+            );
+            let Some(final_delivery) = wait_delivery(&mut final_info) else {
+                trace_original_preparation_stage(
+                    scene,
+                    context,
+                    task,
+                    bundle,
+                    "ERR GetFinalInfo delivery wait",
+                );
+                eprintln!(
+                    "original GetFinalInfo address={original_work:?} metadata={original_metadata:?} saved_request={:?}",
+                    scene
+                        .node
+                        .original_task_request_for_test(context, original_work)
+                );
+                return Err(Box::new((
+                    "original GetFinalInfo delivery timeout",
+                    final_info,
+                )));
+            };
+            trace_original_preparation_stage(
+                scene,
+                context,
+                task,
+                bundle,
+                "GetFinalInfo delivery taken before Cancel",
+            );
+            match final_delivery.body() {
+                ContextReplyBody::Verdict(result) => eprintln!(
+                    "original GetFinalInfo actual verdict={result:?} work={original_work:?} metadata={original_metadata:?}"
+                ),
+                ContextReplyBody::FinalInfo(_) => eprintln!(
+                    "original GetFinalInfo actual body=FinalInfo work={original_work:?} metadata={original_metadata:?}"
+                ),
+                _ => eprintln!(
+                    "original GetFinalInfo actual body=other original variant work={original_work:?} metadata={original_metadata:?}"
+                ),
+            }
+            assert_eq!(final_delivery.request(), original_metadata);
+            assert_eq!(original_metadata.operation, operation);
+            assert!(
+                matches!(
+                    final_delivery.body(),
+                    ContextReplyBody::Verdict(
+                        novarocks_worker_protocol::context::RequestResult::Outcome(
+                            OperationOutcome::InvalidStateOrRequest
+                        )
+                    )
+                ),
+                "the still-preparing Task has no successful final-info body"
+            );
+            // This same Node saved the real event token before its runtime
+            // input retired. Neither Work nor operation can synthesize it.
+            let original_request = scene
+                .node
+                .original_task_request_for_test(context, original_work)
+                .expect("the same live Task R remains owned");
+            assert_eq!(original_request.0.author, original_work);
+            assert_eq!(original_request.0.operation, operation);
+            assert_eq!(original_request.0.deadline, original_metadata.deadline);
+            assert_eq!(original_request.1, task);
+            drop(final_info); // Only the actual delivery now owns its external leg.
+            assert_eq!(scene.ledger.used(Dimension::Requests.id()), 1);
+            let mut cancel = scene
+                .node
+                .submit_task_command(
+                    context,
+                    operation_number(25),
+                    MonotonicInstant::from_origin(Duration::from_secs(100)),
+                    ContextCommand::Cancel {
+                        task,
+                        reason: CancelReason::UpstreamNoLongerNeeded,
+                    },
+                )
+                .map_err(|original| {
+                    trace_original_preparation_stage(
+                        scene,
+                        context,
+                        task,
+                        bundle,
+                        "ERR Cancel admission/submission",
+                    );
+                    eprintln!("original Cancel Node refusal: {original:?}");
+                    Box::new(original) as Failure
+                })?;
+            let Some(delivery) = wait_delivery(&mut cancel) else {
+                trace_original_preparation_stage(
+                    scene,
+                    context,
+                    task,
+                    bundle,
+                    "ERR Cancel delivery wait",
+                );
+                return Err(Box::new(("original Cancel delivery timeout", cancel)));
+            };
+            assert!(
+                matches!(delivery.body(), ContextReplyBody::Task { outcome: OperationOutcome::Accepted, status }
+                if status.identity() == task)
+            );
+            drop(delivery);
+            drop(cancel);
+            trace_original_preparation_stage(
+                scene,
+                context,
+                task,
+                bundle,
+                "before actual Stop observation wait",
+            );
+            if !wait_until(|| {
+                scene
+                    .node
+                    .preparation_fixture_inventory(context, task)
+                    .is_some_and(|current| current.stopped && current.stop_call_exited)
+            }) {
+                trace_original_preparation_stage(
+                    scene,
+                    context,
+                    task,
+                    bundle,
+                    "ERR actual Stop observation wait",
+                );
+                return Err(Box::new(
+                    "original Stop did not physically return before releasing preparation",
+                ));
+            }
+            assert_eq!(bundle.host_entries.load(Ordering::SeqCst), 0);
+            assert_eq!(scene.ledger.used(Dimension::PreparingTasks.id()), 1);
+            assert_eq!(
+                scene.ledger.used(Dimension::PreparingBytes.id()),
+                held_bytes
+            );
+            trace_original_preparation_stage(
+                scene,
+                context,
+                task,
+                bundle,
+                "explicit gate release after actual Stop observed",
+            );
+            bundle.prepare.release();
+            if !wait_until(|| {
+                scene.ledger.used(Dimension::PreparingTasks.id()) == 0
+                && scene.ledger.used(Dimension::PreparingBytes.id()) == 0
+                && scene.ledger.used(Dimension::ActiveTasks.id()) == 0
+                && scene.ledger.used(Dimension::Requests.id()) == 1
+                && resources.host.observed.protocol_events.lock().unwrap().iter().any(|event|
+                    matches!(event, crate::TaskProtocolEvent::TaskTerminalRetained { identity, state }
+                        if *identity == task && *state == TaskState::Canceled))
+            }) {
+                scene.node.print_neutral_task_inventory(context, task);
+                trace_original_preparation_stage(
+                    scene,
+                    context,
+                    task,
+                    bundle,
+                    "ERR stopped actual physical retirement wait",
+                );
+                return Err(Box::new(
+                    "stopped original bundle did not reach real physical/retained retirement",
+                ));
+            }
+            assert_eq!(bundle.host_entries.load(Ordering::SeqCst), 0);
+            assert_eq!(bundle.transfers.load(Ordering::SeqCst), 0);
+            assert_eq!(resources.host.observed.activated.load(Ordering::SeqCst), 0);
+            assert_eq!(resources.host.observed.completed.load(Ordering::SeqCst), 0);
+            assert!(resources.host.tasks.lock().unwrap().is_empty());
+            // The compiled Task and its real preparation are now gone; this
+            // one original Task-causal delivery remains physically held.
+            assert_eq!(scene.ledger.used(Dimension::Requests.id()), 1);
+            return Ok(Some((final_delivery, original_request.0)));
+        }
+        bundle.prepare.release();
+        if !wait_until(|| bundle.adoption.entered()) {
+            return Err(Box::new(
+                "the actual provider adoption callback did not start",
+            ));
+        }
+        let body = bundle.inventory(task);
+        assert_eq!(body.preparation_key, before.preparation_key);
+        assert!(
+            body.body_exited,
+            "the actual preparation body already returned"
+        );
+        assert!(
+            !body.host_borrowers_exited,
+            "the original provider callback/capture is still executing"
+        );
+        assert!(!body.whole_report_retired);
+        assert_eq!(scene.ledger.used(Dimension::PreparingTasks.id()), 1);
+        assert_eq!(
+            scene.ledger.used(Dimension::PreparingBytes.id()),
+            held_bytes
+        );
+        assert_eq!(bundle.whole_refusals.load(Ordering::SeqCst), 1);
+        assert_eq!(bundle.transfers.load(Ordering::SeqCst), 1);
+        assert_eq!(bundle.second_take_refusals.load(Ordering::SeqCst), 1);
+        bundle.adoption.release();
+    }
+    let completion_contract = resources.host.completion_contract.lock().unwrap().clone();
+    if let Some(contract) = &completion_contract {
+        contract.observe_before_exit(scene, context, task, resources)?;
+    }
+    let expected_state = completion_contract
+        .as_ref()
+        .map_or(TaskState::Finished, |contract| contract.expected_state());
     if !wait_until(|| {
         let reporter = resources.host.observed.reporter.lock().unwrap().clone();
         resources.host.observed.activated.load(Ordering::SeqCst) == 1
@@ -1112,7 +1607,7 @@ fn exercise_root(
             && reporter.is_some_and(|reporter| {
                 reporter
                     .current()
-                    .is_ok_and(|status| status.installed() && status.state() == TaskState::Finished)
+                    .is_ok_and(|status| status.installed() && status.state() == expected_state)
             })
             && scene.ledger.used(Dimension::PreparingTasks.id()) == 0
             && scene.ledger.used(Dimension::PreparingBytes.id()) == 0
@@ -1176,7 +1671,7 @@ fn exercise_root(
         // must seal it and observe actual physical exit; Release cannot discard
         // unacknowledged results.
         // No synthetic RootDrained or terminal/cancellation fact is supplied.
-        return Ok(());
+        return Ok(None);
     }
     // A delivered End is an offer, never a client acknowledgement. The
     // first original R reads consumed=0 and must not carry a drain permit.
@@ -1310,9 +1805,9 @@ fn exercise_root(
     if !wait_until(|| scene.ledger.used(Dimension::Requests.id()) == 0) {
         return Err(Box::new("original ACK R did not physically retire"));
     }
-    Ok(())
+    Ok(None)
 }
-fn shutdown(resources: TaskResources) -> Result<(), Failure> {
+pub(super) fn shutdown(resources: TaskResources) -> Result<(), Failure> {
     let TaskResources {
         host,
         loading,
@@ -1345,8 +1840,7 @@ fn shutdown(resources: TaskResources) -> Result<(), Failure> {
     drop(_async_runtime);
     Ok(())
 }
-#[test]
-fn real_node_compiled_task_runs_and_finishes_on_one_and_two_pollers() {
+pub(super) fn compiled_task_geometry() -> ReservationResources {
     let policy = ControlRuntimePolicy::try_new(IngressRoleLimits {
         ordinary_running: 1,
         ordinary_waiting: 0,
@@ -1360,20 +1854,25 @@ fn real_node_compiled_task_runs_and_finishes_on_one_and_two_pollers() {
     // topology members, four owned frozen bytes, no inbound normal-close row.
     let preparation_bytes =
         (std::mem::size_of::<TaskCreationInput>() + 4 + std::mem::size_of::<CreateTask>()) as u64;
-    let geometry = policy
+    policy
         .process_task_storage(1, 1)
         .unwrap()
         .resources()
         .unwrap()
-        .checked_add(
-            &ResourceVector::new([
+        .checked_add(&ReservationResources::new(
+            ResourceVector::new([
                 (Dimension::ActiveTasks.id(), 1),
                 (Dimension::PreparingTasks.id(), 1),
                 (Dimension::PreparingBytes.id(), preparation_bytes),
             ])
             .unwrap(),
-        )
-        .unwrap();
+            Default::default(),
+        ))
+        .unwrap()
+}
+#[test]
+fn real_node_compiled_task_runs_and_finishes_on_one_and_two_pollers() {
+    let geometry = compiled_task_geometry();
     for workers in [1, 2] {
         run_node_lifecycle_with_task(
             workers,
@@ -1392,4 +1891,29 @@ fn real_node_compiled_task_runs_and_finishes_on_one_and_two_pollers() {
             shutdown,
         );
     }
+}
+
+// These are the same two named bundle contracts moved from actors/tests.rs.
+// The actual Node now owns their RF/read gate, Core RetireTask and payment tail.
+#[test]
+fn the_original_preparation_bundle_returns_whole_on_refusal_and_transfers_once_to_the_host() {
+    run_node_lifecycle_with_task(
+        1,
+        NodeClose::Release,
+        compiled_task_geometry(),
+        |root| start_tasks_with_bundle(root, Some(false)),
+        exercise,
+        shutdown,
+    );
+}
+#[test]
+fn stopped_preparation_really_drops_its_unused_bundle_without_entering_the_host() {
+    run_node_lifecycle_with_task(
+        1,
+        NodeClose::Release,
+        compiled_task_geometry(),
+        |root| start_tasks_with_bundle(root, Some(true)),
+        exercise,
+        shutdown,
+    );
 }

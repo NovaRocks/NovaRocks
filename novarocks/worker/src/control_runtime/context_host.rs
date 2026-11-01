@@ -23,17 +23,14 @@ mod driver;
 pub(super) mod failure;
 pub(super) mod failure_tail;
 pub(crate) mod observation;
-pub(crate) use driver::{ContextDriverError, ContextDriverProgress};
+pub(crate) use driver::ContextDriverError;
 pub(crate) mod root_read;
 pub(crate) use root_read::{NodeRootDelivery, NodeRootRead, RootReadError};
 pub(super) mod task_driver;
-pub(crate) use task_driver::{
-    TaskDriverError, TaskDriverPorts, TaskDriverProgress, TaskDriverRefusal,
-};
-mod teardown;
-pub(crate) use teardown::ContextTeardownRefusal;
+pub(crate) use task_driver::TaskDriverPorts;
 mod internal;
 mod owner_control;
+mod teardown;
 pub(crate) use internal::ContextInternalAdvance;
 mod execution_observation;
 mod progress;
@@ -43,32 +40,25 @@ pub(crate) use progress::{ContextHostProgress, ContextHostProgressError};
 
 use super::{
     actors::{ContextActor, WorkerAction, WorkerActor},
-    context_host_jobs::{
-        ContextHostJob, ContextHostJobBinding, ContextHostJobError, ContextHostJobs,
-        MaterializationCaptureRefusal,
-    },
-    context_io::{
-        CONTEXT_IO_CALLBACKS, CONTEXT_IO_ROLES, CONTEXT_IO_STORAGE, ContextIoError,
-        ContextIoInventory,
-    },
+    context_host_jobs::{ContextHostJobBinding, ContextHostJobError, ContextHostJobs},
+    context_io::{CONTEXT_IO_CALLBACKS, CONTEXT_IO_STORAGE, ContextIoError, ContextIoInventory},
     context_lifecycle::{CONTEXT_LIFECYCLE_STORAGE, ContextLifecycle},
     context_ready::{ContextReadyError, ContextReadyNotice},
     effect_dispatch::{EffectDispatch, EffectRef},
-    establish_ingress::ValidatedMaterializationSource,
     establish_route::{EstablishRouteCustody, EstablishRouteError},
     task::{TaskHostBinding, TaskHostError, TaskHostOwner, TaskHostRecord},
 };
 use crate::{
-    control_admission::{AdmissionStorage, Dimension},
+    control_admission::AdmissionStorage,
     control_runtime_policy::{ControlRuntimePolicy, StorageNeed},
 };
 use novarocks_control_runtime::{
     driver::{ActorRegistration, ActorRuntime, DriverError, EffectTicket},
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkChildAuthority, WorkLease},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::ReservationResources,
     identity::{ActorId, InputId, ReservationId},
     mailbox::InputClass,
     scope::{WorkAdmission, WorkKind},
@@ -79,7 +69,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 // The actual child-scope metadata holders. The original admission and the
 // child-scope parent link are the other two Work records, in the Control scope.
-const LOCAL_ROLES: [WorkKind; 3] = [WorkKind::Business, WorkKind::Step, WorkKind::Cleanup];
+const LOCAL_ROLES: [WorkKind; 3] = [WorkKind::Step, WorkKind::Step, WorkKind::Cleanup];
 const LIFETIME: usize = 0;
 const TIMER: usize = 1;
 const FAILURE: usize = 2;
@@ -138,6 +128,10 @@ pub(crate) enum ContextHostError {
     TaskTableFull,
     TaskNotOwned,
     TaskStillOwned,
+    MissingLifecycleExecutor,
+    MissingCapacitySignal,
+    RemovalSubmit(super::host_executor::HostSubmitError),
+    Capacity(super::task_capacity::TaskCapacityError),
     Driver(DriverError),
     Runtime(RuntimeError),
     AdmissionBindInvariant(RuntimeError),
@@ -147,10 +141,104 @@ pub(crate) enum ContextHostError {
     Ready(ContextReadyError),
     RootRead(root_read::RootReadError),
 }
+impl std::fmt::Display for ContextHostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongEffect => f.write_str("Context host received the wrong effect"),
+            Self::WrongRuntime => f.write_str("Context host belongs to another runtime"),
+            Self::WrongContext => f.write_str("Context host identity does not match"),
+            Self::WrongEstablishment => {
+                f.write_str("Context host establishment does not match its original request")
+            }
+            Self::InvalidGeometry => f.write_str("Context host storage geometry is invalid"),
+            Self::InvalidStoragePolicy => f.write_str("Context host storage policy is invalid"),
+            Self::BootstrapUnfunded => {
+                f.write_str("Context host bootstrap has no original funding")
+            }
+            Self::TaskAlreadyOwned => f.write_str("Context already owns the original Task"),
+            Self::TaskTableFull => f.write_str("Context Task positions are full"),
+            Self::TaskNotOwned => f.write_str("Context does not own this Task"),
+            Self::TaskStillOwned => f.write_str("Context still owns the original Task inventory"),
+            Self::MissingLifecycleExecutor => f.write_str("Context lifecycle executor is missing"),
+            Self::MissingCapacitySignal => {
+                f.write_str("Context capacity notification source is missing")
+            }
+            Self::RemovalSubmit(error) => write!(f, "Context removal submission failed: {error:?}"),
+            Self::Capacity(error) => write!(f, "Context capacity notification failed: {error:?}"),
+            Self::Driver(error) => write!(
+                f,
+                "Context host input or publication operation failed: {error}"
+            ),
+            Self::Runtime(error) => write!(f, "Context host role operation failed: {error}"),
+            Self::AdmissionBindInvariant(error) => write!(
+                f,
+                "Context committed admission binding invariant failed: {error}"
+            ),
+            Self::Task(error) => write!(f, "Context Task ownership operation failed: {error}"),
+            Self::Io(error) => write!(f, "Context I/O ownership operation failed: {error}"),
+            Self::HostJob(error) => write!(f, "Context host job failed: {error}"),
+            Self::Ready(error) => write!(f, "Context readiness notification failed: {error:?}"),
+            Self::RootRead(original) => {
+                // Only the closed boundary tag is inspected. Channel causes
+                // may retain foreign failure objects whose formatter is not
+                // safe to invoke from this metadata diagnostic.
+                use root_read::RootReadError;
+                f.write_str(match original {
+                    RootReadError::ForeignProcess => "Root read targets another backend process",
+                    RootReadError::UnknownContext => "Context Root read targets an unknown Context",
+                    RootReadError::ContextRemoved => "Context Root read targets a removed Context",
+                    RootReadError::Request(_) => {
+                        "Context Root read request admission failed; original typed cause retained"
+                    }
+                    RootReadError::Task(_) => {
+                        "Context Root Task read failed; original typed cause retained"
+                    }
+                    RootReadError::Channel(_) => {
+                        "Context Root channel read failed; original typed cause retained"
+                    }
+                    RootReadError::UnknownTask => "Context Root read targets an unknown Task",
+                    RootReadError::Capacity(_) => {
+                        "Context Root read capacity was refused; original facts retained"
+                    }
+                    RootReadError::Closed { .. } => "Context Root read channel is sealed",
+                    RootReadError::WrongOwner => "Context Root read belongs to another owner",
+                })
+            }
+        }
+    }
+}
+impl std::error::Error for ContextHostError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Driver(error) => Some(error),
+            Self::Runtime(error) | Self::AdmissionBindInvariant(error) => Some(error),
+            Self::Task(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::HostJob(error) => Some(error),
+            Self::WrongEffect
+            | Self::WrongRuntime
+            | Self::WrongContext
+            | Self::WrongEstablishment
+            | Self::InvalidGeometry
+            | Self::InvalidStoragePolicy
+            | Self::BootstrapUnfunded
+            | Self::TaskAlreadyOwned
+            | Self::TaskTableFull
+            | Self::TaskNotOwned
+            | Self::TaskStillOwned
+            | Self::MissingLifecycleExecutor
+            | Self::MissingCapacitySignal
+            | Self::RemovalSubmit(_)
+            | Self::Capacity(_)
+            | Self::Ready(_)
+            | Self::RootRead(_) => None,
+        }
+    }
+}
 
 pub(crate) struct ContextMetadataRole {
     pub work: WorkLease,
-    pub capacity: CapacityBundle,
+    pub capacity: ReservationBundle,
 }
 
 /// This is the original, possibly partial bootstrap inventory. Failure returns
@@ -162,8 +250,9 @@ pub(crate) struct ContextHostResources {
     pub(super) observation_positions: usize,
     pub(super) observation_projection: Option<observation::ObservationProjection>,
     pub(in crate::control_runtime) root_reads: root_read::RootReadState,
-    pub(super) teardown: teardown::ContextTeardownState,
+    teardown: teardown::ContextTeardownState,
     pub(super) control_admission_closed: bool,
+    pub(super) execution_close_epoch: Option<novarocks_control_runtime_core::identity::Generation>,
     pub admission: ContextMetadataRole,
     pub scope: Option<ScopeHandle>,
     pub roles: Vec<ContextMetadataRole>,
@@ -176,13 +265,17 @@ pub(crate) struct ContextHostResources {
     pub host_jobs: Option<ContextHostJobs>,
     pending_host_jobs: progress::PendingHostJobs,
     pub lifecycle: Option<ContextLifecycle>,
+    pub(super) removal: Option<super::context_removal::ContextRemovalOwner>,
+    pub(super) removal_job: Option<task_driver::TaskDriverHostJob>,
     pub notice: Option<ContextReadyNotice>,
     io_attempted: bool,
-    pub requests:
-        BTreeMap<novarocks_control_runtime_core::identity::WorkId, requests::ContextRequestCustody>,
+    pub requests: BTreeMap<
+        novarocks_control_runtime_core::identity::ScopedWorkRef,
+        requests::ContextRequestCustody,
+    >,
     failure: Option<failure::ScopeFailureOwner>,
     pub request_partials: BTreeMap<
-        novarocks_control_runtime_core::identity::WorkId,
+        novarocks_control_runtime_core::identity::ScopedWorkRef,
         requests::ContextRequestAdmissionPartial,
     >,
 }
@@ -206,28 +299,35 @@ pub(crate) struct ContextHostRecord {
     identity: QueryContextRef,
     actor: ActorId,
     control: ActorId,
+    control_registration: ActorRegistration,
     // The original Materialize ticket was validated by this exact runtime.
     // A caller-supplied runtime or matching numeric IDs cannot replace it.
     control_runtime: ActorRuntime<WorkerActor>,
     ledger: RuntimeLedger,
+    /// Original process ingress Scope; retained requests never derive Work
+    /// from the Context execution lifetime or its parent-link.
+    request_scope: ScopeHandle,
+    /// Issued only by this process Root's actual baseline Work. This does not
+    /// keep a Context execution owner or a caller's R alive.
+    process_source_parent: WorkChildAuthority,
     establishment: novarocks_worker_protocol::context::ContextEstablishment,
     initial_generation: novarocks_control_runtime_core::identity::Generation,
+    request_horizon: novarocks_worker_protocol::lease::RequestHorizon,
     resources: ContextHostResources,
     tasks: BTreeMap<TaskIdentity, TaskHostOwner>,
     retired_task_reads: BTreeMap<TaskIdentity, Arc<super::lifecycle_read::TaskReadSnapshot>>,
-    pub(super) task_driver: task_driver::TaskDriverState,
+    task_driver: task_driver::TaskDriverState,
     root_issuance_sealed: bool,
     max_live_tasks: usize,
-    max_live_roots: usize,
     max_routes: usize,
     pub dispatch: EffectDispatch,
-    request_inputs: BTreeMap<InputId, novarocks_control_runtime_core::identity::WorkId>,
+    request_inputs: BTreeMap<InputId, novarocks_control_runtime_core::identity::ScopedWorkRef>,
     task_request_cuts: BTreeMap<
         (
             TaskIdentity,
             novarocks_worker_protocol::proposal_summary::CutId,
         ),
-        novarocks_control_runtime_core::identity::WorkId,
+        novarocks_control_runtime_core::identity::ScopedWorkRef,
     >,
 }
 impl ContextHostRecord {
@@ -237,8 +337,9 @@ impl ContextHostRecord {
         ledger: &RuntimeLedger,
         ticket: &EffectTicket<WorkerAction>,
         binding: ContextHostBinding,
+        process_source_parent: WorkChildAuthority,
     ) -> Result<Self, ContextHostRefusal> {
-        Self::adopt_with_routes(runtime, ledger, ticket, binding, 0)
+        Self::adopt_with_routes(runtime, ledger, ticket, binding, 0, process_source_parent)
     }
     pub(crate) fn adopt_with_routes(
         runtime: &ActorRuntime<WorkerActor>,
@@ -246,11 +347,15 @@ impl ContextHostRecord {
         ticket: &EffectTicket<WorkerAction>,
         binding: ContextHostBinding,
         max_routes: usize,
+        process_source_parent: WorkChildAuthority,
     ) -> Result<Self, ContextHostRefusal> {
         let no_owner = |error| ContextHostRefusal {
             error,
             resources: None,
         };
+        let control_registration = runtime
+            .registration_from_effect(ticket)
+            .map_err(|error| no_owner(ContextHostError::Driver(error)))?;
         let (context, reservation, generation, establishment) = match &ticket.effect {
             WorkerAction::Control {
                 effect:
@@ -271,6 +376,7 @@ impl ContextHostRecord {
         if binding.core.establishment() != establishment {
             return Err(no_owner(ContextHostError::WrongEstablishment));
         }
+        let request_horizon = binding.core.request_horizon();
         let loading = binding
             .policy
             .loading
@@ -302,53 +408,12 @@ impl ContextHostRecord {
             .and_then(|n| n.checked_add(owner_control::OWNER_CONTROL_STORAGE.batches))
             .and_then(|n| n.checked_add(internal::CONTEXT_INTERNAL_STORAGE.batches))
             .ok_or_else(|| no_owner(ContextHostError::InvalidGeometry))?;
-        let task_work = binding
-            .policy
-            .task_base
-            .work
-            .checked_mul(binding.max_live_tasks);
-        let root_work = binding
-            .policy
-            .root_read_pool_per_root
-            .work
-            .checked_mul(binding.max_live_roots);
-        let max_work = task_work
-            .and_then(|n| n.checked_add(root_work?))
-            .and_then(|n| n.checked_add(binding.policy.request_pool.work))
-            .and_then(|n| n.checked_add(LOCAL_ROLES.len()))
-            .and_then(|n| n.checked_add(max_routes))
-            .and_then(|n| n.checked_add(CONTEXT_IO_ROLES))
-            .ok_or_else(|| no_owner(ContextHostError::InvalidGeometry))?;
-        let task_reports = binding
-            .policy
-            .task_base
-            .completions
-            .checked_mul(binding.max_live_tasks);
-        let root_reports = binding
-            .policy
-            .root_read_pool_per_root
-            .completions
-            .checked_mul(binding.max_live_roots);
-        let max_slots = task_reports
-            .and_then(|n| n.checked_add(root_reports?))
-            .and_then(|n| n.checked_add(binding.policy.request_pool.completions))
-            .and_then(|n| n.checked_add(1)) // This actor's original attachment.
-            .and_then(|n| n.checked_add(max_routes))
-            .and_then(|n| n.checked_add(CONTEXT_IO_ROLES))
-            .ok_or_else(|| no_owner(ContextHostError::InvalidGeometry))?;
         let effect_limit = actor_config
             .max_batches
             .checked_mul(crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS)
             .ok_or_else(|| no_owner(ContextHostError::InvalidGeometry))?;
         let need = CONTEXT_BOOTSTRAP_STORAGE
             .resources()
-            .and_then(|need| {
-                need.checked_add(
-                    &ResourceVector::new([(Dimension::Contexts.id(), 1)])
-                        .expect("one fixed Context admission dimension"),
-                )
-                .map_err(|_| crate::control_runtime_policy::PolicyError::Overflow)
-            })
             .map_err(|_| no_owner(ContextHostError::InvalidGeometry))?;
         let guard = runtime
             .take_step_reservation(ticket, reservation)
@@ -366,6 +431,7 @@ impl ContextHostRecord {
             ),
             teardown: Default::default(),
             control_admission_closed: false,
+            execution_close_epoch: None,
             failure: None,
             admission: ContextMetadataRole { work, capacity },
             scope: None,
@@ -379,6 +445,8 @@ impl ContextHostRecord {
             host_jobs: None,
             pending_host_jobs: Default::default(),
             lifecycle: None,
+            removal: None,
+            removal_job: None,
             notice: None,
             io_attempted: false,
             requests: BTreeMap::new(),
@@ -390,9 +458,19 @@ impl ContextHostRecord {
                 .capacity
                 .resources()
                 .map_err(ContextHostError::Runtime)?;
+            // Binding consumed this same admission's actual Work header.
+            // The remaining object inventory is storage, not a Context quota.
             if need
+                .quota
                 .iter()
-                .any(|(dimension, count)| paid.get(dimension) < count)
+                .any(|(dimension, count)| paid.quota.get(dimension) < count)
+                || paid
+                    .owned_slots
+                    .checked_add(
+                        novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::work_only(),
+                    )
+                    .ok()
+                    != Some(need.owned_slots)
             {
                 return Err(ContextHostError::BootstrapUnfunded);
             }
@@ -400,9 +478,8 @@ impl ContextHostRecord {
                 .open_child_scope_with_root(
                     &resources.admission.work,
                     generation,
-                    max_work,
-                    max_slots,
                     LOCAL_ROLES[LIFETIME],
+                    ReservationResources::work_only(),
                 )
                 .map_err(ContextHostError::Runtime)?;
             resources.scope = Some(scope.clone());
@@ -414,7 +491,7 @@ impl ContextHostRecord {
                 let guard = scope
                     .reserve_next(
                         scope.gates().map_err(ContextHostError::Runtime)?.generation,
-                        ResourceVector::default(),
+                        ReservationResources::work_only(),
                         kind,
                         WorkAdmission::Derived(resources.roles[LIFETIME].work.id()),
                     )
@@ -430,8 +507,8 @@ impl ContextHostRecord {
                 binding.core,
                 scope.clone(),
                 binding.storage,
-                resources.roles[TIMER].work.id(),
-                resources.roles[LIFETIME].work.id(),
+                resources.roles[TIMER].work.reference(),
+                resources.roles[LIFETIME].work.reference(),
             );
             let registration = runtime
                 .register_supervised_bound(
@@ -482,17 +559,20 @@ impl ContextHostRecord {
             identity: context,
             actor: binding.actor,
             control: ticket.actor,
+            control_registration,
             control_runtime: runtime.clone(),
             ledger: ledger.clone(),
+            request_scope: resources.admission.work.scope().clone(),
+            process_source_parent,
             establishment,
             initial_generation: generation,
+            request_horizon,
             resources,
             tasks: BTreeMap::new(),
             retired_task_reads: BTreeMap::new(),
             task_driver: task_driver::TaskDriverState::new(binding.max_live_tasks),
             root_issuance_sealed: false,
             max_live_tasks: binding.max_live_tasks,
-            max_live_roots: binding.max_live_roots,
             max_routes,
             dispatch: EffectDispatch::context(runtime.clone(), binding.actor, effect_limit),
             request_inputs: BTreeMap::new(),
@@ -510,6 +590,9 @@ impl ContextHostRecord {
             .registration
             .as_ref()
             .expect("registered original Context")
+    }
+    pub(crate) fn request_scope(&self) -> &ScopeHandle {
+        &self.request_scope
     }
     pub(crate) fn scope(&self) -> &ScopeHandle {
         self.resources
@@ -536,17 +619,15 @@ impl ContextHostRecord {
         )?);
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn establish_route(&self, request: InputId) -> Option<&Arc<EstablishRouteCustody>> {
+        self.resources.routes.get(&request)
+    }
     pub(super) fn ready_notice(&self) -> &ContextReadyNotice {
         self.resources
             .notice
             .as_ref()
             .expect("published original Context host notice")
-    }
-    pub(crate) fn matches_ready(&self, notice: &ContextReadyNotice) -> bool {
-        self.resources
-            .notice
-            .as_ref()
-            .is_some_and(|original| original.same_origin(notice))
     }
     /// Bind the fixed original Context bank before asking Root for its source
     /// loan or handing any factory/instance to an executor.
@@ -558,19 +639,36 @@ impl ContextHostRecord {
         // refusal leaves ready headers with the common reaper; an empty host
         // Option is not authority to issue a second bank over those headers.
         self.resources.io_attempted = true;
-        self.resources.io = Some(
-            ContextIoInventory::admit(
-                &self.control_runtime,
-                self.actor,
-                self.scope(),
-                self.resources.roles[LIFETIME].capacity.id(),
-                self.scope()
-                    .gates()
-                    .map_err(ContextHostError::Runtime)?
-                    .generation,
+        let scope = self.scope().clone();
+        let generation = scope.gates().map_err(ContextHostError::Runtime)?.generation;
+        // Only unused positions cross the Scope boundary. M/R/H are born in
+        // this Context under its actual lifetime; no Work is reparented.
+        let mut payer = self
+            .resources
+            .admission
+            .capacity
+            .split_next(
+                &CONTEXT_IO_STORAGE
+                    .resources()
+                    .expect("fixed original Context IO inventory"),
             )
-            .map_err(ContextHostError::Io)?,
+            .map_err(ContextHostError::Runtime)?;
+        if let Err(error) = payer.transfer(&self.resources.roles[LIFETIME].work) {
+            payer.finish().expect("unexposed original IO parcel");
+            return Err(ContextHostError::Runtime(error));
+        }
+        let result = ContextIoInventory::admit(
+            &self.control_runtime,
+            self.actor,
+            &scope,
+            &mut payer,
+            &self.resources.roles[LIFETIME].work,
+            generation,
         );
+        // An incomplete pre-capture admission withdrew its actual roles. Only
+        // never-bound positions remain in this parcel; it owns no Work header.
+        payer.finish().map_err(ContextHostError::Runtime)?;
+        self.resources.io = Some(result.map_err(ContextHostError::Io)?);
         Ok(())
     }
     pub(crate) fn prepare_host_jobs(&mut self) -> Result<(), ContextHostError> {
@@ -603,7 +701,7 @@ impl ContextHostRecord {
                 generation: self.initial_generation,
                 establishment: self.establishment,
                 admission: self.resources.admission.capacity.id(),
-                admission_work: self.resources.admission.work.id(),
+                admission_work: self.resources.admission.work.reference(),
                 notice,
             },
             parts,
@@ -616,31 +714,19 @@ impl ContextHostRecord {
         }
         let mut owner = ContextLifecycle::new(
             self.control_runtime.clone(),
-            self.control,
-            self.actor,
+            self.control_registration.clone(),
+            self.registration().clone(),
             self.identity,
             self.scope().clone(),
             &self.resources.admission.work,
+            self.request_horizon,
         );
         let result = owner.initialize(&self.resources.admission.work);
-        // Even a partial Root input bank remains with this same actual payer.
+        // A partial original Context callback stays with its process payer.
         self.resources.lifecycle = Some(owner);
         result.map_err(ContextHostError::HostJob)
     }
-    pub(crate) fn capture_materialization(
-        &self,
-        source: ValidatedMaterializationSource,
-        factory: Arc<dyn crate::QueryContextHostFactory>,
-    ) -> Result<ContextHostJob, MaterializationCaptureRefusal> {
-        match &self.resources.host_jobs {
-            Some(jobs) => jobs.capture_materialization(source, factory),
-            None => Err(MaterializationCaptureRefusal {
-                error: ContextHostJobError::WrongPhase,
-                source,
-                factory,
-            }),
-        }
-    }
+
     pub(crate) fn host_jobs(&self) -> Option<&ContextHostJobs> {
         self.resources.host_jobs.as_ref()
     }
@@ -661,59 +747,12 @@ impl ContextHostRecord {
             .map_err(|refusal| (ContextHostJobError::Driver(refusal.error), refusal.ticket))?;
         Ok(())
     }
-    pub(crate) fn handoff_retention(
-        &mut self,
-        ticket: EffectTicket<WorkerAction>,
-    ) -> Result<(), (ContextHostJobError, EffectTicket<WorkerAction>)> {
-        let Some(lifecycle) = &mut self.resources.lifecycle else {
-            return Err((ContextHostJobError::WrongPhase, ticket));
-        };
-        let Some(normal_close) = self
-            .resources
-            .host_jobs
-            .as_ref()
-            .and_then(ContextHostJobs::normal_close_observation)
-        else {
-            return Err((ContextHostJobError::WrongPhase, ticket));
-        };
-        if let Err(error) = lifecycle.forward_retained(&ticket, normal_close) {
-            return Err((error, ticket));
-        }
-        let reference = EffectRef {
-            input: ticket.input,
-            action: ticket.descriptor.id,
-        };
-        self.complete_host_effect(ticket)
-            .map_err(|refusal| (ContextHostJobError::Driver(refusal.error), refusal.ticket))?;
-        if self.dispatch.completion_observed(reference).is_err() {
-            std::process::abort();
-        }
-        Ok(())
-    }
-    pub(crate) fn publish_host_removed(&mut self) -> Result<bool, ContextHostJobError> {
-        let jobs = self
-            .resources
-            .host_jobs
-            .as_ref()
-            .ok_or(ContextHostJobError::WrongPhase)?;
-        self.resources
-            .lifecycle
-            .as_mut()
-            .ok_or(ContextHostJobError::WrongPhase)?
-            .publish_removed(
-                jobs,
-                self.resources
-                    .notice
-                    .as_ref()
-                    .ok_or(ContextHostJobError::WrongPhase)?,
-            )
-    }
     pub(crate) fn retire_lifecycle(&mut self) -> Result<bool, ContextHostJobError> {
         self.resources
             .lifecycle
             .as_mut()
             .ok_or(ContextHostJobError::WrongPhase)?
-            .retire_after_removed()
+            .retire_callback()
     }
     pub(crate) fn handoff_establishment_decision(
         &mut self,
@@ -748,10 +787,15 @@ impl ContextHostRecord {
         ) {
             return Err(EstablishRouteError::WrongOwner);
         }
-        // A captured address is not a lifecycle pin. A sealed/removed actor
-        // cannot admit a new Context leg after its metadata sources exit.
+        // A captured address is not a lifecycle pin. A failed or sealed actor
+        // cannot accept a new leg. Root keeps this original R for its existing
+        // failure/closure decision; unavailable does not manufacture Gone.
         match self.control_runtime.snapshot(self.actor) {
-            Ok(snapshot) if snapshot.sealed || self.resources.control_admission_closed => {
+            Ok(snapshot)
+                if snapshot.failed
+                    || snapshot.sealed
+                    || self.resources.control_admission_closed =>
+            {
                 return Err(EstablishRouteError::TargetRemoved);
             }
             Ok(_) => {}
@@ -767,9 +811,28 @@ impl ContextHostRecord {
             return Err(EstablishRouteError::Capacity);
         }
         let request = route.request();
+        // The jobs retain their original execution identity after actual
+        // Scope removal. Validate against that same lifecycle identity; the
+        // new replay leg is already funded by its original process/R payer.
+        let original_scope = self
+            .resources
+            .scope
+            .as_ref()
+            .or_else(|| {
+                self.resources
+                    .lifecycle
+                    .as_ref()
+                    .map(ContextLifecycle::original_execution_scope)
+            })
+            .ok_or(EstablishRouteError::WrongPhase)?;
         // Store this alias before the Context's first Work/report/input.
         self.resources.routes.insert(request.token, route.clone());
-        let initialized = route.initialize_context(&self.resources.roles[LIFETIME].work);
+        route.bind_host_jobs(
+            self.resources.host_jobs.clone(),
+            original_scope,
+            self.ready_notice().clone(),
+        )?;
+        let initialized = route.initialize_context();
         // Cancellation can precede insertion; retain an actual cleanup wake.
         self.notify_host_progress();
         initialized
@@ -784,7 +847,7 @@ impl ContextHostRecord {
         else {
             return Err((EstablishRouteError::WrongEffect, ticket));
         };
-        let Some(route) = self.resources.routes.get(&request.token) else {
+        let Some(route) = self.resources.routes.get(&request.token).cloned() else {
             return Err((EstablishRouteError::WrongOwner, ticket));
         };
         if let Err(error) = route.accept_probe(&ticket) {
@@ -801,6 +864,7 @@ impl ContextHostRecord {
         if self.dispatch.completion_observed(effect).is_err() {
             std::process::abort();
         }
+        route.notify_progress();
         Ok(())
     }
     pub(crate) fn advance_establish_route(
@@ -812,18 +876,16 @@ impl ContextHostRecord {
             .routes
             .get(&request)
             .ok_or(EstablishRouteError::WrongOwner)?;
+        route.advance_replay()?;
         if !route.try_retire_context()? {
             return Ok(false);
         }
         self.resources.routes.remove(&request);
         Ok(true)
     }
-    pub(crate) fn establish_route(&self, request: InputId) -> Option<&Arc<EstablishRouteCustody>> {
-        self.resources.routes.get(&request)
-    }
 
-    /// The original Root decision authorizes parent teardown. Keep both its
-    /// Context slot and metadata payment until the parent records really exit.
+    /// The original Root decision authorizes the admission's own retirement.
+    /// Actual callback/batch tails still exit before its header and storage.
     pub(crate) fn authorize_parent_retirement(
         &mut self,
         ticket: &EffectTicket<WorkerAction>,
@@ -839,13 +901,16 @@ impl ContextHostRecord {
             return Err(ContextHostError::WrongEffect);
         }
         self.resources.teardown.parent_retire_authorized = true;
+        // The Core-consumption receipt may already have woken and parked the
+        // Context before this separate Root effect is handed over.
+        self.notify_host_progress();
         Ok(())
     }
     pub(crate) fn adopt_task(
         &mut self,
         runtime: &ActorRuntime<WorkerActor>,
         ticket: &EffectTicket<WorkerAction>,
-        binding: TaskHostBinding,
+        binding: &TaskHostBinding,
     ) -> Result<(), ContextHostError> {
         if !self.control_runtime.same_runtime(runtime) {
             return Err(ContextHostError::WrongRuntime);
@@ -882,6 +947,10 @@ impl ContextHostRecord {
                             .insert(task, TaskHostOwner::Unpublished(unpublished))
                             .is_none()
                     );
+                    // This row owns actual unused admissions even though no
+                    // Task port exists to provide the usual first notice.
+                    self.task_driver.queue_owned_task(task);
+                    self.notify_host_progress();
                 }
                 return Err(ContextHostError::Task(refusal.error));
             }
@@ -898,6 +967,36 @@ impl ContextHostRecord {
         };
         assert!(self.tasks.insert(task, owner).is_none());
         result.map_err(ContextHostError::Task)
+    }
+    /// Only the running original failure stage may reach this still-owned
+    /// constructor partial. Normal request/loader admission stays Ready-only.
+    pub(super) fn failed_task_for_cleanup(
+        &mut self,
+        stage: &failure::ScopePublicationsDrained<'_>,
+        task: TaskIdentity,
+    ) -> Result<&mut TaskHostRecord, ContextHostError> {
+        stage
+            .validate(&self.control_runtime, self.actor)
+            .map_err(ContextHostError::Driver)?;
+        let owner = match self.tasks.get_mut(&task) {
+            Some(TaskHostOwner::Ready(owner)) => owner.as_mut(),
+            Some(TaskHostOwner::Initializing(owner)) => {
+                if !owner.loader_factory_not_entered() {
+                    return Err(ContextHostError::TaskStillOwned);
+                }
+                owner.as_mut()
+            }
+            Some(TaskHostOwner::Unpublished(_)) => return Err(ContextHostError::TaskStillOwned),
+            None => return Err(ContextHostError::TaskNotOwned),
+        };
+        stage
+            .validate_scope(
+                &self.control_runtime,
+                self.actor,
+                owner.resources_for_retirement().lifetime.scope(),
+            )
+            .map_err(ContextHostError::Driver)?;
+        Ok(owner)
     }
     pub(crate) fn task(&mut self, task: TaskIdentity) -> Option<&mut TaskHostRecord> {
         match self.tasks.get_mut(&task)? {
@@ -993,8 +1092,14 @@ impl ContextHostRecord {
         if self
             .task_request_cuts
             .range((task, novarocks_worker_protocol::proposal_summary::CutId(0))..)
-            .next()
-            .is_some_and(|((identity, _), _)| *identity == task)
+            .take_while(|((identity, _), _)| *identity == task)
+            .any(|(_, work)| {
+                self.resources
+                    .requests
+                    .get(work)
+                    .expect("same original request cut index")
+                    .task_route_attached()
+            })
         {
             return Err(ContextHostError::TaskStillOwned);
         }
@@ -1029,9 +1134,7 @@ impl ContextHostRecord {
 
 pub(crate) mod requests;
 pub(crate) use requests::{
-    CONTEXT_REQUEST_STORAGE, ContextRequestAdmissionRefusal, ContextRequestError,
-    ContextRequestHandle, ContextRequestPublishRefusal, ContextRequestSubmitRefusal,
-    TaskContextRequestHandle,
+    CONTEXT_REQUEST_STORAGE, ContextRequestError, ContextRequestHandle, TaskContextRequestHandle,
 };
 
 #[cfg(test)]
@@ -1043,6 +1146,7 @@ mod tests {
     #[path = "../requests/tests.rs"]
     mod requests;
     use super::*;
+    use crate::control_admission::Dimension;
     use crate::control_runtime::actors::{
         ControlActor, ControlMessage, RequestMetadata, WorkerMessage,
     };
@@ -1053,6 +1157,7 @@ mod tests {
         driver::InputRole,
         publication::{PublishedReply, PublishedSnapshot},
     };
+    use novarocks_control_runtime_core::capacity::ResourceVector;
     use novarocks_control_runtime_core::{
         effect::EffectState,
         identity::{Generation, InputId, Tick},
@@ -1076,6 +1181,37 @@ mod tests {
     };
     use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
+    fn actual_component_inventory(fixture: &Harness) -> [u64; 2] {
+        let root = fixture.scope.snapshot().unwrap();
+        let child = fixture
+            .service
+            .context(fixture.identity)
+            .and_then(|address| {
+                let host = address.lock()?;
+                host.resources
+                    .scope
+                    .as_ref()
+                    .map(|scope| scope.snapshot().unwrap())
+            });
+        [
+            u64::try_from(root.work + child.map_or(0, |s| s.work)).unwrap(),
+            u64::try_from(root.storage + child.map_or(0, |s| s.storage)).unwrap(),
+        ]
+    }
+    fn actual_admission_usage(fixture: &Harness) -> [u64; 4] {
+        [
+            Dimension::Requests,
+            Dimension::ActiveTasks,
+            Dimension::PreparingTasks,
+            Dimension::PreparingBytes,
+        ]
+        .map(|dimension| fixture.ledger.used(dimension.id()))
+    }
+    fn finish_unused_bundle(bundle: &mut ReservationBundle) {
+        let quota = bundle.resources().unwrap().quota;
+        bundle.release_quota(&quota).unwrap();
+        bundle.finish().unwrap();
+    }
     fn generation() -> Generation {
         Generation::new(1).unwrap()
     }
@@ -1096,13 +1232,21 @@ mod tests {
         role.work.captures_exited().unwrap();
     }
     fn release(role: &mut ContextMetadataRole) {
-        role.capacity
-            .release(&role.capacity.resources().unwrap())
-            .unwrap();
+        assert!(
+            role.work.actual_exit_ready().unwrap(),
+            "the original fixture parent still owns live work: scope={:?}, work={:?}, lifecycle={:?}, inventory={:?}",
+            role.work.scope().id(),
+            role.work.id(),
+            role.work.scope().work_lifecycle(role.work.id()).unwrap(),
+            role.work.scope().snapshot().unwrap(),
+        );
+        let quota = role.capacity.resources().unwrap().quota;
+        role.capacity.release_quota(&quota).unwrap();
+        role.capacity.finish().unwrap();
     }
 
-    // The real ControlActor issues both the ticket and Context guard. This
-    // fixture owns the original bounded metadata roles; no EffectTicket or
+    // The real ControlActor issues the original metadata receipt and Context
+    // guard. This fixture owns the original roles; no EffectTicket or
     // protocol Core is fabricated by an adapter.
     struct Harness {
         ledger: RuntimeLedger,
@@ -1114,51 +1258,30 @@ mod tests {
         route: PublishedSnapshot<QueryContextState>,
         replies: BTreeMap<TaskOperationId, PublishedReply<RequestResult>>,
         completed: Vec<(TaskOperationId, RequestResult)>,
-        ticket: Option<ContextMetadataRole>,
+        admission_snapshot:
+            PublishedSnapshot<super::super::node_metrics::ControlAdmissionProjection>,
         context_owner: Option<ContextMetadataRole>,
         policy: ControlRuntimePolicy,
         storage: AdmissionStorage,
         identity: QueryContextRef,
         capability: AdmissionEpochCapability,
-        context_storage: StorageNeed,
         now: Tick,
+        model_establishment_decision:
+            Option<novarocks_worker_protocol::context::ContextEstablishmentDecision>,
+        capture_control: bool,
+        retirement_identity:
+            Option<novarocks_worker_protocol::retention::ContextRetirementIdentity>,
     }
     impl Harness {
         fn new(context_storage: StorageNeed) -> Self {
             Self::new_with_request_capacity(context_storage, 0)
         }
         fn new_with_request_capacity(context_storage: StorageNeed, requests: usize) -> Self {
-            Self::new_with_request_profile(
-                context_storage,
-                requests,
-                super::requests::CONTEXT_REQUEST_STORAGE,
-            )
-        }
-        fn new_with_request_profile(
-            context_storage: StorageNeed,
-            requests: usize,
-            profile: StorageNeed,
-        ) -> Self {
-            Self::new_with_request_and_task_capacity(context_storage, requests, profile, 0)
-        }
-        fn new_with_request_and_task_capacity(
-            context_storage: StorageNeed,
-            requests: usize,
-            profile: StorageNeed,
-            task_positions: usize,
-        ) -> Self {
-            Self::new_with_context_identity(
-                context_storage,
-                requests,
-                profile,
-                task_positions,
-                None,
-            )
+            Self::new_with_context_identity(context_storage, requests, 0, None)
         }
         fn new_with_context_identity(
             context_storage: StorageNeed,
             requests: usize,
-            profile: StorageNeed,
             task_positions: usize,
             identity: Option<QueryContextRef>,
         ) -> Self {
@@ -1171,51 +1294,20 @@ mod tests {
                 root_read_holders: 1,
             })
             .unwrap();
-            let request_storage = profile
-                .checked_mul(requests)
-                .unwrap()
-                .checked_add(policy.task_base.checked_mul(task_positions).unwrap())
-                .unwrap();
             // Control owns its three actual roles, a timer and one sequential
-            // return/request position. The ticket and Context pay separately.
-            let mut limits = Vec::new();
-            for dimension in [
-                Dimension::Requests,
-                Dimension::ActiveTasks,
-                Dimension::PreparingTasks,
-                Dimension::PreparingBytes,
-                Dimension::InboundRecords,
-                Dimension::InboundBytes,
-                Dimension::Contexts,
-                Dimension::Tickets,
-                Dimension::Inputs,
-                Dimension::Batches,
-                Dimension::Effects,
-                Dimension::Cuts,
-                Dimension::Replies,
-                Dimension::Completions,
-                Dimension::Captures,
-                Dimension::Work,
-            ] {
-                let count = match dimension {
-                    Dimension::Requests => requests,
-                    Dimension::Contexts | Dimension::Tickets => 1,
-                    Dimension::Inputs | Dimension::Batches => {
-                        2 + context_storage.inputs + request_storage.inputs
-                    }
-                    Dimension::Effects => {
-                        2 * ControlCore::MAX_STEP_WORK
-                            + context_storage.effects
-                            + request_storage.effects
-                    }
-                    Dimension::Replies => 2 + request_storage.replies,
-                    Dimension::Work => 3 + 1 + context_storage.work + request_storage.work,
-                    _ => 1024,
-                };
-                limits.push((dimension.id(), u64::try_from(count).unwrap()));
-            }
-            let ledger = RuntimeLedger::new(ResourceVector::new(limits).unwrap(), 64, 4);
-            let scope = ledger.open_scope_next(None, generation(), 32, 32).unwrap();
+            // return/request position. Only the real Context pays separately.
+            let limits = ResourceVector::new([
+                (Dimension::Requests.id(), u64::try_from(requests).unwrap()),
+                (
+                    Dimension::ActiveTasks.id(),
+                    u64::try_from(task_positions.max(1)).unwrap(),
+                ),
+                (Dimension::PreparingTasks.id(), 1),
+                (Dimension::PreparingBytes.id(), 1024),
+            ])
+            .unwrap();
+            let ledger = RuntimeLedger::new(limits);
+            let scope = ledger.open_scope_next(None, generation()).unwrap();
             let mut roles = Vec::new();
             for (index, kind) in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step]
                 .into_iter()
@@ -1228,7 +1320,7 @@ mod tests {
                 if index != 0 {
                     need.inputs = 1;
                     need.batches = 1;
-                    need.effects = ControlCore::MAX_STEP_WORK;
+                    need.effects = ControlActor::MAX_STEP_ACTIONS;
                 }
                 if index == 2 {
                     need.replies = 2;
@@ -1260,24 +1352,13 @@ mod tests {
                 loading: policy.loading.resources().unwrap(),
                 accepted: policy.accepted.resources().unwrap(),
                 context: context_storage.resources().unwrap(),
-                ticket: StorageNeed {
-                    work: 1,
-                    ..StorageNeed::default()
-                }
-                .resources()
-                .unwrap(),
             };
             let core = ControlCore::new(
                 ControlConfig {
-                    max_contexts: 1,
-                    max_waiters: 1,
-                    max_pending_requests: 4,
+                    max_pending_requests: requests + 4,
                     step_budget: ControlCore::MAX_STEP_WORK,
-                    retained_contexts: 1,
-                    gone_fences: 1,
-                    retention: Duration::from_secs(10),
                 },
-                AdmissionTicketConfig::new(1, Duration::from_secs(5), Duration::from_secs(10), 4)
+                AdmissionTicketConfig::new(Duration::from_secs(5), Duration::from_secs(10))
                     .unwrap(),
                 [7; 8],
                 MonotonicInstant::ORIGIN,
@@ -1288,10 +1369,10 @@ mod tests {
                 core,
                 scope.clone(),
                 storage.clone(),
-                roles[1].work.id(),
-                roles[0].work.id(),
+                roles[1].work.reference(),
+                roles[0].work.reference(),
             );
-            let runtime = ActorRuntime::new(2);
+            let runtime = ActorRuntime::new();
             runtime
                 .register_supervised_next(
                     control_actor(),
@@ -1313,10 +1394,11 @@ mod tests {
                     panic!("actual Control actor registration: {error:?}")
                 });
             let input = runtime
-                .reserve_input(
+                .reserve_admitted_input(
                     control_actor(),
                     ActorId::new(90).unwrap(),
                     InputClass::Lifecycle,
+                    &roles[2].work,
                 )
                 .unwrap()
                 .into_role()
@@ -1325,7 +1407,7 @@ mod tests {
                 runtime.clone(),
                 ledger.clone(),
                 control_actor(),
-                NonZeroUsize::new(1).unwrap(),
+                &roles[0].work,
             );
             Self {
                 ledger,
@@ -1337,14 +1419,24 @@ mod tests {
                 route: PublishedSnapshot::new(&scope, Arc::new(QueryContextState::Absent)),
                 replies: BTreeMap::new(),
                 completed: Vec::new(),
-                ticket: None,
+                admission_snapshot: PublishedSnapshot::new(
+                    &scope,
+                    Arc::new(super::super::node_metrics::ControlAdmissionProjection {
+                        epoch: capability,
+                        logical_live_grants: 0,
+                        admission_retention: Default::default(),
+                        control_retention: Default::default(),
+                    }),
+                ),
                 context_owner: None,
                 policy,
                 storage,
                 identity,
                 capability,
-                context_storage,
                 now: Tick(1),
+                model_establishment_decision: None,
+                capture_control: false,
+                retirement_identity: None,
             }
         }
         fn binding(
@@ -1381,6 +1473,7 @@ mod tests {
                         step_budget: ContextCore::MAX_STEP_WORK,
                         lease_bounds: LeaseBounds::DEFAULT,
                         metric_publish_interval: Duration::from_millis(100),
+                        request_horizon: crate::RequestHorizon::DEFAULT,
                     },
                 )
                 .unwrap(),
@@ -1405,7 +1498,7 @@ mod tests {
             let input = self
                 .input
                 .fill(WorkerMessage::Control(ControlMessage::Command {
-                    work: self.roles[2].work.id(),
+                    work: self.roles[2].work.reference(),
                     request: request.map(|operation| RequestMetadata {
                         operation,
                         deadline: MonotonicInstant::from_origin(Duration::from_secs(100)),
@@ -1467,31 +1560,57 @@ mod tests {
                             assert!(materialize.replace(ticket).is_none());
                             continue;
                         }
-                        WorkerAction::Control {
-                            effect: ControlEffect::AdmissionReply { result: Ok(_), .. },
-                            admitted: Some(reservation),
-                        } => {
-                            let guard = self
+                        WorkerAction::AdmissionEpoch(projection) => {
+                            let previous = self
                                 .runtime
-                                .take_step_reservation(&ticket, *reservation)
+                                .commit_snapshot(
+                                    &ticket,
+                                    &self.admission_snapshot,
+                                    Arc::new(*projection),
+                                )
                                 .unwrap();
-                            let (mut work, capacity) = guard.bind(WorkKind::Business).unwrap();
-                            work.start().unwrap();
-                            assert!(
-                                self.ticket
-                                    .replace(ContextMetadataRole { work, capacity })
-                                    .is_none()
-                            );
+                            // The same Root advances its published capability
+                            // after recording this decision. Follow that actual
+                            // commit; the bootstrap capability is not timeless.
+                            assert_eq!(previous.epoch, self.capability);
+                            self.capability = projection.epoch;
                         }
                         WorkerAction::Control {
-                            effect: ControlEffect::Route { state, .. },
+                            effect:
+                                ControlEffect::AdmissionReply {
+                                    result: Ok(receipt),
+                                    ..
+                                },
+                            admitted: None,
+                        } => {
+                            assert_eq!(receipt.context(), self.identity);
+                            assert_eq!(self.admission_snapshot.read().logical_live_grants, 1);
+                            assert_eq!(self.admission_snapshot.read().epoch, self.capability);
+                        }
+                        WorkerAction::Control {
+                            effect: ControlEffect::Route { context, state, .. },
                             ..
                         } => {
-                            assert_ne!(
-                                *state,
-                                QueryContextState::Active,
-                                "metadata bootstrap is not materialization"
-                            );
+                            assert_eq!(*context, self.identity);
+                            if let Some(decision) = &self.model_establishment_decision {
+                                if *state == QueryContextState::Active {
+                                    assert_eq!(decision.state, QueryContextState::Active);
+                                    assert_eq!(decision.outcome, Ok(OperationOutcome::Accepted));
+                                    let original = decision.acknowledgement.as_ref().expect(
+                                        "Active follows the actual Context acknowledgement",
+                                    );
+                                    assert_eq!(original.outcome, OperationOutcome::Accepted);
+                                    assert_eq!(original.receipt.context(), self.identity);
+                                    assert_eq!(original.receipt.state(), QueryContextState::Active);
+                                    assert!(original.receipt.lease().is_some());
+                                }
+                            } else {
+                                assert_ne!(
+                                    *state,
+                                    QueryContextState::Active,
+                                    "metadata bootstrap is not materialization"
+                                );
+                            }
                             drop(
                                 self.runtime
                                     .commit_snapshot(&ticket, &self.route, Arc::new(*state))
@@ -1502,6 +1621,9 @@ mod tests {
                             effect: ControlEffect::RemoveHost { .. },
                             ..
                         } => {
+                            if self.capture_control {
+                                return Some(ticket);
+                            }
                             if let Some(host) = self.service.take_removing_context(&ticket).unwrap()
                             {
                                 let (resources, tasks) = host.into_resources();
@@ -1521,39 +1643,58 @@ mod tests {
                             effect: ControlEffect::RetireReservation(id),
                             ..
                         } => {
-                            if self
-                                .ticket
-                                .as_ref()
-                                .is_some_and(|role| role.capacity.id() == *id)
-                            {
-                                let mut role = self.ticket.take().unwrap();
-                                exit(&mut role);
-                                self.ledger.reap_scope_ready(self.scope.id(), 32).unwrap();
-                                release(&mut role);
-                            } else {
-                                let role = self.context_owner.as_mut().expect(
-                                    "original Context payer retained until Control HostRemoved",
-                                );
-                                assert_eq!(role.capacity.id(), *id);
-                                role.capacity
-                                    .release(
-                                        &ResourceVector::new([(Dimension::Contexts.id(), 1)])
-                                            .unwrap(),
-                                    )
-                                    .unwrap();
-                                assert_eq!(
-                                    role.capacity.resources().unwrap(),
-                                    self.context_storage.resources().unwrap()
-                                );
+                            if self.capture_control {
+                                return Some(ticket);
                             }
+                            let address = self
+                                .service
+                                .context(self.identity)
+                                .expect("same original Context");
+                            let mut host = address.lock().unwrap();
+                            assert_eq!(host.admission(), *id);
+                            host.authorize_parent_retirement(&ticket).unwrap();
                         }
                         WorkerAction::Control {
-                            effect: ControlEffect::Reply { outcome, .. },
+                            effect: ControlEffect::WakeInternal,
+                            ..
+                        } => {}
+                        WorkerAction::Control {
+                            effect: ControlEffect::Reply { request, outcome },
                             ..
                         } => {
-                            assert_eq!(*outcome, OperationOutcome::OwnerFailed);
+                            assert_eq!(*request, operation(2));
+                            assert_eq!(
+                                Ok(*outcome),
+                                self.model_establishment_decision
+                                    .as_ref()
+                                    .expect("reply follows the actual same Core decision")
+                                    .outcome
+                            );
                         }
                         WorkerAction::ControlReply(settlement) => {
+                            if settlement.request.operation == operation(2)
+                                && settlement.result
+                                    == RequestResult::Outcome(OperationOutcome::Accepted)
+                            {
+                                let original = self
+                                    .model_establishment_decision
+                                    .as_ref()
+                                    .expect("Accepted follows the original Context decision")
+                                    .acknowledgement
+                                    .as_ref()
+                                    .expect("Accepted retains the original acknowledgement");
+                                let novarocks_worker_protocol::control::ControlReplyBody::Context(
+                                    actual,
+                                ) = &settlement.body
+                                else {
+                                    panic!(
+                                        "Accepted Establish returns its original Context acknowledgement"
+                                    );
+                                };
+                                assert_eq!(actual, original);
+                                assert!(Arc::ptr_eq(&actual.receipt, &original.receipt));
+                                assert_eq!(*self.route.read(), QueryContextState::Active);
+                            }
                             let reply = self
                                 .replies
                                 .remove(&settlement.request.operation)
@@ -1590,7 +1731,7 @@ mod tests {
                 )
                 .is_none()
             );
-            assert_eq!(self.ledger.used(Dimension::Tickets.id()), 1);
+
             self.command(
                 ControlInput::Establish {
                     request: operation(2),
@@ -1630,6 +1771,7 @@ mod tests {
             Self::release_drained_effect_claims(runtime);
             if resources.registered {
                 runtime.close_actor_admission(actor).unwrap();
+                runtime.close_timer_source(actor).unwrap();
                 runtime.seal_actor(actor).unwrap();
             }
             if let Some(scope) = resources.scope.take() {
@@ -1657,9 +1799,68 @@ mod tests {
                 original_host_turn.release(false).unwrap();
             }
         }
+        fn close_model_core(&mut self) {
+            let Some(address) = self.service.context(self.identity) else {
+                return;
+            };
+            let host = address.lock().unwrap();
+            if host.resources.scope.is_none()
+                || host.resources.execution_close_epoch.is_some()
+                || self.runtime.snapshot(host.actor()).unwrap().failed
+                || host
+                    .resources
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.gates().unwrap().failed)
+            {
+                return;
+            }
+            drop(host);
+            // The external Root waiter may expire independently. Only the
+            // actual Context decision determines whether materialization ended.
+            let fact = if self.model_establishment_decision.is_some() {
+                novarocks_worker_protocol::context::ContextInput::OwnerFenced
+            } else {
+                novarocks_worker_protocol::context::ContextInput::MaterializationFinished {
+                    result: Err(
+                        novarocks_worker_protocol::creation::AdmissionRefusal::Verdict(
+                            OperationOutcome::OwnerFailed,
+                        ),
+                    ),
+                }
+            };
+            let input = requests::model_fact(self, fact, self.now.0);
+            requests::complete_model_effects(self, input);
+            self.runtime.retire_input(context_actor(), input).unwrap();
+            for _ in 0..8 {
+                let input = requests::model_fact(
+                    self,
+                    novarocks_worker_protocol::context::ContextInput::NextInternal,
+                    self.now.0,
+                );
+                requests::complete_model_effects(self, input);
+                self.runtime.retire_input(context_actor(), input).unwrap();
+            }
+        }
         fn dispose_service_bootstrap(&mut self, actor: ActorId) {
+            self.close_model_core();
             let host_address = self.service.context(self.identity).unwrap();
             let mut host = host_address.lock().unwrap();
+            if let Ok(proof) = self.runtime.failure_proof_for(host.registration()) {
+                self.retirement_identity = Some(
+                    novarocks_worker_protocol::retention::ContextRetirementIdentity::OwnerFailure {
+                        actor: proof.registration().actor(),
+                        initial_epoch: proof.initial_epoch(),
+                        failed_epoch: proof.failed_epoch(),
+                    },
+                );
+            } else if let Some(close_epoch) = host.resources.execution_close_epoch {
+                self.retirement_identity = Some(
+                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        close_epoch,
+                    },
+                );
+            }
             Self::dispose_inventory(
                 &self.runtime,
                 &self.ledger,
@@ -1679,79 +1880,78 @@ mod tests {
             assert!(self.context_owner.replace(resources.admission).is_none());
         }
         fn one_control_effect(&mut self, command: ControlInput) -> EffectTicket<WorkerAction> {
-            let input = self
-                .input
-                .fill(WorkerMessage::Control(ControlMessage::Command {
-                    work: self.roles[2].work.id(),
-                    request: None,
-                    command,
-                }))
-                .unwrap();
-            assert!(self.runtime.poll_one(self.now).unwrap());
-            let ready = self
-                .runtime
-                .ready_effects(control_actor(), input, ControlCore::MAX_STEP_WORK)
-                .unwrap();
-            assert_eq!(ready.len(), 1);
-            self.runtime
-                .take_effect(control_actor(), input, ready[0])
-                .unwrap()
+            self.capture_control = true;
+            let result = self.command(command, None);
+            self.capture_control = false;
+            result.expect("actual original Root retirement/removal effect")
         }
-        fn complete_control_effect(&self, ticket: EffectTicket<WorkerAction>) {
+        fn complete_control_effect(&mut self, ticket: EffectTicket<WorkerAction>) {
             let input = ticket.input;
             self.runtime.effect_completed(ticket).unwrap();
+            // Capturing one original removal/retirement effect does not retire
+            // the same batch's remaining admission snapshot or continuation.
+            assert!(self.drain(input).is_none());
             self.runtime.retire_input(control_actor(), input).unwrap();
         }
         fn actual_model_refusal_removal(&mut self) -> EffectTicket<WorkerAction> {
             self.dispose_service_bootstrap(context_actor());
+            let retirement = self
+                .retirement_identity
+                .expect("actual Core close or Actor failure proof");
             assert!(
                 self.command(
-                    ControlInput::ContextBootstrapFailed {
+                    ControlInput::ExecutionRetired {
                         context: self.identity,
-                        refusal: novarocks_worker_protocol::creation::AdmissionRefusal::Verdict(
-                            OperationOutcome::OwnerFailed
-                        ),
+                        retirement
                     },
                     None
                 )
                 .is_none()
             );
+            self.capture_control = true;
+            let mut removal = self.command(ControlInput::ProcessDrain, None);
+            if removal.is_none() {
+                removal = self.command(ControlInput::ProcessIngressClosed, None);
+            }
+            for _ in 0..16 {
+                if removal.is_some() {
+                    break;
+                }
+                removal = self.command(ControlInput::NextInternal, None);
+            }
+            self.capture_control = false;
+            let removal =
+                removal.expect("actual process drain removes only the physically retired Context");
             assert!(
-                self.command(
-                    ControlInput::Retained {
-                        context: self.identity,
-                        normal_close: false
-                    },
-                    None
-                )
-                .is_none()
+                matches!(&removal.effect, WorkerAction::Control { effect: ControlEffect::RemoveHost { context }, .. } if *context == self.identity)
             );
-            self.now = Tick(11_000_000_000);
-            let removal = self.one_control_effect(ControlInput::Tick);
-            assert!(matches!(&removal.effect, WorkerAction::Control {
-                effect: ControlEffect::RemoveHost { context }, ..
-            } if *context == self.identity));
             removal
         }
         fn actual_model_refusal_retirement(
             &mut self,
         ) -> (ContextHostRecord, EffectTicket<WorkerAction>) {
-            let removal = self.actual_model_refusal_removal();
-            let host = self
-                .service
-                .take_removing_context(&removal)
-                .unwrap()
-                .unwrap();
+            self.dispose_service_bootstrap(context_actor());
+            let retirement = self
+                .retirement_identity
+                .expect("actual Core close or Actor failure proof");
+            let ticket = self.one_control_effect(ControlInput::ExecutionRetired {
+                context: self.identity,
+                retirement,
+            });
+            let address = self.service.context(self.identity).unwrap();
+            let host = {
+                let mut original = address.lock().unwrap();
+                assert!(original.resources.scope.is_none());
+                assert!(!original.resources.registered);
+                original.take_for_parent()
+            };
+            self.service.directory().remove_original(&address);
             assert!(host.resources.scope.is_none());
             assert!(!host.resources.registered);
-            self.complete_control_effect(removal);
-            let retirement = self.one_control_effect(ControlInput::HostRemoved {
-                context: self.identity,
-            });
-            assert!(matches!(&retirement.effect, WorkerAction::Control {
-                effect: ControlEffect::RetireReservation(reservation), ..
-            } if *reservation == host.admission()));
-            (host, retirement)
+            assert!(
+                matches!(&ticket.effect, WorkerAction::Control { effect: ControlEffect::RetireReservation(id), .. } if *id == host.admission())
+            );
+            (host, ticket)
         }
         fn finish_retired_context(
             mut self,
@@ -1768,65 +1968,36 @@ mod tests {
             self.finish_removed();
         }
         fn finish_model_refusal(mut self) {
-            // No materialization body or foreign Context resource was started.
-            // The original metadata/actor holders have actually exited above;
-            // report that real model refusal, never a fictitious Active fact.
-            assert!(
-                self.command(
-                    ControlInput::ContextBootstrapFailed {
-                        context: self.identity,
-                        refusal: novarocks_worker_protocol::creation::AdmissionRefusal::Verdict(
-                            OperationOutcome::OwnerFailed
-                        ),
-                    },
-                    None
-                )
-                .is_none()
-            );
-            assert_eq!(*self.route.read(), QueryContextState::Aborting);
-            assert!(
-                self.completed
-                    .iter()
-                    .any(|(operation_id, result)| *operation_id == operation(2)
-                        && *result == RequestResult::Outcome(OperationOutcome::OwnerFailed))
-            );
-            assert_eq!(self.ledger.used(Dimension::Contexts.id()), 1);
-            assert!(
-                self.command(
-                    ControlInput::Retained {
-                        context: self.identity,
-                        normal_close: false
-                    },
-                    None
-                )
-                .is_none()
-            );
-            assert_eq!(self.ledger.used(Dimension::Tickets.id()), 0);
-            assert_eq!(self.ledger.used(Dimension::Contexts.id()), 1);
-            assert_eq!(*self.route.read(), QueryContextState::TerminalRetained);
-            // The real retention deadline creates RemoveHost. Service moves
-            // its original owner only on that actual Control effect.
-            self.now = Tick(11_000_000_000);
-            assert!(self.command(ControlInput::Tick, None).is_none());
-            assert!(self.service.context(self.identity).is_none());
-            assert!(
-                self.command(
-                    ControlInput::HostRemoved {
-                        context: self.identity
-                    },
-                    None
-                )
-                .is_none()
-            );
+            if let Some(address) = self.service.context(self.identity) {
+                let host = {
+                    let mut original = address.lock().unwrap();
+                    assert!(original.resources.scope.is_none());
+                    assert!(!original.resources.registered);
+                    original.take_for_parent()
+                };
+                assert!(host.resources.scope.is_none());
+                assert!(!host.resources.registered);
+                self.service.directory().remove_original(&address);
+                let (resources, tasks) = host.into_resources();
+                assert!(tasks.is_empty());
+                assert!(self.context_owner.replace(resources.admission).is_none());
+            }
             self.finish_removed();
         }
         fn finish_removed(mut self) {
-            assert_eq!(self.ledger.used(Dimension::Contexts.id()), 0);
-            let mut admission = self.context_owner.take().unwrap();
+            if !self.replies.is_empty() {
+                self.now = Tick(101_000_000_000);
+                assert!(self.command(ControlInput::Tick, None).is_none());
+            }
+            assert!(self.replies.is_empty());
+
             assert_eq!(
-                admission.capacity.resources().unwrap(),
-                self.context_storage.resources().unwrap()
+                usize::from(self.service.context(self.identity).is_some()),
+                0
             );
+            let mut admission = self.context_owner.take().unwrap();
+            assert!(admission.capacity.resources().unwrap().quota.is_empty());
+            assert!(!admission.work.retirement_observer().is_retired());
             exit(&mut admission);
             self.ledger.reap_scope_ready(self.scope.id(), 32).unwrap();
             release(&mut admission);
@@ -1861,6 +2032,7 @@ mod tests {
             } => *reservation,
             _ => unreachable!(),
         };
+        let root_work_before_adoption = fixture.scope.snapshot().unwrap().work;
         let binding = fixture.binding(context_actor(), &ticket);
         assert_eq!(binding.core.state(), QueryContextState::Establishing);
         let actual_deadline = binding.core.next_deadline();
@@ -1877,14 +2049,26 @@ mod tests {
         let host_address = fixture.service.context(fixture.identity).unwrap();
         let host = host_address.lock().unwrap();
         assert_eq!(host.admission(), original);
+        assert!(
+            fixture
+                .scope
+                .work_lifecycle(host.resources.admission.work.id())
+                .unwrap()
+                .is_some(),
+            "the same original bootstrap author remains owned while its child Scope exists"
+        );
         assert_eq!(host.identity(), fixture.identity);
         assert_eq!(host.actor(), context_actor());
         assert_ne!(host.scope().id(), fixture.scope.id());
         assert_eq!(host.scope().snapshot().unwrap().work, 3);
-        assert_eq!(fixture.scope.snapshot().unwrap().work, 6);
         assert_eq!(
-            fixture.ledger.used(Dimension::Work.id()),
-            4 + u64::try_from(fixture.context_storage.work).unwrap()
+            fixture.scope.snapshot().unwrap().work,
+            root_work_before_adoption + 1,
+            "the child Scope adds exactly one real parent-link Work beside the original Materialize payment"
+        );
+        assert!(
+            fixture.scope.snapshot().unwrap().work >= 4,
+            "the original bootstrap parent remains physically owned"
         );
         assert_eq!(*fixture.route.read(), QueryContextState::Absent);
         assert!(matches!(
@@ -1934,7 +2118,7 @@ mod tests {
             .capacity
             .resources()
             .unwrap();
-        let quota = second.ledger.used(Dimension::Contexts.id());
+        let quota = usize::from(second.service.context(second.identity).is_some());
         let after_work = second.scope.snapshot().unwrap().work;
         // The original source ticket still retires its own actual holder. A
         // broken target rule has already released B's unit; B's own genuine
@@ -1977,13 +2161,13 @@ mod tests {
             let host = host_address.lock().unwrap();
             (host.admission(), host.scope().id(), host.tasks.len())
         };
-        let fee = second.ledger.used(Dimension::Contexts.id());
+        let fee = usize::from(second.service.context(second.identity).is_some());
         let outcome = second.service.take_removing_context(&removal);
         let retained = second.service.context(second.identity).map(|address| {
             let host = address.lock().unwrap();
             (host.admission(), host.scope().id(), host.tasks.len())
         });
-        let fee_after = second.ledger.used(Dimension::Contexts.id());
+        let fee_after = usize::from(second.service.context(second.identity).is_some());
         let (error, moved) = match outcome {
             Err(error) => (Some(error), None),
             Ok(owner) => (None, owner),
@@ -1995,10 +2179,20 @@ mod tests {
             .unwrap()
             .unwrap();
         first.complete_control_effect(removal);
-        let first_retirement = first.one_control_effect(ControlInput::HostRemoved {
-            context: first.identity,
-        });
-        first.finish_retired_context(first_host, first_retirement);
+        assert!(
+            first
+                .command(
+                    ControlInput::HostRemoved {
+                        context: first.identity
+                    },
+                    None
+                )
+                .is_none()
+        );
+        let (resources, tasks) = first_host.into_resources();
+        assert!(tasks.is_empty() && resources.scope.is_none() && !resources.registered);
+        assert!(first.context_owner.replace(resources.admission).is_none());
+        first.finish_removed();
         if let Some(mut wrong_owner) = moved {
             // A broken gate has moved the ACTUAL B owner; keep it and perform
             // its real physical cleanup, never reconstruct or reinsert it.
@@ -2043,7 +2237,7 @@ mod tests {
         assert!(matches!(
             scope.reserve_next(
                 generation(),
-                ResourceVector::default(),
+                ReservationResources::work_only(),
                 WorkKind::Business,
                 WorkAdmission::External
             ),
@@ -2052,17 +2246,29 @@ mod tests {
             ))
         ));
         let lifetime = host.resources.roles[LIFETIME].capacity.id();
-        // Existing responsibility may derive during drain, but a real Task's
-        // nonzero loading inventory is not part of this metadata-only payer.
-        assert!(matches!(
-            scope.reserve_child_next(
+        // External admission is closed, but a real pre-existing owner may
+        // derive during drain. Storage is prepaid per holder, not a metadata
+        // Context count/byte cap. This is no Task or Accepted permission.
+        let before_child = scope.snapshot().unwrap();
+        let (mut child, mut capacity) = scope
+            .reserve_child_next(
                 generation(),
                 lifetime,
                 fixture.policy.loading.resources().unwrap(),
-                WorkKind::Business
-            ),
-            Err(RuntimeError::CapacityDenied(_))
-        ));
+                WorkKind::Business,
+            )
+            .unwrap()
+            .bind(WorkKind::Business)
+            .unwrap();
+        assert_eq!(scope.snapshot().unwrap().work, before_child.work + 1);
+        assert!(!scope.gates().unwrap().external_open);
+        child.body_exited().unwrap();
+        child.captures_exited().unwrap();
+        fixture.ledger.reap_scope_ready(scope.id(), 32).unwrap();
+        assert!(child.actual_exit_ready().unwrap());
+        assert!(capacity.resources().unwrap().quota.is_empty());
+        capacity.finish().unwrap();
+        assert_eq!(scope.snapshot().unwrap(), before_child);
         scope.request_stop().unwrap();
         assert!(matches!(
             scope.reserve_child_next(
@@ -2078,9 +2284,9 @@ mod tests {
             ))
         ));
         assert_eq!(scope.snapshot().unwrap().work, 3);
-        assert_eq!(
-            fixture.ledger.used(Dimension::Work.id()),
-            4 + u64::try_from(fixture.context_storage.work).unwrap()
+        assert!(
+            fixture.scope.snapshot().unwrap().work >= 4,
+            "the original bootstrap parent remains physically owned"
         );
         drop(host);
         fixture.complete_materialize_handoff(ticket);
@@ -2098,20 +2304,23 @@ mod tests {
                 .step_reservations(ticket.actor, ticket.input, None, ControlCore::MAX_STEP_WORK)
                 .unwrap();
             assert_eq!(guards.len(), 1);
-            assert_eq!(guards[0].1, ticket.descriptor.work);
+            assert_eq!(guards[0].1, ticket.descriptor.work.work);
             let work_before = fixture.scope.snapshot().unwrap().work;
             let mut binding = fixture.binding(context_actor(), &ticket);
             if loading {
-                binding.storage.loading = ResourceVector::default();
+                binding.storage.loading = ReservationResources::default();
             } else {
-                binding.storage.accepted = ResourceVector::default();
+                binding.storage.accepted = ReservationResources::default();
             }
-            let refusal =
-                ContextHostRecord::adopt(&fixture.runtime, &fixture.ledger, &ticket, binding)
-                    .err()
-                    .expect(
-                        "deviating from the actual policy must refuse before ownership transfer",
-                    );
+            let refusal = ContextHostRecord::adopt(
+                &fixture.runtime,
+                &fixture.ledger,
+                &ticket,
+                binding,
+                fixture.roles[0].work.child_authority().unwrap(),
+            )
+            .err()
+            .expect("deviating from the actual policy must refuse before ownership transfer");
             assert!(matches!(
                 refusal.error,
                 ContextHostError::InvalidStoragePolicy
@@ -2121,7 +2330,10 @@ mod tests {
                 ticket.actor, ticket.input, None, ControlCore::MAX_STEP_WORK,
             ).unwrap(), guards);
             assert_eq!(fixture.scope.snapshot().unwrap().work, work_before);
-            assert_eq!(fixture.ledger.used(Dimension::Contexts.id()), 1);
+            assert!(
+                fixture.service.context(fixture.identity).is_none(),
+                "a rejected direct adoption cannot publish a Service host"
+            );
 
             // Reuse this exact original ticket/guard, with no second Core
             // decision, Context reservation or invented Materialized fact.
@@ -2140,9 +2352,9 @@ mod tests {
             assert!(fixture.runtime.step_reservations(
                 ticket.actor, ticket.input, None, ControlCore::MAX_STEP_WORK,
             ).unwrap().is_empty());
-            assert_eq!(
-                fixture.ledger.used(Dimension::Work.id()),
-                4 + u64::try_from(fixture.context_storage.work).unwrap()
+            assert!(
+                fixture.scope.snapshot().unwrap().work >= 4,
+                "the original bootstrap parent remains physically owned"
             );
             fixture.complete_materialize_handoff(ticket);
             fixture.dispose_service_bootstrap(context_actor());
@@ -2187,10 +2399,15 @@ mod tests {
             // actual creator's original operation, ticket and facts must agree.
             assert_eq!(binding.core.identity(), fixture.identity);
             assert_eq!(binding.core.generation(), generation());
-            let refusal =
-                ContextHostRecord::adopt(&fixture.runtime, &fixture.ledger, &ticket, binding)
-                    .err()
-                    .expect("a different original creation must not take the guard");
+            let refusal = ContextHostRecord::adopt(
+                &fixture.runtime,
+                &fixture.ledger,
+                &ticket,
+                binding,
+                fixture.roles[0].work.child_authority().unwrap(),
+            )
+            .err()
+            .expect("a different original creation must not take the guard");
             let refused = matches!(refusal.error, ContextHostError::WrongEstablishment)
                 && refusal.resources.is_none();
             let original_guard = fixture
@@ -2221,6 +2438,7 @@ mod tests {
             &fixture.ledger,
             &ticket,
             fixture.binding(context_actor(), &ticket),
+            fixture.roles[0].work.child_authority().unwrap(),
         )
         .err()
         .unwrap();
@@ -2231,9 +2449,9 @@ mod tests {
         assert!(resources.scope.is_none());
         assert!(resources.roles.is_empty());
         assert!(!resources.registered);
-        assert_eq!(
-            fixture.ledger.used(Dimension::Work.id()),
-            4 + u64::try_from(fixture.context_storage.work).unwrap()
+        assert!(
+            fixture.scope.snapshot().unwrap().work >= 4,
+            "the original bootstrap parent remains physically owned"
         );
         fixture.complete_materialize_handoff(ticket);
         fixture.dispose_bootstrap(resources, context_actor());
@@ -2249,6 +2467,7 @@ mod tests {
             &fixture.ledger,
             &ticket,
             fixture.binding(control_actor(), &ticket),
+            fixture.roles[0].work.child_authority().unwrap(),
         )
         .err()
         .unwrap();
@@ -2263,9 +2482,9 @@ mod tests {
             resources.scope.as_ref().unwrap().snapshot().unwrap().work,
             3
         );
-        assert_eq!(
-            fixture.ledger.used(Dimension::Work.id()),
-            4 + u64::try_from(fixture.context_storage.work).unwrap()
+        assert!(
+            fixture.scope.snapshot().unwrap().work >= 4,
+            "the original bootstrap parent remains physically owned"
         );
         fixture.complete_materialize_handoff(ticket);
         fixture.dispose_bootstrap(resources, context_actor());

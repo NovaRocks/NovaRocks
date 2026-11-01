@@ -18,10 +18,21 @@
 //! Pure protocol tests. Host results below are neutral model facts, never
 //! physical executor/capture/Source exit or production quota evidence.
 use super::*;
+use novarocks_control_runtime_core::identity::{ScopeId, ScopedWorkRef, WorkId};
 use novarocks_types::{
     AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
 };
 use std::time::Duration;
+
+// One explicit model process owns these requests. The fixture's non-reused
+// input issuance ordinal also names its original R Work; this is plain protocol
+// metadata and cannot create runtime Work, capacity or an InputAuthor proof.
+fn model_request_author(token: InputId) -> ScopedWorkRef {
+    ScopedWorkRef {
+        scope: ScopeId::new(1).expect("the model process Scope"),
+        work: WorkId::new(token.get()).expect("the original model request ordinal"),
+    }
+}
 
 fn at(seconds: u64) -> MonotonicInstant {
     MonotonicInstant::from_origin(Duration::from_secs(seconds))
@@ -56,7 +67,7 @@ impl AdmissionPort for Port {
     }
 }
 struct Model {
-    core: ContextCore,
+    core: LiveContextCore,
     port: Port,
     now: u64,
     token: u64,
@@ -64,7 +75,7 @@ struct Model {
 impl Model {
     fn new() -> Self {
         let mut m = Self {
-            core: ContextCore::new(
+            core: LiveContextCore::new(
                 identity(),
                 Generation::new(1).unwrap(),
                 ContextEstablishment {
@@ -97,6 +108,7 @@ impl Model {
                     step_budget: ContextCore::MAX_STEP_WORK,
                     lease_bounds: LeaseBounds::DEFAULT,
                     metric_publish_interval: Duration::from_millis(100),
+                    request_horizon: crate::lease::RequestHorizon::DEFAULT,
                 },
             )
             .unwrap(),
@@ -141,6 +153,7 @@ impl Model {
             .handle_request(
                 at(self.now),
                 RequestContext {
+                    author: model_request_author(token),
                     token,
                     operation: TaskOperationId::try_from_bytes(bytes(
                         u8::try_from(self.token + 10).unwrap(),
@@ -170,8 +183,6 @@ impl Model {
                 input_retained_bytes: 1,
                 ingress_retained_bytes: 1,
                 structural_bytes: 1,
-                inbound_records: 0,
-                inbound_bytes: 0,
             }),
         })
     }
@@ -202,17 +213,17 @@ impl Model {
 }
 
 #[test]
-fn an_idle_next_internal_charges_all_six_probes_without_creating_an_action() {
+fn an_idle_next_internal_charges_all_internal_probes_without_creating_an_action() {
     let mut m = Model::new();
     assert!(!m.core.has_internal_work());
     let step = m.fact(ContextInput::NextInternal);
     assert_eq!(step.records_visited, 1 + ContextCore::INTERNAL_CLASSES);
     assert!(step.effects.is_empty());
     assert!(step.requests.is_empty());
-    assert_eq!(m.core.generation(), Generation::new(1).unwrap());
+    assert_eq!(m.core.generation, Generation::new(1).unwrap());
     assert_eq!(ContextCore::MAX_BODY_WORK, 15);
-    assert_eq!(ContextCore::MAX_STEP_ACTIONS, 15);
-    assert_eq!(ContextCore::MAX_STEP_WORK, 21);
+    assert_eq!(ContextCore::MAX_STEP_ACTIONS, 16);
+    assert_eq!(ContextCore::MAX_STEP_WORK, 24);
 }
 
 #[test]
@@ -255,7 +266,7 @@ fn domain_authors_park_at_the_host_boundary_and_resume_only_from_the_original_re
         "ContextDomain has no internal continuation while awaiting host"
     );
     let idle = m.fact(ContextInput::NextInternal);
-    assert_eq!(idle.records_visited, 7);
+    assert_eq!(idle.records_visited, 8);
     assert!(idle.effects.is_empty());
     m.fact(ContextInput::TaskUpdateApplied {
         request,
@@ -276,6 +287,14 @@ fn domain_authors_park_at_the_host_boundary_and_resume_only_from_the_original_re
         }
     }
     assert!(reply.is_some());
+    assert!(
+        m.core.has_internal_work(),
+        "the original domain source still owns its completion notice"
+    );
+    let completed = m.fact(ContextInput::NextInternal);
+    assert!(completed.effects.iter().any(|effect| matches!(effect,
+        ContextEffect::DomainRequestCompleted { request: original, task: Some(identity), payload: PayloadId(3) }
+            if *original == request && *identity == task(1))));
     assert!(!m.core.has_internal_work());
 }
 
@@ -362,7 +381,7 @@ fn creation_replies_rotate_between_decided_tasks_without_selecting_a_loading_wai
     m.load(task(1));
     m.load(task(2));
     let mut tokens = Vec::new();
-    for probes_and_record in [5, 8, 8, 8] {
+    for probes_and_record in [5, 9, 9, 9] {
         let step = m.fact(ContextInput::NextInternal);
         assert_eq!(step.records_visited, probes_and_record);
         assert_eq!(step.requests.len(), 1);
@@ -370,7 +389,10 @@ fn creation_replies_rotate_between_decided_tasks_without_selecting_a_loading_wai
     }
     assert_eq!(tokens, [a1, b1, a2, b2]);
     assert!(!m.core.has_internal_work());
-    assert_eq!(m.core.task(task(3)).unwrap().phase, CreationPhase::Loading);
+    assert_eq!(
+        m.core.tasks.get(&task(3)).unwrap().phase,
+        CreationPhase::Loading
+    );
 }
 
 #[test]
@@ -402,7 +424,7 @@ fn close_parks_until_its_real_task_fact_then_drains_abort_waiters() {
         "scan finished but Task close is still a real host/causal dependency"
     );
     let idle = m.fact(ContextInput::NextInternal);
-    assert_eq!(idle.records_visited, 7);
+    assert_eq!(idle.records_visited, 8);
     assert!(idle.effects.is_empty());
     let applied = m.fact(ContextInput::ApplyTaskClose {
         task: task(1),
@@ -434,7 +456,7 @@ fn maintenance_expires_one_original_request_and_the_lease_prelude_runs_once() {
     let request = m.create(task(1));
     m.now = 30;
     let close = m.fact(ContextInput::NextInternal);
-    assert_eq!(m.core.generation(), Generation::new(2).unwrap());
+    assert_eq!(m.core.generation, Generation::new(2).unwrap());
     assert_eq!(
         close
             .effects
@@ -468,7 +490,7 @@ fn maintenance_expires_one_original_request_and_the_lease_prelude_runs_once() {
         e,
         ContextEffect::CloseExternalAdmission { .. } | ContextEffect::SealRoot { .. }
     )));
-    assert_eq!(m.core.generation(), Generation::new(2).unwrap());
+    assert_eq!(m.core.generation, Generation::new(2).unwrap());
     assert!(!m.core.has_internal_work());
 }
 
@@ -491,10 +513,13 @@ fn the_original_pending_reply_map_always_selects_its_lowest_ready_token() {
         .complete_request_at(high, body.clone(), at(0), &mut authored);
     m.core.complete_request_at(low, body, at(0), &mut authored);
     assert_eq!(authored.requests[0].settlement.request.token, first);
-    assert_eq!(m.core.pending_replies.len(), 2);
+    assert_eq!(m.core.replies.pending_replies.len(), 2);
     let step = m.fact(ContextInput::NextInternal);
     assert_eq!(step.requests[0].settlement.request.token, low);
-    assert_eq!(m.core.pending_replies.first_key_value().unwrap().0, &high);
+    assert_eq!(
+        m.core.replies.pending_replies.first_key_value().unwrap().0,
+        &high
+    );
     let (later, _) = m.command(ContextCommand::Quiesce);
     m.core.complete_request_at(
         later,
@@ -510,5 +535,8 @@ fn the_original_pending_reply_map_always_selects_its_lowest_ready_token() {
     assert!(quiesce.requests.is_empty());
     let oldest = m.fact(ContextInput::NextInternal);
     assert_eq!(oldest.requests[0].settlement.request.token, high);
-    assert_eq!(m.core.pending_replies.first_key_value().unwrap().0, &later);
+    assert_eq!(
+        m.core.replies.pending_replies.first_key_value().unwrap().0,
+        &later
+    );
 }

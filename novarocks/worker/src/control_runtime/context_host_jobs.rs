@@ -23,7 +23,7 @@ use super::{
     actors::{ContextMessage, ControlMessage, WorkerAction, WorkerActor, WorkerMessage},
     admitted_role::adopt_reported_work,
     context_io::ContextIoParts,
-    context_ready::{ContextReadyError, ContextReadyNotice},
+    context_ready::ContextReadyNotice,
     control_request::ControlRequestNotice,
     establish_ingress::ValidatedMaterializationSource,
     failure::ScopePublicationsDrained,
@@ -36,7 +36,8 @@ use crate::{
 use novarocks_control_runtime::{
     completion::ReportSlot,
     driver::{
-        ActorRuntime, DriverError, EffectTicket, InputPermit, InputPhase, InputRole, InputRoleId,
+        ActorRuntime, DriverError, EffectTicket, InputAuthor, InputPermit, InputPhase, InputRole,
+        InputRoleId,
     },
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
     lease::{WorkLease, WorkRetirementObserver},
@@ -46,7 +47,8 @@ use novarocks_control_runtime::{
 };
 use novarocks_control_runtime_core::{
     identity::{
-        ActionId, ActorId, ConsumerId, Generation, InputId, ReservationId, ScopeId, WorkId,
+        ActionId, ActorId, ConsumerId, Generation, InputId, ReservationId, ScopeId, ScopedWorkRef,
+        WorkId,
     },
     mailbox::InputClass,
     scope::ScopeError,
@@ -78,15 +80,71 @@ pub(crate) enum ContextHostReturned {
     StartRefused(ExitRoleError),
     Panicked,
 }
+impl std::fmt::Display for ContextHostReturned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Materialized(Ok(facts)) => write!(
+                f,
+                "Context host materialized credential resource {}",
+                facts.initial_credential_resource
+            ),
+            Self::Materialized(Err(refusal)) => {
+                write!(f, "Context host materialization was refused: {refusal:?}")
+            }
+            Self::MaterializationWithdrawn => {
+                f.write_str("Context host materialization was withdrawn")
+            }
+            Self::Released { normal_close } => write!(
+                f,
+                "Context host released execution; normal close observed: {normal_close}"
+            ),
+            Self::Disposed => f.write_str("Context host holder was physically disposed"),
+            Self::StartRefused(error) => write!(f, "Context host call could not start: {error}"),
+            Self::Panicked => {
+                f.write_str("Context host call panicked; original custody remains unresolved")
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ContextHostJobError {
+    Removal(super::context_removal::ContextRemovalError),
     Runtime(RuntimeError),
     Driver(DriverError),
     Exit(ExitRoleError),
     WrongOwner,
     WrongPhase,
-    Ready(ContextReadyError),
 }
+impl std::fmt::Display for ContextHostJobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Removal(error) => write!(f, "Context host removal failed: {error:?}"),
+            Self::Runtime(error) => write!(f, "Context host role operation failed: {error}"),
+            Self::Driver(error) => {
+                write!(f, "Context host input or effect operation failed: {error}")
+            }
+            Self::Exit(error) => {
+                write!(f, "Context host physical exit observation failed: {error}")
+            }
+            Self::WrongOwner => {
+                f.write_str("Context host job does not belong to the original owner")
+            }
+            Self::WrongPhase => f.write_str("Context host job is in the wrong lifecycle phase"),
+        }
+    }
+}
+impl std::error::Error for ContextHostJobError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(error) => Some(error),
+            Self::Driver(error) => Some(error),
+            Self::Exit(error) => Some(error),
+            Self::Removal(_) | Self::WrongOwner | Self::WrongPhase => None,
+        }
+    }
+}
+
 impl From<RuntimeError> for ContextHostJobError {
     fn from(e: RuntimeError) -> Self {
         Self::Runtime(e)
@@ -104,7 +162,7 @@ impl From<ExitRoleError> for ContextHostJobError {
 }
 
 struct Call {
-    work: WorkId,
+    work: ScopedWorkRef,
     retirement: WorkRetirementObserver,
     role: ExitRole,
     report: ReportSlot,
@@ -121,7 +179,7 @@ struct Call {
 }
 impl Call {
     fn new(original: AdmittedCompletionRole, input: Option<InputRole<WorkerActor>>) -> Self {
-        let work = original.work.id();
+        let work = original.work.reference();
         let retirement = original.work.retirement_observer();
         let report = original.report.clone();
         let (sender, reader) = report
@@ -165,7 +223,6 @@ struct Rich {
     instance: Option<ManuallyDrop<Arc<dyn QueryContextHostInstance>>>,
     credential: Option<ManuallyDrop<CredentialUpdate>>,
     rejection: Option<ManuallyDrop<HostRejection>>,
-    evidence: Option<ManuallyDrop<ReleasedContextEvidence>>,
     panics: [Option<PanicPayload>; HOLDER_PANIC_SLOTS],
     roots: Option<super::context_host::root_read::RootReadDisposal>,
     // One original Node execution owner is retained across physical R and H.
@@ -176,6 +233,9 @@ struct State {
     r: Call,
     h: Call,
     rich: Rich,
+    // Same original release fact, already frozen by the Native owner. It
+    // survives H without retaining any foreign host or destructor.
+    evidence: Option<ReleasedContextEvidence>,
     m_issued: bool,
     r_issued: bool,
     h_issued: bool,
@@ -188,7 +248,6 @@ struct State {
     no_instance_created: bool,
     fault: Option<ContextHostReturned>,
     creator: Option<Creator>,
-    removal: Option<OriginalRemoval>,
     failed_return_cursor: usize,
     failed_retirement_cursor: usize,
 }
@@ -200,18 +259,9 @@ pub(crate) struct FailedHostReturnProgress {
     pub settled: usize,
     pub waiting: bool,
 }
-/// This receipt is created only by validating the actual Root effect against
-/// this same custodian. The pre-admitted H role owns the resulting cleanup
-/// responsibility; these numbers cannot sign a new action or access a source.
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct OriginalRemoval {
-    input: InputId,
-    action: ActionId,
-    generation: Generation,
-}
 struct Creator {
     request: RequestContext,
-    work: WorkId,
+    author: InputAuthor,
     notice: ControlRequestNotice,
     permit: Option<InputPermit<WorkerActor>>,
     input: Option<InputRole<WorkerActor>>,
@@ -229,7 +279,7 @@ struct Custody {
     generation: Generation,
     establishment: ContextEstablishment,
     admission: ReservationId,
-    admission_work: WorkId,
+    admission_work: ScopedWorkRef,
     pending: Notify,
     notice: ContextReadyNotice,
     state: Mutex<State>,
@@ -247,15 +297,15 @@ pub(super) struct ContextHostJobBinding {
     pub generation: Generation,
     pub establishment: ContextEstablishment,
     pub admission: ReservationId,
-    pub admission_work: WorkId,
+    pub admission_work: ScopedWorkRef,
     pub notice: ContextReadyNotice,
 }
 
 #[must_use = "A refusal returns both original opaque captures to their actual caller"]
 pub(crate) struct MaterializationCaptureRefusal {
     pub error: ContextHostJobError,
-    pub source: ValidatedMaterializationSource,
-    pub factory: Arc<dyn QueryContextHostFactory>,
+    pub _source: ValidatedMaterializationSource,
+    pub _factory: Arc<dyn QueryContextHostFactory>,
 }
 impl std::fmt::Debug for MaterializationCaptureRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -275,7 +325,7 @@ enum Operation {
 #[must_use = "Return the same original host job on physical queue refusal"]
 pub(crate) struct ContextHostJob {
     owner: ContextHostJobs,
-    work: WorkId,
+    work: ScopedWorkRef,
     index: usize,
     authority: Option<ExitAuthority>,
     sender: Option<OwnedReturnSender<ContextHostReturned>>,
@@ -297,11 +347,27 @@ impl ContextHostJobs {
             && self.0.context == context
             && self.0.scope.same_scope(scope)
     }
+    /// Observe this same admitted M header, never the Context lifetime or H.
+    pub(super) fn materialization_retirement(
+        &self,
+        ticket: &EffectTicket<WorkerAction>,
+    ) -> Result<WorkRetirementObserver, ContextHostJobError> {
+        self.0.runtime.validate_effect_ticket(ticket)?;
+        if !self.matches_materialization(&self.0.runtime, ticket) {
+            return Err(ContextHostJobError::WrongOwner);
+        }
+        Ok(self
+            .0
+            .state
+            .lock()
+            .expect("original M retirement observer")
+            .m
+            .retirement
+            .clone())
+    }
     pub(super) fn materialization_key(&self) -> (ScopeId, WorkId) {
-        (
-            self.0.scope.id(),
-            self.0.state.lock().expect("original M identity").m.work,
-        )
+        let work = self.0.state.lock().expect("original M identity").m.work;
+        (work.scope, work.work)
     }
     pub(super) fn scope_stopped(&self) -> Result<bool, RuntimeError> {
         Ok(self.0.scope.gates()?.stopped)
@@ -345,6 +411,7 @@ impl ContextHostJobs {
                 r: Call::new(release, Some(release_input)),
                 h: Call::new(holder, None),
                 rich: Rich::default(),
+                evidence: None,
                 m_issued: false,
                 r_issued: false,
                 h_issued: false,
@@ -356,7 +423,6 @@ impl ContextHostJobs {
                 no_instance_created: false,
                 fault: None,
                 creator: None,
-                removal: None,
                 failed_return_cursor: 0,
                 failed_retirement_cursor: 0,
             }),
@@ -379,8 +445,8 @@ impl ContextHostJobs {
         ) {
             return Err(MaterializationCaptureRefusal {
                 error: ContextHostJobError::WrongOwner,
-                source,
-                factory,
+                _source: source,
+                _factory: factory,
             });
         }
         let mut state = self.0.state.lock().expect("Context actual host inventory");
@@ -391,15 +457,15 @@ impl ContextHostJobs {
         {
             return Err(MaterializationCaptureRefusal {
                 error: ContextHostJobError::WrongPhase,
-                source,
-                factory,
+                _source: source,
+                _factory: factory,
             });
         }
         if state.m_issued {
             return Err(MaterializationCaptureRefusal {
                 error: ContextHostJobError::WrongPhase,
-                source,
-                factory,
+                _source: source,
+                _factory: factory,
             });
         }
         let (authority, sender) = match state.m.take() {
@@ -407,8 +473,8 @@ impl ContextHostJobs {
             Err(error) => {
                 return Err(MaterializationCaptureRefusal {
                     error,
-                    source,
-                    factory,
+                    _source: source,
+                    _factory: factory,
                 });
             }
         };
@@ -427,7 +493,7 @@ impl ContextHostJobs {
         &self,
         ticket: &EffectTicket<WorkerAction>,
         request: RequestContext,
-        work: WorkId,
+        original_author: InputAuthor,
         author: &WorkLease,
         notice: ControlRequestNotice,
     ) -> Result<InputRoleId, ContextHostJobError> {
@@ -435,6 +501,8 @@ impl ContextHostJobs {
         if ticket.actor != self.0.control
             || ticket.input != request.token
             || request.operation != self.0.establishment.operation
+            || original_author.actor() != self.0.control
+            || request.author != original_author.work()
             || !self.matches_materialization(&self.0.runtime, ticket)
         {
             return Err(ContextHostJobError::WrongOwner);
@@ -449,7 +517,7 @@ impl ContextHostJobs {
         }
         s.creator = Some(Creator {
             request,
-            work,
+            author: original_author,
             notice,
             permit: None,
             input: None,
@@ -513,6 +581,17 @@ impl ContextHostJobs {
         let s = self.0.state.lock().expect("original M source consumption");
         Ok(s.m_issued && s.m.returned.is_some() && s.m.role.actual_exit_ready()?)
     }
+    /// The actual Context Core decision has reached its original creator
+    /// backchannel. An M body return alone supplies no such decision fact.
+    pub(crate) fn actual_establishment_decided(&self) -> bool {
+        self.0
+            .state
+            .lock()
+            .expect("original establishment decision receipt")
+            .creator
+            .as_ref()
+            .is_some_and(|creator| creator.handoff.is_some())
+    }
     /// Forward only the verdict of the actual original Context M input. This
     /// neither reruns host work nor manufactures a second external request.
     pub(super) fn forward_establishment(
@@ -548,7 +627,7 @@ impl ContextHostJobs {
             return Err(ContextHostJobError::WrongPhase);
         }
         let message = WorkerMessage::Control(ControlMessage::Command {
-            work: c.work,
+            work: c.author.work(),
             request: None,
             command: ControlInput::EstablishmentDecided {
                 context: *context,
@@ -557,9 +636,10 @@ impl ContextHostJobs {
         });
         self.0
             .runtime
-            .fill_from_effect(
+            .fill_from_effect_with_author(
                 ticket,
                 c.input.as_ref().ok_or(ContextHostJobError::WrongPhase)?,
+                &c.author,
                 message,
             )
             .map_err(|(e, _)| ContextHostJobError::Driver(e))?;
@@ -633,19 +713,6 @@ impl ContextHostJobs {
         state.execution_bound = true;
         Ok(())
     }
-    /// Only this original physical R return can supply a retention observation.
-    /// Neither a missing host address nor a protocol reply supplies false.
-    pub(crate) fn normal_close_observation(&self) -> Option<bool> {
-        let state = self
-            .0
-            .state
-            .lock()
-            .expect("original Context retention observation");
-        match state.r.returned {
-            Some(ContextHostReturned::Released { normal_close }) => Some(normal_close),
-            _ => None,
-        }
-    }
     /// R can be requested before factory publication. Only the original
     /// pending bit is set; no worker is occupied waiting for a resource.
     pub(super) fn request_release(
@@ -687,6 +754,12 @@ impl ContextHostJobs {
         }
         Ok(())
     }
+    /// Whether this original R has accepted an instruction but has not yet
+    /// transferred its body to the physical executor.
+    pub(super) fn release_pending(&self) -> bool {
+        let state = self.0.state.lock().expect("Context release instruction");
+        state.release_requested && !state.r_issued
+    }
     pub(crate) fn take_release_job(&self) -> Result<Option<ContextHostJob>, ContextHostJobError> {
         let mut state = self.0.state.lock().expect("Context release inventory");
         if !state.release_requested || state.r_issued || state.domain_borrowers != 0 {
@@ -695,16 +768,17 @@ impl ContextHostJobs {
         if !state.execution_bound {
             return Err(ContextHostJobError::WrongPhase);
         }
+        // M publishes its instance before materialize() runs. Presence is
+        // not its exit: R must never overlap that actual foreign body/capture.
+        if state.m.returned.is_none() || !state.m.role.actual_exit_ready()? {
+            return Ok(None);
+        }
         let instance = state
             .rich
             .instance
             .as_ref()
             .map(|v| ManuallyDrop::new(Arc::clone(v)));
-        if instance.is_none()
-            && !(state.no_instance_created
-                && state.m.returned.is_some()
-                && state.m.role.actual_exit_ready()?)
-        {
+        if instance.is_none() && !state.no_instance_created {
             return Ok(None);
         }
         let (authority, sender) = state.r.take()?;
@@ -724,6 +798,12 @@ impl ContextHostJobs {
                     .map(|host| ManuallyDrop::new(Arc::clone(host))),
             )),
         }))
+    }
+    /// These monotonic instructions are the actual reason a new comparison
+    /// cannot borrow H. The Core must decide again after this real stand-down.
+    pub(super) fn replay_comparison_retiring(&self) -> bool {
+        let state = self.0.state.lock().expect("original comparison stand-down");
+        state.release_requested || state.r_issued || state.h_issued
     }
     /// Borrow the original materialized instance before any foreign domain call.
     /// The caller's already admitted R retains this loan until its real host
@@ -759,7 +839,6 @@ impl ContextHostJobs {
             .state
             .lock()
             .expect("original Context release evidence")
-            .rich
             .evidence
             .as_ref()
             .map(|original| original.runtime_filter_observation())
@@ -769,10 +848,8 @@ impl ContextHostJobs {
             .state
             .lock()
             .expect("original Context release evidence")
-            .rich
             .evidence
-            .as_ref()
-            .map(|original| ReleasedContextEvidence::clone(original))
+            .clone()
     }
     pub(crate) fn fault(&self) -> Option<ContextHostReturned> {
         self.0
@@ -786,9 +863,6 @@ impl ContextHostJobs {
         self.0.pending.notify();
         self.0.notice.notify();
     }
-    pub(crate) fn pending_version(&self) -> u64 {
-        self.0.pending.version()
-    }
 
     /// Observe the original M/R callbacks without invoking their host or exit gates.
     pub(super) fn try_execution_callbacks_quiescent(&self) -> Option<bool> {
@@ -799,7 +873,9 @@ impl ContextHostJobs {
             state.fault.is_none()
                 && state.m.retired
                 && state.r.retired
-                && matches!(state.r.returned, Some(ContextHostReturned::Released { .. })),
+                && state.h.retired
+                && matches!(state.r.returned, Some(ContextHostReturned::Released { .. }))
+                && matches!(state.h.returned, Some(ContextHostReturned::Disposed)),
         )
     }
     /// H owns the moved Root inventory until its actual disposal/report tail ends.
@@ -992,6 +1068,7 @@ impl ContextHostJobs {
             .state
             .lock()
             .expect("failed Context callback retirement");
+        let m_was_retired = state.m.retired;
         let mut progressed = false;
         for _ in 0..budget.min(2) {
             let index = state.failed_retirement_cursor;
@@ -1045,7 +1122,13 @@ impl ContextHostJobs {
             call.retired = call.retirement.is_retired();
         }
         let retired = state.m.retired && state.r.retired;
+        let notice = (!m_was_retired && state.m.retired)
+            .then(|| state.creator.as_ref().map(|c| c.notice.clone()))
+            .flatten();
         drop(state);
+        if let Some(notice) = notice {
+            notice.notify();
+        }
         if progressed {
             self.wake();
         }
@@ -1102,47 +1185,17 @@ impl ContextHostJobs {
     }
     pub(crate) fn retire_callbacks(&self) -> Result<bool, ContextHostJobError> {
         let mut s = self.0.state.lock().expect("Context callback retirement");
+        let was_retired = s.m.retired;
         let m = self.retire_call(&mut s.m, true)?;
         let r = self.retire_call(&mut s.r, true)?;
-        Ok(m && r)
-    }
-    /// Transfer the real Root removal intent into its original prepaid H
-    /// owner. Root can complete this metadata handoff without waiting for
-    /// physical calls, report consumers or a cleanup executor position.
-    pub(crate) fn request_holder_disposal(
-        &self,
-        ticket: &EffectTicket<WorkerAction>,
-    ) -> Result<(), ContextHostJobError> {
-        self.0.runtime.validate_effect_ticket(ticket)?;
-        if ticket.actor != self.0.control
-            || !matches!(&ticket.effect,WorkerAction::Control{effect:ControlEffect::RemoveHost{context},..} if *context==self.0.context)
-        {
-            return Err(ContextHostJobError::WrongOwner);
-        }
-        let original = OriginalRemoval {
-            input: ticket.input,
-            action: ticket.descriptor.id,
-            generation: ticket.generation,
-        };
-        let mut s = self
-            .0
-            .state
-            .lock()
-            .expect("original Context removal handoff");
-        if s.removal.is_some_and(|previous| previous != original) {
-            return Err(ContextHostJobError::WrongPhase);
-        }
-        s.removal = Some(original);
+        let notice = (!was_retired && m)
+            .then(|| s.creator.as_ref().map(|c| c.notice.clone()))
+            .flatten();
         drop(s);
-        self.wake();
-        Ok(())
-    }
-    /// The original accepted intent remains valid after its Root effect and
-    /// timer input retire. Only M/R's actual complete retirement enables H.
-    pub(crate) fn take_holder_disposal(
-        &self,
-    ) -> Result<Option<ContextHostJob>, ContextHostJobError> {
-        self.take_holder_disposal_inner(None)
+        if let Some(notice) = notice {
+            notice.notify();
+        }
+        Ok(m && r)
     }
     pub(super) fn take_holder_disposal_with_roots(
         &self,
@@ -1155,7 +1208,7 @@ impl ContextHostJobs {
         roots: Option<&mut super::context_host::root_read::RootReadState>,
     ) -> Result<Option<ContextHostJob>, ContextHostJobError> {
         let mut s = self.0.state.lock().expect("Context holder disposal");
-        if s.removal.is_none() || !s.m.retired || !s.r.retired || s.h_issued {
+        if !s.release_requested || !s.m.retired || !s.r.retired || s.h_issued {
             return Ok(None);
         }
         if roots.as_ref().is_some_and(|roots| !roots.readers_empty()) {
@@ -1196,7 +1249,7 @@ impl ContextHostJobs {
 }
 impl QueuedPreparation for ContextHostJob {
     fn queue_key(&self) -> (ScopeId, WorkId) {
-        (self.owner.0.scope.id(), self.work)
+        (self.work.scope, self.work.work)
     }
     fn fairness_group(&self, _: ScopeId) -> HostFairnessGroup {
         HostFairnessGroup::Context(self.owner.0.context)
@@ -1249,8 +1302,8 @@ impl ContextHostJob {
                 .expect("Context original instance publication");
             s.rich.instance = Some(ManuallyDrop::new(instance.clone()));
             s.rich.credential = Some(ManuallyDrop::new(canonical));
-            s.credential_resource = Some(s.h.work.get());
-            (s.release_requested, s.h.work.get())
+            s.credential_resource = Some(s.h.work.work.get());
+            (s.release_requested, s.h.work.work.get())
         };
         self.owner.wake();
         if closing {
@@ -1284,13 +1337,16 @@ impl ContextHostJob {
         let evidence = instance
             .as_ref()
             .map_or_else(ReleasedContextEvidence::none, |instance| instance.release());
-        self.owner
-            .0
-            .state
-            .lock()
-            .expect("Context original release evidence")
-            .rich
-            .evidence = Some(ManuallyDrop::new(evidence));
+        {
+            let mut state = self
+                .owner
+                .0
+                .state
+                .lock()
+                .expect("Context original release evidence");
+            assert!(state.evidence.is_none(), "one original frozen release fact");
+            state.evidence = Some(evidence);
+        }
         // The same physical invocation observes the original capability bank
         // only after all Task retirement operations and this real Release.
         let normal_close = execution
@@ -1298,35 +1354,15 @@ impl ContextHostJob {
             .is_some_and(|host| host.retains_normal_close(self.owner.0.context));
         ContextHostReturned::Released { normal_close }
     }
-    fn dispose(&self, mut rich: Rich) -> ContextHostReturned {
-        // H can only be issued after the actual Root RemoveHost authorization.
-        // Forget precedes every holder destructor and HostRemoved. A foreign
-        // panic keeps the whole original capture and H Unknown, never Disposed.
-        if let Some(host) = &rich.execution
-            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
-                host.forget_context_admission(self.owner.0.context);
-            }))
-        {
-            let slot = rich
-                .panics
-                .iter_mut()
-                .find(|slot| slot.is_none())
-                .expect("original H has a fixed panic retention position");
-            *slot = Some(ManuallyDrop::new(payload));
-            self.owner
-                .0
-                .state
-                .lock()
-                .expect("original failed Context forget")
-                .rich = rich;
-            return ContextHostReturned::Panicked;
-        }
+    fn dispose(&self, rich: Rich) -> ContextHostReturned {
+        // H drops only this original hot holder after M/R actually retired.
+        // Inbound normal-close truth remains until the original Core's expiry
+        // or real process closure; hot-holder exit does not forget it.
         let Rich {
             factory,
             instance,
             credential,
             rejection,
-            evidence,
             panics,
             roots,
             execution,
@@ -1350,9 +1386,6 @@ impl ContextHostJob {
         })));
         observe(catch_unwind(AssertUnwindSafe(|| {
             drop(rejection.map(ManuallyDrop::into_inner))
-        })));
-        observe(catch_unwind(AssertUnwindSafe(|| {
-            drop(evidence.map(ManuallyDrop::into_inner))
         })));
         observe(catch_unwind(AssertUnwindSafe(|| {
             if let Some(roots) = roots {
@@ -1536,14 +1569,9 @@ impl ContextDomainInstance {
             && self.owner.0.context == context
             && !self.returned
     }
-    pub(crate) fn context(&self) -> QueryContextRef {
-        self.owner.0.context
-    }
-    pub(crate) fn credential_on_host(
-        &mut self,
-        update: &CredentialUpdate,
-        replacement_resource: u64,
-    ) -> Result<novarocks_worker_protocol::domain::CredentialInput, ContextHostJobError> {
+    /// Capture credential identity, material and resource in one original
+    /// owner transaction. Last-reference destruction stays on this host.
+    fn capture_credential_on_host(&mut self) -> Result<u64, ContextHostJobError> {
         // A previous comparison's last foreign reference must leave on this
         // host before the next exact canonical snapshot is captured.
         if let Some(previous) = self.comparison.take() {
@@ -1572,6 +1600,14 @@ impl ContextDomainInstance {
             )
         };
         self.comparison = Some(ManuallyDrop::new(canonical));
+        Ok(resource)
+    }
+    pub(crate) fn credential_on_host(
+        &mut self,
+        update: &CredentialUpdate,
+        replacement_resource: u64,
+    ) -> Result<novarocks_worker_protocol::domain::CredentialInput, ContextHostJobError> {
+        let resource = self.capture_credential_on_host()?;
         let canonical = self
             .comparison
             .as_ref()
@@ -1583,6 +1619,32 @@ impl ContextDomainInstance {
             replacement_resource,
             same_material: update.matches_installed(canonical.material().as_ref()),
         })
+    }
+    /// Compare a replay against this same canonical capture. The exact
+    /// current resource and material come from one snapshot; no replacement
+    /// resource, domain mutation or second credential observation is needed.
+    pub(crate) fn compare_establish_on_host(
+        &mut self,
+        candidate: &CredentialUpdate,
+    ) -> Result<
+        novarocks_worker_protocol::context::EstablishCredentialComparison,
+        ContextHostJobError,
+    > {
+        let resource = self.capture_credential_on_host()?;
+        let canonical = self
+            .comparison
+            .as_ref()
+            .expect("original comparison capture");
+        let comparison = novarocks_worker_protocol::context::EstablishCredentialComparison {
+            current: novarocks_worker_protocol::domain::CredentialState {
+                lease: canonical.lease_id(),
+                epoch: canonical.epoch(),
+                resource,
+            },
+            same_material: candidate.matches_installed(canonical.material().as_ref()),
+        };
+        self.clear_comparison_on_host();
+        Ok(comparison)
     }
     pub(crate) fn credential_state(
         &self,

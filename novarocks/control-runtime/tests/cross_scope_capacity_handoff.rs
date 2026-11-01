@@ -23,14 +23,15 @@
 use novarocks_control_runtime::{
     completion::ReportSlot,
     exit_role::{ExitAuthority, ExitRole, ExitRolePhase},
-    lease::{CapacityBundle, WorkLease, WorkRetirementObserver},
+    lease::{ReservationBundle, WorkLease, WorkRetirementObserver},
     reported_work::{ReportedWork, ReportedWorkBindingError},
-    transaction::{RuntimeLedger, ScopeHandle},
+    transaction::{RoleSpec, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     completion::{ConsumerKind, Consumption},
     identity::{ConsumerId, DimensionId, Generation},
+    owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
 };
 
@@ -43,16 +44,33 @@ fn dimension() -> DimensionId {
 fn resources(units: u64) -> ResourceVector {
     ResourceVector::new([(dimension(), units)]).unwrap()
 }
+fn reservation(
+    units: u64,
+    headers: usize,
+    completions: usize,
+    captures: usize,
+) -> ReservationResources {
+    ReservationResources {
+        quota: resources(units),
+        owned_slots: OwnedSlotNeed {
+            work_headers: headers,
+            completions,
+            captures,
+            ..OwnedSlotNeed::default()
+        },
+    }
+}
 fn consumer(n: u64) -> ConsumerId {
     ConsumerId::new(n).unwrap()
 }
-fn release(mut capacity: CapacityBundle) {
+fn release(mut capacity: ReservationBundle) {
     let held = capacity.resources().unwrap();
-    capacity.release(&held).unwrap();
+    capacity.release_quota(&held.quota).unwrap();
+    capacity.finish().unwrap();
 }
 struct Original {
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     report: ReportSlot,
 }
 struct Fixture {
@@ -61,35 +79,36 @@ struct Fixture {
     context: ScopeHandle,
     rpc: Option<Original>,
     admission_work: WorkLease,
-    admission_capacity: CapacityBundle,
+    admission_capacity: ReservationBundle,
     context_work: WorkLease,
-    context_capacity: CapacityBundle,
+    context_capacity: ReservationBundle,
     context_report: ReportSlot,
-    route_empty_capacity: CapacityBundle,
     route: Option<Original>,
 }
 impl Fixture {
     fn new() -> Self {
         // Exact finite inventory: RPC 3 = local 1 + transferred 2; independent
-        // Context admission 1. Two scopes, five reservations, five Work headers.
-        let ledger = RuntimeLedger::new(resources(4), 5, 2);
-        let root = ledger.open_scope_next(None, generation(), 3, 1).unwrap();
+        // Context admission 1. The child-scope parent link is independent of
+        // the RPC, and no empty receiver Work is admitted before payment.
+        let ledger = RuntimeLedger::new(resources(4));
+        let root = ledger.open_scope_next(None, generation()).unwrap();
         let (rpc_work, mut rpc_capacity) = root
             .reserve_next(
                 generation(),
-                resources(3),
+                reservation(3, 2, 2, 2),
                 WorkKind::Step,
                 WorkAdmission::External,
             )
             .unwrap()
             .bind(WorkKind::Step)
             .unwrap();
-        let rpc_report =
-            ReportSlot::reserve_next(&root, generation(), rpc_work.id(), 0, []).unwrap();
+        // Move only unused future receiver positions before adopting RPC captures.
+        let mut route_funding = rpc_capacity.split_next(&reservation(2, 1, 1, 1)).unwrap();
+        let rpc_report = ReportSlot::reserve_next(&mut rpc_capacity, generation(), 0, []).unwrap();
         let (mut admission_work, admission_capacity) = root
             .reserve_next(
                 generation(),
-                resources(1),
+                reservation(1, 1, 0, 0),
                 WorkKind::Business,
                 WorkAdmission::External,
             )
@@ -100,38 +119,38 @@ impl Fixture {
         // The receiving scope is derived from this independent admission,
         // never from the RPC that happens to pay its handoff storage.
         let (context, initial) = ledger
-            .open_child_scope_with_root(&admission_work, generation(), 2, 2, WorkKind::Business)
+            .open_child_scope_with_root(
+                &admission_work,
+                generation(),
+                WorkKind::Business,
+                reservation(0, 1, 1, 0),
+            )
             .unwrap();
-        let (mut context_work, context_capacity) = initial.bind(WorkKind::Business).unwrap();
+        let (mut context_work, mut context_capacity) = initial.bind(WorkKind::Business).unwrap();
         context_work.start().unwrap();
         let context_report =
-            ReportSlot::reserve_next(&context, generation(), context_work.id(), 0, []).unwrap();
-        let (route_work, route_empty_capacity) = context
-            .reserve_child_next(
-                generation(),
-                context_capacity.id(),
-                ResourceVector::default(),
-                WorkKind::Settlement,
+            ReportSlot::reserve_next(&mut context_capacity, generation(), 0, []).unwrap();
+        route_funding.transfer(&context_work).unwrap();
+        let route = context
+            .reserve_child_from(
+                &mut route_funding,
+                &context_work,
+                RoleSpec {
+                    generation: generation(),
+                    kind: WorkKind::Settlement,
+                    resources: reservation(2, 1, 1, 1),
+                    consumers: vec![
+                        (consumer(1), ConsumerKind::Observer),
+                        (consumer(2), ConsumerKind::Observer),
+                    ],
+                },
             )
-            .unwrap()
-            .bind(WorkKind::Settlement)
             .unwrap();
-        let route_report = ReportSlot::reserve_next(
-            &context,
-            generation(),
-            route_work.id(),
-            2,
-            [
-                (consumer(1), ConsumerKind::Observer),
-                (consumer(2), ConsumerKind::Observer),
-            ],
-        )
-        .unwrap();
-        let mut route_capacity = rpc_capacity.split_next(&resources(2)).unwrap();
-        route_capacity.transfer(&route_work).unwrap();
+        let (route_work, route_capacity, route_report) = route.into_parts();
+        route_funding.finish().unwrap();
         assert_eq!(ledger.used(dimension()), 4);
-        assert_eq!(rpc_capacity.resources().unwrap(), resources(1));
-        assert_eq!(route_capacity.resources().unwrap(), resources(2));
+        assert_eq!(rpc_capacity.resources().unwrap().quota, resources(1));
+        assert_eq!(route_capacity.resources().unwrap().quota, resources(2));
         Self {
             ledger,
             root,
@@ -146,7 +165,6 @@ impl Fixture {
             context_work,
             context_capacity,
             context_report,
-            route_empty_capacity,
             route: Some(Original {
                 work: route_work,
                 capacity: route_capacity,
@@ -211,10 +229,14 @@ impl Fixture {
         self.ledger.reap_scope_ready(self.context.id(), 2).unwrap();
         assert_eq!(self.context.snapshot().unwrap().work, 0);
         assert!(self.context_work.actual_exit_ready().unwrap());
-        release(self.route_empty_capacity);
         release(self.context_capacity);
+        assert_eq!(self.root.snapshot().unwrap().work, 2);
         self.ledger.remove_scope(self.context.id()).unwrap();
-        assert_eq!(self.ledger.reap_scope_ready(self.root.id(), 2).unwrap(), 2);
+        // Actual child removal retires its intrinsic parent link in the same
+        // transaction. Only the independently exited admission remains to reap.
+        assert_eq!(self.root.snapshot().unwrap().work, 1);
+        assert_eq!(self.ledger.reap_scope_ready(self.root.id(), 2).unwrap(), 1);
+        assert_eq!(self.root.snapshot().unwrap().work, 0);
         assert!(self.admission_work.actual_exit_ready().unwrap());
         release(self.admission_capacity);
         self.root.close_external().unwrap();
@@ -308,7 +330,10 @@ fn refused_binding_after_transfer_preserves_each_original_owner_until_the_correc
     assert_eq!(wrong_report.work.id(), route_id);
     assert_eq!(wrong_report.capacity.id(), reservation);
     assert!(wrong_report.report.same_slot(&f.context_report));
-    assert_eq!(wrong_report.capacity.resources().unwrap(), resources(2));
+    assert_eq!(
+        wrong_report.capacity.resources().unwrap().quota,
+        resources(2)
+    );
     assert_eq!(f.ledger.used(dimension()), 4);
     assert_eq!(f.root.snapshot().unwrap(), root_before);
     assert_eq!(f.context.snapshot().unwrap(), context_before);

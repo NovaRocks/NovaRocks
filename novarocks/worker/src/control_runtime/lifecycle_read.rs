@@ -100,6 +100,11 @@ impl TaskLifetime {
     ) -> novarocks_control_runtime::lease::WorkRetirementObserver {
         self.work.retirement_observer()
     }
+    /// Borrow this owner's unique admitted Work; numeric identity alone does
+    /// not grant child admission or authorize position transfer.
+    pub(crate) fn work(&self) -> &WorkLease {
+        &self.work
+    }
     pub(crate) const fn id(&self) -> WorkId {
         self.work.id()
     }
@@ -194,7 +199,7 @@ mod tests {
     use novarocks_control_runtime::driver::{ActorRuntime, EffectTicket, InputPhase};
     use novarocks_control_runtime::{
         actor::ActorConfig,
-        lease::{CapacityBundle, WorkLease},
+        lease::{ReservationBundle, WorkLease},
         transaction::{RuntimeLedger, ScopeHandle},
     };
     use novarocks_control_runtime_core::{
@@ -222,7 +227,7 @@ mod tests {
         proposal_summary::{Diagnostic, ProposalSummary, SourceId},
     };
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
@@ -247,6 +252,7 @@ mod tests {
         ledger: RuntimeLedger,
         scope: ScopeHandle,
         runtime: ActorRuntime<WorkerActor>,
+        registration: novarocks_control_runtime::driver::ActorRegistration,
         port: Option<Arc<TaskRuntimePort>>,
         host: Option<TaskHostRecord>,
         host_port: Option<Arc<TaskRuntimePort>>,
@@ -256,9 +262,11 @@ mod tests {
         // Exact SourceIds from the actual prefix, observed Committed before
         // its input record is retired. No failed-owner receipt is fabricated.
         core_consumed: Mutex<BTreeMap<SourceId, InputId>>,
-        roles: Vec<(WorkLease, CapacityBundle)>,
-        jobs: BTreeMap<ReservationId, (WorkLease, CapacityBundle)>,
+        roles: Vec<(WorkLease, ReservationBundle)>,
+        jobs: BTreeMap<ReservationId, (WorkLease, ReservationBundle)>,
         dispatch: EffectDispatch,
+        finalization: Option<EffectTicket<WorkerAction>>,
+        pending_inputs: BTreeSet<InputId>,
     }
     impl Fixture {
         fn new() -> Self {
@@ -267,20 +275,19 @@ mod tests {
                     (Dimension::ActiveTasks.id(), 1),
                     (Dimension::PreparingTasks.id(), 1),
                     (Dimension::PreparingBytes.id(), 100),
-                    (Dimension::InboundRecords.id(), 1),
-                    (Dimension::InboundBytes.id(), 100),
                 ])
                 .unwrap(),
-                64,
-                1,
             );
-            let scope = ledger.open_scope_next(None, generation(), 64, 64).unwrap();
+            let scope = ledger.open_scope_next(None, generation()).unwrap();
             let mut roles = Vec::new();
-            for kind in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step] {
+            for (index, kind) in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step]
+                .into_iter()
+                .enumerate()
+            {
                 let (mut work, capacity) = scope
                     .reserve_next(
                         generation(),
-                        ResourceVector::default(),
+                        novarocks_control_runtime_core::capacity::ReservationResources::new(ResourceVector::default(), novarocks_control_runtime_core::owned_storage::OwnedSlotNeed { work_headers: 1, inputs: if index == 2 {48} else if index == 1 {1} else {0}, batches: if index == 2 {48} else if index == 1 {1} else {0}, effects: (if index == 2 {48} else if index == 1 {1} else {0}) * ContextActor::MAX_STEP_ACTIONS, replies: if index == 2 {48} else {0}, ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default() }),
                         kind,
                         WorkAdmission::External,
                     )
@@ -304,6 +311,7 @@ mod tests {
                 context.backend_process_id(),
             );
             let config = ContextConfig {
+                request_horizon: crate::RequestHorizon::DEFAULT,
                 max_tasks: 1,
                 max_creation_waiters: 2,
                 max_pending_requests: 4,
@@ -320,22 +328,20 @@ mod tests {
                 config,
             )
             .unwrap();
-            let runtime = ActorRuntime::new(1);
-            runtime
-                .register_supervised_next(
+            let runtime = ActorRuntime::new();
+            let registration = runtime.register_supervised_bound(
                     actor(),
                     scope.clone(),
                     WorkerActor::Context(Box::new(ContextActor::new(
                         core,
                         scope.clone(),
                         AdmissionStorage {
-                            loading: ResourceVector::default(),
-                            accepted: ResourceVector::default(),
-                            context: ResourceVector::default(),
-                            ticket: ResourceVector::default(),
+                            loading: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(crate::control_runtime_policy::IngressRoleLimits { ordinary_running: 1, ordinary_waiting: 0, control_running: 1, control_waiting: 0, max_batch_items: 1, root_read_holders: 1 }).unwrap()).loading.resources().unwrap(),
+                            accepted: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(crate::control_runtime_policy::IngressRoleLimits { ordinary_running: 1, ordinary_waiting: 0, control_running: 1, control_waiting: 0, max_batch_items: 1, root_read_holders: 1 }).unwrap()).accepted.resources().unwrap(),
+                            context: novarocks_control_runtime_core::capacity::ReservationResources::work_only(),
                         },
-                        roles[1].0.id(),
-                        roles[2].0.id(),
+                        roles[1].0.reference(),
+                        roles[2].0.reference(),
                     ))),
                     ActorConfig {
                         mailbox: [16, 16, 16, 1],
@@ -350,10 +356,12 @@ mod tests {
                     &roles[0].0,
                 )
                 .unwrap_or_else(|(error, _)| panic!("actual actor admission: {error:?}"));
+            let dispatch = EffectDispatch::context(runtime.clone(), actor(), 64);
             let mut f = Self {
                 ledger,
                 scope,
                 runtime,
+                registration,
                 port: None,
                 host: None,
                 host_port: None,
@@ -363,7 +371,9 @@ mod tests {
                 core_consumed: Mutex::new(BTreeMap::new()),
                 roles,
                 jobs: BTreeMap::new(),
-                dispatch: EffectDispatch::new(actor(), 64),
+                dispatch,
+                finalization: None,
+                pending_inputs: BTreeSet::new(),
             };
             for (command, request) in [
                 (
@@ -386,8 +396,6 @@ mod tests {
                             input_retained_bytes: 1,
                             ingress_retained_bytes: 1,
                             structural_bytes: 1,
-                            inbound_records: 0,
-                            inbound_bytes: 0,
                         }),
                     },
                     None,
@@ -412,10 +420,15 @@ mod tests {
             };
             let input = self
                 .runtime
-                .reserve_input(actor(), ActorId::new(2).unwrap(), InputClass::Lifecycle)
+                .reserve_admitted_input_for(
+                    &self.registration,
+                    ActorId::new(2).unwrap(),
+                    InputClass::Lifecycle,
+                    &self.roles[2].0,
+                )
                 .unwrap()
                 .fill(WorkerMessage::Context(ContextMessage::Command {
-                    work: self.roles[2].0.id(),
+                    work: self.roles[2].0.reference(),
                     command,
                     request: request.map(|operation| RequestMetadata {
                         operation,
@@ -484,6 +497,13 @@ mod tests {
         }
         fn drain(&mut self) {
             while let Some(ticket) = self.next() {
+                if matches!(
+                    &ticket.effect,
+                    WorkerAction::Context(ContextEffect::FinalizeTaskExecution { .. })
+                ) {
+                    assert!(self.finalization.replace(ticket).is_none());
+                    continue;
+                }
                 let publication = matches!(
                     ticket.effect,
                     WorkerAction::Context(
@@ -503,12 +523,12 @@ mod tests {
                         let host = TaskHostRecord::adopt_loading(
                             &self.runtime,
                             &ticket,
-                            TaskHostBinding {
+                            &TaskHostBinding {
                                 context: self.context,
                                 task_source: ActorId::new(2).unwrap(),
                                 protocol_generation: generation(),
                                 max_cuts: 4,
-                                source_storage_model: true,
+                                registration: self.registration.clone(),
                                 pending: Arc::new(Pending),
                                 health: Arc::new(ExecutionHealth::default()),
                             },
@@ -535,7 +555,22 @@ mod tests {
                     }
                     _ => {}
                 }
+                let completion = matches!(
+                    &ticket.effect,
+                    WorkerAction::Context(
+                        ContextEffect::EstablishProbed { .. }
+                            | ContextEffect::EstablishmentDecided { .. }
+                            | ContextEffect::RetainContext { .. }
+                    )
+                );
+                let reference = super::super::effect_dispatch::EffectRef {
+                    input: ticket.input,
+                    action: ticket.descriptor.id,
+                };
                 self.runtime.effect_completed(ticket).unwrap();
+                if completion {
+                    self.dispatch.completion_observed(reference).unwrap();
+                }
             }
         }
         fn retire_source_pair(
@@ -600,7 +635,10 @@ mod tests {
                 work.body_exited().unwrap();
                 work.captures_exited().unwrap();
                 self.ledger.reap_scope_ready(self.scope.id(), 64).unwrap();
-                capacity.release(&capacity.resources().unwrap()).unwrap();
+                capacity
+                    .release_quota(&capacity.resources().unwrap().quota)
+                    .unwrap();
+                capacity.finish().unwrap();
             }
         }
         fn retire_sources(&mut self) {
@@ -629,6 +667,8 @@ mod tests {
                 "the live port remains owned until actual sources and reports retire"
             );
             assert!(self.jobs.is_empty());
+            assert!(self.finalization.is_none());
+            assert!(self.pending_inputs.is_empty());
             let causal = self.causal.take().unwrap();
             assert!(causal.is_empty());
             drop(causal);
@@ -638,13 +678,17 @@ mod tests {
                 work.body_exited().unwrap();
                 work.captures_exited().unwrap();
                 self.ledger.reap_scope_ready(self.scope.id(), 64).unwrap();
-                capacity.release(&capacity.resources().unwrap()).unwrap();
+                capacity
+                    .release_quota(&capacity.resources().unwrap().quota)
+                    .unwrap();
+                capacity.finish().unwrap();
             }
             self.scope.close_external().unwrap();
             while let Some(original_host_turn) = self.runtime.claim_host_actor() {
                 original_host_turn.release(false).unwrap();
             }
             self.runtime.remove_actor(actor()).unwrap();
+            self.ledger.reap_scope_ready(self.scope.id(), 3).unwrap();
             self.ledger.remove_scope(self.scope.id()).unwrap();
             assert!(self.ledger.is_empty());
         }
@@ -653,10 +697,29 @@ mod tests {
     impl Fixture {
         fn command(&mut self, command: ContextInput) {
             let input = self.send(command, None);
+            assert!(self.pending_inputs.insert(input));
             self.drain();
-            self.runtime.retire_input(actor(), input).unwrap();
+            self.retire_completed_inputs();
         }
-        fn lifetime(&mut self) -> (TaskLifetime, CapacityBundle) {
+        fn retire_completed_inputs(&mut self) {
+            let ready: Vec<_> = self
+                .pending_inputs
+                .iter()
+                .copied()
+                .filter(|input| {
+                    self.runtime
+                        .effect_inventory(actor(), *input, None, ContextActor::MAX_STEP_ACTIONS)
+                        .unwrap()
+                        .iter()
+                        .all(|(_, state)| *state == EffectState::Completed)
+                })
+                .collect();
+            for input in ready {
+                self.runtime.retire_input(actor(), input).unwrap();
+                assert!(self.pending_inputs.remove(&input));
+            }
+        }
+        fn lifetime(&mut self) -> (TaskLifetime, ReservationBundle) {
             let original_work_count = self.scope.snapshot().unwrap().work;
             let TaskHostResources {
                 lifetime,
@@ -670,7 +733,7 @@ mod tests {
                 pending_loading,
                 preparation,
                 preparation_remainder,
-                accepted_source_storage,
+                accepted_role_storage,
                 pending_preparation_adoption,
                 mut source_partials,
                 completion,
@@ -704,7 +767,6 @@ mod tests {
                     && completion_action.is_none()
                     && open_summary.is_none()
             );
-            assert!(accepted_source_storage.is_none());
             assert!(pending_preparation_adoption.is_none());
             for partial in &mut source_partials {
                 let mut retired = false;
@@ -737,6 +799,12 @@ mod tests {
                 original_work_count - host_calls.len() - 1,
                 "only the actual unused host-call and disposal headers exited while moving the lifetime"
             );
+            // The actual Host inventory has moved out and every partial
+            // issuer retired above; future unused roles cannot be issued again.
+            if let Some(mut original) = accepted_role_storage {
+                assert!(original.resources().unwrap().quota.is_empty());
+                original.finish().unwrap();
+            }
             assert_eq!(lifetime.observation().identity(), self.port().identity());
             (lifetime, active)
         }
@@ -756,7 +824,10 @@ mod tests {
             ] {
                 self.command(ContextInput::Physical { task, fact });
             }
-            assert!(self.port().publication().read().convergence().retired());
+            assert!(
+                self.finalization.is_some(),
+                "the terminal Core conclusion still owns its original physical finalization"
+            );
         }
         fn publish_ingress(&mut self) {
             let input = self.port().ingress().take_next_summary().unwrap();
@@ -768,10 +839,11 @@ mod tests {
             });
             self.port().ingress().summary_consumed(input.cut).unwrap();
         }
-        fn detach_source(&mut self) {
-            // The Core emits this existing metadata-publication role without
-            // changing facts. The host only commits its actual source cleanup
-            // candidate under that real runtime fence; it authors no status.
+        fn detach_live_source(&mut self) {
+            // This component property isolates source projection from terminal
+            // adjudication. It uses the original live Core's publication
+            // authority and leaves its accepted status unchanged.
+            assert!(self.finalization.is_none());
             let input = self.send(
                 ContextInput::Summary {
                     task: self.port().identity(),
@@ -783,33 +855,60 @@ mod tests {
             );
             let ticket = self.next().unwrap();
             assert!(matches!(
-                ticket.effect,
+                &ticket.effect,
                 WorkerAction::Context(ContextEffect::SummaryConsumed { .. })
             ));
+            self.commit_source_detachment(ticket);
+            self.drain();
+            self.runtime.retire_input(actor(), input).unwrap();
+        }
+        fn commit_source_detachment(&mut self, ticket: EffectTicket<WorkerAction>) {
             let candidate = self.port().prepare_source_retirement().unwrap();
-            let old = self
-                .runtime
-                .commit_snapshot(&ticket, self.port().publication(), Arc::new(candidate))
-                .unwrap_or_else(|_| {
-                    panic!("the actual cleanup publication fence accepts its candidate")
-                });
-            drop(old);
+            drop(
+                self.runtime
+                    .commit_snapshot(&ticket, self.port().publication(), Arc::new(candidate))
+                    .unwrap_or_else(|_| {
+                        panic!("the original source cleanup publication accepts its candidate")
+                    }),
+            );
             self.dispatch
                 .publication_committed(&self.runtime, &ticket)
                 .unwrap();
             self.runtime.effect_completed(ticket).unwrap();
+        }
+        fn detach_source(&mut self) {
+            // Consume the actual terminal effect after the test has closed
+            // execution borrowing. This is the original publication authority,
+            // not a newly manufactured summary input or physical exit fact.
+            let ticket = self
+                .finalization
+                .take()
+                .expect("the original Core finalization");
+            assert!(
+                matches!(&ticket.effect, WorkerAction::Context(ContextEffect::FinalizeTaskExecution { task, .. }) if *task == self.port().identity())
+            );
+            self.commit_source_detachment(ticket);
             self.drain();
-            self.runtime.retire_input(actor(), input).unwrap();
+            self.retire_completed_inputs();
+            assert!(self.pending_inputs.is_empty());
+            assert!(self.port().publication().read().convergence().retired());
         }
     }
-    fn exit_lifetime(f: &mut Fixture, lifetime: &mut TaskLifetime, capacity: &mut CapacityBundle) {
+    fn exit_lifetime(
+        f: &mut Fixture,
+        lifetime: &mut TaskLifetime,
+        capacity: &mut ReservationBundle,
+    ) {
         f.port().retire_execution_port();
         f.retire_sources();
         f.exit_jobs();
         lifetime.body_exited().unwrap();
         lifetime.captures_exited().unwrap();
         assert!(lifetime.actual_exit_ready().unwrap());
-        capacity.release(&capacity.resources().unwrap()).unwrap();
+        capacity
+            .release_quota(&capacity.resources().unwrap().quota)
+            .unwrap();
+        capacity.finish().unwrap();
     }
 
     #[test]
@@ -867,7 +966,10 @@ mod tests {
         assert!(lifetime.actual_exit_ready().unwrap());
         let sealed = lifetime.seal_after_exit().unwrap();
         assert!(sealed.convergence.retired());
-        capacity.release(&capacity.resources().unwrap()).unwrap();
+        capacity
+            .release_quota(&capacity.resources().unwrap().quota)
+            .unwrap();
+        capacity.finish().unwrap();
         f.finish();
 
         // A separate original Task exits its real inventory without a Core
@@ -970,15 +1072,16 @@ mod tests {
     fn equal_ids_in_another_ledger_cannot_supply_the_original_lifetime_exit() {
         let mut f = Fixture::new();
         let (mut lifetime, mut capacity) = f.lifetime();
-        let other = RuntimeLedger::new(ResourceVector::default(), 4, 1);
-        let scope = other.open_scope_next(None, generation(), 4, 4).unwrap();
+        let other = RuntimeLedger::new(ResourceVector::default());
+        let scope = other.open_scope_next(None, generation()).unwrap();
         let (mut foreign, mut foreign_capacity) = scope
             .reserve(
                 novarocks_control_runtime_core::capacity::ReservationRequest {
                     guard: lifetime.id(),
                     id: ReservationId::new(100).unwrap(),
                     generation: generation(),
-                    resources: ResourceVector::default(),
+                    resources:
+                        novarocks_control_runtime_core::capacity::ReservationResources::work_only(),
                     kind: WorkKind::Business,
                     admission: WorkAdmission::External,
                 },
@@ -998,8 +1101,9 @@ mod tests {
             Err(TaskReadError::WorkStillLive)
         ));
         foreign_capacity
-            .release(&foreign_capacity.resources().unwrap())
+            .release_quota(&foreign_capacity.resources().unwrap().quota)
             .unwrap();
+        foreign_capacity.finish().unwrap();
         other.reap_scope_ready(scope.id(), 4).unwrap();
         scope.close_external().unwrap();
         other.remove_scope(scope.id()).unwrap();
@@ -1019,7 +1123,8 @@ mod tests {
                     guard: WorkId::new(100).unwrap(),
                     id: ReservationId::new(100).unwrap(),
                     generation: generation(),
-                    resources: ResourceVector::default(),
+                    resources:
+                        novarocks_control_runtime_core::capacity::ReservationResources::work_only(),
                     kind: WorkKind::Cleanup,
                     admission: WorkAdmission::Derived(lifetime.id()),
                 },
@@ -1103,7 +1208,7 @@ mod tests {
         assert_eq!(actual.status, f.port().current());
         assert_eq!(drops.load(Ordering::Acquire), 0);
         f.port().retire_execution_port();
-        f.detach_source();
+        f.detach_live_source();
         assert_eq!(
             f.port().publication().borrow().neutral_accepted(),
             neutral_receipt.as_ref(),
@@ -1191,7 +1296,7 @@ mod tests {
         let (copied, completed, disposal_owner) = std::thread::scope(|scope| {
             let cleanup = scope.spawn(|| {
                 started_tx.send(std::thread::current().id()).unwrap();
-                f.detach_source();
+                f.detach_live_source();
                 done_tx.send(()).unwrap();
             });
             let owner = started_rx.recv_timeout(Duration::from_secs(5)).unwrap();

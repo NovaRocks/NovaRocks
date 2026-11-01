@@ -20,15 +20,16 @@
 use novarocks_control_runtime::{
     completion::ReportSlot,
     history::HistoryCapture,
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     reported_work::ReportedWork,
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::{CapacityError, ResourceVector},
+    capacity::{CapacityError, ReservationResources, ResourceVector},
     history::HistoryFact,
     identity::{DimensionId, Generation, ReservationId},
-    scope::{ScopeError, WorkAdmission, WorkKind},
+    owned_storage::OwnedSlotNeed,
+    scope::{WorkAdmission, WorkKind},
 };
 use std::{
     collections::BTreeSet,
@@ -44,14 +45,17 @@ fn dimension(n: u64) -> DimensionId {
 fn resources(first: u64, second: u64) -> ResourceVector {
     ResourceVector::new([(dimension(1), first), (dimension(2), second)]).unwrap()
 }
+fn quota_only(quota: ResourceVector) -> ReservationResources {
+    ReservationResources::new(quota, OwnedSlotNeed::default())
+}
 fn used(ledger: &RuntimeLedger) -> (u64, u64) {
     (ledger.used(dimension(1)), ledger.used(dimension(2)))
 }
-fn reserve(scope: &ScopeHandle, resources: ResourceVector) -> (WorkLease, CapacityBundle) {
+fn reserve(scope: &ScopeHandle, resources: ResourceVector) -> (WorkLease, ReservationBundle) {
     scope
         .reserve_next(
             generation(),
-            resources,
+            ReservationResources::for_work(resources),
             WorkKind::Step,
             WorkAdmission::External,
         )
@@ -59,9 +63,10 @@ fn reserve(scope: &ScopeHandle, resources: ResourceVector) -> (WorkLease, Capaci
         .bind(WorkKind::Step)
         .unwrap()
 }
-fn release(mut capacity: CapacityBundle) {
+fn release(mut capacity: ReservationBundle) {
     let resources = capacity.resources().unwrap();
-    capacity.release(&resources).unwrap();
+    capacity.release_quota(&resources.quota).unwrap();
+    capacity.finish().unwrap();
 }
 fn exit(work: &mut WorkLease) {
     work.body_exited().unwrap();
@@ -83,18 +88,36 @@ fn finish_scope(ledger: &RuntimeLedger, scope: &ScopeHandle, work: usize) {
 #[test]
 fn paid_split_keeps_its_real_owner_then_transfers_to_an_existing_other_scope_work() {
     let history = HistoryCapture::new(64);
-    let ledger = RuntimeLedger::with_history(resources(10, 20), 3, 2, history.clone());
-    let source = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-    let target = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-    let (source_work, mut remainder) = reserve(&source, resources(10, 20));
-    let (target_work, target_base) = reserve(&target, ResourceVector::default());
-    let source_report =
-        ReportSlot::reserve_next(&source, generation(), source_work.id(), 0, []).unwrap();
-    let target_report =
-        ReportSlot::reserve_next(&target, generation(), target_work.id(), 0, []).unwrap();
+    let ledger = RuntimeLedger::with_history(resources(10, 20), history.clone());
+    let source = ledger.open_scope_next(None, generation()).unwrap();
+    let target = ledger.open_scope_next(None, generation()).unwrap();
+    let reserve_reported = |scope: &ScopeHandle, quota: ResourceVector| {
+        let (work, mut capacity) = scope
+            .reserve_next(
+                generation(),
+                ReservationResources::new(
+                    quota,
+                    OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 1,
+                        ..OwnedSlotNeed::default()
+                    },
+                ),
+                WorkKind::Step,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Step)
+            .unwrap();
+        let report = ReportSlot::reserve_next(&mut capacity, generation(), 0, []).unwrap();
+        (work, capacity, report)
+    };
+    let (source_work, mut remainder, source_report) = reserve_reported(&source, resources(10, 20));
+    let (target_work, target_base, target_report) =
+        reserve_reported(&target, ResourceVector::default());
     let original = remainder.id();
     let work_before = source.snapshot().unwrap().work + target.snapshot().unwrap().work;
-    let route = remainder.split_next(&resources(3, 8)).unwrap();
+    let route = remainder.split_next(&quota_only(resources(3, 8))).unwrap();
     let split_id = route.id();
     // The real binding check proves the split still belongs to the original
     // source Work, rather than to an invented new lease or copied scope ID.
@@ -109,13 +132,13 @@ fn paid_split_keeps_its_real_owner_then_transfers_to_an_existing_other_scope_wor
             .into_parts();
     let work_after = source.snapshot().unwrap().work + target.snapshot().unwrap().work;
     let conserved = used(&ledger);
-    let source_remaining = remainder.resources().unwrap();
+    let source_remaining = remainder.resources().unwrap().quota;
     source_work.start().unwrap();
     target_work.start().unwrap();
     exit_with_report(&mut source_work, &source_report);
-    remainder.release(&resources(2, 4)).unwrap();
+    remainder.release_quota(&resources(2, 4)).unwrap();
     let after_partial_release = used(&ledger);
-    let after_partial_remainder = remainder.resources().unwrap();
+    let after_partial_remainder = remainder.resources().unwrap().quota;
     release(remainder);
     let target_still_held = used(&ledger);
     exit_with_report(&mut target_work, &target_report);
@@ -148,8 +171,8 @@ fn paid_split_keeps_its_real_owner_then_transfers_to_an_existing_other_scope_wor
 
 #[test]
 fn refused_splits_preserve_the_original_vector_work_and_identity_watermark() {
-    let ledger = RuntimeLedger::new(resources(4, 8), 2, 1);
-    let scope = ledger.open_scope_next(None, generation(), 1, 0).unwrap();
+    let ledger = RuntimeLedger::new(resources(4, 8));
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
     let (mut work, mut capacity) = reserve(&scope, resources(4, 8));
     work.start().unwrap();
     let original = capacity.id();
@@ -157,22 +180,37 @@ fn refused_splits_preserve_the_original_vector_work_and_identity_watermark() {
     let mut errors = Vec::new();
     for requested in [
         ResourceVector::default(),
-        resources(4, 8),
         resources(5, 9),
         ResourceVector::new([(dimension(3), 1)]).unwrap(),
     ] {
-        errors.push(capacity.split_next(&requested).err());
+        errors.push(capacity.split_next(&quota_only(requested)).err());
     }
-    let explicit_duplicate = capacity.split(original, &ResourceVector::default()).err();
-    let explicit_failed_high_id = capacity
-        .split(ReservationId::new(1000).unwrap(), &resources(4, 8))
+    let explicit_duplicate = capacity
+        .split(original, &ReservationResources::default())
         .err();
-    let unchanged = capacity.resources().unwrap();
+    let explicit_failed_high_id = capacity
+        .split(
+            ReservationId::new(1000).unwrap(),
+            &quota_only(resources(5, 8)),
+        )
+        .err();
+    let unchanged = capacity.resources().unwrap().quota;
     let committed = used(&ledger);
     let after = scope.snapshot().unwrap();
-    let split = capacity.split_next(&resources(1, 2)).unwrap();
+    let split = capacity.split_next(&quota_only(resources(1, 2))).unwrap();
     let next = split.id();
+    // All unused units may move; the original primary still owns the real
+    // bound Work header. A fully moved non-primary parcel has no remaining owner.
+    let mut whole = capacity.split_next(&quota_only(resources(3, 6))).unwrap();
+    assert!(!capacity.is_released());
+    assert!(capacity.resources().unwrap().quota.is_empty());
+    let moved = whole.split_next(&quota_only(resources(3, 6))).unwrap();
+    assert!(whole.is_released());
+    assert_eq!(whole.resources().unwrap(), ReservationResources::default());
+    assert_eq!(scope.snapshot().unwrap().work, 1);
+    assert_eq!(used(&ledger), (4, 8));
     exit(&mut work);
+    release(moved);
     release(split);
     release(capacity);
     finish_scope(&ledger, &scope, 1);
@@ -181,7 +219,6 @@ fn refused_splits_preserve_the_original_vector_work_and_identity_watermark() {
         errors,
         [
             Some(RuntimeError::Capacity(CapacityError::EmptyReservation)),
-            Some(RuntimeError::Capacity(CapacityError::InvalidSplit)),
             Some(RuntimeError::Capacity(CapacityError::InvalidSplit)),
             Some(RuntimeError::Capacity(CapacityError::InvalidSplit)),
         ]
@@ -201,23 +238,28 @@ fn refused_splits_preserve_the_original_vector_work_and_identity_watermark() {
 }
 
 #[test]
-fn slot_capacity_unknown_owner_and_exhausted_identity_keep_the_pure_error_order() {
-    let ledger = RuntimeLedger::new(resources(4, 8), 1, 1);
-    let scope = ledger.open_scope_next(None, generation(), 1, 0).unwrap();
+fn dynamic_split_records_preserve_unknown_owner_and_exhausted_identity_error_order() {
+    let ledger = RuntimeLedger::new(resources(4, 8));
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
     let (mut work, mut capacity) = reserve(&scope, resources(4, 8));
     work.start().unwrap();
-    let full_before_empty = capacity.split_next(&ResourceVector::default()).err();
-    let unchanged = capacity.resources().unwrap();
+    let empty = capacity.split_next(&ReservationResources::default()).err();
+    let unchanged = capacity.resources().unwrap().quota;
+    let first = capacity.split_next(&quota_only(resources(1, 2))).unwrap();
+    let second = capacity.split_next(&quota_only(resources(1, 2))).unwrap();
+    assert_eq!(scope.snapshot().unwrap().work, 1);
+    assert_eq!(used(&ledger), (4, 8));
     exit(&mut work);
-    capacity.release(&resources(4, 8)).unwrap();
-    let unknown = capacity.split_next(&resources(1, 2)).err();
+    release(first);
+    release(second);
+    capacity.release_quota(&resources(2, 4)).unwrap();
+    capacity.finish().unwrap();
+    let unknown = capacity.split_next(&quota_only(resources(1, 2))).err();
     finish_scope(&ledger, &scope, 1);
     assert!(ledger.is_empty());
     assert_eq!(
-        full_before_empty,
-        Some(RuntimeError::Capacity(CapacityError::Scope(
-            ScopeError::SlotCapacity
-        )))
+        empty,
+        Some(RuntimeError::Capacity(CapacityError::EmptyReservation))
     );
     assert_eq!(unchanged, resources(4, 8));
     assert_eq!(
@@ -225,17 +267,23 @@ fn slot_capacity_unknown_owner_and_exhausted_identity_keep_the_pure_error_order(
         Some(RuntimeError::Capacity(CapacityError::UnknownReservation))
     );
 
-    let ledger = RuntimeLedger::new(resources(4, 8), 3, 1);
-    let scope = ledger.open_scope_next(None, generation(), 1, 0).unwrap();
+    let ledger = RuntimeLedger::new(resources(4, 8));
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
     let (mut work, mut capacity) = reserve(&scope, resources(4, 8));
     work.start().unwrap();
     let high = capacity
-        .split(ReservationId::new(u64::MAX).unwrap(), &resources(1, 2))
+        .split(
+            ReservationId::new(u64::MAX).unwrap(),
+            &quota_only(resources(1, 2)),
+        )
         .unwrap();
     let before = capacity.resources().unwrap();
-    let exhausted = capacity.split_next(&resources(1, 2)).err();
+    let exhausted = capacity.split_next(&quota_only(resources(1, 2))).err();
     let explicit = capacity
-        .split(ReservationId::new(u64::MAX).unwrap(), &resources(1, 2))
+        .split(
+            ReservationId::new(u64::MAX).unwrap(),
+            &quota_only(resources(1, 2)),
+        )
         .err();
     let after = capacity.resources().unwrap();
     let committed = used(&ledger);
@@ -258,9 +306,9 @@ fn slot_capacity_unknown_owner_and_exhausted_identity_keep_the_pure_error_order(
 
 #[test]
 fn two_original_bundles_split_next_while_another_scope_reserves_without_identity_races() {
-    let ledger = RuntimeLedger::new(resources(9, 18), 5, 3);
+    let ledger = RuntimeLedger::new(resources(9, 18));
     let scopes = (0..3)
-        .map(|_| ledger.open_scope_next(None, generation(), 1, 0).unwrap())
+        .map(|_| ledger.open_scope_next(None, generation()).unwrap())
         .collect::<Vec<_>>();
     let (mut first_work, first_capacity) = reserve(&scopes[0], resources(4, 8));
     let (mut second_work, second_capacity) = reserve(&scopes[1], resources(4, 8));
@@ -268,10 +316,10 @@ fn two_original_bundles_split_next_while_another_scope_reserves_without_identity
     second_work.start().unwrap();
     let initial_max = second_capacity.id();
     let barrier = Arc::new(Barrier::new(4));
-    let splitting = |mut capacity: CapacityBundle, barrier: Arc<Barrier>| {
+    let splitting = |mut capacity: ReservationBundle, barrier: Arc<Barrier>| {
         thread::spawn(move || {
             barrier.wait();
-            let result = capacity.split_next(&resources(1, 2));
+            let result = capacity.split_next(&quota_only(resources(1, 2)));
             (capacity, result)
         })
     };
@@ -284,7 +332,7 @@ fn two_original_bundles_split_next_while_another_scope_reserves_without_identity
         reserving
             .reserve_next(
                 generation(),
-                resources(1, 2),
+                ReservationResources::for_work(resources(1, 2)),
                 WorkKind::Step,
                 WorkAdmission::External,
             )

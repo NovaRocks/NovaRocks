@@ -26,6 +26,9 @@ use novarocks_memory::lane::{RecordRef, global_store};
 use novarocks_memory::{
     AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TeardownEvidence, TopUpPolicy,
 };
+use novarocks_native_adapter::backend_task_execution::node_test_support::{
+    NativeNodePreparation, PreparationStop,
+};
 use novarocks_native_adapter::backend_task_execution::{
     TypeMaterializationHost, TypeMaterializationJournal, TypeMaterializationRefusal,
     materialize_package_types_for_test,
@@ -39,7 +42,6 @@ use novarocks_types::{
     QueryId,
     identity::{AttemptId, QueryExecutionId},
 };
-use novarocks_worker::{TestPreparationControl, TestPreparationIntent};
 use std::{sync::Arc, time::Duration};
 
 struct Control;
@@ -165,10 +167,7 @@ fn original_large_field_alias_keeps_real_origin_to_cross_thread_last_free() {
             .fields[0]
             .name,
     );
-    let owner = TestPreparationControl::new(
-        preparation_identity(binding.execution()),
-        Duration::from_millis(1),
-    );
+    let owner = NativeNodePreparation::new(preparation_identity(binding.execution()));
     let mut journal = TypeMaterializationJournal::default();
     let table = materialize_package_types_for_test(
         &source,
@@ -280,10 +279,7 @@ fn original_type_host_keeps_real_capacity_and_stop_refusals_before_body() {
     binding
         .account()
         .install_policy(0, novarocks_memory::LimitDimension::Work);
-    let owner = TestPreparationControl::new(
-        preparation_identity(binding.execution()),
-        Duration::from_millis(1),
-    );
+    let owner = NativeNodePreparation::new(preparation_identity(binding.execution()));
     let mut journal = TypeMaterializationJournal::default();
     assert!(matches!(
         materialize_package_types_for_test(
@@ -302,7 +298,7 @@ fn original_type_host_keeps_real_capacity_and_stop_refusals_before_body() {
     assert!(journal.body.settlement.is_none());
     assert!(journal.capacity.is_some());
     assert_eq!(binding.account().snapshot().granted_bytes, 0);
-    assert!(owner.stop(TestPreparationIntent::Abort(
+    assert!(owner.stop(PreparationStop::Abort(
         novarocks_execution_contract::AbortCause::QueryFailed
     )));
     let loan = owner.loan();
@@ -358,10 +354,7 @@ fn original_type_host_preserves_a_qualified_shared_shortage_without_running_body
         (PAYLOAD + 8) as u64
     );
     let source = source();
-    let owner = TestPreparationControl::new(
-        preparation_identity(binding.execution()),
-        Duration::from_millis(1),
-    );
+    let owner = NativeNodePreparation::new(preparation_identity(binding.execution()));
     let mut journal = TypeMaterializationJournal::default();
     let result = materialize_package_types_for_test(
         &source,

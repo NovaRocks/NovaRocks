@@ -26,9 +26,10 @@ use novarocks_control_runtime::{
     transaction::{RuntimeError, RuntimeLedger},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     completion::{CompletionError, ConsumerKind},
     identity::{ConsumerId, DimensionId, Generation},
+    owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
 };
 fn model(run: impl Fn() + Send + Sync + 'static) {
@@ -47,15 +48,27 @@ fn resources() -> ResourceVector {
     ResourceVector::new([(dimension(), 1)]).unwrap()
 }
 
+fn role_resources() -> ReservationResources {
+    ReservationResources::new(
+        resources(),
+        OwnedSlotNeed {
+            work_headers: 1,
+            completions: 1,
+            captures: 1,
+            ..OwnedSlotNeed::default()
+        },
+    )
+}
+
 #[test]
 fn actual_exit_and_independent_consumption_cannot_reuse_capacity_early() {
     model(|| {
-        let ledger = RuntimeLedger::new(resources(), 1, 1);
-        let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(resources());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation(),
-                resources(),
+                role_resources(),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -64,9 +77,8 @@ fn actual_exit_and_independent_consumption_cannot_reuse_capacity_early() {
             .unwrap();
         let consumer = ConsumerId::new(1).unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            work.id(),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
@@ -113,12 +125,12 @@ fn actual_exit_and_independent_consumption_cannot_reuse_capacity_early() {
 #[test]
 fn scope_failure_abandons_only_the_owner_leg_and_never_the_original_exit() {
     model(|| {
-        let ledger = RuntimeLedger::new(resources(), 1, 1);
-        let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(resources());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation(),
-                resources(),
+                role_resources(),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -128,9 +140,8 @@ fn scope_failure_abandons_only_the_owner_leg_and_never_the_original_exit() {
         let owner = ConsumerId::new(1).unwrap();
         let observer = ConsumerId::new(2).unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            work.id(),
             2,
             [
                 (
@@ -185,23 +196,23 @@ fn scope_failure_abandons_only_the_owner_leg_and_never_the_original_exit() {
 #[test]
 fn parent_physical_exit_waits_for_its_actual_child_but_not_for_report_consumption() {
     model(|| {
-        let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap(), 2, 1);
-        let scope = ledger.open_scope_next(None, generation(), 2, 2).unwrap();
-        let (parent_work, parent_capacity) = scope
+        let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let (parent_work, mut parent_capacity) = scope
             .reserve_next(
                 generation(),
-                resources(),
+                role_resources(),
                 WorkKind::Business,
                 WorkAdmission::External,
             )
             .unwrap()
             .bind(WorkKind::Business)
             .unwrap();
-        let (child_work, child_capacity) = scope
+        let (child_work, mut child_capacity) = scope
             .reserve_child_next(
                 generation(),
                 parent_capacity.id(),
-                resources(),
+                role_resources(),
                 WorkKind::Cleanup,
             )
             .unwrap()
@@ -209,17 +220,15 @@ fn parent_physical_exit_waits_for_its_actual_child_but_not_for_report_consumptio
             .unwrap();
         let consumer = ConsumerId::new(1).unwrap();
         let parent_report = ReportSlot::reserve_next(
-            &scope,
+            &mut parent_capacity,
             generation(),
-            parent_work.id(),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
         .unwrap();
         let child_report = ReportSlot::reserve_next(
-            &scope,
+            &mut child_capacity,
             generation(),
-            child_work.id(),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
@@ -281,12 +290,12 @@ fn parent_physical_exit_waits_for_its_actual_child_but_not_for_report_consumptio
 #[test]
 fn owned_return_publish_take_and_retire_use_the_original_slot_and_versioned_predicate() {
     model(|| {
-        let ledger = RuntimeLedger::new(resources(), 1, 1);
-        let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(resources());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation(),
-                resources(),
+                role_resources(),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -295,9 +304,8 @@ fn owned_return_publish_take_and_retire_use_the_original_slot_and_versioned_pred
             .unwrap();
         let consumer = ConsumerId::new(1).unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            work.id(),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
@@ -350,12 +358,12 @@ fn owned_return_publish_take_and_retire_use_the_original_slot_and_versioned_pred
 #[test]
 fn revoked_original_return_reader_drop_can_race_actual_report_retirement() {
     model(|| {
-        let ledger = RuntimeLedger::new(resources(), 1, 1);
-        let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(resources());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation(),
-                resources(),
+                role_resources(),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -364,9 +372,8 @@ fn revoked_original_return_reader_drop_can_race_actual_report_retirement() {
             .unwrap();
         let consumer = ConsumerId::new(1).unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            work.id(),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
@@ -444,22 +451,22 @@ fn pure_original_return_loss_stays_unknown_against_fill_take_and_retirement() {
 fn mismatched_carrier_refusal_keeps_the_other_running_owners_capacity() {
     model(|| {
         use novarocks_control_runtime::reported_work::{ReportedWork, ReportedWorkBindingError};
-        let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap(), 2, 1);
-        let scope = ledger.open_scope_next(None, generation(), 2, 2).unwrap();
-        let (a, capacity_a) = scope
+        let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let (a, mut capacity_a) = scope
             .reserve_next(
                 generation(),
-                resources(),
+                role_resources(),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
             .unwrap()
             .bind(WorkKind::Cleanup)
             .unwrap();
-        let (mut b, capacity_b) = scope
+        let (mut b, mut capacity_b) = scope
             .reserve_next(
                 generation(),
-                resources(),
+                role_resources(),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -468,17 +475,15 @@ fn mismatched_carrier_refusal_keeps_the_other_running_owners_capacity() {
             .unwrap();
         let consumer = ConsumerId::new(1).unwrap();
         let report_a = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity_a,
             generation(),
-            a.id(),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
         .unwrap();
         let report_b = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity_b,
             generation(),
-            b.id(),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
@@ -539,18 +544,30 @@ fn original_authority_child_scope_and_parent_stop_keep_one_actual_link_order() {
         use novarocks_control_runtime::reported_work::ReportedWork;
         use novarocks_control_runtime_core::scope::ScopeError;
         let paid = ResourceVector::new([(dimension(), 3)]).unwrap();
-        let ledger = RuntimeLedger::new(paid.clone(), 2, 2);
-        let scope = ledger.open_scope_next(None, generation(), 2, 1).unwrap();
-        let (work, capacity) = scope
-            .reserve_next(generation(), paid, WorkKind::Step, WorkAdmission::External)
+        let ledger = RuntimeLedger::new(paid.clone());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let (work, mut capacity) = scope
+            .reserve_next(
+                generation(),
+                ReservationResources::new(
+                    paid,
+                    OwnedSlotNeed {
+                        work_headers: 3,
+                        completions: 1,
+                        captures: 1,
+                        ..OwnedSlotNeed::default()
+                    },
+                ),
+                WorkKind::Step,
+                WorkAdmission::External,
+            )
             .unwrap()
             .bind(WorkKind::Step)
             .unwrap();
         let consumer = ConsumerId::new(1).unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            work.id(),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
@@ -561,8 +578,11 @@ fn original_authority_child_scope_and_parent_stop_keep_one_actual_link_order() {
         scope.close_external().unwrap();
         ledger.close_admission();
         let creating = thread::spawn(move || {
-            let child =
-                authority.open_child_scope_with_root(generation(), 1, 0, WorkKind::Business);
+            let child = authority.open_child_scope_with_root(
+                generation(),
+                WorkKind::Business,
+                ReservationResources::work_only(),
+            );
             (authority, child)
         });
         let stopping = scope.clone();
@@ -585,7 +605,7 @@ fn original_authority_child_scope_and_parent_stop_keep_one_actual_link_order() {
                 work.body_exited().unwrap();
                 work.captures_exited().unwrap();
                 ledger.reap_scope_ready(child.id(), 1).unwrap();
-                capacity.release(&ResourceVector::default()).unwrap();
+                capacity.finish().unwrap();
                 ledger.remove_scope(child.id()).unwrap();
                 ledger.reap_scope_ready(scope.id(), 1).unwrap();
             }
@@ -607,23 +627,29 @@ fn original_authority_child_scope_and_parent_stop_keep_one_actual_link_order() {
 #[test]
 fn generation_guarded_start_and_scope_failure_have_one_order_without_inventing_exit() {
     model(|| {
-        let ledger = RuntimeLedger::new(resources(), 1, 1);
-        let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(resources());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        // Keep the real supervisor separate from its already-paid source
+        // child. Root failure races the child's getter start, not its cleanup.
+        let (mut parent, mut parent_capacity) = scope
             .reserve_next(
                 generation(),
-                resources(),
-                WorkKind::Business,
+                ReservationResources::work_only(),
+                WorkKind::Step,
                 WorkAdmission::External,
             )
             .unwrap()
-            .bind(WorkKind::Business)
+            .bind(WorkKind::Step)
             .unwrap();
+        parent.start().unwrap();
+        let (child, guard) = ledger
+            .open_child_scope_with_root(&parent, generation(), WorkKind::Cleanup, role_resources())
+            .unwrap();
+        let (work, mut capacity) = guard.bind(WorkKind::Cleanup).unwrap();
         let observer = ConsumerId::new(1).unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            work.id(),
             1,
             [(observer, ConsumerKind::Observer)],
         )
@@ -636,13 +662,15 @@ fn generation_guarded_start_and_scope_failure_have_one_order_without_inventing_e
             )
             .unwrap(),
         );
+        scope.close_external().unwrap();
+        let original_parent = scope.clone();
         let starting = thread::spawn(move || {
-            let result = authority.start_in_generation(generation());
+            let result = authority.start_in_parent_generation(&original_parent, generation());
             (authority, result)
         });
         let failing_scope = scope.clone();
         let failing = thread::spawn(move || failing_scope.fail().unwrap());
-        let (authority, started) = starting.join().unwrap();
+        let (mut authority, started) = starting.join().unwrap();
         assert!(failing.join().unwrap() > generation());
         match started {
             Ok(()) => assert_eq!(role.phase(), ExitRolePhase::Started),
@@ -657,15 +685,25 @@ fn generation_guarded_start_and_scope_failure_have_one_order_without_inventing_e
         assert!(!role.captures_exited());
         assert!(!role.actual_exit_ready().unwrap());
         assert_eq!(ledger.used(dimension()), 1);
-        // Both outcomes retain the same authority. Its real holder can finish
-        // after failure; neither race outcome acknowledged the observer.
+        // Root failure never supplies child exit. If its getter was refused,
+        // this same original Cleanup authority can still start real disposal.
+        if role.phase() == ExitRolePhase::Admitted {
+            authority.start().unwrap();
+        }
+        parent.body_exited().unwrap();
+        parent.captures_exited().unwrap();
+        assert!(!parent.actual_exit_ready().unwrap());
         authority.exited().unwrap();
         assert!(!role.try_retire().unwrap());
         assert_eq!(ledger.used(dimension()), 1);
         report.consume(observer).unwrap();
         assert!(role.try_retire().unwrap());
-        assert_eq!(ledger.reap_scope_ready(scope.id(), 1).unwrap(), 1);
-        scope.close_external().unwrap();
+        assert_eq!(ledger.reap_scope_ready(child.id(), 1).unwrap(), 1);
+        child.close_external().unwrap();
+        ledger.remove_scope(child.id()).unwrap();
+        ledger.reap_scope_ready(scope.id(), 2).unwrap();
+        assert!(parent.actual_exit_ready().unwrap());
+        parent_capacity.finish().unwrap();
         ledger.remove_scope(scope.id()).unwrap();
         assert!(ledger.is_empty());
     });

@@ -21,43 +21,28 @@
 use crate::control_runtime_policy::{PolicyError, StorageNeed};
 use novarocks_control_runtime::{
     lease::StepGuard,
-    transaction::{CapacityDenial, RuntimeError, ScopeHandle},
+    transaction::{RuntimeError, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::{CapacityError, ResourceVector},
+    capacity::{ReservationResources, ResourceVector},
     identity::{DimensionId, Generation, ReservationId, WorkId},
-    scope::{ScopeError, WorkAdmission, WorkKind},
+    owned_storage::OwnedSlotNeed,
+    scope::{WorkAdmission, WorkKind},
 };
-use novarocks_execution_contract::{
-    OperationDomainFailure, OperationOutcome, QueryContextRef, SafeDetail,
-    failure::{FailureClass, FailureFact, ResourceDimension, ResourceFacts, ResourceScope},
-    operation::DomainFailureOutcome,
-};
+use novarocks_execution_contract::{OperationOutcome, QueryContextRef};
 use novarocks_worker_protocol::creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal};
 use std::collections::BTreeMap;
 
-/// Worker-owned accounting vocabulary. Storage and active/preparing work are
-/// independent dimensions with different actual holder retirement conditions.
+/// Actual Worker process quotas. Object positions are owned storage, not
+/// process capacity dimensions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
 pub(crate) enum Dimension {
     ActiveTasks = 1,
     PreparingTasks,
     PreparingBytes,
-    InboundRecords,
-    InboundBytes,
-    Contexts,
-    Tickets,
-    Inputs,
-    Batches,
-    Effects,
-    Cuts,
-    Replies,
-    Completions,
-    Captures,
-    Work,
     /// One actually admitted external request, independent of reply cells.
-    Requests,
+    Requests = 16,
 }
 impl Dimension {
     pub(crate) const fn id(self) -> DimensionId {
@@ -66,27 +51,25 @@ impl Dimension {
 }
 
 impl StorageNeed {
-    pub(crate) fn resources(self) -> Result<ResourceVector, PolicyError> {
-        let pairs = [
-            (Dimension::Inputs, self.inputs),
-            (Dimension::Batches, self.batches),
-            (Dimension::Effects, self.effects),
-            (Dimension::Cuts, self.cuts),
-            (Dimension::Replies, self.replies),
-            (Dimension::Completions, self.completions),
-            (Dimension::Captures, self.captures),
-            (Dimension::Work, self.work),
-            (Dimension::Requests, self.requests),
-        ]
-        .into_iter()
-        .map(|(dimension, value)| {
-            Ok((
-                dimension.id(),
-                u64::try_from(value).map_err(|_| PolicyError::Overflow)?,
-            ))
-        })
-        .collect::<Result<Vec<_>, PolicyError>>()?;
-        ResourceVector::new(pairs).map_err(|_| PolicyError::Overflow)
+    pub(crate) fn resources(self) -> Result<ReservationResources, PolicyError> {
+        let quota = ResourceVector::new([(
+            Dimension::Requests.id(),
+            u64::try_from(self.requests).map_err(|_| PolicyError::Overflow)?,
+        )])
+        .map_err(|_| PolicyError::Overflow)?;
+        Ok(ReservationResources::new(
+            quota,
+            OwnedSlotNeed {
+                inputs: self.inputs,
+                batches: self.batches,
+                effects: self.effects,
+                cuts: self.cuts,
+                replies: self.replies,
+                completions: self.completions,
+                captures: self.captures,
+                work_headers: self.work,
+            },
+        ))
     }
 }
 
@@ -95,37 +78,31 @@ impl StorageNeed {
 /// positions that belong to another Task or to a returned ingress permit.
 #[derive(Clone, Debug)]
 pub(crate) struct AdmissionStorage {
-    pub loading: ResourceVector,
-    pub accepted: ResourceVector,
-    pub context: ResourceVector,
-    pub ticket: ResourceVector,
+    pub loading: ReservationResources,
+    pub accepted: ReservationResources,
+    pub context: ReservationResources,
 }
 impl AdmissionStorage {
-    fn request(&self, need: AdmissionNeed) -> ResourceVector {
+    fn request(&self, need: AdmissionNeed) -> ReservationResources {
         let (storage, resources) = match need {
             AdmissionNeed::ActiveTask { .. } => {
                 (&self.loading, vec![(Dimension::ActiveTasks.id(), 1)])
             }
-            AdmissionNeed::Preparation {
-                bytes,
-                inbound_records,
-                inbound_bytes,
-                ..
-            } => (
+            AdmissionNeed::Preparation { bytes, .. } => (
                 &self.accepted,
                 vec![
                     (Dimension::PreparingTasks.id(), 1),
                     (Dimension::PreparingBytes.id(), bytes),
-                    (Dimension::InboundRecords.id(), inbound_records),
-                    (Dimension::InboundBytes.id(), inbound_bytes),
                 ],
             ),
-            AdmissionNeed::Context { .. } => (&self.context, vec![(Dimension::Contexts.id(), 1)]),
-            AdmissionNeed::Ticket { .. } => (&self.ticket, vec![(Dimension::Tickets.id(), 1)]),
+            AdmissionNeed::Context { .. } => (&self.context, Vec::new()),
         };
-        ResourceVector::new(resources)
-            .and_then(|resources| resources.checked_add(storage))
-            .expect("validated fixed Worker admission vector")
+        ReservationResources::new(
+            ResourceVector::new(resources)
+                .and_then(|resources| resources.checked_add(&storage.quota))
+                .expect("validated fixed Worker admission quota"),
+            storage.owned_slots,
+        )
     }
 }
 
@@ -168,47 +145,12 @@ impl ScopeAdmissionPort {
         std::mem::take(&mut self.guards).into_values().collect()
     }
 
-    fn refusal(need: AdmissionNeed, denial: CapacityDenial) -> AdmissionRefusal {
-        if let AdmissionNeed::Preparation { .. } = need {
-            let reason = if denial.dimension == Dimension::InboundRecords.id() {
-                Some((
-                    crate::failure_reason::WorkerFailureReason::InboundRecordCount,
-                    ResourceDimension::Items,
-                ))
-            } else if denial.dimension == Dimension::InboundBytes.id() {
-                Some((
-                    crate::failure_reason::WorkerFailureReason::InboundRecordBytes,
-                    ResourceDimension::Bytes,
-                ))
-            } else {
-                None
-            };
-            if let Some((reason, dimension)) = reason {
-                let fact = FailureFact::new(FailureClass::Resource, reason.reason()).with_resource(
-                    ResourceFacts {
-                        request_scope: Some(ResourceScope::Task),
-                        constraint_scope: Some(ResourceScope::Process),
-                        dimension,
-                        requested: Some(denial.requested),
-                        required_growth: Some(denial.requested),
-                        limit: Some(denial.limit),
-                        live: None,
-                        committed: Some(denial.committed),
-                    },
-                );
-                return AdmissionRefusal::Domain(
-                    DomainFailureOutcome::ResourceExhausted,
-                    OperationDomainFailure::new(
-                        fact,
-                        SafeDetail::truncating(
-                            "inbound normal-close reservation exceeds process capacity",
-                        ),
-                    ),
-                );
-            }
-            return OperationOutcome::PreparationBusy.into();
+    fn refusal(need: AdmissionNeed) -> AdmissionRefusal {
+        if matches!(need, AdmissionNeed::Preparation { .. }) {
+            OperationOutcome::PreparationBusy.into()
+        } else {
+            OperationOutcome::ResourceExhausted.into()
         }
-        OperationOutcome::ResourceExhausted.into()
     }
 }
 impl AdmissionPort for ScopeAdmissionPort {
@@ -216,8 +158,7 @@ impl AdmissionPort for ScopeAdmissionPort {
         let context = match need {
             AdmissionNeed::ActiveTask { context, .. }
             | AdmissionNeed::Preparation { context, .. }
-            | AdmissionNeed::Context { context, .. }
-            | AdmissionNeed::Ticket { context } => context,
+            | AdmissionNeed::Context { context, .. } => context,
         };
         if let Some(bound) = self.context {
             assert_eq!(bound, context, "scope admission exact context binding");
@@ -239,17 +180,7 @@ impl AdmissionPort for ScopeAdmissionPort {
         };
         let guard = match reserved {
             Ok(guard) => guard,
-            Err(RuntimeError::CapacityDenied(denial)) => return Err(Self::refusal(need, denial)),
-            Err(RuntimeError::Capacity(CapacityError::Scope(
-                ScopeError::WorkCapacity | ScopeError::SlotCapacity,
-            )))
-            | Err(RuntimeError::Scope(ScopeError::WorkCapacity | ScopeError::SlotCapacity)) => {
-                return Err(if matches!(need, AdmissionNeed::Preparation { .. }) {
-                    OperationOutcome::PreparationBusy.into()
-                } else {
-                    OperationOutcome::ResourceExhausted.into()
-                });
-            }
+            Err(RuntimeError::CapacityDenied(_)) => return Err(Self::refusal(need)),
             Err(error) => {
                 // A normal close is decided by the core before closing its
                 // scope gate; a dead owner cannot execute another core step.
@@ -295,24 +226,12 @@ mod tests {
     fn generation() -> Generation {
         Generation::new(1).unwrap()
     }
-    fn limits(preparing: u64, inbound_records: u64) -> ResourceVector {
+    fn limits(preparing: u64) -> ResourceVector {
         ResourceVector::new(
             [
                 Dimension::ActiveTasks,
                 Dimension::PreparingTasks,
                 Dimension::PreparingBytes,
-                Dimension::InboundRecords,
-                Dimension::InboundBytes,
-                Dimension::Contexts,
-                Dimension::Tickets,
-                Dimension::Inputs,
-                Dimension::Batches,
-                Dimension::Effects,
-                Dimension::Cuts,
-                Dimension::Replies,
-                Dimension::Completions,
-                Dimension::Captures,
-                Dimension::Work,
                 Dimension::Requests,
             ]
             .map(|d| {
@@ -320,7 +239,6 @@ mod tests {
                     d.id(),
                     match d {
                         Dimension::PreparingTasks => preparing,
-                        Dimension::InboundRecords => inbound_records,
                         _ => 100,
                     },
                 )
@@ -333,23 +251,18 @@ mod tests {
         AdmissionStorage {
             loading: resource.clone(),
             accepted: resource.clone(),
-            context: resource.clone(),
-            ticket: resource,
+            context: resource,
         }
     }
     fn port(ledger: &RuntimeLedger, context: QueryContextRef) -> ScopeAdmissionPort {
         ScopeAdmissionPort::new(
-            ledger.open_scope_next(None, generation(), 16, 16).unwrap(),
+            ledger.open_scope_next(None, generation()).unwrap(),
             generation(),
             Some(context),
             storage(),
         )
     }
-    fn preparing(
-        context: QueryContextRef,
-        active: ReservationId,
-        inbound_records: u64,
-    ) -> AdmissionNeed {
+    fn preparing(context: QueryContextRef, active: ReservationId) -> AdmissionNeed {
         AdmissionNeed::Preparation {
             context,
             task: task(context),
@@ -357,8 +270,6 @@ mod tests {
             generation: generation(),
             preparing_in_context: 0,
             bytes: 14,
-            inbound_records,
-            inbound_bytes: 9,
         }
     }
 
@@ -368,7 +279,7 @@ mod tests {
     ) -> (
         ReservationId,
         novarocks_control_runtime::lease::WorkLease,
-        novarocks_control_runtime::lease::CapacityBundle,
+        novarocks_control_runtime::lease::ReservationBundle,
     ) {
         let id = port
             .try_reserve(AdmissionNeed::ActiveTask {
@@ -386,54 +297,23 @@ mod tests {
     fn finish_parent(
         ledger: &RuntimeLedger,
         mut work: novarocks_control_runtime::lease::WorkLease,
-        mut capacity: novarocks_control_runtime::lease::CapacityBundle,
+        mut capacity: novarocks_control_runtime::lease::ReservationBundle,
     ) {
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
         ledger.reap_scope_ready(work.scope().id(), 16).unwrap();
         let resources = capacity.resources().unwrap();
-        capacity.release(&resources).unwrap();
-    }
-
-    #[test]
-    fn failed_inbound_dimension_keeps_typed_resource_facts_and_reserves_no_other_dimension() {
-        let ledger = RuntimeLedger::new(limits(2, 2), 16, 1);
-        let context = context();
-        let mut port = port(&ledger, context);
-        let (active, work, capacity) = active_task(&mut port, context);
-        let refusal = port.try_reserve(preparing(context, active, 3)).unwrap_err();
-        let AdmissionRefusal::Domain(outcome, failure) = refusal else {
-            panic!("preserve typed inbound rejection");
-        };
-        assert_eq!(outcome, DomainFailureOutcome::ResourceExhausted);
-        assert_eq!(
-            failure.fact().reason(),
-            crate::failure_reason::WorkerFailureReason::InboundRecordCount.reason()
-        );
-        let resource = failure.fact().resource().unwrap();
-        assert_eq!(resource.dimension, ResourceDimension::Items);
-        assert_eq!(resource.requested, Some(3));
-        assert_eq!(resource.committed, Some(0));
-        assert_eq!(resource.limit, Some(2));
-        assert_eq!(ledger.used(Dimension::PreparingTasks.id()), 0);
-        assert_eq!(ledger.used(Dimension::PreparingBytes.id()), 0);
-        assert_eq!(ledger.used(Dimension::InboundBytes.id()), 0);
-        assert_eq!(ledger.used(Dimension::ActiveTasks.id()), 1);
-        assert_eq!(port.scope.snapshot().unwrap().work, 1);
-        assert!(port.take_guards().is_empty());
-        finish_parent(&ledger, work, capacity);
-        assert_eq!(ledger.used(Dimension::ActiveTasks.id()), 0);
-        port.scope.close_external().unwrap();
-        ledger.remove_scope(port.scope.id()).unwrap();
+        capacity.release_quota(&resources.quota).unwrap();
+        capacity.finish().unwrap();
     }
 
     #[test]
     fn a_successful_guard_is_scope_visible_before_return_and_bound_storage_waits_for_real_exit() {
-        let ledger = RuntimeLedger::new(limits(2, 2), 16, 1);
+        let ledger = RuntimeLedger::new(limits(2));
         let context = context();
         let mut port = port(&ledger, context);
         let (active, parent, parent_capacity) = active_task(&mut port, context);
-        port.try_reserve(preparing(context, active, 1)).unwrap();
+        port.try_reserve(preparing(context, active)).unwrap();
         assert_eq!(port.scope.snapshot().unwrap().work, 2);
         let mut guards = port.take_guards();
         let (mut work, mut bundle) = guards.pop().unwrap().bind(WorkKind::Business).unwrap();
@@ -447,7 +327,8 @@ mod tests {
         assert!(!port.scope.snapshot().unwrap().join_ready);
         assert!(!port.scope.snapshot().unwrap().retirement_ready);
         assert_eq!(ledger.used(Dimension::PreparingTasks.id()), 1);
-        bundle.release(&resources).unwrap();
+        bundle.release_quota(&resources.quota).unwrap();
+        bundle.finish().unwrap();
         finish_parent(&ledger, parent, parent_capacity);
         assert!(port.scope.snapshot().unwrap().retirement_ready);
         ledger.remove_scope(port.scope.id()).unwrap();
@@ -455,7 +336,7 @@ mod tests {
 
     #[test]
     fn competing_contexts_share_one_synchronous_quota_and_contention_is_not_a_refusal() {
-        let ledger = RuntimeLedger::new(limits(1, 2), 16, 2);
+        let ledger = RuntimeLedger::new(limits(1));
         let first = context();
         let second = QueryContextRef::new(
             QueryExecutionId::new(QueryId::new(393, 394), AttemptId::new(1).unwrap()).unwrap(),
@@ -471,12 +352,12 @@ mod tests {
         let gb = gate.clone();
         let a = std::thread::spawn(move || {
             ga.wait();
-            let result = a.try_reserve(preparing(first, aid, 1));
+            let result = a.try_reserve(preparing(first, aid));
             (a, result)
         });
         let b = std::thread::spawn(move || {
             gb.wait();
-            let result = b.try_reserve(preparing(second, bid, 1));
+            let result = b.try_reserve(preparing(second, bid));
             (b, result)
         });
         gate.wait();
@@ -510,9 +391,9 @@ mod tests {
             requests: 1,
             ..CONTROL_REQUEST_STORAGE.checked_mul(2).unwrap()
         };
-        let ledger = RuntimeLedger::new(budget.resources().unwrap(), 4, 2);
-        let first = ledger.open_scope_next(None, generation(), 2, 2).unwrap();
-        let second = ledger.open_scope_next(None, generation(), 2, 2).unwrap();
+        let ledger = RuntimeLedger::new(budget.resources().unwrap().quota);
+        let first = ledger.open_scope_next(None, generation()).unwrap();
+        let second = ledger.open_scope_next(None, generation()).unwrap();
         let resources = CONTROL_REQUEST_STORAGE.resources().unwrap();
         let (mut work, mut capacity) = first
             .reserve_next(
@@ -558,7 +439,8 @@ mod tests {
         assert!(
             matches!(denied, RuntimeError::CapacityDenied(denial) if denial.dimension == Dimension::Requests.id())
         );
-        capacity.release(&resources).unwrap();
+        capacity.release_quota(&resources.quota).unwrap();
+        capacity.finish().unwrap();
         assert_eq!(ledger.used(Dimension::Requests.id()), 0);
         let (mut work, mut capacity) = second
             .reserve_next(
@@ -575,7 +457,8 @@ mod tests {
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
         assert_eq!(ledger.reap_scope_ready(second.id(), 1).unwrap(), 1);
-        capacity.release(&resources).unwrap();
+        capacity.release_quota(&resources.quota).unwrap();
+        capacity.finish().unwrap();
         for scope in [first, second] {
             scope.close_external().unwrap();
             ledger.remove_scope(scope.id()).unwrap();

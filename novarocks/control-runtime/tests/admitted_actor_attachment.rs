@@ -20,13 +20,14 @@
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, StepContext},
     driver::{ActorRuntime, DriverError},
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     identity::{ActorId, DimensionId, Generation, ScopeId, Tick},
     mailbox::InputEnvelope,
+    scheduler::SchedulerError,
     scope::{ScopeError, WorkAdmission, WorkKind},
 };
 use std::sync::{Arc, Condvar, Mutex};
@@ -84,21 +85,24 @@ struct Fixture {
     scope: ScopeHandle,
     runtime: ActorRuntime<TestActor>,
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     body_exited: bool,
     captures_exited: bool,
 }
 impl Fixture {
-    fn new(kind: WorkKind, slots: usize) -> Self {
-        // The original owner pays its supervisor plus one possible derived
-        // metadata holder; attaching an actor must not acquire this again.
+    fn new(kind: WorkKind) -> Self {
+        // The original owner retains its admitted resources. Actor metadata
+        // follows that owner's lifetime without acquiring resources again.
         let resources = ResourceVector::new([(DimensionId::new(1).unwrap(), 2)]).unwrap();
-        let ledger = RuntimeLedger::new(resources.clone(), 4, 1);
-        let scope = ledger
-            .open_scope_next(None, generation(), 4, slots)
-            .unwrap();
+        let ledger = RuntimeLedger::new(resources.clone());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (mut work, capacity) = scope
-            .reserve_next(generation(), resources, kind, WorkAdmission::External)
+            .reserve_next(
+                generation(),
+                ReservationResources::for_work(resources),
+                kind,
+                WorkAdmission::External,
+            )
             .unwrap()
             .bind(kind)
             .unwrap();
@@ -106,7 +110,7 @@ impl Fixture {
         Self {
             ledger,
             scope,
-            runtime: ActorRuntime::new(2),
+            runtime: ActorRuntime::new(),
             work,
             capacity,
             body_exited: false,
@@ -121,10 +125,10 @@ impl Fixture {
         self.work.captures_exited().unwrap();
         self.captures_exited = true;
     }
-    fn finish(mut self, registered: bool) {
-        if registered {
-            self.runtime.close_actor_admission(actor()).unwrap();
-            self.runtime.seal_actor(actor()).unwrap();
+    fn finish(mut self, registered: &[ActorId]) {
+        for &actor in registered {
+            self.runtime.close_actor_admission(actor).unwrap();
+            self.runtime.seal_actor(actor).unwrap();
         }
         self.scope.close_external().unwrap();
         if !self.body_exited {
@@ -134,12 +138,14 @@ impl Fixture {
             self.captures_exited();
         }
         self.ledger.reap_scope_ready(self.scope.id(), 8).unwrap();
-        if registered {
-            drop(self.runtime.remove_actor(actor()).unwrap());
+        for &actor in registered {
+            drop(self.runtime.remove_actor(actor).unwrap());
         }
+        assert_eq!(self.scope.snapshot().unwrap().storage, 0);
         self.capacity
-            .release(&self.capacity.resources().unwrap())
+            .release_quota(&self.capacity.resources().unwrap().quota)
             .unwrap();
+        self.capacity.finish().unwrap();
         self.ledger.remove_scope(self.scope.id()).unwrap();
         assert!(self.runtime.is_empty());
         assert!(self.ledger.is_empty());
@@ -148,7 +154,7 @@ impl Fixture {
 
 #[test]
 fn admitted_supervisor_attaches_after_external_close_while_ordinary_registration_stays_closed() {
-    let f = Fixture::new(WorkKind::Cleanup, 1);
+    let f = Fixture::new(WorkKind::Cleanup);
     f.ledger.close_admission();
     f.scope.close_external().unwrap();
     let before = f.scope.snapshot().unwrap();
@@ -177,18 +183,18 @@ fn admitted_supervisor_attaches_after_external_close_while_ordinary_registration
     assert!(matches!(
         f.scope.reserve_next(
             generation(),
-            ResourceVector::default(),
+            ReservationResources::work_only(),
             WorkKind::Business,
             WorkAdmission::External
         ),
         Err(RuntimeError::Scope(ScopeError::Closed))
     ));
-    f.finish(true);
+    f.finish(&[actor()]);
 }
 
 #[test]
 fn stopped_scope_can_attach_original_cleanup_core_without_reopening_business() {
-    let f = Fixture::new(WorkKind::Cleanup, 1);
+    let f = Fixture::new(WorkKind::Cleanup);
     f.scope.request_stop().unwrap();
     f.runtime
         .register_supervised_next(
@@ -203,28 +209,25 @@ fn stopped_scope_can_attach_original_cleanup_core_without_reopening_business() {
         f.scope.reserve_child_next(
             generation(),
             f.capacity.id(),
-            ResourceVector::default(),
+            ReservationResources::work_only(),
             WorkKind::Business
         ),
         Err(RuntimeError::Capacity(
             novarocks_control_runtime_core::capacity::CapacityError::Scope(ScopeError::Stopped)
         ))
     );
-    f.finish(true);
+    f.finish(&[actor()]);
     assert!(refused);
 }
 
 #[test]
 fn failed_scope_or_exited_supervisor_never_revives_a_core_or_reserves_an_attachment() {
     for mode in 0..4 {
-        let mut f = Fixture::new(
-            if mode == 3 {
-                WorkKind::Business
-            } else {
-                WorkKind::Cleanup
-            },
-            1,
-        );
+        let mut f = Fixture::new(if mode == 3 {
+            WorkKind::Business
+        } else {
+            WorkKind::Cleanup
+        });
         match mode {
             0 => {
                 f.scope.fail().unwrap();
@@ -244,14 +247,13 @@ fn failed_scope_or_exited_supervisor_never_revives_a_core_or_reserves_an_attachm
         assert!(result.is_err());
         assert_eq!(f.scope.snapshot().unwrap().storage, 0);
         assert!(f.runtime.is_empty());
-        f.finish(false);
+        f.finish(&[]);
     }
 }
 
 #[test]
-fn admitted_attachment_does_not_bypass_slot_capacity_or_leave_failed_scheduler_registration_slots()
-{
-    let f = Fixture::new(WorkKind::Cleanup, 1);
+fn admitted_attachments_grow_without_leaving_failed_scheduler_registration_slots() {
+    let f = Fixture::new(WorkKind::Cleanup);
     f.scope.close_external().unwrap();
     f.runtime
         .register_supervised_next(
@@ -262,23 +264,34 @@ fn admitted_attachment_does_not_bypass_slot_capacity_or_leave_failed_scheduler_r
             &f.work,
         )
         .unwrap();
+    let second = ActorId::new(2).unwrap();
+    f.runtime
+        .register_supervised_next(
+            second,
+            f.scope.clone(),
+            TestActor::default(),
+            config(),
+            &f.work,
+        )
+        .unwrap();
+    let before_duplicate = f.scope.snapshot().unwrap();
+    assert_eq!(before_duplicate.storage, 2);
+    assert_eq!(before_duplicate.work, 1);
+    assert_eq!(f.ledger.used(DimensionId::new(1).unwrap()), 2);
     assert!(matches!(
         f.runtime.register_supervised_next(
-            ActorId::new(2).unwrap(),
+            second,
             f.scope.clone(),
             TestActor::default(),
             config(),
             &f.work
         ),
-        Err((
-            DriverError::Runtime(RuntimeError::Scope(ScopeError::SlotCapacity)),
-            _
-        ))
+        Err((DriverError::Scheduler(SchedulerError::DuplicateActor), _))
     ));
-    assert_eq!(f.scope.snapshot().unwrap().storage, 1);
-    f.finish(true);
+    assert_eq!(f.scope.snapshot().unwrap(), before_duplicate);
+    f.finish(&[actor(), second]);
 
-    let f = Fixture::new(WorkKind::Cleanup, 1);
+    let f = Fixture::new(WorkKind::Cleanup);
     f.runtime.close_admission();
     assert!(matches!(
         f.runtime.register_supervised_next(
@@ -291,12 +304,12 @@ fn admitted_attachment_does_not_bypass_slot_capacity_or_leave_failed_scheduler_r
         Err((DriverError::Closed, _))
     ));
     assert_eq!(f.scope.snapshot().unwrap().storage, 0);
-    f.finish(false);
+    f.finish(&[]);
 }
 
 #[test]
 fn scope_failure_between_driver_preflight_and_attachment_is_rechecked_atomically() {
-    let f = Fixture::new(WorkKind::Cleanup, 1);
+    let f = Fixture::new(WorkKind::Cleanup);
     let pause = Arc::new((Mutex::new((false, false)), Condvar::new()));
     let result = std::thread::scope(|threads| {
         let pause_ref = pause.clone();
@@ -331,7 +344,8 @@ fn scope_failure_between_driver_preflight_and_attachment_is_rechecked_atomically
     let registered = result.is_ok();
     let no_attachment = f.scope.snapshot().unwrap().storage == 0;
     drop(result);
-    f.finish(registered);
+    let registered_actors = [actor()];
+    f.finish(if registered { &registered_actors } else { &[] });
     assert!(
         refused,
         "a failed owner cannot attach a new Core after preflight"
@@ -341,8 +355,8 @@ fn scope_failure_between_driver_preflight_and_attachment_is_rechecked_atomically
 
 #[test]
 fn foreign_supervisor_cannot_authorize_attachment_in_another_ledger() {
-    let a = Fixture::new(WorkKind::Cleanup, 1);
-    let b = Fixture::new(WorkKind::Cleanup, 1);
+    let a = Fixture::new(WorkKind::Cleanup);
+    let b = Fixture::new(WorkKind::Cleanup);
     assert!(matches!(
         a.runtime.register_supervised_next(
             actor(),
@@ -355,6 +369,6 @@ fn foreign_supervisor_cannot_authorize_attachment_in_another_ledger() {
     ));
     assert_eq!(a.scope.snapshot().unwrap().storage, 0);
     assert_eq!(b.scope.snapshot().unwrap().storage, 0);
-    a.finish(false);
-    b.finish(false);
+    a.finish(&[]);
+    b.finish(&[]);
 }

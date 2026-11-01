@@ -107,23 +107,20 @@ impl Drop for Credential {
         assert!(!self.panic_drop, "owned credential destructor panic");
     }
 }
-fn fixture(scopes: usize) -> Fixture {
-    Fixture::with_scopes(
+fn fixture() -> Fixture {
+    Fixture::with_control_storage(
         2,
         2,
-        3,
         AdmissionStorage {
-            loading: ResourceVector::default(),
-            accepted: ResourceVector::default(),
-            context: ResourceVector::default(),
-            ticket: ResourceVector::default(),
+            loading: Default::default(),
+            accepted: Default::default(),
+            context: Default::default(),
         },
         ESTABLISH_REQUEST_STORAGE
             .checked_sub(CONTROL_REQUEST_STORAGE)
             .unwrap()
             .resources()
             .unwrap(),
-        scopes,
     )
 }
 fn request(
@@ -179,7 +176,6 @@ fn host(job: EstablishIngressJob) {
     let one = NonZeroUsize::new(1).unwrap();
     let executor = HostExecutor::start(
         HostExecutorLimits {
-            contexts: one,
             jobs: one,
             per_context: one,
             workers: one,
@@ -225,14 +221,14 @@ fn finish_rpc(
         .unwrap();
     f.runtime.poll_one(Tick(2)).unwrap();
     f.root.index_control_effects(64).unwrap();
-    let body = f.root.take_control_effect(64).unwrap().unwrap();
+    let body = f.next_control_body();
     let reference = crate::control_runtime::effect_dispatch::EffectRef {
         input: body.input,
         action: body.descriptor.id,
     };
     f.complete_body(body);
     f.root.control_completion_observed(reference).unwrap();
-    let reply = f.root.take_control_effect(64).unwrap().unwrap();
+    let reply = f.next_control_body();
     let disposal = f
         .root
         .begin_rejected_ingress_disposal(&reply)
@@ -250,7 +246,7 @@ fn finish_rpc(
 
 #[test]
 fn the_original_paid_rpc_survives_a_blocked_getter_and_a_blocked_raw_destructor() {
-    let mut f = fixture(3);
+    let mut f = fixture();
     let getter = Gate::new();
     let dropping = Gate::new();
     let (raw, getters, drops) = request(&f, Some(getter.clone()), Some(dropping.clone()), false);
@@ -270,13 +266,17 @@ fn the_original_paid_rpc_survives_a_blocked_getter_and_a_blocked_raw_destructor(
             MonotonicInstant::from_origin(Duration::from_secs(10)),
         )
         .unwrap();
-    let work_before = f.ledger.used(Dimension::Work.id());
+    let work_before = f.root.resources().scope.snapshot().unwrap().work;
     let job = f
         .root
         .begin_establish_ingress(input, raw, PayloadId(1))
         .unwrap();
     assert_eq!(getters.load(Ordering::SeqCst), 0);
-    assert_eq!(f.ledger.used(Dimension::Work.id()), work_before);
+    assert_eq!(
+        f.root.resources().scope.snapshot().unwrap().work,
+        work_before + 1,
+        "the original source child adds exactly its parent-link header to R's scope"
+    );
     let observed = f.runtime.change_version();
     let worker = thread::spawn(move || host(job));
     getter.entered.wait();
@@ -300,14 +300,14 @@ fn the_original_paid_rpc_survives_a_blocked_getter_and_a_blocked_raw_destructor(
         .unwrap();
     f.runtime.poll_one(Tick(1)).unwrap();
     f.root.index_control_effects(64).unwrap();
-    let body = f.root.take_control_effect(64).unwrap().unwrap();
+    let body = f.next_control_body();
     let reference = crate::control_runtime::effect_dispatch::EffectRef {
         input: body.input,
         action: body.descriptor.id,
     };
     f.complete_body(body);
     f.root.control_completion_observed(reference).unwrap();
-    let reply = f.root.take_control_effect(64).unwrap().unwrap();
+    let reply = f.next_control_body();
     f.root.publish_request_reply(reply).unwrap();
     let delivery = other_external.try_take().unwrap();
     drop(delivery);
@@ -328,7 +328,7 @@ fn the_original_paid_rpc_survives_a_blocked_getter_and_a_blocked_raw_destructor(
     let cleaner = thread::spawn(move || disposal.run());
     dropping.entered.wait();
     let prematurely_retired = f.root.reap_ready_requests(8).unwrap();
-    let held = f.ledger.used(Dimension::Replies.id());
+    let held = f.ledger.used(Dimension::Requests.id());
     dropping.resume.wait();
     let source_exited = cleaner.join().unwrap();
     assert_eq!(prematurely_retired, 0);
@@ -341,39 +341,37 @@ fn the_original_paid_rpc_survives_a_blocked_getter_and_a_blocked_raw_destructor(
 }
 
 #[test]
-fn a_child_factory_refusal_returns_the_untouched_raw_request_and_withdraws_no_core_consumer() {
-    let mut f = fixture(1);
+fn an_unstarted_cleanup_child_retires_the_original_raw_request_after_parent_stop() {
+    let mut f = fixture();
     let (raw, getters, drops) = request(&f, None, None, false);
     let (input, external) = admit(&mut f);
-    let refusal = f
+    f.root.resources().scope.request_stop().unwrap();
+    let job = f
         .root
         .begin_establish_ingress(input, raw, PayloadId(1))
-        .err()
         .unwrap();
-    let correct_refusal = matches!(
-        refusal.error,
-        ControlRequestError::Exit(ExitRoleError::Runtime(RuntimeError::ScopeCapacity))
-    );
-    drop(refusal.into_request());
+    assert_eq!(getters.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    job.cancel_before_start();
+    assert!(matches!(
+        f.root.take_establish_ingress(input).unwrap(),
+        Some(EstablishIngressOutcome::CancelledBeforeStart)
+    ));
     drop(external);
-    assert!(correct_refusal);
+    let cleanup = f.root.begin_unsubmitted_withdrawal(input).unwrap().unwrap();
+    assert_eq!(f.root.reap_ready_requests(8).unwrap(), 0);
+    assert!(thread::spawn(move || cleanup.run()).join().unwrap());
     assert_eq!(getters.load(Ordering::SeqCst), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 4);
-    assert!(
-        f.root
-            .begin_unsubmitted_withdrawal(input)
-            .unwrap()
-            .is_none()
-    );
     assert_eq!(f.root.reap_ready_requests(8).unwrap(), 1);
     assert!(f.runtime.input_custody(actor(), input).unwrap().is_none());
-    assert_eq!(f.ledger.used(Dimension::Replies.id()), 0);
+    assert_eq!(f.ledger.used(Dimension::Requests.id()), 0);
     f.finish();
 }
 
 #[test]
 fn a_physical_queue_refusal_returns_the_same_unstarted_job_and_can_revoke_the_original_rpc() {
-    let mut f = fixture(2);
+    let mut f = fixture();
     let (raw, getters, drops) = request(&f, None, None, false);
     let (input, external) = admit(&mut f);
     let job = f
@@ -383,7 +381,6 @@ fn a_physical_queue_refusal_returns_the_same_unstarted_job_and_can_revoke_the_or
     let one = NonZeroUsize::new(1).unwrap();
     let executor = HostExecutor::start(
         HostExecutorLimits {
-            contexts: one,
             jobs: one,
             per_context: one,
             workers: one,
@@ -417,7 +414,7 @@ fn a_physical_queue_refusal_returns_the_same_unstarted_job_and_can_revoke_the_or
 
 #[test]
 fn independent_raw_field_panics_never_unwind_through_another_field_or_return_rpc_capacity() {
-    let mut f = fixture(2);
+    let mut f = fixture();
     let mut pools = source_pools::SourcePoolGuard::start(&mut f);
     let (raw, getters, drops) = request(&f, None, None, true);
     let (input, external) = admit(&mut f);
@@ -434,32 +431,31 @@ fn independent_raw_field_panics_never_unwind_through_another_field_or_return_rpc
     let cleanup = f.root.begin_unsubmitted_withdrawal(input).unwrap().unwrap();
     pools.disposal(cleanup);
     let disposition = source_pools::wait_disposal(&f, input);
-    let retired = f.root.advance_ready_requests(pools.handles(), None, 8);
-    let held = f.ledger.used(Dimension::Replies.id());
+    let progress = f
+        .root
+        .advance_ready_requests(pools.handles(), None, 8)
+        .unwrap();
+    let retired = f.root.reap_ready_requests(8).unwrap();
+    let original_still_owned = f.root.resources().requests.contains_key(&input)
+        && f.root.request_ready().registered() == 1;
+    let held = f.ledger.used(Dimension::Requests.id());
     pools.finish();
-    // This exact bounded Unknown is intentionally retained; it is not a green
-    // cleanup result or proof that the missing S8 failure owner is complete.
+    // The original Source child is genuinely unresolved. The healthy R
+    // supervisor preserves that custody and charge; no invariant failure,
+    // successful raw cleanup or child exit is inferred from its quiet queue.
     std::mem::forget(f);
     assert!(projected);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 4);
     assert_eq!(disposition, ExitRolePhase::Unresolved);
-    assert!(
-        matches!(retired, Err(crate::control_runtime::process_control::RootRequestAdvanceError::Request {
-            input: actual,
-            error: RequestIoError::Control(ControlRequestError::SourceUnresolved { input: source }),
-        }) if actual == input && source == input)
-    );
+    assert_eq!(progress.retired, 0);
+    assert_eq!(retired, 0);
+    assert!(original_still_owned);
     assert_eq!(held, 1);
 }
 
 #[test]
 fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw_disposal() {
-    let ticket_storage = StorageNeed {
-        captures: 1,
-        work: 1,
-        ..StorageNeed::default()
-    };
     let context_storage = StorageNeed {
         captures: 1,
         work: 1,
@@ -470,27 +466,17 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
         .unwrap()
         .resources()
         .unwrap()
-        .checked_add(&ticket_storage.resources().unwrap())
-        .unwrap()
         .checked_add(&context_storage.resources().unwrap())
-        .unwrap()
-        .checked_add(
-            &ResourceVector::new([(Dimension::Tickets.id(), 1), (Dimension::Contexts.id(), 1)])
-                .unwrap(),
-        )
         .unwrap();
-    let mut f = Fixture::with_scopes(
+    let mut f = Fixture::with_control_storage(
         2,
         2,
-        3,
         AdmissionStorage {
-            loading: ResourceVector::default(),
-            accepted: ResourceVector::default(),
+            loading: Default::default(),
+            accepted: Default::default(),
             context: context_storage.resources().unwrap(),
-            ticket: ticket_storage.resources().unwrap(),
         },
         additional,
-        2,
     );
     let mut bytes = [12; 16];
     bytes[6] = 0x70;
@@ -521,15 +507,25 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
         .unwrap();
     f.runtime.poll_one(Tick(1)).unwrap();
     f.root.index_control_effects(64).unwrap();
-    let grant = f.root.take_control_effect(64).unwrap().unwrap();
-    let receipt = f.root.adopt_ticket(&grant).unwrap();
+    let grant = f.next_control_body();
+    let receipt = match &grant.effect {
+        WorkerAction::Control {
+            effect:
+                ControlEffect::AdmissionReply {
+                    result: Ok(receipt),
+                    ..
+                },
+            admitted: None,
+        } => *receipt,
+        other => panic!("the original metadata-only ticket receipt: {other:?}"),
+    };
     let reference = crate::control_runtime::effect_dispatch::EffectRef {
         input: grant.input,
         action: grant.descriptor.id,
     };
     f.complete_body(grant);
     f.root.control_completion_observed(reference).unwrap();
-    let reply = f.root.take_control_effect(64).unwrap().unwrap();
+    let reply = f.next_control_body();
     f.root.publish_request_reply(reply).unwrap();
     drop(acquire_external.try_take().unwrap());
     drop(acquire_external);
@@ -569,7 +565,7 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
         .unwrap();
     f.runtime.poll_one(Tick(2)).unwrap();
     f.root.index_control_effects(64).unwrap();
-    let materialize = f.root.take_control_effect(64).unwrap().unwrap();
+    let materialize = f.next_control_body();
     let reservation = match &materialize.effect {
         WorkerAction::Control {
             effect: ControlEffect::Materialize { reservation, .. },
@@ -617,7 +613,7 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
     assert_eq!(f.runtime.advance_time(deadline, 1).unwrap(), 1);
     f.runtime.poll_one(deadline).unwrap();
     f.root.index_control_effects(64).unwrap();
-    let timeout = f.root.take_control_effect(64).unwrap().unwrap();
+    let timeout = f.next_control_body();
     let is_timeout = matches!(&timeout.effect, WorkerAction::ControlReply(reply)
         if reply.request.token == input && reply.result == RequestResult::TimeoutWhileAccepted);
     let (refused_disposal, retained_wrong_disposal) =
@@ -630,8 +626,8 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
     drop(external.try_take().unwrap());
     drop(external);
     let retired = f.root.reap_ready_requests(8).unwrap();
-    let fee = f.ledger.used(Dimension::Replies.id());
-    let context_still_owned = f.ledger.used(Dimension::Contexts.id());
+    let fee = f.ledger.used(Dimension::Requests.id());
+    let context_still_owned = !context_work.actual_exit_ready().unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     resume.wait();
     assert!(host_call.join().unwrap());
@@ -648,7 +644,7 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
     assert!(refused_disposal);
     assert_eq!(retired, 0);
     assert_eq!(fee, 1);
-    assert_eq!(context_still_owned, 1);
+    assert!(context_still_owned);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
 }
@@ -656,7 +652,7 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
 #[test]
 fn a_started_getter_can_withdraw_only_after_its_raw_child_really_exits_and_without_core_submission()
 {
-    let mut f = fixture(2);
+    let mut f = fixture();
     let (raw, getters, drops) = request(&f, None, None, false);
     let (input, external) = admit(&mut f);
     let job = f
@@ -694,7 +690,7 @@ fn a_started_getter_can_withdraw_only_after_its_raw_child_really_exits_and_witho
     drop(external);
     let cleanup = f.root.begin_unsubmitted_withdrawal(input).unwrap().unwrap();
     assert_eq!(f.root.reap_ready_requests(8).unwrap(), 0);
-    assert_eq!(f.ledger.used(Dimension::Replies.id()), 1);
+    assert_eq!(f.ledger.used(Dimension::Requests.id()), 1);
     assert!(thread::spawn(move || cleanup.run()).join().unwrap());
     assert_eq!(f.root.reap_ready_requests(8).unwrap(), 1);
     assert!(f.runtime.input_custody(actor(), input).unwrap().is_none());
@@ -705,7 +701,7 @@ fn a_started_getter_can_withdraw_only_after_its_raw_child_really_exits_and_witho
 
 #[test]
 fn an_observed_getter_panic_reports_failure_then_retires_after_the_real_raw_exits() {
-    let mut f = fixture(2);
+    let mut f = fixture();
     let getters = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
     let content = |panic_getter| {
@@ -753,7 +749,7 @@ fn an_observed_getter_panic_reports_failure_then_retires_after_the_real_raw_exit
     f.root.submit_establish_ingress_failure(input).unwrap();
     f.runtime.poll_one(Tick(1)).unwrap();
     f.root.index_control_effects(64).unwrap();
-    let failure_reply = f.root.take_control_effect(64).unwrap().unwrap();
+    let failure_reply = f.next_control_body();
     let disposal = f
         .root
         .begin_rejected_ingress_disposal(&failure_reply)
@@ -767,7 +763,7 @@ fn an_observed_getter_panic_reports_failure_then_retires_after_the_real_raw_exit
     drop(external);
     let source_exited = thread::spawn(move || disposal.run()).join().unwrap();
     let retired = f.root.reap_ready_requests(8).unwrap();
-    let fee = f.ledger.used(Dimension::Replies.id());
+    let fee = f.ledger.used(Dimension::Requests.id());
     f.finish();
     assert!(panicked);
     assert!(actor_alive);
@@ -797,32 +793,23 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
         .unwrap()
         .checked_add(&PROCESS_CONTROL_BOOTSTRAP_STORAGE.resources().unwrap())
         .unwrap();
-    let mut f = Fixture::with_geometry(
+    let mut f = Fixture::with_control_storage(
         2,
         2,
-        3,
         AdmissionStorage {
-            loading: ResourceVector::default(),
-            accepted: ResourceVector::default(),
-            context: ResourceVector::default(),
-            ticket: ResourceVector::default(),
+            loading: Default::default(),
+            accepted: Default::default(),
+            context: Default::default(),
         },
         additional,
-        3,
-        2,
     );
     let foreign_actor = ActorId::new(2).unwrap();
     let foreign_core = ControlCore::new(
         ControlConfig {
-            max_contexts: 2,
-            max_waiters: 4,
-            max_pending_requests: 4,
+            max_pending_requests: 1,
             step_budget: ControlCore::MAX_STEP_WORK,
-            retained_contexts: 1,
-            gone_fences: 1,
-            retention: Duration::from_secs(10),
         },
-        AdmissionTicketConfig::new(1, Duration::from_secs(5), Duration::from_secs(10), 1).unwrap(),
+        AdmissionTicketConfig::new(Duration::from_secs(5), Duration::from_secs(10)).unwrap(),
         [8; 8],
         MonotonicInstant::ORIGIN,
     )
@@ -835,8 +822,6 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
         ProcessControlBinding {
             actor: foreign_actor,
             generation: generation(),
-            max_work: 16,
-            max_slots: 3,
             request_positions: NonZeroUsize::new(1).unwrap(),
             actor_config: ActorConfig {
                 mailbox: [4, 4, 4, 1],
@@ -849,10 +834,9 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
                 max_step_work: crate::control_runtime::actors::ControlActor::MAX_STEP_WORK,
             },
             admission_storage: AdmissionStorage {
-                loading: ResourceVector::default(),
-                accepted: ResourceVector::default(),
-                context: ResourceVector::default(),
-                ticket: ResourceVector::default(),
+                loading: Default::default(),
+                accepted: Default::default(),
+                context: Default::default(),
             },
         },
     )
@@ -909,7 +893,28 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
     f.runtime.poll_one(Tick(2)).unwrap();
 
     foreign.index_control_effects(64).unwrap();
-    let body = foreign.take_control_effect(64).unwrap().unwrap();
+    let body = (0..ControlCore::MAX_STEP_WORK)
+        .find_map(|_| {
+            let ticket = foreign.take_control_effect(64).unwrap().unwrap();
+            let WorkerAction::AdmissionEpoch(projection) = &ticket.effect else {
+                return Some(ticket);
+            };
+            f.runtime
+                .commit_snapshot(
+                    &ticket,
+                    &foreign.resources().admission_snapshot,
+                    Arc::new(*projection),
+                )
+                .unwrap();
+            let reference = EffectRef {
+                input: ticket.input,
+                action: ticket.descriptor.id,
+            };
+            f.runtime.effect_completed(ticket).unwrap();
+            foreign.control_completion_observed(reference).unwrap();
+            None
+        })
+        .expect("the bounded foreign Root prefix exposes its semantic body");
     let reference = EffectRef {
         input: body.input,
         action: body.descriptor.id,
@@ -934,16 +939,20 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
     }
     foreign.control_completion_observed(reference).unwrap();
     let foreign_reply = foreign.take_control_effect(64).unwrap().unwrap();
-    let (same_request_context, foreign_rejection) = match &foreign_reply.effect {
-        WorkerAction::ControlReply(reply) => (
-            reply.request == external.request(),
-            matches!(
-                &reply.body,
-                ControlReplyBody::Admission(Err(OperationOutcome::InvalidStateOrRequest))
+    let (same_envelope_with_distinct_original_author, foreign_rejection) =
+        match &foreign_reply.effect {
+            WorkerAction::ControlReply(reply) => (
+                reply.request.token == external.request().token
+                    && reply.request.operation == external.request().operation
+                    && reply.request.deadline == external.request().deadline
+                    && reply.request.author != external.request().author,
+                matches!(
+                    &reply.body,
+                    ControlReplyBody::Admission(Err(OperationOutcome::InvalidStateOrRequest))
+                ),
             ),
-        ),
-        _ => (false, false),
-    };
+            _ => (false, false),
+        };
     let different_actor_same_local_input = foreign_reply.actor == foreign_actor
         && foreign_actor != actor()
         && foreign_input == input
@@ -965,14 +974,14 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
     let foreign_retired = foreign.reap_ready_requests(8).unwrap();
 
     f.root.index_control_effects(64).unwrap();
-    let body = f.root.take_control_effect(64).unwrap().unwrap();
+    let body = f.next_control_body();
     let reference = EffectRef {
         input: body.input,
         action: body.descriptor.id,
     };
     f.complete_body(body);
     f.root.control_completion_observed(reference).unwrap();
-    let own_reply = f.root.take_control_effect(64).unwrap().unwrap();
+    let own_reply = f.next_control_body();
     let own_disposal = f.root.begin_rejected_ingress_disposal(&own_reply).unwrap();
     // take_disposal is one-shot. A broken foreign gate may already hold that
     // same original job; the correct gate leaves it for this actual reply.
@@ -1008,8 +1017,9 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
     drop(f.runtime.remove_actor(foreign_actor).unwrap());
     for role in resources.roles.iter_mut().rev() {
         role.capacity
-            .release(&role.capacity.resources().unwrap())
+            .release_quota(&role.capacity.resources().unwrap().quota)
             .unwrap();
+        role.capacity.finish().unwrap();
     }
     f.ledger.remove_scope(resources.scope.id()).unwrap();
     drop(resources);
@@ -1019,7 +1029,7 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
     // have actually exited. A false authorization is an ordinary test failure,
     // not a leaked active job or a secondary strict-Drop abort.
     assert!(different_actor_same_local_input);
-    assert!(same_request_context);
+    assert!(same_envelope_with_distinct_original_author);
     assert!(foreign_rejection);
     assert!(refused);
     assert_eq!(drops_after_foreign_attempt, 0);
@@ -1046,18 +1056,15 @@ fn two_physical_ingress_workers_keep_same_context_rpcs_serial_and_progress_anoth
         .unwrap()
         .checked_add(&delta)
         .unwrap();
-    let mut f = Fixture::with_scopes(
+    let mut f = Fixture::with_control_storage(
         3,
         3,
-        8,
         AdmissionStorage {
-            loading: ResourceVector::default(),
-            accepted: ResourceVector::default(),
-            context: ResourceVector::default(),
-            ticket: ResourceVector::default(),
+            loading: Default::default(),
+            accepted: Default::default(),
+            context: Default::default(),
         },
         additional,
-        4,
     );
     let original_context = f.context;
     let first_gate = Gate::new();
@@ -1127,7 +1134,6 @@ fn two_physical_ingress_workers_keep_same_context_rpcs_serial_and_progress_anoth
         HostExecutorLimits {
             // Three actual source scopes must fit even in the old grouping,
             // so a refusal cannot masquerade as a fairness test result.
-            contexts: NonZeroUsize::new(3).unwrap(),
             jobs: NonZeroUsize::new(3).unwrap(),
             per_context: NonZeroUsize::new(2).unwrap(),
             workers: NonZeroUsize::new(2).unwrap(),

@@ -166,7 +166,90 @@ impl TaskRecord {
             && self.physical_exit_ready()
             && self.waiting_replies.is_empty()
     }
+    pub(crate) fn compose_status(&self) -> Result<TaskStatus, crate::context::CoreError> {
+        let termination = match self.conclusion.accepted.as_ref() {
+            Some(novarocks_execution_contract::TaskConclusion::Terminated(detail)) => {
+                Some(detail.clone())
+            }
+            _ => None,
+        };
+        compose_status(
+            self.identity,
+            self.version,
+            self.state,
+            termination,
+            self.output,
+            self.installed,
+            self.resources,
+            self.writer,
+            self.filter_advertisement,
+        )
+    }
+    pub(crate) fn into_decided(
+        self,
+        status: TaskStatus,
+        final_info: Option<std::sync::Arc<novarocks_execution_contract::FinalTaskInfo>>,
+    ) -> Result<crate::retention::DecidedTask, crate::context::CoreError> {
+        if !self.accepted()
+            || self.phase != CreationPhase::Retained
+            || !self.state.is_terminal()
+            || !self.retirement_ready()
+            || !self.proposals.is_empty()
+            || self.initial_creation.is_some()
+            || self.scheduled_close_generation.is_some()
+            || self.scheduled_quiesce_generation.is_some()
+            || !self.operator_statistics.is_empty()
+            || self.creation_reply.is_none()
+            || self.creation_decided_at.is_none()
+        {
+            return Err(crate::context::CoreError::IllegalFact);
+        }
+        Ok(crate::retention::DecidedTask {
+            custody_payload: self.payload,
+            custody_epoch: self.applied_close_generation,
+            status,
+            output: self.output,
+            initial_domains: self.initial_domain_receipts,
+            final_info,
+            diagnostics: self.diagnostics,
+            convergence: self.convergence.snapshot(),
+            source: self.conclusion.source,
+        })
+    }
     pub fn bump_version(&mut self) {
         self.version = self.version.checked_add(1).expect("task version exhausted");
     }
+}
+
+/// One status composer for both executing and already-decided neutral facts.
+pub(crate) fn compose_status(
+    identity: TaskIdentity,
+    version: u64,
+    state: TaskState,
+    termination: Option<novarocks_execution_contract::TerminationDetail>,
+    output: TaskOutputFacts,
+    installed: bool,
+    resources: TaskResourceFacts,
+    writer: Option<TaskWriterFacts>,
+    filter: Option<DynamicFilterAdvertisement>,
+) -> Result<TaskStatus, crate::context::CoreError> {
+    use crate::context::CoreError;
+    let mut status = TaskStatus::try_new_with_installed(
+        identity,
+        novarocks_execution_contract::TaskStatusVersion::new(version)
+            .map_err(|_| CoreError::VersionExhausted)?,
+        state,
+        termination,
+        output,
+        installed,
+    )
+    .map_err(|_| CoreError::IllegalFact)?
+    .with_resources(resources);
+    if let Some(writer) = writer {
+        status = status.with_writer(writer);
+    }
+    if let Some(filter) = filter {
+        status = status.with_dynamic_filters(filter);
+    }
+    Ok(status)
 }

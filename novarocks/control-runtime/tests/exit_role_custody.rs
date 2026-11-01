@@ -25,12 +25,17 @@ use novarocks_control_runtime::{
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     completion::{CompletionError, ConsumerKind, Consumption},
     history::HistoryFact,
     identity::{ConsumerId, DimensionId, Generation, WorkId},
+    owned_storage::OwnedSlotNeed,
     scope::{ScopeError, WorkAdmission, WorkKind},
 };
+#[cfg(unix)]
+const INVALID_CARRIER_CHILD: &str = "NR_CONTROL_RUNTIME_INVALID_EXIT_CARRIER_CHILD";
+const INVALID_CARRIER_CHECKPOINT: &str = "invalid-exit-carrier-bound-with-original-custody";
+
 fn generation() -> Generation {
     Generation::new(1).unwrap()
 }
@@ -39,6 +44,26 @@ fn dimension() -> DimensionId {
 }
 fn resources(amount: u64) -> ResourceVector {
     ResourceVector::new([(dimension(), amount)]).unwrap()
+}
+fn work_resources(amount: u64) -> ReservationResources {
+    ReservationResources {
+        quota: resources(amount),
+        owned_slots: OwnedSlotNeed {
+            work_headers: 1,
+            ..OwnedSlotNeed::default()
+        },
+    }
+}
+fn role_resources(amount: u64) -> ReservationResources {
+    ReservationResources {
+        quota: resources(amount),
+        owned_slots: OwnedSlotNeed {
+            work_headers: 1,
+            completions: 1,
+            captures: 1,
+            ..OwnedSlotNeed::default()
+        },
+    }
 }
 struct Fixture {
     ledger: RuntimeLedger,
@@ -60,19 +85,23 @@ fn fixture_with_preobserved_body(body_exited: bool) -> Fixture {
 }
 fn fixture_with_kind_and_preobserved_body(kind: WorkKind, body_exited: bool) -> Fixture {
     let history = HistoryCapture::new(64);
-    let ledger = RuntimeLedger::with_history(resources(1), 1, 1, history.clone());
-    let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-    let (mut work, capacity) = scope
-        .reserve_next(generation(), resources(1), kind, WorkAdmission::External)
+    let ledger = RuntimeLedger::with_history(resources(1), history.clone());
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
+    let (mut work, mut capacity) = scope
+        .reserve_next(
+            generation(),
+            role_resources(1),
+            kind,
+            WorkAdmission::External,
+        )
         .unwrap()
         .bind(kind)
         .unwrap();
     let owner = ConsumerId::new(1).unwrap();
     let observer = ConsumerId::new(2).unwrap();
     let report = ReportSlot::reserve_next(
-        &scope,
+        &mut capacity,
         generation(),
-        work.id(),
         2,
         [
             (
@@ -89,16 +118,43 @@ fn fixture_with_kind_and_preobserved_body(kind: WorkKind, body_exited: bool) -> 
     let id = work.id();
     let retirement = work.retirement_observer();
     if body_exited {
+        // Bind the original paid capture container before observing body exit.
+        // ReportedWork later validates that same existing binding.
+        work.bind_owned_captures(&mut capacity, 1).unwrap();
         work.body_exited().unwrap();
     }
-    let (role, authority) = ExitRole::from_admitted(
-        novarocks_control_runtime::reported_work::ReportedWork::try_new(
-            work,
-            capacity,
-            report.clone(),
-        )
-        .unwrap(),
-    );
+    let reported = novarocks_control_runtime::reported_work::ReportedWork::try_new(
+        work,
+        capacity,
+        report.clone(),
+    )
+    .unwrap();
+    if body_exited {
+        use std::io::Write;
+
+        // The invalid carrier still holds every original resource. The binding
+        // succeeds, but no fresh exit authority may be minted for its exited body.
+        assert_eq!(ledger.used(dimension()), 1);
+        assert_eq!(scope.snapshot().unwrap().work, 1);
+        assert_eq!(scope.snapshot().unwrap().storage, 1);
+        assert!(!retirement.is_retired());
+        assert!(!report.try_retire().unwrap());
+        assert_eq!(
+            reported.bound_storage_profile().unwrap(),
+            role_resources(1).owned_slots
+        );
+        let mut output = std::io::stderr().lock();
+        writeln!(output, "{INVALID_CARRIER_CHECKPOINT}").unwrap();
+        output.flush().unwrap();
+        drop(output);
+        // A returned role or panic must not reach ordinary Drop and produce a
+        // false SIGABRT. Only the constructor's fail-stop satisfies the parent.
+        let returned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ExitRole::from_admitted(reported)
+        }));
+        std::process::exit(if returned.is_ok() { 75 } else { 77 });
+    }
+    let (role, authority) = ExitRole::from_admitted(reported);
     Fixture {
         ledger,
         scope,
@@ -286,43 +342,48 @@ fn published_or_already_revoked_reports_refuse_unused_exit_and_keep_all_custody(
 }
 
 #[test]
-fn error_after_unused_report_revocation_retains_unknown_work_report_and_capacity() {
-    // Fault injection: the admission owner violated from_admitted's original
-    // role contract by supplying Work whose body observation already occurred.
-    let mut f = fixture_with_preobserved_body(true);
-    assert_eq!(
-        f.authority.take().unwrap().revoke_unused_and_exit(),
-        Err(ExitRoleError::Runtime(RuntimeError::Scope(
-            novarocks_control_runtime_core::scope::ScopeError::InvalidTransition
-        )))
+#[cfg(unix)]
+fn a_preobserved_body_cannot_mint_a_new_exit_role_from_original_custody() {
+    use std::os::unix::process::ExitStatusExt;
+
+    if std::env::var_os(INVALID_CARRIER_CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let _fixture = fixture_with_preobserved_body(true);
+        std::process::exit(75);
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_preobserved_body_cannot_mint_a_new_exit_role_from_original_custody",
+            "--nocapture",
+        ])
+        .env(INVALID_CARRIER_CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == INVALID_CARRIER_CHECKPOINT),
+        "the child must reach the bound original carrier before fail-stop: status={:?}, stdout={stdout}, stderr={stderr}",
+        output.status
     );
-    assert_eq!(f.role.phase(), ExitRolePhase::Unresolved);
-    assert!(!f.role.body_exited());
-    assert!(!f.role.captures_exited());
-    assert!(!f.role.actual_exit_ready().unwrap());
-    assert!(!f.role.try_retire().unwrap());
-    assert_eq!(f.ledger.used(dimension()), 1);
-    assert_eq!(f.ledger.unresolved_work(), vec![(f.scope.id(), f.work)]);
-    assert_eq!(f.scope.snapshot().unwrap().work, 1);
-    assert_eq!(f.scope.snapshot().unwrap().storage, 1);
-    assert!(!f.report.try_retire().unwrap());
     assert_eq!(
-        f.report.fill(),
-        Err(RuntimeError::Completion(CompletionError::AlreadyFilled)),
-        "a partially revoked report cannot be refilled or rolled back"
+        output.status.signal(),
+        Some(6),
+        "the constructor must abort without minting new authority or unwinding original custody: stdout={stdout}, stderr={stderr}"
     );
-    assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 0);
 }
 
 #[test]
 fn unused_revocation_still_waits_for_real_derived_child_exit_and_reaping() {
     for reaping_budget in [1, 2] {
-        let ledger = RuntimeLedger::new(resources(2), 2, 1);
-        let scope = ledger.open_scope_next(None, generation(), 2, 1).unwrap();
-        let (parent, capacity) = scope
+        let ledger = RuntimeLedger::new(resources(2));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let (parent, mut capacity) = scope
             .reserve_next(
                 generation(),
-                resources(1),
+                role_resources(1),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -333,7 +394,7 @@ fn unused_revocation_still_waits_for_real_derived_child_exit_and_reaping() {
         let (mut child, mut child_capacity) = scope
             .reserve_next(
                 generation(),
-                resources(1),
+                work_resources(1),
                 WorkKind::Cleanup,
                 WorkAdmission::Derived(parent.id()),
             )
@@ -342,9 +403,8 @@ fn unused_revocation_still_waits_for_real_derived_child_exit_and_reaping() {
             .unwrap();
         child.start().unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            parent.id(),
             2,
             [
                 (ConsumerId::new(1).unwrap(), ConsumerKind::Observer),
@@ -364,7 +424,8 @@ fn unused_revocation_still_waits_for_real_derived_child_exit_and_reaping() {
         assert_eq!(ledger.used(dimension()), 2);
         child.body_exited().unwrap();
         child.captures_exited().unwrap();
-        child_capacity.release(&resources(1)).unwrap();
+        child_capacity.release_quota(&resources(1)).unwrap();
+        child_capacity.finish().unwrap();
         assert!(!role.actual_exit_ready().unwrap());
         assert!(!role.try_retire().unwrap());
         assert_eq!(ledger.used(dimension()), 1);
@@ -462,13 +523,13 @@ fn original_cleanup_exit_after_scope_failure_preserves_the_observers_consumption
 #[test]
 fn body_and_report_exit_cannot_release_capacity_while_a_derived_child_is_live() {
     for reaping_budget in [1, 2] {
-        let ledger = RuntimeLedger::new(resources(2), 4, 2);
-        let scope = ledger.open_scope_next(None, generation(), 2, 1).unwrap();
-        let contender = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-        let (parent, capacity) = scope
+        let ledger = RuntimeLedger::new(resources(2));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let contender = ledger.open_scope_next(None, generation()).unwrap();
+        let (parent, mut capacity) = scope
             .reserve_next(
                 generation(),
-                resources(1),
+                role_resources(1),
                 WorkKind::Cleanup,
                 WorkAdmission::External,
             )
@@ -478,7 +539,7 @@ fn body_and_report_exit_cannot_release_capacity_while_a_derived_child_is_live() 
         let (mut child, mut child_capacity) = scope
             .reserve_next(
                 generation(),
-                resources(1),
+                work_resources(1),
                 WorkKind::Cleanup,
                 WorkAdmission::Derived(parent.id()),
             )
@@ -488,9 +549,8 @@ fn body_and_report_exit_cannot_release_capacity_while_a_derived_child_is_live() 
         child.start().unwrap();
         let consumer = ConsumerId::new(1).unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            parent.id(),
             1,
             [(consumer, ConsumerKind::Observer)],
         )
@@ -511,7 +571,7 @@ fn body_and_report_exit_cannot_release_capacity_while_a_derived_child_is_live() 
             contender
                 .reserve_next(
                     generation(),
-                    resources(1),
+                    work_resources(1),
                     WorkKind::Business,
                     WorkAdmission::External
                 )
@@ -524,7 +584,8 @@ fn body_and_report_exit_cannot_release_capacity_while_a_derived_child_is_live() 
             ledger.change_version() > version,
             "child progress wakes the original finisher"
         );
-        child_capacity.release(&resources(1)).unwrap();
+        child_capacity.release_quota(&resources(1)).unwrap();
+        child_capacity.finish().unwrap();
         assert_eq!(ledger.used(dimension()), 1);
         assert!(
             !role.try_retire().unwrap(),
@@ -546,7 +607,7 @@ fn body_and_report_exit_cannot_release_capacity_while_a_derived_child_is_live() 
         let reusable = contender
             .reserve_next(
                 generation(),
-                resources(1),
+                work_resources(1),
                 WorkKind::Business,
                 WorkAdmission::External,
             )

@@ -57,9 +57,8 @@ impl Drop for OriginalSource {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
-fn source_fees(f: &Harness) -> [u64; 3] {
-    [Dimension::Work, Dimension::Completions, Dimension::Captures]
-        .map(|dimension| f.ledger.used(dimension.id()))
+fn source_fees(f: &Harness) -> [u64; 2] {
+    actual_component_inventory(f)
 }
 // The first test already detached the consuming source pair to inspect the
 // actual fee refund. Finish only the remaining original open pair, then the
@@ -68,7 +67,15 @@ fn source_fees(f: &Harness) -> [u64; 3] {
 pub(super) fn finish_after_consuming_pair_detached(
     f: Harness,
     task: TaskIdentity,
+    preparation: ContextMetadataRole,
+) {
+    finish_after_consuming_pair_detached_with(f, task, preparation, |_| {});
+}
+pub(super) fn finish_after_consuming_pair_detached_with(
+    f: Harness,
+    task: TaskIdentity,
     mut preparation: ContextMetadataRole,
+    before_finish: impl FnOnce(&Harness),
 ) {
     preparation.work.body_exited().unwrap();
     preparation.work.captures_exited().unwrap();
@@ -81,10 +88,7 @@ pub(super) fn finish_after_consuming_pair_detached(
         .scope()
         .clone();
     f.ledger.reap_scope_ready(scope.id(), 32).unwrap();
-    preparation
-        .capacity
-        .release(&preparation.capacity.resources().unwrap())
-        .unwrap();
+    finish_unused_bundle(&mut preparation.capacity);
     drop(preparation);
 
     let host_address = f.service.context(f.identity).unwrap();
@@ -114,20 +118,16 @@ pub(super) fn finish_after_consuming_pair_detached(
         assert!(original.custody.try_retire().unwrap());
     }
     f.ledger.reap_scope_ready(scope.id(), 32).unwrap();
-    let reaped = ingress
-        .prepare_pair_reap(PairRoute::Open)
-        .unwrap()
-        .map(|probe| probe.observe_reaped().unwrap());
+    let reaped = reap_original_source_pair(&ingress, PairRoute::Open);
     let detached = ingress
         .release_closed_route_pair(PairRoute::Open, reaped)
         .unwrap_or_else(|_| panic!("the remaining original closed pair actually reaped"));
-    for mut original in detached {
-        original.release().unwrap();
-    }
+    drop(detached); // The original Source bundle finished at its actual ExitRole retirement.
     crate::control_runtime::task::retire_unused_host_calls_for_test(
         &resources.host_calls,
         &f.ledger,
     );
+    retire_unused_task_roles(&f, &mut resources);
     resources.lifetime.body_exited().unwrap();
     resources.lifetime.captures_exited().unwrap();
     resources
@@ -136,12 +136,10 @@ pub(super) fn finish_after_consuming_pair_detached(
         .unwrap()
         .close_after_exit(&resources.lifetime)
         .unwrap();
-    resources
-        .active
-        .release(&resources.active.resources().unwrap())
-        .unwrap();
+    finish_unused_bundle(&mut resources.active);
     f.ledger.reap_scope_ready(scope.id(), 32).unwrap();
     drop((resources, ingress));
+    before_finish(&f);
     finish(f);
 }
 
@@ -388,10 +386,7 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
             32,
         )
         .unwrap();
-    let reaped = ingress
-        .prepare_pair_reap(PairRoute::ConsumingOpen)
-        .unwrap()
-        .map(|probe| probe.observe_reaped().unwrap());
+    let reaped = reap_original_source_pair(&ingress, PairRoute::ConsumingOpen);
     f.service
         .context(f.identity)
         .unwrap()
@@ -405,24 +400,19 @@ fn a_later_source_keeps_its_original_slot_fees_after_the_r_that_supplied_them_ha
         .unwrap_or_else(|_| panic!("the exact B generation and reports actually reaped"));
     let after_generation = source_fees(&f);
     ingress.seal_source_admission();
-    let reaped = ingress
-        .prepare_pair_reap(PairRoute::ConsumingOpen)
-        .unwrap()
-        .map(|probe| probe.observe_reaped().unwrap());
+    let reaped = reap_original_source_pair(&ingress, PairRoute::ConsumingOpen);
     let detached = ingress
         .release_closed_route_pair(PairRoute::ConsumingOpen, reaped)
         .unwrap_or_else(|_| panic!("the same closed B slot storage leaves the ingress"));
     let before_refund = source_fees(&f);
-    for mut original in detached {
-        original.release().unwrap();
-    }
+    drop(detached); // The original Source bundle finished at its actual ExitRole retirement.
     let after_refund = source_fees(&f);
-    let exact_slot_refund = after_generation == fees_after_r
+    let exact_slot_refund = fees_after_r
+        .iter()
+        .zip(after_generation)
+        .all(|(before, after)| before.checked_sub(after) == Some(2))
         && before_refund == after_generation
-        && before_refund
-            .iter()
-            .zip(after_refund)
-            .all(|(before, after)| before.checked_sub(after) == Some(2));
+        && after_refund == before_refund;
     drop((source_custody, ingress, future_b));
     finish_after_consuming_pair_detached(f, task, preparation);
 
@@ -517,6 +507,18 @@ fn an_original_prefix_source_blocks_its_own_r_until_real_alias_exit_and_source_r
     drop((handle, delivered));
     let retained = ingress.take_source(source).unwrap();
     drop(retained);
+    // Save the actual Core fact while the original role still resides in
+    // the Task. advance_request may uniquely move it into the same R tail.
+    let prefix_core_consumed = {
+        let address = f.service.context(f.identity).unwrap();
+        let mut owner = address.lock().unwrap();
+        let causal = owner.task(task).unwrap().causal();
+        assert_eq!(
+            causal.observe_core(actual.cut).unwrap(),
+            Consumption::Consumed
+        );
+        causal.source_core_consumption(actual.cut, source).unwrap()
+    };
     let own_prefix_waits = !f
         .service
         .context(f.identity)
@@ -528,17 +530,6 @@ fn an_original_prefix_source_blocks_its_own_r_until_real_alias_exit_and_source_r
         && f.ledger.used(Dimension::Requests.id()) == 1
         && drops.load(Ordering::SeqCst) == 0
         && !custody.actual_exit_ready().unwrap();
-    let prefix_core_consumed = f
-        .service
-        .context(f.identity)
-        .unwrap()
-        .lock()
-        .unwrap()
-        .task(task)
-        .unwrap()
-        .causal()
-        .source_core_consumption(actual.cut, source)
-        .unwrap();
     drop(last_alias);
     let actual_last_exit =
         drops.load(Ordering::SeqCst) == 1 && custody.actual_exit_ready().unwrap();

@@ -19,28 +19,35 @@
 //! neutral input legs retire independently; Context retirement never waits
 //! for the Root to consume its already accepted backchannel input.
 
+mod comparison;
+use comparison::ComparisonState;
+pub(crate) use comparison::EstablishComparisonJob;
+
 use super::{
     actors::{ContextMessage, ControlMessage, WorkerAction, WorkerActor, WorkerMessage},
     admitted_role::adopt_reported_work,
+    context_host_jobs::ContextHostJobs,
+    context_ready::ContextReadyNotice,
     control_request::ControlRequestNotice,
+    establish_ingress::EstablishIngressOwner,
 };
 use crate::control_runtime_policy::StorageNeed;
 use novarocks_control_runtime::{
     completion::ReportSlot,
     driver::{
-        ActorRegistration, ActorRuntime, DriverError, EffectTicket, InputPermit, InputRole,
-        InputRoleId,
+        ActorRegistration, ActorRuntime, DriverError, EffectTicket, InputAuthor, InputPermit,
+        InputRole, InputRoleId,
     },
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
-    lease::{CapacityBundle, WorkLease, WorkRetirementObserver},
-    transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
+    header_readiness::{HeaderReadyError, HeaderReadyRegistration, HeaderWaitState},
+    lease::{ReservationBundle, WorkLease, WorkRetirementObserver},
+    transaction::{RoleSpec, RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
     completion::ConsumerKind,
-    identity::{ActionId, ActorId, ConsumerId, InputId, WorkId},
+    identity::{ActionId, ActorId, ConsumerId, InputId, ScopedWorkRef},
     mailbox::InputClass,
-    scope::{WorkAdmission, WorkKind},
+    scope::WorkKind,
 };
 use novarocks_execution_contract::QueryContextRef;
 use novarocks_worker_protocol::{
@@ -92,7 +99,26 @@ pub(crate) enum EstablishRouteError {
     WrongEffect,
     WrongPhase,
     Capacity,
+    ComparisonUnresolved,
+    HeaderReady(HeaderReadyError),
 }
+impl std::fmt::Display for EstablishRouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Driver(error) => write!(f, "Establish route driver failed: {error}"),
+            Self::Runtime(error) => write!(f, "Establish route runtime failed: {error}"),
+            Self::Exit(error) => write!(f, "Establish route exit failed: {error}"),
+            Self::HeaderReady(error) => write!(f, "Establish route header wait failed: {error}"),
+            Self::WrongOwner => f.write_str("Establish route has a different original owner"),
+            Self::TargetRemoved => f.write_str("Establish route target was removed"),
+            Self::WrongEffect => f.write_str("Establish route received a different effect"),
+            Self::WrongPhase => f.write_str("Establish route phase does not allow this transition"),
+            Self::Capacity => f.write_str("Establish route original storage is unavailable"),
+            Self::ComparisonUnresolved => f.write_str("Establish route comparison is unresolved"),
+        }
+    }
+}
+impl std::error::Error for EstablishRouteError {}
 impl From<DriverError> for EstablishRouteError {
     fn from(error: DriverError) -> Self {
         Self::Driver(error)
@@ -118,11 +144,12 @@ enum ProbePhase {
 }
 struct ContextLeg {
     scope: Option<ScopeHandle>,
-    escrow: Option<CapacityBundle>,
+    escrow: Option<ReservationBundle>,
     work: Option<WorkLease>,
-    work_id: Option<WorkId>,
+    work_id: Option<ScopedWorkRef>,
     retirement: Option<WorkRetirementObserver>,
-    zero: Option<CapacityBundle>,
+    header_ready: Option<HeaderReadyRegistration>,
+    zero: Option<ReservationBundle>,
     report: Option<ReportSlot>,
     role: Option<ExitRole>,
     authority: Option<ExitAuthority>,
@@ -138,6 +165,11 @@ struct ContextLeg {
     partial_report_revoked: bool,
     partial_report_body_exited: bool,
     partial_report_captures_exited: bool,
+    jobs: Option<ContextHostJobs>,
+    context_notice: Option<ContextReadyNotice>,
+    bound: bool,
+    comparison: ComparisonState,
+    owner_failed_returned: bool,
 }
 #[derive(Default)]
 struct RootLeg {
@@ -155,12 +187,13 @@ pub(crate) struct EstablishRouteCustody {
     runtime: ActorRuntime<WorkerActor>,
     ledger: RuntimeLedger,
     root: ActorId,
-    root_work: WorkId,
+    root_author: InputAuthor,
     context: QueryContextRef,
     actor: ActorId,
     registration: ActorRegistration,
     request: EstablishReplayRequest,
     notice: ControlRequestNotice,
+    ingress: EstablishIngressOwner,
     context_leg: Mutex<ContextLeg>,
     context_retired: AtomicBool,
     root_leg: Mutex<RootLeg>,
@@ -170,13 +203,17 @@ impl EstablishRouteCustody {
         runtime: ActorRuntime<WorkerActor>,
         ledger: RuntimeLedger,
         root: ActorId,
-        root_work: WorkId,
+        root_author: InputAuthor,
         context: QueryContextRef,
         registration: ActorRegistration,
         request: EstablishReplayRequest,
-        escrow: CapacityBundle,
+        escrow: ReservationBundle,
         notice: ControlRequestNotice,
-    ) -> Result<Arc<Self>, (EstablishRouteError, CapacityBundle)> {
+        ingress: EstablishIngressOwner,
+    ) -> Result<Arc<Self>, (EstablishRouteError, ReservationBundle)> {
+        if root_author.actor() != root || root_author.work() != request.request.author {
+            return Err((EstablishRouteError::WrongOwner, escrow));
+        }
         if let Err(error) = runtime.validate_registration(&registration) {
             return Err((EstablishRouteError::Driver(error), escrow));
         }
@@ -185,18 +222,20 @@ impl EstablishRouteCustody {
             runtime,
             ledger,
             root,
-            root_work,
+            root_author,
             context,
             actor,
             registration,
             request,
             notice,
+            ingress,
             context_leg: Mutex::new(ContextLeg {
                 scope: None,
                 escrow: Some(escrow),
                 work: None,
                 work_id: None,
                 retirement: None,
+                header_ready: None,
                 zero: None,
                 report: None,
                 role: None,
@@ -213,16 +252,15 @@ impl EstablishRouteCustody {
                 partial_report_revoked: false,
                 partial_report_body_exited: false,
                 partial_report_captures_exited: false,
+                jobs: None,
+                context_notice: None,
+                bound: false,
+                comparison: ComparisonState::Idle,
+                owner_failed_returned: false,
             }),
             context_retired: AtomicBool::new(false),
             root_leg: Mutex::new(RootLeg::default()),
         }))
-    }
-    pub(crate) fn context(&self) -> QueryContextRef {
-        self.context
-    }
-    pub(crate) fn actor(&self) -> ActorId {
-        self.actor
     }
     /// Qualify the immutable target without taking either original leg lock.
     /// Equal public IDs cannot replace the admitted Context registration.
@@ -282,11 +320,12 @@ impl EstablishRouteCustody {
             }
         });
         root.role_id = Some(root.input.as_ref().expect("original return role").id());
-        Ok(())
+        drop(root);
+        self.initialize_context_funding(root_author)
     }
-    /// Context stores its alias before initializing any Context Work or input.
-    /// Every partial stays in this original leg; the Root return is already paid.
-    pub(crate) fn initialize_context(&self, parent: &WorkLease) -> Result<(), EstablishRouteError> {
+    /// The same original R pays its leg from the process parent. Retained
+    /// Context actors have no execution Scope or lifetime Work to borrow.
+    fn initialize_context_funding(&self, parent: &WorkLease) -> Result<(), EstablishRouteError> {
         let mut leg = self.context_leg.lock().expect("original Context route");
         if !matches!(leg.phase, ProbePhase::Constructing)
             || leg.scope.is_some()
@@ -296,9 +335,6 @@ impl EstablishRouteCustody {
             || self.context_retired.load(Ordering::Acquire)
         {
             return Err(EstablishRouteError::WrongPhase);
-        }
-        if !self.registration.matches_scope(parent.scope()) {
-            return Err(EstablishRouteError::WrongOwner);
         }
         self.runtime.validate_registration(&self.registration)?;
         {
@@ -318,34 +354,51 @@ impl EstablishRouteCustody {
         // admission refuses. Root may retire only a still-unbound cancelled leg.
         leg.scope = Some(scope.clone());
         let generation = scope.gates()?.generation;
-        let guard = scope.reserve_next(
-            generation,
-            ResourceVector::default(),
-            WorkKind::Settlement,
-            WorkAdmission::Derived(parent.id()),
+        // Transfer only the still-unbound parcel to the true Context parent,
+        // then atomically admit its role. The original Work is never reparented.
+        let escrow = leg.escrow.as_mut().expect("original RPC route parcel");
+        escrow.transfer(parent)?;
+        let resources = escrow.resources()?;
+        let reported = scope.reserve_child_from(
+            escrow,
+            parent,
+            RoleSpec {
+                generation,
+                kind: WorkKind::Settlement,
+                resources,
+                consumers: vec![(context_consumer(), ConsumerKind::Observer)],
+            },
         )?;
-        let (work, zero) = guard.bind(WorkKind::Settlement)?;
-        leg.work_id = Some(work.id());
+        let (work, capacity, report) = reported.into_parts();
+        leg.work_id = Some(work.reference());
         leg.retirement = Some(work.retirement_observer());
         leg.work = Some(work);
-        leg.zero = Some(zero);
-        {
-            let ContextLeg { escrow, work, .. } = &mut *leg;
-            escrow
+        leg.report = Some(report);
+        leg.zero = leg.escrow.take();
+        leg.escrow = Some(capacity);
+        leg.header_ready = Some(
+            leg.work
                 .as_mut()
-                .expect("original RPC escrow")
-                .transfer(work.as_ref().expect("actual Context route Work"))?;
+                .expect("original route Work")
+                .header_readiness_registration()?,
+        );
+        Ok(())
+    }
+    /// Context stores its alias before binding its exact target input. The
+    /// financial Work stays with the same Root/R even after hot Scope removal.
+    pub(crate) fn initialize_context(&self) -> Result<(), EstablishRouteError> {
+        let mut leg = self.context_leg.lock().expect("original Context route");
+        if !leg.bound
+            || !matches!(leg.phase, ProbePhase::Constructing)
+            || leg.role.is_some()
+            || leg.input.is_some()
+            || leg.cancelled
+        {
+            return Err(EstablishRouteError::WrongPhase);
         }
-        Self::release(&mut leg.zero)?;
-        leg.report = Some(ReportSlot::reserve_next(
-            &scope,
-            generation,
-            leg.work_id.expect("bound Context route Work"),
-            1,
-            [(context_consumer(), ConsumerKind::Observer)],
-        )?);
-        leg.permit = Some(self.runtime.reserve_admitted_input(
-            self.actor,
+        self.runtime.validate_registration(&self.registration)?;
+        leg.permit = Some(self.runtime.reserve_admitted_input_for(
+            &self.registration,
             self.root,
             InputClass::Control,
             leg.work.as_ref().expect("actual Context input author"),
@@ -401,39 +454,21 @@ impl EstablishRouteCustody {
         leg.phase = ProbePhase::InFlight;
         Ok(())
     }
-    /// Only a real current-credential comparison author may supply Some.
-    /// This method creates no host job, source loan or comparison fact.
-    pub(crate) fn retry_probe(
-        &self,
-        comparison: Option<EstablishCredentialComparison>,
-    ) -> Result<bool, EstablishRouteError> {
-        let mut leg = self.context_leg.lock().expect("original Context route");
-        if !matches!(leg.phase, ProbePhase::Waiting(_)) || leg.cancelled {
-            return Err(EstablishRouteError::WrongPhase);
-        }
-        if !self.retire_context_input(&mut leg)? {
-            return Ok(false);
-        }
-        self.issue_probe(&mut leg, comparison)?;
-        Ok(true)
-    }
-    pub(crate) fn waiting(&self) -> Option<EstablishReplayResult> {
-        match self
-            .context_leg
-            .lock()
-            .expect("original Context route")
-            .phase
-            .clone()
-        {
-            ProbePhase::Waiting(result) => Some(result),
-            _ => None,
-        }
-    }
     /// Only local cleanup metadata is runnable. A live probe still awaiting
     /// its original Core decision must park rather than spin a host poller.
     pub(crate) fn context_cleanup_ready(&self) -> bool {
         let leg = self.context_leg.lock().expect("original Context route");
-        leg.retired || leg.cancelled || matches!(leg.phase, ProbePhase::Finished)
+        leg.retired
+            || leg.cancelled
+            || matches!(leg.phase, ProbePhase::Finished)
+            || matches!(leg.comparison, ComparisonState::Returned(_))
+            || matches!(
+                leg.phase,
+                ProbePhase::Waiting(EstablishReplayResult::AwaitMaterialization)
+            ) && leg
+                .jobs
+                .as_ref()
+                .is_some_and(ContextHostJobs::actual_establishment_decided)
     }
     /// The Context metadata lane calls this before completing its original
     /// effect. Successful fill transfers only neutral responsibility to Root;
@@ -478,11 +513,12 @@ impl EstablishRouteCustody {
         } else if let EstablishReplayResult::Decided(outcome) = result {
             let root = self.root_leg.lock().expect("original Root route return");
             self.runtime
-                .fill_from_effect(
+                .fill_from_effect_with_author(
                     ticket,
                     root.input.as_ref().ok_or(EstablishRouteError::WrongPhase)?,
+                    &self.root_author,
                     WorkerMessage::Control(ControlMessage::Command {
-                        work: self.root_work,
+                        work: self.root_author.work(),
                         request: None,
                         command: ControlInput::RoutedEstablishFinished {
                             context: self.context,
@@ -506,10 +542,7 @@ impl EstablishRouteCustody {
             .lock()
             .expect("original Context route")
             .cancelled = true;
-        match self.runtime.notify_host_actor(&self.registration) {
-            Ok(()) | Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => {}
-            Err(_) => std::process::abort(),
-        }
+        self.notify_progress();
     }
     fn retire_context_input(&self, leg: &mut ContextLeg) -> Result<bool, EstablishRouteError> {
         if let Some(input) = &leg.input
@@ -527,9 +560,10 @@ impl EstablishRouteCustody {
         }
         Ok(true)
     }
-    fn release(capacity: &mut Option<CapacityBundle>) -> Result<(), RuntimeError> {
+    fn release(capacity: &mut Option<ReservationBundle>) -> Result<(), RuntimeError> {
         if let Some(capacity) = capacity.as_mut() {
-            capacity.release(&capacity.resources()?)?;
+            capacity.release_quota(&capacity.resources()?.quota)?;
+            capacity.finish()?;
         }
         *capacity = None;
         Ok(())
@@ -538,8 +572,12 @@ impl EstablishRouteCustody {
     /// withdrawn by Root. No Context Work, report or body exit is fabricated.
     pub(crate) fn try_retire_unbound_context(&self) -> Result<bool, EstablishRouteError> {
         let mut leg = self.context_leg.lock().expect("original Context route");
-        if leg.scope.is_some() || !leg.cancelled {
+        if leg.bound || !leg.cancelled {
             return Ok(false);
+        }
+        if leg.scope.is_some() {
+            drop(leg);
+            return self.try_retire_context();
         }
         if leg.retired {
             return Ok(true);
@@ -562,6 +600,11 @@ impl EstablishRouteCustody {
             return self.try_retire_unbound_context();
         }
         if !leg.cancelled && !matches!(leg.phase, ProbePhase::Finished) {
+            return Ok(false);
+        }
+        // A cancelled input is not the exit of its actual comparison body,
+        // raw Source loan, Context instance or exclusive route authority.
+        if !matches!(leg.comparison, ComparisonState::Idle) {
             return Ok(false);
         }
         if !self.retire_context_input(&mut leg)? {
@@ -625,19 +668,25 @@ impl EstablishRouteCustody {
             }
             leg.report = None;
         }
-        if let Some(scope) = &leg.scope {
-            self.ledger.reap_scope_ready(scope.id(), 1)?;
-        }
-        if leg
-            .retirement
-            .as_ref()
-            .is_some_and(|observer| !observer.is_retired())
+        if let Some(observer) = leg.retirement.clone()
+            && !self.ledger.reap_observed_header(&observer)?
         {
-            self.notice.notify();
-            self.runtime
-                .notify_host_actor(&self.registration)
-                .unwrap_or_else(|_| std::process::abort());
-            return Ok(false);
+            let wait = leg
+                .header_ready
+                .as_mut()
+                .expect("same original route header registration")
+                .arm(&self.runtime, &self.registration, &observer)
+                .map_err(EstablishRouteError::HeaderReady)?;
+            match wait {
+                HeaderWaitState::Waiting => return Ok(false),
+                HeaderWaitState::ReadyToReap if !self.ledger.reap_observed_header(&observer)? => {
+                    return Ok(false);
+                }
+                HeaderWaitState::ReadyToReap | HeaderWaitState::Retired => {}
+            }
+        }
+        if let Some(ready) = &mut leg.header_ready {
+            ready.cancel();
         }
         if let Some(role) = &leg.role
             && role.phase() != ExitRolePhase::Retired

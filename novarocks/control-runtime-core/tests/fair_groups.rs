@@ -43,7 +43,7 @@ fn job(scope: u64, work: u64) -> OwnerJob {
 fn group_fifo_and_fairness_preserve_complete_owner_keys_with_equal_local_work_ids() {
     let (a, b) = (group(1), group(2));
     let (a1, a2, a3, b1, b2) = (job(11, 1), job(12, 1), job(11, 2), job(21, 1), job(22, 1));
-    let mut queue = FairWorkQueue::<GroupKey, OwnerJob>::new(2, 5, 3);
+    let mut queue = FairWorkQueue::<GroupKey, OwnerJob>::new(5, 3);
     for (group, work) in [(a, a1), (a, a2), (b, b1), (a, a3), (b, b2)] {
         queue.enqueue(group, work).unwrap();
     }
@@ -73,7 +73,7 @@ fn indexed_cancellation_removes_exact_head_middle_and_tail_without_touching_anot
     let (a, b) = (group(1), group(2));
     let a_jobs = [job(10, 1), job(11, 1), job(12, 1), job(13, 1)];
     let b_jobs = [job(20, 1), job(21, 1)];
-    let mut queue = FairWorkQueue::<GroupKey, OwnerJob>::new(2, 6, 4);
+    let mut queue = FairWorkQueue::<GroupKey, OwnerJob>::new(6, 4);
     for work in a_jobs {
         queue.enqueue(a, work).unwrap();
     }
@@ -100,7 +100,7 @@ fn indexed_cancellation_removes_exact_head_middle_and_tail_without_touching_anot
 }
 
 #[test]
-fn cancellation_and_body_finish_recover_original_global_group_and_per_group_capacity() {
+fn cancellation_and_body_finish_recover_job_capacity_with_dynamic_group_metadata() {
     let (a, b, c) = (group(1), group(2), group(3));
     let (a1, a2, a3, b1, b2, c1) = (
         job(10, 1),
@@ -110,18 +110,18 @@ fn cancellation_and_body_finish_recover_original_global_group_and_per_group_capa
         job(21, 1),
         job(30, 1),
     );
-    let mut queue = FairWorkQueue::<GroupKey, OwnerJob>::new(2, 3, 2);
+    let mut queue = FairWorkQueue::<GroupKey, OwnerJob>::new(3, 2);
     queue.enqueue(a, a1).unwrap();
     queue.enqueue(a, a2).unwrap();
     assert_eq!(queue.enqueue(a, a3), Err(FairQueueError::ContextFull));
     queue.enqueue(b, b1).unwrap();
     assert_eq!(queue.enqueue(c, c1), Err(FairQueueError::Full));
     queue.remove_queued(a, a2).unwrap();
-    assert_eq!(queue.enqueue(c, c1), Err(FairQueueError::ContextCapacity));
-    queue.enqueue(b, b2).unwrap();
-    queue.remove_queued(b, b1).unwrap();
-    queue.remove_queued(b, b2).unwrap();
     queue.enqueue(c, c1).unwrap();
+    assert_eq!(queue.enqueue(b, b2), Err(FairQueueError::Full));
+    queue.remove_queued(b, b1).unwrap();
+    queue.enqueue(b, b2).unwrap();
+    queue.remove_queued(b, b2).unwrap();
     assert_eq!(queue.pop(), Some((a, a1)));
     queue.enqueue(a, a2).unwrap();
     queue.finish(a, a1).unwrap();
@@ -142,7 +142,7 @@ fn full_group_value_and_non_default_key_types_are_preserved_without_projection()
     let a = group(1);
     let b = GroupKey { frontend: 8, ..a };
     let c = GroupKey { backend: 10, ..a };
-    let mut queue = FairWorkQueue::<GroupKey, NonDefaultJob>::new(3, 3, 1);
+    let mut queue = FairWorkQueue::<GroupKey, NonDefaultJob>::new(3, 1);
     let expected = [
         (a, NonDefaultJob(1)),
         (b, NonDefaultJob(2)),
@@ -165,19 +165,18 @@ fn full_group_value_and_non_default_key_types_are_preserved_without_projection()
 fn default_api_keeps_scope_local_work_identity_and_zero_capacity_refusals() {
     let (a, b) = (ScopeId::new(1).unwrap(), ScopeId::new(2).unwrap());
     let work = WorkId::new(1).unwrap();
-    let mut queue: FairWorkQueue = FairWorkQueue::new(2, 2, 1);
+    let mut queue: FairWorkQueue = FairWorkQueue::new(2, 1);
     queue.enqueue(a, work).unwrap();
     queue.enqueue(b, work).unwrap();
     queue.remove_queued(a, work).unwrap();
     assert_eq!(queue.pop(), Some((b, work)));
     queue.finish(b, work).unwrap();
     assert!(queue.is_empty());
-    for (groups, jobs, per_group, expected) in [
-        (0, 2, 1, FairQueueError::ContextCapacity),
-        (2, 0, 1, FairQueueError::Full),
-        (2, 2, 0, FairQueueError::ContextFull),
+    for (jobs, per_group, expected) in [
+        (0, 1, FairQueueError::Full),
+        (2, 0, FairQueueError::ContextFull),
     ] {
-        let mut queue = FairWorkQueue::<GroupKey, OwnerJob>::new(groups, jobs, per_group);
+        let mut queue = FairWorkQueue::<GroupKey, OwnerJob>::new(jobs, per_group);
         assert_eq!(queue.enqueue(group(1), job(10, 1)), Err(expected));
         assert_eq!(queue.len(), 0);
         assert_eq!(queue.pop(), None);

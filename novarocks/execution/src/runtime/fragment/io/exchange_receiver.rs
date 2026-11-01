@@ -160,13 +160,13 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
                 registration.creation_factory,
             )?;
         #[cfg(novarocks_dev_controls)]
-        if let Some(observer) = self.test_observer.clone() {
-            if let Err(error) = original.install_test_observer(observer) {
-                // This operation actually registered the receiver. Its own
-                // failure retains the original loan until cancellation ends.
-                self.runtime.exchange_registry().cancel_exchange_key(key);
-                return Err(error);
-            }
+        if let Some(observer) = self.test_observer.clone()
+            && let Err(error) = original.install_test_observer(observer)
+        {
+            // This operation actually registered the receiver. Its own
+            // failure retains the original loan until cancellation ends.
+            self.runtime.exchange_registry().cancel_exchange_key(key);
+            return Err(error);
         }
         Ok(original)
     }

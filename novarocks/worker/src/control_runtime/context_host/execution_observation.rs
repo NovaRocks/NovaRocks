@@ -43,3 +43,35 @@ impl ContextHostRecord {
         Some((idle, roots))
     }
 }
+
+#[cfg(test)]
+impl ContextHostRecord {
+    pub(crate) fn print_original_execution_inventory(&self) {
+        eprintln!(
+            "Context original execution scope={:?} callbacks={:?} root_census_ready={:?} raw_root_census={:?} observed_roots={:?} driver_idle={:?} tasks={} requests={} partials={} routes={} failure={} parent_authorized={} internal={:?}",
+            self.resources.scope.as_ref().map(|scope| scope.snapshot()),
+            self.resources
+                .host_jobs
+                .as_ref()
+                .map(|jobs| jobs.try_execution_callbacks_quiescent()),
+            self.resources
+                .host_jobs
+                .as_ref()
+                .map(|jobs| jobs.try_root_census_ready()),
+            self.resources.root_reads.try_ownership_snapshot(),
+            self.try_root_ownership_snapshot(),
+            self.task_driver.try_is_idle(),
+            self.tasks.len(),
+            self.resources.requests.len(),
+            self.resources.request_partials.len(),
+            self.resources.routes.len(),
+            self.resources.failure.is_some(),
+            self.resources.teardown.parent_retire_authorized,
+            self.control_runtime.role_inventory(self.actor, None, 8)
+        );
+        eprintln!(
+            "Context original requests={:?}",
+            self.original_request_inventory_for_test()
+        );
+    }
+}

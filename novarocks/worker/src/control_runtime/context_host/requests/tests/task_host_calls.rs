@@ -15,19 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual Task-bootstrap calls use their original paid roles and Context failure
-//! publication stage. The foreign-owner refusal separately funds its originals.
+//! Actual Task-bootstrap calls keep their original owned roles and Context
+//! failure publication stage. Process quotas are distinct from object storage.
 
 use super::*;
 use crate::control_runtime::{
     admitted_role::{adopt_reported_work, reserve_reported_role},
     task_host_call::{
-        HOST_CALL_STORAGE, TaskHostCall, TaskHostCallBinding, TaskHostCallError, TaskHostCallKind,
-        TaskHostCallOutcome, TaskHostCallPayment,
+        HOST_CALL_STORAGE, TaskHostCall, TaskHostCallError, TaskHostCallKind, TaskHostCallOutcome,
+        TaskHostCallOwner,
     },
 };
-use novarocks_control_runtime::{exit_role::ExitRolePhase, transaction::RuntimeLedger};
-use novarocks_control_runtime_core::{identity::ActionId, scope::WorkKind};
+use novarocks_control_runtime::{
+    driver::FailureSourceState, exit_role::ExitRolePhase, transaction::RuntimeLedger,
+};
+use novarocks_control_runtime_core::scope::WorkKind;
 use std::{
     panic::panic_any,
     sync::{
@@ -56,16 +58,15 @@ fn supervised_foreign_port(
 }
 fn same_identity_loading_fixture(identity: QueryContextRef) -> (Harness, TaskIdentity) {
     let (mut f, task, work, create, load) = pending_loading_task_fixture(Some(identity));
-    f.service
-        .context(f.identity)
-        .unwrap()
-        .lock()
-        .unwrap()
+    let context_address = f.service.context(f.identity).unwrap();
+    let mut context = context_address.lock().unwrap();
+    let registration = context.registration().clone();
+    context
         .adopt_task(
             &f.runtime,
             &load,
-            crate::control_runtime::task::TaskHostBinding {
-                source_storage_model: false,
+            &crate::control_runtime::task::TaskHostBinding {
+                registration,
                 context: f.identity,
                 task_source: ActorId::new(86).unwrap(),
                 protocol_generation: generation(),
@@ -77,6 +78,7 @@ fn same_identity_loading_fixture(identity: QueryContextRef) -> (Harness, TaskIde
             },
         )
         .unwrap();
+    drop(context);
     finish_create_waiter(&mut f, work, create, load);
     (f, task)
 }
@@ -90,8 +92,8 @@ fn funder(f: &mut Harness, task: TaskIdentity, calls: usize) -> ContextMetadataR
         .active
         .id();
     let scope = host.scope().clone();
-    // This component's original free R3 budget pays two host fees plus one
-    // sentinel Work at most. No R is admitted and no fee is reserved twice.
+    // This actual parent owns the explicit inventory for the requested host
+    // roles. Its own bound header is independent of each future child header.
     let resources = HOST_CALL_STORAGE
         .checked_mul(calls)
         .unwrap()
@@ -121,13 +123,11 @@ fn original_call(f: &mut Harness, task: TaskIdentity, kind: TaskHostCallKind) ->
         .host_call(kind)
         .clone()
 }
-fn publish_failure(f: &mut Harness) {
+fn publish_failure(f: &mut Harness) -> InputId {
     let unknown = crate::control_runtime::actors::tests::task(f.identity, 999);
     let input = model_fact(f, ContextInput::Installed { task: unknown }, 9);
-    let failure = f
-        .runtime
-        .take_effect(context_actor(), input, ActionId::new(1).unwrap())
-        .unwrap();
+    let failure = super::failure_publications::take_actual_failure(f, input);
+    let failure_input = failure.input;
     assert!(matches!(failure.effect, WorkerAction::OwnerFailed { .. }));
     f.service
         .context(f.identity)
@@ -151,10 +151,35 @@ fn publish_failure(f: &mut Harness) {
         }
     }
     assert!(drained);
+    failure_input
 }
-fn usage(ledger: &RuntimeLedger) -> [u64; 3] {
-    [Dimension::Work, Dimension::Completions, Dimension::Captures]
-        .map(|dimension| ledger.used(dimension.id()))
+fn finish_failed_accepted_task_fixture(
+    f: Harness,
+    task: TaskIdentity,
+    preparation: ContextMetadataRole,
+    failure_input: InputId,
+) {
+    let headers = super::failure_publications::actual_context_headers(&f);
+    finish_accepted_task_fixture_with(f, task, preparation, |f| {
+        super::failure_publications::complete_actual_failure_source(f, failure_input);
+        assert!(
+            headers.iter().all(|header| !header.is_retired()),
+            "Task teardown and supervisor input completion do not exit Context holders"
+        );
+    });
+    assert!(
+        headers.iter().all(|header| header.is_retired()),
+        "the original Context holders must retire through their actual fixture exits"
+    );
+}
+fn usage(ledger: &RuntimeLedger) -> [u64; 4] {
+    [
+        Dimension::ActiveTasks,
+        Dimension::PreparingTasks,
+        Dimension::PreparingBytes,
+        Dimension::Requests,
+    ]
+    .map(|dimension| ledger.used(dimension.id()))
 }
 fn retire_call(call: &TaskHostCall, ledger: &RuntimeLedger) {
     let mut retired = false;
@@ -175,8 +200,9 @@ fn release_funder(f: &Harness, mut payer: ContextMetadataRole) {
         .unwrap();
     payer
         .capacity
-        .release(&payer.capacity.resources().unwrap())
+        .release_quota(&payer.capacity.resources().unwrap().quota)
         .unwrap();
+    payer.capacity.finish().unwrap();
 }
 
 struct ObserverGate {
@@ -228,16 +254,16 @@ fn take_original_retire_job(
 }
 
 #[test]
-fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_refund() {
+fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_header_retirement() {
     let (mut f, task, preparation) = accepted_task_fixture();
-    // Both original calls and fees were actually admitted during Task bootstrap.
+    // Both original calls and their bound storage were admitted at Task bootstrap.
     // These are observer aliases of that inventory, not replacement admissions.
     let paid = usage(&f.ledger);
     let stop = original_call(&mut f, task, TaskHostCallKind::Stop);
     let close = original_call(&mut f, task, TaskHostCallKind::RetireBorrowing);
     assert_eq!(usage(&f.ledger), paid);
     let port = original_port(&mut f, task);
-    publish_failure(&mut f);
+    let failure_input = publish_failure(&mut f);
     {
         let context_address = f.service.context(f.identity).unwrap();
         let context = context_address.lock().unwrap();
@@ -250,7 +276,7 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
     assert!(take_original_retire_job(&mut f, task).unwrap().is_none());
     let metadata_thread = thread::current().id();
     let mut prepared_close = None;
-    for (index, call) in [&stop, &close].into_iter().enumerate() {
+    for call in [&stop, &close] {
         assert!(!call.is_retired());
         if call.kind() == TaskHostCallKind::RetireBorrowing {
             assert!(port.prepare_source_retirement().is_err());
@@ -311,12 +337,8 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
         assert!(pending.unwrap().is_none());
         assert_eq!(phase, ExitRolePhase::Started);
         assert_eq!(
-            held,
-            [
-                paid[0] - index as u64,
-                paid[1] - index as u64,
-                paid[2] - index as u64
-            ]
+            held, paid,
+            "host-call storage grants no additional process quota"
         );
         assert!(progressed.unwrap());
         assert_eq!(
@@ -357,7 +379,11 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
         ));
         assert_eq!(usage(&f.ledger), held);
         retire_call(call, &f.ledger);
-        assert_eq!(usage(&f.ledger), [held[0] - 1, held[1] - 1, held[2] - 1]);
+        assert_eq!(usage(&f.ledger), held);
+        assert!(
+            call.is_retired(),
+            "the same actual call header must be reaped"
+        );
         if call.kind() == TaskHostCallKind::Stop {
             let context_address = f.service.context(f.identity).unwrap();
             let context = context_address.lock().unwrap();
@@ -378,9 +404,10 @@ fn stop_and_borrowing_close_run_on_hosts_and_return_consumption_precedes_fee_ref
     assert!(prepared_close.is_none());
     assert!(port.is_stopped());
     assert!(port.prepare_source_retirement().is_ok());
-    assert_eq!(usage(&f.ledger), [paid[0] - 2, paid[1] - 2, paid[2] - 2]);
+    assert_eq!(usage(&f.ledger), paid);
+    assert!(stop.is_retired() && close.is_retired());
     drop((port, stop, close));
-    finish_accepted_task_fixture(f, task, preparation);
+    finish_failed_accepted_task_fixture(f, task, preparation, failure_input);
 }
 
 struct PanicOriginals {
@@ -395,14 +422,15 @@ impl Drop for PanicOriginals {
 }
 
 #[test]
-fn observer_panic_keeps_the_original_payload_port_and_fee_in_unknown_custody() {
+fn observer_panic_keeps_the_original_payload_port_and_storage_in_unknown_custody() {
     let (mut f, task, preparation) = accepted_task_fixture();
     let call = original_call(&mut f, task, TaskHostCallKind::Stop);
     let ledger = f.ledger.clone();
     let held = usage(&ledger);
     let port = original_port(&mut f, task);
     let health = port.health();
-    publish_failure(&mut f);
+    let failure_input = publish_failure(&mut f);
+    let failure_runtime = f.runtime.clone();
     let keeper = Arc::new(Mutex::new(None::<PanicOriginals>));
     let payload_drops = Arc::new(AtomicUsize::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -458,6 +486,13 @@ fn observer_panic_keeps_the_original_payload_port_and_fee_in_unknown_custody() {
     assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(!health.is_healthy());
+    assert_eq!(
+        failure_runtime
+            .failure_source_state(context_actor())
+            .unwrap(),
+        FailureSourceState::ClosedPending(failure_input),
+        "Unknown host custody cannot complete the original supervisor source"
+    );
     drop(subscription);
     // The production primitive's one actual panic slot owns this entire
     // unresolved original graph. No test leak registry or fake exit is used.
@@ -479,61 +514,75 @@ fn foreign_runtime_with_equal_scope_numbers_returns_the_whole_paid_original_for_
         .scope()
         .clone();
     assert_eq!(scope.id(), foreign_scope.id());
-    let admitted =
-        reserve_reported_role(&scope, payer.capacity.id(), WorkKind::Cleanup, None).unwrap();
+    let admitted = reserve_reported_role(
+        &scope,
+        &mut payer.capacity,
+        &payer.work,
+        HOST_CALL_STORAGE.resources().unwrap(),
+        WorkKind::Cleanup,
+        None,
+    )
+    .unwrap();
     let work = admitted.work.id();
     let report = admitted.report.clone();
-    let payment = payer
-        .capacity
-        .split_next(&HOST_CALL_STORAGE.resources().unwrap())
-        .unwrap();
-    let payment_id = payment.id();
+    let original_reservation = admitted.capacity.id();
     let port = original_port(&mut f, task);
     let before = scope.snapshot().unwrap();
     let other_before = foreign_scope.snapshot().unwrap();
-    let mut refusal = TaskHostCall::from_admitted(
-        TaskHostCallBinding {
+    let held = usage(&f.ledger);
+    let mut refusal = TaskHostCall::from_unbound_admitted(
+        TaskHostCallOwner {
             kind: TaskHostCallKind::Stop,
             runtime: other.runtime.clone(),
             actor: context_actor(),
             task,
             health: port.health(),
-            port,
             pending: Arc::new(RpcTaskPending),
         },
         adopt_reported_work(admitted.work, admitted.capacity, admitted.report),
-        TaskHostCallPayment::Paid(payment),
     )
     .err()
     .expect("equal numeric scope/actor IDs cannot replace the original runtime");
     assert!(matches!(refusal.error, TaskHostCallError::WrongScope));
     assert_eq!(refusal.original.work().id(), work);
     assert!(refusal.original.report().same_slot(&report));
-    let TaskHostCallPayment::Paid(original) = &refusal.payment else {
-        panic!("the original paid fee is returned");
-    };
-    assert_eq!(original.id(), payment_id);
+    let (returned_work, returned_capacity, returned_report) = refusal.original.into_parts();
+    assert_eq!(returned_capacity.id(), original_reservation);
+    refusal.original = adopt_reported_work(returned_work, returned_capacity, returned_report);
+    assert_eq!(
+        refusal.original.bound_storage_profile().unwrap(),
+        HOST_CALL_STORAGE.resources().unwrap().owned_slots
+    );
     assert_eq!(scope.snapshot().unwrap(), before);
     assert_eq!(foreign_scope.snapshot().unwrap(), other_before);
-    refusal.binding.runtime = f.runtime.clone();
-    let original_port = refusal.binding.port.clone();
-    refusal.binding.port = supervised_foreign_port(&mut other, other_task);
-    let mut refusal =
-        TaskHostCall::from_admitted(refusal.binding, refusal.original, refusal.payment)
-            .err()
-            .expect("a foreign publication port cannot borrow the actual local scope");
-    assert!(matches!(refusal.error, TaskHostCallError::WrongScope));
-    assert_eq!(refusal.original.work().id(), work);
-    assert!(refusal.original.report().same_slot(&report));
-    let TaskHostCallPayment::Paid(original) = &refusal.payment else {
-        panic!("the same paid fee returns from foreign publication rejection");
-    };
-    assert_eq!(original.id(), payment_id);
-    assert_eq!(scope.snapshot().unwrap(), before);
-    assert_eq!(foreign_scope.snapshot().unwrap(), other_before);
-    refusal.binding.port = original_port;
+    assert_eq!(usage(&f.ledger), held);
+
+    // Retry the exact returned Work/report/bundle through production's
+    // two-phase owner. A refused port attachment leaves this same paid call
+    // unbound, so it needs neither a replacement Work nor another payment.
+    refusal._original_owner.runtime = f.runtime.clone();
     let call =
-        TaskHostCall::from_admitted(refusal.binding, refusal.original, refusal.payment).unwrap();
+        TaskHostCall::from_unbound_admitted(refusal._original_owner, refusal.original).unwrap();
+    assert_eq!(call.key(), (scope.id(), work));
+    let paid_before_attachment = usage(&f.ledger);
+    let owner_before_attachment = scope.snapshot().unwrap();
+    let foreign_port = supervised_foreign_port(&mut other, other_task);
+    assert_eq!(foreign_port.identity(), port.identity());
+    assert!(
+        matches!(
+            call.attach_port(&foreign_port),
+            Err(TaskHostCallError::WrongScope)
+        ),
+        "an equal Task identity in a foreign runtime cannot replace the original publication owner"
+    );
+    assert_eq!(call.key(), (scope.id(), work));
+    assert_eq!(scope.snapshot().unwrap(), owner_before_attachment);
+    assert_eq!(foreign_scope.snapshot().unwrap(), other_before);
+    assert_eq!(usage(&f.ledger), paid_before_attachment);
+    call.attach_port(&port).unwrap();
+    assert_eq!(call.key(), (scope.id(), work));
+    assert_eq!(scope.snapshot().unwrap(), owner_before_attachment);
+    assert_eq!(usage(&f.ledger), paid_before_attachment);
     let mut retired = false;
     for _ in 0..64 {
         if call.retire_unused(&f.ledger).unwrap() {
@@ -542,9 +591,14 @@ fn foreign_runtime_with_equal_scope_numbers_returns_the_whole_paid_original_for_
         }
     }
     assert!(retired && call.is_retired());
+    assert_eq!(
+        usage(&f.ledger),
+        paid_before_attachment,
+        "object retirement never refunds unrelated process quotas"
+    );
     // An actual unused withdrawal is not an unissued executable job. Keep
     // the original port alive and use a real stage for the late handoff check.
-    publish_failure(&mut f);
+    let failure_input = publish_failure(&mut f);
     let before_late_handoff = scope.snapshot().unwrap();
     let paid_before_late_handoff = usage(&f.ledger);
     {
@@ -563,7 +617,7 @@ fn foreign_runtime_with_equal_scope_numbers_returns_the_whole_paid_original_for_
     assert_eq!(usage(&f.ledger), paid_before_late_handoff);
     release_funder(&f, payer);
     drop(call);
-    finish_accepted_task_fixture(f, task, preparation);
+    finish_failed_accepted_task_fixture(f, task, preparation, failure_input);
     finish_task_fixture(other, other_task);
 }
 
@@ -693,10 +747,8 @@ fn a_queued_normal_stop_losing_its_generation_waits_for_the_real_failure_stage()
             .failure_publication_stage()
             .is_err()
     );
-    let failure = f
-        .runtime
-        .take_effect(context_actor(), failed_input, ActionId::new(1).unwrap())
-        .unwrap();
+    let failure = super::failure_publications::take_actual_failure(&f, failed_input);
+    let failure_input = failure.input;
     f.service
         .context(f.identity)
         .unwrap()
@@ -735,7 +787,11 @@ fn a_queued_normal_stop_losing_its_generation_waits_for_the_real_failure_stage()
     ));
     assert_eq!(usage(&f.ledger), paid);
     retire_call(&call, &f.ledger);
-    assert_eq!(usage(&f.ledger), [paid[0] - 1, paid[1] - 1, paid[2] - 1]);
+    assert_eq!(usage(&f.ledger), paid);
+    assert!(
+        call.is_retired(),
+        "same actual header retires after its original report"
+    );
     // This original Started StopTask now has its real host completion. No
     // failure flag, deferred return, or queue removal supplied that fact.
     f.runtime.effect_completed(stop).unwrap();
@@ -755,5 +811,5 @@ fn a_queued_normal_stop_losing_its_generation_waits_for_the_real_failure_stage()
         .unwrap();
     drop(subscription);
     drop((call, port));
-    finish_accepted_task_fixture(f, task, preparation);
+    finish_failed_accepted_task_fixture(f, task, preparation, failure_input);
 }

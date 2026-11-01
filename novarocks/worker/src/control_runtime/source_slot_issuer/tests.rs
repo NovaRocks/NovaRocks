@@ -15,32 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Real original payment and unused Source Work cleanup, not bank detach,
-//! producer disposal, Native execution or complete failed-owner recovery.
+//! Actual prepaid Source roles, ordinary partial refusal and true header exit.
 
 use super::*;
-use crate::control_admission::Dimension;
-use novarocks_control_runtime::lease::WorkLease;
-use novarocks_control_runtime_core::scope::WorkAdmission;
+use novarocks_control_runtime_core::{
+    capacity::{CapacityError, ResourceVector},
+    owned_storage::{OwnedSlotKind, OwnedSlotNeed, OwnedStorageError},
+    scope::WorkAdmission,
+};
 
 struct Fixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
     parent: WorkLease,
-    payer: Option<CapacityBundle>,
+    payer: Option<ReservationBundle>,
 }
 impl Fixture {
-    fn new(units: usize, reports: usize) -> Self {
-        let resources = SOURCE_SLOT_STORAGE
-            .checked_mul(units)
-            .unwrap()
-            .resources()
-            .unwrap();
-        let ledger = RuntimeLedger::new(resources.clone(), 32, 1);
+    fn new(headers: usize, completions: usize, captures: usize) -> Self {
+        let resources = ReservationResources::new(
+            ResourceVector::default(),
+            OwnedSlotNeed {
+                work_headers: headers,
+                completions,
+                captures,
+                ..OwnedSlotNeed::default()
+            },
+        );
+        let ledger = RuntimeLedger::new(ResourceVector::default());
         let generation = Generation::new(1).unwrap();
-        let scope = ledger
-            .open_scope_next(None, generation, 16, reports)
-            .unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
         let (mut parent, payer) = scope
             .reserve_next(
                 generation,
@@ -59,27 +62,25 @@ impl Fixture {
             payer: Some(payer),
         }
     }
-    fn charges(&self) -> [u64; 3] {
-        [Dimension::Work, Dimension::Completions, Dimension::Captures]
-            .map(|dimension| self.ledger.used(dimension.id()))
+    fn remaining(&self) -> OwnedSlotNeed {
+        self.payer
+            .as_ref()
+            .unwrap()
+            .resources()
+            .unwrap()
+            .owned_slots
     }
     fn finish(mut self) {
         self.scope.close_external().unwrap();
         self.parent.body_exited().unwrap();
         self.parent.captures_exited().unwrap();
+        self.payer.as_mut().unwrap().finish().unwrap();
         self.ledger.reap_scope_ready(self.scope.id(), 16).unwrap();
-        if let Some(payer) = &mut self.payer
-            && !payer.is_released()
-        {
-            let remaining = payer.resources().unwrap();
-            payer.release(&remaining).unwrap();
-        }
         self.ledger.remove_scope(self.scope.id()).unwrap();
         assert!(self.ledger.is_empty());
     }
 }
 fn retire(partial: &mut SourceSlotIssuePartial, ledger: &RuntimeLedger) {
-    // The fixture admits at most three source holders, plus this same parent.
     for _ in 0..8 {
         if partial.try_retire(ledger).unwrap() {
             return;
@@ -87,20 +88,31 @@ fn retire(partial: &mut SourceSlotIssuePartial, ledger: &RuntimeLedger) {
     }
     panic!("the original finite unused source headers must retire");
 }
+fn missing(error: &SourceSlotIssueError, kind: OwnedSlotKind) -> bool {
+    matches!(error, SourceSlotIssueError::Runtime(RuntimeError::Capacity(
+        CapacityError::OwnedStorage(OwnedStorageError::MissingPosition(actual))
+    )) if *actual == kind)
+}
 
 #[test]
-fn issuing_and_returning_whole_slots_moves_one_payment_until_each_original_work_reaps() {
-    let mut f = Fixture::new(3, 8);
-    let before = f.charges();
-    let parent = f.payer.as_ref().unwrap().id();
+fn issuing_and_returning_whole_slots_keeps_each_original_work_until_its_true_reaping() {
+    let mut f = Fixture::new(3, 2, 2);
+    let before = f.scope.snapshot().unwrap().work;
     let slots = reserve_source_slots::<2>(
         &f.scope,
-        parent,
-        Generation::new(1).unwrap(),
+        &f.parent,
+        (f.scope.id(), Generation::new(1).unwrap()),
         SourceSlotPayer::Retained(f.payer.as_mut().unwrap()),
     )
     .unwrap();
-    let after_issue = f.charges();
+    for slot in &slots {
+        assert_eq!(
+            slot.reported().bound_storage_profile().unwrap(),
+            SOURCE_SLOT_STORAGE.resources().unwrap().owned_slots
+        );
+    }
+    let after_issue = f.scope.snapshot().unwrap().work;
+    assert!(f.remaining().is_empty());
     let mut partial = SourceSlotIssuePartial::from_admissions(&f.scope, slots);
     let same_scope = partial.scope().same_scope(&f.scope);
     let original_headers = partial
@@ -113,147 +125,158 @@ fn issuing_and_returning_whole_slots_moves_one_payment_until_each_original_work_
         .iter()
         .filter(|slot| !slot.retirement.is_retired())
         .count();
-    let still_paid = f.charges();
+    let still_live = f.scope.snapshot().unwrap().work;
     retire(&mut partial, &f.ledger);
-    let after_retirement = f.charges();
-    let idempotent = partial.try_retire(&f.ledger).unwrap() && f.charges() == after_retirement;
+    let after_retirement = f.scope.snapshot().unwrap().work;
+    let idempotent = partial.try_retire(&f.ledger).unwrap()
+        && f.scope.snapshot().unwrap().work == after_retirement;
     f.finish();
-    assert_eq!(before, [3; 3]);
-    assert_eq!(
-        after_issue, before,
-        "slot admission moves already paid units without acquiring more capacity"
-    );
+    assert_eq!(before, 1);
+    assert_eq!(after_issue, 3);
     assert!(same_scope && original_headers && !first && idempotent);
-    assert_eq!(remaining_header, 1, "one call reaps only one actual header");
     assert_eq!(
-        still_paid, [2; 3],
-        "the other admitted slot remains paid until its own Work reaps"
+        remaining_header, 1,
+        "one visit reaps only one actual header"
     );
-    assert_eq!(
-        after_retirement, [1; 3],
-        "only the two original slot fees were returned"
-    );
+    assert_eq!(still_live, 2);
+    assert_eq!(after_retirement, 1, "only the actual parent remains");
 }
 
 #[test]
-fn a_later_report_refusal_preserves_the_first_paid_slot_and_the_unsplit_payer() {
-    let mut f = Fixture::new(3, 1);
-    let parent = f.payer.as_ref().unwrap().id();
+fn a_later_report_refusal_preserves_the_first_original_and_unsplit_payer_inventory() {
+    let mut f = Fixture::new(3, 1, 2);
     let refused = reserve_source_slots::<2>(
         &f.scope,
-        parent,
-        Generation::new(1).unwrap(),
+        &f.parent,
+        (f.scope.id(), Generation::new(1).unwrap()),
         SourceSlotPayer::Retained(f.payer.as_mut().unwrap()),
     )
     .unwrap_err();
-    let runtime_refusal = matches!(refused.error, SourceSlotIssueError::Runtime(_));
+    assert!(missing(&refused.error, OwnedSlotKind::Completion));
     let mut partial = refused.partial;
-    let paid_originals = partial
-        .slots
-        .iter()
-        .filter(|slot| slot.storage.is_some())
-        .count();
-    let before_cleanup = f.charges();
-    let parent_remaining = f.payer.as_ref().unwrap().resources().unwrap();
-    retire(&mut partial, &f.ledger);
-    let after_cleanup = f.charges();
-    f.finish();
-    assert!(runtime_refusal);
-    assert_eq!(paid_originals, 1);
     assert_eq!(
-        parent_remaining,
-        SOURCE_SLOT_STORAGE
-            .checked_mul(2)
-            .unwrap()
-            .resources()
-            .unwrap()
+        partial.slots.len(),
+        1,
+        "refused atomic admission creates no phantom Work"
     );
-    assert_eq!(before_cleanup, [3; 3]);
-    assert_eq!(after_cleanup, [2; 3]);
+    assert_eq!(f.scope.snapshot().unwrap().work, 2);
+    assert_eq!(
+        f.scope.snapshot().unwrap().storage,
+        1,
+        "only the first actual report exists"
+    );
+    assert_eq!(
+        f.remaining(),
+        OwnedSlotNeed {
+            work_headers: 1,
+            captures: 1,
+            ..OwnedSlotNeed::default()
+        }
+    );
+    retire(&mut partial, &f.ledger);
+    assert_eq!(f.scope.snapshot().unwrap().work, 1);
+    assert_eq!(f.scope.snapshot().unwrap().storage, 0);
+    f.finish();
 }
 
 #[test]
-fn a_later_split_refusal_keeps_the_last_unpaid_reported_holder_without_fabricating_credit() {
-    let mut f = Fixture::new(2, 8);
-    let parent = f.payer.as_ref().unwrap().id();
+fn a_later_header_refusal_retains_only_the_actual_admitted_holder_without_fabricating_storage() {
+    let mut f = Fixture::new(2, 2, 2);
     let refused = reserve_source_slots::<2>(
         &f.scope,
-        parent,
-        Generation::new(1).unwrap(),
+        &f.parent,
+        (f.scope.id(), Generation::new(1).unwrap()),
         SourceSlotPayer::Retained(f.payer.as_mut().unwrap()),
     )
     .unwrap_err();
-    let runtime_refusal = matches!(refused.error, SourceSlotIssueError::Runtime(_));
+    assert!(missing(&refused.error, OwnedSlotKind::WorkHeader));
     let mut partial = refused.partial;
-    let holders = partial.slots.len();
-    let payments = partial
-        .slots
-        .iter()
-        .filter(|slot| slot.storage.is_some())
-        .count();
-    let all_original = partial
-        .slots
-        .iter()
-        .all(|slot| !slot.retirement.is_retired());
-    let before_cleanup = f.charges();
-    let parent_remaining = f.payer.as_ref().unwrap().resources().unwrap();
+    assert_eq!(partial.slots.len(), 1);
+    assert!(
+        partial
+            .slots
+            .iter()
+            .all(|slot| !slot.retirement.is_retired())
+    );
+    assert_eq!(f.scope.snapshot().unwrap().work, 2);
+    let remaining = f.remaining();
+    assert_eq!(
+        remaining,
+        OwnedSlotNeed {
+            completions: 1,
+            captures: 1,
+            ..OwnedSlotNeed::default()
+        }
+    );
     retire(&mut partial, &f.ledger);
-    let after_cleanup = f.charges();
-    let idempotent = partial.try_retire(&f.ledger).unwrap() && f.charges() == after_cleanup;
+    assert_eq!(f.scope.snapshot().unwrap().work, 1);
+    assert!(partial.try_retire(&f.ledger).unwrap());
+    assert_eq!(f.remaining(), remaining);
     f.finish();
-    assert!(runtime_refusal && all_original && idempotent);
-    assert_eq!((holders, payments), (2, 1));
-    assert_eq!(before_cleanup, [2; 3]);
-    assert_eq!(parent_remaining, SOURCE_SLOT_STORAGE.resources().unwrap());
-    assert_eq!(after_cleanup, [1; 3]);
 }
 
 #[test]
-fn a_pure_source_pool_moves_its_last_whole_bundle_without_a_dummy_unit_or_extra_header() {
-    let mut f = Fixture::new(2, 8);
-    let parent = f.payer.as_ref().unwrap().id();
-    let mut pool = f.payer.take();
+fn a_pure_source_pool_moves_all_unused_positions_without_a_dummy_unit_or_extra_header() {
+    let mut f = Fixture::new(3, 2, 2);
+    let mut pool = Some(
+        f.payer
+            .as_mut()
+            .unwrap()
+            .split_next(
+                &SOURCE_SLOT_STORAGE
+                    .checked_mul(2)
+                    .unwrap()
+                    .resources()
+                    .unwrap(),
+            )
+            .unwrap(),
+    );
     let original_pool_id = pool.as_ref().unwrap().id();
-    let before = f.charges();
     let slots = reserve_source_slots::<2>(
         &f.scope,
-        parent,
-        Generation::new(1).unwrap(),
+        &f.parent,
+        (f.scope.id(), Generation::new(1).unwrap()),
         SourceSlotPayer::Pool(&mut pool),
     )
     .unwrap();
-    let exhausted_normally = pool.is_none();
-    let after_issue = f.charges();
+    assert!(pool.as_ref().unwrap().is_released());
+    assert!(pool.as_ref().unwrap().resources().unwrap().is_empty());
+    assert!(f.remaining().is_empty());
+    assert_eq!(f.scope.snapshot().unwrap().work, 3);
+    assert!(
+        slots
+            .iter()
+            .all(|slot| slot.reported().work().scope().same_scope(&f.scope))
+    );
     let mut partial = SourceSlotIssuePartial::from_admissions(&f.scope, slots);
-    let last_is_same_bundle = partial.slots[1].storage.as_ref().unwrap().id() == original_pool_id;
     retire(&mut partial, &f.ledger);
-    let after_cleanup = f.charges();
-    let idempotent = partial.try_retire(&f.ledger).unwrap() && f.charges() == after_cleanup;
+    assert!(partial.try_retire(&f.ledger).unwrap());
+    assert_eq!(f.scope.snapshot().unwrap().work, 1);
+    assert!(pool.as_ref().unwrap().is_released());
+    assert!(original_pool_id.get() > f.payer.as_ref().unwrap().id().get());
     f.finish();
-    assert!(exhausted_normally && last_is_same_bundle && idempotent);
-    assert_eq!(before, [2; 3]);
-    assert_eq!(after_issue, before);
-    assert_eq!(after_cleanup, [0; 3]);
 }
 
 #[test]
-fn an_absent_source_pool_refuses_without_issuing_a_replacement_role_or_payment() {
-    let f = Fixture::new(1, 8);
-    let parent = f.payer.as_ref().unwrap().id();
+fn an_absent_source_pool_refuses_without_issuing_a_replacement_role_or_storage() {
+    let f = Fixture::new(1, 0, 0);
     let mut pool = None;
     let before = f.scope.snapshot().unwrap();
     let refused = reserve_source_slots::<1>(
         &f.scope,
-        parent,
-        Generation::new(1).unwrap(),
+        &f.parent,
+        (f.scope.id(), Generation::new(1).unwrap()),
         SourceSlotPayer::Pool(&mut pool),
     )
     .unwrap_err();
-    let unavailable = matches!(refused.error, SourceSlotIssueError::StorageUnavailable);
+    assert!(matches!(
+        refused.error,
+        SourceSlotIssueError::StorageUnavailable
+    ));
     let mut partial = refused.partial;
-    let no_originals = partial.is_empty();
-    let unchanged = f.scope.snapshot().unwrap() == before && pool.is_none();
-    let retired = partial.try_retire(&f.ledger).unwrap();
+    assert!(partial.is_empty());
+    assert_eq!(f.scope.snapshot().unwrap(), before);
+    assert!(pool.is_none());
+    assert!(partial.try_retire(&f.ledger).unwrap());
     f.finish();
-    assert!(unavailable && no_originals && unchanged && retired);
 }

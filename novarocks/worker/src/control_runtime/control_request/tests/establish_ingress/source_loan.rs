@@ -27,7 +27,7 @@ use std::{
 #[test]
 fn one_original_source_loan_excludes_disposal_and_restores_on_return_or_unwind() {
     for panic_in_host in [false, true] {
-        let mut f = fixture(2);
+        let mut f = fixture();
         let (raw, getters, drops) = request(&f, None, None, false);
         let (input, external) = admit(&mut f);
         let job = f
@@ -69,7 +69,7 @@ fn one_original_source_loan_excludes_disposal_and_restores_on_return_or_unwind()
         let withdrawal_excluded = withdrawal.is_none();
         drop(external);
         let retired_during_loan = f.root.reap_ready_requests(32).unwrap();
-        let fee_during_loan = f.ledger.used(Dimension::Replies.id());
+        let fee_during_loan = f.ledger.used(Dimension::Requests.id());
         let drops_during_loan = drops.load(Ordering::SeqCst);
         let source_exited_during_loan = owner.try_close().unwrap();
         gate.resume.wait();
@@ -79,7 +79,7 @@ fn one_original_source_loan_excludes_disposal_and_restores_on_return_or_unwind()
         let second_loan_refused = next_loan.is_none();
         drop(next_loan);
         let source_exited_on_return = owner.try_close().unwrap();
-        let fee_after_return = f.ledger.used(Dimension::Replies.id());
+        let fee_after_return = f.ledger.used(Dimension::Requests.id());
         let role_after_return = f.root.resources().requests[&input].role.phase();
         let disposal = direct
             .or(withdrawal)
@@ -115,7 +115,7 @@ fn one_original_source_loan_excludes_disposal_and_restores_on_return_or_unwind()
 
 #[test]
 fn an_unsubmitted_request_rejects_a_real_non_materialize_ticket_without_losing_its_source() {
-    let mut f = fixture(2);
+    let mut f = fixture();
     let (raw, getters, drops) = request(&f, None, None, false);
     let (input, external) = admit(&mut f);
     let job = f
@@ -161,7 +161,7 @@ fn an_unsubmitted_request_rejects_a_real_non_materialize_ticket_without_losing_i
         .unwrap();
     f.runtime.poll_one(Tick(1)).unwrap();
     f.root.index_control_effects(64).unwrap();
-    let body = f.root.take_control_effect(64).unwrap().unwrap();
+    let body = f.next_control_body();
     let refused = matches!(
         f.root.resources().requests[&input].take_materialization_source(&body),
         Err(ControlRequestError::WrongEffect)
@@ -175,7 +175,7 @@ fn an_unsubmitted_request_rejects_a_real_non_materialize_ticket_without_losing_i
     };
     f.complete_body(body);
     f.root.control_completion_observed(reference).unwrap();
-    let reply = f.root.take_control_effect(64).unwrap().unwrap();
+    let reply = f.next_control_body();
     f.root.publish_request_reply(reply).unwrap();
     let delivery = other_external.try_take().unwrap();
     drop(delivery);

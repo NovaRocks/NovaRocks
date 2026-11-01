@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::backend_task_execution::tests::node_fixture::NativeNodePreparation;
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime::kernel_memory::{
     KernelMemoryRequest, request, request_complete_operation,
@@ -34,8 +35,7 @@ use novarocks_types::{
     QueryId,
     identity::{AttemptId, QueryExecutionId},
 };
-use novarocks_worker::TestPreparationControl;
-use std::{cell::Cell, sync::Arc, time::Duration};
+use std::{cell::Cell, sync::Arc};
 
 fn preparation_identity(
     binding: &QueryMemoryBinding,
@@ -239,8 +239,7 @@ fn type_materialization_real_pending_requalifies_without_replaying_the_original_
         }],
         ..Default::default()
     };
-    let owner =
-        TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+    let owner = NativeNodePreparation::new(preparation_identity(&binding));
     let loan = owner.loan();
     let calls = Cell::new(0);
     let mut journal = TypeMaterializationJournal::default();

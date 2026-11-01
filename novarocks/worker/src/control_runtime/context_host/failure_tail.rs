@@ -50,7 +50,7 @@ enum FailureCapture {
         _original: Arc<crate::task_port::TaskProjection>,
     },
     Neutral {
-        _original: crate::control_runtime::task::FailedTaskNeutral,
+        _original: Box<crate::control_runtime::task::FailedTaskNeutral>,
     },
 }
 struct Custody {
@@ -104,7 +104,9 @@ impl FailureTail {
     ) -> (Self, FailureTailJob) {
         Self::capture(
             key,
-            Some(FailureCapture::Neutral { _original: neutral }),
+            Some(FailureCapture::Neutral {
+                _original: Box::new(neutral),
+            }),
             notice,
             health,
         )

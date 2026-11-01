@@ -16,8 +16,8 @@
 // under the License.
 
 //! Actual Accepted input and preparation custody. The fair queue owns the
-//! original jobs; body slots, whole preparation and retained inbound capacity
-//! have separate release conditions. No host call or opaque Drop runs locked.
+//! original jobs; body slots and whole preparation have separate release
+//! conditions. No host call or opaque Drop runs locked.
 
 use super::actors::{WorkerAction, WorkerActor};
 use crate::{
@@ -27,11 +27,11 @@ use crate::{
 use novarocks_control_runtime::{
     completion::ReportSlot,
     driver::{ActorRuntime, DriverError, EffectTicket},
-    lease::{CapacityBundle, StepGuard, WorkLease},
+    lease::{ReservationBundle, StepGuard, WorkLease},
     transaction::{RuntimeError, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     completion::ConsumerKind,
     fair_queue::{FairQueueError, FairWorkQueue},
     identity::{ConsumerId, ScopeId, WorkId},
@@ -55,7 +55,7 @@ type PanicPayload = ManuallyDrop<Box<dyn Any + Send>>;
 
 struct State {
     work: Option<WorkLease>,
-    capacity: Option<CapacityBundle>,
+    capacity: Option<ReservationBundle>,
     body_exited: bool,
     captures_exited: bool,
     exit_published: bool,
@@ -63,7 +63,6 @@ struct State {
     exit_report_retired: bool,
     transferred: bool,
     task_source_storage_transferred: bool,
-    inbound_payment_transferred: bool,
     unresolved: bool,
     // One original body and one independent input-disposal boundary. Panic
     // graphs are retained without invoking their destructor a second time.
@@ -101,11 +100,21 @@ impl PreparationParent {
             work: work.id(),
         }
     }
+    #[cfg(test)]
     pub(crate) fn derive(&self, kind: WorkKind) -> Result<StepGuard, RuntimeError> {
+        self.derive_with_storage(kind, ReservationResources::work_only())
+    }
+    /// This actual parent is already counted. Allocate only the new child's
+    /// own positions before any of that child's foreign captures can escape.
+    pub(crate) fn derive_with_storage(
+        &self,
+        kind: WorkKind,
+        resources: ReservationResources,
+    ) -> Result<StepGuard, RuntimeError> {
         let generation = self.scope.gates()?.generation;
         self.scope.reserve_next(
             generation,
-            ResourceVector::default(),
+            resources,
             kind,
             WorkAdmission::Derived(self.work),
         )
@@ -128,6 +137,16 @@ pub(crate) enum PreparationOutcome<T> {
     StartRefused(RuntimeError),
     Unresolved,
 }
+impl<T> std::fmt::Display for PreparationOutcome<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Returned(_) => f.write_str("Returned"),
+            Self::TaskStopped => f.write_str("Stopped"),
+            Self::StartRefused(error) => write!(f, "StartRefused: {error}"),
+            Self::Unresolved => f.write_str("Unresolved"),
+        }
+    }
+}
 #[derive(Debug)]
 pub(crate) enum PreparationAdoptionError {
     WrongEffect,
@@ -149,7 +168,15 @@ impl std::fmt::Display for PreparationAdoptionError {
         }
     }
 }
-impl std::error::Error for PreparationAdoptionError {}
+impl std::error::Error for PreparationAdoptionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Driver(error) => Some(error),
+            Self::Runtime(error) => Some(error),
+            Self::WrongEffect | Self::WrongTask => None,
+        }
+    }
+}
 
 /// Refusal leaves the original preparation inventory and split opportunity intact.
 #[derive(Debug)]
@@ -159,6 +186,42 @@ pub(crate) enum PreparationStorageSplitError {
     Unavailable,
     Runtime(RuntimeError),
 }
+
+impl std::fmt::Display for PreparationStorageSplitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidResources => {
+                f.write_str("preparation storage split requires valid owned resources")
+            }
+            Self::AlreadyTransferred => f.write_str("preparation storage was already transferred"),
+            Self::Unavailable => f.write_str("preparation storage is unavailable"),
+            Self::Runtime(error) => write!(f, "preparation storage split failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for PreparationStorageSplitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(error) => Some(error),
+            Self::InvalidResources | Self::AlreadyTransferred | Self::Unavailable => None,
+        }
+    }
+}
+/// The original Accepted preparation body is independent of its future Task
+/// lifecycle authors. Its same guard owns one Work, two exit reports, and the
+/// one actual input capture; it has no causal input, cut, reply, or RPC role.
+pub(crate) const PREPARATION_STORAGE: crate::control_runtime_policy::StorageNeed =
+    crate::control_runtime_policy::StorageNeed {
+        requests: 0,
+        inputs: 0,
+        batches: 0,
+        effects: 0,
+        cuts: 0,
+        replies: 0,
+        completions: 2,
+        captures: 1,
+        work: 1,
+    };
 
 pub(crate) const PREPARATION_CORE_CONSUMER: ConsumerId = ConsumerId::new(1).unwrap();
 pub(crate) const PREPARATION_OBSERVER_CONSUMER: ConsumerId = ConsumerId::new(2).unwrap();
@@ -201,17 +264,16 @@ impl PreparationCustody {
         if binding.stop.identity() != task {
             return Err((PreparationAdoptionError::WrongTask, input));
         }
-        let guard = match runtime.take_step_reservation(ticket, reservation) {
+        let mut guard = match runtime.take_step_reservation(ticket, reservation) {
             Ok(guard) => guard,
             Err(error) => return Err((PreparationAdoptionError::Driver(error), input)),
         };
-        let scope = guard.scope();
+        let scope = guard.scope().clone();
         let generation = ticket.generation;
-        let report = || {
+        let mut report = || {
             ReportSlot::reserve_next(
-                scope,
+                &mut guard,
                 generation,
-                guard.work_id(),
                 2,
                 [
                     (
@@ -255,23 +317,27 @@ impl PreparationCustody {
     /// All work, storage and both reports were admitted before attaching this
     /// input. The capacity is the same Accepted reservation from the Core step.
     /// The Task owner receives it back, with preparation charges removed, only
-    /// after real whole exit and report retirement. Inbound charges stay in it.
+    /// after real whole exit and report retirement.
     pub(crate) fn from_admitted(
         binding: PreparationBinding,
-        work: WorkLease,
-        capacity: CapacityBundle,
+        mut work: WorkLease,
+        mut capacity: ReservationBundle,
         reports: [ReportSlot; 2],
         input: TaskCreationInput,
     ) -> (Self, PreparationJob) {
+        // The original input holder is one real preparation capture. Future
+        // Task role storage remains unused until its unique Task transfer.
+        work.bind_owned_captures(&mut capacity, 1)
+            .expect("the Accepted role declares its original input capture");
         let resources = capacity
             .resources()
             .expect("live original Accepted reservation");
-        assert_eq!(resources.get(Dimension::PreparingTasks.id()), 1);
+        assert_eq!(resources.quota.get(Dimension::PreparingTasks.id()), 1);
         let preparing = ResourceVector::new([
             (Dimension::PreparingTasks.id(), 1),
             (
                 Dimension::PreparingBytes.id(),
-                resources.get(Dimension::PreparingBytes.id()),
+                resources.quota.get(Dimension::PreparingBytes.id()),
             ),
         ])
         .expect("fixed preparation release dimensions");
@@ -292,7 +358,6 @@ impl PreparationCustody {
                 exit_report_retired: false,
                 transferred: false,
                 task_source_storage_transferred: false,
-                inbound_payment_transferred: false,
                 unresolved: false,
                 panics: [None, None],
             }),
@@ -312,22 +377,20 @@ impl PreparationCustody {
         };
         (owner, job)
     }
-    /// Transfer already paid Task source storage once. Preparation and inbound
-    /// fees, the actual job/input and independent reports stay with this owner.
-    pub(crate) fn take_task_source_storage(
+    /// Transfer the original unused Task roles once. Preparation P/bytes,
+    /// its actual job/input and independent reports stay with this owner.
+    pub(crate) fn take_task_role_storage(
         &self,
-        resources: &ResourceVector,
-    ) -> Result<CapacityBundle, PreparationStorageSplitError> {
-        let units = resources.get(Dimension::Work.id());
-        if units == 0
-            || resources.get(Dimension::Completions.id()) != units
-            || resources.get(Dimension::Captures.id()) != units
-            || resources.iter().any(|(dimension, _)| {
-                dimension != Dimension::Work.id()
-                    && dimension != Dimension::Completions.id()
-                    && dimension != Dimension::Captures.id()
-            })
-        {
+        resources: &ReservationResources,
+    ) -> Result<ReservationBundle, PreparationStorageSplitError> {
+        let per_role = crate::control_runtime_policy::StorageNeed::role(false);
+        let headers = resources.owned_slots.work_headers;
+        let roles = headers / per_role.work;
+        let expected = per_role
+            .checked_mul(roles)
+            .and_then(crate::control_runtime_policy::StorageNeed::resources)
+            .map_err(|_| PreparationStorageSplitError::InvalidResources)?;
+        if roles == 0 || !resources.quota.is_empty() || *resources != expected {
             return Err(PreparationStorageSplitError::InvalidResources);
         }
         let mut state = self.0.state.lock().expect("preparation custody lock");
@@ -346,47 +409,6 @@ impl PreparationCustody {
             .map_err(PreparationStorageSplitError::Runtime)?;
         state.task_source_storage_transferred = true;
         Ok(storage)
-    }
-    pub(crate) fn take_inbound_payment(
-        &self,
-    ) -> Result<Option<crate::TaskInboundPermit>, PreparationStorageSplitError> {
-        let mut state = self.0.state.lock().expect("original inbound payment split");
-        if state.inbound_payment_transferred {
-            return Err(PreparationStorageSplitError::AlreadyTransferred);
-        }
-        if state.transferred || state.unresolved || state.exit_published {
-            return Err(PreparationStorageSplitError::Unavailable);
-        }
-        let capacity = state
-            .capacity
-            .as_mut()
-            .ok_or(PreparationStorageSplitError::Unavailable)?;
-        let resources = capacity
-            .resources()
-            .map_err(PreparationStorageSplitError::Runtime)?;
-        let records = resources.get(Dimension::InboundRecords.id());
-        let bytes = resources.get(Dimension::InboundBytes.id());
-        if records == 0 && bytes == 0 {
-            state.inbound_payment_transferred = true;
-            return Ok(None);
-        }
-        if records != 1 || bytes == 0 {
-            return Err(PreparationStorageSplitError::InvalidResources);
-        }
-        let need = ResourceVector::new([
-            (Dimension::InboundRecords.id(), records),
-            (Dimension::InboundBytes.id(), bytes),
-        ])
-        .expect("two fixed inbound dimensions");
-        let payment = capacity
-            .split_next(&need)
-            .map_err(PreparationStorageSplitError::Runtime)?;
-        state.inbound_payment_transferred = true;
-        Ok(Some(crate::TaskInboundPermit::from_original(
-            self.0.task,
-            bytes,
-            payment,
-        )))
     }
     pub(crate) fn key(&self) -> Key {
         (self.0.parent.scope.id(), self.0.parent.work)
@@ -594,8 +616,8 @@ impl PreparationCustody {
         Ok(true)
     }
     /// Transfer the original bundle once. Only P/count/bytes leave the ledger;
-    /// Task storage and retained normal-close charges remain in the same bundle.
-    pub(crate) fn take_after_exit(&self) -> Result<Option<CapacityBundle>, RuntimeError> {
+    /// Remaining Task role storage stays in the same original bundle.
+    pub(crate) fn take_after_exit(&self) -> Result<Option<ReservationBundle>, RuntimeError> {
         let mut state = self.0.state.lock().expect("preparation custody lock");
         if state.transferred || !state.exit_published || state.unresolved {
             return Ok(None);
@@ -610,7 +632,7 @@ impl PreparationCustody {
             return Ok(None);
         }
         let capacity = state.capacity.as_mut().expect("original Accepted bundle");
-        capacity.release(&self.0.preparing)?;
+        capacity.release_quota(&self.0.preparing)?;
         let capacity = state.capacity.take();
         let work = state.work.take();
         state.transferred = true;
@@ -694,6 +716,7 @@ impl PreparationJob {
     }
     /// Cancellation removes a queued job; this host-side disposal is the
     /// positive exit observation. Queue removal/Drop alone proves no exit.
+    #[cfg(test)]
     pub(crate) fn dispose(mut self) -> bool {
         let input = self.custody.take_input();
         let result = catch_unwind(AssertUnwindSafe(|| drop(input)));
@@ -765,6 +788,14 @@ pub(crate) struct PreparationQueueSnapshot {
 pub(crate) enum PreparationQueueSnapshotError {
     Poisoned,
 }
+impl std::fmt::Display for PreparationQueueSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Poisoned => f.write_str("preparation queue snapshot lock is poisoned"),
+        }
+    }
+}
+impl std::error::Error for PreparationQueueSnapshotError {}
 pub(crate) struct PreparationQueue<J: QueuedPreparation = PreparationJob>(Arc<Queue<J>>);
 impl<J: QueuedPreparation> Clone for PreparationQueue<J> {
     fn clone(&self) -> Self {
@@ -778,24 +809,17 @@ pub(crate) struct RunningPreparation<J: QueuedPreparation = PreparationJob> {
     job: Option<J>,
 }
 impl<J: QueuedPreparation> PreparationQueue<J> {
-    pub(crate) fn new(contexts: usize, jobs: usize, per_context: usize, workers: usize) -> Self {
+    pub(crate) fn new(jobs: usize, per_context: usize, workers: usize) -> Self {
         Self::with_queue(
-            FairWorkQueue::new(contexts, jobs, per_context),
-            contexts,
+            FairWorkQueue::new(jobs, per_context),
             jobs,
             per_context,
             workers,
         )
     }
-    pub(crate) fn eligible_fifo(
-        contexts: usize,
-        jobs: usize,
-        per_context: usize,
-        workers: usize,
-    ) -> Self {
+    pub(crate) fn eligible_fifo(jobs: usize, per_context: usize, workers: usize) -> Self {
         Self::with_queue(
-            FairWorkQueue::eligible_fifo(contexts, jobs, per_context),
-            contexts,
+            FairWorkQueue::eligible_fifo(jobs, per_context),
             jobs,
             per_context,
             workers,
@@ -803,12 +827,11 @@ impl<J: QueuedPreparation> PreparationQueue<J> {
     }
     fn with_queue(
         fair: FairWorkQueue<HostFairnessGroup, Key>,
-        contexts: usize,
         jobs: usize,
         per_context: usize,
         workers: usize,
     ) -> Self {
-        assert!(contexts > 0 && jobs > 0 && per_context > 0 && workers > 0);
+        assert!(jobs > 0 && per_context > 0 && workers > 0);
         Self(Arc::new(Queue {
             state: Mutex::new(QueueState {
                 fair,
@@ -928,7 +951,9 @@ impl<J: QueuedPreparation> RunningPreparation<J> {
         result
     }
 }
+#[cfg(test)]
 impl RunningPreparation<PreparationJob> {
+    #[cfg(test)]
     pub(crate) fn run<T>(
         self,
         host: impl FnOnce(TaskCreationInput, PreparationParent) -> T,

@@ -26,9 +26,10 @@ use novarocks_control_runtime::{
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     completion::{CompletionError, ConsumerKind, Consumption, ReturnState},
     identity::{ConsumerId, DimensionId, Generation},
+    owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
 };
 use std::mem::ManuallyDrop;
@@ -41,6 +42,17 @@ fn dimension() -> DimensionId {
 }
 fn resources() -> ResourceVector {
     ResourceVector::new([(dimension(), 3)]).unwrap()
+}
+fn reported_resources() -> ReservationResources {
+    ReservationResources::new(
+        resources(),
+        OwnedSlotNeed {
+            work_headers: 1,
+            completions: 1,
+            captures: 1,
+            ..OwnedSlotNeed::default()
+        },
+    )
 }
 fn consumers() -> [ConsumerId; 2] {
     [ConsumerId::new(1).unwrap(), ConsumerId::new(2).unwrap()]
@@ -56,12 +68,12 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let ledger = RuntimeLedger::new(resources(), 2, 2);
-        let scope = ledger.open_scope_next(None, generation(), 2, 1).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(resources());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation(),
-                resources(),
+                reported_resources(),
                 WorkKind::Step,
                 WorkAdmission::External,
             )
@@ -70,9 +82,8 @@ impl Fixture {
             .unwrap();
         let [owner, observer] = consumers();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation(),
-            work.id(),
             2,
             [
                 (
@@ -118,9 +129,12 @@ impl Fixture {
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
         assert_eq!(self.ledger.reap_scope_ready(child.id(), 1).unwrap(), 1);
-        capacity.release(&ResourceVector::default()).unwrap();
+        capacity.finish().unwrap();
+        let parent_work = self.scope.snapshot().unwrap().work;
         self.ledger.remove_scope(child.id()).unwrap();
-        assert_eq!(self.ledger.reap_scope_ready(self.scope.id(), 1).unwrap(), 1);
+        assert_eq!(self.scope.snapshot().unwrap().work, parent_work - 1);
+        // Only the separately exited original parent remains ready. Its real
+        // role/report and header retirement still belong to finish().
     }
     fn finish(self) {
         assert!(self.role.try_retire().unwrap());
@@ -138,7 +152,11 @@ fn started_unpublished_exit_keeps_the_original_return_and_real_child_retirement_
         .authority
         .as_mut()
         .unwrap()
-        .open_child_scope_with_root(generation(), 1, 0, WorkKind::Cleanup)
+        .open_child_scope_with_root(
+            generation(),
+            WorkKind::Cleanup,
+            ReservationResources::work_only(),
+        )
         .unwrap();
     f.start();
     f.sender.take().unwrap().publish(29).unwrap();

@@ -25,7 +25,7 @@ use crate::control_runtime::{
 
 #[test]
 fn unknown_task_request_is_refused_without_a_direct_context_request_fallback() {
-    let f = original_context(1, StorageNeed::default());
+    let f = original_context(1);
     let ready = ready(&f, 1);
     let missing = task(f.identity, 1);
     let refusal = f

@@ -648,7 +648,7 @@ impl Scenario for QueryTimeout {
         context.action("observed in-flight distributed query resources before timeout");
         let error = stream.read_timeout_query_error()?;
         ensure!(
-            error.contains("timed out") || error.contains("timeout"),
+            error.starts_with("[query.execution.deadline_exceeded]"),
             "expected MySQL timeout error, got: {error}"
         );
         context.action(format!("received expected MySQL timeout error: {error}"));

@@ -31,7 +31,7 @@ use crate::control_runtime::{
     request_endpoint::RequestNotice,
 };
 use novarocks_control_runtime::driver::{ActorRuntime, EffectTicket};
-use novarocks_control_runtime_core::identity::{ScopeId, WorkId};
+use novarocks_control_runtime_core::identity::{Generation, ScopeId, WorkId};
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
 use novarocks_execution_contract::{AbortCause, QueryContextRef};
 use novarocks_worker_protocol::context::ContextEffect;
@@ -41,6 +41,18 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex},
 };
+
+/// Custody of one actual Core-authored close action. Counts describe handoff
+/// of that action's original fanout, never Task completion or physical exit.
+pub(in crate::control_runtime::context_host) struct ContextCloseFanout {
+    pub(in crate::control_runtime::context_host) generation: Generation,
+    pub(in crate::control_runtime::context_host) reason: Option<AbortCause>,
+    pub(in crate::control_runtime::context_host) targets: Option<usize>,
+    pub(in crate::control_runtime::context_host) staged: usize,
+    pub(in crate::control_runtime::context_host) ticket: Option<EffectTicket<WorkerAction>>,
+    pub(in crate::control_runtime::context_host) gate:
+        Arc<crate::control_runtime::context_close::ContextCloseGate>,
+}
 
 struct State {
     ticket: Option<ManuallyDrop<EffectTicket<WorkerAction>>>,
@@ -60,11 +72,15 @@ struct Custody {
     // This same finite effect cell retains Unknown on callback/capture panic.
     // It is not a second obligation index or a replacement payment.
     retained: Mutex<Option<Arc<Self>>>,
+    gate: Option<Arc<crate::control_runtime::context_close::ContextCloseGate>>,
 }
 #[must_use = "The original close effect must execute or retain its real capture"]
 pub(crate) struct ContextAdmissionCloseJob(Arc<Custody>);
 impl ContextAdmissionCloseJob {
-    pub(super) fn queue_key(&self) -> (ScopeId, WorkId) {
+    pub(in crate::control_runtime::context_host) fn context(&self) -> QueryContextRef {
+        self.0.context
+    }
+    pub(in crate::control_runtime::context_host) fn queue_key(&self) -> (ScopeId, WorkId) {
         self.0.key
     }
     fn notify(&self) {
@@ -83,7 +99,7 @@ impl ContextAdmissionCloseJob {
         );
         self.notify();
     }
-    pub(super) fn run(self) {
+    pub(in crate::control_runtime::context_host) fn run(self) {
         let host = {
             let mut state = self.0.state.lock().expect("original Context close capture");
             assert!(
@@ -135,6 +151,9 @@ impl ContextAdmissionCloseJob {
             self.fail();
             return;
         }
+        if let Some(gate) = &self.0.gate {
+            gate.complete();
+        }
         self.notify();
         let retained = self
             .0
@@ -146,13 +165,69 @@ impl ContextAdmissionCloseJob {
     }
 }
 impl ContextHostRecord {
-    pub(in crate::control_runtime::context_host) fn handoff_context_admission_close(
+    pub(in crate::control_runtime::context_host) fn stage_context_admission_close(
         &mut self,
         ticket: EffectTicket<WorkerAction>,
+        generation: Generation,
         reason: Option<AbortCause>,
+    ) {
+        let fanouts = &mut self.resources.pending_host_jobs.close_fanouts;
+        assert!(
+            !fanouts
+                .iter()
+                .any(|f| f.generation == generation && f.reason == reason),
+            "one original close action per intent"
+        );
+        // The protocol admits one normal Quiesce and one first Abort.
+        assert!(fanouts.len() < 2, "original Context close action inventory");
+        fanouts.push(ContextCloseFanout {
+            generation,
+            reason,
+            targets: None,
+            staged: 0,
+            ticket: Some(ticket),
+            gate: Arc::default(),
+        });
+    }
+
+    pub(in crate::control_runtime::context_host) fn advance_context_admission_closes(
+        &mut self,
         ports: &TaskDriverPorts,
-    ) -> Result<(), TaskDriverRefusal> {
-        self.handoff_context_admission_close_for_owner(ticket, reason, ports, None)
+    ) -> Result<(), TaskDriverError> {
+        for index in 0..self.resources.pending_host_jobs.close_fanouts.len() {
+            let fanout = &mut self.resources.pending_host_jobs.close_fanouts[index];
+            let gate = fanout.gate.clone();
+            let reason = fanout.reason;
+            let ticket = if fanout.targets == Some(fanout.staged) {
+                fanout.ticket.take()
+            } else {
+                None
+            };
+            if let Some(ticket) = ticket
+                && let Err(refusal) = self.handoff_context_admission_close_for_owner(
+                    ticket,
+                    reason,
+                    ports,
+                    None,
+                    Some(gate),
+                )
+            {
+                self.resources.pending_host_jobs.close_fanouts[index].ticket = refusal.ticket;
+                return Err(refusal.error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::control_runtime::context_host) fn advance_context_close_notifications(
+        &self,
+        budget: usize,
+    ) -> bool {
+        let mut runnable = false;
+        for fanout in &self.resources.pending_host_jobs.close_fanouts {
+            runnable |= fanout.gate.notify_ready(budget);
+        }
+        runnable
     }
 
     pub(in crate::control_runtime::context_host) fn handoff_failed_context_admission_close(
@@ -161,8 +236,15 @@ impl ContextHostRecord {
         reason: Option<AbortCause>,
         ports: &TaskDriverPorts,
         stage: &super::super::failure::ScopePublicationsDrained<'_>,
+        gate: Arc<crate::control_runtime::context_close::ContextCloseGate>,
     ) -> Result<(), TaskDriverRefusal> {
-        self.handoff_context_admission_close_for_owner(ticket, reason, ports, Some(stage))
+        self.handoff_context_admission_close_for_owner(
+            ticket,
+            reason,
+            ports,
+            Some(stage),
+            Some(gate),
+        )
     }
 
     fn handoff_context_admission_close_for_owner(
@@ -171,6 +253,7 @@ impl ContextHostRecord {
         reason: Option<AbortCause>,
         ports: &TaskDriverPorts,
         failed: Option<&super::super::failure::ScopePublicationsDrained<'_>>,
+        gate: Option<Arc<crate::control_runtime::context_close::ContextCloseGate>>,
     ) -> Result<(), TaskDriverRefusal> {
         let reject = |error, ticket| TaskDriverRefusal {
             error,
@@ -205,7 +288,7 @@ impl ContextHostRecord {
             runtime: self.control_runtime.clone(),
             context: self.identity,
             reason,
-            key: (self.scope().id(), ticket.descriptor.work),
+            key: (ticket.descriptor.work.scope, ticket.descriptor.work.work),
             notice: self.ready_notice().clone(),
             request: self.request_notice_for_input(ticket.input),
             health: protocol.execution_health(),
@@ -216,6 +299,7 @@ impl ContextHostRecord {
                 panic: None,
             }),
             retained: Mutex::new(None),
+            gate,
         });
         *owner.retained.lock().expect("same original close custody") = Some(owner.clone());
         // Busy retains this same original effect/capture in physical_pending;

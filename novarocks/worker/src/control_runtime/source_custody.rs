@@ -21,10 +21,16 @@
 //! Other typed shared owners still need their author-owned retention boundary;
 //! this custodian is not an arbitrary error-graph or resource-alias tracer.
 
+mod retirement_notice;
+
+use retirement_notice::RetirementNotices;
+
 use super::{
     actors::WorkerAction, adopted_cleanup::AdoptedCleanupEffect, failure::ScopePublicationsDrained,
 };
-use crate::{task_completion_roles::AdmittedCompletionRole, task_port::TaskPendingNotice};
+#[cfg(test)]
+use crate::task_completion_roles::AdmittedCompletionRole;
+use crate::task_port::TaskPendingNotice;
 use novarocks_control_runtime::{
     completion::ReportSlot,
     driver::DriverError,
@@ -66,6 +72,7 @@ struct Custody {
     retirement: WorkRetirementObserver,
     exits: Mutex<Exits>,
     pending: Arc<dyn TaskPendingNotice>,
+    retirement_notices: Mutex<RetirementNotices>,
     health: Arc<ExecutionHealth>,
     retained: Mutex<Option<Arc<Self>>>,
     cleanup: Mutex<Option<AdoptedCleanupEffect>>,
@@ -98,8 +105,13 @@ impl std::fmt::Debug for Marker {
 }
 impl SourceRetentionCapability for Marker {}
 impl SourceCustody {
+    /// The actual financial owner; actor consumer identity is independent.
+    pub(crate) fn financial_scope(&self) -> &novarocks_control_runtime::transaction::ScopeHandle {
+        &self.0.scope
+    }
     /// All authority already belongs to the real admission owner. This binds
     /// no source yet, acquires no capacity and creates no new Work or report.
+    #[cfg(test)]
     pub(crate) fn from_admitted(
         task: TaskIdentity,
         admitted: AdmittedCompletionRole,
@@ -142,6 +154,7 @@ impl SourceCustody {
                 ..Exits::default()
             }),
             pending,
+            retirement_notices: Mutex::new(RetirementNotices::default()),
             health,
             retained: Mutex::new(None),
             cleanup: Mutex::new(None),
@@ -205,7 +218,7 @@ impl SourceCustody {
         drop(slot);
         // The physical exit may already have happened before this transfer.
         // Revisit the original owner once; waiting alone does not self-wake.
-        self.0.pending.pending();
+        self.notify_pending();
         Ok(())
     }
     /// Run before waiting for the old input's effect retirement. The same
@@ -322,13 +335,11 @@ impl SourceCustody {
         core_receipt: novarocks_control_runtime_core::completion::Consumption,
     ) -> Result<bool, ExitRoleError> {
         use novarocks_control_runtime_core::{completion::Consumption, identity::ConsumerId};
-        stage
-            .validate_scope(runtime, actor, &self.0.scope)
-            .map_err(|_| {
-                ExitRoleError::Runtime(
-                    novarocks_control_runtime::transaction::RuntimeError::UnknownScope,
-                )
-            })?;
+        stage.validate(runtime, actor).map_err(|_| {
+            ExitRoleError::Runtime(
+                novarocks_control_runtime::transaction::RuntimeError::UnknownScope,
+            )
+        })?;
         if self.phase() == ExitRolePhase::Retired {
             return Ok(false);
         }
@@ -337,8 +348,30 @@ impl SourceCustody {
         if core_receipt == Consumption::AbandonedByOwnerFailure
             && self.report().consumption(core)? == Consumption::Pending
         {
-            self.report()
-                .abandon_failed_owner(core, &self.0.scope, original_generation)?;
+            let original = stage.registration();
+            if original.initial_epoch() != original_generation {
+                return Err(ExitRoleError::Runtime(
+                    novarocks_control_runtime::transaction::RuntimeError::UnknownScope,
+                ));
+            }
+            let failure = runtime.failure_proof_for(original).map_err(|_| {
+                ExitRoleError::Runtime(
+                    novarocks_control_runtime::transaction::RuntimeError::UnknownScope,
+                )
+            })?;
+            let consumer = self
+                .report()
+                .bind_actor_consumer(runtime, original, core)
+                .map_err(|_| {
+                    ExitRoleError::Runtime(
+                        novarocks_control_runtime::transaction::RuntimeError::UnknownScope,
+                    )
+                })?;
+            consumer.abandon(&failure).map_err(|_| {
+                ExitRoleError::Runtime(
+                    novarocks_control_runtime::transaction::RuntimeError::UnknownScope,
+                )
+            })?;
             progressed = true;
         }
         if self.actual_exit_ready()? {
@@ -376,7 +409,7 @@ impl SourceCustody {
                 crate::failure_reason::WorkerFailureReason::CompletionWorkUnresolved.reason(),
             ),
         );
-        self.0.pending.pending();
+        self.notify_pending();
     }
     fn finish_authority(&self, authority: ExitAuthority) {
         self.observe_authority_exit(authority.exited());
@@ -390,7 +423,7 @@ impl SourceCustody {
                 .unresolved = true;
             self.report_unresolved();
         } else {
-            self.0.pending.pending();
+            self.notify_pending();
         }
     }
     /// Drain only on the host side after releasing its cut/ingress lock. A
@@ -487,7 +520,7 @@ impl SourceCustody {
         } else if let Some(authority) = authority {
             self.finish_authority(authority);
         } else {
-            self.0.pending.pending();
+            self.notify_pending();
         }
     }
     fn unused_exited(&self) {
@@ -573,7 +606,7 @@ impl Drop for Marker {
 mod tests {
     use super::*;
     use novarocks_control_runtime::{
-        lease::{CapacityBundle, WorkLease},
+        lease::{ReservationBundle, WorkLease},
         transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
     };
     use novarocks_control_runtime_core::{
@@ -609,7 +642,7 @@ mod tests {
         ledger: RuntimeLedger,
         scope: ScopeHandle,
         parent: WorkLease,
-        funding: CapacityBundle,
+        funding: ReservationBundle,
         custody: SourceCustody,
         permit: Option<SourcePermit>,
         health: Arc<ExecutionHealth>,
@@ -624,12 +657,12 @@ mod tests {
     fn fixture() -> Fixture {
         let generation = Generation::new(1).unwrap();
         let resources = ResourceVector::new([(dimension(), 1)]).unwrap();
-        let ledger = RuntimeLedger::new(resources.clone(), 2, 1);
-        let scope = ledger.open_scope_next(None, generation, 2, 1).unwrap();
+        let ledger = RuntimeLedger::new(resources.clone());
+        let scope = ledger.open_scope_next(None, generation).unwrap();
         let (mut parent, funding) = scope
             .reserve_next(
                 generation,
-                resources,
+                novarocks_control_runtime_core::capacity::ReservationResources::for_work(resources),
                 WorkKind::Business,
                 WorkAdmission::External,
             )
@@ -637,18 +670,25 @@ mod tests {
             .bind(WorkKind::Business)
             .unwrap();
         parent.start().unwrap();
-        let guard = scope
+        let mut guard = scope
             .reserve_child_next(
                 generation,
                 funding.id(),
-                ResourceVector::default(),
+                novarocks_control_runtime_core::capacity::ReservationResources::new(
+                    ResourceVector::default(),
+                    novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 1,
+                        captures: 1,
+                        ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
+                    },
+                ),
                 WorkKind::Cleanup,
             )
             .unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut guard,
             generation,
-            guard.work_id(),
             1,
             [(observer(), ConsumerKind::Observer)],
         )
@@ -749,8 +789,9 @@ mod tests {
             );
             assert_eq!(self.ledger.reap_scope_ready(self.scope.id(), 1).unwrap(), 1);
             self.funding
-                .release(&self.funding.resources().unwrap())
+                .release_quota(&self.funding.resources().unwrap().quota)
                 .unwrap();
+            self.funding.finish().unwrap();
             self.scope.close_external().unwrap();
             self.ledger.remove_scope(self.scope.id()).unwrap();
             assert!(self.ledger.is_empty());

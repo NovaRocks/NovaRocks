@@ -17,7 +17,11 @@
 
 //! Native ingress checks against the real 1FE+3BE process boundary.
 
-use super::native_creation::receipt_verdict;
+use super::native_creation::{
+    RawBackendSession, RawCreate, await_installed, ensure_accepted,
+    observe_all_canceled_and_stopped, outcome, quiesce_session, raw_create_identity,
+    receipt_verdict, session_control,
+};
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use h2::client;
@@ -125,6 +129,7 @@ impl Scenario for OuterPreflightRejection {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         let (connector, control_connector, authorization, _, _) = probe(context)?;
+        let before_worker = node_hot_resources(&read_backend_metrics(context, 0)?)?;
         let bad_timeout = header_rejection(
             &control_connector,
             HEARTBEAT_PATH,
@@ -205,19 +210,15 @@ impl Scenario for OuterPreflightRejection {
                 "{class} header-stage body gate did not record rejection"
             );
         }
-        let worker_used = metric(
-            &rows,
-            "novarocks_backend_worker_context_reservations",
-            &[("dimension", "used")],
-        )?;
+        let after_worker = node_hot_resources(&rows)?;
         let tasks_created = metric(
             &rows,
             "novarocks_backend_task_execution_tasks_created_total",
             &[],
         )?;
         ensure!(
-            worker_used == 0.0 && tasks_created == 0.0,
-            "preflight rejection escaped into Worker: reservations={worker_used} created={tasks_created}"
+            after_worker == before_worker && tasks_created == 0.0,
+            "preflight rejection escaped into Worker: before={before_worker:?} after={after_worker:?} created={tasks_created}"
         );
         context.action("Tower body_limit counters advanced; Worker reservations and created tasks remained zero");
         Ok(())
@@ -460,23 +461,33 @@ impl Scenario for CurrentGateObservation {
                     );
                 }
             }
-            let worker_used = metric(
+            let available = metric(
                 rows,
-                "novarocks_backend_worker_context_reservations",
-                &[("dimension", "used")],
-            )?;
-            let worker_limit = metric(
-                rows,
-                "novarocks_backend_worker_context_reservations",
-                &[("dimension", "limit")],
+                "novarocks_backend_worker_node_snapshot_available",
+                &[],
             )?;
             ensure!(
-                worker_used == 0.0 && worker_limit > 0.0,
-                "BE[{index}] Worker reservation readout invalid: used={worker_used} limit={worker_limit}"
+                available == 1.0,
+                "BE[{index}] original Node resource snapshot is unavailable"
             );
+            for resource in [
+                "active_tasks",
+                "preparing_tasks",
+                "preparing_bytes",
+                "requests",
+            ] {
+                let used = metric(
+                    rows,
+                    "novarocks_backend_worker_node_resources",
+                    &[("resource", resource)],
+                )?;
+                ensure!(
+                    used == 0.0,
+                    "BE[{index}] original Node {resource} was live at rest: {used}"
+                );
+            }
             for (source, expected) in [
                 ("native_ingress", 1.0),
-                ("worker_context_reservation", 1.0),
                 ("exchange_slot", 0.0),
                 ("memory_charge", 0.0),
             ] {
@@ -490,7 +501,7 @@ impl Scenario for CurrentGateObservation {
                     "BE[{index}] {source} availability={available}, expected={expected}"
                 );
             }
-            context.action(format!("BE[{index}] current Native slots and Worker reservations exposed at rest; future Exchange/MEM readouts explicitly unavailable"));
+            context.action(format!("BE[{index}] current Native slots and actual Node charged resources exposed at rest; future Exchange/MEM readouts explicitly unavailable"));
         }
         let (connector, control_connector, authorization, backend, compatibility_id) =
             probe(context)?;
@@ -518,11 +529,11 @@ impl Scenario for CurrentGateObservation {
             held.await_entered(context.deadline())?;
             wait_ingress_slot(context, "ordinary", "running", 1.0)?;
             context.action(
-                "BE[0] ordinary running slot rose to one during a real held Worker closure",
+                "BE[0] ordinary running slot rose to one during its original held asynchronous Native request",
             );
             held.release_and_join()?;
             wait_ingress_slot(context, "ordinary", "running", 0.0)?;
-            context.action("BE[0] ordinary running slot returned to zero after closure release");
+            context.action("BE[0] ordinary running slot returned to zero after the original Native request exited");
             Ok(())
         })();
         held.finish_after(primary)
@@ -575,7 +586,7 @@ impl Scenario for BlockingSaturationControl {
         let targets = (0..8).map(|query| (0, query, None)).collect::<Vec<_>>();
         Ok(Some(self.intent.freeze(
             "ingress-hold",
-            8,
+            10,
             &targets,
             false,
             cluster_size,
@@ -587,20 +598,15 @@ impl Scenario for BlockingSaturationControl {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         let (connector, control_connector, authorization, backend, compatibility_id) =
             probe(context)?;
-        let releasable = establish_releasable_context(
-            &connector,
-            &control_connector,
-            &authorization,
-            backend,
-            compatibility_id,
-            context.deadline(),
-        )?;
         let intent = self.intent.get()?;
         intent.verify_backend(0, backend)?;
         ensure!(
             context.deadline() == intent.deadline,
             "Native ingress deadline changed after freeze"
         );
+        // Positively observe the initial real owner inventory; do not assume
+        // that a freshly launched process has no active Context custody.
+        wait_execution_custody(context, 0.0)?;
         let operations = held_operations(
             &intent,
             &control_connector,
@@ -615,6 +621,33 @@ impl Scenario for BlockingSaturationControl {
             compatibility_id,
             context.deadline(),
         )?;
+        let releasable_query = intent
+            .queries
+            .get(8)
+            .context("missing declared control Context")?;
+        let (releasable, _) = establish_declared_context(
+            &connector,
+            &control_connector,
+            &authorization,
+            backend,
+            compatibility_id,
+            (releasable_query.context(backend), None),
+            context.deadline(),
+        )?;
+        let expiring_query = intent
+            .queries
+            .get(9)
+            .context("missing declared timer Context")?;
+        let (expiring, expiring_lease) = establish_declared_context(
+            &connector,
+            &control_connector,
+            &authorization,
+            backend,
+            compatibility_id,
+            (expiring_query.context(backend), Some(1_000)),
+            context.deadline(),
+        )?;
+        let before_expiry = wait_execution_custody(context, 2.0)?;
         let running_limit = metric(
             &read_backend_metrics(context, 0)?,
             "novarocks_backend_native_ingress_slots",
@@ -638,11 +671,98 @@ impl Scenario for BlockingSaturationControl {
         let primary = (|| -> Result<()> {
             held.await_entered(context.deadline())?;
             wait_ingress_slot(context, "ordinary", "running", 8.0)?;
-            context.action("BE[0] eight real ordinary Worker closures held; ordinary blocking pool and running gate full");
+            context.action("BE[0] eight original asynchronous Native requests retained their actual ordinary running permits before Worker transfer; the ordinary running gate is full");
 
             held.start_waiter(&authorization, operation.clone())?;
             wait_ingress_slot(context, "ordinary", "waiting", 1.0)?;
             context.action("ninth ordinary request visibly waited at Native gate");
+
+            // Management sampling cannot deliver a Worker input to this
+            // Context. Its actual execution Scope must disappear BEFORE a
+            // typed RPC probe could itself observe time and expire the lease.
+            let after_expiry = wait_execution_custody(context, 1.0)?;
+            ensure!(
+                metric(
+                    &after_expiry,
+                    "novarocks_backend_native_ingress_slots",
+                    &[
+                        ("class", "ordinary"),
+                        ("phase", "running"),
+                        ("dimension", "used")
+                    ]
+                )? == 8.0
+                    && metric(
+                        &after_expiry,
+                        "novarocks_backend_native_ingress_slots",
+                        &[
+                            ("class", "ordinary"),
+                            ("phase", "waiting"),
+                            ("dimension", "used")
+                        ]
+                    )? == 1.0,
+                "original ordinary saturation ended before the independent timer observation"
+            );
+            let probe = proto::ApplyTaskControlOperationsRequest {
+                operations: vec![proto::TaskControlOperation {
+                    envelope: Some(raw_operation_envelope(15_000)),
+                    control: Some(proto::task_control_operation::Control::RenewLease(
+                        proto::RenewQueryExecutionLeaseRequest {
+                            query_context: Some(expiring.clone()),
+                            lease: Some(proto::QueryExecutionLeaseGrant {
+                                sequence: expiring_lease
+                                    .sequence
+                                    .checked_add(1)
+                                    .context("timer Context lease sequence overflow")?,
+                                valid_for_millis: expiring_lease.requested_valid_for_millis,
+                            }),
+                        },
+                    )),
+                }],
+            };
+            let probe_id = probe.operations[0]
+                .envelope
+                .as_ref()
+                .and_then(|envelope| envelope.operation_id.clone())
+                .context("timer probe omitted operation id")?;
+            let timer = exact_probe_receipt(
+                raw_unary_response_until(
+                    &control_connector,
+                    CONTROL_PATH,
+                    &authorization,
+                    probe,
+                    intent.deadline,
+                )?,
+                &probe_id,
+                proto::TaskOperationOutcome::LeaseExpired,
+                "original timer Context",
+            )?;
+            let Some(proto::task_operation_verdict::Ack::QueryContext(ack)) =
+                &receipt_verdict(&timer)?.ack
+            else {
+                anyhow::bail!("timer Context omitted its typed Context receipt");
+            };
+            ensure!(
+                ack.query_context.as_ref() == Some(&expiring)
+                    && matches!(
+                        proto::QueryContextState::try_from(ack.state),
+                        Ok(proto::QueryContextState::Aborting
+                            | proto::QueryContextState::TerminalRetained)
+                    ),
+                "the already-retired timer Context changed identity/state: {ack:?}"
+            );
+            fs::write(
+                context
+                    .scenario_root()
+                    .join("ordinary-full-original-timer.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({"context":format!("{expiring:?}"),
+                    "initial_sequence":expiring_lease.sequence,
+                    "requested_valid_for_millis":expiring_lease.requested_valid_for_millis,
+                    "effective_valid_for_millis":expiring_lease.effective_valid_for_millis,
+                    "before_probe_execution_custody":after_expiry,
+                    "before_expiry_execution_custody":before_expiry,
+                    "outcome":"LeaseExpired"}))?,
+            )?;
+            context.action("the original short-lease Context's actual execution custody fell from two to one while all eight ordinary permits remained held, before any Worker probe; its exact later control receipt confirmed LeaseExpired");
 
             // No task was created in this context. A typed Worker refusal proves
             // control-lane progress without claiming that a real task was canceled.
@@ -673,7 +793,7 @@ impl Scenario for BlockingSaturationControl {
                 "task-free Cancel did not return its Worker-owned refusal: {receipt:?}"
             );
             context.action(
-            "task-free Cancel returned the exact Worker refusal while eight ordinary closures and one waiter were present",
+            "task-free Cancel returned the exact Worker refusal while eight original ordinary requests and one waiter were present",
         );
 
             let quiesce_request = control_quiesce(releasable.clone());
@@ -747,6 +867,28 @@ impl Scenario for BlockingSaturationControl {
             "Release of the exact quiesced, task-free context returned Released and TerminalRetained under ordinary saturation",
         );
 
+            let still_full = read_backend_metrics(context, 0)?;
+            ensure!(
+                metric(
+                    &still_full,
+                    "novarocks_backend_native_ingress_slots",
+                    &[
+                        ("class", "ordinary"),
+                        ("phase", "running"),
+                        ("dimension", "used")
+                    ]
+                )? == 8.0
+                    && metric(
+                        &still_full,
+                        "novarocks_backend_native_ingress_slots",
+                        &[
+                            ("class", "ordinary"),
+                            ("phase", "waiting"),
+                            ("dimension", "used")
+                        ]
+                    )? == 1.0,
+                "original ordinary saturation ended before control completion"
+            );
             held.release_and_join()?;
             let queued = held.join_waiter()?;
             ensure!(
@@ -995,11 +1137,12 @@ impl Scenario for RegistryContentionControl {
         binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
-        let targets = (0..1).map(|query| (0, query, None)).collect::<Vec<_>>();
+        // One original Context's already Accepted preparation is the held
+        // host action. The second Context uses the same live backend/poller.
         Ok(Some(self.intent.freeze(
-            "registry-hold",
-            1,
-            &targets,
+            "preparation-hold",
+            2,
+            &[(0, 0, Some(1))],
             false,
             cluster_size,
             binary,
@@ -1008,171 +1151,153 @@ impl Scenario for RegistryContentionControl {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        let epoch = Instant::now();
         let intent = self.intent.get()?;
         ensure!(
             context.deadline() == intent.deadline,
-            "Native registry deadline changed after freeze"
+            "Native host-action deadline changed after freeze"
         );
-        let mut rendezvous = RegistryRendezvous::bind(intent.token(0)?)?;
-        let (connector, control_connector, authorization, backend, compatibility_id) =
-            probe(context)?;
-        intent.verify_backend(0, backend)?;
-        let operation = held_operations(
-            &intent,
-            &control_connector,
-            &authorization,
-            backend,
-            compatibility_id,
-        )?
-        .remove(0)
-        .0;
-        let original_deadline = intent.deadline;
-        let before = read_backend_metrics(context, 0)?;
-        let control_started_before = metric_or_zero(
-            &before,
-            "novarocks_backend_native_control_queue_wait_seconds_count",
-            &[("outcome", "started")],
-        )?;
-        let registry_wait_before = metric(
-            &before,
-            "novarocks_backend_worker_registry_lock_observation",
-            &[("phase", "wait"), ("statistic", "samples")],
-        )?;
-        let acquire_connector = connector.clone();
-        let acquire_authorization = authorization.clone();
-        let acquire = JoinedActor::spawn(move || {
-            raw_unary_response_until::<_, proto::ApplyTaskOperationsResponse>(
-                &acquire_connector,
-                ORDINARY_PATH,
-                &acquire_authorization,
-                proto::ApplyTaskOperationsRequest {
-                    operations: vec![operation],
-                },
-                original_deadline,
-            )
-        });
-        rendezvous.await_entered(backend, context.deadline())?;
-        context.action("BE[0] first Acquire held the real Worker registry mutex before mutation");
+        ensure!(
+            context.handle().be_count() == REQUIRED_BACKENDS,
+            "host-action isolation requires the original native 1FE+3BE cluster"
+        );
+        let mut rendezvous = HostActionRendezvous::bind(intent.token(0)?)?;
+        let query = intent
+            .queries
+            .first()
+            .context("missing held Context identity")?;
+        let held =
+            RawBackendSession::establish_declared(context, 0, query.query_id, query.frontend)?;
+        intent.verify_backend(0, held.backend)?;
+        let mut create = RawCreate::values(&held, 1);
+        // Reuse the existing capacity receiver shape: it remains live until
+        // its own normal fence, rather than completing an unrelated query.
+        create.pipeline_dop = 1;
+        create.exchange_input = true;
+        ensure_accepted(&held, &create)?;
+        rendezvous.await_entered(&held, &create, context.deadline())?;
+        context.action("one Context's exact Accepted preparation entered its supervised Native host action; no poller or registry lock is held");
 
-        let control_connector = control_connector.clone();
-        let control_authorization = authorization.clone();
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let control_thread = JoinedActor::spawn(move || {
-            let result = raw_unary_response_until::<_, proto::ApplyTaskOperationsResponse>(
-                &control_connector,
-                CONTROL_PATH,
-                &control_authorization,
-                control_cancel(backend),
-                original_deadline,
-            );
-            let _ = done_tx.send(result);
-        });
-        let deadline = context
-            .deadline()
-            .min(Instant::now() + Duration::from_secs(10));
-        loop {
-            let rows = read_backend_metrics(context, 0)?;
-            let started = metric_or_zero(
-                &rows,
-                "novarocks_backend_native_control_queue_wait_seconds_count",
-                &[("outcome", "started")],
-            )?;
-            let running = metric(
-                &rows,
-                "novarocks_backend_native_ingress_slots",
-                &[
-                    ("class", "control"),
-                    ("phase", "running"),
-                    ("dimension", "used"),
-                ],
-            )?;
-            if started > control_started_before && running == 1.0 {
-                break;
-            }
-            ensure!(
-                Instant::now() < deadline,
-                "control executor did not start while registry lock was held: started={started} running={running}"
-            );
-            thread::yield_now();
-        }
+        let query = intent
+            .queries
+            .get(1)
+            .context("missing sibling Context identity")?;
+        let sibling =
+            RawBackendSession::establish_declared(context, 0, query.query_id, query.frontend)?;
+        intent.verify_backend(0, sibling.backend)?;
         ensure!(
-            matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
-            "control completed before Worker registry lock was released"
+            held.backend == sibling.backend && held.query_id != sibling.query_id,
+            "host-action isolation must use two actual Contexts on the same backend"
         );
-        context.action("control executor started and held one control-running slot, but its receipt waited for the Worker mutex");
-        rendezvous.release()?;
-        let acquisition = acquire.join()??;
-        ensure!(
-            acquisition.grpc_status == 0,
-            "registry Acquire failed after release: {:?}",
-            acquisition.grpc_message
-        );
-        let control = done_rx.recv_timeout(
-            context
-                .remaining("join registry control actor")?
-                .min(Duration::from_secs(10)),
-        )??;
-        control_thread.join()?;
-        ensure!(
-            control.grpc_status == 0
-                && control
-                    .message
-                    .as_ref()
-                    .is_some_and(|body| body.receipts.len() == 1),
-            "control did not complete after registry release: {:?}",
-            control.grpc_message
-        );
-        wait_ingress_slot(context, "control", "running", 0.0)?;
-        let after = read_backend_metrics(context, 0)?;
-        let registry_wait_after = metric(
-            &after,
-            "novarocks_backend_worker_registry_lock_observation",
-            &[("phase", "wait"), ("statistic", "samples")],
+        let original = sibling
+            .establish_request
+            .as_ref()
+            .context("sibling lost original Establish")?;
+        let Some(proto::task_operation::Operation::UpdateQueryContext(update)) =
+            &original.operation
+        else {
+            anyhow::bail!("sibling original operation is not a Context update");
+        };
+        let Some(proto::update_query_context_request::Command::Establish(establish)) =
+            &update.command
+        else {
+            anyhow::bail!("sibling original update is not Establish");
+        };
+        let mut lease = establish
+            .initial_lease
+            .context("sibling omitted its actual initial lease")?;
+        lease.sequence = lease
+            .sequence
+            .checked_add(1)
+            .context("sibling lease sequence overflow")?;
+        let renewed = session_control(
+            &sibling,
+            proto::task_control_operation::Control::RenewLease(
+                proto::RenewQueryExecutionLeaseRequest {
+                    query_context: Some(sibling.context_under(sibling.frontend, 1)),
+                    lease: Some(lease),
+                },
+            ),
         )?;
         ensure!(
-            registry_wait_after > registry_wait_before,
-            "Worker lock wait samples did not advance after true contention"
+            outcome(&renewed)? == proto::TaskOperationOutcome::Accepted,
+            "same-backend sibling renewal did not complete while the host action was held: {renewed:?}"
         );
-        context.action(format!("registry lock released; control receipt completed, lock wait samples before/after={registry_wait_before}/{registry_wait_after}"));
+        let Some(proto::task_operation_verdict::Ack::QueryContext(ack)) =
+            &receipt_verdict(&renewed)?.ack
+        else {
+            anyhow::bail!("sibling renewal omitted its exact Context receipt");
+        };
+        let receipt = ack
+            .lease
+            .as_ref()
+            .context("sibling renewal omitted its lease receipt")?;
+        ensure!(
+            ack.query_context.as_ref() == Some(&sibling.context_under(sibling.frontend, 1))
+                && ack.state == proto::QueryContextState::Active as i32
+                && receipt.sequence == lease.sequence
+                && receipt.requested_valid_for_millis == lease.valid_for_millis
+                && receipt.effective_valid_for_millis > 0
+                && receipt.effective_valid_for_millis <= lease.valid_for_millis,
+            "sibling renewal changed its original Context or lease: {ack:?}"
+        );
+        let sibling_fence = quiesce_session(&sibling)?;
+        ensure!(
+            sibling_fence.fence_version != 0 && sibling_fence.accepted_tasks.is_empty(),
+            "sibling fence invented Task membership: {sibling_fence:?}"
+        );
+        ensure!(
+            sibling.release_when_ready(context)? == proto::ReleaseQueryContextOutcome::Released,
+            "same-backend sibling did not actually release while the host action was held"
+        );
+        context.action("the independent same-BE Context established, renewed its exact next lease, fenced and actually Released before the held host action was released");
+
+        let replay = held.apply(
+            create.operation(),
+            "observe the still-held original preparation",
+        )?;
+        ensure!(
+            outcome(&replay)? == proto::TaskOperationOutcome::Idempotent,
+            "held Task replay changed original ownership: {replay:?}"
+        );
+        let Some(proto::task_operation_verdict::Ack::CreateTask(ack)) =
+            &receipt_verdict(&replay)?.ack
+        else {
+            anyhow::bail!("held Task replay omitted its exact Create acknowledgement");
+        };
+        let status = ack
+            .current_status
+            .as_ref()
+            .context("held Task omitted its status")?;
+        ensure!(
+            status.installed == Some(false) && status.state == proto::TaskState::Planned as i32,
+            "held host action unexpectedly installed or stopped before release: {status:?}"
+        );
+        rendezvous.release()?;
+        await_installed(context, &held, &create)?;
+        let fence = quiesce_session(&held)?;
+        let identities = vec![raw_create_identity(&create)];
+        ensure!(
+            fence.fence_version != 0 && fence.accepted_tasks == identities,
+            "held Context fence changed original Task membership: {fence:?}"
+        );
+        observe_all_canceled_and_stopped(context, &held, &fence, &identities)?;
+        ensure!(
+            held.release_when_ready(context)? == proto::ReleaseQueryContextOutcome::Released,
+            "held Context did not actually release after its host action exited"
+        );
+        super::result_delivery_support::await_idle(
+            context,
+            "context-host-action",
+            "after-original-release",
+            epoch,
+        )?;
+        context.action("the original held host action exited, installed and normally stopped its exact Task, and both Contexts released with the existing owner-idle barrier");
         Ok(())
     }
 }
 
-struct JoinedActor<T>(Option<thread::JoinHandle<T>>);
-impl<T: Send + 'static> JoinedActor<T> {
-    fn spawn(action: impl FnOnce() -> T + Send + 'static) -> Self {
-        Self(Some(thread::spawn(action)))
-    }
-    fn join(mut self) -> Result<T> {
-        self.0
-            .take()
-            .context("Native actor already joined")?
-            .join()
-            .map_err(|_| anyhow::anyhow!("Native registry actor panicked"))
-    }
-}
-impl<T> Drop for JoinedActor<T> {
-    fn drop(&mut self) {
-        if let Some(actor) = self.0.take() {
-            let _ = actor.join();
-        }
-    }
-}
-
-fn metric_or_zero(rows: &[Value], name: &str, labels: &[(&str, &str)]) -> Result<f64> {
-    if rows.iter().any(|row| {
-        row["tags"]["metric"] == name
-            && labels
-                .iter()
-                .all(|(key, value)| row["tags"][*key] == *value)
-    }) {
-        metric(rows, name, labels)
-    } else {
-        Ok(0.0)
-    }
-}
-
-struct RegistryRendezvous {
+struct HostActionRendezvous {
     deadline: Option<Instant>,
     path: PathBuf,
     listener: UnixListener,
@@ -1180,7 +1305,7 @@ struct RegistryRendezvous {
     token: String,
 }
 
-impl RegistryRendezvous {
+impl HostActionRendezvous {
     fn bind(token: &str) -> Result<Self> {
         let path = novarocks_failpoint::native_registry_hold_socket_path(token)
             .map_err(anyhow::Error::msg)?;
@@ -1197,7 +1322,8 @@ impl RegistryRendezvous {
 
     fn await_entered(
         &mut self,
-        backend: BackendProcessId,
+        session: &RawBackendSession,
+        create: &RawCreate,
         scenario_deadline: Instant,
     ) -> Result<()> {
         let deadline = scenario_deadline.min(Instant::now() + Duration::from_secs(10));
@@ -1207,7 +1333,7 @@ impl RegistryRendezvous {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     ensure!(
                         Instant::now() < deadline,
-                        "Worker registry lock rendezvous did not arrive"
+                        "the original preparation host-action rendezvous did not arrive"
                     );
                     thread::yield_now();
                 }
@@ -1217,8 +1343,16 @@ impl RegistryRendezvous {
         let marker = read_marker(&mut stream, deadline)?;
         self.deadline = Some(scenario_deadline);
         ensure!(
-            marker == format!("NIR1 0 {backend} {}\n", self.token),
-            "unexpected Worker registry marker: {marker:?}"
+            marker
+                == format!(
+                    "NTP1 {} {} {} 1 1 {} {}\n",
+                    session.backend,
+                    session.query_id.hi,
+                    session.query_id.lo,
+                    create.task_id,
+                    self.token
+                ),
+            "unexpected original preparation host-action marker: {marker:?}"
         );
         self.stream = Some(stream);
         Ok(())
@@ -1228,16 +1362,16 @@ impl RegistryRendezvous {
         release_hold(
             self.stream
                 .as_mut()
-                .context("registry hold has not entered")?,
+                .context("original host action has not entered")?,
             self.deadline
-                .context("registry hold lacks original deadline")?,
+                .context("original host action lacks its original deadline")?,
         )?;
         self.stream = None;
         Ok(())
     }
 }
 
-impl Drop for RegistryRendezvous {
+impl Drop for HostActionRendezvous {
     fn drop(&mut self) {
         if let Some(stream) = &mut self.stream {
             close_hold(stream);
@@ -1467,30 +1601,30 @@ fn ticket_operation(
     ))
 }
 
-fn establish_releasable_context(
+fn establish_declared_context(
     connector: &NativeEndpointConnector,
     control_connector: &NativeEndpointConnector,
     authorization: &str,
     backend: BackendProcessId,
     compatibility_id: [u8; 32],
+    declared: (proto::QueryContextRef, Option<u64>),
     deadline: Instant,
-) -> Result<proto::QueryContextRef> {
-    let acquisition = ticket_operation(
+) -> Result<(proto::QueryContextRef, proto::QueryExecutionLeaseReceipt)> {
+    let (declared_context, lease_duration_millis) = declared;
+    let mut acquisition = ticket_operation(
         control_connector,
         authorization,
         backend,
         compatibility_id,
         deadline,
     )?;
-    let context = match acquisition.operation.as_ref() {
+    match acquisition.operation.as_mut() {
         Some(proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(request)) => {
-            request
-                .query_context
-                .clone()
-                .context("ticket operation omitted context")?
+            request.query_context = Some(declared_context.clone());
         }
         _ => anyhow::bail!("ticket helper produced wrong operation"),
-    };
+    }
+    let context = declared_context;
     let acquisition_id = acquisition
         .envelope
         .as_ref()
@@ -1523,7 +1657,67 @@ fn establish_releasable_context(
     let ticket_id = ticket
         .ticket_id
         .context("ticket acknowledgement omitted id")?;
-    let operation = raw_establish(context.clone(), ticket_id, Some(compatibility_id.to_vec()));
+    let mut operation = raw_establish(context.clone(), ticket_id, Some(compatibility_id.to_vec()));
+    let Some(proto::task_operation::Operation::UpdateQueryContext(update)) =
+        operation.operation.as_mut()
+    else {
+        anyhow::bail!("original Establish factory produced the wrong operation");
+    };
+    let Some(proto::update_query_context_request::Command::Establish(establish)) =
+        update.command.as_mut()
+    else {
+        anyhow::bail!("original Establish factory produced the wrong command");
+    };
+    let initial = establish
+        .initial_lease
+        .as_mut()
+        .context("original Establish omitted its lease grant")?;
+    if let Some(millis) = lease_duration_millis {
+        initial.valid_for_millis = millis;
+    }
+    let requested_sequence = initial.sequence;
+    let requested_duration = initial.valid_for_millis;
+    ensure!(
+        establish.catalog_set.is_some() && establish.initial_runtime_filter.is_some(),
+        "original Establish omitted its catalog or runtime-filter domain"
+    );
+    let credential = establish
+        .initial_credential
+        .as_ref()
+        .context("original Establish omitted its credential domain")?;
+    // Establish installs these actual three initial domains. Even empty
+    // catalog/filter content receives its first-version Apply receipt.
+    let expected_domains = vec![
+        proto::QueryContextDomainReceipt {
+            progression: proto::AcceptedDomainProgression::Apply as i32,
+            receipt: Some(
+                proto::query_context_domain_receipt::Receipt::CatalogBinding(
+                    proto::ScalarDomainReceipt {
+                        accepted_version: novarocks_execution_contract::DomainVersion::FIRST.get(),
+                    },
+                ),
+            ),
+        },
+        proto::QueryContextDomainReceipt {
+            progression: proto::AcceptedDomainProgression::Apply as i32,
+            receipt: Some(
+                proto::query_context_domain_receipt::Receipt::SharedDynamicFilter(
+                    proto::ScalarDomainReceipt {
+                        accepted_version: novarocks_execution_contract::DomainVersion::FIRST.get(),
+                    },
+                ),
+            ),
+        },
+        proto::QueryContextDomainReceipt {
+            progression: proto::AcceptedDomainProgression::Apply as i32,
+            receipt: Some(proto::query_context_domain_receipt::Receipt::Credential(
+                proto::QueryContextCredentialReceipt {
+                    lease_id: credential.lease_id,
+                    accepted_epoch: credential.epoch,
+                },
+            )),
+        },
+    ];
     let establish_id = operation
         .envelope
         .as_ref()
@@ -1558,14 +1752,88 @@ fn establish_releasable_context(
             && proto::QueryContextState::try_from(ack.state)
                 == Ok(proto::QueryContextState::Active)
             && ack.termination_cause.is_none()
-            && ack.accepted_domains.is_empty()
-            && lease.sequence == 0
-            && lease.requested_valid_for_millis == 30_000
+            && ack.accepted_domains == expected_domains
+            && lease.sequence == requested_sequence
+            && lease.requested_valid_for_millis == requested_duration
             && lease.effective_valid_for_millis > 0
             && lease.effective_valid_for_millis <= lease.requested_valid_for_millis,
         "Establish did not install the exact active context and initial facts: {ack:?}"
     );
-    Ok(context)
+    Ok((
+        context,
+        proto::QueryExecutionLeaseReceipt {
+            sequence: lease.sequence,
+            requested_valid_for_millis: lease.requested_valid_for_millis,
+            effective_valid_for_millis: lease.effective_valid_for_millis,
+        },
+    ))
+}
+
+/// Read management-only original execution custody. A timer proof must be
+/// recorded before any application input could itself advance that Context.
+fn node_hot_resources(rows: &[Value]) -> Result<[f64; 4]> {
+    ensure!(
+        metric(
+            rows,
+            "novarocks_backend_worker_node_snapshot_available",
+            &[]
+        )? == 1.0,
+        "original Node resource snapshot is unavailable"
+    );
+    let mut values = [0.0; 4];
+    for (index, resource) in [
+        "requests",
+        "active_tasks",
+        "preparing_tasks",
+        "preparing_bytes",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        values[index] = metric(
+            rows,
+            "novarocks_backend_worker_node_resources",
+            &[("resource", resource)],
+        )?;
+    }
+    Ok(values)
+}
+
+fn wait_execution_custody(context: &mut ScenarioContext, expected: f64) -> Result<Vec<Value>> {
+    let deadline = context
+        .deadline()
+        .min(Instant::now() + Duration::from_secs(10));
+    loop {
+        let rows = read_backend_metrics(context, 0)?;
+        let available = metric(
+            &rows,
+            "novarocks_backend_execution_quiescence_snapshot_available",
+            &[],
+        )?;
+        ensure!(
+            available == 0.0 || available == 1.0,
+            "invalid execution custody availability: {available}"
+        );
+        if available == 1.0 {
+            let actual = metric(
+                &rows,
+                "novarocks_backend_execution_quiescence",
+                &[("resource", "contexts_with_execution_custody")],
+            )?;
+            if actual == expected {
+                return Ok(rows);
+            }
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "actual execution custody did not reach {expected}"
+        );
+        thread::sleep(
+            context
+                .remaining("observe original execution custody")?
+                .min(Duration::from_millis(10)),
+        );
+    }
 }
 
 fn control_cancel(backend: BackendProcessId) -> proto::ApplyTaskControlOperationsRequest {
@@ -1745,7 +2013,7 @@ impl HeldOrdinary {
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         ensure!(
                             Instant::now() < deadline,
-                            "ordinary closure did not enter token={}",
+                            "ordinary asynchronous request did not enter token={}",
                             call.token
                         );
                         thread::yield_now();

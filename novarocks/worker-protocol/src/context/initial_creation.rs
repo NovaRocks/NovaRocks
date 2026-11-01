@@ -19,7 +19,7 @@
 //! precedes classification; actual installation supplies queued depths before
 //! the same bounded journal commits. No separate host-side domain authority exists.
 
-use super::{ContextCore, ContextEffect, ContextStep, CoreError, TaskShape};
+use super::{ContextEffect, ContextStep, CoreError, LiveContextCore, TaskShape};
 use crate::{
     creation::{AdmissionPort, AdmissionRefusal, CreationCost},
     domain::{TaskDomainInput, TaskDomainTransaction, TaskDomainTransactionProgress, TaskDomains},
@@ -60,7 +60,7 @@ pub(crate) enum InitialFinish {
     AlreadyDecided,
 }
 
-impl ContextCore {
+impl LiveContextCore {
     pub(super) fn loaded_task(
         &mut self,
         task: TaskIdentity,

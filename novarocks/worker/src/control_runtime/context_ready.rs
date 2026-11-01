@@ -19,11 +19,12 @@
 //! Common owns its one host ready queue; there is no Context scheduler here.
 
 use super::actors::WorkerActor;
+#[cfg(test)]
+use novarocks_control_runtime::transaction::RuntimeError;
 use novarocks_control_runtime::{
     driver::{ActorRegistration, ActorRuntime, DriverError},
-    transaction::{RuntimeError, ScopeHandle},
+    transaction::ScopeHandle,
 };
-use novarocks_control_runtime_core::identity::ScopeId;
 use novarocks_execution_contract::QueryContextRef;
 use std::sync::{
     Arc,
@@ -34,12 +35,13 @@ use std::sync::{
 pub(crate) enum ContextReadyError {
     Duplicate,
     Driver(DriverError),
+    #[cfg(test)]
     Runtime(RuntimeError),
 }
 struct Endpoint {
     runtime: ActorRuntime<WorkerActor>,
     context: QueryContextRef,
-    scope: ScopeHandle,
+    _scope: ScopeHandle,
     registration: ActorRegistration,
     version: AtomicU64,
 }
@@ -65,19 +67,26 @@ impl ContextReadyNotice {
         Ok(Self(Arc::new(Endpoint {
             runtime: runtime.clone(),
             context,
-            scope: scope.clone(),
+            _scope: scope.clone(),
             registration: registration.clone(),
             version: AtomicU64::new(0),
         })))
     }
+    #[cfg(test)]
     pub(crate) fn same_origin(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+    /// Read only the original runtime and actor registration binding. Public
+    /// actor or Scope numbers alone cannot identify this notice's owner.
+    pub(super) fn matches_registration(
+        &self,
+        runtime: &ActorRuntime<WorkerActor>,
+        registration: &ActorRegistration,
+    ) -> bool {
+        self.0.runtime.same_runtime(runtime) && self.0.registration.same_registration(registration)
+    }
     pub(crate) fn context(&self) -> QueryContextRef {
         self.0.context
-    }
-    pub(crate) fn scope(&self) -> ScopeId {
-        self.0.scope.id()
     }
     /// Wake ordering only. Neither this revision nor a comparison authorizes
     /// admission, a callback, publication, or any resource exit.
@@ -98,8 +107,9 @@ impl ContextReadyNotice {
     }
     /// Actual Scope removal closes this source's useful lifetime. This check
     /// never retires Work, revokes another producer, or refunds any fee.
+    #[cfg(test)]
     pub(super) fn unregister_removed(&self) -> Result<(), ContextReadyError> {
-        match self.0.scope.gates() {
+        match self.0._scope.gates() {
             Err(RuntimeError::UnknownScope) => Ok(()),
             Ok(_) => Err(ContextReadyError::Runtime(RuntimeError::ScopeNotRetired)),
             Err(error) => Err(ContextReadyError::Runtime(error)),

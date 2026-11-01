@@ -26,10 +26,11 @@ use super::{
 use crate::{control_runtime_policy::StorageNeed, task_completion_roles::AdmittedCompletionRole};
 use novarocks_control_runtime::{
     driver::{ActorRuntime, DriverError, InputPermit, InputRole},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeError, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    identity::{ActorId, Generation, ReservationId},
+    identity::{ActorId, Generation},
     mailbox::InputClass,
     scope::WorkKind,
 };
@@ -65,11 +66,29 @@ pub(crate) enum ContextIoError {
     Driver(DriverError),
     AlreadyAdmitted,
 }
+impl std::fmt::Display for ContextIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runtime(error) => write!(f, "Context I/O role operation failed: {error}"),
+            Self::Driver(error) => write!(f, "Context I/O input binding failed: {error}"),
+            Self::AlreadyAdmitted => f.write_str("Context I/O roles were already admitted"),
+        }
+    }
+}
+impl std::error::Error for ContextIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(error) => Some(error),
+            Self::Driver(error) => Some(error),
+            Self::AlreadyAdmitted => None,
+        }
+    }
+}
 
 /// These are actual original Work/report/input owners. There are no replica
 /// counters, inferred physical exits or opaque fields in this pre-capture
-/// inventory. Its zero-resource children use the original Context's prepaid
-/// bundle, which remains charged through all child/report retirement.
+/// inventory. Each role binds its own original header, report and capture
+/// positions before either a callback or a host source can escape.
 pub(crate) struct ContextIoInventory {
     roles: Vec<AdmittedCompletionRole>,
     inputs: Vec<InputRole<WorkerActor>>,
@@ -90,7 +109,8 @@ impl ContextIoInventory {
         runtime: &ActorRuntime<WorkerActor>,
         actor: ActorId,
         scope: &ScopeHandle,
-        parent: ReservationId,
+        payer: &mut ReservationBundle,
+        parent: &WorkLease,
         generation: Generation,
     ) -> Result<Self, ContextIoError> {
         let mut inventory = Self {
@@ -103,12 +123,33 @@ impl ContextIoInventory {
                 .into_iter()
                 .enumerate()
             {
+                let callback = usize::from(index < CONTEXT_IO_CALLBACKS);
+                let role_storage = StorageNeed {
+                    work: 1,
+                    completions: 1,
+                    captures: 1 + if callback == 0 {
+                        CONTEXT_EXECUTION_HOST_CAPTURES + CONTEXT_ADMISSION_CLOSE_CAPTURES
+                    } else {
+                        0
+                    },
+                    inputs: callback,
+                    batches: callback,
+                    effects: callback
+                        * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                    cuts: 0,
+                    replies: 0,
+                    requests: 0,
+                }
+                .resources()
+                .expect("fixed original Context IO role storage");
                 inventory.roles.push(
                     reserve_reported_role(
                         scope,
+                        payer,
                         parent,
+                        role_storage,
                         kind,
-                        (index < CONTEXT_IO_CALLBACKS).then_some(generation),
+                        (index < CONTEXT_IO_CALLBACKS).then_some((scope.id(), generation)),
                     )
                     .map_err(ContextIoError::Runtime)?,
                 );
@@ -130,7 +171,8 @@ impl ContextIoInventory {
         if let Err(error) = result {
             // No source, host instance or job was captured. These exact unused
             // originals can be withdrawn; their real ready Work headers still
-            // belong to the common scope reaper. No Context fee is refunded.
+            // belong to the common scope reaper. Bound role positions cannot
+            // be returned by discarding the still-unused payer remainder.
             inventory.withdraw_unused();
             return Err(error);
         }

@@ -35,7 +35,7 @@ pub(crate) struct AdoptedCleanupEffect {
     notice: Option<RequestNotice>,
 }
 impl AdoptedCleanupEffect {
-    pub(crate) fn from_normal(
+    pub(in crate::control_runtime) fn from_normal(
         runtime: &ActorRuntime<WorkerActor>,
         ticket: EffectTicket<WorkerAction>,
         notice: Option<RequestNotice>,
@@ -49,7 +49,7 @@ impl AdoptedCleanupEffect {
             notice,
         })
     }
-    pub(crate) fn from_original(
+    pub(in crate::control_runtime) fn from_original(
         runtime: &ActorRuntime<WorkerActor>,
         stage: &ScopePublicationsDrained<'_>,
         ticket: EffectTicket<WorkerAction>,

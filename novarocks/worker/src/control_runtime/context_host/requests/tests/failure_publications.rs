@@ -22,9 +22,10 @@
 
 use super::*;
 use crate::{
-    control_runtime::context_host::{FAILURE, failure::FailurePublicationError},
+    control_runtime::context_host::{FAILURE, TIMER, failure::FailurePublicationError},
     task_proposal_ingress::PairRoute,
 };
+use novarocks_control_runtime::driver::{FailureSourceState, InputPhase};
 use novarocks_control_runtime_core::{effect::EffectState, identity::ActionId};
 use novarocks_execution::runtime::fragment::ExecutionFailure;
 use novarocks_execution_contract::{
@@ -32,8 +33,13 @@ use novarocks_execution_contract::{
     failure::{FailureClass, FailureFact, FailureProjection, FailureReason, domain},
 };
 use std::{
-    num::NonZeroU16,
-    sync::atomic::{AtomicUsize, Ordering},
+    num::{NonZeroU16, NonZeroUsize},
+    sync::{
+        Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{SyncSender, sync_channel},
+    },
+    thread::{self, ThreadId},
 };
 
 fn activate(f: &mut Harness) {
@@ -47,15 +53,44 @@ fn activate(f: &mut Harness) {
     complete_model_effects(f, input);
     f.runtime.retire_input(context_actor(), input).unwrap();
 }
-fn actual_failure(f: &mut Harness) -> EffectTicket<WorkerAction> {
+pub(super) fn actual_failure(f: &mut Harness) -> EffectTicket<WorkerAction> {
     let unknown = crate::control_runtime::actors::tests::task(f.identity, 999);
     // The actual actor consumes this unknown Task input, its Core rejects it,
     // and the runtime installs its original failed-generation cleanup action.
     let input = model_fact(f, ContextInput::Installed { task: unknown }, 9);
+    take_actual_failure(f, input)
+}
+/// Each fixture supplies the actual failed business occurrence; Runtime owns
+/// its distinct prepaid supervisor source. No caller guesses that address.
+pub(super) fn take_actual_failure(f: &Harness, input: InputId) -> EffectTicket<WorkerAction> {
+    assert!(
+        f.runtime
+            .input_custody(context_actor(), input)
+            .unwrap()
+            .is_some_and(|original| original.phase == InputPhase::AbandonedByOwnerFailure),
+        "the original failing business input keeps its real abandoned receipt"
+    );
+    let FailureSourceState::ClosedPending(supervisor) =
+        f.runtime.failure_source_state(context_actor()).unwrap()
+    else {
+        panic!("the actual builtin failure source must own its pending batch");
+    };
+    assert_ne!(supervisor, input);
     let ticket = f
         .runtime
-        .take_effect(context_actor(), input, ActionId::new(1).unwrap())
+        .take_effect(context_actor(), supervisor, ActionId::new(1).unwrap())
         .unwrap();
+    f.runtime.retire_input(context_actor(), input).unwrap();
+    assert!(
+        f.runtime
+            .input_custody(context_actor(), input)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        f.runtime.failure_source_state(context_actor()).unwrap(),
+        FailureSourceState::ClosedPending(supervisor)
+    );
     assert!(matches!(ticket.effect, WorkerAction::OwnerFailed { .. }));
     assert!(
         f.service
@@ -69,6 +104,48 @@ fn actual_failure(f: &mut Harness) -> EffectTicket<WorkerAction> {
             .failed
     );
     ticket
+}
+pub(super) fn complete_actual_failure_source(f: &Harness, input: InputId) {
+    assert_eq!(
+        f.runtime.failure_source_state(context_actor()).unwrap(),
+        FailureSourceState::ClosedPending(input)
+    );
+    f.service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .complete_failure_publications_for_test();
+    assert_eq!(
+        f.runtime.failure_source_state(context_actor()).unwrap(),
+        FailureSourceState::ClosedDrained
+    );
+    assert!(
+        f.runtime
+            .input_custody(context_actor(), input)
+            .unwrap()
+            .is_none()
+    );
+}
+pub(super) fn actual_context_headers(
+    f: &Harness,
+) -> [novarocks_control_runtime::lease::WorkRetirementObserver; 2] {
+    let address = f.service.context(f.identity).unwrap();
+    let host = address.lock().unwrap();
+    [TIMER, FAILURE].map(|role| host.resources.roles[role].work.retirement_observer())
+}
+pub(super) fn finish_failed_fixture(f: Harness, input: InputId) {
+    let headers = actual_context_headers(&f);
+    complete_actual_failure_source(&f, input);
+    assert!(
+        headers.iter().all(|header| !header.is_retired()),
+        "supervisor input retirement does not exit the original body/capture holders"
+    );
+    finish(f);
+    assert!(
+        headers.iter().all(|header| header.is_retired()),
+        "the original fixture must physically exit and retire both actual holders"
+    );
 }
 fn failure_is_still_started(f: &mut Harness, input: InputId) -> bool {
     let host_address = f.service.context(f.identity).unwrap();
@@ -90,7 +167,7 @@ fn failure_is_still_started(f: &mut Harness, input: InputId) -> bool {
                 })
             })
 }
-fn drain_one_unit_turns(f: &mut Harness, input: InputId) -> (bool, bool) {
+pub(super) fn drain_one_unit_turns(f: &mut Harness, input: InputId) -> (bool, bool) {
     let mut alive = true;
     for _ in 0..128 {
         alive &= failure_is_still_started(f, input);
@@ -110,9 +187,118 @@ fn drain_one_unit_turns(f: &mut Harness, input: InputId) -> (bool, bool) {
     (false, alive)
 }
 
+struct RawDomainDropGate {
+    open: Mutex<bool>,
+    changed: Condvar,
+}
+struct ReleaseRawDomainDrop(Arc<RawDomainDropGate>);
+impl ReleaseRawDomainDrop {
+    fn release(&self) {
+        *self.0.open.lock().unwrap() = true;
+        self.0.changed.notify_all();
+    }
+}
+impl Drop for ReleaseRawDomainDrop {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+struct RawDomainDropProbe {
+    entered: Option<SyncSender<ThreadId>>,
+    gate: Arc<RawDomainDropGate>,
+    drops: Arc<AtomicUsize>,
+    getters: Arc<AtomicUsize>,
+}
+impl novarocks_execution_contract::ConfidentialContent for RawDomainDropProbe {
+    fn encoded_len(&self) -> usize {
+        self.getters.fetch_add(1, Ordering::SeqCst);
+        1
+    }
+    fn matches(&self, _other: &dyn novarocks_execution_contract::ConfidentialContent) -> bool {
+        self.getters.fetch_add(1, Ordering::SeqCst);
+        false
+    }
+    fn stored_representation(&self) -> Option<&(dyn std::any::Any + 'static)> {
+        self.getters.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+}
+impl Drop for RawDomainDropProbe {
+    fn drop(&mut self) {
+        let _ = self.entered.take().unwrap().send(thread::current().id());
+        let mut open = self.gate.open.lock().unwrap();
+        while !*open {
+            open = self.gate.changed.wait(open).unwrap();
+        }
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+struct OriginalDomainIngressMarker {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    drops: Arc<AtomicUsize>,
+}
+impl crate::WorkerIngressBacking for OriginalDomainIngressMarker {}
+impl Drop for OriginalDomainIngressMarker {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn observe_original_request(
+    f: &Harness,
+    work: ScopedWorkRef,
+) -> crate::control_runtime::context_host::requests::RequestCustodyObservation {
+    f.service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .resources
+        .requests[&work]
+        .observation_for_test()
+        .unwrap()
+}
+
+type OriginalLifecycleExecutor = crate::control_runtime::host_executor::HostExecutor<
+    crate::control_runtime::context_host::task_driver::TaskDriverHostJob,
+    fn(crate::control_runtime::context_host::task_driver::TaskDriverHostJob),
+>;
+
+pub(super) fn original_lifecycle_executor(
+    runtime: &ActorRuntime<WorkerActor>,
+    root_registration: novarocks_control_runtime::driver::ActorRegistration,
+) -> (
+    OriginalLifecycleExecutor,
+    crate::control_runtime::context_host::task_driver::TaskDriverPorts,
+) {
+    use crate::control_runtime::{
+        context_host::task_driver::{TaskDriverHostJob, TaskDriverPorts},
+        host_executor::{HostExecutor, HostExecutorLimits},
+        task_capacity::TaskCapacitySignal,
+    };
+    let capacity = TaskCapacitySignal::new(runtime.clone(), root_registration).unwrap();
+    let one = NonZeroUsize::new(1).unwrap();
+    let executor = HostExecutor::start_with_waker(
+        HostExecutorLimits {
+            jobs: one,
+            per_context: one,
+            workers: one,
+        },
+        TaskDriverHostJob::run_on_host as fn(TaskDriverHostJob),
+        capacity.waker(),
+    )
+    .unwrap_or_else(|_| panic!("the original bounded lifecycle executor starts"));
+    let ports = TaskDriverPorts {
+        lifecycle: Some(executor.handle()),
+        capacity: Some(capacity),
+        ..TaskDriverPorts::default()
+    };
+    (executor, ports)
+}
+
 #[test]
 fn bounded_failure_publication_preserves_the_published_reply_and_fills_only_the_empty_outbox() {
-    let mut f = original_context(2, StorageNeed::default());
+    let mut f = original_context(2);
     let ready = ready(&f, 2);
     let (published_work, mut published_handle) = admit(&mut f, &ready, operation(131));
     let published_input = published_handle.request().token;
@@ -136,6 +322,19 @@ fn bounded_failure_publication_preserves_the_published_reply_and_fills_only_the_
             ContextReplyBody::Verdict(RequestResult::Outcome(OperationOutcome::OwnerFailed))
         );
     let (empty_work, mut empty_handle) = admit(&mut f, &ready, operation(132));
+    let (empty_header, context_scope, root_registration) = {
+        let address = f.service.context(f.identity).unwrap();
+        let host = address.lock().unwrap();
+        let original = host.resources.requests[&empty_work]
+            .observation_for_test()
+            .unwrap();
+        assert!(original.authority_present && !original.started && !original.submitted);
+        (
+            original.header,
+            host.scope().clone(),
+            host.control_registration.clone(),
+        )
+    };
     let failure = actual_failure(&mut f);
     let failure_input = failure.input;
     f.service
@@ -193,6 +392,88 @@ fn bounded_failure_publication_preserves_the_published_reply_and_fills_only_the_
     let original_command_returned = matches!(refusal.error, ContextRequestError::OwnerFailed)
         && matches!(refusal.command, Some(ContextCommand::Renew { .. }));
 
+    // This is the already-admitted R, with the same operation and unfilled
+    // actual input. The real failed actor refuses its feedback input gate.
+    let raw_drops = Arc::new(AtomicUsize::new(0));
+    let raw_getters = Arc::new(AtomicUsize::new(0));
+    let marker_drops = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(RawDomainDropGate {
+        open: Mutex::new(false),
+        changed: Condvar::new(),
+    });
+    let release = ReleaseRawDomainDrop(gate.clone());
+    let (entered, physical_drop) = sync_channel(1);
+    let raw = novarocks_execution_contract::AdvanceQueryContextDomain::new(
+        operation(132),
+        f.identity,
+        novarocks_execution_contract::QueryContextDomainUpdate::Credential(
+            novarocks_execution_contract::CredentialUpdate::new(
+                novarocks_execution_contract::CredentialLeaseId::new(1),
+                novarocks_execution_contract::CredentialEpoch::new(2).unwrap(),
+                Arc::new(RawDomainDropProbe {
+                    entered: Some(entered),
+                    gate,
+                    drops: raw_drops.clone(),
+                    getters: raw_getters.clone(),
+                }),
+            ),
+        ),
+    );
+    let ingress_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let ingress =
+        crate::WorkerIngressResponsibility::from_admitted(Arc::new(OriginalDomainIngressMarker {
+            _permit: ingress_gate.clone().try_acquire_owned().unwrap(),
+            drops: marker_drops.clone(),
+        }));
+    let context_before_capture = context_scope.snapshot().unwrap();
+    let context_work_before = context_before_capture.work;
+    let root_work_before = f.scope.snapshot().unwrap().work;
+    {
+        let address = f.service.context(f.identity).unwrap();
+        let mut host = address.lock().unwrap();
+        let (error, raw) = host
+            .capture_context_domain(empty_work, raw, PayloadId(132))
+            .expect_err("the actual failed Actor rejects the original feedback input");
+        assert!(matches!(
+            error,
+            ContextRequestError::Driver(DriverError::ActorFailed)
+        ));
+        assert!(host.resources.request_partials.is_empty());
+        assert!(
+            host.resources.requests[&empty_work]
+                .observation_for_test()
+                .unwrap()
+                .domain
+                .as_ref()
+                .unwrap()
+                .uncaptured_unused
+        );
+        assert_eq!(
+            context_scope.snapshot().unwrap().work,
+            context_work_before + 3,
+            "the three actual unused feedback originals belong to this R"
+        );
+        assert_eq!(f.scope.snapshot().unwrap().work, root_work_before);
+        host.capture_refused_context_domain(empty_work, raw, ingress)
+            .unwrap_or_else(|_| {
+                panic!("same original failed R captures its whole raw and Native marker")
+            });
+        assert!(
+            !host.resources.requests[&empty_work]
+                .observation_for_test()
+                .unwrap()
+                .authority_present
+        );
+    }
+    assert_eq!(f.ledger.used(Dimension::Requests.id()), 2);
+    assert_eq!(
+        observe_original_request(&f, empty_work).return_state,
+        novarocks_control_runtime_core::completion::ReturnState::Reserved
+    );
+    assert_eq!(raw_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(raw_getters.load(Ordering::SeqCst), 0);
+    assert_eq!(marker_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(ingress_gate.available_permits(), 0);
     let (drained, failure_alive_through_drain) = drain_one_unit_turns(&mut f, failure_input);
     let failed_delivery = empty_handle
         .try_take()
@@ -203,6 +484,120 @@ fn bounded_failure_publication_preserves_the_published_reply_and_fills_only_the_
     );
     let already_published_preserved = published_delivery.body() == decided.as_ref();
     let physical_deliveries_still_paid = f.ledger.used(Dimension::Requests.id()) == 2;
+    let (executor, ports) = original_lifecycle_executor(&f.runtime, root_registration);
+    let mut feedback_retired = false;
+    for _ in 0..16 {
+        let address = f.service.context(f.identity).unwrap();
+        let mut host = address.lock().unwrap();
+        host.advance_domain_request(empty_work, &ports).unwrap();
+        if host.resources.requests[&empty_work]
+            .observation_for_test()
+            .unwrap()
+            .domain
+            .as_ref()
+            .unwrap()
+            .retired
+        {
+            feedback_retired = true;
+            break;
+        }
+    }
+    assert!(feedback_retired);
+    assert_eq!(
+        context_scope.snapshot().unwrap().work,
+        context_work_before,
+        "the exact unused feedback Work/Source headers have really retired"
+    );
+    assert_eq!(
+        context_scope.snapshot().unwrap().storage,
+        context_before_capture.storage,
+        "the original unused feedback reports retire with their real holders"
+    );
+    assert!(!empty_header.is_retired());
+    assert_eq!(f.ledger.used(Dimension::Requests.id()), 2);
+    f.service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .advance_request_notification(empty_work, &ports)
+        .unwrap();
+    let entered = physical_drop.recv_timeout(Duration::from_secs(10));
+    // Gather while the real foreign destructor is held, then unconditionally
+    // release and physically join before asserting the held observations.
+    let blocked_retirement = f
+        .service
+        .context(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .advance_request(empty_work);
+    let blocked_work = f.scope.work_lifecycle(empty_work.work);
+    let held_drops = raw_drops.load(Ordering::SeqCst);
+    let held_marker = marker_drops.load(Ordering::SeqCst);
+    let held_requests = f.ledger.used(Dimension::Requests.id());
+    release.release();
+    drop(
+        executor
+            .shutdown()
+            .unwrap_or_else(|_| panic!("the actual lifecycle body drains and joins")),
+    );
+    assert_ne!(
+        entered.unwrap(),
+        thread::current().id(),
+        "raw Drop must run on the real host worker"
+    );
+    assert!(matches!(blocked_retirement, Ok(false)));
+    assert!(matches!(
+        blocked_work.unwrap(),
+        Some((
+            novarocks_control_runtime_core::scope::WorkPhase::Started,
+            false,
+            false,
+            _
+        ))
+    ));
+    assert_eq!((held_drops, held_marker, held_requests), (0, 0, 2));
+    assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(raw_getters.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        observe_original_request(&f, empty_work).return_state,
+        novarocks_control_runtime_core::completion::ReturnState::Filled
+    );
+    assert!(
+        !f.service
+            .context(f.identity)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .advance_request(empty_work)
+            .unwrap(),
+        "taking actual authority does not end the live delivery"
+    );
+    assert_eq!(
+        observe_original_request(&f, empty_work).return_state,
+        novarocks_control_runtime_core::completion::ReturnState::Taken
+    );
+    {
+        let address = f.service.context(f.identity).unwrap();
+        let host = address.lock().unwrap();
+        let original = host.resources.requests[&empty_work]
+            .observation_for_test()
+            .unwrap();
+        assert_eq!(original.work, empty_work);
+        assert!(original.authority_present && original.started && !original.submitted);
+        assert_eq!(
+            original.role.as_ref().unwrap().phase,
+            novarocks_control_runtime::exit_role::ExitRolePhase::Started
+        );
+        assert!(!original.role.as_ref().unwrap().body_exited);
+        assert!(!original.role.as_ref().unwrap().captures_exited);
+    }
+    assert!(!empty_header.is_retired());
+    assert_eq!(marker_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(ingress_gate.available_permits(), 0);
+    assert_eq!(f.ledger.used(Dimension::Requests.id()), 2);
+    drop(ports);
     drop((
         published_handle,
         published_delivery,
@@ -210,8 +605,14 @@ fn bounded_failure_publication_preserves_the_published_reply_and_fills_only_the_
         failed_delivery,
     ));
     let requests_retired = advance(&mut f, published_work) && advance(&mut f, empty_work);
+    assert!(empty_header.is_retired());
+    assert_eq!(f.ledger.used(Dimension::Requests.id()), 0);
+    assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(raw_getters.load(Ordering::SeqCst), 0);
+    assert_eq!(marker_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(ingress_gate.available_permits(), 1);
     let supervision_still_owned = failure_is_still_started(&mut f, failure_input);
-    finish(f);
+    finish_failed_fixture(f, failure_input);
 
     assert!(original_body && already_published_preserved && only_empty_failed);
     assert!(zero_did_not_drain && zero_did_not_publish && one_did_not_scan_all);
@@ -241,9 +642,8 @@ impl Drop for QueuedSource {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
-fn source_fees(f: &Harness) -> [u64; 3] {
-    [Dimension::Work, Dimension::Completions, Dimension::Captures]
-        .map(|dimension| f.ledger.used(dimension.id()))
+fn source_fees(f: &Harness) -> [u64; 2] {
+    actual_component_inventory(f)
 }
 
 #[test]
@@ -409,19 +809,33 @@ fn only_the_real_publication_drain_abandons_a_queued_source_and_its_alias_still_
         .release_closed_route_pair(PairRoute::ConsumingOpen, reaped)
         .unwrap_or_else(|_| panic!("the closed original source slots detach after true reaping"));
     let before_release = source_fees(&f);
-    for mut original in detached {
-        original.release().unwrap();
-    }
+    drop(detached); // The original Source bundle finished at its actual ExitRole retirement.
     let after_release = source_fees(&f);
-    let only_actual_slot_release_refunded = after_generation == fees
-        && before_release == fees
-        && before_release
-            .iter()
-            .zip(after_release)
-            .all(|(before, after)| before.checked_sub(after) == Some(2));
+    let only_actual_slot_release_refunded = fees
+        .iter()
+        .zip(after_generation)
+        .all(|(before, after)| before.checked_sub(after) == Some(2))
+        && before_release == after_generation
+        && after_release == before_release;
     let failure_work_still_alive = failure_is_still_started(&mut f, failure_input);
     drop((original, custody, ingress));
-    super::source_slot_lifetime::finish_after_consuming_pair_detached(f, task, preparation);
+    let headers = actual_context_headers(&f);
+    super::source_slot_lifetime::finish_after_consuming_pair_detached_with(
+        f,
+        task,
+        preparation,
+        |f| {
+            complete_actual_failure_source(f, failure_input);
+            assert!(
+                headers.iter().all(|header| !header.is_retired()),
+                "real Task/Source teardown does not invent Context holder exit"
+            );
+        },
+    );
+    assert!(
+        headers.iter().all(|header| header.is_retired()),
+        "the original Context holders retire only through the actual fixture teardown"
+    );
 
     assert!(not_started && not_drained && drained && failure_alive);
     assert!(exact_summary && abandoned_not_consumed && never_filled);
@@ -436,8 +850,8 @@ fn only_the_real_publication_drain_abandons_a_queued_source_and_its_alias_still_
 #[test]
 fn a_foreign_same_number_failure_ticket_cannot_start_the_local_work_and_returns_to_its_actual_owner()
  {
-    let mut local = original_context(0, StorageNeed::default());
-    let mut foreign = original_context(0, StorageNeed::default());
+    let mut local = original_context(0);
+    let mut foreign = original_context(0);
     activate(&mut local);
     activate(&mut foreign);
     let local_ticket = actual_failure(&mut local);
@@ -500,8 +914,8 @@ fn a_foreign_same_number_failure_ticket_cannot_start_the_local_work_and_returns_
         .unwrap();
     let (local_drained, local_alive) = drain_one_unit_turns(&mut local, local_input);
     let (foreign_drained, foreign_alive) = drain_one_unit_turns(&mut foreign, foreign_input);
-    finish(local);
-    finish(foreign);
+    finish_failed_fixture(local, local_input);
+    finish_failed_fixture(foreign, foreign_input);
 
     assert!(same_numeric_identity && rejected_origin && returned_original);
     assert!(local_drained && foreign_drained && local_alive && foreign_alive);
@@ -512,11 +926,11 @@ fn real_parent_fence_uses_one_prepaid_context_role_and_failed_owner_abandons_its
     use crate::control_runtime::context_host::owner_control::OwnerFenceDelivery;
     use novarocks_control_runtime::driver::InputPhase;
 
-    let mut f = original_context(1, StorageNeed::default());
+    let mut f = original_context(1);
     let root_fence_input = f
         .input
         .fill(WorkerMessage::Control(ControlMessage::Command {
-            work: f.roles[2].work.id(),
+            work: f.roles[2].work.reference(),
             request: None,
             command: ControlInput::FenceFrontend {
                 frontend: f.identity.frontend_process_id(),
@@ -532,15 +946,30 @@ fn real_parent_fence_uses_one_prepaid_context_role_and_failed_owner_abandons_its
             ControlCore::MAX_STEP_WORK,
         )
         .unwrap();
-    assert_eq!(
-        wake_actions.len(),
-        1,
-        "the real fence schedules its own continuation"
-    );
-    let wake = f
-        .runtime
-        .take_effect(control_actor(), root_fence_input, wake_actions[0])
-        .unwrap();
+    let mut wake = None;
+    for action in wake_actions {
+        let ticket = f
+            .runtime
+            .take_effect(control_actor(), root_fence_input, action)
+            .unwrap();
+        match &ticket.effect {
+            WorkerAction::AdmissionEpoch(_) => {
+                // The real fence also updates its neutral admission inventory.
+                f.runtime.effect_completed(ticket).unwrap();
+            }
+            WorkerAction::Control {
+                effect: ControlEffect::WakeInternal,
+                ..
+            } => {
+                assert!(
+                    wake.replace(ticket).is_none(),
+                    "one original fence continuation"
+                );
+            }
+            _ => panic!("the original fence emits only its projection and continuation"),
+        }
+    }
+    let wake = wake.expect("the real fence schedules its own continuation");
     assert!(matches!(
         &wake.effect,
         WorkerAction::Control {
@@ -558,7 +987,7 @@ fn real_parent_fence_uses_one_prepaid_context_role_and_failed_owner_abandons_its
     let root_input = f
         .input
         .fill(WorkerMessage::Control(ControlMessage::Command {
-            work: f.roles[2].work.id(),
+            work: f.roles[2].work.reference(),
             request: None,
             command: ControlInput::NextInternal,
         }))
@@ -609,16 +1038,7 @@ fn real_parent_fence_uses_one_prepaid_context_role_and_failed_owner_abandons_its
     let before_scope = scope.snapshot().unwrap();
     let before_actor = f.runtime.snapshot(context_actor()).unwrap();
     let before_roles = f.runtime.role_inventory(context_actor(), None, 16).unwrap();
-    let paid = [
-        Dimension::Inputs,
-        Dimension::Batches,
-        Dimension::Effects,
-        Dimension::Work,
-        Dimension::Completions,
-        Dimension::Captures,
-        Dimension::Requests,
-    ]
-    .map(|dimension| f.ledger.used(dimension.id()));
+    let paid = actual_admission_usage(&f);
     let original_parent_role = before_roles
         .iter()
         .find(|role| role.source == control_actor() && role.class == InputClass::Control)
@@ -653,18 +1073,8 @@ fn real_parent_fence_uses_one_prepaid_context_role_and_failed_owner_abandons_its
         && after_first.roles == before_actor.roles
         && after_first.batches == before_actor.batches
         && after_duplicate == after_first;
-    let no_new_work_or_funding = scope.snapshot().unwrap() == before_scope
-        && paid
-            == [
-                Dimension::Inputs,
-                Dimension::Batches,
-                Dimension::Effects,
-                Dimension::Work,
-                Dimension::Completions,
-                Dimension::Captures,
-                Dimension::Requests,
-            ]
-            .map(|dimension| f.ledger.used(dimension.id()));
+    let no_new_work_or_funding =
+        scope.snapshot().unwrap() == before_scope && paid == actual_admission_usage(&f);
     let no_rpc_capture = {
         let host = address.lock().unwrap();
         host.resources.requests.is_empty()
@@ -733,7 +1143,7 @@ fn real_parent_fence_uses_one_prepaid_context_role_and_failed_owner_abandons_its
     f.runtime.retire_input(control_actor(), root_input).unwrap();
     // Existing metadata-only teardown finishes the genuine failure session,
     // then the original Root refusal/retention/removal. It is not Native exit.
-    finish(f);
+    finish_failed_fixture(f, failure_input);
 
     assert!(route_published && original_root_ticket_still_valid);
     assert_eq!(delivered, OwnerFenceDelivery::Delivered);

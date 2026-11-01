@@ -34,7 +34,6 @@ use novarocks_execution::runtime::fragment::io::{
 use novarocks_execution::runtime::observable::{
     BoundedNotification, Observable, ObserverSubscription,
 };
-use novarocks_execution_contract::TaskIdentity;
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_execution_contract::ordered_retained_stream::{
     OfferOutcome, OrderedRetainedStream, RetainedItemKind, RetainedStreamItem,
@@ -47,8 +46,8 @@ use novarocks_execution_contract::root_result::{
 use novarocks_result_contract::{RootOutputKind, RootProfileV1};
 use tokio::sync::Notify;
 
+use crate::WorkerResultRetainedLimits;
 use crate::result_buffer::{ResultBufferKey, ResultRetainedBudget};
-use crate::{TaskStatusSource, WorkerResultRetainedLimits};
 
 /// Read-only root ownership observations. Logical fields share the channel
 /// lock; physical fields are independent atomic samples, not a settlement
@@ -405,7 +404,7 @@ impl From<StreamError> for RootChannelError {
 }
 
 const ROOT_WRITABLE_ENTRIES: usize = 2;
-const ROOT_NOTIFICATION_PHASES: usize = 3 + 4 * ROOT_WRITABLE_ENTRIES;
+const ROOT_NOTIFICATION_PHASES: usize = 2 + 4 * ROOT_WRITABLE_ENTRIES;
 type RootMetadataPanic = Box<dyn std::any::Any + Send + 'static>;
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 enum RootMetadataPhase {
@@ -474,19 +473,14 @@ impl RootNotificationWork {
     }
     fn notify(&mut self, owner: &PhysicalOwners) {
         self.run(owner, 0, |_| owner.changed.notify_waiters());
-        self.run(owner, 1, |_| {
-            if let Some(source) = owner.progress.get().and_then(Weak::upgrade) {
-                source.note_progress();
-            }
-        });
         let mut snapshot_valid = true;
-        self.run(owner, 2, |batch| {
+        self.run(owner, 1, |batch| {
             if owner.writable.snapshot_bounded_notification(batch).is_err() {
                 snapshot_valid = false;
             }
         });
         if !snapshot_valid {
-            self.phases[2] = RootMetadataPhase::Unresolved;
+            self.phases[1] = RootMetadataPhase::Unresolved;
             self.failed = true;
             owner.report_metadata_fault(true);
         }
@@ -494,7 +488,7 @@ impl RootNotificationWork {
             if !self.batch.occupied(index) {
                 continue;
             }
-            let base = 3 + 4 * index;
+            let base = 2 + 4 * index;
             self.run(owner, base, |batch| batch.invoke(index));
             // Call unwind does not invalidate its still-owned callback. Its
             // captured owners are independently destroyed exactly once.
@@ -624,7 +618,6 @@ struct PhysicalOwners {
     fixed_metadata_holders: AtomicUsize,
     changed: Notify,
     writable: Arc<Observable>,
-    progress: OnceLock<Weak<TaskStatusSource>>,
     // Fixed metadata follows all physical aliases, including End-only sends.
     _fixed_credit: ResultWriteCredit,
     // The original wallet itself also outlives the final physical alias.
@@ -739,11 +732,6 @@ impl Drop for PhysicalReservationPosition {
         let last_closed = self.0.retained_reservations.release_is_last_closed();
         if self.1 || last_closed {
             self.0.wake();
-        } else if let Some(source) = self.0.progress.get().and_then(Weak::upgrade) {
-            // An unsuccessful tentative admission returned no usable
-            // resource. It must not invalidate a producer's blocked-credit
-            // generation and cause an endless retry/notification loop.
-            source.note_progress();
         }
     }
 }
@@ -1150,7 +1138,6 @@ impl RootResultChannel {
                 Observable::try_bounded(Self::WRITABLE_CALLBACK_CAPACITY)
                     .map_err(RootChannelError::Observable)?,
             ),
-            progress: OnceLock::new(),
             _fixed_credit: credit,
             _budget_owner: Arc::clone(&budget),
         });
@@ -1290,23 +1277,6 @@ impl RootResultChannel {
             bytes,
             move |released| owner.release(released),
         )))
-    }
-    /// Only the context's registry binds its original progress source. This
-    /// callback acquires no registry lock and cannot reopen a closed route.
-    pub fn bind_context_progress(
-        &self,
-        source: &Arc<TaskStatusSource>,
-    ) -> Result<(), RootChannelError> {
-        if let Some(bound) = self.physical.progress.get() {
-            if bound.ptr_eq(&Arc::downgrade(source)) {
-                return Ok(());
-            }
-            return Err(RootChannelError::Identity);
-        }
-        self.physical
-            .progress
-            .set(Arc::downgrade(source))
-            .map_err(|_| RootChannelError::Identity)
     }
     /// Called by the creation transaction after the exact context takes this
     /// channel. A provisional preparation channel is never a readable route.
@@ -1660,7 +1630,30 @@ impl RootResultChannel {
         drop(retired);
         self.physical.wake();
     }
-    /// Mint the read owner while the registry still holds its context fence.
+    /// Observe a closed route without admitting a delivery or applying an ACK.
+    /// The same channel lock orders this marker against read sealing.
+    pub(crate) fn closed_read_frontier(
+        &self,
+        read: &RootResultRead,
+    ) -> Result<Option<u64>, RootChannelError> {
+        if read.root_task() != self.spec.task
+            || read.profile() != self.spec.contract.profile()
+            || read.kind() != self.spec.contract.kind()
+        {
+            return Err(RootChannelError::Identity);
+        }
+        // An open route needs no additional channel-lock acquisition. If seal
+        // wins after this sample, begin_read observes it under the same lock.
+        if !self.physical.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let state = self.state.lock().unwrap();
+        if !state.context_owned {
+            return Err(RootChannelError::Identity);
+        }
+        Ok((!state.lifetime.allows_read()).then(|| state.stream.snapshot().consumed_through))
+    }
+    /// Mint the read owner under the channel's original seal fence.
     /// A looked-up Arc alone does not prove an admitted read or join lifetime.
     pub fn begin_read(
         self: &Arc<Self>,
@@ -2661,10 +2654,17 @@ mod tests {
             assert_eq!(second_calls.load(Ordering::SeqCst), 1);
             let held = channel.physical.notification.lock().unwrap();
             assert!(held.failed && held.self_pin.is_some());
-            assert_eq!(
-                held.work.as_ref().unwrap().faults[3].secondary.is_some(),
-                secondary
-            );
+            // The opaque invocation payload owns its own destructor failure;
+            // its custody is independent of callback/registration layout.
+            let retained_secondary = held
+                .work
+                .as_ref()
+                .unwrap()
+                .faults
+                .iter()
+                .filter(|fault| fault.secondary.is_some())
+                .count();
+            assert_eq!(retained_secondary, usize::from(secondary));
             drop(held);
             drop(subscription);
             assert!(!channel.physical_idle());

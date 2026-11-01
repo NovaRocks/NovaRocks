@@ -46,8 +46,8 @@ fn advance_until(
 
 #[test]
 fn original_ready_turn_submits_getter_return_and_disposes_rejected_source_before_retirement() {
-    let mut f = fixture(2);
-    let mut foreign = fixture(2);
+    let mut f = fixture();
+    let mut foreign = fixture();
     let pools = SourcePoolGuard::start(&mut f);
     let foreign_pools = SourcePoolGuard::start(&mut foreign);
     let handles = pools.handles.as_ref().unwrap().clone();
@@ -74,14 +74,14 @@ fn original_ready_turn_submits_getter_return_and_disposes_rejected_source_before
     // test-side call to take_establish_ingress or submit_request is involved.
     f.runtime.poll_one(Tick(2)).unwrap();
     f.root.index_control_effects(64).unwrap();
-    let body = f.root.take_control_effect(64).unwrap().unwrap();
+    let body = f.next_control_body();
     let reference = crate::control_runtime::effect_dispatch::EffectRef {
         input: body.input,
         action: body.descriptor.id,
     };
     f.complete_body(body);
     f.root.control_completion_observed(reference).unwrap();
-    let reply = f.root.take_control_effect(64).unwrap().unwrap();
+    let reply = f.next_control_body();
     f.root.publish_request_reply(reply).unwrap();
     let delivery = external.try_take().unwrap();
     let gone = delivery.body()
@@ -92,14 +92,14 @@ fn original_ready_turn_submits_getter_return_and_disposes_rejected_source_before
         .unwrap()
         .retired
         == 0
-        && f.ledger.used(Dimension::Replies.id()) == 1;
+        && f.ledger.used(Dimension::Requests.id()) == 1;
     drop(delivery);
     drop(external);
     let retired = advance_until(&mut f, &handles, |f| f.root.resources().requests.is_empty());
     drop(handles);
     pools.finish();
     foreign_pools.finish();
-    let fees_zero = f.ledger.used(Dimension::Replies.id()) == 0;
+    let fees_zero = f.ledger.used(Dimension::Requests.id()) == 0;
     f.finish();
     foreign.finish();
     assert!(wrong_owner && untouched && gone && held_for_delivery && fees_zero);
@@ -111,7 +111,7 @@ fn original_ready_turn_submits_getter_return_and_disposes_rejected_source_before
 
 #[test]
 fn a_self_requeued_lower_request_does_not_starve_another_ready_original() {
-    let mut f = fixture(2);
+    let mut f = fixture();
     let (first, external1) = f
         .root
         .admit_request(
@@ -156,7 +156,7 @@ fn a_self_requeued_lower_request_does_not_starve_another_ready_original() {
 
 #[test]
 fn original_ready_turn_publishes_getter_panic_failure_without_claiming_raw_exit() {
-    let mut f = fixture(2);
+    let mut f = fixture();
     let pools = SourcePoolGuard::start(&mut f);
     let handles = pools.handles().clone();
     let (raw, getters, drops) = owner_failure::symbolic_panicking_source(&f, None);
@@ -174,7 +174,7 @@ fn original_ready_turn_publishes_getter_panic_failure_without_claiming_raw_exit(
         f.root.resources().requests[&input].submitted
     });
     let raw_still_owned =
-        drops.load(Ordering::SeqCst) == 0 && f.ledger.used(Dimension::Replies.id()) == 1;
+        drops.load(Ordering::SeqCst) == 0 && f.ledger.used(Dimension::Requests.id()) == 1;
     f.runtime.poll_one(Tick(1)).unwrap();
     f.root.index_control_effects(8).unwrap();
     let reply = f.root.take_control_effect(8).unwrap().unwrap();
@@ -198,7 +198,7 @@ fn original_ready_turn_publishes_getter_panic_failure_without_claiming_raw_exit(
 
 #[test]
 fn a_cancelled_original_return_keeps_authority_for_actual_withdrawal_and_cleanup() {
-    let mut f = fixture(2);
+    let mut f = fixture();
     let pools = SourcePoolGuard::start(&mut f);
     let handles = pools.handles().clone();
     let (raw, getters, drops) = request(&f, None, None, false);

@@ -21,11 +21,12 @@ use super::{RequestMetadata, WorkerAction};
 use crate::control_admission::{AdmissionStorage, ScopeAdmissionPort};
 use novarocks_control_runtime::{
     actor::{Actor, StepContext},
+    driver::InputAuthor,
     transaction::ScopeHandle,
 };
 use novarocks_control_runtime_core::{
     effect::{EffectDescriptor, EffectKind},
-    identity::{ActionId, Generation, ScopeId, Tick, WorkId},
+    identity::{ActionId, Generation, InputId, ScopeId, ScopedWorkRef, Tick},
     mailbox::InputEnvelope,
 };
 use novarocks_execution_contract::TaskOperationId;
@@ -36,24 +37,22 @@ use novarocks_worker_protocol::{
 };
 use std::{collections::BTreeMap, time::Duration};
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Each paid input position stores one neutral command inline, including the payload-free timer alternative."
-)]
 #[derive(Debug)]
 pub(crate) enum ControlMessage {
     ObserveTicket {
-        work: WorkId,
+        work: ScopedWorkRef,
         request: RequestMetadata,
         ticket: novarocks_execution_contract::AdmissionTicketId,
         context: novarocks_execution_contract::QueryContextRef,
         preflight: bool,
     },
     Command {
-        work: WorkId,
+        work: ScopedWorkRef,
         request: Option<RequestMetadata>,
         command: ControlInput,
     },
+    /// A payload forwarded through the runtime's original metadata ticket.
+    Metadata(ControlInput),
     Timer,
 }
 
@@ -62,20 +61,28 @@ pub(crate) struct ControlActor {
     scope: ScopeHandle,
     runtime_generation: Generation,
     storage: AdmissionStorage,
-    timer_work: WorkId,
-    lifetime_work: WorkId,
+    timer_work: ScopedWorkRef,
+    lifetime_work: ScopedWorkRef,
+    request_authors: BTreeMap<InputId, InputAuthor>,
 }
 impl ControlActor {
     pub(crate) const MAX_STEP_ACTIONS: usize = ControlCore::MAX_STEP_WORK + 2;
     pub(crate) const MAX_STEP_WORK: usize = ControlCore::MAX_STEP_WORK + 2;
+    #[cfg(test)]
     pub(crate) const TURN_BUDGET: usize = 4 * (Self::MAX_STEP_WORK + 1);
     pub(crate) fn new(
         core: ControlCore,
         scope: ScopeHandle,
         storage: AdmissionStorage,
-        timer_work: WorkId,
-        lifetime_work: WorkId,
+        timer_work: ScopedWorkRef,
+        lifetime_work: ScopedWorkRef,
     ) -> Self {
+        assert_eq!(timer_work.scope, scope.id(), "original Root timer scope");
+        assert_eq!(
+            lifetime_work.scope,
+            scope.id(),
+            "original Root lifetime scope"
+        );
         let runtime_generation = scope
             .gates()
             .expect("live process control scope")
@@ -87,6 +94,7 @@ impl ControlActor {
             storage,
             timer_work,
             lifetime_work,
+            request_authors: BTreeMap::new(),
         }
     }
 }
@@ -104,6 +112,11 @@ impl Actor for ControlActor {
         step: &mut StepContext<'_, WorkerAction>,
     ) {
         let now = MonotonicInstant::from_origin(Duration::from_nanos(now.0));
+        assert_eq!(
+            matches!(&message, ControlMessage::Metadata(_)),
+            step.is_runtime_metadata(),
+            "only an original runtime metadata delivery carries a metadata command"
+        );
         let (work, request, command) = match message {
             ControlMessage::Command {
                 work,
@@ -111,6 +124,7 @@ impl Actor for ControlActor {
                 command,
             } => (work, request, command),
             ControlMessage::Timer => (self.timer_work, None, ControlInput::Tick),
+            ControlMessage::Metadata(command) => (self.timer_work, None, command),
             ControlMessage::ObserveTicket {
                 work,
                 request,
@@ -144,7 +158,13 @@ impl Actor for ControlActor {
                     )
                 };
                 assert!(step.charge(1), "one original ticket observation");
-                step.effect(
+                let proof = step
+                    .input_author()
+                    .cloned()
+                    .expect("the original ticket read R author");
+                assert_eq!(proof.work(), work);
+                step.effect_from_author(
+                    &proof,
                     EffectDescriptor {
                         id: ActionId::new(1).expect("original read reply action"),
                         work,
@@ -154,6 +174,7 @@ impl Actor for ControlActor {
                     WorkerAction::ControlReply(ControlRequestSettlement {
                         settlement: RequestSettlement {
                             request: RequestContext {
+                                author: work,
                                 token: envelope.input,
                                 operation: request.operation,
                                 deadline: request.deadline,
@@ -169,19 +190,39 @@ impl Actor for ControlActor {
                 return;
             }
         };
-        let acquiring = matches!(&command, ControlInput::Acquire { .. });
         let mut admission = ScopeAdmissionPort::new(
             self.scope.clone(),
             self.runtime_generation,
             None,
             self.storage.clone(),
         )
-        .with_parent(self.lifetime_work);
+        .with_parent(self.lifetime_work.work);
+        if let Some(proof) = step.input_author() {
+            assert!(
+                proof.work() == work
+                    || (request.is_none() && !step.is_retained() && work.scope == self.scope.id()),
+                "a request keeps its exact author; internal duty stays in the live execution scope"
+            );
+        }
+        if request.is_some() {
+            let proof = step
+                .input_author()
+                .cloned()
+                .expect("the original Root R author");
+            assert!(
+                self.request_authors.insert(envelope.input, proof).is_none(),
+                "one original Root R proof"
+            );
+        }
         let previous_epoch = self.core.admission().capability();
+        let previous_live_grants = self.core.admission().logical_live_grants();
+        let previous_admission_retention = self.core.admission().retention_inventory();
+        let previous_control_retention = self.core.retention_inventory();
         let result = match request {
             Some(request) => self.core.handle_request(
                 now,
                 RequestContext {
+                    author: work,
                     token: envelope.input,
                     operation: request.operation,
                     deadline: request.deadline,
@@ -191,7 +232,10 @@ impl Actor for ControlActor {
             ),
             None => self.core.handle(now, command, &mut admission),
         }
-        .expect("process control input preserves its frozen invariants");
+        .unwrap_or_else(|error| {
+            self.request_authors.clear();
+            panic!("process control input preserves its frozen invariants: {error:?}")
+        });
         let internal_ready = self.core.has_internal_work();
         assert!(
             step.charge(result.records_visited),
@@ -199,7 +243,13 @@ impl Actor for ControlActor {
         );
         let mut reservations = BTreeMap::new();
         for guard in admission.take_guards() {
-            reservations.insert(guard.reservation_id(), guard.work_id());
+            reservations.insert(
+                guard.reservation_id(),
+                ScopedWorkRef {
+                    scope: guard.scope().id(),
+                    work: guard.work_id(),
+                },
+            );
             if let Err((error, guard)) = step.reservation(guard) {
                 drop(guard);
                 panic!("process reservation handoff invariant: {error:?}");
@@ -207,15 +257,18 @@ impl Actor for ControlActor {
         }
         assert!(
             reservations.len() <= 1,
-            "one control command can admit only its original ticket or context"
+            "one control command can admit only its original context materialization"
         );
-        let ticket_admission = acquiring
-            .then(|| reservations.keys().next().copied())
-            .flatten();
-        let mut adopted_ticket = false;
         let mut next = 0u64;
         let epoch = self.core.admission().capability();
-        let epoch_publication = if epoch != previous_epoch {
+        let logical_live_grants = self.core.admission().logical_live_grants();
+        let admission_retention = self.core.admission().retention_inventory();
+        let control_retention = self.core.retention_inventory();
+        let epoch_publication = if epoch != previous_epoch
+            || logical_live_grants != previous_live_grants
+            || admission_retention != previous_admission_retention
+            || control_retention != previous_control_retention
+        {
             next += 1;
             let id = ActionId::new(next).expect("first epoch projection action");
             step.effect(
@@ -225,7 +278,14 @@ impl Actor for ControlActor {
                     kind: EffectKind::Publication,
                     dependencies: Vec::new(),
                 },
-                WorkerAction::AdmissionEpoch(epoch),
+                WorkerAction::AdmissionEpoch(
+                    super::super::node_metrics::ControlAdmissionProjection {
+                        epoch,
+                        logical_live_grants,
+                        admission_retention,
+                        control_retention,
+                    },
+                ),
             )
             .unwrap_or_else(|(error, _)| panic!("bounded admission epoch projection: {error:?}"));
             Some(id)
@@ -233,7 +293,6 @@ impl Actor for ControlActor {
             None
         };
         let mut reply_bodies = BTreeMap::<TaskOperationId, ActionId>::new();
-        let mut released_admission = Vec::new();
         let mut route_publications = Vec::new();
         for effect in result.effects {
             // These are pure continuation hints, not lifecycle facts. The
@@ -251,10 +310,6 @@ impl Actor for ControlActor {
             let mut dependencies: Vec<_> = epoch_publication.into_iter().collect();
             let admitted = match &effect {
                 ControlEffect::Materialize { reservation, .. } => Some(*reservation),
-                ControlEffect::AdmissionReply { result: Ok(_), .. } => {
-                    adopted_ticket = ticket_admission.is_some();
-                    ticket_admission
-                }
                 _ => None,
             };
             let kind = if admitted.is_some() {
@@ -272,17 +327,6 @@ impl Actor for ControlActor {
                     .get(&id)
                     .expect("original control guard accompanies its host effect")
             });
-            // A TerminalRetained route follows actual active-ticket release.
-            // Its separately funded metadata survives in the directory.
-            if matches!(
-                &effect,
-                ControlEffect::Route {
-                    state: novarocks_execution_contract::QueryContextState::TerminalRetained,
-                    ..
-                }
-            ) {
-                dependencies.clone_from(&released_admission);
-            }
             next += 1;
             let id = ActionId::new(next).unwrap();
             match &effect {
@@ -295,7 +339,6 @@ impl Actor for ControlActor {
                     reply_bodies.insert(*request, id);
                 }
                 ControlEffect::Route { .. } => route_publications.push(id),
-                ControlEffect::RetireReservation(_) => released_admission.push(id),
                 _ => {}
             }
             step.effect(
@@ -327,10 +370,6 @@ impl Actor for ControlActor {
             )
             .unwrap_or_else(|(error, _)| panic!("bounded internal wake handoff: {error:?}"));
         }
-        assert!(
-            ticket_admission.is_none() || adopted_ticket,
-            "every newly issued ticket transfers its actual guard in the grant body"
-        );
         for reply in result.requests {
             next += 1;
             let dependencies = reply_bodies
@@ -338,10 +377,20 @@ impl Actor for ControlActor {
                 .copied()
                 .into_iter()
                 .collect();
-            step.effect(
+            let proof = self
+                .request_authors
+                .remove(&reply.request.token)
+                .expect("the pure Root reply returns its original author");
+            assert_eq!(
+                proof.work(),
+                reply.request.author,
+                "same pure Root request author"
+            );
+            step.effect_from_author(
+                &proof,
                 EffectDescriptor {
                     id: ActionId::new(next).unwrap(),
-                    work,
+                    work: reply.request.author,
                     kind: EffectKind::Reply,
                     dependencies,
                 },

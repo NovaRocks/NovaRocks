@@ -17,25 +17,19 @@
 
 //! Native backend adapters for the Worker-owned task protocol.
 //!
-//! Worker owns query context lifecycle, the task registry and its creation
-//! transaction, per-task status, the observation channel, and terminal
-//! retention. This Backend module supplies role-local ports and execution hosts
-//! to that owner; it owns no transport. Every entry point takes a neutral typed request from
-//! `novarocks_execution_contract::task_execution::operation` and returns a neutral
-//! typed receipt, so it is fully drivable by an in-process caller and a
-//! transport adapter adds only encoding.
+//! Worker owns Context/Task cells, pure protocol decisions, covered observation
+//! and original admission/exit custody. This module supplies role-local
+//! execution hosts; Native DTO decoding and wire projection remain in the
+//! sibling Worker Node ingress.
 //!
 //! ```text
-//! caller (transport adapter, or a test's fake caller)
-//!   `- TaskExecutionRegistry ------ QueryContextHost   (shared facts)
-//!        |                     `--- TaskExecutionHost  (receiver, capability, runnable)
-//!        |
-//!        +-- TaskStatusOwner  (one per task: the only status serializer)
-//!        `-- TaskStatusSource (one per context: the observation channel)
+//! Native RPC -> WorkerTaskControl -> WorkerNodeHost
+//!                                  |-- original Context/Task cells and Core
+//!                                  `-- supervised Native execution host ports
 //! ```
 //!
-//! The transport ingress is a sibling adapter. It routes no traffic: the
-//! task protocol owner is bound directly to these execution hosts.
+//! Host callbacks report physical facts through their original Worker roles.
+//! They do not create another task registry or status owner.
 // Design: ADR-0161 (docs/adr/ADR-0161-pure-local-programs-and-supervised-task-lifecycle.md)
 
 mod compiled_package;
@@ -51,7 +45,7 @@ mod task_update_replay_gate;
 mod type_materialization;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use compiled_package::{
     CompiledPackageCompiler, CompiledPackageError, CompiledPackageInterpreter, CompiledTaskOptions,
@@ -59,6 +53,11 @@ pub use compiled_package::{
 };
 pub use context_host::NativeQueryContextHost;
 pub use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
+
+#[cfg(any(test, novarocks_dev_controls))]
+#[doc(hidden)]
+#[path = "node_fixture.rs"]
+pub mod node_test_support;
 
 pub use type_materialization::{
     TypeMaterializationHost, TypeMaterializationJournal, TypeMaterializationRefusal,

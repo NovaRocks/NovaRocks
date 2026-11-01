@@ -36,16 +36,6 @@ pub(crate) struct HostExecutorPair<J: QueuedPreparation> {
     startup_complete: bool,
 }
 impl<J: QueuedPreparation> HostExecutorPair<J> {
-    /// Fixed runner functions carry no opaque captures to dispose on failure.
-    /// Partial startup returns every actual queue/thread owner. Only complete
-    /// startup publishes operational handles.
-    pub(crate) fn start(
-        ordinary: HostExecutorLimits,
-        cleanup: HostExecutorLimits,
-        run: fn(J),
-    ) -> Result<Self, (std::io::Error, Self)> {
-        Self::start_inner(ordinary, cleanup, run, None)
-    }
     pub(crate) fn start_with_waker(
         ordinary: HostExecutorLimits,
         cleanup: HostExecutorLimits,

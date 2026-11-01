@@ -20,22 +20,23 @@
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, StepContext},
     driver::{ActorRuntime, DriverError, EffectTicket},
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     publication::{PublishedReply, PublishedSnapshot},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     effect::{EffectDescriptor, EffectKind},
     identity::*,
     mailbox::{InputClass, InputEnvelope},
+    owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
 };
 use std::sync::Arc;
 
 #[derive(Debug)]
 struct Publisher {
-    work: WorkId,
+    work: ScopedWorkRef,
 }
 impl Actor for Publisher {
     type Input = u64;
@@ -81,18 +82,24 @@ struct Fixture {
     runtime: ActorRuntime<Publisher>,
     input: InputId,
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
 }
 impl Fixture {
     fn new() -> (Self, EffectTicket<u64>) {
-        let ledger = RuntimeLedger::new(ResourceVector::new([]).unwrap(), 8, 8);
+        let ledger = RuntimeLedger::new(ResourceVector::new([]).unwrap());
         let scope = ledger
-            .open_scope_next(None, Generation::new(1).unwrap(), 8, 8)
+            .open_scope_next(None, Generation::new(1).unwrap())
             .unwrap();
         let (mut work, capacity) = scope
             .reserve_next(
                 Generation::new(1).unwrap(),
-                ResourceVector::new([]).unwrap(),
+                ReservationResources {
+                    quota: ResourceVector::new([]).unwrap(),
+                    owned_slots: OwnedSlotNeed {
+                        work_headers: 1,
+                        ..OwnedSlotNeed::default()
+                    },
+                },
                 WorkKind::Business,
                 WorkAdmission::External,
             )
@@ -100,12 +107,14 @@ impl Fixture {
             .bind(WorkKind::Business)
             .unwrap();
         work.start().unwrap();
-        let runtime = ActorRuntime::new(1);
+        let runtime = ActorRuntime::new();
         runtime
             .register_next(
                 actor(),
                 scope.clone(),
-                Publisher { work: work.id() },
+                Publisher {
+                    work: work.reference(),
+                },
                 ActorConfig {
                     mailbox: [2; 4],
                     max_batches: 2,
@@ -151,9 +160,7 @@ impl Fixture {
             original_host_turn.release(false).unwrap();
         }
         self.runtime.remove_actor(actor()).unwrap();
-        self.capacity
-            .release(&self.capacity.resources().unwrap())
-            .unwrap();
+        self.capacity.finish().unwrap();
         self.ledger.remove_scope(self.scope.id()).unwrap();
     }
 }
@@ -244,11 +251,6 @@ fn current_validation_does_not_reject_original_late_external_fact_or_exit() {
     let current = fixture.runtime.validate_effect_ticket(&ticket);
     let external = fixture.runtime.observe_external_publication(&ticket);
     fixture.finish(ticket);
-    assert!(matches!(
-        current,
-        Err(DriverError::Effect(
-            novarocks_control_runtime_core::effect::EffectError::StaleGeneration
-        ))
-    ));
+    assert_eq!(current, Err(DriverError::FailurePublicationRequired));
     assert_eq!(external, Ok(()));
 }

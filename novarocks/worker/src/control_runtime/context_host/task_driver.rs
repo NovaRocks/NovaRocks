@@ -19,7 +19,7 @@
 //! an effect; its exact ticket remains in the caller's existing paid slot.
 
 #[path = "context_admission.rs"]
-mod context_admission;
+pub(super) mod context_admission;
 
 use super::{ContextHostError, ContextHostRecord};
 use crate::control_runtime::{
@@ -77,6 +77,8 @@ pub(crate) enum TaskDriverError {
     HostCall(crate::control_runtime::task_host_call::TaskHostCallError),
     Settlement(crate::settlement::SettlementDispatchError),
     Publication,
+    PublicationRefused(super::super::task_publication::TaskPublicationError),
+    Projection(crate::task_port::ProjectionError),
     Task(ContextHostError),
     Host(TaskHostError),
     Driver(DriverError),
@@ -89,6 +91,94 @@ pub(crate) enum TaskDriverError {
     DynamicFilter(crate::control_runtime::dynamic_filters::DynamicFilterError),
     Source(crate::control_runtime::source_positions::SourcePositionError),
 }
+impl std::fmt::Display for TaskDriverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongOwner => {
+                f.write_str("Task driver does not belong to the original Context owner")
+            }
+            Self::MissingExecutionPort => f.write_str("Task driver execution port is missing"),
+            Self::MissingExecutionHealth => {
+                f.write_str("Task driver execution health source is missing")
+            }
+            Self::MissingLoadingPort => f.write_str("Task driver loading port is missing"),
+            Self::MissingPreparationPort => f.write_str("Task driver preparation port is missing"),
+            Self::MissingLifecyclePort => f.write_str("Task driver lifecycle port is missing"),
+            Self::Capacity(error) => {
+                write!(f, "Task driver capacity notification failed: {error:?}")
+            }
+            Self::HostCall(error) => write!(f, "Task driver host call failed: {error}"),
+            Self::Settlement(error) => write!(f, "Task driver settlement dispatch failed: {error}"),
+            Self::Publication => f.write_str("Task driver publication failed"),
+            Self::PublicationRefused(error) => {
+                write!(f, "Task driver publication was refused: {error:?}")
+            }
+            Self::Projection(error) => write!(f, "Task driver projection was refused: {error:?}"),
+            Self::Task(error) => {
+                write!(f, "Task driver Context ownership operation failed: {error}")
+            }
+            Self::Host(error) => write!(
+                f,
+                "Task driver original Task host operation failed: {error}"
+            ),
+            Self::Driver(error) => {
+                write!(f, "Task driver input or effect operation failed: {error}")
+            }
+            Self::Dispatch(error) => write!(f, "Task driver effect dispatch failed: {error}"),
+            Self::Request(error) => write!(f, "Task driver original request failed: {error}"),
+            Self::Loading(error) => write!(
+                f,
+                "Task driver original loading operation failed: {error:?}"
+            ),
+            Self::EffectRequiresOriginalOwner => {
+                f.write_str("Task driver effect requires its original action owner")
+            }
+            Self::UnsupportedEffect(kind) => {
+                write!(f, "Task driver does not support effect: {kind}")
+            }
+            Self::RetainedRootSeal(error) => {
+                write!(f, "Task driver retained Root seal failed: {error:?}")
+            }
+            Self::DynamicFilter(error) => {
+                write!(f, "Task driver runtime-filter operation failed: {error:?}")
+            }
+            Self::Source(error) => write!(
+                f,
+                "Task driver original Source position operation failed: {error:?}"
+            ),
+        }
+    }
+}
+impl std::error::Error for TaskDriverError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HostCall(error) => Some(error),
+            Self::Settlement(error) => Some(error),
+            Self::Task(error) => Some(error),
+            Self::Host(error) => Some(error),
+            Self::Driver(error) => Some(error),
+            Self::Dispatch(error) => Some(error),
+            Self::Request(error) => Some(error),
+            Self::WrongOwner
+            | Self::MissingExecutionPort
+            | Self::MissingExecutionHealth
+            | Self::MissingLoadingPort
+            | Self::MissingPreparationPort
+            | Self::MissingLifecyclePort
+            | Self::Capacity(_)
+            | Self::Publication
+            | Self::PublicationRefused(_)
+            | Self::Projection(_)
+            | Self::Loading(_)
+            | Self::EffectRequiresOriginalOwner
+            | Self::UnsupportedEffect(_)
+            | Self::RetainedRootSeal(_)
+            | Self::DynamicFilter(_)
+            | Self::Source(_) => None,
+        }
+    }
+}
+
 pub(crate) struct TaskDriverRefusal {
     pub error: TaskDriverError,
     pub ticket: Option<EffectTicket<WorkerAction>>,
@@ -117,7 +207,7 @@ struct TaskReady {
 impl TaskReady {
     fn new(max_live_tasks: usize) -> Self {
         Self {
-            queue: FairWorkQueue::new(max_live_tasks, max_live_tasks, 1),
+            queue: FairWorkQueue::new(max_live_tasks, 1),
         }
     }
     fn insert(&mut self, task: TaskIdentity) {
@@ -151,21 +241,22 @@ impl TaskReady {
 }
 
 pub(super) struct TaskDriverState {
+    pub(super) admission_partial_sweep: super::requests::rejected_capture::AdmissionPartialSweep,
     pub(super) sources: BTreeMap<ActorId, TaskIdentity>,
     pub(super) domain_feedback_cuts: BTreeMap<
         (
             TaskIdentity,
             novarocks_worker_protocol::proposal_summary::CutId,
         ),
-        novarocks_control_runtime_core::identity::WorkId,
+        novarocks_control_runtime_core::identity::ScopedWorkRef,
     >,
     pub(super) domain_requests:
-        BTreeMap<TaskIdentity, BTreeSet<novarocks_control_runtime_core::identity::WorkId>>,
+        BTreeMap<TaskIdentity, BTreeSet<novarocks_control_runtime_core::identity::ScopedWorkRef>>,
     pub(super) domain_wakes: BTreeMap<
         TaskIdentity,
         (
-            Option<novarocks_control_runtime_core::identity::WorkId>,
-            novarocks_control_runtime_core::identity::WorkId,
+            Option<novarocks_control_runtime_core::identity::ScopedWorkRef>,
+            novarocks_control_runtime_core::identity::ScopedWorkRef,
             bool,
         ),
     >,
@@ -196,11 +287,12 @@ struct TaskRetirement {
     projection_committed: bool,
     finalize_execution_only: bool,
     disposal_authorization: Option<super::super::task_disposal::TaskDisposalAuthorization>,
-    retained_payload: Option<novarocks_worker_protocol::creation::PayloadId>,
+    retained_custody: Option<(novarocks_worker_protocol::creation::PayloadId, Generation)>,
 }
 impl TaskDriverState {
     pub(super) fn new(max_live_tasks: usize) -> Self {
         Self {
+            admission_partial_sweep: Default::default(),
             sources: BTreeMap::new(),
             domain_feedback_cuts: BTreeMap::new(),
             domain_requests: BTreeMap::new(),
@@ -223,6 +315,14 @@ impl TaskDriverState {
             failed_retirement_cursor: None,
             publication_refusal: None,
         }
+    }
+    /// Continue an already owned Task's finite metadata work. Callers retain
+    /// the original owner; this queue grants no Task or retirement authority.
+    pub(super) fn queue_owned_task(&self, task: TaskIdentity) {
+        self.ready
+            .lock()
+            .expect("original owned Task readiness")
+            .insert(task);
     }
     pub(super) fn is_idle(&self) -> bool {
         self.sources.is_empty()
@@ -277,11 +377,22 @@ impl ContextHostRecord {
             pending_kinds[index] += 1;
         }
         tracing::debug!(pid = std::process::id(), context = ?self.identity,
-            actor = ?self.control_runtime.snapshot(self.actor), scope = ?self.scope().snapshot(),
+            actor = ?self.control_runtime.snapshot(self.actor),
+            scope = ?self.resources.scope.as_ref().map(|scope| scope.snapshot()),
+            release_pending = self.resources.host_jobs.as_ref().map(|jobs| jobs.release_pending()),
+            release_evidence_ready = self.resources.host_jobs.as_ref().map(|jobs| jobs.released_observation().is_some()),
+            roots_sealed = self.task_driver_roots_sealed(),
+            release_root_cursor = ?self.resources.pending_host_jobs.root_release_after,
+            release_roots_finished = self.resources.pending_host_jobs.root_release_finished,
             tasks = self.tasks.len(), jobs = self.task_driver.jobs.len(),
             cleanup = self.task_driver.physical_pending.len(), retirements = self.task_driver.retirements.len(),
             pending_kinds_activate_projection_retire_dispose_rollback_other = ?pending_kinds,
             pending_kinds_complete = self.task_driver.physical_pending.len() <= budget,
+            driver_close = ?self.resources.pending_host_jobs.close_fanouts.iter()
+                .filter_map(|f| f.ticket.as_ref().map(|t| (t.input, t.descriptor.id, t.descriptor.work)))
+                .collect::<Vec<_>>(),
+            driver_seal = ?self.resources.pending_host_jobs.driver_seal.as_ref()
+                .map(|t| (t.input, t.descriptor.id, t.descriptor.work)),
             "Worker original Context inventory at process drain");
         for request in self.resources.requests.values().take(budget) {
             request.trace_drain_inventory();
@@ -339,11 +450,7 @@ impl ContextHostRecord {
                 .map_err(TaskDriverError::Driver)?
                 .ok_or(TaskDriverError::Driver(DriverError::UnknownInput))?;
             if let Some(&task) = self.task_driver.sources.get(&custody.source) {
-                self.task_driver
-                    .ready
-                    .lock()
-                    .expect("original Task commitment notice")
-                    .insert(task);
+                self.notify_task_driver_progress(task);
             }
         }
         Ok(())
@@ -428,8 +535,27 @@ impl ContextHostRecord {
             });
             binding.pending = task_notice.clone();
             let runtime = self.control_runtime.clone();
-            if let Err(error) = self.adopt_task(&runtime, &ticket, binding) {
-                self.restore_create_after_load_refusal(work, payload);
+            if let Err(error) = self.adopt_task(&runtime, &ticket, &binding) {
+                self.restore_create_after_load_refusal(work, payload, binding);
+                // The same Task notice already backs every admitted partial
+                // child. Preserve it even when no port could be constructed.
+                let retained = self.tasks.get(&task).is_some_and(|owner| match owner {
+                    super::TaskHostOwner::Unpublished(owner) => owner.matches_loading(&ticket),
+                    super::TaskHostOwner::Initializing(owner) => {
+                        owner.resources_for_retirement().lifetime.work().reference()
+                            == ticket.descriptor.work
+                    }
+                    super::TaskHostOwner::Ready(_) => false,
+                });
+                if retained {
+                    assert!(
+                        self.task_driver
+                            .notices
+                            .insert(task, task_notice.clone())
+                            .is_none()
+                    );
+                    crate::task_port::TaskPendingNotice::pending(task_notice.as_ref());
+                }
                 return Err(reject(TaskDriverError::Task(error), ticket));
             }
             assert!(self.task_driver.notices.insert(task, task_notice).is_none());
@@ -441,26 +567,20 @@ impl ContextHostRecord {
             if matches!(
                 &result,
                 Ok(crate::control_runtime::task::LoadingSubmission::Pending(_))
-            ) {
-                if let (Some(capacity), Some(before)) = (&ports.capacity, before) {
-                    if let Err(error) = capacity.register_waiter(self.registration(), before) {
-                        // Original job already moved into the actual Task owner.
-                        return Err(reject(TaskDriverError::Capacity(error), ticket));
-                    }
-                }
+            ) && let (Some(capacity), Some(before)) = (&ports.capacity, before)
+                && let Err(error) = capacity.register_waiter(self.registration(), before)
+            {
+                // Original job already moved into the actual Task owner.
+                return Err(reject(TaskDriverError::Capacity(error), ticket));
             }
             if let Err((error, payload)) = result {
-                self.restore_create_after_load_refusal(work, payload);
+                self.restore_create_after_load_refusal(work, payload, binding);
                 return Err(reject(TaskDriverError::Host(error), ticket));
             }
             if let Err(error) = self.create_transferred_to_loader(work) {
                 return Err(reject(TaskDriverError::Request(error), ticket));
             }
-            self.task_driver
-                .ready
-                .lock()
-                .expect("Task ready metadata")
-                .insert(task);
+            self.notify_task_driver_progress(task);
             return self
                 .complete_host_effect(ticket)
                 .map_err(|refusal| reject(TaskDriverError::Driver(refusal.error), refusal.ticket));
@@ -483,9 +603,10 @@ impl ContextHostRecord {
                 Err(error) => return Err(reject(TaskDriverError::Host(error), ticket)),
             };
             let pending = owner.pending_notice();
-            let key = (self.scope().id(), ticket.descriptor.work);
+            let key = (ticket.descriptor.work.scope, ticket.descriptor.work.work);
             if let Err(error) = self.queue_task_cleanup(
                 TaskDriverHostJob::DisposeLoadedInput {
+                    fairness: self.identity,
                     key,
                     runtime: self.control_runtime.clone(),
                     ticket: std::mem::ManuallyDrop::new(ticket),
@@ -518,8 +639,18 @@ impl ContextHostRecord {
             };
             let runtime = self.control_runtime.clone();
             let root_close_reason = self.task_driver.root_close_reason;
+            let pending = match self.tasks.get(&task) {
+                Some(super::TaskHostOwner::Ready(owner)) => owner.pending_notice(),
+                _ => {
+                    return Err(reject(
+                        TaskDriverError::Task(ContextHostError::TaskNotOwned),
+                        ticket,
+                    ));
+                }
+            };
             let root_wake = Arc::new(TaskRootWake {
                 task,
+                pending,
                 ready: self.task_driver.ready.clone(),
                 notice: self
                     .resources
@@ -542,12 +673,6 @@ impl ContextHostRecord {
                 Ok(job) => job,
                 Err(error) => return Err(reject(TaskDriverError::Host(error), ticket)),
             };
-            if let Err(error) =
-                owner.bind_inbound_payment(&mut job, &self.resources.roles[super::LIFETIME].work)
-            {
-                owner.retain_preparation_job(job);
-                return Err(reject(TaskDriverError::Host(error), ticket));
-            }
             let roles = match owner.preparation_roles() {
                 Ok(roles) => roles,
                 Err(error) => {
@@ -594,10 +719,10 @@ impl ContextHostRecord {
                 assert!(self.task_driver.jobs.insert(task, job).is_none());
             } else if let Err((_, job)) = executor.try_submit(job) {
                 assert!(self.task_driver.jobs.insert(task, job).is_none());
-                if let (Some(capacity), Some(before)) = (&ports.capacity, before) {
-                    if let Err(error) = capacity.register_waiter(self.registration(), before) {
-                        return Err(reject(TaskDriverError::Capacity(error), ticket));
-                    }
+                if let (Some(capacity), Some(before)) = (&ports.capacity, before)
+                    && let Err(error) = capacity.register_waiter(self.registration(), before)
+                {
+                    return Err(reject(TaskDriverError::Capacity(error), ticket));
                 }
             }
             return self
@@ -647,10 +772,10 @@ impl ContextHostRecord {
                         "Original rejected preparation remains queued after physical pool refusal");
                 }
                 assert!(self.task_driver.jobs.insert(task, job).is_none());
-                if let (Some(capacity), Some(before)) = (&ports.capacity, before) {
-                    if let Err(error) = capacity.register_waiter(self.registration(), before) {
-                        return Err(reject(TaskDriverError::Capacity(error), ticket));
-                    }
+                if let (Some(capacity), Some(before)) = (&ports.capacity, before)
+                    && let Err(error) = capacity.register_waiter(self.registration(), before)
+                {
+                    return Err(reject(TaskDriverError::Capacity(error), ticket));
                 }
             }
             if refusal.is_some() {
@@ -669,20 +794,44 @@ impl ContextHostRecord {
         }) = &ticket.effect
         {
             let (task, generation, intent) = (*task, *generation, *intent);
+            let reason = match intent {
+                novarocks_worker_protocol::context::TaskCloseIntent::Quiesce => None,
+                novarocks_worker_protocol::context::TaskCloseIntent::Abort(cause) => Some(cause),
+            };
+            let Some(fanout) = self
+                .resources
+                .pending_host_jobs
+                .close_fanouts
+                .iter()
+                .find(|fanout| fanout.generation == generation && fanout.reason == reason)
+            else {
+                return Err(reject(TaskDriverError::WrongOwner, ticket));
+            };
+            let gate = fanout.gate.clone();
             let Some(owner) = self.task(task) else {
                 return Err(reject(
                     TaskDriverError::Task(ContextHostError::TaskNotOwned),
                     ticket,
                 ));
             };
-            if let Err(error) = owner.publish_context_close(generation, intent) {
+            if let Err(error) = owner.publish_context_close(generation, intent, gate) {
                 return Err(reject(TaskDriverError::Host(error), ticket));
             }
-            self.task_driver
-                .ready
-                .lock()
-                .expect("original Context close delivery")
-                .insert(task);
+            let fanout = self
+                .resources
+                .pending_host_jobs
+                .close_fanouts
+                .iter_mut()
+                .find(|fanout| fanout.generation == generation && fanout.reason == reason)
+                .expect("same original Context close action");
+            fanout.staged += 1;
+            assert!(
+                fanout
+                    .targets
+                    .is_none_or(|targets| fanout.staged <= targets),
+                "the original Core scan bounds its actual fanout"
+            );
+            self.notify_task_driver_progress(task);
             return self
                 .complete_host_effect(ticket)
                 .map_err(|refusal| reject(TaskDriverError::Driver(refusal.error), refusal.ticket));
@@ -697,8 +846,12 @@ impl ContextHostRecord {
                 &ticket.effect,
                 WorkerAction::Context(ContextEffect::FinalizeTaskExecution { .. })
             );
-            let retained_payload = match &ticket.effect {
-                WorkerAction::Context(ContextEffect::RetireTask { payload, .. }) => Some(*payload),
+            let retained_custody = match &ticket.effect {
+                WorkerAction::Context(ContextEffect::RetireTask {
+                    payload,
+                    close_epoch,
+                    ..
+                }) => Some((*payload, *close_epoch)),
                 _ => None,
             };
             let Some(owner) = self.task(task) else {
@@ -707,12 +860,11 @@ impl ContextHostRecord {
                     ticket,
                 ));
             };
-            if !finalize_execution_only {
-                if let Some(filters) = owner.dynamic_filters() {
-                    if let Err(error) = filters.close_read_admission(&ticket) {
-                        return Err(reject(TaskDriverError::DynamicFilter(error), ticket));
-                    }
-                }
+            if !finalize_execution_only
+                && let Some(filters) = owner.dynamic_filters()
+                && let Err(error) = filters.close_read_admission(&ticket)
+            {
+                return Err(reject(TaskDriverError::DynamicFilter(error), ticket));
             }
             let disposal_authorization = if !finalize_execution_only {
                 match owner.authorize_normal_disposal(&ticket) {
@@ -737,17 +889,13 @@ impl ContextHostRecord {
                             projection_committed: false,
                             finalize_execution_only,
                             disposal_authorization,
-                            retained_payload,
+                            retained_custody,
                         }
                     )
                     .is_none(),
                 "one original Task retirement"
             );
-            self.task_driver
-                .ready
-                .lock()
-                .expect("original Task retirement notice")
-                .insert(task);
+            self.notify_task_driver_progress(task);
             return Ok(());
         }
         if let WorkerAction::Context(
@@ -762,11 +910,7 @@ impl ContextHostRecord {
             if let Err(error) = self.adopt_installed_task_root(task) {
                 return Err(reject(error, ticket));
             }
-            self.task_driver
-                .ready
-                .lock()
-                .expect("Task ready metadata")
-                .insert(task);
+            self.notify_task_driver_progress(task);
             let Some(executor) = ports.lifecycle.as_ref() else {
                 return Err(reject(TaskDriverError::MissingLifecyclePort, ticket));
             };
@@ -785,7 +929,7 @@ impl ContextHostRecord {
             ) {
                 Ok(old) => old,
                 Err(refusal) => {
-                    let error = TaskDriverError::Publication;
+                    let error = TaskDriverError::PublicationRefused(refusal.error);
                     assert!(self.task_driver.publication_refusal.is_none());
                     self.task_driver.publication_refusal =
                         Some(std::mem::ManuallyDrop::new(refusal));
@@ -794,19 +938,15 @@ impl ContextHostRecord {
             };
             if let WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) =
                 &ticket.effect
+                && let Some(advertisement) = snapshot.dynamic_filters()
+                && let Some(source) = self.task(task).and_then(|owner| owner.dynamic_filters())
+                && let Err(error) = source.publication_committed(advertisement.version())
             {
-                if let Some(advertisement) = snapshot.dynamic_filters() {
-                    if let Some(source) = self.task(task).and_then(|owner| owner.dynamic_filters())
-                    {
-                        if let Err(error) = source.publication_committed(advertisement.version()) {
-                            std::mem::forget((old, ticket));
-                            return Err(TaskDriverRefusal {
-                                error: TaskDriverError::DynamicFilter(error),
-                                ticket: None,
-                            });
-                        }
-                    }
-                }
+                std::mem::forget((old, ticket));
+                return Err(TaskDriverRefusal {
+                    error: TaskDriverError::DynamicFilter(error),
+                    ticket: None,
+                });
             }
             if let Err(error) = self
                 .dispatch
@@ -821,7 +961,8 @@ impl ContextHostRecord {
                 });
             }
             let job = TaskDriverHostJob::DisposeProjection {
-                key: (self.scope().id(), ticket.descriptor.work),
+                fairness: self.identity,
+                key: (ticket.descriptor.work.scope, ticket.descriptor.work.work),
                 runtime: self.control_runtime.clone(),
                 ticket,
                 old: std::mem::ManuallyDrop::new(old),
@@ -830,7 +971,10 @@ impl ContextHostRecord {
             // One Task lane's publication is synchronous. Its slow destructor
             // keeps the original ticket and source, while the lane is released.
             let before = ports.capacity.as_ref().map(|capacity| capacity.revision());
-            if let Err((_, job)) = executor.try_submit(job) {
+            if let Err((_, job)) = executor.try_submit_for_group(
+                job,
+                crate::control_runtime::preparation::HostFairnessGroup::Context(self.identity),
+            ) {
                 self.task_driver.physical_pending.push_back(job);
                 if let (Some(capacity), Some(before)) = (&ports.capacity, before) {
                     capacity
@@ -877,14 +1021,18 @@ impl ContextHostRecord {
             // original source. Its foreign destructor runs on the lifecycle
             // worker while the same effect ticket still owes actual exit.
             let job = TaskDriverHostJob::DisposeSource {
-                key: (self.scope().id(), ticket.descriptor.work),
+                fairness: self.identity,
+                key: (ticket.descriptor.work.scope, ticket.descriptor.work.work),
                 runtime: self.control_runtime.clone(),
                 ticket: std::mem::ManuallyDrop::new(ticket),
                 source: Box::new(std::mem::ManuallyDrop::new(source)),
                 pending,
             };
             let before = ports.capacity.as_ref().map(|capacity| capacity.revision());
-            if let Err((_, job)) = executor.try_submit(job) {
+            if let Err((_, job)) = executor.try_submit_for_group(
+                job,
+                crate::control_runtime::preparation::HostFairnessGroup::Context(self.identity),
+            ) {
                 self.task_driver.physical_pending.push_back(job);
                 if let (Some(capacity), Some(before)) = (&ports.capacity, before) {
                     capacity
@@ -919,7 +1067,10 @@ impl ContextHostRecord {
                 }
             };
             let before = ports.capacity.as_ref().map(|capacity| capacity.revision());
-            if let Err((_, job)) = executor.try_submit(job) {
+            if let Err((_, job)) = executor.try_submit_for_group(
+                job,
+                crate::control_runtime::preparation::HostFairnessGroup::Context(self.identity),
+            ) {
                 self.task_driver.physical_pending.push_back(job);
                 if let (Some(capacity), Some(before)) = (&ports.capacity, before) {
                     capacity
@@ -958,12 +1109,15 @@ impl ContextHostRecord {
                 return Err(reject(TaskDriverError::Settlement(error), ticket));
             }
             let job = TaskDriverHostJob::Settlement {
-                key: (self.scope().id(), work),
+                key: (work.scope, work.work),
                 roles,
                 port: std::mem::ManuallyDrop::new(port),
             };
             let before = ports.capacity.as_ref().map(|capacity| capacity.revision());
-            if let Err((_, job)) = executor.try_submit(job) {
+            if let Err((_, job)) = executor.try_submit_for_group(
+                job,
+                crate::control_runtime::preparation::HostFairnessGroup::Context(self.identity),
+            ) {
                 self.task_driver.physical_pending.push_back(job);
                 if let (Some(capacity), Some(before)) = (&ports.capacity, before) {
                     capacity
@@ -987,11 +1141,7 @@ impl ContextHostRecord {
             // Wait effects remain with their original caller until a real
             // waiter owner accepts them; this adapter has accepted none.
             // This notification reaches the original Task metadata owner.
-            self.task_driver
-                .ready
-                .lock()
-                .expect("original Task notification")
-                .insert(task);
+            self.notify_task_driver_progress(task);
             self.resources
                 .notice
                 .as_ref()
@@ -1087,7 +1237,10 @@ impl ContextHostRecord {
             };
             if let Some(executor) = &ports.lifecycle {
                 let before = ports.capacity.as_ref().map(|capacity| capacity.revision());
-                if let Err((_, original)) = executor.try_submit(job) {
+                if let Err((_, original)) = executor.try_submit_for_group(
+                    job,
+                    crate::control_runtime::preparation::HostFairnessGroup::Context(self.identity),
+                ) {
                     self.task_driver.physical_pending.push_front(original);
                     if let (Some(capacity), Some(before)) = (&ports.capacity, before) {
                         capacity
@@ -1133,6 +1286,9 @@ impl ContextHostRecord {
             self.adopt_installed_task_root(task)?;
             let mut loading_wait = None;
             let mut source_progress = false;
+            let mut retirement_runnable = false;
+            let mut retired_authors = Vec::new();
+            let mut request_cut = None;
             let ledger = self.ledger.clone();
             let reaped = ledger
                 .reap_scope_ready(self.scope().id(), 1)
@@ -1150,53 +1306,80 @@ impl ContextHostRecord {
                         loading_wait = before;
                     }
                 }
-                if let Some(returned) = host.take_loading_return().map_err(TaskDriverError::Host)? {
-                    if let Err((error, original)) = host.observe_loading_job_return(returned) {
-                        // A broken original return binding cannot be unwound through opaque custody.
-                        std::mem::forget(original);
-                        return Err(TaskDriverError::Host(error));
-                    }
+                if let Some(returned) = host.take_loading_return().map_err(TaskDriverError::Host)?
+                    && let Err((error, original)) = host.observe_loading_job_return(returned)
+                {
+                    // A broken original return binding cannot be unwound through opaque custody.
+                    std::mem::forget(original);
+                    return Err(TaskDriverError::Host(error));
                 }
                 if let Some(receipt) = host
                     .publish_loading_exit()
                     .map_err(TaskDriverError::Loading)?
+                    && let Err((error, original)) = host.observe_loading_author_return(receipt)
                 {
-                    if let Err((error, original)) = host.observe_loading_author_return(receipt) {
-                        std::mem::forget(original);
-                        return Err(TaskDriverError::Host(error));
-                    }
+                    std::mem::forget(original);
+                    return Err(TaskDriverError::Host(error));
                 }
                 host.observe_loading_exit_report()
                     .map_err(TaskDriverError::Loading)?;
-                if host
-                    .advance_production_cut(&ledger)
-                    .map_err(TaskDriverError::Host)?
-                {
+                let retirement = host.advance_production_cut().map_err(|error| {
+                    tracing::error!(?task, operation = "advance_production_cut", %error,
+                            "Original Task host transition refused");
+                    TaskDriverError::Host(error)
+                })?;
+                retirement_runnable = retirement.runnable;
+                retired_authors = retirement.retired_authors;
+                request_cut = retirement.request_cut;
+                if retirement.progressed {
                     source_progress = true;
                     host.pending_notice().pending();
                 }
 
-                if host
-                    .advance_production_facts()
-                    .map_err(TaskDriverError::Host)?
-                {
+                if host.advance_production_facts().map_err(|error| {
+                    tracing::error!(?task, operation = "advance_production_facts", %error,
+                            "Original Task host transition refused");
+                    TaskDriverError::Host(error)
+                })? {
                     source_progress = true;
                     host.pending_notice().pending();
                 }
-                if host
-                    .advance_normal_retirement(&ledger)
-                    .map_err(TaskDriverError::Host)?
-                {
+                if host.advance_normal_retirement(&ledger).map_err(|error| {
+                    tracing::error!(?task, operation = "advance_normal_retirement", %error,
+                            "Original Task host transition refused");
+                    TaskDriverError::Host(error)
+                })? {
                     host.pending_notice().pending();
                 }
             }
-            if let Some(execution) = &ports.execution {
-                if let Some(job) = self
+            self.notify_retired_input_authors(&retired_authors);
+            if let Some(cut) = request_cut
+                && let Some(original) = self
+                    .task_request_cuts
+                    .get(&(task, cut))
+                    .and_then(|work| self.resources.requests.get(work))
+            {
+                // Physical effect jobs wake their original Task. Its finite
+                // cut visit forwards that event to the same admitted R; it
+                // neither scans requests nor claims Core/physical exit.
+                original.note_input_progress();
+            }
+            if retirement_runnable {
+                // Continue the frozen finite round without manufacturing a
+                // new producer/IO epoch. Coalesced external notices retain
+                // their independently recorded epoch for the next round.
+                self.task_driver
+                    .ready
+                    .lock()
+                    .expect("finite Task retirement continuation")
+                    .insert(task);
+            }
+            if let Some(execution) = &ports.execution
+                && let Some(job) = self
                     .task(task)
                     .and_then(|owner| owner.take_preparation_rollback_job(execution.clone()))
-                {
-                    self.queue_task_cleanup(job, ports)?;
-                }
+            {
+                self.queue_task_cleanup(job, ports)?;
             }
             if source_progress || reaped > 0 {
                 self.notify_domain_source_progress(task);
@@ -1206,10 +1389,10 @@ impl ContextHostRecord {
                 None => None,
             };
             if let Some(rf) = rf_progress {
-                if rf.progressed {
-                    if let Some(host) = self.task(task) {
-                        host.pending_notice().pending();
-                    }
+                if rf.progressed
+                    && let Some(host) = self.task(task)
+                {
+                    host.pending_notice().pending();
                 }
                 if let Some(job) = rf.job {
                     self.task_driver
@@ -1280,7 +1463,7 @@ impl ContextHostRecord {
         context: QueryContextRef,
         _generation: Generation,
         reason: novarocks_execution_contract::root_lifetime::RootRetentionClose,
-        seal_work: novarocks_control_runtime_core::identity::WorkId,
+        seal_work: novarocks_control_runtime_core::identity::ScopedWorkRef,
         ports: &TaskDriverPorts,
     ) -> Result<bool, TaskDriverError> {
         use std::ops::Bound::{Excluded, Unbounded};
@@ -1353,7 +1536,7 @@ impl ContextHostRecord {
     }
     fn seal_retained_roots(
         &mut self,
-        work: novarocks_control_runtime_core::identity::WorkId,
+        work: novarocks_control_runtime_core::identity::ScopedWorkRef,
         reason: novarocks_execution_contract::root_lifetime::RootRetentionClose,
         ports: &TaskDriverPorts,
     ) -> Result<bool, TaskDriverError> {
@@ -1375,7 +1558,8 @@ impl ContextHostRecord {
             RetainedRootSealPreparation::Job(job) => {
                 self.queue_task_cleanup(
                     TaskDriverHostJob::SealRetainedRoot {
-                        key: (self.scope().id(), work),
+                        fairness: self.identity,
+                        key: (work.scope, work.work),
                         job,
                     },
                     ports,
@@ -1420,7 +1604,9 @@ pub(crate) enum TaskDriverHostJob {
     FailedTask(crate::control_runtime::task::FailedTaskAction),
     FailureTail(super::failure_tail::FailureTailJob),
     CloseContextAdmission(context_admission::ContextAdmissionCloseJob),
+    ContextForget(crate::control_runtime::context_forget::ContextForgetJob),
     DisposeLoadedInput {
+        fairness: QueryContextRef,
         key: (
             novarocks_control_runtime_core::identity::ScopeId,
             novarocks_control_runtime_core::identity::WorkId,
@@ -1431,6 +1617,8 @@ pub(crate) enum TaskDriverHostJob {
         pending: Arc<dyn crate::task_port::TaskPendingNotice>,
     },
     DisposeCreate(super::requests::create_disposal::TaskCreateDisposalJob),
+    DisposeRejectedPartial(super::requests::rejected_capture::RejectedCaptureJob),
+    DisposeRejectedDomain(super::requests::rejected_domain_capture::RejectedDomainJob),
     RequestObservation(crate::control_runtime::request_observation::RequestObservationJob),
     DynamicFilter(crate::control_runtime::dynamic_filters::TaskDynamicFilterHostJob),
     RollbackPreparation {
@@ -1440,6 +1628,7 @@ pub(crate) enum TaskDriverHostJob {
         pending: Arc<dyn crate::task_port::TaskPendingNotice>,
     },
     DisposeSource {
+        fairness: QueryContextRef,
         key: (
             novarocks_control_runtime_core::identity::ScopeId,
             novarocks_control_runtime_core::identity::WorkId,
@@ -1458,6 +1647,7 @@ pub(crate) enum TaskDriverHostJob {
     Domain(super::requests::domain::DomainHostJob),
     DomainProjection(super::requests::domain_driver::DomainProjectionJob),
     SealRetainedRoot {
+        fairness: QueryContextRef,
         key: (
             novarocks_control_runtime_core::identity::ScopeId,
             novarocks_control_runtime_core::identity::WorkId,
@@ -1495,6 +1685,7 @@ pub(crate) enum TaskDriverHostJob {
         port: std::mem::ManuallyDrop<Arc<crate::task_port::TaskRuntimePort>>,
     },
     DisposeProjection {
+        fairness: QueryContextRef,
         key: (
             novarocks_control_runtime_core::identity::ScopeId,
             novarocks_control_runtime_core::identity::WorkId,
@@ -1550,8 +1741,11 @@ impl crate::control_runtime::preparation::QueuedPreparation for TaskDriverHostJo
             Self::FailedTask(job) => job.queue_key(),
             Self::FailureTail(job) => job.queue_key(),
             Self::CloseContextAdmission(job) => job.queue_key(),
+            Self::ContextForget(job) => job.queue_key(),
             Self::RollbackPreparation { preparation, .. } => preparation.key(),
             Self::DisposeCreate(job) => job.queue_key(),
+            Self::DisposeRejectedPartial(job) => job.queue_key(),
+            Self::DisposeRejectedDomain(job) => job.queue_key(),
             Self::RequestObservation(job) => job.queue_key(),
             Self::DynamicFilter(job) => job.queue_key(),
             Self::RetireExecution { job, .. } => {
@@ -1577,6 +1771,21 @@ impl crate::control_runtime::preparation::QueuedPreparation for TaskDriverHostJo
             | Self::DisposeProjection { key, .. } => *key,
         }
     }
+    fn fairness_group(
+        &self,
+        scope: novarocks_control_runtime_core::identity::ScopeId,
+    ) -> crate::control_runtime::preparation::HostFairnessGroup {
+        use crate::control_runtime::preparation::HostFairnessGroup;
+        match self {
+            Self::DisposeLoadedInput { fairness, .. }
+            | Self::DisposeSource { fairness, .. }
+            | Self::DisposeProjection { fairness, .. }
+            | Self::SealRetainedRoot { fairness, .. } => HostFairnessGroup::Context(*fairness),
+            Self::CloseContextAdmission(job) => HostFairnessGroup::Context(job.context()),
+            Self::ContextForget(job) => HostFairnessGroup::Context(job.context()),
+            _ => HostFairnessGroup::Scope(scope),
+        }
+    }
 }
 impl TaskDriverHostJob {
     pub(crate) fn run_on_host(self) {
@@ -1584,6 +1793,7 @@ impl TaskDriverHostJob {
             Self::FailedTask(job) => job.run(),
             Self::FailureTail(job) => job.run(),
             Self::CloseContextAdmission(job) => job.run(),
+            Self::ContextForget(job) => job.run(),
             Self::RollbackPreparation {
                 preparation,
                 owner,
@@ -1611,6 +1821,8 @@ impl TaskDriverHostJob {
                 pending.pending();
             }
             Self::DisposeCreate(job) => job.run(),
+            Self::DisposeRejectedPartial(job) => job.run(),
+            Self::DisposeRejectedDomain(job) => job.run(),
             Self::RequestObservation(job) => job.run(),
             Self::DynamicFilter(job) => job.run(),
             Self::DisposeSource {
@@ -1618,8 +1830,18 @@ impl TaskDriverHostJob {
                 ticket,
                 mut source,
                 pending,
+                key,
                 ..
             } => {
+                let input = ticket.input;
+                let action = ticket.descriptor.id;
+                tracing::debug!(
+                    pid = std::process::id(),
+                    ?key,
+                    ?input,
+                    ?action,
+                    "Original source disposal body started"
+                );
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // SAFETY: destruction is attempted once at this stable
                     // Box address. A partial unwind never moves or retries the
@@ -1631,6 +1853,13 @@ impl TaskDriverHostJob {
                     std::panic::resume_unwind(panic);
                 }
                 drop(source);
+                tracing::debug!(
+                    pid = std::process::id(),
+                    ?key,
+                    ?input,
+                    ?action,
+                    "Original source disposal captures exited"
+                );
                 if let Err(refusal) =
                     runtime.effect_completed(std::mem::ManuallyDrop::into_inner(ticket))
                 {
@@ -1639,6 +1868,13 @@ impl TaskDriverHostJob {
                     std::mem::forget(refusal);
                     std::process::abort();
                 }
+                tracing::debug!(
+                    pid = std::process::id(),
+                    ?key,
+                    ?input,
+                    ?action,
+                    "Original source disposal effect completed"
+                );
                 pending.pending();
             }
             Self::SealRetainedRoot { job, .. } => {
@@ -1727,6 +1963,7 @@ enum RootWakeRoute {
 /// wake, so transfer cannot leave a stale Task address after retirement.
 pub(crate) struct TaskRootWake {
     task: TaskIdentity,
+    pending: Arc<dyn crate::task_port::TaskPendingNotice>,
     ready: Arc<Mutex<TaskReady>>,
     notice: crate::control_runtime::context_ready::ContextReadyNotice,
     route: Mutex<RootWakeRoute>,
@@ -1748,12 +1985,10 @@ impl std::task::Wake for TaskRootWake {
     fn wake_by_ref(self: &Arc<Self>) {
         let route = self.route.lock().expect("original Root wake routing");
         if matches!(*route, RootWakeRoute::Task) {
-            self.ready
-                .lock()
-                .expect("original Root Task readiness")
-                .insert(self.task);
+            self.pending.pending();
+        } else {
+            self.notice.notify();
         }
-        self.notice.notify();
     }
 }
 
@@ -1770,7 +2005,10 @@ impl ContextHostRecord {
             return Err(TaskDriverError::MissingLifecyclePort);
         };
         let before = ports.capacity.as_ref().map(|capacity| capacity.revision());
-        if let Err((_, job)) = executor.try_submit(job) {
+        if let Err((_, job)) = executor.try_submit_for_group(
+            job,
+            crate::control_runtime::preparation::HostFairnessGroup::Context(self.identity),
+        ) {
             self.task_driver.physical_pending.push_back(job);
             if let (Some(capacity), Some(before)) = (&ports.capacity, before) {
                 capacity
@@ -1835,6 +2073,20 @@ impl ContextHostRecord {
         if let Some(job) = self.task_driver.jobs.remove(&task) {
             self.queue_task_cleanup(job, ports)?;
         }
+        if matches!(
+            self.tasks.get(&task),
+            Some(super::TaskHostOwner::Unpublished(_))
+        ) {
+            let step = self.advance_unpublished_task(stage, task, budget)?;
+            if step.runnable {
+                self.task_driver
+                    .ready
+                    .lock()
+                    .expect("original unpublished ready address")
+                    .insert(task);
+            }
+            return Ok(Some((task, step)));
+        }
         let ledger = self.ledger.clone();
         let execution = ports
             .execution
@@ -1847,7 +2099,7 @@ impl ContextHostRecord {
                 .advance_failed_retirement(stage, &ledger, execution, budget)
                 .map_err(TaskDriverError::Host)?,
             Some(super::TaskHostOwner::Unpublished(_)) => {
-                return Err(TaskDriverError::Task(ContextHostError::TaskStillOwned));
+                unreachable!("handled original unpublished Task")
             }
             None => return Ok(None),
         };
@@ -1861,17 +2113,88 @@ impl ContextHostRecord {
         Ok(Some((task, step)))
     }
 
+    fn advance_unpublished_task(
+        &mut self,
+        stage: &super::failure::ScopePublicationsDrained<'_>,
+        task: TaskIdentity,
+        budget: usize,
+    ) -> Result<crate::control_runtime::task::FailedTaskStep, TaskDriverError> {
+        let Some(super::TaskHostOwner::Unpublished(owner)) = self.tasks.get_mut(&task) else {
+            return Err(TaskDriverError::WrongOwner);
+        };
+        if !owner
+            .advance_failed_unused(
+                stage,
+                &self.control_runtime,
+                self.actor,
+                &self.ledger,
+                budget,
+            )
+            .map_err(TaskDriverError::Host)?
+        {
+            return Ok(crate::control_runtime::task::FailedTaskStep {
+                runnable: true,
+                ..Default::default()
+            });
+        }
+        let (input, payload) = (owner.loading_input, owner.payload);
+        // The failed custodian must first settle the matching Started effect.
+        // Its original pure input can then leave without waiting on Root R.
+        if self
+            .control_runtime
+            .input_custody(self.actor, input)
+            .map_err(TaskDriverError::Driver)?
+            .is_some()
+            && !self
+                .retire_failed_unpublished_create_input(stage, input, task, payload)
+                .map_err(TaskDriverError::Request)?
+        {
+            return Ok(crate::control_runtime::task::FailedTaskStep::default());
+        }
+        let Some(super::TaskHostOwner::Unpublished(owner)) = self.tasks.get_mut(&task) else {
+            unreachable!("same original unpublished retirement");
+        };
+        let (retired, runnable) = owner
+            .retire_after_input(stage, &self.control_runtime, self.actor, budget)
+            .map_err(TaskDriverError::Host)?;
+        if retired {
+            // All fields are the same empty, truly exited bootstrap holders.
+            // There was no port, execution host or opaque task carrier here.
+            if let Some(notice) = self.task_driver.notices.remove(&task) {
+                notice.retire_to_context();
+            }
+            self.task_driver
+                .ready
+                .lock()
+                .expect("retired unpublished address")
+                .remove(&task);
+            let original = self
+                .tasks
+                .remove(&task)
+                .expect("same retired unpublished Task");
+            drop(original);
+            self.notify_host_progress();
+        }
+        Ok(crate::control_runtime::task::FailedTaskStep {
+            runnable,
+            ..Default::default()
+        })
+    }
+
     pub(super) fn retain_failed_retirement_ticket(
         &mut self,
         ticket: EffectTicket<WorkerAction>,
     ) -> Result<(), (TaskDriverError, EffectTicket<WorkerAction>)> {
-        let (task, finalize_execution_only, retained_payload) = match &ticket.effect {
+        let (task, finalize_execution_only, retained_custody) = match &ticket.effect {
             WorkerAction::Context(ContextEffect::FinalizeTaskExecution { task, .. }) => {
                 (*task, true, None)
             }
-            WorkerAction::Context(ContextEffect::RetireTask { task, payload, .. }) => {
-                (*task, false, Some(*payload))
-            }
+            WorkerAction::Context(ContextEffect::RetireTask {
+                task,
+                payload,
+                close_epoch,
+                ..
+            }) => (*task, false, Some((*payload, *close_epoch))),
             _ => return Err((TaskDriverError::WrongOwner, ticket)),
         };
         if self.task_driver.retirements.contains_key(&task) {
@@ -1880,7 +2203,7 @@ impl ContextHostRecord {
         let Some(owner) = self.task(task) else {
             return Err((TaskDriverError::WrongOwner, ticket));
         };
-        if retained_payload.is_some_and(|payload| payload != owner.original_payload_id()) {
+        if retained_custody.is_some_and(|(payload, _)| payload != owner.original_payload_id()) {
             return Err((TaskDriverError::WrongOwner, ticket));
         }
         self.task_driver.retirements.insert(
@@ -1891,7 +2214,7 @@ impl ContextHostRecord {
                 projection_committed: false,
                 finalize_execution_only,
                 disposal_authorization: None,
-                retained_payload,
+                retained_custody,
             },
         );
         Ok(())
@@ -1948,7 +2271,7 @@ impl ContextHostRecord {
         let candidate = owner
             .port()
             .prepare_source_retirement()
-            .map_err(|_| TaskDriverError::Publication)?;
+            .map_err(TaskDriverError::Projection)?;
         Ok(Some((task, Arc::new(candidate))))
     }
 
@@ -2140,11 +2463,7 @@ impl ContextHostRecord {
                     .get_mut(&task)
                     .expect("same original rejection retirement")
                     .execution_job_issued = true;
-                self.task_driver
-                    .ready
-                    .lock()
-                    .expect("same original Task ready")
-                    .insert(task);
+                self.notify_task_driver_progress(task);
             }
             return Ok(());
         }
@@ -2178,9 +2497,9 @@ impl ContextHostRecord {
                     });
             let candidate = match candidate {
                 Ok(candidate) => candidate,
-                Err(_) => {
+                Err(error) => {
                     self.task_driver.retirements.get_mut(&task).unwrap().ticket = Some(ticket);
-                    return Err(TaskDriverError::Publication);
+                    return Err(TaskDriverError::Projection(error));
                 }
             };
             let observer = match self.control_runtime.effect_completion_observer(&ticket) {
@@ -2221,7 +2540,8 @@ impl ContextHostRecord {
                 .projection_committed = true;
             self.queue_task_cleanup(
                 TaskDriverHostJob::DisposeProjection {
-                    key: (self.scope().id(), ticket.descriptor.work),
+                    fairness: self.identity,
+                    key: (ticket.descriptor.work.scope, ticket.descriptor.work.work),
                     runtime: self.control_runtime.clone(),
                     ticket,
                     old: std::mem::ManuallyDrop::new(old),
@@ -2268,11 +2588,15 @@ impl ContextHostRecord {
             .disposal_authorization
             .take()
             .expect("original validated disposal authorization");
+        let (original_payload, original_epoch) = self.task_driver.retirements[&task]
+            .retained_custody
+            .expect("original Core Task retirement payload and close epoch");
         let (disposal, job) = crate::control_runtime::task::TaskDisposal::from_original(
             resources,
             ports.protocol_events.clone(),
             authorization,
         );
+        disposal.bind_custody_retirement(original_payload, original_epoch);
         let disposal = Arc::new(disposal);
         let key = job.key();
         self.task_driver
@@ -2280,9 +2604,6 @@ impl ContextHostRecord {
             .lock()
             .expect("removed original Task ready address")
             .remove(&task);
-        let original_payload = self.task_driver.retirements[&task]
-            .retained_payload
-            .expect("original Core Task retirement payload");
         self.task_driver.retirements.remove(&task);
         assert!(
             self.task_driver
@@ -2342,7 +2663,9 @@ impl ContextHostRecord {
                     continue;
                 }
             }
-            if let Some(payload) = owner.rejected_payload()
+            let rejected_payload = owner.rejected_payload();
+            let accepted_custody = owner.accepted_custody();
+            if (rejected_payload.is_some() || accepted_custody.is_some())
                 && !(owner.retirement_input().is_none()
                     && self.resources.internal.failed_publications_drained())
             {
@@ -2350,26 +2673,40 @@ impl ContextHostRecord {
                     match self
                         .resources
                         .internal
-                        .finish_rejected_creation(input)
+                        .finish_task_retirement(input)
                         .map_err(TaskDriverError::Driver)?
                     {
                         Consumption::Pending => continue,
-                        Consumption::Consumed | Consumption::AbandonedByOwnerFailure => {}
+                        Consumption::Consumed => {}
+                        // This exact input's failed-owner receipt is not a
+                        // normal Core decision. All physical exit gates above
+                        // remain required before either branch removes custody.
+                        Consumption::AbandonedByOwnerFailure => {}
                     }
                 } else {
-                    if let Some(input) = self
-                        .resources
-                        .internal
-                        .try_submit_rejected_creation(task, payload)
-                        .map_err(TaskDriverError::Driver)?
-                    {
+                    let input = if let Some(payload) = rejected_payload {
+                        self.resources
+                            .internal
+                            .try_submit_rejected_creation(task, payload)
+                    } else {
+                        let (payload, close_epoch) =
+                            accepted_custody.expect("same completed accepted Task custody");
+                        self.resources.internal.try_submit_task_custody_retired(
+                            task,
+                            payload,
+                            close_epoch,
+                        )
+                    }
+                    .map_err(TaskDriverError::Driver)?;
+                    if let Some(input) = input {
                         owner.bind_retirement_input(input);
-                        // The original disposal is complete. Remove only this
-                        // rejected owner's sealed read row before a later new
-                        // LoadInput can run under the same Context cell lock.
-                        self.retired_task_reads
-                            .remove(&task)
-                            .ok_or(TaskDriverError::Publication)?;
+                        if rejected_payload.is_some() {
+                            // Only this rejected identity may be created again
+                            // after its actual self-source fact is consumed.
+                            self.retired_task_reads
+                                .remove(&task)
+                                .ok_or(TaskDriverError::Publication)?;
+                        }
                         progress = true;
                     }
                     continue;

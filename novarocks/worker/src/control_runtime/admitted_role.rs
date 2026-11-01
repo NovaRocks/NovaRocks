@@ -23,20 +23,20 @@
 use crate::task_completion_roles::AdmittedCompletionRole;
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkChildAuthority, WorkLease},
     reported_work::ReportedWork,
-    transaction::{RuntimeError, ScopeHandle},
+    transaction::{RoleSpec, RuntimeError, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::ReservationResources,
     completion::ConsumerKind,
-    identity::{ConsumerId, Generation, ReservationId},
+    identity::{ConsumerId, Generation, ScopeId},
     scope::WorkKind,
 };
 
 pub(crate) fn adopt_reported_work(
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     report: ReportSlot,
 ) -> ReportedWork {
     match ReportedWork::try_new(work, capacity, report) {
@@ -48,33 +48,84 @@ pub(crate) fn adopt_reported_work(
     }
 }
 
+/// Financial admission and the consuming Core are separate original owners.
+/// `core_owner` names that Core's Scope and initial actor epoch; it grants no
+/// Work and never replaces the financial Scope's current generation.
 pub(super) fn reserve_reported_role(
     scope: &ScopeHandle,
-    parent: ReservationId,
+    payer: &mut ReservationBundle,
+    actual_parent: &WorkLease,
+    resources: ReservationResources,
     kind: WorkKind,
-    core_generation: Option<Generation>,
+    core_owner: Option<(ScopeId, Generation)>,
 ) -> Result<AdmittedCompletionRole, RuntimeError> {
+    reserve_reported_role_with_parent(
+        scope,
+        payer,
+        RoleParent::Work(actual_parent),
+        resources,
+        kind,
+        core_owner,
+    )
+}
+
+/// The same unique payer funds a child of an independently held original
+/// baseline. Authority revalidation and position binding share Common's gate.
+pub(super) fn reserve_reported_role_from_authority(
+    scope: &ScopeHandle,
+    payer: &mut ReservationBundle,
+    actual_parent: &WorkChildAuthority,
+    resources: ReservationResources,
+    kind: WorkKind,
+    core_owner: Option<(ScopeId, Generation)>,
+) -> Result<AdmittedCompletionRole, RuntimeError> {
+    reserve_reported_role_with_parent(
+        scope,
+        payer,
+        RoleParent::Authority(actual_parent),
+        resources,
+        kind,
+        core_owner,
+    )
+}
+
+enum RoleParent<'a> {
+    Work(&'a WorkLease),
+    Authority(&'a WorkChildAuthority),
+}
+fn reserve_reported_role_with_parent(
+    scope: &ScopeHandle,
+    payer: &mut ReservationBundle,
+    actual_parent: RoleParent<'_>,
+    resources: ReservationResources,
+    kind: WorkKind,
+    core_owner: Option<(ScopeId, Generation)>,
+) -> Result<AdmittedCompletionRole, RuntimeError> {
+    // Financial admission follows this original Scope. Report consumption
+    // targets the explicitly supplied Core, independently of the parent.
     let generation = scope.gates()?.generation;
-    let guard = scope.reserve_child_next(generation, parent, ResourceVector::default(), kind)?;
     let mut consumers = Vec::with_capacity(2);
-    if let Some(core_generation) = core_generation {
+    if let Some((core_scope, core_generation)) = core_owner {
         consumers.push((
             ConsumerId::new(1).unwrap(),
             ConsumerKind::Owner {
-                scope: scope.id(),
+                scope: core_scope,
                 generation: core_generation,
             },
         ));
     }
     consumers.push((ConsumerId::new(2).unwrap(), ConsumerKind::Observer));
-    let report = ReportSlot::reserve_next(scope, generation, guard.work_id(), 2, consumers)?;
-    let (work, capacity) = match guard.bind(kind) {
-        Ok(bound) => bound,
-        Err(error) => {
-            revoke_report(&report);
-            return Err(error);
-        }
+    let role = RoleSpec {
+        generation,
+        kind,
+        resources,
+        consumers,
     };
+    let reported = match actual_parent {
+        RoleParent::Work(parent) => scope.reserve_child_from(payer, parent, role),
+        RoleParent::Authority(parent) => scope.reserve_child_from_authority(payer, parent, role),
+    }?;
+    let (work, capacity, report) = reported.into_parts();
     Ok(AdmittedCompletionRole {
         work,
         capacity,
@@ -99,6 +150,6 @@ pub(super) fn dispose_unused_completion(mut role: AdmittedCompletionRole) {
         .captures_exited()
         .expect("unused original role captures");
     role.capacity
-        .release(&ResourceVector::default())
-        .expect("zero-resource original header release");
+        .finish()
+        .expect("unused original role storage exit");
 }

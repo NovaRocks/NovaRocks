@@ -53,6 +53,7 @@ impl Default for FailedRetirementCursor {
     }
 }
 #[must_use = "The original failure custodian must retain every returned owner"]
+#[derive(Default)]
 pub(crate) struct FailedTaskStep {
     pub progressed: bool,
     pub runnable: bool,
@@ -64,26 +65,24 @@ pub(crate) struct FailedTaskStep {
     pub detached_projection: Option<Arc<TaskProjection>>,
     pub ready_for_disposal: bool,
 }
-impl Default for FailedTaskStep {
-    fn default() -> Self {
-        Self {
-            progressed: false,
-            runnable: false,
-            action: None,
-            neutral: None,
-            root: None,
-            detached_projection: None,
-            ready_for_disposal: false,
-        }
-    }
-}
 #[must_use = "Dispose the exact abandoned neutral body on its original failure owner"]
 pub(crate) enum FailedTaskNeutral {
-    Queued(CausalEventInput),
-    Rejected(Option<WorkerMessage>, WorkerMessage),
-    Open(SummaryInput),
-    OpenRejected(WorkerMessage),
-    Loading([Option<novarocks_worker_protocol::context::ContextInput>; 2]),
+    Queued {
+        _original: CausalEventInput,
+    },
+    Rejected {
+        _original_prefix: Option<WorkerMessage>,
+        _original_event: WorkerMessage,
+    },
+    Open {
+        _original: SummaryInput,
+    },
+    OpenRejected {
+        _original: WorkerMessage,
+    },
+    Loading {
+        _original: [Option<novarocks_worker_protocol::context::ContextInput>; 2],
+    },
 }
 /// Each variant contains an existing unique physical permission. The queue
 /// key is scheduling metadata; it does not grant another Work or capture.
@@ -103,7 +102,7 @@ enum Physical {
     Settlement(crate::settlement::FailedSettlementDispatch),
     Filters(super::super::dynamic_filters::TaskDynamicFilterHostJob),
     Loader(LoadingHostJob),
-    UnstartedPreparation(TaskPreparationJob),
+    UnstartedPreparation(Box<TaskPreparationJob>),
     ActivateStopped {
         preparation: PreparationCustody,
         owner: Arc<ProductionPreparation>,
@@ -202,7 +201,10 @@ impl TaskHostRecord {
             Physical::ActivateStopped { preparation, .. }
             | Physical::Rollback { preparation, .. } => preparation.key(),
             Physical::LoaderInput(job) => job.queue_key(),
-            Physical::Withdraw(author) => (self.scope.id(), author.custody().work_id()),
+            Physical::Withdraw(author) => {
+                let work = author.custody().work_id();
+                (work.scope, work.work)
+            }
             Physical::Source { key, .. } => *key,
         };
         FailedTaskAction {
@@ -279,8 +281,8 @@ impl TaskHostRecord {
                 3 => self.failed_author(stage, &mut step)?,
                 4 => self.failed_completion(stage, &mut step)?,
                 5 => self.failed_repeated_sources(stage, &mut step)?,
-                6 => self.failed_cut(stage, ledger, &mut step)?,
-                7 => self.failed_open(stage, ledger, &mut step)?,
+                6 => self.failed_cut(stage, &mut step)?,
+                7 => self.failed_open(stage, &mut step)?,
                 8 => self.failed_final_inventory(stage, ledger, &mut step)?,
                 _ => unreachable!("fixed original owner classes"),
             }
@@ -403,7 +405,9 @@ impl TaskHostRecord {
                 step.progressed = true;
             }
             if turn.rejected.iter().any(Option::is_some) {
-                step.neutral = Some(FailedTaskNeutral::Loading(turn.rejected));
+                step.neutral = Some(FailedTaskNeutral::Loading {
+                    _original: turn.rejected,
+                });
             }
         }
         Ok(())
@@ -415,7 +419,7 @@ impl TaskHostRecord {
         step: &mut FailedTaskStep,
     ) -> Result<(), TaskHostError> {
         if let Some(job) = self.resources.pending_preparation_adoption.take() {
-            step.action = Some(self.failed_action(Physical::UnstartedPreparation(job)));
+            step.action = Some(self.failed_action(Physical::UnstartedPreparation(Box::new(job))));
             step.progressed = true;
             return Ok(());
         }
@@ -613,7 +617,7 @@ impl TaskHostRecord {
                 continue;
             }
             let report = roles.report(kind);
-            step.progressed |= abandon_report(stage, self, &report)?;
+            step.progressed |= abandon_report(stage, self, report)?;
             if roles.execution_calls_exited() {
                 let host = ConsumerId::new(2).unwrap();
                 if report.consumption(host)? == Consumption::Pending {
@@ -668,13 +672,14 @@ impl TaskHostRecord {
     fn failed_cut(
         &mut self,
         stage: &ScopePublicationsDrained<'_>,
-        ledger: &RuntimeLedger,
         step: &mut FailedTaskStep,
     ) -> Result<(), TaskHostError> {
         // A queued value never transferred to the runtime is still the same
         // original failed-owner body. Save its abandoned receipt first.
         if let Some(original) = self.resources.causal.take_failed_queued(stage)? {
-            step.neutral = Some(FailedTaskNeutral::Queued(original));
+            step.neutral = Some(FailedTaskNeutral::Queued {
+                _original: original,
+            });
             step.progressed = true;
             return Ok(());
         }
@@ -685,10 +690,19 @@ impl TaskHostRecord {
                 .ingress()
                 .owned_pair_inventory(&retired.pair)
                 .map_err(|error| TaskHostError::Causal(error.into()))?;
-            step.progressed |= Self::advance_source_cleanups(positions)?;
-            // The normal helper's first branch only drains an already-returned
-            // pair and does not enter its normal Core-observation path.
-            step.progressed |= self.advance_production_cut(ledger)?;
+            let cleanup_progress = Self::advance_source_cleanups(positions)?;
+            step.progressed |= cleanup_progress;
+            if cleanup_progress {
+                self.pending_notice().pending();
+            }
+            // The failed-owner helper drains only the original returned pair;
+            // it never enters normal Core observation.
+            let retirement = self.advance_retired_host_pair()?;
+            step.progressed |= retirement.progressed;
+            step.runnable |= retirement.runnable;
+            if retirement.progressed {
+                self.pending_notice().pending();
+            }
             return Ok(());
         }
         let next = self
@@ -735,7 +749,10 @@ impl TaskHostRecord {
             .advance_failed_original_cut(stage, cut, 1)?;
         step.progressed |= turn.progressed;
         if let Some((prefix, event)) = turn.rejected {
-            step.neutral = Some(FailedTaskNeutral::Rejected(prefix, event));
+            step.neutral = Some(FailedTaskNeutral::Rejected {
+                _original_prefix: prefix,
+                _original_event: event,
+            });
             return Ok(());
         }
         // Prepaid future authors are real Pending holders. Their pair still
@@ -778,7 +795,6 @@ impl TaskHostRecord {
         let sources = self.resources.causal.advance_failed_source_pair(
             stage,
             cut,
-            ledger,
             &self.scope,
             self.core_generation,
             1,
@@ -793,7 +809,7 @@ impl TaskHostRecord {
             .retire_after_exit(cut, CausalSourceRetirement::Unclaimed)
         {
             Ok(pair) => {
-                self.host_retired_pairs.insert(cut, pair);
+                self.retain_returned_host_pair(cut, pair);
                 step.progressed = true;
             }
             Err(refusal) => {
@@ -807,7 +823,7 @@ impl TaskHostRecord {
                         .retire_after_exit(cut, CausalSourceRetirement::Reaped(reaped))
                     {
                         Ok(pair) => {
-                            self.host_retired_pairs.insert(cut, pair);
+                            self.retain_returned_host_pair(cut, pair);
                             step.progressed = true;
                         }
                         Err(refusal) if waiting_cut(refusal.error) => {}
@@ -821,7 +837,6 @@ impl TaskHostRecord {
     fn failed_open(
         &mut self,
         stage: &ScopePublicationsDrained<'_>,
-        ledger: &RuntimeLedger,
         step: &mut FailedTaskStep,
     ) -> Result<(), TaskHostError> {
         let ingress = self.resources.port.ingress().clone();
@@ -829,22 +844,23 @@ impl TaskHostRecord {
             if open.is_closed() {
                 return Ok(());
             }
-            if open.is_idle().map_err(TaskHostError::OpenSummary)? {
-                if let Some(summary) = open
+            if open.is_idle().map_err(TaskHostError::OpenSummary)?
+                && let Some(summary) = open
                     .take_failed_queued(stage)
                     .map_err(TaskHostError::OpenSummary)?
-                {
-                    step.neutral = Some(FailedTaskNeutral::Open(summary));
-                    step.progressed = true;
-                    return Ok(());
-                }
+            {
+                step.neutral = Some(FailedTaskNeutral::Open { _original: summary });
+                step.progressed = true;
+                return Ok(());
             }
             let turn = open
                 .advance_failed(stage, 1)
                 .map_err(TaskHostError::OpenSummary)?;
             step.progressed |= turn.progressed;
             if let Some(rejected) = turn.rejected {
-                step.neutral = Some(FailedTaskNeutral::OpenRejected(rejected));
+                step.neutral = Some(FailedTaskNeutral::OpenRejected {
+                    _original: rejected,
+                });
                 return Ok(());
             }
             if turn.consumption.is_none() {
@@ -905,7 +921,16 @@ impl TaskHostRecord {
                     step.progressed |= before != position.custody.phase();
                 }
             }
-            step.progressed |= ledger.reap_scope_ready(self.scope.id(), 1)? != 0;
+            let mut reaped_count = 0;
+            for position in ingress
+                .pair_inventory(PairRoute::ConsumingOpen)
+                .map_err(|error| TaskHostError::Causal(error.into()))?
+            {
+                if reaped_count == 0 && !position.custody.reusable() {
+                    reaped_count += position.custody.financial_scope().reap_ready(1)?;
+                }
+            }
+            step.progressed |= reaped_count != 0;
             // Source exit, adopted cleanup and its independent report/header
             // may advance while the old batch is still live. Moving this pair
             // remains gated by the original input and saved Core receipt.
@@ -1033,6 +1058,18 @@ impl TaskHostRecord {
                 }
                 step.progressed |= before != position.custody.phase();
             }
+            // A Source's actual process payer owns its header, including
+            // unused fixed-pair positions. Spend one real reap per turn and
+            // do not let an already reusable first position hide the second.
+            for position in ingress
+                .pair_inventory(route)
+                .map_err(|error| TaskHostError::Causal(error.into()))?
+                .into_iter()
+                .filter(|position| !position.custody.reusable())
+                .take(1)
+            {
+                step.progressed |= position.custody.financial_scope().reap_ready(1)? != 0;
+            }
             let [a, b] = ingress
                 .prepare_pair_reap(route)
                 .map_err(|error| TaskHostError::Causal(error.into()))?
@@ -1040,17 +1077,10 @@ impl TaskHostRecord {
             let (Ok(a), Ok(b)) = (a, b) else {
                 return Ok(());
             };
-            let mut storage = ingress
+            let detached = ingress
                 .release_closed_route_pair(route, [a, b])
                 .map_err(|(error, _)| TaskHostError::Causal(error.into()))?;
-            for slot in &mut storage {
-                if let Err(error) = slot.release() {
-                    // Refund failure preserves the same detached payment;
-                    // metadata unwinding cannot destroy its active bundle.
-                    std::mem::forget(storage);
-                    return Err(TaskHostError::Runtime(error));
-                }
-            }
+            drop(detached);
             self.normal_source_detached[index] = true;
             step.progressed = true;
             return Ok(());
@@ -1107,14 +1137,13 @@ impl TaskHostRecord {
             self.normal_lifetime_ended = true;
             step.progressed = true;
         }
-        if self.resources.lifetime.actual_exit_ready()? {
-            if let Some(open) = &mut self.resources.open_summary
-                && !open.is_closed()
-            {
-                open.close_failed_after_exit(stage, &self.resources.lifetime)
-                    .map_err(TaskHostError::OpenSummary)?;
-                step.progressed = true;
-            }
+        if self.resources.lifetime.actual_exit_ready()?
+            && let Some(open) = &mut self.resources.open_summary
+            && !open.is_closed()
+        {
+            open.close_failed_after_exit(stage, &self.resources.lifetime)
+                .map_err(TaskHostError::OpenSummary)?;
+            step.progressed = true;
         }
         step.ready_for_disposal = self.resources.seal_read_observation().is_ok();
         Ok(())

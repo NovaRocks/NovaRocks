@@ -854,6 +854,60 @@ impl NativeRootResultSession {
         join_root_exit_progress(pool, self.shared.authority.input_exit_progress())
     }
     #[cfg(test)]
+    pub(crate) fn assert_scalar_origin_stop_reentry(&self, origin: &ExecutionFailure) {
+        use novarocks_execution_contract::failure::FailureProjection;
+        // Source projection and error-chain inspection also stay outside the
+        // two real Root locks whose reentry the observer is verifying.
+        let fact = origin.failure_fact();
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(origin);
+        let mut original_scalar = false;
+        while let Some(error) = source {
+            if let Some(original) = error.downcast_ref::<RootSessionFailure>() {
+                assert!(matches!(original, RootSessionFailure::ScalarCardinality));
+                original_scalar = true;
+                break;
+            }
+            source = error.source();
+        }
+        assert!(
+            original_scalar,
+            "the actual original scalar codec source reaches the Task"
+        );
+        assert!(
+            self.shared.state.try_lock().is_ok(),
+            "producer mutex is released before Task callbacks"
+        );
+        assert!(
+            self.shared.failure_reporter.try_lock().is_ok(),
+            "reporter mutex is released before Task callbacks"
+        );
+        let state = self
+            .shared
+            .state
+            .try_lock()
+            .expect("the actual Root cleanup gate keeps producer state available");
+        let failed = state
+            .failed
+            .as_ref()
+            .expect("the original producer failure remains observable");
+        assert_eq!(failed.phase, FailureSourcePhase::Transferred);
+        assert!(
+            failed.live_source.is_none(),
+            "Root transferred its unique original source"
+        );
+        assert_eq!(failed.observation.as_ref().unwrap().fact(), fact);
+        assert!(matches!(
+            failed.producer_state(),
+            RootProducerState::Failed(_)
+        ));
+        drop(state);
+        assert_eq!(
+            self.producer_exit_progress(),
+            RootWorkExitProgress::Pending,
+            "the observer reenters while the original producer cleanup is still physically gated"
+        );
+    }
+    #[cfg(test)]
     fn state(&self) -> MutexGuard<'_, ProducerState> {
         self.shared.state()
     }
@@ -1023,10 +1077,7 @@ impl RootSessionState {
                     &mut state.client_types,
                 );
                 input.execution = InputExecution::Idle;
-                let encoder = match construction {
-                    Ok(encoder) => encoder,
-                    Err(message) => return Err(message),
-                };
+                let encoder = construction?;
                 input.encoder = Some(std::mem::ManuallyDrop::new(encoder));
                 return Ok(RootProducerTurn::Yielded);
             }
@@ -1047,10 +1098,7 @@ impl RootSessionState {
                 .unwrap()
                 .step(state.builder.as_mut().unwrap().output_at(state.used));
             input.execution = InputExecution::Idle;
-            let turn = match rendering {
-                Ok(turn) => turn,
-                Err(message) => return Err(message),
-            };
+            let turn = rendering?;
             state.used += turn.emitted_bytes;
             if let Err(cause) = self.channel.note_rows(turn.completed_rows) {
                 return Err(cause.into_execution());
@@ -1114,9 +1162,7 @@ impl RootSessionState {
             if self.scalar() {
                 return self.finish_scalar(state);
             }
-            if let Err(message) = self.sealed_domain_complete(state) {
-                return Err(message);
-            }
+            self.sealed_domain_complete(state)?;
             if let Err(cause) = self
                 .channel
                 .request_finish()
@@ -1768,7 +1814,7 @@ where
 }
 
 #[cfg(test)]
-mod terminal_observation_tests {
+pub(crate) mod terminal_observation_tests {
     use super::*;
     use std::num::NonZeroUsize;
     use std::sync::Condvar;
@@ -1789,6 +1835,343 @@ mod terminal_observation_tests {
     use novarocks_worker::result_buffer::ResultRetainedBudget;
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    use crate::backend_task_execution::tests::node_fixture::{
+        NativeNodeFixture, await_original, factory_from_host,
+    };
+    use novarocks_execution::runtime::task_control::TaskExecutionControl;
+    use novarocks_execution_contract::{
+        CreateTask, CreationContent, ExchangeTopology, FrozenBytes, OperationOutcome,
+        QueryContextRef, TaskCreationInput, TaskDescriptor, TaskOperationId,
+    };
+    use novarocks_worker::{
+        HostRejection, PreparedTaskInstallation, QueryContextHost, ReleasedContextEvidence,
+        RunnableTask, SharedFactsRequest, TaskExecutionHost, TaskIngressRetirement,
+        TaskPreparationContext, TaskStatusReporter, WorkerContextReplyBody, WorkerCreateReply,
+    };
+
+    struct RootContext;
+    impl QueryContextHost for RootContext {
+        fn materialize(&self, _: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+            Ok(())
+        }
+        fn release(&self, _: QueryContextRef) -> ReleasedContextEvidence {
+            ReleasedContextEvidence::none()
+        }
+        fn advance_shared_domain(
+            &self,
+            _: QueryContextRef,
+            _: &novarocks_execution_contract::QueryContextDomainUpdate,
+        ) -> Result<(), HostRejection> {
+            unreachable!("Root fixture has no shared-domain updates")
+        }
+    }
+    #[derive(Debug)]
+    struct RootPreparationReturned;
+    impl std::fmt::Display for RootPreparationReturned {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("the original Root fixture preparation returned")
+        }
+    }
+    impl std::error::Error for RootPreparationReturned {}
+    impl novarocks_execution_contract::failure::FailureProjection for RootPreparationReturned {
+        fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+            use novarocks_execution_contract::failure::*;
+            FailureFact::new(
+                FailureClass::Control,
+                FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(60046).unwrap()),
+            )
+        }
+    }
+    #[derive(Debug)]
+    struct RootAssignment;
+    impl CreationContent for RootAssignment {
+        fn retained_bytes(&self) -> usize {
+            std::mem::size_of::<Self>()
+        }
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn into_stored(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
+        }
+    }
+    type RootPreparationCallback = Box<dyn for<'a> FnOnce(TaskPreparationContext<'a>) + Send>;
+    struct RootCallbackHost(Mutex<Option<RootPreparationCallback>>);
+    impl TaskExecutionHost for RootCallbackHost {
+        fn close_context_admission(&self, _: QueryContextRef) {}
+        fn retire_context_execution(&self, _: QueryContextRef) {}
+        fn forget_context_admission(&self, _: QueryContextRef) {}
+        fn install_receiver(
+            &self,
+            _: &TaskDescriptor,
+            _: TaskCreationInput,
+            preparation: TaskPreparationContext<'_>,
+        ) -> Result<PreparedTaskInstallation, HostRejection> {
+            let callback = self
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one original preparation callback");
+            callback(preparation);
+            Err(HostRejection::from_domain(
+                novarocks_execution_contract::TaskFailureCategory::Execution,
+                RootPreparationReturned,
+            ))
+        }
+        fn remove_receiver(&self, _: &TaskDescriptor) {}
+        fn retire_receiver_checked(
+            &self,
+            _: &TaskDescriptor,
+            _: TaskIngressRetirement,
+        ) -> Result<(), HostRejection> {
+            Ok(())
+        }
+        fn install_inbound_capability(&self, _: &TaskDescriptor) -> Result<(), HostRejection> {
+            unreachable!("the Root fixture pauses before installation")
+        }
+        fn remove_inbound_capability(&self, _: &TaskDescriptor) {}
+        fn submit_runnable(
+            &self,
+            _: &TaskDescriptor,
+            _: TaskStatusReporter,
+        ) -> Result<Arc<dyn RunnableTask>, HostRejection> {
+            unreachable!("the Root fixture returns its explicit preparation refusal")
+        }
+        fn apply_task_domain(
+            &self,
+            _: &TaskDescriptor,
+            _: &novarocks_execution_contract::TaskDomainUpdate,
+            _: TaskOperationId,
+        ) -> Result<Option<u64>, HostRejection> {
+            unreachable!("no task domains")
+        }
+    }
+    pub(crate) struct OriginalRootNode {
+        node: Mutex<Option<NativeNodeFixture>>,
+        context: QueryContextRef,
+        task: TaskIdentity,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        // The test host owns its actual born outputs until the same close
+        // obligation as a production preparation refusal has run. This is
+        // custody of existing channels, never another output or Task role.
+        original_roots: Mutex<Vec<Arc<RootResultChannel>>>,
+    }
+    impl OriginalRootNode {
+        pub(crate) fn retain_root_for_teardown(&self, original: Arc<RootResultChannel>) {
+            assert_eq!(
+                original.spec().task,
+                self.task,
+                "retain only this original Task's Root"
+            );
+            let mut roots = self.original_roots.lock().unwrap();
+            if !roots.iter().any(|owned| Arc::ptr_eq(owned, &original)) {
+                roots.push(original);
+            }
+        }
+        pub(crate) fn release_body(&self) {
+            *self.release.0.lock().unwrap() = true;
+            self.release.1.notify_all();
+        }
+    }
+    impl Drop for OriginalRootNode {
+        fn drop(&mut self) {
+            let original_roots = std::mem::take(
+                self.original_roots
+                    .get_mut()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+            );
+            // A successful producer End intentionally preserves the channel
+            // for reads. This fixture returns a preparation refusal instead
+            // of publishing Installed, so its original host must close that
+            // retained output before waiting for the real preparation exit.
+            for original in original_roots {
+                original.close(RootRetentionClose::ContextAborted);
+                drop(original);
+            }
+            self.release_body();
+            drop(
+                self.node
+                    .get_mut()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take(),
+            );
+        }
+    }
+    // Only the actual Worker preparation callback can supply this loan. The
+    // returned value observes its original work; it cannot mint another role.
+    pub(crate) fn in_original_preparation<R: Send + 'static>(
+        task: TaskIdentity,
+        health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
+        callback: impl for<'a, 'b> FnOnce(&'b TaskPreparationContext<'a>) -> R + Send + 'static,
+    ) -> (R, Arc<OriginalRootNode>) {
+        let result = Arc::new((Mutex::new(None), Condvar::new()));
+        let output = result.clone();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let body_release = release.clone();
+        let execution = Arc::new(RootCallbackHost(Mutex::new(Some(Box::new(
+            move |preparation| {
+                let value = callback(&preparation);
+                *output.0.lock().unwrap() = Some(value);
+                output.1.notify_all();
+                let guard = body_release.0.lock().unwrap();
+                let (guard, _) = body_release
+                    .1
+                    .wait_timeout_while(guard, Duration::from_secs(10), |released| !*released)
+                    .unwrap();
+                assert!(*guard, "the original Root preparation must be released");
+            },
+        )))));
+        let context = QueryContextRef::new(
+            task.query_execution_id(),
+            novarocks_types::FrontendProcessId::new_v7(),
+            task.backend_process_id(),
+        );
+        let node = NativeNodeFixture::start(
+            task.backend_process_id(),
+            factory_from_host(Arc::new(RootContext)),
+            execution,
+            health,
+            1,
+            1,
+        );
+        node.establish(context);
+        let descriptor = TaskDescriptor::try_new(
+            task,
+            novarocks_types::UniqueId::new(907, 908),
+            NonZeroUsize::new(1).unwrap(),
+            vec![],
+            ExchangeTopology::default(),
+        )
+        .unwrap();
+        let created = node.create(
+            CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, vec![]).unwrap(),
+            TaskCreationInput::new(
+                FrozenBytes::freeze(bytes::Bytes::from_static(&[1])),
+                Box::new(RootAssignment),
+            ),
+        );
+        assert!(matches!(
+            created.reply(),
+            WorkerCreateReply::Context(WorkerContextReplyBody::Create {
+                outcome: OperationOutcome::Accepted,
+                ..
+            })
+        ));
+        drop(created);
+        let value = result.0.lock().unwrap();
+        let (mut value, _) = result
+            .1
+            .wait_timeout_while(value, WAIT, |value| value.is_none())
+            .unwrap();
+        let value = value
+            .take()
+            .expect("the actual Root preparation produced its observation");
+        (
+            value,
+            Arc::new(OriginalRootNode {
+                node: Mutex::new(Some(node)),
+                context,
+                task,
+                release,
+                original_roots: Mutex::new(Vec::new()),
+            }),
+        )
+    }
+    pub(crate) fn open_root_in_preparation(
+        preparation: &TaskPreparationContext<'_>,
+        pool: &Arc<RootProducerPool>,
+        spec: RootResultWriteSpec,
+        budget: Arc<ResultRetainedBudget>,
+        limits: WorkerResultRetainedLimits,
+        health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
+    ) -> Result<Arc<NativeRootResultSession>, FragmentIoError> {
+        let child =
+            crate::backend_task_execution::prepared_owner::NativePreparationChild::register(
+                preparation,
+                health.clone(),
+            )
+            .unwrap();
+        child.begin_root_birth().unwrap();
+        let channel = match RootResultChannel::try_open_with_owner_metadata(
+            spec, budget, limits, health,
+            crate::backend_task_execution::prepared_owner::NativePreparationChild::root_birth_metadata_bytes(),
+        ) {
+            Ok(channel) => channel,
+            Err(error) => { child.root_birth_refused(); return Err(io_error(error)); }
+        };
+        child.record_root_birth(&channel);
+        channel
+            .bind_preparation_exit_waker(preparation.readiness_waker())
+            .unwrap_or_else(|_| panic!("one original Root exit waker"));
+        let result =
+            NativeRootResultSession::try_open_prepared(channel.clone(), pool, preparation, &child);
+        if result.is_err() {
+            channel.close(RootRetentionClose::ContextAborted);
+        }
+        result
+    }
+    struct OriginalRootTask {
+        probe: Arc<TaskExecutionControl>,
+        node: Arc<OriginalRootNode>,
+    }
+    impl OriginalRootTask {
+        fn status(&self) -> &Arc<TaskExecutionControl> {
+            &self.probe
+        }
+        fn abort(&self, cause: novarocks_execution_contract::AbortCause) {
+            let (control, deadline) = {
+                let held = self.node.node.lock().unwrap();
+                let node = held.as_ref().unwrap();
+                (node.control.clone(), node.deadline())
+            };
+            drop(
+                await_original(control.abort(
+                    novarocks_execution_contract::AbortQueryContext::new(
+                        TaskOperationId::new_v7(),
+                        self.node.context,
+                        cause,
+                    ),
+                    deadline,
+                ))
+                .unwrap(),
+            );
+            let until = Instant::now() + WAIT;
+            while !self.probe.is_stopped() {
+                assert!(
+                    Instant::now() < until,
+                    "the original Node must publish its accepted abort"
+                );
+                std::thread::yield_now();
+            }
+        }
+        fn cancel(&self, reason: novarocks_execution_contract::CancelReason) {
+            let (control, deadline) = {
+                let held = self.node.node.lock().unwrap();
+                let node = held.as_ref().unwrap();
+                (node.control.clone(), node.deadline())
+            };
+            let receipt = await_original(control.cancel(
+                novarocks_execution_contract::CancelTask::new(
+                    TaskOperationId::new_v7(),
+                    self.node.task,
+                    reason,
+                ),
+                deadline,
+            ))
+            .unwrap();
+            drop(receipt);
+            let until = Instant::now() + WAIT;
+            while !self.probe.is_stopped() {
+                assert!(
+                    Instant::now() < until,
+                    "the original Node must publish its accepted stop"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
 
     // Occupies the one real CPU worker. The native session still owns its
     // admitted input and producer guard; its turn cannot exit until release.
@@ -1846,27 +2229,22 @@ mod terminal_observation_tests {
         blocker: Option<(Arc<GatedTurn>, RootProducerRegistration)>,
         health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
         budget: Arc<ResultRetainedBudget>,
+        original_nodes: Mutex<Vec<Arc<OriginalRootNode>>>,
     }
     impl Fixture {
         fn new(gated: bool) -> Self {
-            Self::with_task_control(gated, None)
+            let (fixture, task, _) = actual_task_fixture_with_gate(gated);
+            drop(task);
+            fixture
         }
         fn with_task_control(
             gated: bool,
-            control: Option<(
-                &novarocks_worker::TestPreparationControl,
-                Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
-            )>,
+            control: &TaskPreparationContext<'_>,
+            health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
         ) -> Self {
             let limits =
                 WorkerResultRetainedLimits::try_new(256 * 1024 * 1024, 1024 * 1024 * 1024).unwrap();
             let budget = ResultRetainedBudget::new(limits.per_process());
-            let health = control
-                .as_ref()
-                .map(|(_, health)| health.clone())
-                .unwrap_or_else(|| {
-                    Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::new())
-                });
             let pool = RootProducerPool::try_new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
@@ -1890,31 +2268,20 @@ mod terminal_observation_tests {
                 job.wait_entered();
                 (job, registration)
             });
-            let task = control
-                .as_ref()
-                .map(|(control, _)| control.status().identity())
-                .unwrap_or_else(root_task);
-
-            let channel = RootResultChannel::try_open(
+            let session = open_root_in_preparation(
+                control,
+                &pool,
                 RootResultWriteSpec {
-                    task,
+                    task: control.runtime_control().identity(),
                     contract: Arc::new(RootOutputContract::new(
                         RootProfileId::V1,
                         FrozenRootOutput::CountOnly,
                     )),
                 },
-                Arc::clone(&budget),
+                budget.clone(),
                 limits,
-                Arc::clone(&health),
+                health.clone(),
             )
-            .unwrap();
-            let session = match control {
-                Some((control, _)) => {
-                    let child = crate::backend_task_execution::prepared_owner::NativePreparationChild::register(&control.scope(), pool.execution_health()).unwrap();
-                    NativeRootResultSession::try_open_prepared(channel, &pool, &control.scope(), &child)
-                }
-                None => NativeRootResultSession::try_open_for_local_encoding(channel, &pool),
-            }
             .unwrap();
             Self {
                 session,
@@ -1922,6 +2289,7 @@ mod terminal_observation_tests {
                 blocker,
                 health,
                 budget,
+                original_nodes: Mutex::new(Vec::new()),
             }
         }
         fn observations(&self) -> Vec<&'static str> {
@@ -1993,8 +2361,22 @@ mod terminal_observation_tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
+            eprintln!(
+                "original Root fixture before teardown: ownership={:?} producer={:?} producer_exit={:?}",
+                self.session.channel().try_ownership_snapshot(),
+                self.session.producer_state(),
+                self.session.producer_exit_progress(),
+            );
             self.release();
             let _ = self.pool.shutdown();
+            for node in self
+                .original_nodes
+                .get_mut()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .iter()
+            {
+                node.release_body();
+            }
         }
     }
 
@@ -2006,76 +2388,61 @@ mod terminal_observation_tests {
             BackendProcessId::new_v7(),
         )
     }
-    fn task_with_health(
-        health: &Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
-    ) -> novarocks_worker::TestPreparationControl {
-        novarocks_worker::TestPreparationControl::from_status(
-            Arc::new(novarocks_worker::TaskStatusOwner::new(
-                root_task(),
-                Arc::new(novarocks_worker::TaskStatusSource::new()),
-                Arc::new(novarocks_worker::ManualClock::new()),
-                Duration::ZERO,
-                health.clone(),
-            )),
-            Duration::from_millis(1),
-        )
-    }
     fn root_control_lifetime(
         session: &NativeRootResultSession,
     ) -> Weak<novarocks_execution::runtime::task_control::TaskExecutionControl> {
-        match session
-            .shared
-            .failure_reporter
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-        {
-            RootFailureReporter::Task(control) => Arc::downgrade(control),
-            RootFailureReporter::LocalEncoding => panic!("fixture must own actual Task authority"),
-        }
+        Arc::downgrade(
+            session
+                .shared
+                .failure_reporter
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap(),
+        )
     }
-    fn actual_task_fixture() -> (
-        Fixture,
-        novarocks_worker::TestPreparationControl,
-        Weak<novarocks_execution::runtime::task_control::TaskExecutionControl>,
-    ) {
+    fn actual_task_fixture_with_gate(
+        gated: bool,
+    ) -> (Fixture, OriginalRootTask, Weak<TaskExecutionControl>) {
         let health =
             Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::new());
-        let task = task_with_health(&health);
-        let fixture = Fixture::with_task_control(false, Some((&task, health)));
+        let body_health = health.clone();
+        let ((mut fixture, probe), node) =
+            in_original_preparation(root_task(), health, move |preparation| {
+                let probe = preparation.runtime_control();
+                let fixture = Fixture::with_task_control(gated, preparation, body_health);
+                (fixture, probe)
+            });
         let weak_control = root_control_lifetime(&fixture.session);
-        (fixture, task, weak_control)
+        node.retain_root_for_teardown(fixture.session.channel().clone());
+        fixture.original_nodes.get_mut().unwrap().push(node.clone());
+        (fixture, OriginalRootTask { probe, node }, weak_control)
+    }
+    fn actual_task_fixture() -> (Fixture, OriginalRootTask, Weak<TaskExecutionControl>) {
+        actual_task_fixture_with_gate(false)
     }
 
     #[test]
     fn cold_root_cancellation_and_rollback_do_not_claim_exit_while_real_cleanup_is_queued() {
-        use novarocks_execution_contract::{
-            CancelReason, TaskConclusionPort, TaskConclusionProposal, TaskFailurePhase,
-        };
+        use novarocks_execution_contract::{CancelReason, TaskFailurePhase};
         let mut observed = Vec::new();
         for reason in [
             ResultAbort::PrepareRollback,
             ResultAbort::Cancelled("cold root deadline".into()),
         ] {
-            let health =
-                Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::new());
-            let task = task_with_health(&health);
-            let fixture = Fixture::with_task_control(true, Some((&task, health)));
+            let (fixture, task, _) = actual_task_fixture_with_gate(true);
             let controller_lifetime = root_control_lifetime(&fixture.session);
             let rollback = matches!(&reason, ResultAbort::PrepareRollback);
             if rollback {
                 task.status()
-                    .execution_control(TaskFailurePhase::Preparation)
+                    .in_phase(TaskFailurePhase::Preparation)
                     .report_failure(
                         novarocks_execution::runtime::fragment::ExecutionFailure::from(
                             novarocks_functions::KernelFailure::ResourceExhausted,
                         ),
                     );
             } else {
-                task.status().submit(TaskConclusionProposal::Canceled(
-                    CancelReason::UpstreamNoLongerNeeded,
-                ));
+                task.cancel(CancelReason::UpstreamNoLongerNeeded);
             }
             assert!(fixture.session.state().producer.is_none());
             assert_eq!(
@@ -2109,62 +2476,12 @@ mod terminal_observation_tests {
         }
     }
 
-    #[test]
-    fn root_actual_task_origin_notification_reenters_producer_without_holding_either_mutex() {
-        use novarocks_execution::runtime::task_control::TaskExecutionPort;
-        use novarocks_execution_contract::TaskConclusionPort;
-        let (fixture, task, control) = actual_task_fixture();
-        let notifications = Arc::new(AtomicUsize::new(0));
-        let observed = notifications.clone();
-        let session = Arc::downgrade(&fixture.session);
-        task.status()
-            .stop_observable()
-            .add_observer(Arc::new(move || {
-                let session = session.upgrade().unwrap();
-                assert!(
-                    session.shared.state.try_lock().is_ok(),
-                    "producer mutex is released before Task callbacks"
-                );
-                assert!(
-                    session.shared.failure_reporter.try_lock().is_ok(),
-                    "reporter mutex is released before Task callbacks"
-                );
-                assert!(matches!(
-                    session.producer_state(),
-                    RootProducerState::Failed(_)
-                ));
-                assert_eq!(
-                    session.producer_exit_progress(),
-                    RootWorkExitProgress::Pending,
-                    "the Task callback cannot wait for its own still-running job"
-                );
-                observed.fetch_add(1, Ordering::Release);
-            }));
-        fixture.session.shared.channel.note_rows(u64::MAX).unwrap();
-        fixture.submit();
-        fixture.wait_terminal("aborted");
-        fixture.pool.shutdown().unwrap();
-        assert_eq!(
-            fixture.session.producer_exit_progress(),
-            RootWorkExitProgress::Exited
-        );
-        assert_eq!(notifications.load(Ordering::Acquire), 1);
-        let accepted = task.status().accepted().unwrap();
-        let origin = accepted.originating_failure().unwrap();
-        let state = fixture.session.state();
-        assert!(std::ptr::eq(
-            origin.cause(),
-            state.failed.as_ref().unwrap().cause()
-        ));
-        assert!(
-            control.upgrade().is_none(),
-            "real exit releases reporting authority even while failure metadata is retained"
-        );
-    }
+    // Runtime-origin reentry is covered by the actual adopted Native scalar
+    // codec case in execution_host::tests. A paused preparation has not yet
+    // produced the real runtime/finisher cut that adjudicates that origin.
 
     #[test]
     fn root_success_releases_actual_task_authority_before_independent_metadata_late_drop() {
-        use novarocks_execution_contract::TaskConclusionPort;
         let (fixture, task, control) = actual_task_fixture();
         let weak_task = Arc::downgrade(task.status());
         fixture.submit();
@@ -2186,7 +2503,6 @@ mod terminal_observation_tests {
 
     #[test]
     fn root_preparation_rollback_releases_work_authority_without_inventing_a_task_failure() {
-        use novarocks_execution_contract::TaskConclusionPort;
         for reason in [ResultAbort::PrepareRollback, ResultAbort::NeverStarted] {
             let (fixture, task, control) = actual_task_fixture();
             fixture.session.abort(reason);
@@ -2203,33 +2519,34 @@ mod terminal_observation_tests {
 
     #[test]
     fn root_refuses_foreign_actual_task_control_before_creating_a_session() {
-        use novarocks_execution_contract::{TaskConclusionPort, failure::FailureProjection};
+        use novarocks_execution_contract::failure::FailureProjection;
         let fixture = Fixture::new(false);
-        let foreign =
-            novarocks_worker::TestPreparationControl::new(root_task(), Duration::from_millis(1));
-        let control = foreign
-            .status()
-            .execution_control(novarocks_execution_contract::TaskFailurePhase::Execution);
-        assert_ne!(control.identity(), fixture.session.spec().task);
-        let child =
-            crate::backend_task_execution::prepared_owner::NativePreparationChild::register(
-                &foreign.scope(),
-                fixture.pool.execution_health(),
-            )
-            .unwrap();
-        let error = NativeRootResultSession::try_open_prepared(
-            fixture.session.channel().clone(),
-            &fixture.pool,
-            &foreign.scope(),
-            &child,
-        )
-        .err()
-        .expect("foreign Task control must be refused");
+        let channel = fixture.session.channel().clone();
+        let health = fixture.health.clone();
+        let pool = fixture.pool.clone();
+        let (fact, original) = in_original_preparation(root_task(), health, move |preparation| {
+            assert_ne!(
+                preparation.runtime_control().identity(),
+                channel.spec().task
+            );
+            let child =
+                crate::backend_task_execution::prepared_owner::NativePreparationChild::register(
+                    preparation,
+                    pool.execution_health(),
+                )
+                .unwrap();
+            let error =
+                NativeRootResultSession::try_open_prepared(channel, &pool, preparation, &child)
+                    .err()
+                    .expect("foreign original Task control must be refused");
+            assert!(preparation.runtime_control().accepted().is_none());
+            error.failure_fact()
+        });
         assert_eq!(
-            error.failure_fact(),
+            fact,
             novarocks_execution::runtime::task_control::TaskControlIdentityMismatch.failure_fact()
         );
-        assert!(foreign.status().accepted().is_none());
+        drop(original);
     }
 
     #[test]
@@ -2266,10 +2583,7 @@ mod terminal_observation_tests {
         let expected = original.failure_fact();
         assert_eq!(expected.evidence(), FailureEvidence::Originating);
         assert_eq!(expected.reason().code(), 10);
-        let outcome = fixture
-            .session
-            .fail(&mut fixture.session.state(), original.clone());
-        assert!(matches!(outcome, RootProducerTurn::Complete));
+        fixture.session.fail(original.clone());
         let admission = fixture
             .session
             .try_acquire_input()
@@ -2472,6 +2786,10 @@ mod terminal_observation_tests {
 
     #[test]
     fn native_root_published_end_wakeup_panic_keeps_normal_end_and_channel_metadata_custody() {
+        if !crate::root_unknown_test::enter() {
+            return;
+        }
+
         let fixture = Fixture::new(false);
         // This local encoding fixture explicitly supplies the Context owner
         // required for the same successful handoff as production installation.
@@ -2593,6 +2911,7 @@ mod terminal_observation_tests {
         );
         drop(subscription);
         assert!(!fixture.session.channel().physical_idle());
+        crate::root_unknown_test::complete_and_abort();
     }
 
     #[test]
@@ -2771,6 +3090,11 @@ mod terminal_observation_tests {
 
     #[test]
     fn native_root_real_hook_capture_drop_failure_is_unresolved_after_independent_cleanup() {
+        if !crate::root_unknown_test::enter() {
+            return;
+        }
+        let mut original_unknown_owners = Vec::new();
+
         struct PanicCapture(Arc<AtomicUsize>);
         impl Drop for PanicCapture {
             fn drop(&mut self) {
@@ -2825,7 +3149,9 @@ mod terminal_observation_tests {
             assert_eq!(ownership.ends_published, 1);
             assert_eq!(ownership.producers_exited, 1);
             assert_eq!(ownership.producers_running, 0);
+            original_unknown_owners.push(fixture);
         }
+        crate::root_unknown_test::complete_and_abort();
     }
     // Insert these items inside terminal_observation_tests. The existing Fixture,
     // GatedTurn and real NativeRootResultSession/RootProducerPool are reused.
@@ -2993,25 +3319,35 @@ mod terminal_observation_tests {
             .unwrap_or_else(|_| panic!("actual blocker must commit"));
         registration.wake().unwrap();
         blocker.wait_entered();
-        let channel = RootResultChannel::try_open(
-            RootResultWriteSpec {
-                task: root_task(),
-                contract: Arc::new(RootOutputContract::new(RootProfileId::V1, output)),
-            },
-            Arc::clone(&budget),
-            limits,
-            Arc::clone(&health),
-        )
-        .unwrap();
-        channel.mark_context_owned().unwrap();
-        let session = NativeRootResultSession::try_open_for_local_encoding(channel, &pool).unwrap();
+        let callback_pool = pool.clone();
+        let callback_budget = budget.clone();
+        let callback_health = health.clone();
+        let task = root_task();
+        let (session, node) = in_original_preparation(task, health.clone(), move |preparation| {
+            let session = open_root_in_preparation(
+                preparation,
+                &callback_pool,
+                RootResultWriteSpec {
+                    task,
+                    contract: Arc::new(RootOutputContract::new(RootProfileId::V1, output)),
+                },
+                callback_budget,
+                limits,
+                callback_health,
+            )
+            .unwrap();
+            session.channel().mark_context_owned().unwrap();
+            session
+        });
+        node.retain_root_for_teardown(session.channel().clone());
         (
             Fixture {
                 session,
                 pool,
                 blocker: Some((blocker, registration)),
                 health,
-                budget: Arc::clone(&budget),
+                budget: budget.clone(),
+                original_nodes: Mutex::new(vec![node]),
             },
             budget,
             limits,
@@ -3022,21 +3358,33 @@ mod terminal_observation_tests {
         budget: &Arc<ResultRetainedBudget>,
         limits: WorkerResultRetainedLimits,
     ) -> Arc<NativeRootResultSession> {
-        let channel = RootResultChannel::try_open(
-            RootResultWriteSpec {
-                task: root_task(),
-                contract: Arc::new(RootOutputContract::new(
-                    RootProfileId::V1,
-                    FrozenRootOutput::CountOnly,
-                )),
-            },
-            Arc::clone(budget),
-            limits,
-            Arc::clone(&fixture.health),
-        )
-        .unwrap();
-        channel.mark_context_owned().unwrap();
-        NativeRootResultSession::try_open_for_local_encoding(channel, &fixture.pool).unwrap()
+        let task = root_task();
+        let pool = fixture.pool.clone();
+        let budget = budget.clone();
+        let health = fixture.health.clone();
+        let body_health = health.clone();
+        let (session, node) = in_original_preparation(task, health, move |preparation| {
+            let session = open_root_in_preparation(
+                preparation,
+                &pool,
+                RootResultWriteSpec {
+                    task,
+                    contract: Arc::new(RootOutputContract::new(
+                        RootProfileId::V1,
+                        FrozenRootOutput::CountOnly,
+                    )),
+                },
+                budget,
+                limits,
+                body_health,
+            )
+            .unwrap();
+            session.channel().mark_context_owned().unwrap();
+            session
+        });
+        node.retain_root_for_teardown(session.channel().clone());
+        fixture.original_nodes.lock().unwrap().push(node);
+        session
     }
     // Every observation below is an actual funded grant and real release against
     // the original ResultRetainedBudget, not a private counter or new ledger. The
@@ -3083,9 +3431,14 @@ mod terminal_observation_tests {
 
     #[test]
     fn native_chunk_unknown_exit_keeps_funding_and_allows_accepted_sibling_exit() {
+        if !crate::root_unknown_test::enter() {
+            return;
+        }
+
         use novarocks_result_contract::{
             ClientRenderSchema, NativeRenderType, RenderColumn, RenderField, RenderPresentation,
         };
+        let mut unknown_owners = Vec::new();
         for client in [false, true] {
             let output = if client {
                 FrozenRootOutput::ClientRows(
@@ -3209,7 +3562,9 @@ mod terminal_observation_tests {
             );
             assert_eq!(allocation.data.upgrade().unwrap().values.as_ref(), &[42]);
             drop(after);
+            unknown_owners.push((fixture, safe));
         }
+        crate::root_unknown_test::complete_and_abort();
     }
 
     #[test]
@@ -3493,13 +3848,13 @@ mod terminal_observation_tests {
     #[test]
     fn channel_credit_notification_unknown_keeps_opaque_custody_after_input_exit_and_preserves_peer()
      {
-        use novarocks_execution_contract::{
-            AbortCause, TaskConclusionPort, TaskConclusionProposal,
-        };
-        let health =
-            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::new());
-        let task = task_with_health(&health);
-        let fixture = Fixture::with_task_control(true, Some((&task, Arc::clone(&health))));
+        if !crate::root_unknown_test::enter() {
+            return;
+        }
+
+        use novarocks_execution_contract::AbortCause;
+        let (fixture, task, _) = actual_task_fixture_with_gate(true);
+        let health = fixture.health.clone();
         let baseline = reserve_all_actual_spare(&fixture.budget, 1024 << 20);
         let available_before_input = baseline.bytes();
         drop(baseline);
@@ -3542,8 +3897,7 @@ mod terminal_observation_tests {
             Some(novarocks_execution::runtime::fragment::io::RootResultInput::new(chunk, permit));
         fixture.session.submit_input(&mut offered).unwrap();
         assert!(offered.is_none());
-        task.status()
-            .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        task.abort(AbortCause::PeerTaskFailed);
         let peer = task.status().accepted().unwrap();
         armed.store(true, Ordering::SeqCst);
         fixture.release();
@@ -3626,6 +3980,7 @@ mod terminal_observation_tests {
         );
         assert!(fixture.session.try_acquire_input().is_err());
         assert!(!fixture.session.channel().physical_idle());
+        crate::root_unknown_test::complete_and_abort();
     }
 }
 
@@ -3773,3 +4128,6 @@ mod failure_record_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod producer_tests;

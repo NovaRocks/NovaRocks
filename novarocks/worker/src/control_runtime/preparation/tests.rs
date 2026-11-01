@@ -84,21 +84,14 @@ impl Fixture {
                 ResourceVector::new([
                     (Dimension::PreparingTasks.id(), 4),
                     (Dimension::PreparingBytes.id(), 40),
-                    (Dimension::InboundRecords.id(), 4),
-                    (Dimension::InboundBytes.id(), 36),
                 ])
                 .unwrap(),
-                32,
-                4,
             ),
             scopes: Vec::new(),
         }
     }
     fn scope(&mut self) -> ScopeHandle {
-        let scope = self
-            .ledger
-            .open_scope_next(None, generation(), 16, 16)
-            .unwrap();
+        let scope = self.ledger.open_scope_next(None, generation()).unwrap();
         self.scopes.push(scope.clone());
         scope
     }
@@ -108,27 +101,32 @@ impl Fixture {
         n: u32,
         input: TaskCreationInput,
     ) -> (PreparationCustody, PreparationJob) {
-        let (work, capacity) = scope
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation(),
-                ResourceVector::new([
-                    (Dimension::PreparingTasks.id(), 1),
-                    (Dimension::PreparingBytes.id(), 10),
-                    (Dimension::InboundRecords.id(), 1),
-                    (Dimension::InboundBytes.id(), 9),
-                ])
-                .unwrap(),
+                novarocks_control_runtime_core::capacity::ReservationResources::new(
+                    ResourceVector::new([
+                        (Dimension::PreparingTasks.id(), 1),
+                        (Dimension::PreparingBytes.id(), 10),
+                    ])
+                    .unwrap(),
+                    novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 2,
+                        captures: 1,
+                        ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
+                    },
+                ),
                 WorkKind::Business,
                 WorkAdmission::External,
             )
             .unwrap()
             .bind(WorkKind::Business)
             .unwrap();
-        let report = || {
+        let mut report = || {
             ReportSlot::reserve_next(
-                scope,
+                &mut capacity,
                 generation(),
-                work.id(),
                 2,
                 [
                     (
@@ -171,11 +169,13 @@ impl Fixture {
             bundle
                 .resources()
                 .unwrap()
+                .quota
                 .get(Dimension::PreparingTasks.id()),
             0
         );
         let resources = bundle.resources().unwrap();
-        bundle.release(&resources).unwrap();
+        bundle.release_quota(&resources.quota).unwrap();
+        bundle.finish().unwrap();
     }
     fn finish(self) {
         for scope in self.scopes {
@@ -187,7 +187,7 @@ impl Fixture {
     }
 }
 #[test]
-fn body_slot_reuse_does_not_return_preparation_or_retained_close_capacity() {
+fn body_slot_reuse_does_not_return_preparation_capacity_before_whole_exit_and_consumption() {
     let mut fixture = Fixture::new();
     let a = fixture.scope();
     let b = fixture.scope();
@@ -205,7 +205,7 @@ fn body_slot_reuse_does_not_return_preparation_or_retained_close_capacity() {
         .as_ref()
         .unwrap()
         .id();
-    let queue = PreparationQueue::new(2, 2, 1, 1);
+    let queue = PreparationQueue::new(2, 1, 1);
     queue
         .enqueue(job_a)
         .unwrap_or_else(|_| panic!("first Accepted enqueue"));
@@ -239,7 +239,8 @@ fn body_slot_reuse_does_not_return_preparation_or_retained_close_capacity() {
     child.0.body_exited().unwrap();
     child.0.captures_exited().unwrap();
     let resources = child.1.resources().unwrap();
-    child.1.release(&resources).unwrap();
+    child.1.release_quota(&resources.quota).unwrap();
+    child.1.finish().unwrap();
     fixture.ledger.reap_scope_ready(a.id(), 16).unwrap();
     assert!(owner_a.publish_whole_exit().unwrap());
     owner_a.body_report().consume(core()).unwrap();
@@ -251,12 +252,15 @@ fn body_slot_reuse_does_not_return_preparation_or_retained_close_capacity() {
     let mut retained = owner_a.take_after_exit().unwrap().unwrap();
     assert_eq!(retained.id(), original);
     assert_eq!(fixture.ledger.used(Dimension::PreparingTasks.id()), 1);
-    assert_eq!(fixture.ledger.used(Dimension::InboundBytes.id()), 18);
+    assert_eq!(fixture.ledger.used(Dimension::PreparingBytes.id()), 10);
+    assert!(retained.resources().unwrap().is_empty());
     assert!(owner_a.take_after_exit().unwrap().is_none());
     fixture.release(&owner_b);
-    assert_eq!(fixture.ledger.used(Dimension::InboundBytes.id()), 9);
+    assert_eq!(fixture.ledger.used(Dimension::PreparingTasks.id()), 0);
+    assert_eq!(fixture.ledger.used(Dimension::PreparingBytes.id()), 0);
     let resources = retained.resources().unwrap();
-    retained.release(&resources).unwrap();
+    retained.release_quota(&resources.quota).unwrap();
+    retained.finish().unwrap();
     fixture.finish();
 }
 
@@ -290,7 +294,7 @@ impl Drop for ReentrantDrop {
 fn queued_cancel_and_refused_start_dispose_the_original_input_outside_queue_locks() {
     let mut fixture = Fixture::new();
     let scope = fixture.scope();
-    let queue = PreparationQueue::new(1, 2, 2, 1);
+    let queue = PreparationQueue::new(2, 2, 1);
     let drops = Arc::new(AtomicUsize::new(0));
     let create_input = || {
         TaskCreationInput::new(
@@ -386,7 +390,7 @@ fn input_destructor_panic_retains_unknown_work_and_payload_while_other_context_p
     );
     let (bad, bad_job) = fixture.admitted(&a, 1, bad_input);
     let (good, good_job) = fixture.admitted(&b, 2, input(Arc::new(AtomicUsize::new(0))));
-    let queue = PreparationQueue::new(2, 2, 1, 1);
+    let queue = PreparationQueue::new(2, 1, 1);
     queue
         .enqueue(bad_job)
         .unwrap_or_else(|_| panic!("bad original job"));

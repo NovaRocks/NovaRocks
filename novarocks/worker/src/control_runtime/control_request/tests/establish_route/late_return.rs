@@ -34,6 +34,7 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
         host.dispatch.index_committed(&runtime, 64).unwrap();
         host.dispatch.take_ready(&runtime, 64).unwrap().unwrap()
     };
+    f.assert_original_probe_author(&probe, input);
     let decided_conflict = matches!(
         &probe.effect,
         WorkerAction::Context(ContextEffect::EstablishProbed { request, result, .. })
@@ -99,7 +100,7 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
     // Filled. This must retain R and both paid Replies, not guess Core exit.
     let before_return_reaped = f.f.root.reap_ready_requests(32).unwrap();
     let pending_before_return = f.f.root.resources().requests.contains_key(&input);
-    let fees_before_return = f.f.ledger.used(Dimension::Replies.id());
+    let fees_before_return = f.f.ledger.used(Dimension::Requests.id());
     let filled_before_return = runtime
         .input_custody(actor(), return_input)
         .unwrap()
@@ -110,6 +111,9 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
     // The pure Core correctly ignores the expired token and commits an empty
     // effect batch. Its real input progress must still address the original R.
     let no_new_effect = f.f.root.take_control_effect(64).unwrap().is_none();
+    let no_second_observer = f.f.root.resources().requests[&input]
+        .protocol_observation
+        .is_idle();
     let committed_return = runtime
         .input_custody(actor(), return_input)
         .unwrap()
@@ -131,7 +135,7 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
         0
     };
     let request_retired = !f.f.root.resources().requests.contains_key(&input);
-    let fees_after_return = f.f.ledger.used(Dimension::Replies.id());
+    let fees_after_return = f.f.ledger.used(Dimension::Requests.id());
     let actual_getters = getters.load(Ordering::SeqCst);
     let actual_drops = drops.load(Ordering::SeqCst);
     f.finish_model_refusal();
@@ -153,6 +157,10 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
     assert_eq!(fees_before_return, 2);
     assert!(filled_before_return);
     assert!(no_new_effect);
+    assert!(
+        no_second_observer,
+        "the late ignored result must not stage another R observation"
+    );
     assert!(committed_return);
     assert_eq!(assisted_reaped, 0);
     assert!(request_retired);

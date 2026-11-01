@@ -135,13 +135,6 @@ impl PreparedCleanupDiagnostic {
     }
 }
 
-/// A diagnostic storage outcome supplies no acceptance, exit or capacity proof.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DiagnosticRecordOutcome {
-    Stored,
-    Dropped,
-}
-
 /// One local snapshot clones at most four cold records without allocating or
 /// pinning Task/runtime/source owners. Retirement/wire export remains separate.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,48 +184,6 @@ impl TaskSecondaryDiagnosticsSnapshot {
     }
 }
 
-/// Fixed slot metadata only. Normal Tasks do not reserve four inline payloads.
-#[derive(Debug)]
-pub(crate) struct TaskSecondaryDiagnostics {
-    entries: [Option<Arc<TaskSecondaryDiagnostic>>; MAX_DIAGNOSTICS],
-    len: u8,
-    dropped: u64,
-}
-impl Default for TaskSecondaryDiagnostics {
-    fn default() -> Self {
-        Self {
-            entries: std::array::from_fn(|_| None),
-            len: 0,
-            dropped: 0,
-        }
-    }
-}
-impl TaskSecondaryDiagnostics {
-    pub(crate) fn record(
-        &mut self,
-        prepared: &mut Option<Arc<TaskSecondaryDiagnostic>>,
-    ) -> DiagnosticRecordOutcome {
-        assert!(prepared.is_some(), "a diagnostic record is consumed once");
-        if usize::from(self.len) == MAX_DIAGNOSTICS {
-            self.dropped = self.dropped.saturating_add(1);
-            // Leave overflow owned by the caller's prepared effect. In the
-            // failure path it leaves every enclosing fence with the original
-            // losing source, through Pending/OwnedTaskConclusion.
-            return DiagnosticRecordOutcome::Dropped;
-        }
-        self.entries[usize::from(self.len)] = prepared.take();
-        self.len += 1;
-        DiagnosticRecordOutcome::Stored
-    }
-    pub(crate) fn snapshot(&self) -> TaskSecondaryDiagnosticsSnapshot {
-        TaskSecondaryDiagnosticsSnapshot {
-            entries: self.entries.clone(),
-            len: self.len,
-            dropped: self.dropped,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,29 +197,5 @@ mod tests {
         assert!(std::str::from_utf8(detail.as_str().as_bytes()).is_ok());
         let split = "€".repeat(200);
         assert_eq!(InlineSafeDetail::copy_utf8(&split).as_str(), &split[..510]);
-    }
-
-    #[test]
-    fn omitted_report_count_saturates_without_replacing_the_first_records() {
-        let cause = ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
-        let mut journal = TaskSecondaryDiagnostics::default();
-        for _ in 0..MAX_DIAGNOSTICS {
-            let mut prepared =
-                PreparedCleanupDiagnostic::from_failure(&cause, TaskFailurePhase::Execution);
-            assert_eq!(
-                journal.record(prepared.record_mut()),
-                DiagnosticRecordOutcome::Stored
-            );
-        }
-        journal.dropped = u64::MAX;
-        let mut overflow =
-            PreparedCleanupDiagnostic::from_failure(&cause, TaskFailurePhase::Execution);
-        assert_eq!(
-            journal.record(overflow.record_mut()),
-            DiagnosticRecordOutcome::Dropped
-        );
-        assert_eq!(journal.snapshot().dropped(), u64::MAX);
-        assert_eq!(journal.snapshot().entries().len(), MAX_DIAGNOSTICS);
-        assert!(overflow.record.is_some());
     }
 }

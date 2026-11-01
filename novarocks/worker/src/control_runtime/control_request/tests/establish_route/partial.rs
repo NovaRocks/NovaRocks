@@ -20,9 +20,9 @@
 
 use super::*;
 use crate::control_runtime::context_io::CONTEXT_IO_CALLBACKS;
-use crate::control_runtime::establish_route::{CONTEXT_ROUTE_ESCROW_STORAGE, EstablishRouteError};
+use crate::control_runtime::establish_route::EstablishRouteError;
 use novarocks_control_runtime::{
-    lease::{CapacityBundle, WorkLease, WorkRetirementObserver},
+    lease::{ReservationBundle, WorkLease, WorkRetirementObserver},
     transaction::ScopeHandle,
 };
 use novarocks_control_runtime_core::scope::{WorkAdmission, WorkKind};
@@ -30,17 +30,22 @@ use novarocks_control_runtime_core::scope::{WorkAdmission, WorkKind};
 struct PaidMetadata {
     scope: ScopeHandle,
     work: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     retirement: WorkRetirementObserver,
 }
 impl PaidMetadata {
     fn admit(f: &mut RouteFixture, need: StorageNeed) -> Self {
-        let context = f.f.context;
-        let original_address = f.f.root.service().context(context).unwrap();
-        let mut original_context = original_address.lock().unwrap();
-        let resources = original_context.resources_for_test();
-        let scope = resources.scope.as_ref().unwrap().clone();
-        let parent = resources.roles[0].work.id();
+        // The route's escrow now lives under the actual process Cleanup
+        // parent. Use that same financial Scope for independent metadata.
+        let resources = f.f.root.resources();
+        let scope = resources.scope.clone();
+        let parent = resources
+            .roles
+            .iter()
+            .find(|role| role.work.kind().unwrap() == WorkKind::Cleanup)
+            .expect("the actual Root failure Cleanup author")
+            .work
+            .id();
         let (mut work, capacity) = scope
             .reserve_next(
                 scope.gates().unwrap().generation,
@@ -72,8 +77,9 @@ impl PaidMetadata {
             "the exact paid metadata header must retire before refund"
         );
         self.capacity
-            .release(&self.capacity.resources().unwrap())
+            .release_quota(&self.capacity.resources().unwrap().quota)
             .unwrap();
+        self.capacity.finish().unwrap();
     }
 }
 
@@ -107,11 +113,18 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
     let scope = occupier.scope.clone();
     let baseline = scope.snapshot().unwrap();
     let mut positions = Vec::new();
+    let registration =
+        f.f.root
+            .service()
+            .context(f.f.context)
+            .unwrap()
+            .registration()
+            .clone();
     for _ in 0..control_positions {
         positions.push(
             f.f.runtime
-                .reserve_admitted_input(
-                    context_actor(),
+                .reserve_admitted_input_for(
+                    &registration,
                     context_actor(),
                     InputClass::Control,
                     &occupier.work,
@@ -135,7 +148,9 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
             DriverError::InputCapacity
         )))
     );
-    let partial_has_report = scope.snapshot().unwrap().storage == baseline.storage + 1;
+    // Root holds both the newly admitted R report and its actual route-leg
+    // report; the raw source child has its independent Scope/report.
+    let partial_has_report = scope.snapshot().unwrap().storage == baseline.storage + 2;
 
     // The original Route effect already completed despite construction
     // refusal. Its real Root deadline can therefore dispatch Cancel/Timeout.
@@ -163,10 +178,17 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
         position.revoke_unused().unwrap();
     }
     occupier.exit();
-    // Only the earlier occupier header is removed here. The next earlier
-    // backlog header remains ready to consume the route's first reap budget.
+    // Only the earlier occupier header is removed here. Exact route-header
+    // retirement must not reap or wait for this independent ready backlog.
     let occupier_headers = f.f.ledger.reap_scope_ready(scope.id(), 1).unwrap();
     occupier.release();
+    let address = f.f.root.service().context(f.f.context).unwrap();
+    let route = address
+        .lock()
+        .unwrap()
+        .establish_route(input)
+        .unwrap()
+        .clone();
     let first =
         f.f.root
             .service()
@@ -176,16 +198,42 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
             .unwrap()
             .advance_establish_route(input)
             .unwrap();
-    let partial_report_retired = scope.snapshot().unwrap().storage == baseline.storage;
-    let second =
-        f.f.root
-            .service()
-            .context(f.f.context)
+    let partial_report_retired = scope.snapshot().unwrap().storage == baseline.storage + 1;
+    let independent_backlog_still_held = !backlog.retirement.is_retired();
+    let after_first = scope.snapshot().unwrap();
+    let dimensions = [
+        Dimension::ActiveTasks,
+        Dimension::PreparingTasks,
+        Dimension::PreparingBytes,
+        Dimension::Requests,
+    ];
+    let quota_after_first = dimensions.map(|dimension| f.f.ledger.used(dimension.id()));
+    let (second, removed_address_refused) = if first {
+        // A true first retirement removed this exact directory entry. The
+        // retained original Arc still observes its own completed retirement;
+        // a numeric lookup is not an idempotence capability.
+        let lookup = address.lock().unwrap().advance_establish_route(input);
+        let refused = matches!(lookup, Err(EstablishRouteError::WrongOwner));
+        (route.try_retire_context().unwrap(), refused)
+    } else {
+        // Preserve actual owner-driven cleanup if the first-turn oracle
+        // regresses, then report that original failure after full teardown.
+        (
+            address
+                .lock()
+                .unwrap()
+                .advance_establish_route(input)
+                .unwrap(),
+            false,
+        )
+    };
+    let repeated_observation_kept_inventory = scope.snapshot().unwrap() == after_first
+        && dimensions.map(|dimension| f.f.ledger.used(dimension.id())) == quota_after_first;
+    assert!(
+        f.f.ledger
+            .reap_observed_header(&backlog.retirement)
             .unwrap()
-            .lock()
-            .unwrap()
-            .advance_establish_route(input)
-            .unwrap();
+    );
     backlog.release();
     let disposal = premature
         .or_else(|| f.f.root.take_retired_route_disposal(input))
@@ -204,9 +252,12 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
     assert!(timeout_reply);
     assert!(source_not_yet_disposable);
     assert_eq!(occupier_headers, 1);
-    assert!(!first);
+    assert!(first);
     assert!(partial_report_retired);
+    assert!(independent_backlog_still_held);
     assert!(second);
+    assert!(removed_address_refused);
+    assert!(repeated_observation_kept_inventory);
     assert!(source_exited);
     assert_eq!(retired, 1);
     assert!(context_restored);
@@ -219,15 +270,13 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
     let mut f = RouteFixture::with_geometry(2, header_storage(), false);
     let mut backlog = PaidMetadata::admit(&mut f, header_storage());
     let scope = backlog.scope.clone();
-    let metadata_work_with_backlog = scope.snapshot().unwrap().work;
+    let original_root_reports = scope.snapshot().unwrap().storage;
     backlog.exit();
     let (input, mut handle, getters, drops) = f.begin_route(op(12), 100, None);
     let result = f.probe(input);
-    let escrow = CONTEXT_ROUTE_ESCROW_STORAGE.resources().unwrap();
-    let before: Vec<_> = escrow
-        .iter()
-        .map(|(dimension, count)| (dimension, count, f.f.ledger.used(dimension)))
-        .collect();
+    let address = f.f.root.service().context(f.f.context).unwrap();
+    let route = address.lock().unwrap().resources_for_test().routes[&input].clone();
+    let escrow_held = !route.context_retired();
     let first =
         f.f.root
             .service()
@@ -237,21 +286,37 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
             .unwrap()
             .advance_establish_route(input)
             .unwrap();
-    let escrow_held = before
-        .iter()
-        .all(|(dimension, _, held)| f.f.ledger.used(*dimension) == *held);
-    let second =
-        f.f.root
-            .service()
-            .context(f.f.context)
-            .unwrap()
-            .lock()
-            .unwrap()
-            .advance_establish_route(input)
-            .unwrap();
-    let exact_refund = before.iter().all(|(dimension, count, held)| {
-        held.checked_sub(*count) == Some(f.f.ledger.used(*dimension))
-    });
+    let independent_backlog_still_held = !backlog.retirement.is_retired();
+    let after_first = scope.snapshot().unwrap();
+    let dimensions = [
+        Dimension::ActiveTasks,
+        Dimension::PreparingTasks,
+        Dimension::PreparingBytes,
+        Dimension::Requests,
+    ];
+    let quota_after_first = dimensions.map(|dimension| f.f.ledger.used(dimension.id()));
+    let (second, removed_address_refused) = if first {
+        // A true first retirement removed this exact directory entry. The
+        // retained original Arc still observes its own completed retirement;
+        // a numeric lookup is not an idempotence capability.
+        let lookup = address.lock().unwrap().advance_establish_route(input);
+        let refused = matches!(lookup, Err(EstablishRouteError::WrongOwner));
+        (route.try_retire_context().unwrap(), refused)
+    } else {
+        // Preserve actual owner-driven cleanup if the first-turn oracle
+        // regresses, then report that original failure after full teardown.
+        (
+            address
+                .lock()
+                .unwrap()
+                .advance_establish_route(input)
+                .unwrap(),
+            false,
+        )
+    };
+    let repeated_observation_kept_inventory = scope.snapshot().unwrap() == after_first
+        && dimensions.map(|dimension| f.f.ledger.used(dimension.id())) == quota_after_first;
+    let exact_refund = route.context_retired();
     let root_return_still_filled =
         f.f.runtime
             .input_inventory(actor(), None, 16)
@@ -266,8 +331,16 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
             == 1;
     let root_reply_not_consumed = handle.try_take().is_none();
     let root_held = f.f.root.reap_ready_requests(32).unwrap() == 0;
+    assert!(
+        f.f.ledger
+            .reap_observed_header(&backlog.retirement)
+            .unwrap()
+    );
     backlog.release();
-    let only_context_metadata = scope.snapshot().unwrap().work == metadata_work_with_backlog - 1;
+    // Its exact report retired, while the distinct original R report and
+    // external return responsibility remain in the real Root financial Scope.
+    let only_original_root_r_report =
+        scope.snapshot().unwrap().storage == original_root_reports + 1;
     f.dispose_context_metadata();
 
     f.f.runtime.poll_one(Tick(4)).unwrap();
@@ -285,6 +358,7 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
     drop(delivery);
     drop(handle);
     let source_exited = thread::spawn(move || disposal.run()).join().unwrap();
+    f.finish_conflict_observation(input);
     let retired = f.f.root.reap_ready_requests(32).unwrap();
     f.finish_model_refusal();
 
@@ -292,14 +366,17 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
         result,
         EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict
     ));
-    assert!(!first);
+    assert!(first);
     assert!(escrow_held);
+    assert!(independent_backlog_still_held);
     assert!(second);
+    assert!(removed_address_refused);
+    assert!(repeated_observation_kept_inventory);
     assert!(exact_refund);
     assert!(root_return_still_filled);
     assert!(root_reply_not_consumed);
     assert!(root_held);
-    assert!(only_context_metadata);
+    assert!(only_original_root_r_report);
     assert!(original_reply);
     assert!(source_exited);
     assert_eq!(retired, 1);

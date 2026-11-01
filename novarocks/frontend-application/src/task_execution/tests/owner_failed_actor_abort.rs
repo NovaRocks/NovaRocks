@@ -22,7 +22,7 @@ use crate::task_execution::{execution::ActorAbortDispatchState, round::TaskRound
 use novarocks_coordination_contract::AttemptFailureClass;
 use novarocks_execution_contract::{SafeDetail, failure::FailureClass};
 use novarocks_query_application::{
-    coordination::{AbortQueryContextIssueState, ContextClosureState},
+    coordination::{AbortQueryContextIssueState, ContextClosureState, ContextStandDownSnapshot},
     execution_error::ExecutionFailureSite,
     test_support::LogicalExecutionTestHarness,
 };
@@ -102,6 +102,26 @@ async fn wait_for_adapter_replay(round: &TaskRound) {
     .expect("the original actor authorizes a bounded replay");
 }
 
+async fn wait_for_owner_failure(
+    logical: &LogicalExecutionTestHarness,
+    context: QueryContextRef,
+) -> Result<ContextStandDownSnapshot, tokio::time::error::Elapsed> {
+    // Settlement queues an event for the logical actor. Its snapshot command
+    // is a separate input and does not acknowledge consumption of that event.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = logical.stand_down_snapshot(context).await.unwrap().unwrap();
+            if snapshot.issue_state() == Some(AbortQueryContextIssueState::FailedClosed)
+                && snapshot.closure() == ContextClosureState::AbortIssueExhausted
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_owner_failed_abort_settles_dispatch_and_preserves_remote_responsibility() {
     let (mut round, _sink, acknowledgements, logical, context, abort, _clock) =
@@ -117,7 +137,7 @@ async fn active_owner_failed_abort_settles_dispatch_and_preserves_remote_respons
         .execution()
         .context_convergence_receipt(context)
         .is_some();
-    let snapshot = logical.stand_down_snapshot(context).await.unwrap().unwrap();
+    let snapshot = wait_for_owner_failure(&logical, context).await;
     finish_residual(round, logical, context).await;
 
     assert_exact_owner_failure(result.unwrap_err(), &ack, context);
@@ -127,6 +147,7 @@ async fn active_owner_failed_abort_settles_dispatch_and_preserves_remote_respons
     ));
     assert!(!released);
     assert!(!converged);
+    let snapshot = snapshot.expect("the original logical actor consumes the failed-closed event");
     assert_eq!(
         snapshot.issue_state(),
         Some(AbortQueryContextIssueState::FailedClosed)
@@ -156,7 +177,7 @@ async fn late_owner_failed_abort_settles_its_original_late_authority_without_a_c
         .execution()
         .context_convergence_receipt(context)
         .is_some();
-    let snapshot = logical.stand_down_snapshot(context).await.unwrap().unwrap();
+    let snapshot = wait_for_owner_failure(&logical, context).await;
     finish_residual(round, logical, context).await;
 
     assert_exact_owner_failure(result.unwrap_err(), &ack, context);
@@ -166,6 +187,7 @@ async fn late_owner_failed_abort_settles_its_original_late_authority_without_a_c
     ));
     assert!(!released);
     assert!(!converged);
+    let snapshot = snapshot.expect("the original logical actor consumes the failed-closed event");
     assert_eq!(
         snapshot.issue_state(),
         Some(AbortQueryContextIssueState::FailedClosed)
@@ -214,7 +236,7 @@ async fn owner_failed_late_abort_cancels_the_actual_dispatcher_queued_replay() {
         .execution()
         .context_convergence_receipt(context)
         .is_some();
-    let snapshot = logical.stand_down_snapshot(context).await.unwrap().unwrap();
+    let snapshot = wait_for_owner_failure(&logical, context).await;
     finish_residual(round, logical, context).await;
 
     assert_eq!(queued.unwrap(), ActorAbortDispatchState::Queued);
@@ -227,6 +249,7 @@ async fn owner_failed_late_abort_cancels_the_actual_dispatcher_queued_replay() {
     assert_eq!(paid_after, 0);
     assert!(!released);
     assert!(!converged);
+    let snapshot = snapshot.expect("the original logical actor consumes the failed-closed event");
     assert_eq!(
         snapshot.issue_state(),
         Some(AbortQueryContextIssueState::FailedClosed)

@@ -8508,8 +8508,8 @@ mod tests {
         );
         assert_eq!(*acks[0].payload(), AckPayload::None);
         assert_eq!(
-            novarocks_query_application::coordination::frontend_action(acks[0].dispatch_result()),
-            novarocks_query_application::coordination::FrontendAction::FailAttempt,
+            crate::task_execution::operation::frontend_action(acks[0].dispatch_result()),
+            crate::task_execution::operation::FrontendAction::FailAttempt,
         );
     }
 

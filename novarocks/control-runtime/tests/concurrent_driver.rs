@@ -24,10 +24,11 @@ use novarocks_control_runtime::{
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::{ReservationRequest, ResourceVector},
+    capacity::{ReservationRequest, ReservationResources, ResourceVector},
     effect::{EffectDescriptor, EffectKind},
     identity::*,
     mailbox::{InputClass, InputEnvelope},
+    owned_storage::OwnedSlotNeed,
     scheduler::SchedulerError,
     scope::{WorkAdmission, WorkKind},
 };
@@ -61,6 +62,7 @@ fn config() -> ActorConfig {
 struct Counter {
     seen: Vec<u64>,
     effect: bool,
+    author: Option<ScopedWorkRef>,
 }
 impl Actor for Counter {
     type Input = u64;
@@ -71,7 +73,7 @@ impl Actor for Counter {
     fn handle(
         &mut self,
         _now: Tick,
-        input: InputEnvelope,
+        _input: InputEnvelope,
         value: u64,
         step: &mut StepContext<'_, u64>,
     ) {
@@ -80,7 +82,10 @@ impl Actor for Counter {
             step.effect(
                 EffectDescriptor {
                     id: ActionId::new(1).unwrap(),
-                    work: WorkId::new(input.input.get()).unwrap(),
+                    work: step
+                        .input_work()
+                        .or(self.author)
+                        .expect("original admitted Counter Business author"),
                     kind: EffectKind::Business,
                     dependencies: vec![],
                 },
@@ -128,13 +133,11 @@ fn remove_after_turn(
     }
 }
 fn pool_case(workers: usize) {
-    let ledger = RuntimeLedger::new(vector(8), 16, 8);
-    let runtime = ActorRuntime::new(4);
+    let ledger = RuntimeLedger::new(vector(8));
+    let runtime = ActorRuntime::new();
     let mut scopes = vec![];
     for id in 1..=4 {
-        let scope = ledger
-            .open_scope(sid(id), None, generation(), 8, 8)
-            .unwrap();
+        let scope = ledger.open_scope(sid(id), None, generation()).unwrap();
         runtime
             .register(
                 aid(id),
@@ -143,6 +146,7 @@ fn pool_case(workers: usize) {
                 Counter {
                     seen: vec![],
                     effect: false,
+                    author: None,
                 },
                 config(),
             )
@@ -208,30 +212,18 @@ impl Drop for SlowDrop {
 }
 #[test]
 fn slow_host_destructor_keeps_its_work_but_does_not_occupy_the_only_poller() {
-    let ledger = RuntimeLedger::new(vector(8), 16, 8);
-    let runtime = ActorRuntime::new(2);
-    let first = ledger.open_scope(sid(1), None, generation(), 8, 8).unwrap();
-    let second = ledger.open_scope(sid(2), None, generation(), 8, 8).unwrap();
+    let ledger = RuntimeLedger::new(vector(8));
+    let runtime = ActorRuntime::new();
+    let first = ledger.open_scope(sid(1), None, generation()).unwrap();
+    let second = ledger.open_scope(sid(2), None, generation()).unwrap();
     runtime
-        .register(
-            aid(1),
-            first.clone(),
-            slot(1),
-            Counter {
-                seen: vec![],
-                effect: true,
-            },
-            config(),
-        )
-        .unwrap();
-    runtime
-        .register(
+        .register_next(
             aid(2),
             second.clone(),
-            slot(2),
             Counter {
                 seen: vec![],
                 effect: false,
+                author: None,
             },
             config(),
         )
@@ -241,7 +233,13 @@ fn slow_host_destructor_keeps_its_work_but_does_not_occupy_the_only_poller() {
             id: ReservationId::new(1).unwrap(),
             generation: generation(),
             guard: WorkId::new(1).unwrap(),
-            resources: vector(1),
+            resources: ReservationResources {
+                quota: vector(1),
+                owned_slots: OwnedSlotNeed {
+                    work_headers: 1,
+                    ..OwnedSlotNeed::default()
+                },
+            },
             admission: WorkAdmission::External,
             kind: WorkKind::Business,
         })
@@ -249,6 +247,19 @@ fn slow_host_destructor_keeps_its_work_but_does_not_occupy_the_only_poller() {
         .bind(WorkKind::Business)
         .unwrap();
     work.start().unwrap();
+    runtime
+        .register_next(
+            aid(1),
+            first.clone(),
+            Counter {
+                seen: vec![],
+                effect: true,
+                author: Some(work.reference()),
+            },
+            config(),
+        )
+        .unwrap();
+
     let (entered_tx, entered_rx) = mpsc::channel();
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let resources = ResourceStore::new(1);
@@ -278,7 +289,8 @@ fn slow_host_destructor_keeps_its_work_but_does_not_occupy_the_only_poller() {
         drop(resource.take().unwrap());
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
-        bundle.release(&vector(1)).unwrap();
+        bundle.release_quota(&vector(1)).unwrap();
+        bundle.finish().unwrap();
         host_runtime.effect_completed(ticket).unwrap();
     });
     entered_rx.recv().unwrap();
@@ -311,9 +323,9 @@ fn slow_host_destructor_keeps_its_work_but_does_not_occupy_the_only_poller() {
 #[test]
 fn concurrent_production_admission_mints_and_binds_ids_in_one_transaction() {
     use novarocks_control_runtime::completion::ReportSlot;
-    let ledger = RuntimeLedger::new(vector(32), 32, 4);
-    let scope = ledger.open_scope_next(None, generation(), 32, 64).unwrap();
-    let runtime = ActorRuntime::new(32);
+    let ledger = RuntimeLedger::new(vector(32));
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
+    let runtime = ActorRuntime::new();
     let barrier = Arc::new(std::sync::Barrier::new(4));
     let mut threads = vec![];
     for thread_index in 0..4 {
@@ -324,18 +336,24 @@ fn concurrent_production_admission_mints_and_binds_ids_in_one_transaction() {
             barrier.wait();
             let mut admitted = vec![];
             for local in 0..8 {
-                let (work, bundle) = scope
+                let (work, mut bundle) = scope
                     .reserve_next(
                         generation(),
-                        vector(1),
+                        ReservationResources {
+                            quota: vector(1),
+                            owned_slots: OwnedSlotNeed {
+                                work_headers: 1,
+                                completions: 1,
+                                ..OwnedSlotNeed::default()
+                            },
+                        },
                         WorkKind::Business,
                         WorkAdmission::External,
                     )
                     .unwrap()
                     .bind(WorkKind::Business)
                     .unwrap();
-                let report =
-                    ReportSlot::reserve_next(&scope, generation(), work.id(), 0, []).unwrap();
+                let report = ReportSlot::reserve_next(&mut bundle, generation(), 0, []).unwrap();
                 let actor = aid(thread_index * 8 + local + 1);
                 let attachment = runtime
                     .register_next(
@@ -344,6 +362,7 @@ fn concurrent_production_admission_mints_and_binds_ids_in_one_transaction() {
                         Counter {
                             seen: vec![],
                             effect: false,
+                            author: None,
                         },
                         config(),
                     )
@@ -375,7 +394,8 @@ fn concurrent_production_admission_mints_and_binds_ids_in_one_transaction() {
         assert!(report.try_retire().unwrap());
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
-        bundle.release(&vector(1)).unwrap();
+        bundle.release_quota(&vector(1)).unwrap();
+        bundle.finish().unwrap();
         actors.push(actor);
     }
     assert_eq!(ledger.reap_ready(32).unwrap(), 32);
@@ -391,8 +411,8 @@ fn concurrent_production_admission_mints_and_binds_ids_in_one_transaction() {
 #[test]
 fn concurrent_child_scope_creation_mints_parent_work_inside_the_scope_transaction() {
     use novarocks_control_runtime::transaction::ScopeParentAdmission;
-    let ledger = RuntimeLedger::new(vector(1), 1, 32);
-    let parent = ledger.open_scope_next(None, generation(), 16, 1).unwrap();
+    let ledger = RuntimeLedger::new(vector(1));
+    let parent = ledger.open_scope_next(None, generation()).unwrap();
     let barrier = Arc::new(std::sync::Barrier::new(4));
     let mut threads = vec![];
     for _ in 0..4 {
@@ -412,8 +432,6 @@ fn concurrent_child_scope_creation_mints_parent_work_inside_the_scope_transactio
                                 admission: WorkAdmission::External,
                             }),
                             generation(),
-                            1,
-                            1,
                         )
                         .unwrap()
                 })
@@ -433,11 +451,12 @@ fn concurrent_child_scope_creation_mints_parent_work_inside_the_scope_transactio
         16
     );
     assert_eq!(parent.snapshot().unwrap().work, 16);
-    for child in children {
+    for (removed, child) in children.into_iter().enumerate() {
         child.close_external().unwrap();
         ledger.remove_scope(child.id()).unwrap();
+        assert_eq!(parent.snapshot().unwrap().work, 16 - removed - 1);
     }
-    assert_eq!(ledger.reap_ready(16).unwrap(), 16);
+    assert_eq!(ledger.reap_ready(16).unwrap(), 0);
     parent.close_external().unwrap();
     ledger.remove_scope(parent.id()).unwrap();
     assert!(ledger.is_empty());

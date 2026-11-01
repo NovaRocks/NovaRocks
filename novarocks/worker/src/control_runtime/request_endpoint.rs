@@ -60,6 +60,7 @@ pub(crate) struct RequestHandle<B, H: Copy = RequestContext> {
     pub(super) observer: Option<ReplyObserver<WorkerActor>>,
 }
 impl<B, H: Copy> RequestHandle<B, H> {
+    #[cfg(test)]
     pub(crate) fn request(&self) -> H {
         self.endpoint.request
     }
@@ -199,10 +200,7 @@ pub(crate) fn notification_submit_busy(error: &super::host_executor::HostSubmitE
     matches!(
         error,
         super::host_executor::HostSubmitError::Queue(
-            FairQueueError::Full
-                | FairQueueError::ContextFull
-                | FairQueueError::ContextCapacity
-                | FairQueueError::DuplicateWork
+            FairQueueError::Full | FairQueueError::ContextFull | FairQueueError::DuplicateWork
         )
     )
 }

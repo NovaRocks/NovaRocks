@@ -72,7 +72,6 @@ pub mod root_statistics_codec;
 pub mod root_write_commit_codec;
 pub use native_client::NativeRpcClient;
 pub mod native_codec;
-pub mod native_control_executor;
 pub mod native_fragment_query;
 #[cfg(test)]
 mod native_fragment_query_tests;
@@ -100,8 +99,6 @@ pub mod task_execution_observation;
 pub mod task_protocol;
 #[cfg(novarocks_dev_controls)]
 pub mod task_protocol_fault;
-#[cfg(test)]
-pub mod task_protocol_ingress;
 pub mod task_query_context_options;
 pub mod task_result_diagnostics;
 pub mod task_shared_facts;
@@ -482,3 +479,6 @@ mod frontend_selected_origin_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod root_unknown_test;

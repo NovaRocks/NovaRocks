@@ -27,7 +27,7 @@ use novarocks_control_runtime::{
     publication::PublishedReply,
     transaction::ScopeHandle,
 };
-use novarocks_control_runtime_core::identity::{ActorId, InputId, WorkId};
+use novarocks_control_runtime_core::identity::{ActorId, InputId, ScopedWorkRef};
 use std::{
     collections::BTreeMap,
     num::NonZeroUsize,
@@ -40,7 +40,7 @@ enum Address {
     // A Context's actual registration owns its scope-local Work addresses.
     // The registered actor ID selects its FIFO; the stored original witness
     // qualifies every fill/pop. Neither numeric field grants Work or access.
-    Context { actor: ActorId, work: WorkId },
+    Context { actor: ActorId, work: ScopedWorkRef },
 }
 struct RegisteredSlot {
     original: Weak<RequestReadySlot>,
@@ -50,7 +50,7 @@ struct RegisteredSlot {
 struct ReadyState {
     slots: BTreeMap<Address, RegisteredSlot>,
     control_ready: BTreeMap<u64, InputId>,
-    context_ready: BTreeMap<ActorId, BTreeMap<u64, WorkId>>,
+    context_ready: BTreeMap<ActorId, BTreeMap<u64, ScopedWorkRef>>,
     next_ready: u64,
     capacity: BTreeMap<ActorId, capacity::CapacityWaiters>,
 }
@@ -111,31 +111,32 @@ impl ControlRequestReady {
         owner: &ActorRegistration,
     ) -> Result<Arc<RequestReadySlot>, ControlRequestError> {
         self.bind_source_capacity_owner(owner)?;
-        self.register(Address::Control(input), owner)
+        self.register(Address::Control(input), owner, None)
     }
     pub(crate) fn register_context(
         &self,
-        scope: &ScopeHandle,
-        work: WorkId,
+        author: &novarocks_control_runtime::lease::WorkLease,
         owner: &ActorRegistration,
     ) -> Result<Arc<RequestReadySlot>, ControlRequestError> {
-        if !owner.matches_scope(scope) {
-            return Err(ControlRequestError::Driver(
-                DriverError::EffectTicketOriginMismatch,
-            ));
-        }
+        self.shared
+            .runtime
+            .validate_work_author(owner, author)
+            .map_err(ControlRequestError::Driver)?;
+        let work = author.reference();
         self.register(
             Address::Context {
                 actor: owner.actor(),
                 work,
             },
             owner,
+            Some(author.scope().clone()),
         )
     }
     fn register(
         &self,
         address: Address,
         owner: &ActorRegistration,
+        financial_scope: Option<ScopeHandle>,
     ) -> Result<Arc<RequestReadySlot>, ControlRequestError> {
         // The real request's admitted Work/input keeps this actor resident.
         // This validation grants no additional Work or lifecycle position.
@@ -153,6 +154,7 @@ impl ControlRequestReady {
         let slot = Arc::new(RequestReadySlot {
             shared: Arc::downgrade(&self.shared),
             address,
+            financial_scope,
         });
         state.slots.insert(
             address,
@@ -201,6 +203,7 @@ impl ControlRequestReady {
         Ok(())
     }
     /// A wake proves only that this actual index should be rechecked.
+    #[cfg(test)]
     pub(crate) fn change_version(&self) -> u64 {
         self.shared.changed.version()
     }
@@ -223,7 +226,7 @@ impl ControlRequestReady {
     /// Consume only this original Context's next Work address. Actor fairness
     /// belongs to the Common host queue; one Context cannot steal a sibling's
     /// pending return or mistake an old registration for its successor.
-    pub(crate) fn next_context_ready(&self, owner: &ActorRegistration) -> Option<WorkId> {
+    pub(crate) fn next_context_ready(&self, owner: &ActorRegistration) -> Option<ScopedWorkRef> {
         let mut state = self.shared.state.lock().expect("request ready index");
         let (&ordinal, &work) = state.context_ready.get(&owner.actor())?.first_key_value()?;
         let address = Address::Context {
@@ -264,12 +267,37 @@ impl ControlRequestReady {
 }
 
 /// An exact weak address, shared only as concrete notification metadata.
-/// Keeping it alive does not retain its index, request, payload or runtime.
+/// Keeping it alive does not retain its index, request, payload or Work.
 pub(crate) struct RequestReadySlot {
     shared: Weak<ReadyShared>,
     address: Address,
+    // Same original financial identity, without a Work/header pin or credit.
+    financial_scope: Option<ScopeHandle>,
 }
 impl RequestReadySlot {
+    /// The registered original consumer, never a reconstructed actor author.
+    pub(crate) fn context_owner(self: &Arc<Self>) -> Option<ActorRegistration> {
+        self.context_author()?;
+        let shared = self.shared.upgrade()?;
+        let state = shared.state.lock().expect("original request ready owner");
+        let registered = state.slots.get(&self.address)?;
+        if !Weak::ptr_eq(&registered.original, &Arc::downgrade(self)) {
+            return None;
+        }
+        Some(registered.owner.clone())
+    }
+    pub(crate) fn belongs_to_financial_scope(&self, scope: &ScopeHandle) -> bool {
+        self.financial_scope
+            .as_ref()
+            .is_some_and(|original| original.same_scope(scope))
+    }
+    /// Immutable original address only; it grants no Work or input authority.
+    pub(crate) fn context_author(&self) -> Option<(ActorId, ScopedWorkRef)> {
+        match self.address {
+            Address::Context { actor, work } => Some((actor, work)),
+            Address::Control(_) => None,
+        }
+    }
     pub(crate) fn belongs_to(&self, index: &ControlRequestReady) -> bool {
         Weak::ptr_eq(&self.shared, &Arc::downgrade(&index.shared))
     }

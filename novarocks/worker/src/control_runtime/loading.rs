@@ -27,7 +27,7 @@ use novarocks_control_runtime::{
     driver::DriverError,
     exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
 };
-use novarocks_control_runtime_core::identity::{ConsumerId, ScopeId, WorkId};
+use novarocks_control_runtime_core::identity::{ConsumerId, ScopeId, ScopedWorkRef, WorkId};
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
 use novarocks_execution_contract::{
     CreateTask, TaskCreationInput, TaskFailurePhase, TaskIdentity,
@@ -79,7 +79,7 @@ impl LoadingSources {
 struct Custody {
     task: TaskIdentity,
     payload: PayloadId,
-    work: WorkId,
+    work: ScopedWorkRef,
     scope: novarocks_control_runtime::transaction::ScopeHandle,
     ingress_retained_bytes: usize,
     sources: Mutex<Option<LoadingSources>>,
@@ -117,9 +117,8 @@ pub(crate) struct InputDisposalJob {
     active: bool,
 }
 pub(crate) enum LoaderOutcome {
-    Measured(Result<CreationCost, AdmissionRefusal>),
     Loaded {
-        result: Result<CreationCost, AdmissionRefusal>,
+        result: Box<Result<CreationCost, AdmissionRefusal>>,
         shape: novarocks_worker_protocol::context::TaskShape,
         initial_domains: Vec<novarocks_worker_protocol::domain::TaskDomainInput>,
     },
@@ -135,7 +134,7 @@ impl LoaderCustody {
         pending: Arc<dyn TaskPendingNotice>,
         health: Arc<ExecutionHealth>,
     ) -> (Self, LoaderJob) {
-        let work = admitted.work.id();
+        let work = admitted.work.reference();
         let scope = admitted.work.scope().clone();
         let report = admitted.report.clone();
         let (role, authority) = ExitRole::from_admitted(super::admitted_role::adopt_reported_work(
@@ -191,9 +190,10 @@ impl LoaderCustody {
     pub(crate) fn identity(&self) -> TaskIdentity {
         self.0.task
     }
-    pub(crate) fn work_id(&self) -> WorkId {
+    pub(crate) fn work_id(&self) -> ScopedWorkRef {
         self.0.work
     }
+    #[cfg(test)]
     pub(crate) fn scope_id(&self) -> ScopeId {
         self.0.scope.id()
     }
@@ -435,7 +435,7 @@ impl LoaderJob {
                         .take_sources()
                         .expect("one original loading source holder");
                     let result = catch_unwind(AssertUnwindSafe(|| {
-                        let result = crate::task_creation_cost::measure(
+                        let cost = crate::task_creation_cost::measure(
                             &sources.request,
                             &sources.input,
                             self.custody.0.ingress_retained_bytes,
@@ -496,15 +496,14 @@ impl LoaderJob {
                             })
                             .collect();
                         LoaderOutcome::Loaded {
-                            result,
+                            result: Box::new(Ok(cost)),
                             shape,
                             initial_domains,
                         }
                     }));
                     self.custody.restore_sources(sources);
-                    result.map(|outcome| {
+                    result.inspect(|_| {
                         self.custody.0.measured.store(true, Ordering::Release);
-                        outcome
                     })
                 }
             }

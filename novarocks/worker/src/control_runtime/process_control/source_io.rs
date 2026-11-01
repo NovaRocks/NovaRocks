@@ -22,20 +22,59 @@ use super::*;
 use crate::control_runtime::{
     control_request::{RequestIoError, RequestIoProgress},
     establish_executors::EstablishExecutorHandles,
-    establish_ingress::{EstablishDisposalJob, EstablishIngressJob},
+    establish_ingress::EstablishIngressJob,
 };
+
+#[cfg(test)]
+use crate::control_runtime::establish_ingress::EstablishDisposalJob;
 
 #[derive(Debug)]
 pub(crate) enum RootRequestAdvanceError {
     WrongOwner,
     Control(ControlRequestError),
+    Rejected(super::rejected_ingress::RejectedIngressAdvanceError),
     Request {
         input: InputId,
         error: RequestIoError,
     },
 }
+impl std::fmt::Display for RootRequestAdvanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongOwner => {
+                f.write_str("Root request executor does not belong to the original owner")
+            }
+            Self::Control(error) => write!(f, "Root request control operation failed: {error}"),
+            Self::Rejected(error) => write!(f, "Root rejected ingress cleanup failed: {error}"),
+            Self::Request { input, error } => {
+                write!(f, "Root request input {input:?} failed: {error:?}")
+            }
+        }
+    }
+}
+impl std::error::Error for RootRequestAdvanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(error) => Some(error),
+            Self::Rejected(error) => Some(error),
+            Self::WrongOwner | Self::Request { .. } => None,
+        }
+    }
+}
 
 impl ProcessControlOwner {
+    pub(super) fn advance_rejected_ingress(
+        &mut self,
+        handles: &EstablishExecutorHandles,
+        budget: usize,
+    ) -> Result<super::rejected_ingress::RejectedIngressProgress, RootRequestAdvanceError> {
+        match self.resources.rejected_ingress.as_mut() {
+            Some(original) => original
+                .advance(handles, budget)
+                .map_err(RootRequestAdvanceError::Rejected),
+            None => Ok(Default::default()),
+        }
+    }
     pub(crate) fn stage_establish_getter(
         &mut self,
         input: InputId,
@@ -47,6 +86,7 @@ impl ProcessControlOwner {
         custody.stage_getter(original)
     }
 
+    #[cfg(test)]
     pub(crate) fn stage_establish_disposal(
         &mut self,
         input: InputId,
@@ -82,7 +122,6 @@ impl ProcessControlOwner {
             .gates()
             .map_err(|error| RootRequestAdvanceError::Control(ControlRequestError::Runtime(error)))?
             .generation;
-        let failure_work = self.resources.roles[FAILURE].work.id();
         // Context transfers are driven outside this Root inventory lock.
         // Source returns retain their own independent finite allowance.
         let mut progress = RequestIoProgress::default();
@@ -99,7 +138,7 @@ impl ProcessControlOwner {
                 .advance_protocol_observation(handles, ports)
                 .map_err(|error| RootRequestAdvanceError::Request { input, error })?;
             let advanced = custody
-                .advance_source_io(handles, generation, failure_work)
+                .advance_source_io(handles, generation)
                 .map_err(|error| RootRequestAdvanceError::Request { input, error })?;
             progress.visited += advanced.visited;
             progress.dispatched += advanced.dispatched;
@@ -114,7 +153,7 @@ impl ProcessControlOwner {
                 if let Some(role) = custody.route_return_role() {
                     assert_eq!(self.resources.return_routes.remove(&role), Some(input));
                 }
-                self.resources.requests.remove(&input);
+                self.remove_retired_request(input);
                 progress.retired += 1;
             }
         }

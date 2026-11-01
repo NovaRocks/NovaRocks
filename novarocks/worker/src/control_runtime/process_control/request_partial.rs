@@ -135,7 +135,8 @@ impl OriginalPartial {
                                 .map_err(ControlRequestError::Runtime)?;
                             self.original
                                 .capacity
-                                .release(&remaining)
+                                .release_quota(&remaining.quota)
+                                .and_then(|()| self.original.capacity.finish())
                                 .map_err(ControlRequestError::Runtime)?;
                         }
                         Phase::Escrow
@@ -147,7 +148,8 @@ impl OriginalPartial {
                             let remaining =
                                 escrow.resources().map_err(ControlRequestError::Runtime)?;
                             escrow
-                                .release(&remaining)
+                                .release_quota(&remaining.quota)
+                                .and_then(|()| escrow.finish())
                                 .map_err(ControlRequestError::Runtime)?;
                         }
                         Phase::Done

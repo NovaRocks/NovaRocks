@@ -57,10 +57,6 @@ pub(crate) enum WorkerFailureReason {
     DomainUnknownMember = 63,
     DomainNonMonotonic = 64,
     CredentialLeaseRepeated = 65,
-    InboundRecordSize = 70,
-    InboundReservationConflict = 71,
-    InboundRecordCount = 72,
-    InboundRecordBytes = 73,
     InboundContextClosed = 74,
     InboundKeyClosed = 75,
     InboundKeyClaimed = 76,
@@ -99,10 +95,10 @@ pub(crate) enum WorkerFailureReason {
     ReadRegistrationPoisoned = 143,
     ReadRegistrationDuplicate = 144,
     PreparationOwnerUnavailable = 145,
-    PreparationWorkerStart = 146,
+    // 146 is retired and must not be reused (PreparationWorkerStart).
     PreparationPanicked = 147,
     TestUpdateConsumptionUnsupportedHost = 149,
-    TestUpdateConsumptionLiveTaskRequired = 150,
+    // 150 is retired and must not be reused (TestUpdateConsumptionLiveTaskRequired).
     PreparationChildRegistration = 151,
     PreparationChildRollback = 152,
     PreparationInboundCleanup = 153,
@@ -112,8 +108,8 @@ pub(crate) enum WorkerFailureReason {
     PreparationChildDrop = 157,
     PreparationExitPublication = 158,
     PreparationChildUnresolved = 159,
-    PreparationRuntimeStandDown = 160,
-    PreparationPanicPayloadDrop = 161,
+    // 160 is retired and must not be reused (PreparationRuntimeStandDown).
+    // 161 is retired and must not be reused (PreparationPanicPayloadDrop).
     SinkCommitAfterSettled = 162,
     RootMetadataNotification = 163,
     RootMetadataNotificationInvariant = 164,

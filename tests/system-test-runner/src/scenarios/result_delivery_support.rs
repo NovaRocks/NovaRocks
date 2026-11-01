@@ -160,7 +160,6 @@ fn idle_snapshot(
                 "preparing_tasks",
                 "preparing_bytes",
                 "requests",
-                "tickets",
                 "contexts_with_execution_custody",
                 "root_producers_running",
                 "root_data_positions",

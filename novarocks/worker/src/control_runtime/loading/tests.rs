@@ -18,7 +18,7 @@
 use super::*;
 use bytes::Bytes;
 use novarocks_control_runtime::{
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -120,7 +120,7 @@ struct Fixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
     parent: WorkLease,
-    capacity: CapacityBundle,
+    capacity: ReservationBundle,
     owner: LoaderCustody,
     job: Option<LoaderJob>,
     getter: Arc<AtomicUsize>,
@@ -129,12 +129,25 @@ struct Fixture {
 }
 fn reserve_role(
     scope: &ScopeHandle,
-    parent: &CapacityBundle,
+    parent: &ReservationBundle,
     kind: WorkKind,
     core_leg: bool,
 ) -> AdmittedCompletionRole {
-    let guard = scope
-        .reserve_child_next(generation(), parent.id(), ResourceVector::default(), kind)
+    let mut guard = scope
+        .reserve_child_next(
+            generation(),
+            parent.id(),
+            novarocks_control_runtime_core::capacity::ReservationResources::new(
+                ResourceVector::default(),
+                novarocks_control_runtime_core::owned_storage::OwnedSlotNeed {
+                    work_headers: 1,
+                    completions: 1,
+                    captures: 1,
+                    ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
+                },
+            ),
+            kind,
+        )
         .unwrap();
     let mut consumers = vec![(observer(), ConsumerKind::Observer)];
     if core_leg {
@@ -146,8 +159,7 @@ fn reserve_role(
             },
         ));
     }
-    let report =
-        ReportSlot::reserve_next(scope, generation(), guard.work_id(), 2, consumers).unwrap();
+    let report = ReportSlot::reserve_next(&mut guard, generation(), 2, consumers).unwrap();
     let (work, capacity) = guard.bind(kind).unwrap();
     AdmittedCompletionRole {
         work,
@@ -165,12 +177,14 @@ impl Fixture {
         gate: Option<Arc<Barrier>>,
         domains: Vec<novarocks_execution_contract::TaskDomainUpdate>,
     ) -> Self {
-        let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 1)]).unwrap(), 8, 1);
-        let scope = ledger.open_scope_next(None, generation(), 8, 8).unwrap();
+        let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 1)]).unwrap());
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (parent, capacity) = scope
             .reserve_next(
                 generation(),
-                ResourceVector::new([(dimension(), 1)]).unwrap(),
+                novarocks_control_runtime_core::capacity::ReservationResources::for_work(
+                    ResourceVector::new([(dimension(), 1)]).unwrap(),
+                ),
                 WorkKind::Business,
                 WorkAdmission::External,
             )
@@ -263,8 +277,9 @@ impl Fixture {
         self.parent.captures_exited().unwrap();
         self.ledger.reap_scope_ready(self.scope.id(), 8).unwrap();
         self.capacity
-            .release(&self.capacity.resources().unwrap())
+            .release_quota(&self.capacity.resources().unwrap().quota)
             .unwrap();
+        self.capacity.finish().unwrap();
         self.scope.close_external().unwrap();
         self.ledger.remove_scope(self.scope.id()).unwrap();
         assert!(self.ledger.is_empty());
@@ -274,7 +289,10 @@ impl Fixture {
 fn measured_input_is_borrowed_without_locks_and_whole_exit_waits_for_actual_disposal() {
     let mut f = Fixture::new(false, false, None);
     let cost = match f.job.take().unwrap().run() {
-        LoaderOutcome::Measured(Ok(cost)) => cost,
+        LoaderOutcome::Loaded { result, .. } => match *result {
+            Ok(cost) => cost,
+            Err(_) => panic!("actual measure"),
+        },
         _ => panic!("actual measure"),
     };
     assert_eq!(
@@ -283,7 +301,6 @@ fn measured_input_is_borrowed_without_locks_and_whole_exit_waits_for_actual_disp
     );
     assert_eq!(cost.ingress_retained_bytes, 5);
     assert!(cost.structural_bytes > 0);
-    assert_eq!((cost.inbound_records, cost.inbound_bytes), (0, 0));
     assert_eq!(f.getter.load(Ordering::SeqCst), 1);
     assert_eq!(f.drops.load(Ordering::SeqCst), 0);
     assert!(!f.owner.ready_for_exit().unwrap());
@@ -338,7 +355,7 @@ fn input_drop_panic_does_not_publish_loader_exit_or_destroy_its_caught_panic() {
     let mut f = Fixture::new(false, true, None);
     assert!(matches!(
         f.job.take().unwrap().run(),
-        LoaderOutcome::Measured(Ok(_))
+        LoaderOutcome::Loaded { result, .. } if result.is_ok()
     ));
     assert!(!f.owner.take_input_disposal().unwrap().run());
     assert_eq!(f.drops.load(Ordering::SeqCst), 1);
@@ -387,7 +404,7 @@ fn slow_getter_keeps_metadata_and_scope_ledger_available_for_cancel_and_drain() 
     assert!(!f.owner.ready_for_exit().unwrap());
     assert_eq!(f.ledger.used(dimension()), 1);
     assert!(!f.scope.join_ready().unwrap());
-    assert!(matches!(worker.finish(), LoaderOutcome::Measured(Ok(_))));
+    assert!(matches!(worker.finish(), LoaderOutcome::Loaded { result, .. } if result.is_ok()));
     assert!(f.owner.take_input_disposal().unwrap().run());
     f.ledger.reap_scope_ready(f.scope.id(), 8).unwrap();
     f.finish();
@@ -434,7 +451,7 @@ fn lost_input_disposal_job_restores_original_custody_and_never_claims_source_exi
     let mut f = Fixture::new(false, false, None);
     assert!(matches!(
         f.job.take().unwrap().run(),
-        LoaderOutcome::Measured(Ok(_))
+        LoaderOutcome::Loaded { result, .. } if result.is_ok()
     ));
     drop(f.owner.take_input_disposal().unwrap());
     assert_eq!(f.drops.load(Ordering::SeqCst), 0);
@@ -483,7 +500,7 @@ fn request_and_input_destructor_panics_have_independent_original_custody() {
     let mut f = Fixture::with_domains(false, true, None, domains);
     assert!(matches!(
         f.job.take().unwrap().run(),
-        LoaderOutcome::Measured(Ok(_))
+        LoaderOutcome::Loaded { result, .. } if result.is_ok()
     ));
     assert!(!f.owner.take_input_disposal().unwrap().run());
     assert_eq!(request_drops.load(Ordering::SeqCst), 1);

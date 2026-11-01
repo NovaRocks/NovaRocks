@@ -27,29 +27,36 @@ use super::{
         HostSubmitError,
     },
     preparation::{HostFairnessGroup, QueuedPreparation},
+    process_control::rejected_ingress::RejectedIngressJob,
 };
 use novarocks_control_runtime_core::identity::{ScopeId, WorkId};
 use std::num::NonZeroUsize;
 
 enum Queued {
     Getter(EstablishIngressJob),
+    Comparison(super::establish_route::EstablishComparisonJob),
     Disposal(EstablishDisposalJob),
     ReplyNotification(super::request_endpoint::RequestNotificationJob),
     RequestObservation(super::request_observation::RequestObservationJob),
+    RejectedIngress(RejectedIngressJob),
 }
 impl QueuedPreparation for Queued {
     fn queue_key(&self) -> (ScopeId, WorkId) {
         match self {
             Self::Getter(job) => job.queue_key(),
+            Self::Comparison(job) => job.queue_key(),
             Self::Disposal(job) => job.queue_key(),
             Self::ReplyNotification(job) => job.queue_key(),
             Self::RequestObservation(job) => job.queue_key(),
+            Self::RejectedIngress(job) => job.queue_key(),
         }
     }
     fn fairness_group(&self, scope: ScopeId) -> HostFairnessGroup {
         match self {
             Self::Getter(job) => job.fairness_group(scope),
+            Self::Comparison(job) => job.fairness_group(scope),
             Self::Disposal(job) => job.fairness_group(scope),
+            Self::RejectedIngress(job) => job.fairness_group(scope),
             Self::ReplyNotification(_) | Self::RequestObservation(_) => {
                 HostFairnessGroup::Scope(scope)
             }
@@ -59,8 +66,10 @@ impl QueuedPreparation for Queued {
 fn run(original: Queued) {
     match original {
         Queued::Getter(job) => job.run(),
+        Queued::Comparison(job) => job.run(),
         Queued::ReplyNotification(job) => job.run(),
         Queued::RequestObservation(job) => job.run(),
+        Queued::RejectedIngress(job) => job.run(),
         Queued::Disposal(job) => {
             // A false result leaves the original Source role Unresolved and
             // marks its original R. Root's ready consumer reports that fault;
@@ -84,7 +93,6 @@ fn limits(
             .checked_add(workers.get())?,
     )?;
     Some(HostExecutorLimits {
-        contexts: bound,
         jobs: bound,
         per_context: bound,
         workers,
@@ -97,6 +105,16 @@ pub(crate) enum EstablishExecutorStartError {
     GeometryOverflow,
     Spawn(std::io::Error),
 }
+impl std::fmt::Display for EstablishExecutorStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyStarted => f.write_str("Establish executors already started"),
+            Self::GeometryOverflow => f.write_str("Establish executor geometry overflow"),
+            Self::Spawn(error) => write!(f, "Establish executor worker spawn failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for EstablishExecutorStartError {}
 #[must_use = "Partial startup retains the actual physical queues and workers"]
 pub(crate) struct EstablishExecutorStartRefusal {
     pub error: EstablishExecutorStartError,
@@ -129,9 +147,11 @@ impl EstablishExecutors {
     ) -> Result<Self, EstablishExecutorStartRefusal> {
         let (Some(getters), Some(cleanup)) = (
             limits(ready.limit(), getter_workers, 1),
-            // Original source disposal, reply notification and one protocol
-            // observation may overlap; each is captured by that same paid R.
-            limits(ready.limit(), cleanup_workers, 3),
+            // Original source disposal, reply notification and protocol
+            // observation retain their R. Pre-R disposal retains its actual
+            // Native batch/window backing, bounded by the same ingress R
+            // geometry, without charging or constructing another Worker R.
+            limits(ready.limit(), cleanup_workers, 4),
         ) else {
             return Err(EstablishExecutorStartRefusal {
                 error: EstablishExecutorStartError::GeometryOverflow,
@@ -192,6 +212,30 @@ impl EstablishExecutorHandles {
                 (EstablishSubmitError::Host(error), original)
             })
     }
+    pub(crate) fn try_submit_comparison(
+        &self,
+        original: super::establish_route::EstablishComparisonJob,
+    ) -> Result<
+        (),
+        (
+            EstablishSubmitError,
+            super::establish_route::EstablishComparisonJob,
+        ),
+    > {
+        if !original.belongs_to(&self.ready) {
+            return Err((EstablishSubmitError::WrongOwner, original));
+        }
+        // The getter has already returned before this same R can ask for a
+        // comparison. At most one of them occupies this original queue place.
+        self.getters
+            .try_submit(Queued::Comparison(original))
+            .map_err(|(error, original)| {
+                let Queued::Comparison(original) = original else {
+                    unreachable!("same original comparison")
+                };
+                (EstablishSubmitError::Host(error), original)
+            })
+    }
     pub(crate) fn try_submit_notification(
         &self,
         original: super::request_endpoint::RequestNotificationJob,
@@ -232,6 +276,22 @@ impl EstablishExecutorHandles {
             .map_err(|(error, original)| {
                 let Queued::RequestObservation(original) = original else {
                     unreachable!("same original protocol observation");
+                };
+                (EstablishSubmitError::Host(error), original)
+            })
+    }
+    pub(crate) fn try_submit_rejected_ingress(
+        &self,
+        original: RejectedIngressJob,
+    ) -> Result<(), (EstablishSubmitError, RejectedIngressJob)> {
+        if !original.belongs_to(&self.ready) {
+            return Err((EstablishSubmitError::WrongOwner, original));
+        }
+        self.cleanup
+            .try_submit(Queued::RejectedIngress(original))
+            .map_err(|(error, original)| {
+                let Queued::RejectedIngress(original) = original else {
+                    unreachable!("same original rejected ingress disposal");
                 };
                 (EstablishSubmitError::Host(error), original)
             })

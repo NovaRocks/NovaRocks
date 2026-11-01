@@ -145,19 +145,59 @@ pub fn hold_native_registry_lock(
     hold_socket(&path, marker.as_bytes(), &mut claim, request_deadline)
         .map_err(tonic::Status::failed_precondition)
 }
-pub fn hold_native_ingress_ordinary_closure(
+/// Holds this same admitted Native ordinary request before Worker transfer.
+/// The original RPC future retains its real permit/raw input; socket and
+/// cancellation readiness use the existing Tokio reactor without another task.
+pub async fn hold_native_ingress_ordinary_request(
     mut claim: crate::test_controls::NativeHoldClaim,
     request_deadline: std::time::Instant,
 ) -> Result<(), tonic::Status> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let path = novarocks_failpoint::native_ingress_hold_socket_path(&claim.token)
         .map_err(tonic::Status::invalid_argument)?;
     let marker = format!(
         "NIH1 {} {} {}\n",
         claim.backend_index, claim.process_id, claim.token
     );
-    hold_socket(&path, marker.as_bytes(), &mut claim, request_deadline)
-        .map_err(tonic::Status::failed_precondition)
+    let cancellation = claim.cancellation();
+    let deadline = request_deadline
+        .min(cancellation.deadline())
+        .min(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    if !cancellation.is_active() || std::time::Instant::now() >= deadline {
+        return Ok(());
+    }
+    let rendezvous = async {
+        let mut stream = tokio::net::UnixStream::connect(&path)
+            .await
+            .map_err(|error| format!("connect Native hold runner: {error}"))?;
+        stream
+            .write_all(marker.as_bytes())
+            .await
+            .map_err(|error| format!("write Native hold identity: {error}"))?;
+        stream.shutdown().await.map_err(|error| error.to_string())?;
+        claim.record_hit()?;
+        let mut release = [0_u8; 1];
+        stream
+            .read_exact(&mut release)
+            .await
+            .map_err(|error| format!("Native hold runner read failed: {error}"))?;
+        if release != *b"R" {
+            return Err("Native hold runner disconnected or sent an invalid release".into());
+        }
+        Ok::<(), String>(())
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(tonic::Status::failed_precondition(
+            "Native hold session closed or original deadline elapsed")),
+        result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rendezvous) => {
+            result.map_err(|_| tonic::Status::failed_precondition(
+                "Native hold session closed or original deadline elapsed"))?
+                .map_err(tonic::Status::failed_precondition)
+        }
+    }
 }
+
 fn hold_socket(
     path: &std::path::Path,
     marker: &[u8],
@@ -1005,7 +1045,7 @@ pub fn create_task_receipt_foreign_task(
 /// fact is the backend process inside the event's own `TaskIdentity`.
 ///
 /// Claimed at the encode boundary rather than in
-/// [`novarocks_worker::TaskStatusSource`], which is a process-local snapshot
+/// the Worker-owned pure observation source, which is a process-local snapshot
 /// holder with no wire and no identity of its own to misstate: a status
 /// published there is the truth this backend holds, and the lie belongs where
 /// the frame leaves the process. Both the catch-up frames and the live ones
@@ -1451,7 +1491,14 @@ mod tests {
         let path = novarocks_failpoint::native_ingress_hold_socket_path(&claim.token).unwrap();
         let listener = UnixListener::bind(&path).unwrap();
         let worker = std::thread::spawn(move || {
-            hold_native_ingress_ordinary_closure(claim, Instant::now() + Duration::from_secs(5))
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(hold_native_ingress_ordinary_request(
+                    claim,
+                    Instant::now() + Duration::from_secs(5),
+                ))
         });
         let mut stream = accept_marker(&listener);
         let mut marker = String::new();

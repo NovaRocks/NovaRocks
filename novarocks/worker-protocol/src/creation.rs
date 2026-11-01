@@ -29,8 +29,6 @@ pub struct CreationCost {
     pub input_retained_bytes: u64,
     pub ingress_retained_bytes: u64,
     pub structural_bytes: u64,
-    pub inbound_records: u64,
-    pub inbound_bytes: u64,
 }
 impl CreationCost {
     pub fn preparation_bytes(self) -> Option<u64> {
@@ -55,15 +53,10 @@ pub enum AdmissionNeed {
         generation: Generation,
         preparing_in_context: usize,
         bytes: u64,
-        inbound_records: u64,
-        inbound_bytes: u64,
     },
     Context {
         context: QueryContextRef,
         generation: Generation,
-    },
-    Ticket {
-        context: QueryContextRef,
     },
 }
 /// The exact pre-Accepted refusal. Typed domain provenance remains intact
@@ -105,6 +98,9 @@ pub trait AdmissionPort {
 /// obligation even though they need no pending entry in the pure core.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RequestContext {
+    /// The same original admitted R work, qualified by its actual scope.
+    /// This neutral identity grants no runtime permission or capacity.
+    pub author: novarocks_control_runtime_core::identity::ScopedWorkRef,
     pub token: novarocks_control_runtime_core::identity::InputId,
     pub operation: novarocks_execution_contract::TaskOperationId,
     pub deadline: crate::lease::MonotonicInstant,

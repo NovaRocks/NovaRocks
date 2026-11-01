@@ -34,9 +34,10 @@ use novarocks_control_runtime::{
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     completion::{ConsumerKind, Consumption},
     identity::{ConsumerId, DimensionId, Generation, SlotId},
+    owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
 };
 
@@ -64,12 +65,20 @@ struct Fixture {
 }
 fn fixture() -> Fixture {
     let resources = ResourceVector::new([(dimension(), 1)]).unwrap();
-    let ledger = RuntimeLedger::new(resources.clone(), 1, 1);
-    let scope = ledger.open_scope_next(None, generation(), 1, 1).unwrap();
-    let (work, capacity) = scope
+    let ledger = RuntimeLedger::new(resources.clone());
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
+    let (work, mut capacity) = scope
         .reserve_next(
             generation(),
-            resources,
+            ReservationResources::new(
+                resources,
+                OwnedSlotNeed {
+                    work_headers: 1,
+                    completions: 1,
+                    captures: 1,
+                    ..OwnedSlotNeed::default()
+                },
+            ),
             WorkKind::Business,
             WorkAdmission::External,
         )
@@ -77,9 +86,8 @@ fn fixture() -> Fixture {
         .bind(WorkKind::Business)
         .unwrap();
     let report = ReportSlot::reserve_next(
-        &scope,
+        &mut capacity,
         generation(),
-        work.id(),
         2,
         [
             (

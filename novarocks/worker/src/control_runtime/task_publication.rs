@@ -27,7 +27,7 @@ use novarocks_execution_contract::{AcceptedTaskConclusion, RetainedTaskSource};
 use novarocks_worker_protocol::context::ContextEffect;
 use std::{num::NonZeroU64, sync::Arc};
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskPublicationError {
     WrongEffect,
     WrongTask,
@@ -182,13 +182,13 @@ mod tests {
     use novarocks_control_runtime::{
         actor::ActorConfig,
         driver::InputPhase,
-        lease::{CapacityBundle, WorkLease},
+        lease::{ReservationBundle, WorkLease},
         transaction::{RuntimeLedger, ScopeHandle},
     };
     use novarocks_control_runtime_core::{
         capacity::ResourceVector,
         completion::CompletionError,
-        effect::{EffectError, EffectState},
+        effect::EffectState,
         identity::{ActorId, ConsumerId, Generation, InputId, ReservationId, Tick},
         mailbox::InputClass,
         scope::{WorkAdmission, WorkKind},
@@ -238,14 +238,15 @@ mod tests {
         ledger: RuntimeLedger,
         scope: ScopeHandle,
         runtime: ActorRuntime<WorkerActor>,
+        registration: novarocks_control_runtime::driver::ActorRegistration,
         port: Option<Arc<TaskRuntimePort>>,
         host: Option<TaskHostRecord>,
         context: QueryContextRef,
         // Exact SourceIds from the actual prefix, observed Committed before
         // its input record is retired. No failed-owner receipt is fabricated.
         core_consumed: Mutex<BTreeMap<SourceId, InputId>>,
-        roles: Vec<(WorkLease, CapacityBundle)>,
-        jobs: BTreeMap<ReservationId, (WorkLease, CapacityBundle)>,
+        roles: Vec<(WorkLease, ReservationBundle)>,
+        jobs: BTreeMap<ReservationId, (WorkLease, ReservationBundle)>,
         dispatch: EffectDispatch,
     }
     impl Fixture {
@@ -255,20 +256,19 @@ mod tests {
                     (Dimension::ActiveTasks.id(), 1),
                     (Dimension::PreparingTasks.id(), 1),
                     (Dimension::PreparingBytes.id(), 100),
-                    (Dimension::InboundRecords.id(), 1),
-                    (Dimension::InboundBytes.id(), 100),
                 ])
                 .unwrap(),
-                64,
-                1,
             );
-            let scope = ledger.open_scope_next(None, generation(), 64, 64).unwrap();
+            let scope = ledger.open_scope_next(None, generation()).unwrap();
             let mut roles = Vec::new();
-            for kind in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step] {
+            for (index, kind) in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step]
+                .into_iter()
+                .enumerate()
+            {
                 let (mut work, capacity) = scope
                     .reserve_next(
                         generation(),
-                        ResourceVector::default(),
+                        novarocks_control_runtime_core::capacity::ReservationResources::new(ResourceVector::default(), novarocks_control_runtime_core::owned_storage::OwnedSlotNeed { work_headers: 1, inputs: if index == 2 {48} else if index == 1 {1} else {0}, batches: if index == 2 {48} else if index == 1 {1} else {0}, effects: (if index == 2 {48} else if index == 1 {1} else {0}) * ContextActor::MAX_STEP_ACTIONS, replies: if index == 2 {48} else {0}, ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default() }),
                         kind,
                         WorkAdmission::External,
                     )
@@ -292,6 +292,7 @@ mod tests {
                 context.backend_process_id(),
             );
             let config = ContextConfig {
+                request_horizon: crate::RequestHorizon::DEFAULT,
                 max_tasks: 1,
                 max_creation_waiters: 2,
                 max_pending_requests: 4,
@@ -308,22 +309,20 @@ mod tests {
                 config,
             )
             .unwrap();
-            let runtime = ActorRuntime::new(1);
-            runtime
-                .register_supervised_next(
+            let runtime = ActorRuntime::new();
+            let registration = runtime.register_supervised_bound(
                     actor(),
                     scope.clone(),
                     WorkerActor::Context(Box::new(ContextActor::new(
                         core,
                         scope.clone(),
                         AdmissionStorage {
-                            loading: ResourceVector::default(),
-                            accepted: ResourceVector::default(),
-                            context: ResourceVector::default(),
-                            ticket: ResourceVector::default(),
+                            loading: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(crate::control_runtime_policy::IngressRoleLimits { ordinary_running: 1, ordinary_waiting: 0, control_running: 1, control_waiting: 0, max_batch_items: 1, root_read_holders: 1 }).unwrap()).loading.resources().unwrap(),
+                            accepted: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(crate::control_runtime_policy::IngressRoleLimits { ordinary_running: 1, ordinary_waiting: 0, control_running: 1, control_waiting: 0, max_batch_items: 1, root_read_holders: 1 }).unwrap()).accepted.resources().unwrap(),
+                            context: novarocks_control_runtime_core::capacity::ReservationResources::work_only(),
                         },
-                        roles[1].0.id(),
-                        roles[2].0.id(),
+                        roles[1].0.reference(),
+                        roles[2].0.reference(),
                     ))),
                     ActorConfig {
                         mailbox: [16, 16, 16, 1],
@@ -342,6 +341,7 @@ mod tests {
                 ledger,
                 scope,
                 runtime,
+                registration,
                 port: None,
                 host: None,
                 context,
@@ -371,8 +371,6 @@ mod tests {
                             input_retained_bytes: 1,
                             ingress_retained_bytes: 1,
                             structural_bytes: 1,
-                            inbound_records: 0,
-                            inbound_bytes: 0,
                         }),
                     },
                     None,
@@ -397,10 +395,15 @@ mod tests {
             };
             let input = self
                 .runtime
-                .reserve_input(actor(), ActorId::new(2).unwrap(), InputClass::Lifecycle)
+                .reserve_admitted_input_for(
+                    &self.registration,
+                    ActorId::new(2).unwrap(),
+                    InputClass::Lifecycle,
+                    &self.roles[2].0,
+                )
                 .unwrap()
                 .fill(WorkerMessage::Context(ContextMessage::Command {
-                    work: self.roles[2].0.id(),
+                    work: self.roles[2].0.reference(),
                     command,
                     request: request.map(|operation| RequestMetadata {
                         operation,
@@ -488,12 +491,12 @@ mod tests {
                         let host = TaskHostRecord::adopt_loading(
                             &self.runtime,
                             &ticket,
-                            TaskHostBinding {
+                            &TaskHostBinding {
                                 context: self.context,
                                 task_source: ActorId::new(2).unwrap(),
                                 protocol_generation: generation(),
                                 max_cuts: 4,
-                                source_storage_model: true,
+                                registration: self.registration.clone(),
                                 pending: Arc::new(Pending),
                                 health: Arc::new(ExecutionHealth::default()),
                             },
@@ -600,7 +603,7 @@ mod tests {
                 pending_loading,
                 preparation,
                 preparation_remainder,
-                accepted_source_storage,
+                accepted_role_storage,
                 pending_preparation_adoption,
                 mut source_partials,
                 completion,
@@ -631,7 +634,6 @@ mod tests {
                 open_summary.is_none(),
                 "this component issued no open-summary role"
             );
-            assert!(accepted_source_storage.is_none());
             assert!(pending_preparation_adoption.is_none());
             for partial in &mut source_partials {
                 let mut retired = false;
@@ -658,7 +660,10 @@ mod tests {
                 work.body_exited().unwrap();
                 work.captures_exited().unwrap();
                 self.ledger.reap_scope_ready(self.scope.id(), 64).unwrap();
-                capacity.release(&capacity.resources().unwrap()).unwrap();
+                capacity
+                    .release_quota(&capacity.resources().unwrap().quota)
+                    .unwrap();
+                capacity.finish().unwrap();
             }
             crate::control_runtime::task::retire_unused_host_calls_for_test(
                 &host_calls,
@@ -688,22 +693,35 @@ mod tests {
                 drop(consuming);
             }
             assert_eq!(ingress.retained_sources(), 0);
+            // No further Task host issuer remains. Only this parcel's unused
+            // role inventory is returned; bound Source/report exits above are real.
+            if let Some(mut original) = accepted_role_storage {
+                assert!(original.resources().unwrap().quota.is_empty());
+                original.finish().unwrap();
+            }
             assert!(lifetime.actual_exit_ready().unwrap());
             self.ledger.reap_scope_ready(self.scope.id(), 64).unwrap();
-            active.release(&active.resources().unwrap()).unwrap();
+            active
+                .release_quota(&active.resources().unwrap().quota)
+                .unwrap();
+            active.finish().unwrap();
             drop(causal);
             drop(ingress);
             for (mut work, mut capacity) in self.roles.drain(..) {
                 work.body_exited().unwrap();
                 work.captures_exited().unwrap();
                 self.ledger.reap_scope_ready(self.scope.id(), 32).unwrap();
-                capacity.release(&capacity.resources().unwrap()).unwrap();
+                capacity
+                    .release_quota(&capacity.resources().unwrap().quota)
+                    .unwrap();
+                capacity.finish().unwrap();
             }
             self.scope.close_external().unwrap();
             while let Some(original_host_turn) = self.runtime.claim_host_actor() {
                 original_host_turn.release(false).unwrap();
             }
             self.runtime.remove_actor(actor()).unwrap();
+            self.ledger.reap_scope_ready(self.scope.id(), 3).unwrap();
             self.ledger.remove_scope(self.scope.id()).unwrap();
             assert!(self.ledger.is_empty());
         }
@@ -952,13 +970,30 @@ mod tests {
             let status_before = f.port().current();
             let convergence_before = f.port().publication().read().convergence();
             let work_before = f.scope.snapshot().unwrap().work;
-            let foreign_runtime = ActorRuntime::<WorkerActor>::new(1);
-            let target = if stale {
-                f.scope.fail().unwrap();
-                &f.runtime
-            } else {
-                &foreign_runtime
-            };
+            let foreign_runtime = ActorRuntime::<WorkerActor>::new();
+            // Exercise the real actor failure boundary, not only a ledger
+            // generation change: the original fixed failure source then owns
+            // the old batch's explicit abandonment and actual cleanup.
+            let failed_input = stale.then(|| {
+                let unknown_task = TaskIdentity::new(
+                    f.context.query_execution_id(),
+                    StageId::new(1).unwrap(),
+                    TaskId::new(999).unwrap(),
+                    f.context.backend_process_id(),
+                );
+                let original = f.send(ContextInput::Installed { task: unknown_task }, None);
+                assert!(f.runtime.snapshot(actor()).unwrap().failed);
+                assert_eq!(
+                    f.runtime
+                        .input_custody(actor(), original)
+                        .unwrap()
+                        .unwrap()
+                        .phase,
+                    InputPhase::AbandonedByOwnerFailure
+                );
+                original
+            });
+            let target = if stale { &f.runtime } else { &foreign_runtime };
             let mut refusal = match commit_task_projection(target, &ticket, f.port()) {
                 Err(refusal) => refusal,
                 Ok(_) => panic!("a refused effect cannot publish its candidate"),
@@ -966,9 +1001,7 @@ mod tests {
             if stale {
                 assert!(matches!(
                     refusal.error,
-                    TaskPublicationError::Runtime(DriverError::Effect(
-                        EffectError::StaleGeneration
-                    ))
+                    TaskPublicationError::Runtime(DriverError::FailurePublicationRequired)
                 ));
             } else {
                 assert!(matches!(
@@ -1034,8 +1067,64 @@ mod tests {
             if !stale {
                 f.drain();
                 f.port().ingress().summary_consumed(summary.cut).unwrap();
+            } else {
+                // The failed Scope cannot start the remaining publications.
+                // The original started host call returned above; abandon only
+                // still-unstarted actions, without publishing their candidate,
+                // inventing an exit or releasing the original rich snapshot.
+                let remaining = f
+                    .runtime
+                    .effect_inventory(actor(), input, None, 15)
+                    .unwrap();
+                let mut abandoned = 0;
+                for (descriptor, state) in remaining {
+                    if state == EffectState::Pending {
+                        f.runtime
+                            .abandon_unstarted_effect(actor(), input, descriptor.id)
+                            .unwrap();
+                        abandoned += 1;
+                    } else {
+                        assert_eq!(state, EffectState::Completed);
+                    }
+                }
+                assert!(abandoned > 0);
+                assert_eq!(f.port().current(), status_before);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
             }
             f.runtime.retire_input(actor(), input).unwrap();
+            if let Some(failed_input) = failed_input {
+                // Retire the actual failed input and run its separately paid
+                // fixed cleanup action. None of these neutral receipts owns
+                // the original rich Source, which still awaits port disposal.
+                f.dispatch.clear_failed_index(&f.runtime).unwrap();
+                let novarocks_control_runtime::driver::FailureSourceState::ClosedPending(cleanup) =
+                    f.runtime.failure_source_state(actor()).unwrap()
+                else {
+                    panic!("the original failure source retains its actual cleanup");
+                };
+                let descriptor = f
+                    .runtime
+                    .effect_inventory(actor(), cleanup, None, 1)
+                    .unwrap()[0]
+                    .0
+                    .clone();
+                let cleanup_ticket = f
+                    .runtime
+                    .take_effect(actor(), cleanup, descriptor.id)
+                    .unwrap();
+                assert!(matches!(
+                    cleanup_ticket.effect,
+                    WorkerAction::OwnerFailed { scope, .. } if scope == f.scope.id()
+                ));
+                assert_eq!(cleanup_ticket.descriptor.work, f.roles[0].0.reference());
+                f.roles[0].0.start().unwrap();
+                f.runtime.effect_completed(cleanup_ticket).unwrap();
+                f.runtime.retire_input(actor(), cleanup).unwrap();
+                f.runtime.retire_input(actor(), failed_input).unwrap();
+                drop(f.runtime.take_failure_payload(actor()).unwrap().unwrap());
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                assert_eq!(f.port().current(), status_before);
+            }
             f.finish();
             assert_eq!(drops.load(Ordering::SeqCst), 1);
         }

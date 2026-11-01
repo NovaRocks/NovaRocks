@@ -75,7 +75,13 @@ fn probe_in_handoff_order(f: &mut RouteFixture, input: InputId) -> EstablishRepl
                 }) if request.token == input => result.clone(),
                 _ => panic!("the actual Context probe follows route handoff order"),
             };
-            host.handoff_establish_probe(probe).unwrap();
+            drop(host);
+            f.assert_original_probe_author(&probe, input);
+            host_address
+                .lock()
+                .unwrap()
+                .handoff_establish_probe(probe)
+                .unwrap();
             return result;
         }
         if claimed < 2 {
@@ -109,6 +115,7 @@ fn finish_conflict_return(
     drop(handle);
     assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 0);
     assert!(thread::spawn(move || disposal.run()).join().unwrap());
+    f.finish_conflict_observation(input);
     assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 1);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 4);
@@ -162,7 +169,7 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
             .is_none()
     );
     f.adopt_pending_context();
-    let replies_before = f.f.ledger.used(Dimension::Replies.id());
+    let replies_before = f.f.ledger.used(Dimension::Requests.id());
     let registration = f.f.root.registration().clone();
     let runtime = f.f.runtime.clone();
     let cell = Arc::new(RootHostCell::new(f.f.root));
@@ -180,7 +187,7 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
         && second_turn.requests.visited == 1
         && first_turn.requests.retired + second_turn.requests.retired == 1;
     let retired_original = !f.f.root.resources().requests.contains_key(&withdrawn)
-        && f.f.ledger.used(Dimension::Replies.id()) + 1 == replies_before;
+        && f.f.ledger.used(Dimension::Requests.id()) + 1 == replies_before;
     {
         let original_address = f.f.root.service().context(f.f.context).unwrap();
         let mut original_context = original_address.lock().unwrap();
@@ -278,7 +285,8 @@ fn a_real_context_lock_wait_releases_root_inventory_but_keeps_the_original_host_
         if let Some(root) = cell.try_lock() {
             let original = root.resources().requests.get(&input).unwrap();
             // The actual Root return role exists only after original-R
-            // preparation, before any target Context Work can be admitted.
+            // preparation, before any target Context input can be bound.
+            // Its prepaid financial leg is already on the original Root.
             if original.route_return_role().is_some() && original.pending_route().is_none() {
                 root_was_free_after_prepare = true;
                 break;

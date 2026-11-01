@@ -20,7 +20,7 @@
 
 use crate::{
     completion::ReportSlot,
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     reported_work::ReportedWork,
     sync::{Arc, AtomicBool, Mutex, Ordering},
     transaction::RuntimeError,
@@ -77,7 +77,7 @@ struct State<T: Send + 'static> {
     callback: Option<ManuallyDrop<ContinuationCallback<T>>>,
     value: Option<ManuallyDrop<T>>,
     work: Option<WorkLease>,
-    capacity: Option<CapacityBundle>,
+    capacity: Option<ReservationBundle>,
     panic: Option<PanicPayload>,
     body_exited: bool,
     captures_exited: bool,
@@ -161,6 +161,17 @@ impl<T: Send + 'static> RegistrationToken<T> {
             let error = ContinuationError::InvalidPhase(state.phase);
             drop(state);
             return Err((error, ManuallyDrop::into_inner(callback)));
+        }
+        let capture_storage = state.work.as_ref().expect("original continuation work")
+            .capture_positions().and_then(|count| {
+                if count == 0 {
+                    Err(novarocks_control_runtime_core::owned_storage::OwnedStorageError::MissingPosition(
+                        novarocks_control_runtime_core::owned_storage::OwnedSlotKind::Capture).into())
+                } else { Ok(()) }
+            });
+        if let Err(error) = capture_storage {
+            drop(state);
+            return Err((error.into(), ManuallyDrop::into_inner(callback)));
         }
         state.callback = Some(callback);
         state.phase = ContinuationPhase::Registered;
@@ -427,7 +438,10 @@ impl<T: Send + 'static> ContinuationSlot<T> {
             .as_mut()
             .expect("original continuation capacity");
         let resources = capacity.resources()?;
-        if let Err(error) = capacity.release(&resources) {
+        if let Err(error) = capacity
+            .release_quota(&resources.quota)
+            .and_then(|()| capacity.finish())
+        {
             state.phase = ContinuationPhase::Unresolved;
             state
                 .work

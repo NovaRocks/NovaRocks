@@ -25,11 +25,23 @@ use novarocks_control_runtime::{
     transaction::RuntimeLedger,
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     completion::ConsumerKind,
     identity::{ConsumerId, DimensionId, Generation},
+    owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
 };
+fn continuation_resources(quota: ResourceVector) -> ReservationResources {
+    ReservationResources::new(
+        quota,
+        OwnedSlotNeed {
+            work_headers: 1,
+            completions: 1,
+            captures: 1,
+            ..OwnedSlotNeed::default()
+        },
+    )
+}
 fn model(run: impl Fn() + Send + Sync + 'static) {
     let mut model = loom::model::Builder::new();
     model.preemption_bound = Some(2);
@@ -46,12 +58,12 @@ fn one_dispatch_claim_serializes_input_refresh_and_reentrant_invocation() {
         let generation = Generation::new(1).unwrap();
         let dimension = DimensionId::new(1).unwrap();
         let resources = ResourceVector::new([(dimension, 1)]).unwrap();
-        let ledger = RuntimeLedger::new(resources.clone(), 1, 1);
-        let scope = ledger.open_scope_next(None, generation, 1, 1).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(resources.clone());
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation,
-                resources,
+                continuation_resources(resources),
                 WorkKind::Settlement,
                 WorkAdmission::External,
             )
@@ -60,9 +72,8 @@ fn one_dispatch_claim_serializes_input_refresh_and_reentrant_invocation() {
             .unwrap();
         let observer = ConsumerId::new(1).unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation,
-            work.id(),
             1,
             [(observer, ConsumerKind::Observer)],
         )
@@ -131,12 +142,12 @@ fn delayed_continuation_start_and_scope_failure_share_the_actual_generation_gate
         let generation = Generation::new(1).unwrap();
         let dimension = DimensionId::new(1).unwrap();
         let resources = ResourceVector::new([(dimension, 1)]).unwrap();
-        let ledger = RuntimeLedger::new(resources.clone(), 1, 1);
-        let scope = ledger.open_scope_next(None, generation, 1, 1).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(resources.clone());
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation,
-                resources,
+                continuation_resources(resources),
                 WorkKind::Settlement,
                 WorkAdmission::External,
             )
@@ -146,9 +157,8 @@ fn delayed_continuation_start_and_scope_failure_share_the_actual_generation_gate
         let owner = ConsumerId::new(1).unwrap();
         let observer = ConsumerId::new(2).unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation,
-            work.id(),
             2,
             [
                 (
@@ -213,12 +223,12 @@ fn actual_invocation_and_owner_abandonment_preserve_the_other_consumer() {
         let generation = Generation::new(1).unwrap();
         let dimension = DimensionId::new(1).unwrap();
         let resources = ResourceVector::new([(dimension, 1)]).unwrap();
-        let ledger = RuntimeLedger::new(resources.clone(), 1, 1);
-        let scope = ledger.open_scope_next(None, generation, 1, 1).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(resources.clone());
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation,
-                resources,
+                continuation_resources(resources),
                 WorkKind::Settlement,
                 WorkAdmission::External,
             )
@@ -228,9 +238,8 @@ fn actual_invocation_and_owner_abandonment_preserve_the_other_consumer() {
         let owner = ConsumerId::new(1).unwrap();
         let observer = ConsumerId::new(2).unwrap();
         let report = ReportSlot::reserve_next(
-            &scope,
+            &mut capacity,
             generation,
-            work.id(),
             2,
             [
                 (
@@ -283,19 +292,19 @@ fn dropping_registration_authority_and_actual_unused_exit_are_separate_observati
         let generation = Generation::new(1).unwrap();
         let dimension = DimensionId::new(1).unwrap();
         let resources = ResourceVector::new([(dimension, 1)]).unwrap();
-        let ledger = RuntimeLedger::new(resources.clone(), 1, 1);
-        let scope = ledger.open_scope_next(None, generation, 1, 1).unwrap();
-        let (work, capacity) = scope
+        let ledger = RuntimeLedger::new(resources.clone());
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let (work, mut capacity) = scope
             .reserve_next(
                 generation,
-                resources,
+                continuation_resources(resources),
                 WorkKind::Settlement,
                 WorkAdmission::External,
             )
             .unwrap()
             .bind(WorkKind::Settlement)
             .unwrap();
-        let report = ReportSlot::reserve_next(&scope, generation, work.id(), 0, []).unwrap();
+        let report = ReportSlot::reserve_next(&mut capacity, generation, 0, []).unwrap();
         let (slot, token) = ContinuationSlot::<()>::from_admitted(
             novarocks_control_runtime::reported_work::ReportedWork::try_new(work, capacity, report)
                 .unwrap(),

@@ -23,6 +23,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use super::terminal_observation_tests::{
+    OriginalRootNode, in_original_preparation, open_root_in_preparation,
+};
+use super::{NativeRootResultSession, RootProducerPool};
 use arrow::array::{
     Array, ArrayRef, BinaryArray, Decimal256Array, DictionaryArray, Int32Array, Int64Array,
     RecordBatch, StringArray,
@@ -35,10 +39,10 @@ use novarocks_execution::runtime::fragment::io::{
     RootInputReservationAdmission, RootProducerState, RootResultSession, RootResultWriteSpec,
     RootWorkExitProgress,
 };
+use novarocks_execution::runtime::task_control::TaskExecutionControl;
 use novarocks_execution_contract::TaskIdentity;
 use novarocks_execution_contract::root_lifetime::RootRetentionClose;
 use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultRead};
-use novarocks_native_adapter::root_result_session::{NativeRootResultSession, RootProducerPool};
 use novarocks_result_contract::{
     ClientRenderSchema, FrozenRootOutput, NativeRenderType, RenderColumn, RenderField,
     RenderPresentation, RootOutputContract, RootProfileId, ScalarField, ScalarRecord, ScalarSchema,
@@ -88,6 +92,9 @@ struct Fixture {
     channel: Arc<RootResultChannel>,
     session: Arc<NativeRootResultSession>,
     health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
+    control: Arc<TaskExecutionControl>,
+    // Fields above exit before releasing this same original physical callback.
+    _original_node: Arc<OriginalRootNode>,
 }
 
 impl Fixture {
@@ -104,38 +111,67 @@ impl Fixture {
             Arc::clone(&health),
         )
         .unwrap();
-        let channel = RootResultChannel::try_open(
-            RootResultWriteSpec {
-                task: task(),
-                contract: Arc::new(RootOutputContract::new(RootProfileId::V1, output)),
-            },
-            Arc::clone(&budget),
-            limits,
-            Arc::clone(&health),
-        )
-        .unwrap();
-        channel.mark_context_owned().unwrap();
-        let session =
-            NativeRootResultSession::try_open_for_local_encoding(Arc::clone(&channel), &pool)
-                .unwrap();
+        let (session, control, original_node) =
+            open_original(output, &pool, &budget, limits, &health);
+        let channel = session.channel().clone();
         Self {
             pool,
             budget,
             channel,
             session,
             health,
+            control,
+            _original_node: original_node,
         }
     }
 }
 
+fn open_original(
+    output: FrozenRootOutput,
+    pool: &Arc<RootProducerPool>,
+    budget: &Arc<ResultRetainedBudget>,
+    limits: WorkerResultRetainedLimits,
+    health: &Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
+) -> (
+    Arc<NativeRootResultSession>,
+    Arc<TaskExecutionControl>,
+    Arc<OriginalRootNode>,
+) {
+    let task = task();
+    let pool = pool.clone();
+    let budget = budget.clone();
+    let body_health = health.clone();
+    let ((session, control), original_node) =
+        in_original_preparation(task, health.clone(), move |preparation| {
+            let session = open_root_in_preparation(
+                preparation,
+                &pool,
+                RootResultWriteSpec {
+                    task,
+                    contract: Arc::new(RootOutputContract::new(RootProfileId::V1, output)),
+                },
+                budget,
+                limits,
+                body_health,
+            )
+            .unwrap();
+            (session, preparation.runtime_control())
+        });
+    original_node.retain_root_for_teardown(Arc::clone(session.channel()));
+    (session, control, original_node)
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // A failed assertion must not perform an unbounded join on the test
-        // thread. Normal tests explicitly await shutdown under DEADLINE.
-        let pool = Arc::clone(&self.pool);
-        std::thread::spawn(move || {
-            let _ = pool.shutdown();
-        });
+        // Unknown cases end in the isolated process owner before reaching
+        // this ordinary cleanup. A healthy case joins the actual pool first.
+        self.session
+            .abort(ResultAbort::Cancelled("component fixture closed".into()));
+        self.channel.close(RootRetentionClose::ContextReleased);
+        self.pool
+            .shutdown()
+            .expect("original component pool joined");
+        self._original_node.release_body();
     }
 }
 
@@ -841,11 +877,13 @@ async fn full_window_suspends_original_input_and_abort_exits_with_response_alias
     // remains as the deliberately live physical result owner.
     let channel = Arc::clone(&fixture.channel);
     let pool = Arc::clone(&fixture.pool);
+    let original_node = fixture._original_node.clone();
     drop(fixture);
     assert!(!channel.physical_idle());
     drop(alias);
     wait_until(|| channel.physical_idle()).await;
     shutdown(&pool).await;
+    drop(original_node);
 }
 
 #[tokio::test]
@@ -882,11 +920,8 @@ async fn pool_shutdown_drains_an_active_blocked_session_without_consumer_ack() {
     ));
     assert!(fixture.session.try_acquire_input().is_err());
     assert!(
-        NativeRootResultSession::try_open_for_local_encoding(
-            Arc::clone(&fixture.channel),
-            &fixture.pool
-        )
-        .is_err()
+        fixture.pool.reserve_for_test(super::ROOT_CLEANUP).is_err(),
+        "the same closed pool rejects a new producer reservation"
     );
     fixture.channel.close(RootRetentionClose::ContextReleased);
 }
@@ -894,6 +929,10 @@ async fn pool_shutdown_drains_an_active_blocked_session_without_consumer_ack() {
 #[tokio::test]
 async fn repeated_cancel_issuer_observer_panics_keep_notification_unknown_after_original_input_exit()
  {
+    if !crate::root_unknown_test::enter() {
+        return;
+    }
+
     let fixture = Fixture::new(client(1));
     let value = "x".repeat(3 << 20);
     let array: ArrayRef = Arc::new(StringArray::from(vec![value.as_str()]));
@@ -947,10 +986,15 @@ async fn repeated_cancel_issuer_observer_panics_keep_notification_unknown_after_
         panic!("original input grant remained retained after its physical exit");
     };
     drop(credit);
+    crate::root_unknown_test::complete_and_abort();
 }
 
 #[tokio::test]
 async fn count_only_panicking_issuer_observer_keeps_unknown_after_cpu_and_grant_exit() {
+    if !crate::root_unknown_test::enter() {
+        return;
+    }
+
     let fixture = Fixture::new(FrozenRootOutput::CountOnly);
     let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
     let weak = Arc::downgrade(&array);
@@ -998,6 +1042,7 @@ async fn count_only_panicking_issuer_observer_keeps_unknown_after_cpu_and_grant_
         panic!("original input grant remained retained after its physical exit");
     };
     drop(credit);
+    crate::root_unknown_test::complete_and_abort();
 }
 
 #[tokio::test]
@@ -1021,6 +1066,10 @@ async fn cancel_after_a_normal_end_keeps_the_completed_terminal() {
 
 #[tokio::test]
 async fn encoder_handoff_notification_panic_keeps_contextheld_and_channel_metadata_unknown() {
+    if !crate::root_unknown_test::enter() {
+        return;
+    }
+
     let fixture = Fixture::new(client(1));
     let metadata_before_fault = fixture
         .channel
@@ -1056,6 +1105,7 @@ async fn encoder_handoff_notification_panic_keeps_contextheld_and_channel_metada
     assert_eq!(fixture.channel.snapshot().data_positions, 0);
     assert_eq!(fixture.channel.snapshot().consumed_through, 0);
     assert_end(&read(&fixture.channel, Some(1), 0).await, 1, 0);
+    crate::root_unknown_test::complete_and_abort();
 }
 
 #[tokio::test]
@@ -1073,22 +1123,9 @@ async fn writable_snapshot_retains_fixed_metadata_after_last_session_arc_exits()
         Arc::clone(&health),
     )
     .unwrap();
-    let channel = RootResultChannel::try_open(
-        RootResultWriteSpec {
-            task: task(),
-            contract: Arc::new(RootOutputContract::new(
-                RootProfileId::V1,
-                FrozenRootOutput::CountOnly,
-            )),
-        },
-        budget,
-        limits,
-        Arc::clone(&health),
-    )
-    .unwrap();
-    channel.mark_context_owned().unwrap();
-    let session =
-        NativeRootResultSession::try_open_for_local_encoding(Arc::clone(&channel), &pool).unwrap();
+    let (session, control, original_node) =
+        open_original(FrozenRootOutput::CountOnly, &pool, &budget, limits, &health);
+    let channel = session.channel().clone();
     assert_eq!(
         session.producer_exit_progress(),
         RootWorkExitProgress::Pending
@@ -1150,6 +1187,7 @@ async fn writable_snapshot_retains_fixed_metadata_after_last_session_arc_exits()
         "the notification snapshot must not pin the Session itself"
     );
     channel.close(RootRetentionClose::ContextAborted);
+    original_node.release_body();
     let owners = wait_until(|| channel.physical_idle());
     tokio::pin!(owners);
     assert!(
@@ -1170,6 +1208,8 @@ async fn writable_snapshot_retains_fixed_metadata_after_last_session_arc_exits()
         .expect("fixed metadata did not exit with the callback snapshot");
     assert!(channel.physical_idle());
     shutdown(&pool).await;
+    drop(control);
+    drop(original_node);
 }
 
 // This source-only fixture declares physical values explicitly. It does not
@@ -1564,14 +1604,21 @@ async fn write_commit_without_summary_fails_instead_of_a_success_end() {
     let RootProducerState::Failed(cause) = fixture.session.producer_state() else {
         panic!("missing SUMMARY cannot publish normal End")
     };
-    use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
-    assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+    use novarocks_execution_contract::failure::FailureClass;
+    assert_eq!(cause.fact().class(), FailureClass::Invariant);
     assert_eq!(
-        cause.failure_fact().reason().domain(),
+        cause.fact().reason().domain(),
         novarocks_execution_contract::failure::domain::NATIVE.get()
     );
-    assert_eq!(cause.failure_fact().reason().code(), 206);
-    let mut source = std::error::Error::source(&cause);
+    assert_eq!(cause.fact().reason().code(), 206);
+    let accepted = fixture
+        .control
+        .accepted()
+        .expect("original Task accepted the physical codec failure");
+    let original_failure = accepted
+        .originating_failure()
+        .expect("same original codec failure source");
+    let mut source = std::error::Error::source(original_failure);
     let mut original = None;
     while let Some(cause) = source {
         if let Some(cause) = cause.downcast_ref::<novarocks_native_adapter::root_write_commit_codec::WriteCommitCodecError>() { original = Some(*cause); break; }
@@ -1617,26 +1664,20 @@ async fn every_internal_domain_opens_and_an_untyped_scalar_identity_has_no_chann
         InternalResultDomain::PreparedWriteCommitV1,
         InternalResultDomain::CowSelectionArrowV1,
     ] {
-        let channel = RootResultChannel::try_open(
-            RootResultWriteSpec {
-                task: task(),
-                contract: Arc::new(RootOutputContract::new(
-                    RootProfileId::V1,
-                    FrozenRootOutput::InternalFacts(domain),
-                )),
-            },
-            Arc::clone(&budget),
+        let (session, _control, original_node) = open_original(
+            FrozenRootOutput::InternalFacts(domain),
+            &pool,
+            &budget,
             limits,
-            Arc::clone(&health),
-        )
-        .unwrap();
-        channel.mark_context_owned().unwrap();
-        let session =
-            NativeRootResultSession::try_open_for_local_encoding(Arc::clone(&channel), &pool)
-                .unwrap_or_else(|error| panic!("{domain:?} producer is installed: {error}"));
+            &health,
+        );
+        let channel = session.channel().clone();
         session.abort(ResultAbort::Cancelled(String::new()));
         drop(session);
         channel.close(RootRetentionClose::ContextReleased);
+        drop(channel);
+        drop(_control);
+        drop(original_node);
     }
     shutdown(&pool).await;
 }

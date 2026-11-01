@@ -24,6 +24,8 @@ use crate::control_runtime::{
     actors::WorkerAction,
     context_executors::{ContextCancelError, ContextExecutorHandles, ContextSubmitError},
     context_host_jobs::{ContextHostJob, ContextHostJobError, ContextHostReturned},
+    host_executor::HostSubmitError,
+    task_capacity::TaskCapacityError,
 };
 use novarocks_control_runtime::driver::{DriverError, EffectCompletionRefusal, EffectTicket};
 use novarocks_control_runtime_core::fair_queue::FairQueueError;
@@ -39,10 +41,8 @@ pub(super) struct PendingHostJobs {
     pub(super) driver_effect: Option<EffectTicket<WorkerAction>>,
     // Exactly the two original close actions can await their real host jobs
     // without blocking unrelated stop/release effects in the same batch.
-    pub(super) driver_close: Option<EffectTicket<WorkerAction>>,
+    pub(super) close_fanouts: Vec<super::task_driver::context_admission::ContextCloseFanout>,
     pub(super) driver_seal: Option<EffectTicket<WorkerAction>>,
-    // The one original Release effect waits on Context-owned Root aliases.
-    pub(super) driver_release: Option<EffectTicket<WorkerAction>>,
     pub(super) root_release_after: Option<novarocks_execution_contract::TaskIdentity>,
     pub(super) root_release_finished: bool,
     pub(super) effect_scan_remaining: usize,
@@ -58,8 +58,57 @@ pub(super) struct PendingHostJobs {
 pub(crate) enum ContextHostProgressError {
     Host(ContextHostJobError),
     Submit(ContextSubmitError),
+    Capacity(TaskCapacityError),
     Cancel(ContextCancelError),
     Fault(ContextHostReturned),
+}
+impl std::fmt::Display for ContextHostProgressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Host(error) => write!(f, "Context host progress failed: {error}"),
+            Self::Submit(error) => write!(f, "Context original job submission failed: {error:?}"),
+            Self::Capacity(error) => write!(f, "Context capacity notification failed: {error:?}"),
+            Self::Cancel(error) => write!(
+                f,
+                "Context original queued job cancellation failed: {error:?}"
+            ),
+            Self::Fault(outcome) => write!(f, "Context original host reported a fault: {outcome}"),
+        }
+    }
+}
+impl std::error::Error for ContextHostProgressError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Host(error) => Some(error),
+            Self::Submit(ContextSubmitError::Runtime(error)) => Some(error),
+            Self::Capacity(TaskCapacityError::Driver(error)) => Some(error),
+            Self::Cancel(ContextCancelError::Runtime(error)) => Some(error),
+            Self::Fault(ContextHostReturned::StartRefused(error)) => Some(error),
+            Self::Submit(
+                ContextSubmitError::WrongOwner
+                | ContextSubmitError::StopRequired
+                | ContextSubmitError::Host(_),
+            )
+            | Self::Capacity(
+                TaskCapacityError::WrongOwner
+                | TaskCapacityError::ForeignRegistration
+                | TaskCapacityError::FutureRevision
+                | TaskCapacityError::Queue(_),
+            )
+            | Self::Cancel(
+                ContextCancelError::WrongOwner
+                | ContextCancelError::StopRequired
+                | ContextCancelError::Queue(_),
+            )
+            | Self::Fault(
+                ContextHostReturned::Materialized(_)
+                | ContextHostReturned::MaterializationWithdrawn
+                | ContextHostReturned::Released { .. }
+                | ContextHostReturned::Disposed
+                | ContextHostReturned::Panicked,
+            ) => None,
+        }
+    }
 }
 impl From<ContextHostJobError> for ContextHostProgressError {
     fn from(error: ContextHostJobError) -> Self {
@@ -86,15 +135,19 @@ impl ContextHostRecord {
         &self,
         ticket: EffectTicket<WorkerAction>,
     ) -> Result<(), EffectCompletionRefusal<WorkerAction>> {
-        let Some(registration) = &self.resources.registration else {
-            return Err(EffectCompletionRefusal {
-                error: DriverError::PublicationTargetMismatch,
-                ticket,
-            });
-        };
         let input = ticket.input;
+        let task = match self.effect_producer_task(&ticket) {
+            Ok(task) => task,
+            Err(error) => return Err(EffectCompletionRefusal { error, ticket }),
+        };
+        let registration = self
+            .resources
+            .registration
+            .as_ref()
+            .expect("the original completion observer validated this registration");
         self.control_runtime
             .effect_completed_for(registration, ticket)?;
+        self.notify_effect_producer_task(task);
         // A late close/seal body can outlive its already delivered reply.
         // Wake that exact original R when its own batch changes; waking only
         // the Context would leave its drained ready slot parked indefinitely.
@@ -107,6 +160,54 @@ impl ContextHostRecord {
         }
         self.notify_host_progress();
         Ok(())
+    }
+
+    /// Save the exact original input's Task address before its last physical
+    /// completion may retire the batch. This is observation, not publication
+    /// authority, and never derives Task ownership from an R financial Scope.
+    pub(crate) fn effect_producer_task(
+        &self,
+        ticket: &EffectTicket<WorkerAction>,
+    ) -> Result<Option<novarocks_execution_contract::TaskIdentity>, DriverError> {
+        let registration = self
+            .resources
+            .registration
+            .as_ref()
+            .ok_or(DriverError::PublicationTargetMismatch)?;
+        self.control_runtime.validate_registration(registration)?;
+        if registration.actor() != self.actor || ticket.actor != self.actor {
+            return Err(DriverError::PublicationTargetMismatch);
+        }
+        self.control_runtime.effect_completion_observer(ticket)?;
+        Ok(self
+            .control_runtime
+            .input_custody(self.actor, ticket.input)?
+            .and_then(|custody| self.task_driver.sources.get(&custody.source).copied()))
+    }
+
+    /// Call only after the same original completion succeeds. Deferred Reply
+    /// owners use the saved address; this does not complete an effect twice.
+    pub(crate) fn notify_effect_producer_task(
+        &self,
+        task: Option<novarocks_execution_contract::TaskIdentity>,
+    ) {
+        if let Some(task) = task {
+            self.notify_task_driver_progress(task);
+        }
+    }
+
+    /// Record an actual Task producer/Core/state transition, including a
+    /// notification coalesced while its finite retirement round is running.
+    pub(super) fn notify_task_driver_progress(
+        &self,
+        task: novarocks_execution_contract::TaskIdentity,
+    ) {
+        if let Some(
+            super::TaskHostOwner::Ready(owner) | super::TaskHostOwner::Initializing(owner),
+        ) = self.tasks.get(&task)
+        {
+            owner.pending_notice().pending();
+        }
     }
 
     /// Move the same captured M into this original owner before submitting to
@@ -131,6 +232,41 @@ impl ContextHostRecord {
         Ok(())
     }
 
+    /// Permission to execute the already instructed R, not a new authority.
+    /// Every condition is read from this same Context's original inventory;
+    /// advancing one positive Root-idle cursor is the only self-notification.
+    fn advance_release_execution_gate(&mut self, budget: usize) -> bool {
+        if budget == 0
+            || !self
+                .resources
+                .host_jobs
+                .as_ref()
+                .is_some_and(|jobs| jobs.release_pending())
+            || !self.task_driver_roots_sealed()
+            || self.resources.pending_host_jobs.driver_seal.is_some()
+        {
+            return false;
+        }
+        if !self.resources.pending_host_jobs.root_release_finished {
+            match self
+                .resources
+                .root_reads
+                .next_release_root(self.resources.pending_host_jobs.root_release_after)
+            {
+                Some((task, true)) => {
+                    self.resources.pending_host_jobs.root_release_after = Some(task);
+                    self.notify_host_progress();
+                    return false;
+                }
+                Some((_, false)) => return false,
+                None => self.resources.pending_host_jobs.root_release_finished = true,
+            }
+        }
+        // R snapshots normal-close retention only after Finalize/Retire and
+        // actual Task disposal, never from Core intent or a Task's terminal.
+        self.tasks.is_empty() && self.task_driver.is_idle()
+    }
+
     pub(super) fn notify_host_progress(&self) {
         if let Some(notice) = &self.resources.notice {
             notice.notify();
@@ -141,9 +277,8 @@ impl ContextHostRecord {
     /// Context effect completion. No foreign getter, destructor or host call
     /// runs here. A failure retains all original pending jobs in this owner.
     /// This turn does not remove an actor/Scope or assert whole Context exit.
-    /// Submission refusal is an explicit owner-driver error, not an ordinary
-    /// parked retry: the pools cover all C original jobs plus N physical tails.
-    /// No pool-capacity wake is promised by this operation after such an error.
+    /// Physical Full retains the same job and waits for the original capacity
+    /// revision. Closure, failure and invariant refusals remain typed errors.
     pub(crate) fn advance_host_io(
         &mut self,
         handles: &ContextExecutorHandles,
@@ -157,14 +292,22 @@ impl ContextHostRecord {
         failed: Option<&super::failure::ScopePublicationsDrained<'_>>,
         budget: usize,
     ) -> Result<ContextHostProgress, ContextHostProgressError> {
+        {
+            let jobs = self
+                .resources
+                .host_jobs
+                .as_ref()
+                .ok_or(ContextHostJobError::WrongPhase)?;
+            if !handles.accepts_owner(jobs) {
+                return Err(ContextHostJobError::WrongOwner.into());
+            }
+        }
+        let release_ready = self.advance_release_execution_gate(budget);
         let jobs = self
             .resources
             .host_jobs
             .as_ref()
-            .ok_or(ContextHostJobError::WrongPhase)?;
-        if !handles.accepts_owner(jobs) {
-            return Err(ContextHostJobError::WrongOwner.into());
-        }
+            .expect("same original Context jobs after metadata progress");
         let mut progress = ContextHostProgress::default();
         if let Some(stage) = failed {
             let returns = jobs.poll_failed_returns(stage, budget)?;
@@ -193,18 +336,13 @@ impl ContextHostRecord {
         );
 
         let stopped = jobs.scope_stopped().map_err(ContextHostJobError::Runtime)?;
-        if let Some(stage) = failed
-            && self.tasks.is_empty()
-            && self.task_driver.is_idle()
-            && self.resources.pending_host_jobs.root_release_finished
-        {
+        if let Some(stage) = failed {
+            // The actual drained failure stage authorizes only R's original
+            // instruction. Its body still crosses the same physical gate.
             jobs.request_failed_release(stage)?;
         }
-        if let Some(stage) = failed
-            && let Some(lifecycle) = self.resources.lifecycle.as_mut()
-        {
-            lifecycle.forward_failed_retained(stage, jobs)?;
-        }
+        let registration = self.registration().clone();
+        let capacity = handles.capacity_signal();
         let pending = &mut self.resources.pending_host_jobs;
         if stopped && pending.materialization_submitted && !pending.materialization_cancel_checked {
             // Cancel and physical pop arbitrate in the original queue. A pop
@@ -220,17 +358,17 @@ impl ContextHostRecord {
             }
             pending.materialization_cancel_checked = true;
         }
-        if pending.jobs[1].is_none() {
+        if release_ready && pending.jobs[1].is_none() {
             pending.jobs[1] = jobs.take_release_job()?;
         }
         if pending.jobs[2].is_none()
             && pending.driver_seal.is_none()
-            && pending.driver_release.is_none()
             && self.tasks.is_empty()
             && self.task_driver.is_idle()
-            && self.resources.requests.is_empty()
-            && self.resources.request_partials.is_empty()
         {
+            // Process-owned R metadata can remain live. M/R retirement and
+            // the original Root/capture gates, rather than an R map census,
+            // decide whether this hot holder can actually be destroyed.
             pending.jobs[2] =
                 jobs.take_holder_disposal_with_roots(&mut self.resources.root_reads)?;
         }
@@ -238,6 +376,9 @@ impl ContextHostRecord {
             let Some(original) = slot.take() else {
                 continue;
             };
+            // Observe before submission: a physical tail racing the returned
+            // Full is retained by register_waiter's post-insertion check.
+            let before = capacity.revision();
             let submitted = if index == 0 && stopped {
                 handles.try_submit_stopped(original)
             } else {
@@ -245,6 +386,18 @@ impl ContextHostRecord {
             };
             if let Err((error, original)) = submitted {
                 *slot = Some(original);
+                if matches!(
+                    error,
+                    ContextSubmitError::Host(HostSubmitError::Queue(
+                        FairQueueError::Full | FairQueueError::ContextFull
+                    ))
+                ) {
+                    capacity
+                        .register_waiter(&registration, before)
+                        .map_err(ContextHostProgressError::Capacity)?;
+                    // Independent cleanup jobs may still enter their pool.
+                    continue;
+                }
                 return Err(ContextHostProgressError::Submit(error));
             }
             if index == 0 && !stopped {

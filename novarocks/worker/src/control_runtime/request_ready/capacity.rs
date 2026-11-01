@@ -74,7 +74,7 @@ impl Wake for SourceCapacityWake {
     }
 }
 impl ControlRequestReady {
-    pub(super) fn bind_source_capacity_owner(
+    pub(in crate::control_runtime) fn bind_source_capacity_owner(
         &self,
         owner: &ActorRegistration,
     ) -> Result<(), ControlRequestError> {
@@ -126,7 +126,7 @@ impl ControlRequestReady {
             .entry(owner.actor())
             .or_insert_with(|| CapacityWaiters {
                 original: owner.clone(),
-                fifo: FairWorkQueue::new(limit, limit, 1),
+                fifo: FairWorkQueue::new(limit, 1),
                 before: BTreeMap::new(),
                 revision: before,
                 remaining: 0,

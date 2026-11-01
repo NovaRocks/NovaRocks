@@ -33,7 +33,7 @@ use novarocks_control_runtime::{
 };
 use novarocks_control_runtime_core::{
     completion::Consumption,
-    identity::{ActorId, InputId, WorkId},
+    identity::{ActorId, Generation, InputId, ScopedWorkRef},
     mailbox::InputClass,
 };
 use novarocks_execution_contract::QueryContextRef;
@@ -72,7 +72,7 @@ pub(in crate::control_runtime) struct ContextInternal {
     pending: bool,
     // The same single input is borrowed by its physical-disposal owner until
     // that owner has saved the exact Core receipt. Wake hints cannot reap it.
-    rejected_retirement: Option<InputId>,
+    task_retirement: Option<InputId>,
     source_ended: bool,
     failed: bool,
     closed: bool,
@@ -82,9 +82,33 @@ struct Binding {
     registration: ActorRegistration,
     root: ActorId,
     context: QueryContextRef,
-    author: WorkId,
+    author: ScopedWorkRef,
 }
 impl ContextInternal {
+    pub(super) fn detachment_source(
+        &mut self,
+    ) -> Result<Option<&mut InputRole<WorkerActor>>, DriverError> {
+        if self.pending || self.task_retirement.is_some() || self.failed || self.permit.is_some() {
+            return Err(DriverError::ActorNotRetired);
+        }
+        if self
+            .role
+            .as_ref()
+            .map(InputRole::in_flight)
+            .transpose()?
+            .flatten()
+            .is_some()
+        {
+            return Err(DriverError::ActorNotRetired);
+        }
+        Ok(self.role.as_mut())
+    }
+    pub(super) fn execution_detached(&mut self) {
+        // The same transaction has already removed the actual idle role.
+        self.role = None;
+        self.closed = true;
+        self.source_ended = true;
+    }
     pub(super) fn admit(
         &mut self,
         runtime: &ActorRuntime<WorkerActor>,
@@ -102,7 +126,7 @@ impl ContextInternal {
             registration: registration.clone(),
             root,
             context,
-            author: author.id(),
+            author: author.reference(),
         });
         self.permit = Some(runtime.reserve_admitted_input(
             registration.actor(),
@@ -157,7 +181,7 @@ impl ContextInternal {
         let original = self.binding()?;
         let role = self.role.as_ref().ok_or(DriverError::UnknownRole)?;
         if let Some(input) = role.in_flight()? {
-            if self.rejected_retirement == Some(input) {
+            if self.task_retirement == Some(input) {
                 return Ok(ContextInternalAdvance::Waiting(input));
             }
             match original
@@ -203,8 +227,7 @@ impl ContextInternal {
     /// The only remaining input is the builtin supervisor, independent of
     /// this original self-source. No producer can create another callback.
     pub(super) fn ready_for_failure_tail(&self, supervisor: InputId) -> Result<bool, DriverError> {
-        if !self.failed || !self.source_ended || self.pending || self.rejected_retirement.is_some()
-        {
+        if !self.failed || !self.source_ended || self.pending || self.task_retirement.is_some() {
             return Ok(false);
         }
         let original = self.binding()?;
@@ -228,20 +251,42 @@ impl ContextInternal {
                 == [supervisor]
             && original
                 .runtime
-                .timer_source_state(original.registration.actor())?
-                == TimerSourceState::ClosedDrained)
+                .pending_timer_input(original.registration.actor())?
+                .is_none())
     }
-    /// Borrow the existing prepaid self-source for one exact completed
-    /// disposal. Busy preserves the caller's original Task entry and payload.
+    /// A rejected creation keeps its original identity until this same
+    /// completed-disposal fact is consumed. Its identity may then be retried.
     pub(super) fn try_submit_rejected_creation(
         &mut self,
         task: novarocks_execution_contract::TaskIdentity,
         payload: PayloadId,
     ) -> Result<Option<InputId>, DriverError> {
+        self.try_submit_task_retirement(ContextInput::RejectedCreationRetired { task, payload })
+    }
+    /// Accepted custody is the original RetireTask's identity and close epoch,
+    /// carried only after its actual disposal and all independent tails exit.
+    pub(super) fn try_submit_task_custody_retired(
+        &mut self,
+        task: novarocks_execution_contract::TaskIdentity,
+        payload: PayloadId,
+        close_epoch: Generation,
+    ) -> Result<Option<InputId>, DriverError> {
+        self.try_submit_task_retirement(ContextInput::TaskExecutionCustodyRetired {
+            task,
+            payload,
+            close_epoch,
+        })
+    }
+    /// Both facts borrow the original single self-source position, in order
+    /// with an existing hint. Busy retains the caller's same disposal owner.
+    fn try_submit_task_retirement(
+        &mut self,
+        command: ContextInput,
+    ) -> Result<Option<InputId>, DriverError> {
         if self.closed || self.failed {
             return Err(DriverError::Closed);
         }
-        if self.rejected_retirement.is_some() {
+        if self.task_retirement.is_some() {
             return Ok(None);
         }
         let original = self.binding()?;
@@ -264,21 +309,21 @@ impl ContextInternal {
             .fill(WorkerMessage::Context(ContextMessage::Command {
                 work: original.author,
                 request: None,
-                command: ContextInput::RejectedCreationRetired { task, payload },
+                command,
             }))
             .map_err(|(error, _neutral)| error)?;
-        self.rejected_retirement = Some(input);
+        self.task_retirement = Some(input);
         Ok(Some(input))
     }
     /// Save this same input's positive consumption before actually retiring
     /// its header. Failure abandonment remains distinct from Core consumption.
-    pub(super) fn finish_rejected_creation(
+    pub(super) fn finish_task_retirement(
         &mut self,
         input: InputId,
     ) -> Result<Consumption, DriverError> {
         let original = self.binding()?;
         let role = self.role.as_ref().ok_or(DriverError::UnknownRole)?;
-        if self.rejected_retirement != Some(input) || role.in_flight()? != Some(input) {
+        if self.task_retirement != Some(input) || role.in_flight()? != Some(input) {
             return Err(DriverError::InputAuthorMismatch);
         }
         let receipt = match original
@@ -304,7 +349,7 @@ impl ContextInternal {
             ) => return Ok(Consumption::Pending),
             Err(error) => return Err(error),
         }
-        self.rejected_retirement = None;
+        self.task_retirement = None;
         Ok(receipt)
     }
     pub(super) fn authorize_removal(
@@ -336,9 +381,9 @@ impl ContextInternal {
         original
             .runtime
             .close_actor_admission(original.registration.actor())?;
-        original
-            .runtime
-            .close_timer_source(original.registration.actor())?;
+        // Failure fences Core timer production. Keep the same TimerIndex
+        // position available for the retained custodian's original horizon.
+        // An already filled Tick still needs real abandonment and retirement.
         // The original Core was discarded. There is no computation to resume.
         // A filled input still needs its actual failed-input abandonment and
         // batch retirement; neither is acknowledged by clearing this bool.
@@ -358,7 +403,7 @@ impl ContextInternal {
         if self.closed {
             return Ok(true);
         }
-        if !self.source_ended || self.pending || self.rejected_retirement.is_some() {
+        if !self.source_ended || self.pending || self.task_retirement.is_some() {
             return Ok(false);
         }
         let original = self.binding()?;
@@ -382,14 +427,20 @@ impl ContextInternal {
                 Err(error) => return Err(error),
             }
         }
-        if original
-            .runtime
-            .timer_source_state(original.registration.actor())?
-            != TimerSourceState::ClosedDrained
-        {
+        let snapshot = original.runtime.snapshot(original.registration.actor())?;
+        if if self.failed {
+            original
+                .runtime
+                .pending_timer_input(original.registration.actor())?
+                .is_some()
+        } else {
+            original
+                .runtime
+                .timer_source_state(original.registration.actor())?
+                != TimerSourceState::ClosedDrained
+        } {
             return Ok(false);
         }
-        let snapshot = original.runtime.snapshot(original.registration.actor())?;
         let own_roles = usize::from(self.role.is_some());
         let own_permits = usize::from(self.permit.is_some());
         // Unfilled original permits are included in inputs. This also waits
@@ -439,6 +490,7 @@ impl ContextHostRecord {
         }
         self.complete_host_effect(ticket)
     }
+    #[cfg(test)]
     pub(crate) fn advance_internal(&mut self) -> Result<ContextInternalAdvance, DriverError> {
         self.resources.internal.advance()
     }

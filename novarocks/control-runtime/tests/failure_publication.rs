@@ -19,18 +19,19 @@
 
 use novarocks_control_runtime::{
     actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, DriverError, EffectTicket, InputPhase},
+    driver::{ActorRuntime, DriverError, EffectTicket, FailureSourceState, InputPhase},
     history::HistoryCapture,
-    lease::{CapacityBundle, WorkLease},
+    lease::{ReservationBundle, WorkLease},
     publication::{PublishedReply, PublishedSnapshot},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
-    capacity::ResourceVector,
+    capacity::{ReservationResources, ResourceVector},
     effect::{EffectDescriptor, EffectKind},
     history::HistoryFact,
     identity::*,
     mailbox::{InputClass, InputEnvelope},
+    owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
 };
 use std::sync::{
@@ -43,17 +44,30 @@ fn aid() -> ActorId {
 fn action(n: u64) -> ActionId {
     ActionId::new(n).unwrap()
 }
-fn work_id(n: u64) -> WorkId {
-    WorkId::new(n).unwrap()
-}
 fn generation() -> Generation {
     Generation::new(1).unwrap()
 }
 fn vector(n: u64) -> ResourceVector {
     ResourceVector::new([(DimensionId::new(1).unwrap(), n)]).unwrap()
 }
+fn work_resources(quota: ResourceVector) -> ReservationResources {
+    ReservationResources {
+        quota,
+        owned_slots: OwnedSlotNeed {
+            work_headers: 1,
+            ..OwnedSlotNeed::default()
+        },
+    }
+}
+fn supervisor_input(runtime: &ActorRuntime<FailingActor>) -> InputId {
+    let FailureSourceState::ClosedPending(input) = runtime.failure_source_state(aid()).unwrap()
+    else {
+        panic!("the original failure supervisor is pending");
+    };
+    input
+}
 #[derive(Debug)]
-struct FailingActor;
+struct FailingActor(ScopedWorkRef);
 impl Actor for FailingActor {
     type Input = u64;
     type Effect = u64;
@@ -71,7 +85,7 @@ impl Actor for FailingActor {
         step.effect(
             EffectDescriptor {
                 id: action(1),
-                work: work_id(1),
+                work: step.input_work().unwrap_or(self.0),
                 kind: EffectKind::Business,
                 dependencies: vec![],
             },
@@ -93,7 +107,7 @@ impl Actor for FailingActor {
         step.effect(
             EffectDescriptor {
                 id: action(17),
-                work: work_id(2),
+                work: step.failure_work().expect("original Cleanup supervisor"),
                 kind: EffectKind::Cleanup,
                 dependencies: vec![],
             },
@@ -109,9 +123,9 @@ struct Fixture {
     history: HistoryCapture,
     committed: PublishedReply<&'static str>,
     business: WorkLease,
-    business_capacity: CapacityBundle,
+    business_capacity: ReservationBundle,
     cleanup: WorkLease,
-    cleanup_capacity: CapacityBundle,
+    cleanup_capacity: ReservationBundle,
     first: InputId,
     failed: InputId,
     reserved: InputId,
@@ -119,14 +133,14 @@ struct Fixture {
     old: Option<EffectTicket<u64>>,
     initial: Option<EffectTicket<u64>>,
 }
-fn fixture(cleanup_kind: WorkKind, start_cleanup: bool) -> Fixture {
+fn fixture(start_cleanup: bool) -> Fixture {
     let history = HistoryCapture::new(256);
-    let ledger = RuntimeLedger::with_history(vector(2), 2, 1, history.clone());
-    let scope = ledger.open_scope_next(None, generation(), 2, 1).unwrap();
+    let ledger = RuntimeLedger::with_history(vector(2), history.clone());
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
     let (mut business, business_capacity) = scope
         .reserve_next(
             generation(),
-            vector(1),
+            work_resources(vector(1)),
             WorkKind::Business,
             WorkAdmission::External,
         )
@@ -136,23 +150,23 @@ fn fixture(cleanup_kind: WorkKind, start_cleanup: bool) -> Fixture {
     let (mut cleanup, cleanup_capacity) = scope
         .reserve_next(
             generation(),
-            vector(1),
-            cleanup_kind,
+            work_resources(vector(1)),
+            WorkKind::Cleanup,
             WorkAdmission::External,
         )
         .unwrap()
-        .bind(cleanup_kind)
+        .bind(WorkKind::Cleanup)
         .unwrap();
     business.start().unwrap();
     if start_cleanup {
         cleanup.start().unwrap();
     }
-    let runtime = ActorRuntime::with_history(1, history.clone());
+    let runtime = ActorRuntime::with_history(history.clone());
     runtime
-        .register_next(
+        .register_supervised_bound(
             aid(),
             scope.clone(),
-            FailingActor,
+            FailingActor(business.reference()),
             ActorConfig {
                 mailbox: [8; 4],
                 max_batches: 8,
@@ -161,6 +175,7 @@ fn fixture(cleanup_kind: WorkKind, start_cleanup: bool) -> Fixture {
                 turn_budget: 16,
                 max_step_work: 1,
             },
+            &cleanup,
         )
         .unwrap();
     let first = runtime
@@ -193,7 +208,9 @@ fn fixture(cleanup_kind: WorkKind, start_cleanup: bool) -> Fixture {
         .fill(77)
         .unwrap();
     runtime.poll_one(Tick(2)).unwrap();
-    let initial = runtime.take_effect(aid(), failed, action(17)).unwrap();
+    let initial = runtime
+        .take_effect(aid(), supervisor_input(&runtime), action(17))
+        .unwrap();
     Fixture {
         ledger,
         scope,
@@ -238,14 +255,17 @@ fn drain(mut f: Fixture) {
     drain_neutral_inputs(&f);
     f.cleanup.body_exited().unwrap();
     f.cleanup.captures_exited().unwrap();
-    f.cleanup_capacity.release(&vector(1)).unwrap();
-    f.runtime
-        .effect_completed(f.initial.take().unwrap())
-        .unwrap();
+    f.cleanup_capacity.release_quota(&vector(1)).unwrap();
+    f.cleanup_capacity.finish().unwrap();
+    let initial = f.initial.take().unwrap();
+    let supervisor = initial.input;
+    f.runtime.effect_completed(initial).unwrap();
+    f.runtime.retire_input(aid(), supervisor).unwrap();
     f.runtime.retire_input(aid(), f.failed).unwrap();
     f.business.body_exited().unwrap();
     f.business.captures_exited().unwrap();
-    f.business_capacity.release(&vector(1)).unwrap();
+    f.business_capacity.release_quota(&vector(1)).unwrap();
+    f.business_capacity.finish().unwrap();
     f.runtime.effect_completed(f.old.take().unwrap()).unwrap();
     f.runtime.retire_input(aid(), f.first).unwrap();
     f.ledger.reap_ready(2).unwrap();
@@ -260,15 +280,20 @@ fn drain(mut f: Fixture) {
 
 struct Incarnation {
     scope: ScopeHandle,
-    work: [(WorkLease, CapacityBundle); 2],
+    work: [(WorkLease, ReservationBundle); 2],
     input: InputId,
     cleanup: EffectTicket<u64>,
 }
 fn failed_incarnation(runtime: &ActorRuntime<FailingActor>, ledger: &RuntimeLedger) -> Incarnation {
-    let scope = ledger.open_scope_next(None, generation(), 2, 1).unwrap();
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
     let admit = |kind| {
         let (mut work, capacity) = scope
-            .reserve_next(generation(), vector(1), kind, WorkAdmission::External)
+            .reserve_next(
+                generation(),
+                work_resources(vector(1)),
+                kind,
+                WorkAdmission::External,
+            )
             .unwrap()
             .bind(kind)
             .unwrap();
@@ -277,10 +302,10 @@ fn failed_incarnation(runtime: &ActorRuntime<FailingActor>, ledger: &RuntimeLedg
     };
     let work = [admit(WorkKind::Business), admit(WorkKind::Cleanup)];
     runtime
-        .register_next(
+        .register_supervised_bound(
             aid(),
             scope.clone(),
-            FailingActor,
+            FailingActor(work[0].0.reference()),
             ActorConfig {
                 mailbox: [1; 4],
                 max_batches: 1,
@@ -289,6 +314,7 @@ fn failed_incarnation(runtime: &ActorRuntime<FailingActor>, ledger: &RuntimeLedg
                 turn_budget: 8,
                 max_step_work: 1,
             },
+            &work[1].0,
         )
         .unwrap();
     let input = runtime
@@ -297,7 +323,9 @@ fn failed_incarnation(runtime: &ActorRuntime<FailingActor>, ledger: &RuntimeLedg
         .fill(99)
         .unwrap();
     runtime.poll_one(Tick(1)).unwrap();
-    let cleanup = runtime.take_effect(aid(), input, action(17)).unwrap();
+    let cleanup = runtime
+        .take_effect(aid(), supervisor_input(runtime), action(17))
+        .unwrap();
     Incarnation {
         scope,
         work,
@@ -313,9 +341,12 @@ fn retire_incarnation(
     for (mut work, mut capacity) in incarnation.work {
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
-        capacity.release(&vector(1)).unwrap();
+        capacity.release_quota(&vector(1)).unwrap();
+        capacity.finish().unwrap();
     }
+    let supervisor = incarnation.cleanup.input;
     runtime.effect_completed(incarnation.cleanup).unwrap();
+    runtime.retire_input(aid(), supervisor).unwrap();
     runtime.retire_input(aid(), incarnation.input).unwrap();
     ledger.reap_scope_ready(incarnation.scope.id(), 2).unwrap();
     drop(runtime.take_failure_payload(aid()).unwrap());
@@ -328,8 +359,8 @@ fn retire_incarnation(
 }
 
 fn reject_reused_actor_session(different_ledger: bool) {
-    let ledger = RuntimeLedger::new(vector(2), 2, 1);
-    let runtime = ActorRuntime::new(1);
+    let ledger = RuntimeLedger::new(vector(2));
+    let runtime = ActorRuntime::new();
     let first = failed_incarnation(&runtime, &ledger);
     let mut stale = runtime.claim_failure_publication(&first.cleanup).unwrap();
     let original_scope = first.scope.id();
@@ -339,7 +370,7 @@ fn reject_reused_actor_session(different_ledger: bool) {
     retire_incarnation(&runtime, &ledger, first);
 
     let next_ledger = if different_ledger {
-        RuntimeLedger::new(vector(2), 2, 1)
+        RuntimeLedger::new(vector(2))
     } else {
         ledger.clone()
     };
@@ -350,7 +381,9 @@ fn reject_reused_actor_session(different_ledger: bool) {
         assert_ne!(second.scope.id(), original_scope);
     }
     assert_eq!(second.input, original_input);
-    assert_eq!(second.cleanup.descriptor.work, original_work);
+    assert_eq!(second.cleanup.descriptor.work.work, original_work.work);
+    assert_eq!(second.cleanup.descriptor.work.scope, second.scope.id());
+    assert_eq!(original_work.scope, original_scope);
     assert_eq!(second.cleanup.generation, original_generation);
     let mut current = runtime.claim_failure_publication(&second.cleanup).unwrap();
     let stale_matches = stale.matches_actor_runtime(&runtime, aid());
@@ -363,10 +396,10 @@ fn reject_reused_actor_session(different_ledger: bool) {
     // Always retire actual work before asserting the intended regression, so
     // an old implementation fails once rather than unwinding live actor custody.
     retire_incarnation(&runtime, &next_ledger, second);
-    assert_eq!(stale_matches, Err(DriverError::PublicationTargetMismatch));
+    assert_eq!(stale_matches, Err(DriverError::EffectTicketOriginMismatch));
     assert_eq!(current_matches, Ok(true));
     assert!(
-        matches!(rejected, Err((DriverError::PublicationTargetMismatch, _))),
+        matches!(rejected, Err((DriverError::EffectTicketOriginMismatch, _))),
         "a retired scope's session must not acquire the new actor incarnation: {rejected:?}"
     );
     assert_eq!(after_stale, "new bootstrap");
@@ -386,7 +419,7 @@ fn stale_session_cannot_follow_reused_scope_numbers_in_another_ledger() {
 
 #[test]
 fn one_prepaid_failure_session_publishes_each_actual_target_without_republishing_its_ticket() {
-    let f = fixture(WorkKind::Cleanup, true);
+    let f = fixture(true);
     let initial = f.initial.as_ref().unwrap();
     assert!(
         f.runtime
@@ -406,7 +439,7 @@ fn one_prepaid_failure_session_publishes_each_actual_target_without_republishing
             .matches_actor_runtime(&f.runtime, ActorId::new(2).unwrap())
             .unwrap()
     );
-    let unrelated = ActorRuntime::<FailingActor>::new(1);
+    let unrelated = ActorRuntime::<FailingActor>::new();
     assert!(!session.matches_actor_runtime(&unrelated, aid()).unwrap());
     assert_eq!(
         f.runtime.claim_failure_publication(initial).unwrap_err(),
@@ -444,9 +477,11 @@ fn one_prepaid_failure_session_publishes_each_actual_target_without_republishing
         .entries
         .into_iter()
         .filter_map(|entry| match entry.fact {
-            HistoryFact::Published {
-                generation, action, ..
-            } if generation == session.generation() => Some(action.get()),
+            HistoryFact::FailurePublication {
+                actor_generation,
+                action,
+                ..
+            } if actor_generation == session.generation() => Some(action.get()),
             _ => None,
         })
         .collect();
@@ -456,7 +491,8 @@ fn one_prepaid_failure_session_publishes_each_actual_target_without_republishing
         "each actual commit has its own action after sparse failure action 17"
     );
     assert_eq!(
-        f.runtime.retire_input(aid(), f.failed),
+        f.runtime
+            .retire_input(aid(), f.initial.as_ref().unwrap().input),
         Err(DriverError::EffectsRemain),
         "initial cleanup stays Started throughout publication slices"
     );
@@ -471,7 +507,7 @@ fn one_prepaid_failure_session_publishes_each_actual_target_without_republishing
 
 #[test]
 fn previously_committed_reply_survives_failure_and_is_never_overwritten() {
-    let f = fixture(WorkKind::Cleanup, true);
+    let f = fixture(true);
     let reply = &f.committed;
     let mut session = f
         .runtime
@@ -495,7 +531,7 @@ fn previously_committed_reply_survives_failure_and_is_never_overwritten() {
 
 #[test]
 fn cleanup_work_must_be_started_and_still_have_a_live_body_for_each_commit() {
-    let mut f = fixture(WorkKind::Cleanup, false);
+    let mut f = fixture(false);
     assert_eq!(
         f.runtime
             .claim_failure_publication(f.initial.as_ref().unwrap())
@@ -520,15 +556,18 @@ fn cleanup_work_must_be_started_and_still_have_a_live_body_for_each_commit() {
     );
     assert_eq!(*target.read(), 0);
     f.cleanup.captures_exited().unwrap();
-    f.cleanup_capacity.release(&vector(1)).unwrap();
+    f.cleanup_capacity.release_quota(&vector(1)).unwrap();
+    f.cleanup_capacity.finish().unwrap();
     drain_neutral_inputs(&f);
-    f.runtime
-        .effect_completed(f.initial.take().unwrap())
-        .unwrap();
+    let initial = f.initial.take().unwrap();
+    let supervisor = initial.input;
+    f.runtime.effect_completed(initial).unwrap();
+    f.runtime.retire_input(aid(), supervisor).unwrap();
     f.runtime.retire_input(aid(), f.failed).unwrap();
     f.business.body_exited().unwrap();
     f.business.captures_exited().unwrap();
-    f.business_capacity.release(&vector(1)).unwrap();
+    f.business_capacity.release_quota(&vector(1)).unwrap();
+    f.business_capacity.finish().unwrap();
     f.runtime.effect_completed(f.old.take().unwrap()).unwrap();
     f.runtime.retire_input(aid(), f.first).unwrap();
     f.ledger.reap_ready(2).unwrap();
@@ -542,14 +581,50 @@ fn cleanup_work_must_be_started_and_still_have_a_live_body_for_each_commit() {
 
 #[test]
 fn a_cleanup_descriptor_cannot_borrow_business_work_as_failure_publication_authority() {
-    let f = fixture(WorkKind::Business, true);
+    let ledger = RuntimeLedger::new(vector(1));
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
+    let (mut business, mut capacity) = scope
+        .reserve_next(
+            generation(),
+            work_resources(vector(1)),
+            WorkKind::Business,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Business)
+        .unwrap();
+    business.start().unwrap();
+    let runtime = ActorRuntime::new();
+    let refusal = runtime
+        .register_supervised_bound(
+            aid(),
+            scope.clone(),
+            FailingActor(business.reference()),
+            ActorConfig {
+                mailbox: [1; 4],
+                max_batches: 1,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 8,
+                max_step_work: 1,
+            },
+            &business,
+        )
+        .unwrap_err();
     assert_eq!(
-        f.runtime
-            .claim_failure_publication(f.initial.as_ref().unwrap())
-            .unwrap_err(),
-        DriverError::FailureWorkInactive
+        refusal.0,
+        DriverError::FailureWorkInactive,
+        "the actual registration gate refuses a Business role as failure authority"
     );
-    drain(f);
+    business.body_exited().unwrap();
+    business.captures_exited().unwrap();
+    capacity.release_quota(&vector(1)).unwrap();
+    capacity.finish().unwrap();
+    ledger.reap_scope_ready(scope.id(), 1).unwrap();
+    scope.close_external().unwrap();
+    ledger.remove_scope(scope.id()).unwrap();
+    assert!(runtime.is_empty());
+    assert!(ledger.is_empty());
 }
 
 struct DropProbe {
@@ -578,7 +653,7 @@ fn probe(f: &Fixture, value: u64, counter: &Arc<AtomicUsize>) -> Arc<DropProbe> 
 }
 #[test]
 fn replaced_and_rejected_source_arcs_are_disposed_by_the_host_outside_every_gate() {
-    let f = fixture(WorkKind::Cleanup, true);
+    let f = fixture(true);
     let mut session = f
         .runtime
         .claim_failure_publication(f.initial.as_ref().unwrap())
@@ -611,7 +686,7 @@ fn replaced_and_rejected_source_arcs_are_disposed_by_the_host_outside_every_gate
 
 #[test]
 fn failed_input_is_abandoned_once_and_waits_for_its_failure_batch_to_retire() {
-    let f = fixture(WorkKind::Cleanup, true);
+    let f = fixture(true);
     let input = f
         .runtime
         .input_inventory(aid(), None, 8)
@@ -622,7 +697,8 @@ fn failed_input_is_abandoned_once_and_waits_for_its_failure_batch_to_retire() {
     assert_eq!(input.phase, InputPhase::AbandonedByOwnerFailure);
     f.runtime.abandon_failed_input(aid(), f.failed).unwrap();
     assert_eq!(
-        f.runtime.retire_input(aid(), f.failed),
+        f.runtime
+            .retire_input(aid(), f.initial.as_ref().unwrap().input),
         Err(DriverError::EffectsRemain)
     );
     f.runtime.abandon_failed_input(aid(), f.reserved).unwrap();

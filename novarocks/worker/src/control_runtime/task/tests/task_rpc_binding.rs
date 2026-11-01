@@ -20,11 +20,66 @@
 
 use super::*;
 use crate::control_runtime::{
-    actors::tests::{Fixture, finish_source_routes, generation, operation, task},
+    actors::tests::{Fixture, finish_source_routes, operation, task},
     causal::{CausalSourceRetirement, RpcAuthorAdmission},
 };
+use novarocks_control_runtime_core::completion::ConsumerKind;
+use novarocks_control_runtime_core::identity::ConsumerId;
 use novarocks_worker_protocol::lease::MonotonicInstant;
 use std::time::Duration;
+
+fn original_rpc_roles(
+    scope: &ScopeHandle,
+    parent: &WorkLease,
+) -> (AdmittedCompletionRole, [SourceSlotAdmission; 2]) {
+    let generation = scope.gates().unwrap().generation;
+    let (work, mut capacity) = scope
+        .reserve_next(
+            generation,
+            StorageNeed::role(false).resources().unwrap(),
+            WorkKind::Settlement,
+            novarocks_control_runtime_core::scope::WorkAdmission::Derived(parent.id()),
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    let report = ReportSlot::reserve_next(
+        &mut capacity,
+        generation,
+        2,
+        [
+            (
+                ConsumerId::new(1).unwrap(),
+                ConsumerKind::Owner {
+                    scope: scope.id(),
+                    generation: crate::control_runtime::actors::tests::generation(),
+                },
+            ),
+            (ConsumerId::new(2).unwrap(), ConsumerKind::Observer),
+        ],
+    )
+    .unwrap();
+    // The original R owns its own capture and prepaid Source2. Issuing the
+    // two children first leaves precisely R's actual capture to adopt.
+    let sources = reserve_source_slots::<2>(
+        scope,
+        &work,
+        (
+            scope.id(),
+            crate::control_runtime::actors::tests::generation(),
+        ),
+        SourceSlotPayer::Retained(&mut capacity),
+    )
+    .unwrap();
+    (
+        AdmittedCompletionRole {
+            work,
+            capacity,
+            report,
+        },
+        sources,
+    )
+}
 
 #[test]
 fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_alive() {
@@ -32,12 +87,9 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
     let identity = task(f.identity, 1);
     let mut host = f.adopt_task_host(identity, 4);
     let original_scope = f.scope.clone();
-    let parent = host.resources.active.id();
     let initial_open = host.request_admission_open() && host.task_id() == identity;
-    let admitted =
-        reserve_reported_role(&f.scope, parent, WorkKind::Settlement, Some(generation())).unwrap();
-    let admission =
-        CutSourceAdmission::Fresh(test_model_source_slots::<2>(&f.scope, parent, generation()));
+    let (admitted, sources) = original_rpc_roles(&f.scope, host.resources.lifetime.work());
+    let admission = CutSourceAdmission::Fresh(sources);
     let request = RequestMetadata {
         operation: operation(92),
         deadline: MonotonicInstant::from_origin(Duration::from_nanos(99)),
@@ -47,6 +99,7 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
         role,
         authority,
         sender,
+        input_author: _,
     } = host
         .bind_request_author(admitted, request, InputClass::Control, 1, admission)
         .unwrap();
@@ -58,12 +111,10 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
         && host.causal().cut_inventory(None, 4) == vec![cut]
         && role.phase() == novarocks_control_runtime::exit_role::ExitRolePhase::Admitted;
 
-    let rejected =
-        reserve_reported_role(&f.scope, parent, WorkKind::Settlement, Some(generation())).unwrap();
+    let (rejected, source_roles) = original_rpc_roles(&f.scope, host.resources.lifetime.work());
     let work = rejected.work.id();
     let capacity = rejected.capacity.id();
     let report = rejected.report.clone();
-    let source_roles = test_model_source_slots::<2>(&f.scope, parent, generation());
     let sources = source_roles.each_ref().map(|source| {
         (
             source.reported().work().id(),
@@ -103,7 +154,6 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
             });
     let no_new_cut_or_stop = f.scope.snapshot().unwrap() == before_reject
         && host.causal().cut_inventory(None, 4) == vec![cut];
-    dispose_unused_completion(rejected);
     let mut unused =
         crate::control_runtime::source_slot_issuer::SourceSlotIssuePartial::from_admissions(
             &f.scope,
@@ -117,6 +167,7 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
         }
     }
     assert!(unused_retired);
+    dispose_unused_completion(rejected);
 
     // The original already-admitted sender still really returns after closure.
     // This neither exits its main R nor fabricates a Core event/consumption.
@@ -125,11 +176,27 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
     let still_no_event = host.causal().rpc_delivery(cut).unwrap().is_none();
     host.causal().observe_effects_exited(cut).unwrap();
     authority.withdraw_unpublished_and_exit().unwrap();
-    f.ledger.reap_scope_ready(f.scope.id(), 128).unwrap();
+    assert!(
+        !role.try_retire().unwrap(),
+        "R's original Source2 children still join their actual parent"
+    );
+    let mut reaped_sources = None;
+    for _ in 0..128 {
+        let progress = host
+            .causal()
+            .advance_source_pair_retirement(cut, &f.scope)
+            .unwrap();
+        if let Some(reaped) = progress.reaped {
+            reaped_sources = Some(reaped);
+            break;
+        }
+    }
+    let reaped_sources =
+        reaped_sources.expect("same R's two unused Source children actually exit and reap");
     let original_retired = role.try_retire().unwrap();
     let retired = host
         .causal()
-        .retire_after_exit(cut, CausalSourceRetirement::Unclaimed)
+        .retire_after_exit(cut, CausalSourceRetirement::Reaped(reaped_sources))
         .unwrap();
     let ingress = host.resources.port.ingress().clone();
     for holder in ingress
@@ -148,9 +215,8 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
         .prepare_owned_pair_reap(&retired.pair)
         .unwrap()
         .map(|probe| probe.observe_reaped().unwrap());
-    for mut storage in ingress.release_owned_pair(&retired.pair, reaped).unwrap() {
-        storage.release().unwrap();
-    }
+    let detached = ingress.release_owned_pair(&retired.pair, reaped).unwrap();
+    drop(detached);
     drop(retired);
     let mut resources = host.into_resources();
     finish_source_routes(&f, &ingress);
@@ -159,13 +225,23 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
         &resources.host_calls,
         &f.ledger,
     );
+    // This unissued disposal is the original Context child, outside Task join.
+    let mut disposal_retired = false;
+    for _ in 0..64 {
+        if resources.disposal.retire_unused(&f.ledger).unwrap() {
+            disposal_retired = true;
+            break;
+        }
+    }
+    assert!(disposal_retired && resources.disposal.is_retired());
     resources.lifetime.body_exited().unwrap();
     resources.lifetime.captures_exited().unwrap();
     let original_lifetime_exited = resources.lifetime.actual_exit_ready().unwrap();
     resources
         .active
-        .release(&resources.active.resources().unwrap())
+        .release_quota(&resources.active.resources().unwrap().quota)
         .unwrap();
+    resources.active.finish().unwrap();
     f.ledger.reap_scope_ready(original_scope.id(), 128).unwrap();
     drop(resources);
     f.finish();

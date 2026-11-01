@@ -44,7 +44,6 @@ type PanicPayload = ManuallyDrop<Box<dyn Any + Send>>;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HostExecutorLimits {
-    pub contexts: NonZeroUsize,
     pub jobs: NonZeroUsize,
     pub per_context: NonZeroUsize,
     pub workers: NonZeroUsize,
@@ -55,25 +54,25 @@ impl HostExecutorLimits {
     /// are cumulative, so their original T bound still covers historical tails.
     /// This pure check can run before capturing the original runner.
     pub(crate) fn for_loading(
-        config: &crate::task_registry_config::TaskExecutionRegistryConfig,
-        max_contexts: NonZeroUsize,
-    ) -> Result<Self, String> {
-        config.validate_capacity_limits()?;
-        let jobs = config
-            .max_active_tasks_per_backend
-            .checked_add(config.max_prepare_workers)
-            .ok_or_else(|| "loading executor active-plus-worker capacity overflow".to_owned())?;
-        let contexts = max_contexts
-            .get()
-            .checked_add(config.max_prepare_workers)
-            .ok_or_else(|| "loading executor context-plus-worker capacity overflow".to_owned())?;
+        tasks_per_context: usize,
+        active_tasks: usize,
+        workers: usize,
+    ) -> Result<Self, super::node_geometry::NodeGeometryError> {
+        use super::node_geometry::NodeGeometryError;
+        let positive =
+            |value| NonZeroUsize::new(value).ok_or(NodeGeometryError::InvalidBootstrapManifest);
+        let per_context = positive(tasks_per_context)?;
+        let active_tasks = positive(active_tasks)?;
+        let workers = positive(workers)?;
         Ok(Self {
-            contexts: NonZeroUsize::new(contexts).expect("positive Context and worker capacities"),
-            jobs: NonZeroUsize::new(jobs).expect("positive active Task and worker capacities"),
-            per_context: NonZeroUsize::new(config.max_tasks_per_context)
-                .expect("validated per-Context Task capacity"),
-            workers: NonZeroUsize::new(config.max_prepare_workers)
-                .expect("validated physical worker capacity"),
+            jobs: positive(
+                active_tasks
+                    .get()
+                    .checked_add(workers.get())
+                    .ok_or(NodeGeometryError::Overflow)?,
+            )?,
+            per_context,
+            workers,
         })
     }
 }
@@ -239,6 +238,25 @@ impl<J: QueuedPreparation> HostExecutorHandle<J> {
         // implementation of HostJob::queue_key runs behind the submit gate.
         let key = job.queue_key();
         let group = job.fairness_group(key.0);
+        self.submit_with_metadata(job, key, group)
+    }
+    /// The actual application owner chooses its scheduling group independently
+    /// of the original financial Scope. This grants no Work, queue position or
+    /// physical-worker capacity; all admission and running limits stay shared.
+    pub(crate) fn try_submit_for_group(
+        &self,
+        job: J,
+        group: HostFairnessGroup,
+    ) -> Result<(), (HostSubmitError, J)> {
+        let key = job.queue_key();
+        self.submit_with_metadata(job, key, group)
+    }
+    fn submit_with_metadata(
+        &self,
+        job: J,
+        key: (ScopeId, WorkId),
+        group: HostFairnessGroup,
+    ) -> Result<(), (HostSubmitError, J)> {
         let gate = self.shared.gate.lock().expect("host admission gate");
         if !gate.accepting {
             let reason = if gate
@@ -267,6 +285,7 @@ impl<J: QueuedPreparation> HostExecutorHandle<J> {
             Err((reason, job)) => Err((HostSubmitError::Queue(reason), job.original)),
         }
     }
+    #[cfg(test)]
     pub(crate) fn close_external(&self) {
         self.shared.close_external();
     }
@@ -334,19 +353,9 @@ where
         let count = limits.workers.get();
         let shared = Arc::new(Shared {
             queue: if eligible_fifo {
-                PreparationQueue::eligible_fifo(
-                    limits.contexts.get(),
-                    limits.jobs.get(),
-                    limits.per_context.get(),
-                    count,
-                )
+                PreparationQueue::eligible_fifo(limits.jobs.get(), limits.per_context.get(), count)
             } else {
-                PreparationQueue::new(
-                    limits.contexts.get(),
-                    limits.jobs.get(),
-                    limits.per_context.get(),
-                    count,
-                )
+                PreparationQueue::new(limits.jobs.get(), limits.per_context.get(), count)
             },
             gate: Mutex::new(Gate {
                 accepting: true,
@@ -512,7 +521,6 @@ mod tests {
     }
     fn limits(workers: usize) -> HostExecutorLimits {
         HostExecutorLimits {
-            contexts: NonZeroUsize::new(8).unwrap(),
             jobs: NonZeroUsize::new(16).unwrap(),
             per_context: NonZeroUsize::new(8).unwrap(),
             workers: NonZeroUsize::new(workers).unwrap(),
@@ -541,17 +549,8 @@ mod tests {
 
     #[test]
     fn loading_geometry_covers_active_inventory_independently_of_preparation_p() {
-        use crate::task_registry_config::TaskExecutionRegistryConfig;
-        use novarocks_types::identity::BackendProcessId;
-
-        let mut config =
-            TaskExecutionRegistryConfig::for_process(BackendProcessId::new_v7(), 17, 9);
-        config.max_preparing_tasks = 2;
-        config.max_preparing_tasks_per_context = 1;
-        config.max_prepare_workers = 4;
-        let limits = HostExecutorLimits::for_loading(&config, NonZeroUsize::new(3).unwrap())
-            .expect("valid original loading geometry");
-        assert_eq!(limits.contexts.get(), 7);
+        let limits =
+            HostExecutorLimits::for_loading(17, 9, 4).expect("valid original loading geometry");
         assert_eq!(limits.jobs.get(), 13);
         assert_eq!(limits.per_context.get(), 17);
         assert_eq!(limits.workers.get(), 4);
@@ -559,65 +558,30 @@ mod tests {
 
     #[test]
     fn loading_geometry_rejects_invalid_config_before_any_runner_transfer() {
-        use crate::task_registry_config::TaskExecutionRegistryConfig;
-        use novarocks_types::identity::BackendProcessId;
-
-        for field in 0..3 {
-            let mut config =
-                TaskExecutionRegistryConfig::for_process(BackendProcessId::new_v7(), 2, 3);
-            let expected = match field {
-                0 => {
-                    config.max_tasks_per_context = 0;
-                    "max_tasks_per_context"
-                }
-                1 => {
-                    config.max_active_tasks_per_backend = 0;
-                    "max_active_tasks_per_backend"
-                }
-                _ => {
-                    config.max_prepare_workers = 0;
-                    "max_prepare_workers"
-                }
-            };
-            let error = HostExecutorLimits::for_loading(&config, NonZeroUsize::new(2).unwrap())
-                .expect_err("invalid loading geometry must fail before executor start");
-            assert!(error.contains(expected), "{error}");
+        for (tasks, active, workers) in [(0, 3, 1), (2, 0, 1), (2, 3, 0)] {
+            assert_eq!(
+                HostExecutorLimits::for_loading(tasks, active, workers).unwrap_err(),
+                super::super::node_geometry::NodeGeometryError::InvalidBootstrapManifest,
+            );
         }
     }
 
     #[test]
     fn loading_geometry_checks_physical_tail_overflow_without_incrementing_cumulative_t() {
-        use crate::task_registry_config::TaskExecutionRegistryConfig;
-        use novarocks_types::identity::BackendProcessId;
-
-        let mut config =
-            TaskExecutionRegistryConfig::for_process(BackendProcessId::new_v7(), 1, usize::MAX);
-        config.max_prepare_workers = 1;
-        let error = HostExecutorLimits::for_loading(&config, NonZeroUsize::new(1).unwrap())
-            .expect_err("A plus N must be checked before runner transfer");
-        assert!(error.contains("active-plus-worker"), "{error}");
-        config.max_active_tasks_per_backend = 1;
-        let error =
-            HostExecutorLimits::for_loading(&config, NonZeroUsize::new(usize::MAX).unwrap())
-                .expect_err("C plus N must be checked before runner transfer");
-        assert!(error.contains("context-plus-worker"), "{error}");
-        config.max_tasks_per_context = usize::MAX;
-        let limits = HostExecutorLimits::for_loading(&config, NonZeroUsize::new(1).unwrap())
+        use super::super::node_geometry::NodeGeometryError;
+        assert_eq!(
+            HostExecutorLimits::for_loading(1, usize::MAX, 1).unwrap_err(),
+            NodeGeometryError::Overflow
+        );
+        let limits = HostExecutorLimits::for_loading(usize::MAX, 1, 1)
             .expect("cumulative Task identities require no T plus one arithmetic");
         assert_eq!(limits.per_context.get(), usize::MAX);
     }
 
     #[test]
     fn loading_geometry_preserves_all_live_positions_behind_a_retired_business_tail() {
-        use crate::task_registry_config::TaskExecutionRegistryConfig;
-        use novarocks_types::identity::BackendProcessId;
-
-        let mut config = TaskExecutionRegistryConfig::for_process(BackendProcessId::new_v7(), 3, 3);
-        config.max_preparing_tasks = 1;
-        config.max_preparing_tasks_per_context = 1;
-        config.max_prepare_workers = 1;
-        let limits = HostExecutorLimits::for_loading(&config, NonZeroUsize::new(1).unwrap())
-            .expect("valid actual inventory bound");
+        let limits =
+            HostExecutorLimits::for_loading(3, 3, 1).expect("valid actual inventory bound");
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let release_rx = Mutex::new(release_rx);
@@ -723,25 +687,13 @@ mod tests {
 
     #[test]
     fn fairness_group_is_independent_of_the_original_queued_and_running_owner_keys() {
-        struct Grouped {
-            group: HostFairnessGroup,
-            original: Job,
-        }
-        impl QueuedPreparation for Grouped {
-            fn queue_key(&self) -> (ScopeId, WorkId) {
-                self.original.key
-            }
-            fn fairness_group(&self, _scope: ScopeId) -> HostFairnessGroup {
-                self.group
-            }
-        }
         let group = |n| HostFairnessGroup::Scope(ScopeId::new(n).unwrap());
-        let executor = HostExecutor::start(limits(2), |job: Grouped| run(job.original))
+        let executor = HostExecutor::start(limits(2), run)
             .unwrap_or_else(|_| panic!("two original host workers"));
         let handle = executor.handle();
         let submit = |group, original| {
             handle
-                .try_submit(Grouped { group, original })
+                .try_submit_for_group(original, group)
                 .unwrap_or_else(|_| panic!("bounded grouped original job"));
         };
         let (started_tx, started_rx) = mpsc::channel();
@@ -766,26 +718,19 @@ mod tests {
         );
         // A queued real key cannot be recaptured using a different group.
         let queued_duplicate = handle
-            .try_submit(Grouped {
-                group: group(81),
-                original: job(2, 1, || {}),
-            })
+            .try_submit_for_group(job(2, 1, || {}), group(81))
             .err()
             .unwrap();
         let canceled = handle
             .cancel_queued(ScopeId::new(2).unwrap(), WorkId::new(1).unwrap())
             .expect("indexed cancel resolves the original group");
         let canceled_key = canceled.queue_key();
-        let canceled_group = canceled.fairness_group(canceled_key.0);
         handle
-            .try_submit(canceled)
+            .try_submit_for_group(canceled, group(80))
             .unwrap_or_else(|_| panic!("same canceled original"));
         // Running members also remain indexed until their physical body exits.
         let running_duplicate = handle
-            .try_submit(Grouped {
-                group: group(81),
-                original: job(1, 1, || {}),
-            })
+            .try_submit_for_group(job(1, 1, || {}), group(81))
             .err()
             .unwrap();
         let tx = started_tx.clone();
@@ -819,7 +764,6 @@ mod tests {
             canceled_key,
             (ScopeId::new(2).unwrap(), WorkId::new(1).unwrap())
         );
-        assert_eq!(canceled_group, group(80));
         drop(queued_duplicate);
         drop(running_duplicate);
     }
@@ -1180,7 +1124,7 @@ mod tests {
         const CHILD: &str = "NOVAROCKS_HOST_DRIVER_FAILURE_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let shared = Arc::new(Shared::<Job> {
-                queue: PreparationQueue::new(1, 1, 1, 1),
+                queue: PreparationQueue::new(1, 1, 1),
                 gate: Mutex::new(Gate {
                     accepting: true,
                     workers: vec![WorkerSlot {
@@ -1218,7 +1162,7 @@ mod tests {
     fn readiness_between_predicate_and_sleep_is_not_lost() {
         // This is the same next_body/wait split used by every physical worker.
         let shared = Arc::new(Shared::<Job> {
-            queue: PreparationQueue::new(1, 1, 1, 1),
+            queue: PreparationQueue::new(1, 1, 1),
             gate: Mutex::new(Gate {
                 accepting: true,
                 workers: Box::new([]),
@@ -1386,7 +1330,6 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let executor = match HostExecutor::start_with_waker(
             HostExecutorLimits {
-                contexts: NonZeroUsize::new(2).unwrap(),
                 jobs: NonZeroUsize::new(2).unwrap(),
                 per_context: NonZeroUsize::new(2).unwrap(),
                 workers: NonZeroUsize::new(1).unwrap(),
