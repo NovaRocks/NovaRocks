@@ -2435,6 +2435,10 @@ async fn unary_backing_deferral_has_no_ack_receipt_after_actual_ack_applies() {
     drop(raw);
     drop(body);
     drop(alias);
+    // This fixture owns its Node exclusively. The prior data and deferred ACK
+    // reads must retire their original R/report/header charges before replay;
+    // dropping a reply or its last data alias alone does not prove that step.
+    wait_until(|| fixture.control.metrics_snapshot().requests == 0);
     let replay = owned(fixture.reader.read(&read).await);
     assert_eq!(
         replay.reply().accepted_consumed,
